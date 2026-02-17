@@ -510,6 +510,9 @@ impl MessageConsumer for EventStoreConsumer {
             new_offset = last.offset;
         }
 
+        // Advance offset immediately to support async commit pipelines (like Route)
+        self.last_offset.store(new_offset, Ordering::SeqCst);
+
         // Convert to CanonicalMessage for the consumer
         let events: Vec<CanonicalMessage> = stored_events.into_iter().map(|e| e.message).collect();
         trace!(count = events.len(), subscriber_id = %self.subscriber_id, message_ids = ?LazyMessageIds(&events), "Received batch of events from store");
@@ -520,12 +523,13 @@ impl MessageConsumer for EventStoreConsumer {
 
         let commit: BatchCommitFunc = Box::new(move |dispositions| {
             Box::pin(async move {
-                if !dispositions
+                if dispositions
                     .iter()
                     .any(|d| matches!(d, MessageDisposition::Nack))
                 {
+                    last_offset_arc.fetch_min(last_offset_val, Ordering::SeqCst);
+                } else {
                     store.ack(&subscriber_id, new_offset).await;
-                    last_offset_arc.store(new_offset, Ordering::SeqCst);
                 }
                 Ok(())
             })

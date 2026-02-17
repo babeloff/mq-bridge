@@ -707,4 +707,237 @@ mod tests {
         let content = tokio::fs::read_to_string(&file_path).await.unwrap();
         assert_eq!(content, "line1\nline2\n");
     }
+
+    #[tokio::test]
+    async fn test_file_consumer_consume_explicit_delete() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("consume_explicit_delete.log");
+        let file_path_str = file_path.to_str().unwrap().to_string();
+
+        tokio::fs::write(&file_path, b"line1\n").await.unwrap();
+
+        let config = FileConfig {
+            path: file_path_str.clone(),
+            subscribe_mode: false,
+            delete: Some(true),
+        };
+        let mut consumer = FileConsumer::new(&config).await.unwrap();
+
+        let received = consumer.receive().await.unwrap();
+        assert_eq!(received.message.payload.as_ref(), b"line1");
+
+        (received.commit)(crate::traits::MessageDisposition::Ack)
+            .await
+            .unwrap();
+
+        // Verify file becomes empty
+        let mut content = String::new();
+        for _ in 0..20 {
+            content = tokio::fs::read_to_string(&file_path).await.unwrap();
+            if content.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert_eq!(content, "");
+    }
+
+    #[tokio::test]
+    async fn test_file_consumer_subscribe_with_delete() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("subscribe_delete.log");
+        let file_path_str = file_path.to_str().unwrap().to_string();
+
+        tokio::fs::write(&file_path, b"line1\n").await.unwrap();
+
+        let config = FileConfig {
+            path: file_path_str.clone(),
+            subscribe_mode: true,
+            delete: Some(true),
+        };
+
+        let mut sub1 = FileConsumer::new(&config).await.unwrap();
+        let mut sub2 = FileConsumer::new(&config).await.unwrap();
+
+        let msg1 = sub1.receive().await.unwrap();
+        assert_eq!(msg1.message.payload.as_ref(), b"line1");
+
+        let msg2 = sub2.receive().await.unwrap();
+        assert_eq!(msg2.message.payload.as_ref(), b"line1");
+
+        // Sub1 acks. File should NOT be deleted yet.
+        (msg1.commit)(crate::traits::MessageDisposition::Ack)
+            .await
+            .unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let content = tokio::fs::read_to_string(&file_path).await.unwrap();
+        assert_eq!(content, "line1\n");
+
+        // Sub2 acks. File should be deleted.
+        (msg2.commit)(crate::traits::MessageDisposition::Ack)
+            .await
+            .unwrap();
+
+        let mut content = String::new();
+        for _ in 0..20 {
+            content = tokio::fs::read_to_string(&file_path).await.unwrap();
+            if content.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert_eq!(content, "");
+    }
+
+    #[tokio::test]
+    async fn test_file_consumer_subscribe_explicit_no_delete() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("subscribe_no_delete.log");
+        let file_path_str = file_path.to_str().unwrap().to_string();
+
+        tokio::fs::write(&file_path, b"line1\n").await.unwrap();
+
+        let config = FileConfig {
+            path: file_path_str.clone(),
+            subscribe_mode: true,
+            delete: Some(false),
+        };
+
+        let mut consumer = FileConsumer::new(&config).await.unwrap();
+
+        let received = consumer.receive().await.unwrap();
+        assert_eq!(received.message.payload.as_ref(), b"line1");
+
+        (received.commit)(crate::traits::MessageDisposition::Ack)
+            .await
+            .unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let content = tokio::fs::read_to_string(&file_path).await.unwrap();
+        assert_eq!(content, "line1\n");
+    }
+
+    use crate::models::{Endpoint, EndpointType, Route};
+
+    #[tokio::test]
+    async fn test_route_file_consume_explicit_delete() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("route_consume_explicit_delete.log");
+        let file_path_str = file_path.to_str().unwrap().to_string();
+        tokio::fs::write(&file_path, b"msg1\n").await.unwrap();
+
+        let input = Endpoint::new(EndpointType::File(FileConfig {
+            path: file_path_str.clone(),
+            subscribe_mode: false,
+            delete: Some(true),
+        }));
+        let output = Endpoint::new_memory("out_consume_explicit_delete", 10);
+        let route = Route::new(input, output.clone());
+
+        let handle = route.run("test_route_consume_explicit_delete").await.unwrap();
+
+        let channel = output.channel().unwrap();
+        // Wait for message
+        let mut received = Vec::new();
+        for _ in 0..20 {
+            if channel.len() > 0 {
+                received = channel.drain_messages();
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert_eq!(received.len(), 1);
+        assert_eq!(&received[0].payload.to_vec(), b"msg1");
+
+        // Verify deletion
+        let mut content = String::new();
+        for _ in 0..20 {
+            content = tokio::fs::read_to_string(&file_path).await.unwrap();
+            if content.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert_eq!(content, "");
+
+        handle.stop().await;
+    }
+
+    #[tokio::test]
+    async fn test_route_file_subscribe_with_delete() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("route_subscribe_delete.log");
+        let file_path_str = file_path.to_str().unwrap().to_string();
+        tokio::fs::write(&file_path, b"msg1\n").await.unwrap();
+
+        let input = Endpoint::new(EndpointType::File(FileConfig {
+            path: file_path_str.clone(),
+            subscribe_mode: true,
+            delete: Some(true),
+        }));
+        let output = Endpoint::new_memory("out_subscribe_delete", 10);
+        let route = Route::new(input, output.clone());
+
+        let handle = route.run("test_route_subscribe_delete").await.unwrap();
+
+        let channel = output.channel().unwrap();
+        let mut received = Vec::new();
+        for _ in 0..20 {
+            if channel.len() > 0 {
+                received = channel.drain_messages();
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert_eq!(received.len(), 1);
+
+        // Verify deletion
+        let mut content = String::new();
+        for _ in 0..20 {
+            content = tokio::fs::read_to_string(&file_path).await.unwrap();
+            if content.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert_eq!(content, "");
+
+        handle.stop().await;
+    }
+
+    #[tokio::test]
+    async fn test_route_file_subscribe_explicit_no_delete() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("route_subscribe_no_delete.log");
+        let file_path_str = file_path.to_str().unwrap().to_string();
+        tokio::fs::write(&file_path, b"msg1\n").await.unwrap();
+
+        let input = Endpoint::new(EndpointType::File(FileConfig {
+            path: file_path_str.clone(),
+            subscribe_mode: true,
+            delete: Some(false),
+        }));
+        let output = Endpoint::new_memory("out_subscribe_no_delete", 10);
+        let route = Route::new(input, output.clone());
+
+        let handle = route.run("test_route_subscribe_no_delete").await.unwrap();
+
+        let channel = output.channel().unwrap();
+        let mut received = Vec::new();
+        for _ in 0..20 {
+            if channel.len() > 0 {
+                received = channel.drain_messages();
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert_eq!(received.len(), 1);
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let content = tokio::fs::read_to_string(&file_path).await.unwrap();
+        assert_eq!(content, "msg1\n");
+
+        handle.stop().await;
+    }
 }
