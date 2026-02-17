@@ -662,4 +662,109 @@ http_route:
         assert_eq!(resp.status(), reqwest::StatusCode::OK);
         assert_eq!(resp.text().await.unwrap(), "handled: input_data");
     }
+
+    #[tokio::test]
+    async fn test_http_publisher_server_error() {
+        let port = get_free_port();
+        let addr = format!("127.0.0.1:{}", port);
+        let url = format!("http://{}", addr);
+
+        // Start a simple server that always returns 500
+        let server = actix_web::HttpServer::new(|| {
+            actix_web::App::new().route(
+                "/",
+                actix_web::web::post()
+                    .to(|| async { actix_web::HttpResponse::InternalServerError().body("error") }),
+            )
+        })
+        .bind(&addr)
+        .unwrap()
+        .run();
+
+        let server_handle = server.handle();
+        tokio::spawn(server);
+
+        // Give server time to start
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let pub_config = HttpConfig {
+            url: url.clone(),
+            ..Default::default()
+        };
+        let publisher = HttpPublisher::new(&pub_config)
+            .await
+            .expect("Failed to create publisher");
+
+        let msg = CanonicalMessage::new(b"test".to_vec(), None);
+        let result = publisher.send(msg).await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("500 Internal Server Error"));
+
+        server_handle.stop(true).await;
+    }
+
+    #[tokio::test]
+    async fn test_http_publisher_metadata_propagation() {
+        use std::collections::HashMap;
+        let port = get_free_port();
+        let addr = format!("127.0.0.1:{}", port);
+        let url = format!("http://{}", addr);
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<HashMap<String, String>>(1);
+
+        let server = actix_web::HttpServer::new(move || {
+            let tx = tx.clone();
+            actix_web::App::new().route(
+                "/",
+                actix_web::web::post().to(move |req: actix_web::HttpRequest| {
+                    let tx = tx.clone();
+                    async move {
+                        let mut headers = HashMap::new();
+                        for (k, v) in req.headers() {
+                            if let Ok(s) = v.to_str() {
+                                headers.insert(k.to_string(), s.to_string());
+                            }
+                        }
+                        tx.send(headers).await.unwrap();
+                        actix_web::HttpResponse::Ok().finish()
+                    }
+                }),
+            )
+        })
+        .bind(&addr)
+        .unwrap()
+        .run();
+
+        let server_handle = server.handle();
+        tokio::spawn(server);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let pub_config = HttpConfig {
+            url: url.clone(),
+            ..Default::default()
+        };
+        let publisher = HttpPublisher::new(&pub_config)
+            .await
+            .expect("Failed to create publisher");
+
+        let mut msg = CanonicalMessage::new(b"test".to_vec(), None);
+        msg.metadata
+            .insert("x-custom-header".to_string(), "custom-value".to_string());
+
+        publisher.send(msg).await.expect("Failed to send");
+
+        let received_headers = rx.recv().await.expect("Server didn't receive request");
+        let found = received_headers
+            .iter()
+            .any(|(k, v)| k.eq_ignore_ascii_case("x-custom-header") && v == "custom-value");
+        assert!(
+            found,
+            "Header x-custom-header not found or value mismatch. Headers: {:?}",
+            received_headers
+        );
+
+        server_handle.stop(true).await;
+    }
 }
