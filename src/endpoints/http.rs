@@ -298,9 +298,16 @@ impl HttpPublisher {
             client_builder = client_builder.identity(identity);
         }
 
+        let url = if config.url.starts_with("http://") || config.url.starts_with("https://") {
+            config.url.clone()
+        } else {
+            let scheme = if config.tls.required { "https" } else { "http" };
+            format!("{}://{}", scheme, config.url)
+        };
+
         Ok(Self {
             client: client_builder.build()?,
-            url: config.url.clone(),
+            url,
         })
     }
 }
