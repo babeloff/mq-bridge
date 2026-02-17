@@ -38,7 +38,6 @@ fn get_file_lock(path: &str) -> Arc<Mutex<()>> {
 
 #[derive(Clone)]
 pub struct FilePublisher {
-    writer: Arc<Mutex<BufWriter<File>>>,
     path: String,
     file_lock: Arc<Mutex<()>>,
 }
@@ -52,7 +51,7 @@ impl FilePublisher {
             })?;
         }
 
-        let file = OpenOptions::new()
+        let _ = OpenOptions::new()
             .create(true)
             .append(true)
             .open(&path)
@@ -65,7 +64,6 @@ impl FilePublisher {
 
         info!(path = %config.path, "File sink opened for appending");
         Ok(Self {
-            writer: Arc::new(Mutex::new(BufWriter::new(file))),
             path: config.path.clone(),
             file_lock,
         })
@@ -85,7 +83,19 @@ impl MessagePublisher for FilePublisher {
 
         trace!(count = messages.len(), path = %self.path, message_ids = ?LazyMessageIds(&messages), "Writing batch to file");
         let _file_guard = self.file_lock.lock().await;
-        let mut writer = self.writer.lock().await;
+        
+        // We open the file for every batch to ensure we are writing to the current file path.
+        // This handles external file rotation/deletion (e.g. by the consumer in delete mode)
+        // where the old file handle would point to a deleted inode.
+        // While this has a performance cost, it ensures correctness.
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+            .await
+            .context("Failed to open file for writing batch")?;
+            
+        let mut writer = BufWriter::new(file);
         let mut failed_messages = Vec::new();
 
         // Iterate over messages, consuming them
@@ -133,9 +143,6 @@ impl MessagePublisher for FilePublisher {
     }
 
     async fn flush(&self) -> anyhow::Result<()> {
-        let _file_guard = self.file_lock.lock().await;
-        let mut writer = self.writer.lock().await;
-        writer.flush().await?;
         Ok(())
     }
 
@@ -155,6 +162,8 @@ struct FileFeedState {
     last_position: u64,
 }
 
+/// Creates an EventStore backed by a file.
+/// The EventStore acts as an in-memory buffer for the file content, allowing unified handling of Consume and Subscribe modes.
 async fn create_file_event_store(config: &FileConfig) -> anyhow::Result<Arc<EventStore>> {
     let path = config.path.clone();
     let should_delete = config.delete.unwrap_or(!config.subscribe_mode);
@@ -937,6 +946,55 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         let content = tokio::fs::read_to_string(&file_path).await.unwrap();
         assert_eq!(content, "msg1\n");
+
+        handle.stop().await;
+    }
+
+    #[tokio::test]
+    async fn test_route_file_consume_all_lines() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("consume_all.log");
+        let file_path_str = file_path.to_str().unwrap().to_string();
+
+        // Write 10 lines
+        let mut content = String::new();
+        for i in 0..10 {
+            content.push_str(&format!("msg{}\n", i));
+        }
+        tokio::fs::write(&file_path, content).await.unwrap();
+
+        let input = Endpoint::new(EndpointType::File(FileConfig {
+            path: file_path_str.clone(),
+            subscribe_mode: false,
+            delete: Some(true),
+        }));
+        let output = Endpoint::new_memory("out_consume_all", 100);
+        let route = Route::new(input, output.clone());
+
+        let handle = route.run("test_route_consume_all").await.unwrap();
+
+        let channel = output.channel().unwrap();
+        // Wait for messages
+        let mut received_count = 0;
+        for _ in 0..100 {
+            received_count += channel.drain_messages().len();
+            if received_count >= 10 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert_eq!(received_count, 10);
+
+        // Verify file is empty
+        let mut content = String::new();
+        for _ in 0..40 {
+            content = tokio::fs::read_to_string(&file_path).await.unwrap();
+            if content.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert_eq!(content, "");
 
         handle.stop().await;
     }

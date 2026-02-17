@@ -995,6 +995,11 @@ pub struct HttpConfig {
     pub message_id_header: Option<String>,
     /// (Consumer only) Timeout for request-reply operations in milliseconds. Defaults to 30000ms.
     pub request_timeout_ms: Option<u64>,
+    /// (Consumer only) Internal buffer size for the channel. Defaults to 100.
+    pub internal_buffer_size: Option<usize>,
+    /// (Consumer only) If true, respond immediately with 202 Accepted without waiting for downstream processing. Defaults to false.
+    #[serde(default)]
+    pub fire_and_forget: bool,
 }
 
 // --- IBM MQ Specific Configuration ---

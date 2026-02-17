@@ -450,6 +450,131 @@ pub mod memory_subscriber_helper {
     }
 }
 
+pub mod file_helper {
+    use mq_bridge::endpoints::file::{FileConsumer, FilePublisher};
+    use mq_bridge::models::FileConfig;
+    use mq_bridge::traits::{MessageConsumer, MessagePublisher};
+    use once_cell::sync::Lazy;
+    use std::sync::Arc;
+    use std::sync::Mutex as StdMutex;
+    use tempfile::TempDir;
+    use tokio::sync::Mutex;
+
+    static TEMP_DIR: Lazy<StdMutex<Option<TempDir>>> = Lazy::new(|| StdMutex::new(None));
+    static FILE_PATH: Lazy<StdMutex<String>> = Lazy::new(|| StdMutex::new(String::new()));
+
+    pub async fn create_consumer() -> Arc<Mutex<dyn MessageConsumer>> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bench.log");
+        let path_str = path.to_str().unwrap().to_string();
+
+        {
+            let mut p_lock = FILE_PATH.lock().unwrap();
+            *p_lock = path_str.clone();
+            let mut d_lock = TEMP_DIR.lock().unwrap();
+            *d_lock = Some(dir);
+        }
+
+        let config = FileConfig {
+            path: path_str,
+            subscribe_mode: false,
+            delete: Some(true),
+        };
+        Arc::new(Mutex::new(FileConsumer::new(&config).await.unwrap()))
+    }
+
+    pub async fn create_publisher() -> Arc<dyn MessagePublisher> {
+        let path_str = {
+            let lock = FILE_PATH.lock().unwrap();
+            lock.clone()
+        };
+        let config = FileConfig {
+            path: path_str,
+            subscribe_mode: false,
+            delete: None,
+        };
+        Arc::new(FilePublisher::new(&config).await.unwrap())
+    }
+}
+
+#[cfg(feature = "http")]
+pub mod http_helper {
+    use mq_bridge::endpoints::http::{HttpConsumer, HttpPublisher};
+    use mq_bridge::endpoints::memory::MemoryConsumer;
+    use mq_bridge::models::HttpConfig;
+    use mq_bridge::traits::{MessageConsumer, MessageDisposition, MessagePublisher};
+    use once_cell::sync::Lazy;
+    use std::net::TcpListener;
+    use std::sync::Arc;
+    use std::sync::Mutex as StdMutex;
+    use tokio::sync::Mutex;
+
+    static CURRENT_URL: Lazy<StdMutex<String>> = Lazy::new(|| StdMutex::new(String::new()));
+
+    fn get_free_port() -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap().port()
+    }
+
+    pub async fn create_consumer() -> Arc<Mutex<dyn MessageConsumer>> {
+        let port = get_free_port();
+        let addr = format!("127.0.0.1:{}", port);
+        let url = format!("http://{}", addr);
+
+        {
+            let mut lock = CURRENT_URL.lock().unwrap();
+            *lock = url.clone();
+        }
+
+        let config = HttpConfig {
+            url: addr,
+            internal_buffer_size: Some(super::PERF_TEST_MESSAGE_COUNT * 2),
+            fire_and_forget: false,
+            ..Default::default()
+        };
+        let mut http_consumer = HttpConsumer::new(&config).await.unwrap();
+
+        // Create a memory consumer to act as the buffer
+        let buffer_topic = format!("http_bench_buffer_{}", fast_uuid_v7::gen_id());
+        let memory_consumer = MemoryConsumer::new_local(&buffer_topic, super::PERF_TEST_MESSAGE_COUNT * 2);
+        let memory_channel = memory_consumer.channel();
+
+        // Spawn background task to drain HTTP consumer into memory consumer
+        tokio::spawn(async move {
+            loop {
+                match http_consumer.receive_batch(100).await {
+                    Ok(batch) => {
+                        let count = batch.messages.len();
+                        if count > 0 {
+                            // Forward to memory channel
+                            if memory_channel.sender.send(batch.messages).await.is_err() {
+                                break; // Memory consumer closed
+                            }
+                            // Ack immediately to unblock HTTP response
+                            let _ = (batch.commit)(vec![MessageDisposition::Ack; count]).await;
+                        }
+                    }
+                    Err(_) => break, // HTTP consumer closed/error
+                }
+            }
+        });
+
+        Arc::new(Mutex::new(memory_consumer))
+    }
+
+    pub async fn create_publisher() -> Arc<dyn MessagePublisher> {
+        let url = {
+            let lock = CURRENT_URL.lock().unwrap();
+            lock.clone()
+        };
+        let config = HttpConfig {
+            url,
+            ..Default::default()
+        };
+        Arc::new(HttpPublisher::new(&config).await.unwrap())
+    }
+}
+
 fn performance_benchmarks(c: &mut Criterion) {
     let rt = Runtime::new().unwrap();
 
@@ -572,6 +697,24 @@ fn performance_benchmarks(c: &mut Criterion) {
     bench_backend!(
         "memory_subscriber",
         memory_subscriber_helper,
+        group,
+        &rt,
+        &BENCH_RESULTS,
+        PERF_TEST_MESSAGE_COUNT,
+        PERF_TEST_CONCURRENCY
+    );
+    bench_backend!(
+        "file",
+        file_helper,
+        group,
+        &rt,
+        &BENCH_RESULTS,
+        PERF_TEST_MESSAGE_COUNT,
+        PERF_TEST_CONCURRENCY
+    );
+    bench_backend!(
+        "http",
+        http_helper,
         group,
         &rt,
         &BENCH_RESULTS,
