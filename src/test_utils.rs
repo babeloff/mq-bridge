@@ -1057,7 +1057,7 @@ pub fn print_benchmark_results(
 
 #[macro_export]
 macro_rules! run_benchmarks {
-    ($name:literal, $group:expr, $rt:expr, $results:expr, $msg_count:expr, $concurrency:expr) => {
+    ($name:literal, $group:expr, $rt:expr, $results:expr, $msg_count:expr, $concurrency:expr, $sleep_duration:expr) => {
         $group.bench_function(concat!($name, "_single_write"), |b| {
             b.to_async($rt).iter_custom(|iters| async move {
                 let mut total = std::time::Duration::ZERO;
@@ -1075,7 +1075,7 @@ macro_rules! run_benchmarks {
                     )
                     .await;
                     total += duration;
-                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                    tokio::time::sleep($sleep_duration).await;
                     $crate::test_utils::measure_read_performance(
                         "cleanup",
                         std::sync::Arc::clone(&consumer),
@@ -1113,7 +1113,7 @@ macro_rules! run_benchmarks {
                         $concurrency,
                     )
                     .await;
-                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                    tokio::time::sleep($sleep_duration).await;
 
                     let duration = $crate::test_utils::measure_single_read_performance(
                         concat!($name, "_single_read"),
@@ -1153,7 +1153,7 @@ macro_rules! run_benchmarks {
                         $concurrency,
                     )
                     .await;
-                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                    tokio::time::sleep($sleep_duration).await;
                     total += duration;
 
                     $crate::test_utils::measure_read_performance(
@@ -1193,7 +1193,7 @@ macro_rules! run_benchmarks {
                         $concurrency,
                     )
                     .await;
-                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                    tokio::time::sleep($sleep_duration).await;
 
                     let duration = $crate::test_utils::measure_read_performance(
                         concat!($name, "_batch_read"),
@@ -1223,7 +1223,7 @@ macro_rules! run_benchmarks {
 #[macro_export]
 macro_rules! bench_backend {
     // Matches a backend that requires Docker but has no specific feature gate.
-    ("", $name:literal, $compose_file:literal, $helper:path, $group:expr, $rt:expr, $results:expr, $msg_count:expr, $concurrency:expr) => {
+    ("", $name:literal, $compose_file:literal, $helper:path, $group:expr, $rt:expr, $results:expr, $msg_count:expr, $concurrency:expr, $sleep_duration:expr) => {
         if $crate::test_utils::should_run_benchmark($name) {
             use $helper as backend;
 
@@ -1233,11 +1233,19 @@ macro_rules! bench_backend {
             _docker.down();
             _docker.up();
 
-            $crate::run_benchmarks!($name, $group, $rt, $results, $msg_count, $concurrency);
+            $crate::run_benchmarks!(
+                $name,
+                $group,
+                $rt,
+                $results,
+                $msg_count,
+                $concurrency,
+                $sleep_duration
+            );
             _docker.down();
         }
     };
-    ($feature:literal, $name:literal, $compose_file:literal, $helper:path, $group:expr, $rt:expr, $results:expr, $msg_count:expr, $concurrency:expr) => {
+    ($feature:literal, $name:literal, $compose_file:literal, $helper:path, $group:expr, $rt:expr, $results:expr, $msg_count:expr, $concurrency:expr, $sleep_duration:expr) => {
         #[cfg(feature = $feature)]
         if $crate::test_utils::should_run_benchmark($name) {
             use $helper as backend;
@@ -1248,23 +1256,47 @@ macro_rules! bench_backend {
             _docker.down();
             _docker.up();
 
-            $crate::run_benchmarks!($name, $group, $rt, $results, $msg_count, $concurrency);
+            $crate::run_benchmarks!(
+                $name,
+                $group,
+                $rt,
+                $results,
+                $msg_count,
+                $concurrency,
+                $sleep_duration
+            );
             _docker.down();
         }
     };
-    ($feature:literal, $name:literal, $helper:path, $group:expr, $rt:expr, $results:expr, $msg_count:expr, $concurrency:expr) => {
+    ($feature:literal, $name:literal, $helper:path, $group:expr, $rt:expr, $results:expr, $msg_count:expr, $concurrency:expr, $sleep_duration:expr) => {
         #[cfg(feature = $feature)]
         if $crate::test_utils::should_run_benchmark($name) {
             use $helper as backend;
             // No docker setup
-            $crate::run_benchmarks!($name, $group, $rt, $results, $msg_count, $concurrency);
+            $crate::run_benchmarks!(
+                $name,
+                $group,
+                $rt,
+                $results,
+                $msg_count,
+                $concurrency,
+                $sleep_duration
+            );
         }
     };
-    ($name:literal, $helper:path, $group:expr, $rt:expr, $results:expr, $msg_count:expr, $concurrency:expr) => {
+    ($name:literal, $helper:path, $group:expr, $rt:expr, $results:expr, $msg_count:expr, $concurrency:expr, $sleep_duration:expr) => {
         if $crate::test_utils::should_run_benchmark($name) {
             use $helper as backend;
             // No docker setup, no feature gate
-            $crate::run_benchmarks!($name, $group, $rt, $results, $msg_count, $concurrency);
+            $crate::run_benchmarks!(
+                $name,
+                $group,
+                $rt,
+                $results,
+                $msg_count,
+                $concurrency,
+                $sleep_duration
+            );
         }
     };
 }

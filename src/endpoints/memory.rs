@@ -406,10 +406,15 @@ impl MemoryConsumer {
 impl MemoryQueueConsumer {
     pub fn new(config: &MemoryConfig) -> anyhow::Result<Self> {
         let channel = get_or_create_channel(config);
+        let buffer = if let Some(capacity) = config.capacity {
+            Vec::with_capacity(capacity)
+        } else {
+            Vec::new()
+        };
         Ok(Self {
             topic: config.topic.clone(),
             receiver: channel.receiver.clone(),
-            buffer: Vec::new(),
+            buffer,
             enable_nack: config.enable_nack,
         })
     }

@@ -457,10 +457,8 @@ pub mod file_helper {
     use once_cell::sync::Lazy;
     use std::sync::Arc;
     use std::sync::Mutex as StdMutex;
-    use tempfile::TempDir;
     use tokio::sync::Mutex;
 
-    static TEMP_DIR: Lazy<StdMutex<Option<TempDir>>> = Lazy::new(|| StdMutex::new(None));
     static FILE_PATH: Lazy<StdMutex<String>> = Lazy::new(|| StdMutex::new(String::new()));
 
     pub async fn create_consumer() -> Arc<Mutex<dyn MessageConsumer>> {
@@ -471,14 +469,12 @@ pub mod file_helper {
         {
             let mut p_lock = FILE_PATH.lock().unwrap();
             *p_lock = path_str.clone();
-            let mut d_lock = TEMP_DIR.lock().unwrap();
-            *d_lock = Some(dir);
         }
 
         let config = FileConfig {
             path: path_str,
             subscribe_mode: false,
-            delete: Some(true),
+            delete: Some(false),
         };
         Arc::new(Mutex::new(FileConsumer::new(&config).await.unwrap()))
     }
@@ -536,7 +532,8 @@ pub mod http_helper {
 
         // Create a memory consumer to act as the buffer
         let buffer_topic = format!("http_bench_buffer_{}", fast_uuid_v7::gen_id());
-        let memory_consumer = MemoryConsumer::new_local(&buffer_topic, super::PERF_TEST_MESSAGE_COUNT * 2);
+        let memory_consumer =
+            MemoryConsumer::new_local(&buffer_topic, super::PERF_TEST_MESSAGE_COUNT * 2);
         let memory_channel = memory_consumer.channel();
 
         // Spawn background task to drain HTTP consumer into memory consumer
@@ -595,7 +592,8 @@ fn performance_benchmarks(c: &mut Criterion) {
         &rt,
         &BENCH_RESULTS,
         PERF_TEST_MESSAGE_COUNT,
-        PERF_TEST_CONCURRENCY
+        PERF_TEST_CONCURRENCY,
+        std::time::Duration::from_millis(100)
     );
     bench_backend!(
         "kafka",
@@ -606,7 +604,8 @@ fn performance_benchmarks(c: &mut Criterion) {
         &rt,
         &BENCH_RESULTS,
         PERF_TEST_MESSAGE_COUNT,
-        PERF_TEST_CONCURRENCY
+        PERF_TEST_CONCURRENCY,
+        std::time::Duration::from_millis(100)
     );
     bench_backend!(
         "amqp",
@@ -617,7 +616,8 @@ fn performance_benchmarks(c: &mut Criterion) {
         &rt,
         &BENCH_RESULTS,
         PERF_TEST_MESSAGE_COUNT,
-        PERF_TEST_CONCURRENCY
+        PERF_TEST_CONCURRENCY,
+        std::time::Duration::from_millis(100)
     );
     bench_backend!(
         "nats",
@@ -628,7 +628,8 @@ fn performance_benchmarks(c: &mut Criterion) {
         &rt,
         &BENCH_RESULTS,
         PERF_TEST_MESSAGE_COUNT,
-        PERF_TEST_CONCURRENCY
+        PERF_TEST_CONCURRENCY,
+        std::time::Duration::from_millis(100)
     );
     bench_backend!(
         "mongodb",
@@ -639,7 +640,8 @@ fn performance_benchmarks(c: &mut Criterion) {
         &rt,
         &BENCH_RESULTS,
         PERF_TEST_MESSAGE_COUNT,
-        PERF_TEST_CONCURRENCY
+        PERF_TEST_CONCURRENCY,
+        std::time::Duration::from_millis(100)
     );
     bench_backend!(
         "mongodb",
@@ -650,7 +652,8 @@ fn performance_benchmarks(c: &mut Criterion) {
         &rt,
         &BENCH_RESULTS,
         PERF_TEST_MESSAGE_COUNT,
-        PERF_TEST_CONCURRENCY
+        PERF_TEST_CONCURRENCY,
+        std::time::Duration::from_millis(100)
     );
     bench_backend!(
         "mqtt",
@@ -661,7 +664,8 @@ fn performance_benchmarks(c: &mut Criterion) {
         &rt,
         &BENCH_RESULTS,
         PERF_TEST_MESSAGE_COUNT,
-        PERF_TEST_CONCURRENCY
+        PERF_TEST_CONCURRENCY,
+        std::time::Duration::from_millis(100)
     );
 
     bench_backend!(
@@ -672,7 +676,8 @@ fn performance_benchmarks(c: &mut Criterion) {
         &rt,
         &BENCH_RESULTS,
         PERF_TEST_MESSAGE_COUNT,
-        PERF_TEST_CONCURRENCY
+        PERF_TEST_CONCURRENCY,
+        std::time::Duration::from_millis(10)
     );
     bench_backend!(
         "ibm-mq",
@@ -683,7 +688,8 @@ fn performance_benchmarks(c: &mut Criterion) {
         &rt,
         &BENCH_RESULTS,
         PERF_TEST_MESSAGE_COUNT,
-        PERF_TEST_CONCURRENCY
+        PERF_TEST_CONCURRENCY,
+        std::time::Duration::from_millis(100)
     );
     bench_backend!(
         "memory",
@@ -692,7 +698,8 @@ fn performance_benchmarks(c: &mut Criterion) {
         &rt,
         &BENCH_RESULTS,
         PERF_TEST_MESSAGE_COUNT,
-        PERF_TEST_CONCURRENCY
+        PERF_TEST_CONCURRENCY,
+        std::time::Duration::from_millis(1)
     );
     bench_backend!(
         "memory_subscriber",
@@ -701,7 +708,8 @@ fn performance_benchmarks(c: &mut Criterion) {
         &rt,
         &BENCH_RESULTS,
         PERF_TEST_MESSAGE_COUNT,
-        PERF_TEST_CONCURRENCY
+        PERF_TEST_CONCURRENCY,
+        std::time::Duration::from_millis(1)
     );
     bench_backend!(
         "file",
@@ -710,16 +718,19 @@ fn performance_benchmarks(c: &mut Criterion) {
         &rt,
         &BENCH_RESULTS,
         PERF_TEST_MESSAGE_COUNT,
-        PERF_TEST_CONCURRENCY
+        PERF_TEST_CONCURRENCY,
+        std::time::Duration::from_millis(1000)
     );
     bench_backend!(
+        "http",
         "http",
         http_helper,
         group,
         &rt,
         &BENCH_RESULTS,
         PERF_TEST_MESSAGE_COUNT,
-        PERF_TEST_CONCURRENCY
+        PERF_TEST_CONCURRENCY,
+        std::time::Duration::from_millis(10)
     );
 
     // Print consolidated results

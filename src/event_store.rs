@@ -183,7 +183,7 @@ impl EventStore {
             .as_millis() as u64;
 
         let count = messages.len() as u64;
-        
+
         let mut events = self.events.write().unwrap();
         let start_offset = self.next_offset.fetch_add(count, Ordering::SeqCst);
 

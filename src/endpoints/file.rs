@@ -15,6 +15,7 @@ use once_cell::sync::Lazy;
 use std::any::Any;
 use std::collections::HashMap;
 use std::io::SeekFrom;
+use std::io::{BufRead, Seek};
 use std::path::Path;
 use std::sync::{Arc, Mutex as StdMutex, Weak};
 use tokio::fs::{self, File, OpenOptions};
@@ -83,7 +84,7 @@ impl MessagePublisher for FilePublisher {
 
         trace!(count = messages.len(), path = %self.path, message_ids = ?LazyMessageIds(&messages), "Writing batch to file");
         let _file_guard = self.file_lock.lock().await;
-        
+
         // We open the file for every batch to ensure we are writing to the current file path.
         // This handles external file rotation/deletion (e.g. by the consumer in delete mode)
         // where the old file handle would point to a deleted inode.
@@ -94,7 +95,7 @@ impl MessagePublisher for FilePublisher {
             .open(&self.path)
             .await
             .context("Failed to open file for writing batch")?;
-            
+
         let mut writer = BufWriter::new(file);
         let mut failed_messages = Vec::new();
 
@@ -156,7 +157,6 @@ static FILE_EVENT_STORES: Lazy<Mutex<HashMap<String, Weak<EventStore>>>> =
 
 struct FileFeedState {
     /// For Consume mode: number of lines currently buffered in EventStore.
-    /// We skip this many lines from the start of the file when reading.
     lines_in_memory: usize,
     /// For Subscribe mode: the file offset (bytes) where we stopped reading.
     last_position: u64,
@@ -202,23 +202,21 @@ async fn create_file_event_store(config: &FileConfig) -> anyhow::Result<Arc<Even
             let path = path_clone.clone();
             let file_op_lock = file_op_lock_clone.clone();
 
-            // Spawn a task to rewrite the file, removing the dropped lines.
-            // We use the mutex to ensure we don't race with the reader or other drops.
             tokio::spawn(async move {
+                {
+                    let mut s = state.lock().await;
+                    s.lines_in_memory = s.lines_in_memory.saturating_sub(count);
+                }
+
                 // Serialize file operations to prevent race conditions between multiple GCs
                 let _guard = file_op_lock.lock().await;
 
                 if let Err(e) = remove_lines_from_file(&path, count).await {
                     tracing::error!("Failed to remove lines from file {}: {}", path, e);
+                    // Note: In this simplified model, if deletion fails, lines_in_memory
+                    // might become out of sync, leading to reprocessing on restart.
                 } else {
-                    let mut state = state.lock().await;
-                    state.lines_in_memory = state.lines_in_memory.saturating_sub(count);
-                    trace!(
-                        "Removed {} lines from {}, remaining in memory: {}",
-                        count,
-                        path,
-                        state.lines_in_memory
-                    );
+                    trace!("Removed {} lines from {}", count, path);
                 }
             });
         }),
@@ -231,6 +229,9 @@ async fn create_file_event_store(config: &FileConfig) -> anyhow::Result<Arc<Even
     let file_op_lock_clone = file_op_lock.clone();
 
     tokio::spawn(async move {
+        let mut current_sleep = std::time::Duration::from_millis(1);
+        const MAX_SLEEP: std::time::Duration = std::time::Duration::from_millis(100);
+
         loop {
             // Check if the store is still alive
             let store_clone = match store_weak.upgrade() {
@@ -239,7 +240,11 @@ async fn create_file_event_store(config: &FileConfig) -> anyhow::Result<Arc<Even
             };
 
             // Acquire file op lock first to coordinate with GC
-            let _file_guard = file_op_lock_clone.lock().await;
+            let file_guard = if should_delete {
+                Some(file_op_lock_clone.lock().await)
+            } else {
+                None
+            };
 
             let mut state = feed_state_clone.lock().await;
 
@@ -250,7 +255,7 @@ async fn create_file_event_store(config: &FileConfig) -> anyhow::Result<Arc<Even
                 Err(e) => {
                     tracing::error!("Failed to open file {}: {}", path_clone, e);
                     drop(state);
-                    drop(_file_guard);
+                    drop(file_guard);
                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                     continue;
                 }
@@ -278,7 +283,8 @@ async fn create_file_event_store(config: &FileConfig) -> anyhow::Result<Arc<Even
                 let mut reader = BufReader::new(file);
                 let mut lines_skipped = 0;
                 let mut error = false;
-                while lines_skipped < state.lines_in_memory {
+                let lines_to_skip = state.lines_in_memory;
+                while lines_skipped < lines_to_skip {
                     let mut buf = Vec::new();
                     match reader.read_until(b'\n', &mut buf).await {
                         Ok(0) => break, // EOF
@@ -292,16 +298,21 @@ async fn create_file_event_store(config: &FileConfig) -> anyhow::Result<Arc<Even
                 }
                 if error {
                     drop(state);
-                    drop(_file_guard);
+                    drop(file_guard);
                     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                     continue;
                 }
                 file = reader.into_inner();
             }
 
+            // Release file op lock to allow publisher to write while we read
+            drop(file_guard);
+
             // Read new lines
             let mut reader = BufReader::new(file);
             let mut lines_read = 0;
+            let mut batch = Vec::with_capacity(128);
+
             loop {
                 let mut buffer = Vec::new();
                 match reader.read_until(b'\n', &mut buffer).await {
@@ -310,14 +321,19 @@ async fn create_file_event_store(config: &FileConfig) -> anyhow::Result<Arc<Even
                         if buffer.ends_with(b"\n") {
                             buffer.pop();
                         }
-                        let msg = parse_message(buffer);
-                        store_clone.append(msg).await;
+                        let msg = parse_message(&buffer);
+                        batch.push(msg);
                         lines_read += 1;
 
                         if !should_delete {
                             state.last_position += n as u64;
                         } else {
                             state.lines_in_memory += 1;
+                        }
+
+                        if batch.len() >= 128 {
+                            store_clone.append_batch(std::mem::take(&mut batch)).await;
+                            batch.reserve(128);
                         }
                     }
                     Err(e) => {
@@ -327,12 +343,16 @@ async fn create_file_event_store(config: &FileConfig) -> anyhow::Result<Arc<Even
                 }
             }
 
+            if !batch.is_empty() {
+                store_clone.append_batch(batch).await;
+            }
+
             drop(state); // Release lock before sleeping
-            drop(_file_guard);
 
             // If we didn't read anything, sleep a bit (polling)
             if lines_read == 0 {
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                tokio::time::sleep(current_sleep).await;
+                current_sleep = std::cmp::min(current_sleep * 2, MAX_SLEEP);
             }
         }
     });
@@ -381,50 +401,188 @@ async fn remove_lines_from_file(path: &str, count: usize) -> anyhow::Result<()> 
     Ok(())
 }
 
+struct FileTailConsumer {
+    msg_rx: async_channel::Receiver<Vec<CanonicalMessage>>,
+    buffer: Vec<CanonicalMessage>,
+}
+
+fn run_file_tail_task_sync(path: String, msg_tx: async_channel::Sender<Vec<CanonicalMessage>>) {
+    let mut last_position: u64 = 0;
+    let mut reader: Option<std::io::BufReader<std::fs::File>> = None;
+    let mut current_sleep = std::time::Duration::from_millis(1);
+    const MAX_SLEEP: std::time::Duration = std::time::Duration::from_millis(50);
+    const BATCH_SIZE: usize = 1024;
+    let mut buf = Vec::with_capacity(1024);
+
+    loop {
+        if reader.is_none() {
+            let mut file = match std::fs::OpenOptions::new().read(true).open(&path) {
+                Ok(f) => f,
+                Err(e) => {
+                    tracing::error!("Failed to open {}: {}", path, e);
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                    continue;
+                }
+            };
+
+            if let Ok(metadata) = file.metadata() {
+                if metadata.len() < last_position {
+                    tracing::warn!("File {} was truncated. Resetting position to 0.", path);
+                    last_position = 0;
+                }
+            }
+
+            if let Err(e) = file.seek(std::io::SeekFrom::Start(last_position)) {
+                tracing::error!("Failed to seek in {}: {}", path, e);
+                last_position = 0; // Reset on seek failure
+            }
+
+            reader = Some(std::io::BufReader::with_capacity(128 * BATCH_SIZE, file));
+        }
+
+        let mut batch = Vec::with_capacity(BATCH_SIZE);
+        let mut lines_read_in_batch = 0;
+
+        if let Some(r) = reader.as_mut() {
+            for _ in 0..BATCH_SIZE {
+                buf.clear();
+                match r.read_until(b'\n', &mut buf) {
+                    Ok(0) => break, // EOF
+                    Ok(n) => {
+                        last_position += n as u64;
+                        if buf.ends_with(b"\n") {
+                            buf.pop();
+                        }
+                        if buf.ends_with(b"\r") {
+                            buf.pop();
+                        }
+                        batch.push(parse_message(&buf));
+                        lines_read_in_batch += 1;
+                    }
+                    Err(e) => {
+                        tracing::error!("Error reading {}: {}", path, e);
+                        reader = None; // Force reopen on next loop
+                        break;
+                    }
+                }
+            }
+        }
+
+        if !batch.is_empty() {
+            if msg_tx.send_blocking(batch).is_err() {
+                break; // Consumer dropped, exit thread
+            }
+            current_sleep = std::time::Duration::from_millis(1);
+        }
+
+        if lines_read_in_batch == 0 {
+            // EOF reached, sleep
+            std::thread::sleep(current_sleep);
+            current_sleep = std::cmp::min(current_sleep * 2, MAX_SLEEP);
+            // Invalidate reader to check for file changes (like rotation) on next poll
+            reader = None;
+        }
+    }
+}
+
+enum ConsumerBackend {
+    EventStore(EventStoreConsumer),
+    Tail(FileTailConsumer),
+}
+
 /// A consumer that reads messages from a file and removes them upon commit.
 pub struct FileConsumer {
-    inner: EventStoreConsumer,
+    backend: ConsumerBackend,
 }
 
 impl FileConsumer {
     pub async fn new(config: &FileConfig) -> anyhow::Result<Self> {
         let should_delete = config.delete.unwrap_or(!config.subscribe_mode);
-        let key = format!(
-            "{}|{}|{}",
-            config.path, config.subscribe_mode, should_delete
-        );
-        let store = if let Some(store) = {
-            let mut stores = FILE_EVENT_STORES.lock().await;
-            stores.retain(|_, v| v.strong_count() > 0);
-            stores.get(&key).and_then(|w| w.upgrade())
-        } {
-            store
+
+        if !config.subscribe_mode && !should_delete {
+            let (msg_tx, msg_rx) = async_channel::bounded(100);
+            let path = config.path.clone();
+
+            std::thread::spawn(move || {
+                run_file_tail_task_sync(path, msg_tx);
+            });
+
+            info!(path = %config.path, mode = "consume (no-delete, optimized)", "File consumer connected");
+
+            Ok(Self {
+                backend: ConsumerBackend::Tail(FileTailConsumer {
+                    msg_rx,
+                    buffer: Vec::new(),
+                }),
+            })
         } else {
-            let created = create_file_event_store(config).await?;
-            let mut stores = FILE_EVENT_STORES.lock().await;
-            let store = stores
-                .get(&key)
-                .and_then(|w| w.upgrade())
-                .unwrap_or_else(|| {
-                    stores.insert(key.clone(), Arc::downgrade(&created));
-                    created
-                });
-            store
-        };
+            let key = format!(
+                "{}|{}|{}",
+                config.path, config.subscribe_mode, should_delete
+            );
 
-        let subscriber_id = format!("file-sub-{}", fast_uuid_v7::gen_id_str());
-        info!(path = %config.path, mode = ?if config.subscribe_mode { "subscribe" } else { "consume" }, subscriber_id = %subscriber_id, "File consumer connected");
+            let store = if let Some(store) = {
+                let mut stores = FILE_EVENT_STORES.lock().await;
+                stores.retain(|_, v| v.strong_count() > 0);
+                stores.get(&key).and_then(|w| w.upgrade())
+            } {
+                store
+            } else {
+                let created = create_file_event_store(config).await?;
+                let mut stores = FILE_EVENT_STORES.lock().await;
+                let store = stores
+                    .get(&key)
+                    .and_then(|w| w.upgrade())
+                    .unwrap_or_else(|| {
+                        stores.insert(key.clone(), Arc::downgrade(&created));
+                        created
+                    });
+                store
+            };
 
-        Ok(Self {
-            inner: store.consumer(subscriber_id),
-        })
+            let subscriber_id = format!("file-sub-{}", fast_uuid_v7::gen_id_str());
+            info!(path = %config.path, mode = ?if config.subscribe_mode { "subscribe" } else { "consume" }, subscriber_id = %subscriber_id, "File consumer connected");
+
+            Ok(Self {
+                backend: ConsumerBackend::EventStore(store.consumer(subscriber_id)),
+            })
+        }
     }
 }
 
 #[async_trait]
 impl MessageConsumer for FileConsumer {
     async fn receive_batch(&mut self, max_messages: usize) -> Result<ReceivedBatch, ConsumerError> {
-        self.inner.receive_batch(max_messages).await
+        match &mut self.backend {
+            ConsumerBackend::EventStore(c) => c.receive_batch(max_messages).await,
+            ConsumerBackend::Tail(c) => {
+                if c.buffer.is_empty() {
+                    match c.msg_rx.recv().await {
+                        Ok(batch) => c.buffer = batch,
+                        Err(_) => return Err(ConsumerError::EndOfStream),
+                    }
+                }
+
+                // Greedily fill buffer from channel if more messages are available
+                while c.buffer.len() < max_messages {
+                    match c.msg_rx.try_recv() {
+                        Ok(mut next_batch) => c.buffer.append(&mut next_batch),
+                        Err(_) => break, // Channel is empty or disconnected
+                    }
+                }
+
+                let count = std::cmp::min(c.buffer.len(), max_messages);
+                let messages: Vec<_> = c.buffer.drain(0..count).collect();
+
+                // No-op commit since we are not deleting
+                let commit = Box::new(|_dispositions: Vec<crate::traits::MessageDisposition>| {
+                    Box::pin(async move { Ok(()) })
+                        as crate::traits::BoxFuture<'static, anyhow::Result<()>>
+                });
+
+                Ok(ReceivedBatch { messages, commit })
+            }
+        }
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -432,11 +590,11 @@ impl MessageConsumer for FileConsumer {
     }
 }
 
-fn parse_message(buffer: Vec<u8>) -> CanonicalMessage {
-    match serde_json::from_slice::<CanonicalMessage>(&buffer) {
+fn parse_message(buffer: &[u8]) -> CanonicalMessage {
+    match serde_json::from_slice::<CanonicalMessage>(buffer) {
         Ok(msg) => msg,
         Err(_) => {
-            let mut msg = CanonicalMessage::new(buffer, None);
+            let mut msg = CanonicalMessage::new(buffer.to_vec(), None);
             msg.metadata
                 .insert("mq_bridge.original_format".to_string(), "raw".to_string());
             msg
@@ -844,7 +1002,10 @@ mod tests {
         let output = Endpoint::new_memory("out_consume_explicit_delete", 10);
         let route = Route::new(input, output.clone());
 
-        let handle = route.run("test_route_consume_explicit_delete").await.unwrap();
+        let handle = route
+            .run("test_route_consume_explicit_delete")
+            .await
+            .unwrap();
 
         let channel = output.channel().unwrap();
         // Wait for message
