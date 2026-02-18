@@ -493,6 +493,49 @@ pub mod file_helper {
     }
 }
 
+pub mod file_delete_helper {
+    use mq_bridge::endpoints::file::{FileConsumer, FilePublisher};
+    use mq_bridge::models::FileConfig;
+    use mq_bridge::traits::{MessageConsumer, MessagePublisher};
+    use once_cell::sync::Lazy;
+    use std::sync::Arc;
+    use std::sync::Mutex as StdMutex;
+    use tokio::sync::Mutex;
+
+    static FILE_PATH: Lazy<StdMutex<String>> = Lazy::new(|| StdMutex::new(String::new()));
+
+    pub async fn create_consumer() -> Arc<Mutex<dyn MessageConsumer>> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bench_delete.log");
+        let path_str = path.to_str().unwrap().to_string();
+
+        {
+            let mut p_lock = FILE_PATH.lock().unwrap();
+            *p_lock = path_str.clone();
+        }
+
+        let config = FileConfig {
+            path: path_str,
+            subscribe_mode: false,
+            delete: Some(true),
+        };
+        Arc::new(Mutex::new(FileConsumer::new(&config).await.unwrap()))
+    }
+
+    pub async fn create_publisher() -> Arc<dyn MessagePublisher> {
+        let path_str = {
+            let lock = FILE_PATH.lock().unwrap();
+            lock.clone()
+        };
+        let config = FileConfig {
+            path: path_str,
+            subscribe_mode: false,
+            delete: None,
+        };
+        Arc::new(FilePublisher::new(&config).await.unwrap())
+    }
+}
+
 #[cfg(feature = "http")]
 pub mod http_helper {
     use mq_bridge::endpoints::http::{HttpConsumer, HttpPublisher};
@@ -710,6 +753,16 @@ fn performance_benchmarks(c: &mut Criterion) {
         PERF_TEST_MESSAGE_COUNT,
         PERF_TEST_CONCURRENCY,
         std::time::Duration::from_millis(1)
+    );
+    bench_backend!(
+        "file_delete",
+        file_delete_helper,
+        group,
+        &rt,
+        &BENCH_RESULTS,
+        PERF_TEST_MESSAGE_COUNT,
+        PERF_TEST_CONCURRENCY,
+        std::time::Duration::from_millis(1000)
     );
     bench_backend!(
         "file",

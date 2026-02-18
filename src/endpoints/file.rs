@@ -23,6 +23,7 @@ use tokio::io::{self, AsyncBufReadExt, AsyncSeekExt, BufReader};
 use tokio::io::{AsyncWriteExt, BufWriter};
 use tokio::sync::Mutex;
 use tracing::{info, instrument, trace};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// A sink that writes messages to a file, one per line.
 static FILE_LOCKS: Lazy<StdMutex<HashMap<String, Arc<Mutex<()>>>>> =
@@ -406,13 +407,18 @@ struct FileTailConsumer {
     buffer: Vec<CanonicalMessage>,
 }
 
-fn run_file_tail_task_sync(path: String, msg_tx: async_channel::Sender<Vec<CanonicalMessage>>) {
+fn run_file_tail_task_sync(
+    path: String,
+    msg_tx: async_channel::Sender<Vec<CanonicalMessage>>,
+    start_at_end: bool,
+) {
     let mut last_position: u64 = 0;
     let mut reader: Option<std::io::BufReader<std::fs::File>> = None;
     let mut current_sleep = std::time::Duration::from_millis(1);
     const MAX_SLEEP: std::time::Duration = std::time::Duration::from_millis(50);
     const BATCH_SIZE: usize = 1024;
     let mut buf = Vec::with_capacity(1024);
+    let mut initialized = false;
 
     loop {
         if reader.is_none() {
@@ -424,6 +430,15 @@ fn run_file_tail_task_sync(path: String, msg_tx: async_channel::Sender<Vec<Canon
                     continue;
                 }
             };
+
+            if !initialized {
+                if start_at_end {
+                    if let Ok(metadata) = file.metadata() {
+                        last_position = metadata.len();
+                    }
+                }
+                initialized = true;
+            }
 
             if let Ok(metadata) = file.metadata() {
                 if metadata.len() < last_position {
@@ -485,9 +500,88 @@ fn run_file_tail_task_sync(path: String, msg_tx: async_channel::Sender<Vec<Canon
     }
 }
 
+struct FileQueueConsumer {
+    msg_rx: async_channel::Receiver<Vec<CanonicalMessage>>,
+    lines_in_memory: Arc<AtomicUsize>,
+    path: String,
+    file_lock: Arc<Mutex<()>>,
+    buffer: Vec<CanonicalMessage>,
+}
+
+fn run_file_queue_task(
+    path: String,
+    msg_tx: async_channel::Sender<Vec<CanonicalMessage>>,
+    lines_in_memory: Arc<AtomicUsize>,
+    file_lock: Arc<Mutex<()>>,
+    runtime_handle: tokio::runtime::Handle,
+) {
+    let mut current_sleep = std::time::Duration::from_millis(1);
+    const MAX_SLEEP: std::time::Duration = std::time::Duration::from_millis(100);
+
+    loop {
+        let _guard = runtime_handle.block_on(file_lock.lock());
+        let skip_count = lines_in_memory.load(Ordering::SeqCst);
+
+        let file = match std::fs::OpenOptions::new().read(true).open(&path) {
+            Ok(f) => f,
+            Err(e) => {
+                tracing::error!("Failed to open {}: {}", path, e);
+                drop(_guard);
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                continue;
+            }
+        };
+
+        let mut reader = std::io::BufReader::new(file);
+        let mut skipped = 0;
+        let mut buf = Vec::new();
+
+        while skipped < skip_count {
+            buf.clear();
+            if reader.read_until(b'\n', &mut buf).unwrap_or(0) == 0 {
+                break;
+            }
+            skipped += 1;
+        }
+
+        let mut batch = Vec::with_capacity(128);
+        let mut lines_read = 0;
+
+        for _ in 0..128 {
+            buf.clear();
+            match reader.read_until(b'\n', &mut buf) {
+                Ok(0) => break,
+                Ok(_) => {
+                    if buf.ends_with(b"\n") {
+                        buf.pop();
+                    }
+                    if buf.ends_with(b"\r") {
+                        buf.pop();
+                    }
+                    batch.push(parse_message(&buf));
+                    lines_read += 1;
+                }
+                Err(_) => break,
+            }
+        }
+
+        if lines_read > 0 {
+            lines_in_memory.fetch_add(lines_read, Ordering::SeqCst);
+            if msg_tx.send_blocking(batch).is_err() {
+                break;
+            }
+            current_sleep = std::time::Duration::from_millis(1);
+        } else {
+            std::thread::sleep(current_sleep);
+            current_sleep = std::cmp::min(current_sleep * 2, MAX_SLEEP);
+        }
+    }
+}
+
 enum ConsumerBackend {
     EventStore(EventStoreConsumer),
     Tail(FileTailConsumer),
+    Queue(FileQueueConsumer),
 }
 
 /// A consumer that reads messages from a file and removes them upon commit.
@@ -499,19 +593,43 @@ impl FileConsumer {
     pub async fn new(config: &FileConfig) -> anyhow::Result<Self> {
         let should_delete = config.delete.unwrap_or(!config.subscribe_mode);
 
-        if !config.subscribe_mode && !should_delete {
+        if !should_delete {
             let (msg_tx, msg_rx) = async_channel::bounded(100);
             let path = config.path.clone();
+            let start_at_end = config.subscribe_mode;
 
             std::thread::spawn(move || {
-                run_file_tail_task_sync(path, msg_tx);
+                run_file_tail_task_sync(path, msg_tx, start_at_end);
             });
 
-            info!(path = %config.path, mode = "consume (no-delete, optimized)", "File consumer connected");
+            info!(path = %config.path, mode = "tail (no-delete, optimized)", "File consumer connected");
 
             Ok(Self {
                 backend: ConsumerBackend::Tail(FileTailConsumer {
                     msg_rx,
+                    buffer: Vec::new(),
+                }),
+            })
+        } else if !config.subscribe_mode {
+            let (msg_tx, msg_rx) = async_channel::bounded(100);
+            let path = config.path.clone();
+            let file_lock = get_file_lock(&path);
+            let lines_in_memory = Arc::new(AtomicUsize::new(0));
+            let lines_clone = lines_in_memory.clone();
+            let lock_clone = file_lock.clone();
+            let runtime = tokio::runtime::Handle::current();
+
+            std::thread::spawn(move || {
+                run_file_queue_task(path, msg_tx, lines_clone, lock_clone, runtime);
+            });
+
+            info!(path = %config.path, mode = "queue (delete, optimized)", "File consumer connected");
+            Ok(Self {
+                backend: ConsumerBackend::Queue(FileQueueConsumer {
+                    msg_rx,
+                    lines_in_memory,
+                    path: config.path.clone(),
+                    file_lock,
                     buffer: Vec::new(),
                 }),
             })
@@ -581,6 +699,51 @@ impl MessageConsumer for FileConsumer {
                 });
 
                 Ok(ReceivedBatch { messages, commit })
+            }
+            ConsumerBackend::Queue(c) => {
+                if c.buffer.is_empty() {
+                    match c.msg_rx.recv().await {
+                        Ok(b) => c.buffer = b,
+                        Err(_) => return Err(ConsumerError::EndOfStream),
+                    }
+                }
+
+                while c.buffer.len() < max_messages {
+                    match c.msg_rx.try_recv() {
+                        Ok(mut b) => c.buffer.append(&mut b),
+                        Err(_) => break,
+                    }
+                }
+
+                let count = std::cmp::min(c.buffer.len(), max_messages);
+                let batch: Vec<_> = c.buffer.drain(0..count).collect();
+
+                let path = c.path.clone();
+                let lock = c.file_lock.clone();
+                let lines_mem = c.lines_in_memory.clone();
+
+                let commit = Box::new(move |dispositions: Vec<crate::traits::MessageDisposition>| {
+                    Box::pin(async move {
+                        let acked = dispositions
+                            .iter()
+                            .take_while(|d| matches!(d, crate::traits::MessageDisposition::Ack | crate::traits::MessageDisposition::Reply(_)))
+                            .count();
+
+                        if acked > 0 {
+                            let _guard = lock.lock().await;
+                            if let Err(e) = remove_lines_from_file(&path, acked).await {
+                                tracing::error!("Failed to remove lines from {}: {}", path, e);
+                            }
+                        }
+                        lines_mem.fetch_sub(count, Ordering::SeqCst);
+                        Ok(())
+                    }) as crate::traits::BoxFuture<'static, anyhow::Result<()>>
+                });
+
+                Ok(ReceivedBatch {
+                    messages: batch,
+                    commit,
+                })
             }
         }
     }
