@@ -280,7 +280,12 @@ fn make_response(disposition: MessageDisposition) -> HttpResponse {
                 .keys()
                 .any(|k| k.eq_ignore_ascii_case("content-type"));
             if !has_content_type {
-                builder.content_type("application/octet-stream");
+                if status == actix_web::http::StatusCode::OK {
+                    builder.content_type("application/octet-stream");
+                }
+                else {
+                    builder.content_type("text/plain; charset=UTF-8");
+                }
             }
             builder.body(msg.payload)
         }
