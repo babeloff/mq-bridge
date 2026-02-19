@@ -204,13 +204,13 @@ async fn create_file_event_store(config: &FileConfig) -> anyhow::Result<Arc<Even
             let file_op_lock = file_op_lock_clone.clone();
 
             tokio::spawn(async move {
+                // Serialize file operations to prevent race conditions between multiple GCs
+                let _guard = file_op_lock.lock().await;
+
                 {
                     let mut s = state.lock().await;
                     s.lines_in_memory = s.lines_in_memory.saturating_sub(count);
                 }
-
-                // Serialize file operations to prevent race conditions between multiple GCs
-                let _guard = file_op_lock.lock().await;
 
                 if let Err(e) = remove_lines_from_file(&path, count).await {
                     tracing::error!("Failed to remove lines from file {}: {}", path, e);
@@ -455,6 +455,11 @@ fn run_file_tail_task_sync(
             if let Err(e) = file.seek(std::io::SeekFrom::Start(last_position)) {
                 tracing::error!("Failed to seek in {}: {}", path, e);
                 last_position = 0; // Reset on seek failure
+                if let Err(e) = file.seek(std::io::SeekFrom::Start(0)) {
+                    tracing::error!("Failed to reset seek to 0 in {}: {}", path, e);
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                    continue;
+                }
             }
 
             reader = Some(std::io::BufReader::with_capacity(128 * BATCH_SIZE, file));
@@ -544,30 +549,38 @@ fn run_file_queue_task(
 
             let mut reader = std::io::BufReader::new(file);
             let mut skipped = 0;
+            let mut error = false;
 
             while skipped < skip_count {
                 buf.clear();
-                if reader.read_until(b'\n', &mut buf).unwrap_or(0) == 0 {
-                    break;
-                }
-                skipped += 1;
-            }
-
-            for _ in 0..128 {
-                buf.clear();
                 match reader.read_until(b'\n', &mut buf) {
                     Ok(0) => break,
-                    Ok(_) => {
-                        if buf.ends_with(b"\n") {
-                            buf.pop();
-                        }
-                        if buf.ends_with(b"\r") {
-                            buf.pop();
-                        }
-                        batch.push(parse_message(&buf));
-                        lines_read += 1;
+                    Ok(_) => skipped += 1,
+                    Err(e) => {
+                        tracing::error!("Error skipping lines in {}: {}", path, e);
+                        error = true;
+                        break;
                     }
-                    Err(_) => break,
+                }
+            }
+
+            if !error {
+                for _ in 0..128 {
+                    buf.clear();
+                    match reader.read_until(b'\n', &mut buf) {
+                        Ok(0) => break,
+                        Ok(_) => {
+                            if buf.ends_with(b"\n") {
+                                buf.pop();
+                            }
+                            if buf.ends_with(b"\r") {
+                                buf.pop();
+                            }
+                            batch.push(parse_message(&buf));
+                            lines_read += 1;
+                        }
+                        Err(_) => break,
+                    }
                 }
             }
         }
@@ -708,13 +721,17 @@ impl MessageConsumer for FileConsumer {
                 Ok(ReceivedBatch { messages, commit })
             }
             ConsumerBackend::Queue(c) => {
-                let mut buffer = c.buffer.lock().await;
-                if buffer.is_empty() {
-                    match c.msg_rx.recv().await {
-                        Ok(b) => *buffer = b,
-                        Err(_) => return Err(ConsumerError::EndOfStream),
+                {
+                    let buffer = c.buffer.lock().await;
+                    if buffer.is_empty() {
+                        drop(buffer);
+                        match c.msg_rx.recv().await {
+                            Ok(b) => c.buffer.lock().await.extend(b),
+                            Err(_) => return Err(ConsumerError::EndOfStream),
+                        }
                     }
                 }
+                let mut buffer = c.buffer.lock().await;
 
                 while buffer.len() < max_messages {
                     match c.msg_rx.try_recv() {
@@ -736,16 +753,20 @@ impl MessageConsumer for FileConsumer {
                 let commit = Box::new(
                     move |dispositions: Vec<crate::traits::MessageDisposition>| {
                         Box::pin(async move {
-                            let mut acked = 0;
+                            let mut leading_acks = 0;
                             let mut nacked_msgs = Vec::new();
+                            let mut encountered_nack = false;
 
                             for (i, d) in dispositions.iter().enumerate() {
                                 match d {
                                     crate::traits::MessageDisposition::Ack
                                     | crate::traits::MessageDisposition::Reply(_) => {
-                                        acked += 1;
+                                        if !encountered_nack {
+                                            leading_acks += 1;
+                                        }
                                     }
                                     crate::traits::MessageDisposition::Nack => {
+                                        encountered_nack = true;
                                         if let Some(msg) = batch_for_commit.get(i) {
                                             nacked_msgs.push(msg.clone());
                                         }
@@ -755,18 +776,18 @@ impl MessageConsumer for FileConsumer {
 
                             if !nacked_msgs.is_empty() {
                                 let mut buf = buffer_clone.lock().await;
-                                // Re-insert nacked messages at the front
-                                for msg in nacked_msgs.into_iter().rev() {
-                                    buf.insert(0, msg);
-                                }
+                                let old_buf = std::mem::take(&mut *buf);
+                                let mut new_buf = nacked_msgs;
+                                new_buf.extend(old_buf);
+                                *buf = new_buf;
                             }
 
-                            if acked > 0 {
+                            if leading_acks > 0 {
                                 let _guard = lock.lock().await;
-                                if let Err(e) = remove_lines_from_file(&path, acked).await {
+                                if let Err(e) = remove_lines_from_file(&path, leading_acks).await {
                                     tracing::error!("Failed to remove lines from {}: {}", path, e);
                                 }
-                                lines_mem.fetch_sub(acked, Ordering::SeqCst);
+                                lines_mem.fetch_sub(leading_acks, Ordering::SeqCst);
                             }
                             Ok(())
                         })
