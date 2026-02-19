@@ -308,7 +308,9 @@ impl HttpPublisher {
             client_builder = client_builder.identity(identity);
         }
 
-        let url = if config.url.starts_with("http://") || config.url.starts_with("https://") {
+        let url = if config.url.to_lowercase().starts_with("http://")
+            || config.url.to_lowercase().starts_with("https://")
+        {
             config.url.clone()
         } else {
             let scheme = if config.tls.required { "https" } else { "http" };
