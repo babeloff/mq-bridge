@@ -17,13 +17,13 @@ use std::collections::HashMap;
 use std::io::SeekFrom;
 use std::io::{BufRead, Seek};
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, Weak};
 use tokio::fs::{self, File, OpenOptions};
 use tokio::io::{self, AsyncBufReadExt, AsyncSeekExt, BufReader};
 use tokio::io::{AsyncWriteExt, BufWriter};
 use tokio::sync::Mutex;
 use tracing::{info, instrument, trace};
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// A sink that writes messages to a file, one per line.
 static FILE_LOCKS: Lazy<StdMutex<HashMap<String, Arc<Mutex<()>>>>> =
@@ -722,23 +722,32 @@ impl MessageConsumer for FileConsumer {
                 let lock = c.file_lock.clone();
                 let lines_mem = c.lines_in_memory.clone();
 
-                let commit = Box::new(move |dispositions: Vec<crate::traits::MessageDisposition>| {
-                    Box::pin(async move {
-                        let acked = dispositions
-                            .iter()
-                            .take_while(|d| matches!(d, crate::traits::MessageDisposition::Ack | crate::traits::MessageDisposition::Reply(_)))
-                            .count();
+                let commit = Box::new(
+                    move |dispositions: Vec<crate::traits::MessageDisposition>| {
+                        Box::pin(async move {
+                            let acked = dispositions
+                                .iter()
+                                .take_while(|d| {
+                                    matches!(
+                                        d,
+                                        crate::traits::MessageDisposition::Ack
+                                            | crate::traits::MessageDisposition::Reply(_)
+                                    )
+                                })
+                                .count();
 
-                        if acked > 0 {
-                            let _guard = lock.lock().await;
-                            if let Err(e) = remove_lines_from_file(&path, acked).await {
-                                tracing::error!("Failed to remove lines from {}: {}", path, e);
+                            if acked > 0 {
+                                let _guard = lock.lock().await;
+                                if let Err(e) = remove_lines_from_file(&path, acked).await {
+                                    tracing::error!("Failed to remove lines from {}: {}", path, e);
+                                }
                             }
-                        }
-                        lines_mem.fetch_sub(count, Ordering::SeqCst);
-                        Ok(())
-                    }) as crate::traits::BoxFuture<'static, anyhow::Result<()>>
-                });
+                            lines_mem.fetch_sub(count, Ordering::SeqCst);
+                            Ok(())
+                        })
+                            as crate::traits::BoxFuture<'static, anyhow::Result<()>>
+                    },
+                );
 
                 Ok(ReceivedBatch {
                     messages: batch,
