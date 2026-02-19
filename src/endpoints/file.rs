@@ -125,8 +125,7 @@ impl MessagePublisher for FilePublisher {
                 failed_messages.push((msg, PublisherError::NonRetryable(anyhow::anyhow!(e))));
             } else if let Err(e) = writer.write_all(b"\n").await {
                 tracing::error!("Failed to write newline to file: {}", e);
-                // If write fails, add the message to the failed list
-                failed_messages.push((msg, PublisherError::NonRetryable(anyhow::anyhow!(e))));
+                return Err(PublisherError::NonRetryable(anyhow::anyhow!(e)));
             }
         }
 
@@ -527,11 +526,12 @@ fn run_file_queue_task(
 ) {
     let mut current_sleep = std::time::Duration::from_millis(1);
     const MAX_SLEEP: std::time::Duration = std::time::Duration::from_millis(100);
+    let mut buf = Vec::new();
 
     loop {
+        buf.clear();
         let mut batch = Vec::with_capacity(128);
         let mut lines_read = 0;
-        let mut buf = Vec::new();
 
         {
             let _guard = runtime_handle.block_on(file_lock.lock());
@@ -758,12 +758,16 @@ impl MessageConsumer for FileConsumer {
                             let mut encountered_nack = false;
 
                             for (i, d) in dispositions.iter().enumerate() {
+                                if encountered_nack {
+                                    if let Some(msg) = batch_for_commit.get(i) {
+                                        nacked_msgs.push(msg.clone());
+                                    }
+                                    continue;
+                                }
                                 match d {
                                     crate::traits::MessageDisposition::Ack
                                     | crate::traits::MessageDisposition::Reply(_) => {
-                                        if !encountered_nack {
-                                            leading_acks += 1;
-                                        }
+                                        leading_acks += 1;
                                     }
                                     crate::traits::MessageDisposition::Nack => {
                                         encountered_nack = true;

@@ -263,8 +263,15 @@ async fn handle_request(
 #[cfg(feature = "actix-web")]
 fn make_response(disposition: MessageDisposition) -> HttpResponse {
     match disposition {
-        MessageDisposition::Reply(msg) => {
-            let mut builder = HttpResponse::Ok();
+        MessageDisposition::Reply(mut msg) => {
+            let status = msg
+                .metadata
+                .remove("http_status_code")
+                .and_then(|s| s.parse::<u16>().ok())
+                .and_then(|code| actix_web::http::StatusCode::from_u16(code).ok())
+                .unwrap_or(actix_web::http::StatusCode::OK);
+
+            let mut builder = HttpResponse::build(status);
             for (key, value) in &msg.metadata {
                 builder.insert_header((key.as_str(), value.as_str()));
             }
@@ -694,6 +701,56 @@ http_route:
 
         assert_eq!(resp.status(), reqwest::StatusCode::OK);
         assert_eq!(resp.text().await.unwrap(), "handled: input_data");
+    }
+
+    #[tokio::test]
+    async fn test_http_reply_with_custom_status_code() {
+        use crate::traits::Handled;
+
+        let port = get_free_port();
+        let addr = format!("127.0.0.1:{}", port);
+        let http_config = HttpConfig {
+            url: addr.clone(),
+            ..Default::default()
+        };
+        let mut consumer = HttpConsumer::new(&http_config).await.unwrap();
+
+        let mut response_endpoint =
+            crate::models::Endpoint::new(EndpointType::Response(crate::models::ResponseConfig {}));
+
+        let handler = |mut msg: CanonicalMessage| async move {
+            msg.metadata
+                .insert("http_status_code".to_string(), "201".to_string());
+            Ok(Handled::Publish(msg))
+        };
+        response_endpoint.handler = Some(std::sync::Arc::new(handler));
+
+        let publisher =
+            create_publisher_from_route("test_response_handler_status", &response_endpoint)
+                .await
+                .unwrap();
+
+        tokio::spawn(async move {
+            if let Ok(received) = consumer.receive().await {
+                let outcome = publisher.send(received.message).await.unwrap();
+                let disposition = match outcome {
+                    Sent::Response(msg) => crate::traits::MessageDisposition::Reply(msg),
+                    Sent::Ack => crate::traits::MessageDisposition::Ack,
+                };
+                let _ = (received.commit)(disposition).await;
+            }
+        });
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("http://{}", addr))
+            .body("input_data")
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
+        assert_eq!(resp.text().await.unwrap(), "input_data");
     }
 
     #[tokio::test]
