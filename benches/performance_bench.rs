@@ -460,6 +460,7 @@ pub mod file_helper {
     use tokio::sync::Mutex;
 
     static FILE_PATH: Lazy<StdMutex<String>> = Lazy::new(|| StdMutex::new(String::new()));
+    static TEMP_DIR: Lazy<StdMutex<Option<tempfile::TempDir>>> = Lazy::new(|| StdMutex::new(None));
 
     pub async fn create_consumer() -> Arc<Mutex<dyn MessageConsumer>> {
         let dir = tempfile::tempdir().unwrap();
@@ -469,6 +470,8 @@ pub mod file_helper {
         {
             let mut p_lock = FILE_PATH.lock().unwrap();
             *p_lock = path_str.clone();
+            let mut t_lock = TEMP_DIR.lock().unwrap();
+            *t_lock = Some(dir);
         }
 
         let config = FileConfig {
@@ -503,6 +506,7 @@ pub mod file_delete_helper {
     use tokio::sync::Mutex;
 
     static FILE_PATH: Lazy<StdMutex<String>> = Lazy::new(|| StdMutex::new(String::new()));
+    static TEMP_DIR: Lazy<StdMutex<Option<tempfile::TempDir>>> = Lazy::new(|| StdMutex::new(None));
 
     pub async fn create_consumer() -> Arc<Mutex<dyn MessageConsumer>> {
         let dir = tempfile::tempdir().unwrap();
@@ -512,6 +516,8 @@ pub mod file_delete_helper {
         {
             let mut p_lock = FILE_PATH.lock().unwrap();
             *p_lock = path_str.clone();
+            let mut t_lock = TEMP_DIR.lock().unwrap();
+            *t_lock = Some(dir);
         }
 
         let config = FileConfig {
@@ -541,7 +547,7 @@ pub mod http_helper {
     use mq_bridge::endpoints::http::{HttpConsumer, HttpPublisher};
     use mq_bridge::endpoints::memory::MemoryConsumer;
     use mq_bridge::models::HttpConfig;
-    use mq_bridge::traits::{MessageConsumer, MessageDisposition, MessagePublisher};
+    use mq_bridge::traits::{ConsumerError, MessageConsumer, MessageDisposition, MessagePublisher};
     use once_cell::sync::Lazy;
     use std::net::TcpListener;
     use std::sync::Arc;
@@ -553,6 +559,32 @@ pub mod http_helper {
     fn get_free_port() -> u16 {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.local_addr().unwrap().port()
+    }
+
+    struct HttpBenchConsumer {
+        inner: MemoryConsumer,
+        task: Option<tokio::task::JoinHandle<()>>,
+    }
+
+    #[async_trait::async_trait]
+    impl MessageConsumer for HttpBenchConsumer {
+        async fn receive_batch(
+            &mut self,
+            max_messages: usize,
+        ) -> Result<mq_bridge::ReceivedBatch, ConsumerError> {
+            self.inner.receive_batch(max_messages).await
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    impl Drop for HttpBenchConsumer {
+        fn drop(&mut self) {
+            if let Some(task) = self.task.take() {
+                task.abort();
+            }
+        }
     }
 
     pub async fn create_consumer() -> Arc<Mutex<dyn MessageConsumer>> {
@@ -580,7 +612,7 @@ pub mod http_helper {
         let memory_channel = memory_consumer.channel();
 
         // Spawn background task to drain HTTP consumer into memory consumer
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             while let Ok(batch) = http_consumer.receive_batch(100).await {
                 let count = batch.messages.len();
                 if count > 0 {
@@ -594,7 +626,10 @@ pub mod http_helper {
             }
         });
 
-        Arc::new(Mutex::new(memory_consumer))
+        Arc::new(Mutex::new(HttpBenchConsumer {
+            inner: memory_consumer,
+            task: Some(task),
+        }))
     }
 
     pub async fn create_publisher() -> Arc<dyn MessagePublisher> {

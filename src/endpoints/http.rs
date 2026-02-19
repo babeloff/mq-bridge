@@ -48,7 +48,7 @@ struct HttpConsumerState {
 #[cfg(feature = "actix-web")]
 impl HttpConsumer {
     pub async fn new(config: &HttpConfig) -> anyhow::Result<Self> {
-        let buffer_size = config.internal_buffer_size.unwrap_or(100);
+        let buffer_size = config.internal_buffer_size.unwrap_or(100).max(1);
         let (request_tx, request_rx) = tokio::sync::mpsc::channel::<HttpSourceMessage>(buffer_size);
         let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(());
 

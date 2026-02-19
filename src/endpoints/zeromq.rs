@@ -70,7 +70,7 @@ impl ZeroMqPublisher {
             }
         };
 
-        let buffer_size = config.internal_buffer_size.unwrap_or(128);
+        let buffer_size = config.internal_buffer_size.unwrap_or(128).max(1);
         let (tx, rx) = bounded::<PublisherJob>(buffer_size);
         tokio::spawn(async move {
             while let Ok(job) = rx.recv().await {
@@ -237,7 +237,7 @@ impl ZeroMqConsumer {
             }
         };
 
-        let buffer_size = config.internal_buffer_size.unwrap_or(128);
+        let buffer_size = config.internal_buffer_size.unwrap_or(128).max(1);
         let (tx, rx) = bounded::<Result<ConsumerItem, ConsumerError>>(buffer_size);
         tokio::spawn(async move {
             loop {
