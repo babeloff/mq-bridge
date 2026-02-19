@@ -9,7 +9,6 @@ use mq_bridge::test_utils::{
     run_performance_pipeline_test, run_pipeline_test, run_test_with_docker,
     run_test_with_docker_controller, setup_logging,
 };
-use mq_bridge::traits::MessagePublisher;
 const CONFIG_YAML: &str = r#"
 routes:
   memory_to_mongodb:
@@ -64,6 +63,7 @@ pub async fn test_mongodb_chaos() {
 #[tokio::test]
 async fn test_mongodb_subscriber_no_duplicates() {
     use mq_bridge::models::{Endpoint, Route};
+    use mq_bridge::traits::MessagePublisher;
     use mq_bridge::type_handler::TypeHandler;
     use mq_bridge::Handled;
     use serde::{Deserialize, Serialize};

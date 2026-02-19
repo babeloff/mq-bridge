@@ -1183,7 +1183,7 @@ mod tests {
         // Wait for message
         let mut received = Vec::new();
         for _ in 0..20 {
-            if channel.len() > 0 {
+            if !channel.is_empty() {
                 received = channel.drain_messages();
                 break;
             }
@@ -1226,7 +1226,7 @@ mod tests {
         let channel = output.channel().unwrap();
         let mut received = Vec::new();
         for _ in 0..20 {
-            if channel.len() > 0 {
+            if !channel.is_empty() {
                 received = channel.drain_messages();
                 break;
             }
@@ -1268,7 +1268,7 @@ mod tests {
         let channel = output.channel().unwrap();
         let mut received = Vec::new();
         for _ in 0..20 {
-            if channel.len() > 0 {
+            if !channel.is_empty() {
                 received = channel.drain_messages();
                 break;
             }

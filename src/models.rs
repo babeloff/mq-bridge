@@ -642,7 +642,6 @@ pub struct FileConfig {
     /// Path to the file.
     pub path: String,
     /// (Consumer only) If true, acts in **Subscriber mode** (like `tail -f`), reading new lines as they are written.
-    /// When `delete` is disabled, this also controls whether to start reading from the end (true) or beginning (false) of the file.
     /// If false (default), acts in Consumer mode, reading lines and removing them from the file (queue behavior).
     #[serde(default)]
     pub subscribe_mode: bool,

@@ -581,20 +581,15 @@ pub mod http_helper {
 
         // Spawn background task to drain HTTP consumer into memory consumer
         tokio::spawn(async move {
-            loop {
-                match http_consumer.receive_batch(100).await {
-                    Ok(batch) => {
-                        let count = batch.messages.len();
-                        if count > 0 {
-                            // Forward to memory channel
-                            if memory_channel.sender.send(batch.messages).await.is_err() {
-                                break; // Memory consumer closed
-                            }
-                            // Ack immediately to unblock HTTP response
-                            let _ = (batch.commit)(vec![MessageDisposition::Ack; count]).await;
-                        }
+            while let Ok(batch) = http_consumer.receive_batch(100).await {
+                let count = batch.messages.len();
+                if count > 0 {
+                    // Forward to memory channel
+                    if memory_channel.sender.send(batch.messages).await.is_err() {
+                        break; // Memory consumer closed
                     }
-                    Err(_) => break, // HTTP consumer closed/error
+                    // Ack immediately to unblock HTTP response
+                    let _ = (batch.commit)(vec![MessageDisposition::Ack; count]).await;
                 }
             }
         });

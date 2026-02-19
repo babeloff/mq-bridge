@@ -226,10 +226,8 @@ async fn handle_request(
     let (ack_tx, ack_rx) = tokio::sync::oneshot::channel::<MessageDisposition>();
     let commit = Box::new(move |disposition: MessageDisposition| {
         Box::pin(async move {
-            if ack_tx.send(disposition).is_err() {
-                if !fire_and_forget {
-                    trace!("HTTP handler was no longer waiting for commit disposition (client disconnected).");
-                }
+            if ack_tx.send(disposition).is_err() && !fire_and_forget {
+                trace!("HTTP handler was no longer waiting for commit disposition (client disconnected).");
             }
             Ok(())
         }) as BoxFuture<'static, anyhow::Result<()>>
@@ -870,11 +868,13 @@ http_route:
         let count = *received_count.lock().unwrap();
         assert_eq!(count, 10);
 
-        let payloads = received_payloads.lock().unwrap();
-        assert_eq!(payloads.len(), 10);
-        for i in 0..10 {
-            let expected = format!("msg{}", i).into_bytes();
-            assert!(payloads.contains(&expected), "Missing payload: msg{}", i);
+        {
+            let payloads = received_payloads.lock().unwrap();
+            assert_eq!(payloads.len(), 10);
+            for i in 0..10 {
+                let expected = format!("msg{}", i).into_bytes();
+                assert!(payloads.contains(&expected), "Missing payload: msg{}", i);
+            }
         }
 
         handle.stop().await;
