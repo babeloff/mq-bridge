@@ -566,6 +566,14 @@ where
     Ok(value)
 }
 
+fn deserialize_null_as_false<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let opt = Option::<bool>::deserialize(deserializer)?;
+    Ok(opt.unwrap_or(false))
+}
+
 // --- AWS Specific Configuration ---
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
@@ -692,7 +700,7 @@ impl<'de> Deserialize<'de> for FileConfig {
                             if delete.is_some() {
                                 return Err(serde::de::Error::duplicate_field("delete"));
                             }
-                            delete = Some(map.next_value()?);
+                            delete = map.next_value()?;
                         }
                         _ => {
                             let _ = map.next_value::<serde::de::IgnoredAny>()?;
@@ -987,6 +995,11 @@ pub struct HttpConfig {
     pub message_id_header: Option<String>,
     /// (Consumer only) Timeout for request-reply operations in milliseconds. Defaults to 30000ms.
     pub request_timeout_ms: Option<u64>,
+    /// (Consumer only) Internal buffer size for the channel. Defaults to 100.
+    pub internal_buffer_size: Option<usize>,
+    /// (Consumer only) If true, respond immediately with 202 Accepted without waiting for downstream processing. Defaults to false.
+    #[serde(default)]
+    pub fire_and_forget: bool,
 }
 
 // --- IBM MQ Specific Configuration ---
@@ -1064,6 +1077,7 @@ pub struct ResponseConfig {
 #[serde(deny_unknown_fields)]
 pub struct TlsConfig {
     /// If true, enable TLS/SSL.
+    #[serde(default, deserialize_with = "deserialize_null_as_false")]
     pub required: bool,
     /// Path to the CA certificate file.
     pub ca_file: Option<String>,

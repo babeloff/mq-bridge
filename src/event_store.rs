@@ -14,7 +14,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::sync::Notify;
+use tokio::sync::watch;
 use tracing::{debug, info, trace, warn};
 
 #[derive(Debug, Clone)]
@@ -83,7 +83,7 @@ pub struct EventStore {
     next_offset: AtomicU64,
     base_offset: AtomicU64,
     retention_policy: RetentionPolicy,
-    notify: Arc<Notify>,
+    offset_update: watch::Sender<u64>,
     dropped_events: AtomicU64,
     last_gc: RwLock<SystemTime>,
     on_drop: Option<Box<dyn Fn(Vec<StoredEvent>) + Send + Sync>>,
@@ -101,13 +101,14 @@ impl std::fmt::Debug for EventStore {
 
 impl EventStore {
     pub fn new(retention_policy: RetentionPolicy) -> Self {
+        let (offset_update, _) = watch::channel(0);
         Self {
             events: RwLock::new(VecDeque::new()),
             subscribers: RwLock::new(HashMap::new()),
             next_offset: AtomicU64::new(1), // Start offsets at 1
             base_offset: AtomicU64::new(1),
             retention_policy,
-            notify: Arc::new(Notify::new()),
+            offset_update,
             dropped_events: AtomicU64::new(0),
             last_gc: RwLock::new(SystemTime::now()),
             on_drop: None,
@@ -122,6 +123,7 @@ impl EventStore {
             .unwrap_or_default()
             .as_millis() as u64;
 
+        let mut events = self.events.write().unwrap();
         let offset = self.next_offset.fetch_add(1, Ordering::SeqCst);
         let stored = StoredEvent {
             message: event,
@@ -129,7 +131,6 @@ impl EventStore {
             stored_at: timestamp,
         };
 
-        let mut events = self.events.write().unwrap();
         events.push_back(stored);
 
         let mut removed = Vec::new();
@@ -165,7 +166,7 @@ impl EventStore {
 
         trace!("Appended event offset {}", offset);
         // Notify waiting subscribers
-        self.notify.notify_waiters();
+        let _ = self.offset_update.send(offset);
 
         offset
     }
@@ -182,6 +183,8 @@ impl EventStore {
             .as_millis() as u64;
 
         let count = messages.len() as u64;
+
+        let mut events = self.events.write().unwrap();
         let start_offset = self.next_offset.fetch_add(count, Ordering::SeqCst);
 
         let stored_events = messages
@@ -193,7 +196,6 @@ impl EventStore {
                 stored_at: timestamp,
             });
 
-        let mut events = self.events.write().unwrap();
         events.extend(stored_events);
 
         let last_offset = start_offset + count - 1;
@@ -231,7 +233,7 @@ impl EventStore {
 
         trace!("Appended batch up to offset {}", last_offset);
         // Notify waiting subscribers
-        self.notify.notify_waiters();
+        let _ = self.offset_update.send(last_offset);
 
         last_offset
     }
@@ -364,15 +366,15 @@ impl EventStore {
 
     /// Waits for new events if none are currently available after last_known_offset.
     pub async fn wait_for_events(&self, last_known_offset: u64) {
-        {
-            let events = self.events.read().unwrap();
-            let base = self.base_offset.load(Ordering::SeqCst);
-            let max_offset = base + events.len() as u64;
-            if max_offset > last_known_offset + 1 {
+        let mut rx = self.offset_update.subscribe();
+        if *rx.borrow() > last_known_offset {
+            return;
+        }
+        while rx.changed().await.is_ok() {
+            if *rx.borrow() > last_known_offset {
                 return;
             }
         }
-        self.notify.notified().await;
     }
 
     async fn run_gc(&self) {
@@ -510,6 +512,9 @@ impl MessageConsumer for EventStoreConsumer {
             new_offset = last.offset;
         }
 
+        // Advance offset immediately to support async commit pipelines (like Route)
+        self.last_offset.store(new_offset, Ordering::SeqCst);
+
         // Convert to CanonicalMessage for the consumer
         let events: Vec<CanonicalMessage> = stored_events.into_iter().map(|e| e.message).collect();
         trace!(count = events.len(), subscriber_id = %self.subscriber_id, message_ids = ?LazyMessageIds(&events), "Received batch of events from store");
@@ -520,12 +525,13 @@ impl MessageConsumer for EventStoreConsumer {
 
         let commit: BatchCommitFunc = Box::new(move |dispositions| {
             Box::pin(async move {
-                if !dispositions
+                if dispositions
                     .iter()
                     .any(|d| matches!(d, MessageDisposition::Nack))
                 {
+                    last_offset_arc.fetch_min(last_offset_val, Ordering::SeqCst);
+                } else {
                     store.ack(&subscriber_id, new_offset).await;
-                    last_offset_arc.store(new_offset, Ordering::SeqCst);
                 }
                 Ok(())
             })

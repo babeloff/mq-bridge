@@ -99,7 +99,7 @@ pub struct IbmMqPublisher {
 
 impl IbmMqPublisher {
     pub async fn new(config: &IbmMqConfig) -> Result<Self, PublisherError> {
-        let buffer_size = config.internal_buffer_size.unwrap_or(100);
+        let buffer_size = config.internal_buffer_size.unwrap_or(100).max(1);
         let (tx, mut rx) = mpsc::channel::<BatchJob>(buffer_size);
         let (init_tx, init_rx) = oneshot::channel();
         let config = config.clone();
@@ -251,7 +251,7 @@ async fn spawn_consumer_thread(
     config: IbmMqConfig,
 ) -> Result<mpsc::Sender<ConsumerJob>, ConsumerError> {
     info!("Starting IBM MQ consumer thread");
-    let buffer_size = config.internal_buffer_size.unwrap_or(100);
+    let buffer_size = config.internal_buffer_size.unwrap_or(100).max(1);
     let (tx, mut rx) = mpsc::channel::<ConsumerJob>(buffer_size);
     let tx_loop = tx.clone();
     let (init_tx, init_rx) = oneshot::channel();

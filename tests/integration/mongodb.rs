@@ -9,7 +9,6 @@ use mq_bridge::test_utils::{
     run_performance_pipeline_test, run_pipeline_test, run_test_with_docker,
     run_test_with_docker_controller, setup_logging,
 };
-use mq_bridge::traits::MessagePublisher;
 const CONFIG_YAML: &str = r#"
 routes:
   memory_to_mongodb:
@@ -64,6 +63,7 @@ pub async fn test_mongodb_chaos() {
 #[tokio::test]
 async fn test_mongodb_subscriber_no_duplicates() {
     use mq_bridge::models::{Endpoint, Route};
+    use mq_bridge::traits::MessagePublisher;
     use mq_bridge::type_handler::TypeHandler;
     use mq_bridge::Handled;
     use serde::{Deserialize, Serialize};
@@ -80,71 +80,93 @@ async fn test_mongodb_subscriber_no_duplicates() {
         data: String,
     }
 
-    run_test_with_docker("tests/integration/docker-compose/mongodb.yml", || async move {
-        // Clean setup
-        let client = mongodb::Client::with_uri_str(url).await.unwrap();
-        client
-            .database(db_name)
-            .collection::<mongodb::bson::Document>(collection_name)
-            .drop()
-            .await
-            .ok();
+    run_test_with_docker(
+        "tests/integration/docker-compose/mongodb.yml",
+        || async move {
+            // Clean setup
+            let client = mongodb::Client::with_uri_str(url).await.unwrap();
+            client
+                .database(db_name)
+                .collection::<mongodb::bson::Document>(collection_name)
+                .drop()
+                .await
+                .ok();
 
-        // 1. Setup Input Endpoint (MongoDB Subscriber)
-        let input_config = mq_bridge::models::MongoDbConfig {
-            url: url.to_string(),
-            database: db_name.to_string(),
-            collection: Some(collection_name.to_string()),
-            change_stream: true, // Subscriber mode
-            polling_interval_ms: Some(10),
-            format: mq_bridge::models::MongoDbFormat::Json,
-            ..Default::default()
-        };
-        let input = Endpoint::new(mq_bridge::models::EndpointType::MongoDb(input_config.clone()));
+            // 1. Setup Input Endpoint (MongoDB Subscriber)
+            let input_config = mq_bridge::models::MongoDbConfig {
+                url: url.to_string(),
+                database: db_name.to_string(),
+                collection: Some(collection_name.to_string()),
+                change_stream: true, // Subscriber mode
+                polling_interval_ms: Some(10),
+                format: mq_bridge::models::MongoDbFormat::Json,
+                ..Default::default()
+            };
+            let input = Endpoint::new(mq_bridge::models::EndpointType::MongoDb(
+                input_config.clone(),
+            ));
 
-        // 2. Setup Output Endpoint (Memory to verify)
-        let output = Endpoint::new_memory("out_no_dupes", 20);
+            // 2. Setup Output Endpoint (Memory to verify)
+            let output = Endpoint::new_memory("out_no_dupes", 20);
 
-        // 3. Setup TypeHandler
-        let counter = Arc::new(AtomicUsize::new(0));
-        let counter_clone = counter.clone();
-        
-        let type_handler = TypeHandler::new().add("test_msg", move |msg: TestMsg| {
-            let counter = counter_clone.clone();
-            async move {
-                assert!(msg.id == 1 || msg.id == 2);
-                counter.fetch_add(1, Ordering::SeqCst);
-                Ok(Handled::Ack)
-            }
-        });
+            // 3. Setup TypeHandler
+            let counter = Arc::new(AtomicUsize::new(0));
+            let counter_clone = counter.clone();
 
-        // 4. Create Route
-        let route = Route::new(input, output).with_handler(type_handler);
+            let type_handler = TypeHandler::new().add("test_msg", move |msg: TestMsg| {
+                let counter = counter_clone.clone();
+                async move {
+                    assert!(msg.id == 1 || msg.id == 2);
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    Ok(Handled::Ack)
+                }
+            });
 
-        // 5. Run Route (Start subscriber)
-        route.deploy("test_no_dupes_route").await.unwrap();
+            // 4. Create Route
+            let route = Route::new(input, output).with_handler(type_handler);
 
-        // 6. Publish messages
-        let publisher = MongoDbPublisher::new(&input_config).await.unwrap();
-        let msg1 = TestMsg { id: 1, data: "one".to_string() };
-        let msg2 = TestMsg { id: 2, data: "two".to_string() };
-        
-        publisher.send(mq_bridge::msg!(&msg1, "test_msg")).await.unwrap();
-        publisher.send(mq_bridge::msg!(&msg2, "test_msg")).await.unwrap();
+            // 5. Run Route (Start subscriber)
+            route.deploy("test_no_dupes_route").await.unwrap();
 
-        // Wait for processing
-        let start = std::time::Instant::now();
-        while counter.load(Ordering::SeqCst) < 2 {
-            if start.elapsed() > std::time::Duration::from_secs(10) {
-                break;
+            // 6. Publish messages
+            let publisher = MongoDbPublisher::new(&input_config).await.unwrap();
+            let msg1 = TestMsg {
+                id: 1,
+                data: "one".to_string(),
+            };
+            let msg2 = TestMsg {
+                id: 2,
+                data: "two".to_string(),
+            };
+
+            publisher
+                .send(mq_bridge::msg!(&msg1, "test_msg"))
+                .await
+                .unwrap();
+            publisher
+                .send(mq_bridge::msg!(&msg2, "test_msg"))
+                .await
+                .unwrap();
+
+            // Wait for processing
+            let start = std::time::Instant::now();
+            while counter.load(Ordering::SeqCst) < 2 {
+                if start.elapsed() > std::time::Duration::from_secs(10) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-        mq_bridge::stop_route("test_no_dupes_route").await;
-        assert_eq!(counter.load(Ordering::SeqCst), 2, "Should have processed exactly 2 messages");
-    }).await;
+            mq_bridge::stop_route("test_no_dupes_route").await;
+            assert_eq!(
+                counter.load(Ordering::SeqCst),
+                2,
+                "Should have processed exactly 2 messages"
+            );
+        },
+    )
+    .await;
 }
 
 pub async fn test_mongodb_replica_set_pipeline() {

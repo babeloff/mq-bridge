@@ -1,6 +1,6 @@
 [package]
 name = "mq-bridge"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2021"
 rust-version = "1.70"  # 2021 edition was released in 1.56
 description = "An asynchronous message bridging library connecting Kafka, MQTT, AMQP, NATS, MongoDB, HTTP, and more."
@@ -15,11 +15,16 @@ categories = ["asynchronous", "network-programming"]
 serde = { version = "1.0", features = ["derive"] }
 anyhow = "1.0"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "io-util", "net", "signal"] }
+# Note on MSRV for optional features:
+# The "http" feature (actix-web) and "aws" feature (aws-sdk-*) may require a newer Rust version than the crate MSRV (1.70).
+# - "http" (actix-web 4.x) typically requires Rust 1.75+.
+# - "aws" (aws-sdk-*) typically requires Rust 1.75+.
+# Use `rustup override set stable` or a `rust-toolchain.toml` file to use a compatible toolchain when enabling these features.
 async-trait = "0.1"
 serde_json = "1.0"
 thiserror = "2.0"
 futures = "0.3"
-tracing = "0.1"
+tracing = { version = "0.1", features = ["log"] }
 bytes = { version = "1", features = ["serde"] }
 async-channel = { version = "2.5" }
 once_cell = { version = "1.21" }
@@ -65,13 +70,13 @@ rumqttc = { version = "0.25", optional = true }
 mqi = { version = "0.3", optional = true }
 
 # HTTP
-actix-web = { version = "4.12", features = ["rustls-0_23"], optional = true }
+actix-web = { version = "4.12", default-features = false, features = ["rustls-0_23"], optional = true }
 reqwest = { version = "0.13", features = ["json"], optional = true }
 
 # AWS
-aws-config = { version = "1.8", optional = true, features = ["behavior-version-latest"] }
-aws-sdk-sqs = { version = "1.92", optional = true }
-aws-sdk-sns = { version = "1.93", optional = true }
+aws-config = { version = "1.8", optional = true, default-features = false, features = ["behavior-version-latest", "rt-tokio", "rustls"] }
+aws-sdk-sqs = { version = "1.92", optional = true, default-features = false, features = ["rt-tokio", "rustls"] }
+aws-sdk-sns = { version = "1.93", optional = true, default-features = false, features = ["rt-tokio", "rustls"] }
 
 # ZeroMQ
 zeromq = { version = "0.4", optional = true }
