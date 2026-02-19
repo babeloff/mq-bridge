@@ -282,8 +282,7 @@ fn make_response(disposition: MessageDisposition) -> HttpResponse {
             if !has_content_type {
                 if status == actix_web::http::StatusCode::OK {
                     builder.content_type("application/octet-stream");
-                }
-                else {
+                } else {
                     builder.content_type("text/plain; charset=UTF-8");
                 }
             }
