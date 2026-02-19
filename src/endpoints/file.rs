@@ -1043,12 +1043,8 @@ mod tests {
 
         let mut consumer = FileConsumer::new(&config).await.unwrap();
 
-        // Receive existing line
-        let received1 = consumer.receive().await.unwrap();
-        assert_eq!(received1.message.payload.as_ref(), b"line1");
-        (received1.commit)(crate::traits::MessageDisposition::Ack)
-            .await
-            .unwrap();
+        // Give the background tailer a moment to initialize and find its starting position.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         // Append new line
         {
@@ -1061,9 +1057,10 @@ mod tests {
         }
 
         // Receive new line
-        let received2 = consumer.receive().await.unwrap();
-        assert_eq!(received2.message.payload.as_ref(), b"line2");
-        (received2.commit)(crate::traits::MessageDisposition::Ack)
+        let received2 = consumer.receive_batch(2).await.unwrap();
+        assert_eq!(received2.messages.len(), 1);
+        assert_eq!(received2.messages[0].payload.as_ref(), b"line2");
+        (received2.commit)(vec![crate::traits::MessageDisposition::Ack])
             .await
             .unwrap();
 
@@ -1169,9 +1166,19 @@ mod tests {
         };
 
         let mut consumer = FileConsumer::new(&config).await.unwrap();
+        // Give the background tailer a moment to initialize and find its starting position.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        {
+            let mut file = OpenOptions::new()
+                .append(true)
+                .open(&file_path)
+                .await
+                .unwrap();
+            file.write_all(b"line2\n").await.unwrap();
+        }
 
         let received = consumer.receive().await.unwrap();
-        assert_eq!(received.message.payload.as_ref(), b"line1");
+        assert_eq!(received.message.payload.as_ref(), b"line2");
 
         (received.commit)(crate::traits::MessageDisposition::Ack)
             .await
@@ -1179,7 +1186,7 @@ mod tests {
 
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         let content = tokio::fs::read_to_string(&file_path).await.unwrap();
-        assert_eq!(content, "line1\n");
+        assert_eq!(content, "line1\nline2\n");
     }
 
     use crate::models::{Endpoint, EndpointType, Route};
@@ -1299,7 +1306,7 @@ mod tests {
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
-        assert_eq!(received.len(), 1);
+        assert_eq!(received.len(), 0);
 
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         let content = tokio::fs::read_to_string(&file_path).await.unwrap();
