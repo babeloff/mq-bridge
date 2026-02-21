@@ -476,8 +476,7 @@ pub mod file_helper {
 
         let config = FileConfig {
             path: path_str,
-            subscribe_mode: false,
-            delete: Some(false),
+            mode: mq_bridge::models::FileConsumerMode::Consume { delete: false },
         };
         Arc::new(Mutex::new(FileConsumer::new(&config).await.unwrap()))
     }
@@ -489,8 +488,7 @@ pub mod file_helper {
         };
         let config = FileConfig {
             path: path_str,
-            subscribe_mode: false,
-            delete: None,
+            mode: mq_bridge::models::FileConsumerMode::Consume { delete: false },
         };
         Arc::new(FilePublisher::new(&config).await.unwrap())
     }
@@ -522,8 +520,7 @@ pub mod file_delete_helper {
 
         let config = FileConfig {
             path: path_str,
-            subscribe_mode: false,
-            delete: Some(true),
+            mode: mq_bridge::models::FileConsumerMode::Consume { delete: true },
         };
         Arc::new(Mutex::new(FileConsumer::new(&config).await.unwrap()))
     }
@@ -535,8 +532,7 @@ pub mod file_delete_helper {
         };
         let config = FileConfig {
             path: path_str,
-            subscribe_mode: false,
-            delete: None,
+            mode: mq_bridge::models::FileConsumerMode::Consume { delete: false },
         };
         Arc::new(FilePublisher::new(&config).await.unwrap())
     }

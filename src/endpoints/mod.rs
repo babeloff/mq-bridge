@@ -23,6 +23,7 @@ pub mod mqtt;
 #[cfg(feature = "nats")]
 pub mod nats;
 pub mod null;
+pub mod reader;
 pub mod response;
 pub mod static_endpoint;
 pub mod switch;
@@ -176,6 +177,10 @@ pub fn check_consumer(
         EndpointType::Custom { .. } => Ok(()),
         EndpointType::Switch(_) => Err(anyhow!(
             "[route:{}] Switch endpoint is only supported as an output",
+            route_name
+        )),
+        EndpointType::Reader(_) => Err(anyhow!(
+            "[route:{}] Reader endpoint is only supported as an output",
             route_name
         )),
         #[allow(unreachable_patterns)]
@@ -387,6 +392,7 @@ fn check_publisher_recursive(
         }
         EndpointType::Response(_) => Ok(()),
         EndpointType::Custom { .. } => Ok(()),
+        EndpointType::Reader(inner) => check_consumer(route_name, inner, allowed_types),
         #[allow(unreachable_patterns)]
         _ => {
             if let Some(allowed) = allowed_types {
@@ -544,6 +550,10 @@ async fn create_base_publisher(
         }
         EndpointType::Response(_) => {
             Ok(Box::new(response::ResponsePublisher) as Box<dyn MessagePublisher>)
+        }
+        EndpointType::Reader(inner) => {
+            let consumer = create_consumer_from_route(route_name, inner).await?;
+            Ok(Box::new(reader::ReaderPublisher::new(consumer)) as Box<dyn MessagePublisher>)
         }
         EndpointType::Custom { name, config } => {
             let factory = get_endpoint_factory(name)

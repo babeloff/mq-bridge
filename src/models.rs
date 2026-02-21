@@ -414,6 +414,7 @@ pub enum EndpointType {
     Fanout(Vec<Endpoint>),
     Switch(SwitchConfig),
     Response(ResponseConfig),
+    Reader(Box<Endpoint>),
     Custom {
         name: String,
         config: serde_json::Value,
@@ -440,6 +441,7 @@ impl EndpointType {
             EndpointType::Fanout(_) => "fanout",
             EndpointType::Switch(_) => "switch",
             EndpointType::Response(_) => "response",
+            EndpointType::Reader(_) => "reader",
             EndpointType::Custom { .. } => "custom",
             EndpointType::Null => "null",
         }
@@ -454,6 +456,7 @@ impl EndpointType {
                 | EndpointType::Fanout(_)
                 | EndpointType::Switch(_)
                 | EndpointType::Response(_)
+                | EndpointType::Reader(_)
                 | EndpointType::Custom { .. }
                 | EndpointType::Null
         )
@@ -636,89 +639,45 @@ pub struct KafkaConfig {
 
 // --- File Specific Configuration ---
 
-#[derive(Debug, Serialize, Clone)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct FileConfig {
     /// Path to the file.
     pub path: String,
-    /// (Consumer only) If true, acts in **Subscriber mode** (like `tail -f`), reading new lines as they are written.
-    /// If false (default), acts in Consumer mode, reading lines and removing them from the file (queue behavior).
-    #[serde(default)]
-    pub subscribe_mode: bool,
-    /// (Consumer only) If true, lines are removed from the file after being processed by all subscribers.
-    /// Defaults to true if subscribe_mode is false, and false if subscribe_mode is true.
-    pub delete: Option<bool>,
+    #[serde(flatten)]
+    pub mode: FileConsumerMode,
 }
 
-impl<'de> Deserialize<'de> for FileConfig {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        struct FileConfigVisitor;
-        impl<'de> Visitor<'de> for FileConfigVisitor {
-            type Value = FileConfig;
-            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-                formatter.write_str("string or map")
-            }
-            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
-            where
-                E: serde::de::Error,
-            {
-                Ok(FileConfig {
-                    path: value.to_string(),
-                    subscribe_mode: false,
-                    delete: None,
-                })
-            }
-            fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
-            where
-                M: MapAccess<'de>,
-            {
-                let mut path = None;
-                let mut consume = true;
-                let mut subscribe_mode = None;
-                let mut delete = None;
-                while let Some(key) = map.next_key::<String>()? {
-                    match key.as_str() {
-                        "path" => {
-                            if path.is_some() {
-                                return Err(serde::de::Error::duplicate_field("path"));
-                            }
-                            path = Some(map.next_value()?);
-                        }
-                        "consume" => {
-                            consume = map.next_value()?;
-                        }
-                        "subscribe_mode" => {
-                            if subscribe_mode.is_some() {
-                                return Err(serde::de::Error::duplicate_field("subscribe_mode"));
-                            }
-                            subscribe_mode = Some(map.next_value()?);
-                        }
-                        "delete" => {
-                            if delete.is_some() {
-                                return Err(serde::de::Error::duplicate_field("delete"));
-                            }
-                            delete = map.next_value()?;
-                        }
-                        _ => {
-                            let _ = map.next_value::<serde::de::IgnoredAny>()?;
-                        }
-                    }
-                }
-                let path = path.ok_or_else(|| serde::de::Error::missing_field("path"))?;
-                Ok(FileConfig {
-                    path,
-                    subscribe_mode: subscribe_mode.unwrap_or(!consume),
-                    delete,
-                })
-            }
-        }
-        deserializer.deserialize_any(FileConfigVisitor)
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub enum FileConsumerMode {
+    /// **Queue Mode**: Reads from the beginning of the file.
+    Consume {
+        #[serde(default)]
+        delete: bool,
+    },
+    /// **Broadcast Mode**: Tails the file (starts at the end).
+    Subscribe {
+        #[serde(default)]
+        delete: bool,
+    },
+    /// **Persistent Mode**: Reads the file with offset tracking.
+    GroupSubscribe {
+        /// The consumer group ID that is used for offset tracking. Should be unique.
+        group_id: String,
+        /// If true, starts reading from the end of the file if no offset is stored.
+        /// If false, starts reading from the beginning.
+        #[serde(default)]
+        read_from_tail: bool,
+    },
+}
+
+impl Default for FileConsumerMode {
+    fn default() -> Self {
+        Self::Consume { delete: false }
     }
 }
-
 // --- NATS Specific Configuration ---
 
 /// General NATS connection configuration.
@@ -1299,6 +1258,30 @@ kafka_to_nats:
             // Correctly parsed
         } else {
             panic!("Expected DLQ middleware");
+        }
+    }
+
+    #[test]
+    fn test_file_config_inference() {
+        let yaml = r#"
+mode: group_subscribe
+path: "/tmp/test"
+group_id: "my_group"
+"#;
+        let config: FileConfig = serde_yaml_ng::from_str(yaml).unwrap();
+        match config.mode {
+            FileConsumerMode::GroupSubscribe { group_id, .. } => assert_eq!(group_id, "my_group"),
+            _ => panic!("Expected GroupSubscribe"),
+        }
+
+        let yaml_queue = r#"
+mode: consume
+path: "/tmp/test"
+"#;
+        let config_queue: FileConfig = serde_yaml_ng::from_str(yaml_queue).unwrap();
+        match config_queue.mode {
+            FileConsumerMode::Consume { delete } => assert!(!delete),
+            _ => panic!("Expected Consume"),
         }
     }
 }
