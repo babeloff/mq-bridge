@@ -25,6 +25,8 @@ pub mod nats;
 pub mod null;
 pub mod reader;
 pub mod response;
+#[cfg(feature = "sled")]
+pub mod sled;
 pub mod static_endpoint;
 pub mod switch;
 #[cfg(feature = "zeromq")]
@@ -171,6 +173,8 @@ pub fn check_consumer(
             #[cfg(feature = "http-server")]
             Ok(())
         }
+        #[cfg(feature = "sled")]
+        EndpointType::Sled(_) => Ok(()),
         EndpointType::Static(_) => Ok(()),
         EndpointType::Memory(_) => Ok(()),
         EndpointType::File(_) => Ok(()),
@@ -281,6 +285,8 @@ async fn create_base_consumer(
         }
         EndpointType::Static(cfg) => Ok(boxed(static_endpoint::StaticRequestConsumer::new(cfg)?)),
         EndpointType::Memory(cfg) => Ok(boxed(memory::MemoryConsumer::new(cfg)?)),
+        #[cfg(feature = "sled")]
+        EndpointType::Sled(cfg) => Ok(boxed(sled::SledConsumer::new(cfg)?)),
         #[cfg(feature = "mongodb")]
         EndpointType::MongoDb(cfg) => {
             let mut config = cfg.clone();
@@ -374,6 +380,8 @@ fn check_publisher_recursive(
         EndpointType::File(_) => Ok(()),
         EndpointType::Static(_) => Ok(()),
         EndpointType::Memory(_) => Ok(()),
+        #[cfg(feature = "sled")]
+        EndpointType::Sled(_) => Ok(()),
         EndpointType::Null => Ok(()),
         EndpointType::Fanout(endpoints) => {
             for endpoint in endpoints {
@@ -521,6 +529,10 @@ async fn create_base_publisher(
         )?) as Box<dyn MessagePublisher>),
         EndpointType::Memory(cfg) => {
             Ok(Box::new(memory::MemoryPublisher::new(cfg)?) as Box<dyn MessagePublisher>)
+        }
+        #[cfg(feature = "sled")]
+        EndpointType::Sled(cfg) => {
+            Ok(Box::new(sled::SledPublisher::new(cfg)?) as Box<dyn MessagePublisher>)
         }
         EndpointType::Null => Ok(Box::new(null::NullPublisher) as Box<dyn MessagePublisher>),
         EndpointType::Fanout(endpoints) => {

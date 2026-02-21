@@ -531,7 +531,7 @@ fn run_file_queue_task(
                     match reader.read_until(b'\n', &mut buf) {
                         Ok(0) => break,
                         Ok(_) => {
-                        while buf.ends_with(b"\n") || buf.ends_with(b"\r") {
+                            while buf.ends_with(b"\n") || buf.ends_with(b"\r") {
                                 buf.pop();
                             }
                             batch.push(parse_message(&buf));

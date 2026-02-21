@@ -150,6 +150,7 @@ fn is_known_endpoint_name(name: &str) -> bool {
             | "file"
             | "static"
             | "memory"
+            | "sled"
             | "amqp"
             | "mongodb"
             | "mqtt"
@@ -405,6 +406,7 @@ pub enum EndpointType {
     File(FileConfig),
     Static(String),
     Memory(MemoryConfig),
+    Sled(SledConfig),
     Amqp(AmqpConfig),
     MongoDb(MongoDbConfig),
     Mqtt(MqttConfig),
@@ -432,6 +434,7 @@ impl EndpointType {
             EndpointType::File(_) => "file",
             EndpointType::Static(_) => "static",
             EndpointType::Memory(_) => "memory",
+            EndpointType::Sled(_) => "sled",
             EndpointType::Amqp(_) => "amqp",
             EndpointType::MongoDb(_) => "mongodb",
             EndpointType::Mqtt(_) => "mqtt",
@@ -635,6 +638,25 @@ pub struct KafkaConfig {
     /// (Consumer only) Additional librdkafka consumer configuration options (key-value pairs).
     #[serde(default)]
     pub consumer_options: Option<Vec<(String, String)>>,
+}
+
+// --- Sled Specific Configuration ---
+
+/// General Sled database configuration
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct SledConfig {
+    /// Path to the Sled database directory.
+    pub path: String,
+    /// The tree name to use as a queue. Defaults to "default".
+    pub tree: Option<String>,
+    /// (Consumer only) If true, start reading from the beginning of the tree.
+    #[serde(default)]
+    pub read_from_start: bool,
+    /// (Consumer only) If true, delete messages after processing (Queue mode).
+    #[serde(default)]
+    pub delete_after_read: bool,
 }
 
 // --- File Specific Configuration ---
