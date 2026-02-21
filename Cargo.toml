@@ -81,6 +81,12 @@ aws-sdk-sns = { version = "1.93", optional = true, default-features = false, fea
 # ZeroMQ
 zeromq = { version = "0.4", optional = true }
 
+# gRPC
+tonic = { version = "0.14", optional = true, default-features = false, features = ["codegen", "transport"] }
+tonic-prost = { version = "0.14", optional = true }
+prost = { version = "0.14", optional = true, default-features = false, features = ["std", "derive"] }
+tokio-stream = { version = "0.1", optional = true, features = ["net"] }
+
 url = { version = "2.5", optional = true }
 
 # Generate JSON schema
@@ -89,10 +95,15 @@ schemars = { version = "1.2", optional = true }
 # test-utils
 serde_yaml_ng = { version = "0.10", optional = true }
 
+
+[build-dependencies]
+tonic-prost-build = { version = "0.14", optional = true, default-features = false, features = ["transport"] }
+protobuf-src = { version = "1.1", optional = true }
+
 [features]
-default = []
+default = ["grpc"]
 middleware = ["metrics", "dedup", "panic"]
-full = ["middleware", "mongodb", "kafka", "amqp", "nats", "mqtt", "http", "aws", "zeromq", "sled"]
+full = ["middleware", "mongodb", "kafka", "amqp", "nats", "mqtt", "http", "aws", "zeromq", "sled", "grpc"]
 
 # Functionality features
 dedup = ["sled"]
@@ -115,6 +126,7 @@ http-server = ["actix-web", "rustls", "tokio-rustls", "rustls-pemfile", "url"]
 aws = ["aws-config", "aws-sdk-sqs", "aws-sdk-sns"]
 ibm-mq = ["mqi"]
 zeromq = ["dep:zeromq"]
+grpc = ["tonic", "prost", "tokio-stream", "tonic-prost", "tonic-prost-build", "protobuf-src"]
 
 [dev-dependencies]
 config = { version = "0.15" }

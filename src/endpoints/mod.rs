@@ -9,6 +9,8 @@ pub mod amqp;
 pub mod aws;
 pub mod fanout;
 pub mod file;
+#[cfg(feature = "grpc")]
+pub mod grpc;
 #[cfg(any(feature = "http-client", feature = "http-server"))]
 pub mod http;
 #[cfg(feature = "ibm-mq")]
@@ -164,6 +166,8 @@ pub fn check_consumer(
         EndpointType::IbmMq(_) => Ok(()),
         #[cfg(feature = "mongodb")]
         EndpointType::MongoDb(_) => Ok(()),
+        #[cfg(feature = "grpc")]
+        EndpointType::Grpc(_) => Ok(()),
         #[cfg(any(feature = "http-client", feature = "http-server"))]
         EndpointType::Http(_) => {
             #[cfg(not(feature = "http-server"))]
@@ -272,6 +276,8 @@ async fn create_base_consumer(
         #[cfg(feature = "zeromq")]
         EndpointType::ZeroMq(cfg) => Ok(boxed(zeromq::ZeroMqConsumer::new(cfg).await?)),
         EndpointType::File(cfg) => Ok(boxed(file::FileConsumer::new(cfg).await?)),
+        #[cfg(feature = "grpc")]
+        EndpointType::Grpc(cfg) => Ok(boxed(grpc::GrpcConsumer::new(cfg).await?)),
         #[cfg(any(feature = "http-client", feature = "http-server"))]
         EndpointType::Http(cfg) => {
             #[cfg(feature = "http-server")]
@@ -375,6 +381,8 @@ fn check_publisher_recursive(
             #[cfg(feature = "reqwest")]
             Ok(())
         }
+        #[cfg(feature = "grpc")]
+        EndpointType::Grpc(_) => Ok(()),
         #[cfg(feature = "mongodb")]
         EndpointType::MongoDb(_) => Ok(()),
         EndpointType::File(_) => Ok(()),
@@ -499,6 +507,10 @@ async fn create_base_publisher(
         #[cfg(feature = "zeromq")]
         EndpointType::ZeroMq(cfg) => {
             Ok(Box::new(zeromq::ZeroMqPublisher::new(cfg).await?) as Box<dyn MessagePublisher>)
+        }
+        #[cfg(feature = "grpc")]
+        EndpointType::Grpc(cfg) => {
+            Ok(Box::new(grpc::GrpcPublisher::new(cfg).await?) as Box<dyn MessagePublisher>)
         }
         #[cfg(any(feature = "http-client", feature = "http-server"))]
         EndpointType::Http(cfg) => {

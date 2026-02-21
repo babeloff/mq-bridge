@@ -158,6 +158,7 @@ fn is_known_endpoint_name(name: &str) -> bool {
             | "ibm-mq"
             | "ibmmq"
             | "zeromq"
+            | "grpc"
             | "fanout"
             | "switch"
             | "response"
@@ -413,6 +414,7 @@ pub enum EndpointType {
     Http(HttpConfig),
     IbmMq(IbmMqConfig),
     ZeroMq(ZeroMqConfig),
+    Grpc(GrpcConfig),
     Fanout(Vec<Endpoint>),
     Switch(SwitchConfig),
     Response(ResponseConfig),
@@ -441,6 +443,7 @@ impl EndpointType {
             EndpointType::Http(_) => "http",
             EndpointType::IbmMq(_) => "ibmmq",
             EndpointType::ZeroMq(_) => "zeromq",
+            EndpointType::Grpc(_) => "grpc",
             EndpointType::Fanout(_) => "fanout",
             EndpointType::Switch(_) => "switch",
             EndpointType::Response(_) => "response",
@@ -956,6 +959,20 @@ pub enum ZeroMqSocketType {
     Sub,
     Req,
     Rep,
+}
+
+// --- gRPC Specific Configuration ---
+
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct GrpcConfig {
+    /// The gRPC server URL (e.g., "http://[::1]:50051").
+    pub url: String,
+    /// The topic to subscribe to.
+    pub topic: Option<String>,
+    /// Timeout in milliseconds.
+    pub timeout_ms: Option<u64>,
 }
 
 // --- HTTP Specific Configuration ---
