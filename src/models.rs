@@ -669,7 +669,7 @@ pub struct SledConfig {
 pub struct FileConfig {
     /// Path to the file.
     pub path: String,
-    #[serde(flatten)]
+    #[serde(default, flatten)]
     pub mode: FileConsumerMode,
 }
 
