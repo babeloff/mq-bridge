@@ -293,6 +293,17 @@
         {
           "type": "object",
           "properties": {
+            "sled": {
+              "$ref": "#/$defs/SledConfig"
+            }
+          },
+          "required": [
+            "sled"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
             "amqp": {
               "$ref": "#/$defs/AmqpConfig"
             }
@@ -359,6 +370,17 @@
         {
           "type": "object",
           "properties": {
+            "grpc": {
+              "$ref": "#/$defs/GrpcConfig"
+            }
+          },
+          "required": [
+            "grpc"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
             "fanout": {
               "type": "array",
               "items": {
@@ -390,6 +412,17 @@
           },
           "required": [
             "response"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "reader": {
+              "$ref": "#/$defs/Endpoint"
+            }
+          },
+          "required": [
+            "reader"
           ]
         },
         {
@@ -433,21 +466,118 @@
         "path": {
           "description": "Path to the file.",
           "type": "string"
-        },
-        "subscribe_mode": {
-          "description": "(Consumer only) If true, acts in **Subscriber mode** (like `tail -f`), reading new lines as they are written.\nIf false (default), acts in Consumer mode, reading lines and removing them from the file (queue behavior).",
-          "type": "boolean",
-          "default": false
         }
       },
+      "oneOf": [
+        {
+          "description": "**Queue Mode**: Reads from the beginning of the file.",
+          "type": "object",
+          "properties": {
+            "delete": {
+              "type": "boolean",
+              "default": false
+            },
+            "mode": {
+              "type": "string",
+              "const": "consume"
+            }
+          },
+          "required": [
+            "mode"
+          ]
+        },
+        {
+          "description": "**Broadcast Mode**: Tails the file (starts at the end).",
+          "type": "object",
+          "properties": {
+            "delete": {
+              "type": "boolean",
+              "default": false
+            },
+            "mode": {
+              "type": "string",
+              "const": "subscribe"
+            }
+          },
+          "required": [
+            "mode"
+          ]
+        },
+        {
+          "description": "**Persistent Mode**: Reads the file with offset tracking.",
+          "type": "object",
+          "properties": {
+            "group_id": {
+              "description": "The consumer group ID that is used for offset tracking. Should be unique.",
+              "type": "string"
+            },
+            "mode": {
+              "type": "string",
+              "const": "group_subscribe"
+            },
+            "read_from_tail": {
+              "description": "If true, starts reading from the end of the file if no offset is stored.\nIf false, starts reading from the beginning.",
+              "type": "boolean",
+              "default": false
+            }
+          },
+          "required": [
+            "mode",
+            "group_id"
+          ]
+        }
+      ],
       "required": [
         "path"
+      ]
+    },
+    "GrpcConfig": {
+      "type": "object",
+      "properties": {
+        "timeout_ms": {
+          "description": "Timeout in milliseconds.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "topic": {
+          "description": "The topic to subscribe to.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "url": {
+          "description": "The gRPC server URL (e.g., \"http://[::1]:50051\").",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "url"
       ]
     },
     "HttpConfig": {
       "description": "General HTTP connection configuration.",
       "type": "object",
       "properties": {
+        "fire_and_forget": {
+          "description": "(Consumer only) If true, respond immediately with 202 Accepted without waiting for downstream processing. Defaults to false.",
+          "type": "boolean",
+          "default": false
+        },
+        "internal_buffer_size": {
+          "description": "(Consumer only) Internal buffer size for the channel. Defaults to 100.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0
+        },
         "message_id_header": {
           "description": "(Consumer only) Header key to extract the message ID from. Defaults to \"message-id\".",
           "type": [
@@ -568,7 +698,7 @@
           "description": "Required. Connection URL in `host(port)` format. Supports comma-separated list for failover (e.g., `host1(1414),host2(1414)`).",
           "type": "string"
         },
-        "user": {
+        "username": {
           "description": "Username for authentication. Optional; required if the channel enforces authentication.",
           "type": [
             "string",
@@ -819,6 +949,18 @@
         {
           "type": "object",
           "properties": {
+            "weak_join": {
+              "$ref": "#/$defs/WeakJoinMiddleware"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "weak_join"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
             "custom": {
               "type": "object",
               "properties": {
@@ -844,6 +986,14 @@
       "description": "General MongoDB connection configuration.",
       "type": "object",
       "properties": {
+        "capped_size_bytes": {
+          "description": "(Publisher only) If set, creates a capped collection with this size in bytes.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
         "change_stream": {
           "description": "(Consumer only) If true, use Change Streams (**Subscriber mode**). Defaults to false (polling/consumer mode).",
           "type": "boolean",
@@ -856,9 +1006,21 @@
             "null"
           ]
         },
+        "cursor_id": {
+          "description": "The ID used for the cursor in sequenced mode. If not provided, consumption starts from the current sequence (ephemeral).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "database": {
           "description": "The database name.",
           "type": "string"
+        },
+        "format": {
+          "description": "Format for storing messages. Defaults to Normal.",
+          "$ref": "#/$defs/MongoDbFormat",
+          "default": "normal"
         },
         "password": {
           "description": "Optional password. Takes precedence over any credentials embedded in the `url`.\nUse embedded URL credentials for simple one-off connections but prefer explicit username/password fields (or environment-sourced secrets) for clarity and secret management in production.",
@@ -936,6 +1098,14 @@
       "required": [
         "url",
         "database"
+      ]
+    },
+    "MongoDbFormat": {
+      "type": "string",
+      "enum": [
+        "normal",
+        "json",
+        "raw"
       ]
     },
     "MqttConfig": {
@@ -1270,6 +1440,37 @@
         "input"
       ]
     },
+    "SledConfig": {
+      "description": "General Sled database configuration",
+      "type": "object",
+      "properties": {
+        "delete_after_read": {
+          "description": "(Consumer only) If true, delete messages after processing (Queue mode).",
+          "type": "boolean",
+          "default": false
+        },
+        "path": {
+          "description": "Path to the Sled database directory.",
+          "type": "string"
+        },
+        "read_from_start": {
+          "description": "(Consumer only) If true, start reading from the beginning of the tree.",
+          "type": "boolean",
+          "default": false
+        },
+        "tree": {
+          "description": "The tree name to use as a queue. Defaults to \"default\".",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "path"
+      ]
+    },
     "SwitchConfig": {
       "type": "object",
       "properties": {
@@ -1341,12 +1542,37 @@
         },
         "required": {
           "description": "If true, enable TLS/SSL.",
-          "type": "boolean"
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "WeakJoinMiddleware": {
+      "type": "object",
+      "properties": {
+        "expected_count": {
+          "description": "The number of messages to wait for.",
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "group_by": {
+          "description": "The metadata key to group messages by (e.g., \"correlation_id\").",
+          "type": "string"
+        },
+        "timeout_ms": {
+          "description": "Timeout in milliseconds.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
         }
       },
       "additionalProperties": false,
       "required": [
-        "required"
+        "group_by",
+        "expected_count",
+        "timeout_ms"
       ]
     },
     "ZeroMqConfig": {
