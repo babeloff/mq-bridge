@@ -664,13 +664,43 @@ pub struct SledConfig {
 
 // --- File Specific Configuration ---
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct FileConfig {
     /// Path to the file.
     pub path: String,
     #[serde(default, flatten)]
     pub mode: FileConsumerMode,
+}
+
+impl<'de> Deserialize<'de> for FileConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct FileConfigHelper {
+            path: String,
+            #[serde(flatten)]
+            extra: serde_json::Value,
+        }
+
+        let helper = FileConfigHelper::deserialize(deserializer)?;
+        let mut extra = helper.extra;
+
+        if let serde_json::Value::Object(ref mut map) = extra {
+            if !map.contains_key("mode") {
+                map.insert("mode".to_string(), serde_json::Value::String("consume".to_string()));
+            }
+        }
+
+        let mode: FileConsumerMode = serde_json::from_value(extra).map_err(serde::de::Error::custom)?;
+
+        Ok(FileConfig {
+            path: helper.path,
+            mode,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1137,6 +1167,10 @@ kafka_to_nats:
   output:
     middlewares:
       - metrics: {}
+      - dlq:
+          endpoint:
+            file:
+              path: "error.out"
     nats:
       subject: "output-subject"
       url: "nats://localhost:4222"
@@ -1209,7 +1243,7 @@ kafka_to_nats:
 
         // --- Assert Output ---
         let output = &route.output;
-        assert_eq!(output.middlewares.len(), 1);
+        assert_eq!(output.middlewares.len(), 2);
         assert!(matches!(output.middlewares[0], Middleware::Metrics(_)));
 
         if let EndpointType::Nats(nats) = &output.endpoint_type {
