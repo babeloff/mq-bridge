@@ -690,11 +690,15 @@ impl<'de> Deserialize<'de> for FileConfig {
 
         if let serde_json::Value::Object(ref mut map) = extra {
             if !map.contains_key("mode") {
-                map.insert("mode".to_string(), serde_json::Value::String("consume".to_string()));
+                map.insert(
+                    "mode".to_string(),
+                    serde_json::Value::String("consume".to_string()),
+                );
             }
         }
 
-        let mode: FileConsumerMode = serde_json::from_value(extra).map_err(serde::de::Error::custom)?;
+        let mode: FileConsumerMode =
+            serde_json::from_value(extra).map_err(serde::de::Error::custom)?;
 
         Ok(FileConfig {
             path: helper.path,

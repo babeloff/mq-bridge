@@ -4,6 +4,8 @@ package mqbridge;
 service Bridge {
     // Publishes a message to the bridge
     rpc Publish (BridgeMessage) returns (PublishResponse);
+    // Publishes a batch of messages using a client stream
+    rpc PublishBatch (stream BridgeMessage) returns (PublishResponse);
     // Subscribes to a stream of messages from the bridge
     rpc Subscribe (SubscribeRequest) returns (stream BridgeMessage);
 }

@@ -12,13 +12,13 @@ use crate::traits::{
 use crate::CanonicalMessage;
 use anyhow::{anyhow, Context};
 use async_trait::async_trait;
-use std::ops::Bound;
+use once_cell::sync::Lazy;
 use sled::{Db, IVec, Tree};
 use std::any::Any;
-use tracing::trace;
 use std::collections::HashMap;
+use std::ops::Bound;
 use std::sync::Mutex;
-use once_cell::sync::Lazy;
+use tracing::trace;
 
 pub struct SledPublisher {
     db: Db,
@@ -28,7 +28,9 @@ pub struct SledPublisher {
 static SLED_DBS: Lazy<Mutex<HashMap<String, Db>>> = Lazy::new(|| Mutex::new(HashMap::new()));
 
 fn get_or_open_db(path: &str) -> anyhow::Result<Db> {
-    let mut dbs = SLED_DBS.lock().map_err(|_| anyhow!("Sled DB registry lock poisoned"))?;
+    let mut dbs = SLED_DBS
+        .lock()
+        .map_err(|_| anyhow!("Sled DB registry lock poisoned"))?;
     if let Some(db) = dbs.get(path) {
         return Ok(db.clone());
     }
@@ -41,7 +43,9 @@ impl SledPublisher {
     pub fn new(config: &SledConfig) -> anyhow::Result<Self> {
         let db = get_or_open_db(&config.path).context("Failed to open Sled DB")?;
         let tree_name = config.tree.as_deref().unwrap_or("default");
-        let tree = db.open_tree(tree_name).context("Failed to open Sled tree")?;
+        let tree = db
+            .open_tree(tree_name)
+            .context("Failed to open Sled tree")?;
         Ok(Self { db, tree })
     }
 }
@@ -54,8 +58,8 @@ impl MessagePublisher for SledPublisher {
             .generate_id()
             .map_err(|e| PublisherError::Retryable(anyhow!(e)))?;
         let key = id.to_be_bytes();
-        let value = serde_json::to_vec(&message)
-            .map_err(|e| PublisherError::NonRetryable(anyhow!(e)))?;
+        let value =
+            serde_json::to_vec(&message).map_err(|e| PublisherError::NonRetryable(anyhow!(e)))?;
 
         self.tree
             .insert(key, value)
@@ -211,7 +215,9 @@ impl SledConsumer {
     pub fn new(config: &SledConfig) -> anyhow::Result<Self> {
         let db = get_or_open_db(&config.path).context("Failed to open Sled DB")?;
         let tree_name = config.tree.as_deref().unwrap_or("default");
-        let tree = db.open_tree(tree_name).context("Failed to open Sled tree")?;
+        let tree = db
+            .open_tree(tree_name)
+            .context("Failed to open Sled tree")?;
 
         let mut subscriber = tree.watch_prefix(vec![]);
         let (tx, rx) = async_channel::bounded(1);
@@ -293,7 +299,10 @@ impl MessageConsumer for SledConsumer {
         }
     }
 
-    async fn receive_batch(&mut self, _max_messages: usize) -> Result<ReceivedBatch, ConsumerError> {
+    async fn receive_batch(
+        &mut self,
+        _max_messages: usize,
+    ) -> Result<ReceivedBatch, ConsumerError> {
         let received = self.receive().await?;
         Ok(ReceivedBatch {
             messages: vec![received.message],

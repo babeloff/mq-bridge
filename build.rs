@@ -1,4 +1,4 @@
-fn main()  -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     if std::env::var("CARGO_FEATURE_IBM_MQ").is_ok() {
         // Ensure rebuild when these environment variables change
         println!("cargo:rerun-if-env-changed=MQ_INSTALLATION_PATH");
@@ -30,10 +30,7 @@ fn main()  -> Result<(), Box<dyn std::error::Error>> {
     {
         std::env::set_var("PROTOC", protobuf_src::protoc());
         tonic_prost_build::configure()
-            .compile_protos(
-                &["src/endpoints/grpc.proto"],
-                &["src/endpoints"],
-            )?;
+            .compile_protos(&["src/endpoints/grpc.proto"], &["src/endpoints"])?;
     }
     Ok(())
 }

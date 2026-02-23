@@ -4,9 +4,7 @@
 //  git clone https://github.com/marcomq/mq-bridge
 
 use crate::models::GrpcConfig;
-use crate::traits::{
-    ConsumerError, MessageConsumer, MessagePublisher, PublisherError, SentBatch,
-};
+use crate::traits::{ConsumerError, MessageConsumer, MessagePublisher, PublisherError, SentBatch};
 use crate::CanonicalMessage;
 use anyhow::Result;
 use async_trait::async_trait;
@@ -33,7 +31,10 @@ pub struct GrpcConsumer {
 impl GrpcConsumer {
     pub async fn new(config: &GrpcConfig) -> Result<Self> {
         let client = BridgeClient::connect(config.url.clone()).await?;
-        let topic = config.topic.clone().unwrap_or_else(|| "default".to_string());
+        let topic = config
+            .topic
+            .clone()
+            .unwrap_or_else(|| "default".to_string());
         Ok(Self {
             client: Mutex::new(client),
             stream: Mutex::new(None),
@@ -71,14 +72,15 @@ impl MessageConsumer for GrpcConsumer {
                         None
                     } else if let Ok(uuid) = Uuid::parse_str(&msg.id) {
                         Some(uuid.as_u128())
-                    } else if let Ok(n) = u128::from_str_radix(msg.id.trim_start_matches("0x"), 16) {
+                    } else if let Ok(n) = u128::from_str_radix(msg.id.trim_start_matches("0x"), 16)
+                    {
                         Some(n)
                     } else {
                         msg.id.parse::<u128>().ok()
                     };
 
-                    let canonical = CanonicalMessage::new(msg.payload, message_id)
-                        .with_metadata(msg.metadata);
+                    let canonical =
+                        CanonicalMessage::new(msg.payload, message_id).with_metadata(msg.metadata);
                     Ok(crate::outcomes::ReceivedBatch {
                         messages: vec![canonical],
                         commit: Box::new(|_| Box::pin(async { Ok(()) })), // Auto-ack for now
@@ -119,15 +121,27 @@ impl MessagePublisher for GrpcPublisher {
         messages: Vec<CanonicalMessage>,
     ) -> Result<SentBatch, PublisherError> {
         let mut client = self.client.lock().await;
-        for msg in messages {
-            let req = BridgeMessage {
-                payload: msg.payload.to_vec(),
-                id: msg.message_id.to_string(),
-                metadata: msg.metadata.into_iter().collect(),
-            };
-            let _ = client.publish(req).await.map_err(anyhow::Error::from)?;
+        let bridge_messages = messages.into_iter().map(|msg| BridgeMessage {
+            payload: msg.payload.to_vec(),
+            id: fast_uuid_v7::format_uuid(msg.message_id).to_string(),
+            metadata: msg.metadata.into_iter().collect(),
+        });
+
+        let request_stream = tokio_stream::iter(bridge_messages);
+
+        let response = client
+            .publish_batch(request_stream)
+            .await
+            .map_err(anyhow::Error::from)?;
+
+        let inner_response = response.into_inner();
+        if inner_response.success {
+            Ok(SentBatch::Ack)
+        } else {
+            Err(PublisherError::Retryable(anyhow::anyhow!(
+                inner_response.error
+            )))
         }
-        Ok(SentBatch::Ack)
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -147,8 +161,6 @@ mod tests {
 
     struct MockBridge {
         tx: mpsc::Sender<Result<BridgeMessage, Status>>,
-        #[allow(dead_code)]
-        rx: tokio::sync::Mutex<mpsc::Receiver<Result<BridgeMessage, Status>>>,
     }
 
     #[tonic::async_trait]
@@ -159,6 +171,20 @@ mod tests {
         ) -> Result<Response<PublishResponse>, Status> {
             let msg = request.into_inner();
             self.tx.send(Ok(msg)).await.unwrap();
+            Ok(Response::new(PublishResponse {
+                success: true,
+                error: "".to_string(),
+            }))
+        }
+
+        async fn publish_batch(
+            &self,
+            request: Request<tonic::Streaming<BridgeMessage>>,
+        ) -> Result<Response<PublishResponse>, Status> {
+            let mut stream = request.into_inner();
+            while let Some(msg_result) = stream.message().await? {
+                self.tx.send(Ok(msg_result)).await.unwrap();
+            }
             Ok(Response::new(PublishResponse {
                 success: true,
                 error: "".to_string(),
@@ -181,7 +207,7 @@ mod tests {
             let (tx, rx) = mpsc::channel(4);
             tx.send(Ok(BridgeMessage {
                 payload: b"grpc_payload".to_vec(),
-                id: "1".to_string(),
+                id: "0190163d-8694-739b-aea5-966c26f8ad91".to_string(),
                 metadata: Default::default(),
             }))
             .await
@@ -194,11 +220,8 @@ mod tests {
     #[tokio::test]
     async fn test_grpc_publisher_and_consumer() {
         let addr = "[::1]:50051".parse().unwrap();
-        let (tx, rx) = mpsc::channel(10);
-        let bridge = MockBridge {
-            tx,
-            rx: tokio::sync::Mutex::new(rx),
-        };
+        let (tx, mut rx) = mpsc::channel(10);
+        let bridge = MockBridge { tx };
 
         // Start Server
         let server_handle = tokio::spawn(async move {
@@ -228,10 +251,15 @@ mod tests {
             .await
             .expect("Failed to create publisher");
 
+        let sent_payload = "hello_grpc";
         publisher
-            .send("hello_grpc".into())
+            .send(sent_payload.into())
             .await
             .expect("Failed to send");
+
+        // Verify the mock server received the message from the publisher
+        let received_msg = rx.recv().await.unwrap().unwrap();
+        assert_eq!(received_msg.payload, sent_payload.as_bytes());
 
         // 2. Test Consumer
         let consumer_ep = Endpoint {
