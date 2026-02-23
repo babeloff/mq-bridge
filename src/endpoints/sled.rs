@@ -243,6 +243,28 @@ impl SledConsumer {
             .open_tree(format!("{}_inflight", tree_name))
             .context("Failed to open Sled inflight tree")?;
 
+        if config.delete_after_read && !inflight_tree.is_empty() {
+            let inflight_items: Vec<_> = inflight_tree.iter().collect::<Result<_, _>>()?;
+            if !inflight_items.is_empty() {
+                tracing::info!(
+                    "Found {} inflight messages from previous Sled session, attempting recovery...",
+                    inflight_items.len()
+                );
+                let (tree_ref, inflight_tree_ref) = (&tree, &inflight_tree);
+                let tx_result: Result<(), _> =
+                    (tree_ref, inflight_tree_ref).transaction(|(t_main, t_inflight)| {
+                        for (key, value) in &inflight_items {
+                            t_main.insert(key, value)?;
+                            t_inflight.remove(key)?;
+                        }
+                        Ok::<(), sled::transaction::ConflictableTransactionError<()>>(())
+                    });
+                if let Err(e) = tx_result {
+                    return Err(anyhow!("Failed to recover inflight Sled messages: {:?}", e));
+                }
+            }
+        }
+
         let subscriber = tree.watch_prefix(vec![]);
         let (tx, rx) = async_channel::bounded(1);
 
@@ -383,6 +405,12 @@ impl MessageConsumer for SledConsumer {
     }
 
     async fn receive_batch(&mut self, max_messages: usize) -> Result<ReceivedBatch, ConsumerError> {
+        if max_messages == 0 {
+            return Ok(ReceivedBatch {
+                messages: Vec::new(),
+                commit: Box::new(|_| Box::pin(async { Ok(()) })),
+            });
+        }
         let mut messages = Vec::with_capacity(max_messages);
         let mut commits = Vec::with_capacity(max_messages);
 

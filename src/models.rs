@@ -1125,6 +1125,8 @@ pub struct TlsConfig {
     /// If true, disable server certificate verification (insecure).
     #[serde(default)]
     pub accept_invalid_certs: bool,
+    /// The domain name to verify the server's certificate against.
+    pub domain_name: Option<String>,
 }
 
 impl TlsConfig {

@@ -32,6 +32,11 @@ pub struct GrpcConsumer {
 impl GrpcConsumer {
     pub async fn new(config: &GrpcConfig) -> Result<Self> {
         let mut endpoint = tonic::transport::Endpoint::from_shared(config.url.clone())?;
+        if config.tls.required {
+            return Err(anyhow::anyhow!(
+                "gRPC TLS support is not compiled in. Please enable tonic TLS features."
+            ));
+        }
         if let Some(timeout) = config.timeout_ms {
             endpoint = endpoint.connect_timeout(Duration::from_millis(timeout));
         }
@@ -138,6 +143,11 @@ pub struct GrpcPublisher {
 impl GrpcPublisher {
     pub async fn new(config: &GrpcConfig) -> Result<Self> {
         let mut endpoint = tonic::transport::Endpoint::from_shared(config.url.clone())?;
+        if config.tls.required {
+            return Err(anyhow::anyhow!(
+                "gRPC TLS support is not compiled in. Please enable tonic TLS features."
+            ));
+        }
         if let Some(timeout) = config.timeout_ms {
             endpoint = endpoint.connect_timeout(Duration::from_millis(timeout));
         }
