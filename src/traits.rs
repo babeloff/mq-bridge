@@ -82,7 +82,10 @@ impl<T: Handler + ?Sized> Handler for Arc<T> {
 ///
 /// Implementations of this trait can be adapted to `Handler` using `SimpleHandler`.
 pub trait AsyncHandler: Send + Sync + 'static {
-    fn handle(&self, msg: CanonicalMessage) -> impl std::future::Future<Output = Result<Handled, HandlerError>> + Send;
+    fn handle(
+        &self,
+        msg: CanonicalMessage,
+    ) -> impl std::future::Future<Output = Result<Handled, HandlerError>> + Send;
 }
 
 /// A wrapper struct that adapts an `AsyncHandler` to the `Handler` trait.

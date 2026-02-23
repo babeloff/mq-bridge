@@ -362,7 +362,9 @@ impl MessageConsumer for SledConsumer {
                                             }
                                             Ok(())
                                         })
-                                        .map_err(|e: sled::transaction::TransactionError<()>| anyhow!("{:?}", e))?;
+                                        .map_err(|e: sled::transaction::TransactionError<()>| {
+                                            anyhow!("{:?}", e)
+                                        })?;
                                 }
                             }
                         }
