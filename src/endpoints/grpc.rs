@@ -292,6 +292,7 @@ mod tests {
             url: format!("http://{}", addr),
             timeout_ms: None,
             topic: Some("test_topic".to_string()),
+            ..Default::default()
         };
 
         // 1. Test Publisher
@@ -366,6 +367,7 @@ mod tests {
             url: format!("http://{}", addr),
             timeout_ms: None,
             topic: Some("e2e_test_topic".to_string()),
+            ..Default::default()
         };
 
         // Source for sending messages into the system
