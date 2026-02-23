@@ -29,6 +29,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(feature = "grpc")]
     {
         std::env::set_var("PROTOC", protoc_bin_vendored::protoc_bin_path().unwrap());
+        println!("cargo:rerun-if-changed=src/endpoints/grpc.proto");
         tonic_prost_build::configure()
             .compile_protos(&["src/endpoints/grpc.proto"], &["src/endpoints"])?;
     }

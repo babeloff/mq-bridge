@@ -101,7 +101,7 @@ tonic-prost-build = { version = "0.14", optional = true, default-features = fals
 protoc-bin-vendored = { version = "3.0", optional = true }
 
 [features]
-default = ["grpc"]
+default = []
 middleware = ["metrics", "dedup", "panic"]
 full = ["middleware", "mongodb", "kafka", "amqp", "nats", "mqtt", "http", "aws", "zeromq", "sled", "grpc"]
 
@@ -126,6 +126,7 @@ http-server = ["actix-web", "rustls", "tokio-rustls", "rustls-pemfile", "url"]
 aws = ["aws-config", "aws-sdk-sqs", "aws-sdk-sns"]
 ibm-mq = ["mqi"]
 zeromq = ["dep:zeromq"]
+# Note: The grpc feature requires protobuf-src which can significantly increase build times.
 grpc = ["tonic", "prost", "tokio-stream", "tonic-prost", "tonic-prost-build", "protoc-bin-vendored"]
 
 [dev-dependencies]

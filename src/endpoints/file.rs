@@ -386,7 +386,6 @@ fn run_file_tail_task_sync(
     const MAX_SLEEP: std::time::Duration = std::time::Duration::from_millis(50);
     const BATCH_SIZE: usize = 1024;
     let mut buf = Vec::with_capacity(1024);
-    let mut initialized = false;
 
     loop {
         if reader.is_none() {
@@ -398,10 +397,6 @@ fn run_file_tail_task_sync(
                     continue;
                 }
             };
-
-            if !initialized {
-                initialized = true;
-            }
 
             if let Ok(metadata) = file.metadata() {
                 if metadata.len() < last_position {

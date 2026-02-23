@@ -70,11 +70,7 @@ impl MessagePublisher for ReaderPublisher {
                     }
                 }
 
-                // We return the received messages as responses.
-                Ok(SentBatch::Partial {
-                    responses: Some(batch.messages),
-                    failed: vec![],
-                })
+                Ok(SentBatch::Ack)
             }
             Err(e) => match e {
                 ConsumerError::EndOfStream => Err(PublisherError::NonRetryable(anyhow::anyhow!(e))),

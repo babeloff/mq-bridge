@@ -1007,6 +1007,9 @@ pub struct GrpcConfig {
     pub topic: Option<String>,
     /// Timeout in milliseconds.
     pub timeout_ms: Option<u64>,
+    /// TLS configuration.
+    #[serde(default)]
+    pub tls: TlsConfig,
 }
 
 // --- HTTP Specific Configuration ---

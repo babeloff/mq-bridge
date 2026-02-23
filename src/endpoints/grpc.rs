@@ -10,7 +10,6 @@ use anyhow::Result;
 use async_trait::async_trait;
 use std::any::Any;
 use std::time::Duration;
-use tokio::sync::Mutex;
 use tonic::transport::Channel;
 use uuid::Uuid;
 
@@ -23,28 +22,41 @@ use proto::bridge_client::BridgeClient;
 use proto::{BridgeMessage, SubscribeRequest};
 use tonic::Request;
 
+const GRPC_BATCH_POLL_MS: u64 = 10;
+
 pub struct GrpcConsumer {
-    _client: Mutex<BridgeClient<Channel>>,
-    stream: Mutex<Option<tonic::Streaming<BridgeMessage>>>,
+    _client: BridgeClient<Channel>,
+    stream: Option<tonic::Streaming<BridgeMessage>>,
 }
 
 impl GrpcConsumer {
     pub async fn new(config: &GrpcConfig) -> Result<Self> {
-        let mut client = BridgeClient::connect(config.url.clone()).await?;
+        let mut endpoint = tonic::transport::Endpoint::from_shared(config.url.clone())?;
+        if let Some(timeout) = config.timeout_ms {
+            endpoint = endpoint.connect_timeout(Duration::from_millis(timeout));
+        }
+        let channel = endpoint.connect().await?;
+        let mut client = BridgeClient::new(channel);
+
         let topic = config
             .topic
             .clone()
             .unwrap_or_else(|| "default".to_string());
 
         // Eagerly subscribe to ensure the consumer is ready upon creation.
-        let request = Request::new(SubscribeRequest {
-            topic: topic.clone(),
-        });
-        let stream = client.subscribe(request).await?.into_inner();
+        let request = Request::new(SubscribeRequest { topic });
+        let stream = if let Some(timeout) = config.timeout_ms {
+            tokio::time::timeout(Duration::from_millis(timeout), client.subscribe(request))
+                .await
+                .map_err(|_| anyhow::anyhow!("gRPC subscribe timed out"))??
+        } else {
+            client.subscribe(request).await?
+        }
+        .into_inner();
 
         Ok(Self {
-            _client: Mutex::new(client),
-            stream: Mutex::new(Some(stream)),
+            _client: client,
+            stream: Some(stream),
         })
     }
 }
@@ -55,10 +67,8 @@ impl MessageConsumer for GrpcConsumer {
         &mut self,
         max_messages: usize,
     ) -> Result<crate::outcomes::ReceivedBatch, ConsumerError> {
-        let mut stream_guard = self.stream.lock().await;
-
         let mut messages = Vec::with_capacity(max_messages);
-        if let Some(stream) = stream_guard.as_mut() {
+        if let Some(stream) = self.stream.as_mut() {
             // The first message will block until it arrives. Subsequent messages will be
             // fetched with a short timeout to fill the batch without blocking indefinitely.
             loop {
@@ -68,7 +78,8 @@ impl MessageConsumer for GrpcConsumer {
                     Ok(msg_future.await)
                 } else {
                     // Poll for subsequent messages
-                    tokio::time::timeout(Duration::from_millis(1), msg_future).await
+                    tokio::time::timeout(Duration::from_millis(GRPC_BATCH_POLL_MS), msg_future)
+                        .await
                 };
 
                 match msg_result {
@@ -120,14 +131,20 @@ impl MessageConsumer for GrpcConsumer {
 }
 
 pub struct GrpcPublisher {
-    client: Mutex<BridgeClient<Channel>>,
+    client: BridgeClient<Channel>,
+    timeout: Option<Duration>,
 }
 
 impl GrpcPublisher {
     pub async fn new(config: &GrpcConfig) -> Result<Self> {
-        let client = BridgeClient::connect(config.url.clone()).await?;
+        let mut endpoint = tonic::transport::Endpoint::from_shared(config.url.clone())?;
+        if let Some(timeout) = config.timeout_ms {
+            endpoint = endpoint.connect_timeout(Duration::from_millis(timeout));
+        }
+        let client = BridgeClient::new(endpoint.connect().await?);
         Ok(Self {
-            client: Mutex::new(client),
+            client,
+            timeout: config.timeout_ms.map(Duration::from_millis),
         })
     }
 }
@@ -138,7 +155,7 @@ impl MessagePublisher for GrpcPublisher {
         &self,
         messages: Vec<CanonicalMessage>,
     ) -> Result<SentBatch, PublisherError> {
-        let mut client = self.client.lock().await;
+        let mut client = self.client.clone();
         let bridge_messages = messages.into_iter().map(|msg| BridgeMessage {
             payload: msg.payload.to_vec(),
             id: fast_uuid_v7::format_uuid(msg.message_id).to_string(),
@@ -147,10 +164,17 @@ impl MessagePublisher for GrpcPublisher {
 
         let request_stream = tokio_stream::iter(bridge_messages);
 
-        let response = client
-            .publish_batch(request_stream)
-            .await
-            .map_err(anyhow::Error::from)?;
+        let response_fut = client.publish_batch(request_stream);
+        let response = if let Some(timeout) = self.timeout {
+            tokio::time::timeout(timeout, response_fut)
+                .await
+                .map_err(|_| {
+                    PublisherError::Retryable(anyhow::anyhow!("gRPC publish batch timed out"))
+                })?
+                .map_err(anyhow::Error::from)?
+        } else {
+            response_fut.await.map_err(anyhow::Error::from)?
+        };
 
         let inner_response = response.into_inner();
         if inner_response.success {
@@ -265,7 +289,7 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         let config = GrpcConfig {
-            url: "http://[::1]:50051".to_string(),
+            url: format!("http://{}", addr),
             timeout_ms: None,
             topic: Some("test_topic".to_string()),
         };
@@ -339,7 +363,7 @@ mod tests {
 
         // 2. Setup Config and Endpoints
         let config = GrpcConfig {
-            url: "http://[::1]:50052".to_string(),
+            url: format!("http://{}", addr),
             timeout_ms: None,
             topic: Some("e2e_test_topic".to_string()),
         };
