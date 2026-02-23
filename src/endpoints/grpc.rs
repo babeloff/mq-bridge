@@ -292,6 +292,7 @@ mod tests {
             url: format!("http://{}", addr),
             timeout_ms: None,
             topic: Some("test_topic".to_string()),
+            tls: Default::default(),
             ..Default::default()
         };
 
@@ -367,6 +368,7 @@ mod tests {
             url: format!("http://{}", addr),
             timeout_ms: None,
             topic: Some("e2e_test_topic".to_string()),
+            tls: Default::default(),
             ..Default::default()
         };
 
@@ -374,7 +376,7 @@ mod tests {
         let mem_source_topic = format!("e2e_in_{}", fast_uuid_v7::gen_id_str());
         let mem_dest_topic = format!("e2e_out_{}", fast_uuid_v7::gen_id_str());
         let mem_source_ep = Endpoint::new_memory(&mem_source_topic, 10);
-        let mut mem_source_publisher = mem_source_ep.create_publisher("mem_source").await.unwrap();
+        let mem_source_publisher = mem_source_ep.create_publisher("mem_source").await.unwrap();
 
         // The gRPC endpoint that will publish messages to our mock server
         let grpc_publisher_ep = Endpoint {

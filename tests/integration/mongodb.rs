@@ -61,6 +61,7 @@ pub async fn test_mongodb_chaos() {
 }
 
 #[tokio::test]
+#[ignore = "requires docker compose"]
 async fn test_mongodb_subscriber_no_duplicates() {
     use mq_bridge::models::{Endpoint, Route};
     use mq_bridge::traits::MessagePublisher;
