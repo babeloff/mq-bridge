@@ -116,7 +116,6 @@ impl MessagePublisher for SledPublisher {
     }
 }
 
-
 pub struct SledConsumer {
     _db: Db,
     tree: Tree,
@@ -341,7 +340,6 @@ impl MessageConsumer for SledConsumer {
         self
     }
 }
-
 
 #[cfg(test)]
 mod tests {
