@@ -116,112 +116,6 @@ impl MessagePublisher for SledPublisher {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::CanonicalMessage;
-    use tempfile::tempdir;
-    use tokio::time::{timeout, Duration};
-
-    #[tokio::test]
-    async fn test_sled_queue_mode() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().to_str().unwrap().to_string();
-        let config = SledConfig {
-            path: path.clone(),
-            tree: None,
-            read_from_start: true,
-            delete_after_read: true,
-        };
-
-        let publisher = SledPublisher::new(&config).unwrap();
-        let mut consumer = SledConsumer::new(&config).unwrap();
-
-        let msg = CanonicalMessage::new(b"queue_item".to_vec(), None);
-        publisher.send(msg.clone()).await.unwrap();
-
-        let received = timeout(Duration::from_secs(2), consumer.receive())
-            .await
-            .expect("Timed out waiting for message")
-            .unwrap();
-
-        assert_eq!(received.message.payload, msg.payload);
-
-        // Commit (Ack)
-        (received.commit)(MessageDisposition::Ack).await.unwrap();
-
-        // Verify DB is empty
-        let db = get_or_open_db(&path).unwrap();
-        let tree = db.open_tree("default").unwrap();
-        assert!(tree.is_empty());
-        close_db(&path).unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_sled_topic_mode() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().to_str().unwrap().to_string();
-        let config = SledConfig {
-            path: path.clone(),
-            tree: Some("topic".to_string()),
-            read_from_start: true,
-            delete_after_read: false,
-        };
-
-        let publisher = SledPublisher::new(&config).unwrap();
-        let mut consumer = SledConsumer::new(&config).unwrap();
-
-        let msg1 = CanonicalMessage::new(b"msg1".to_vec(), None);
-        publisher.send(msg1.clone()).await.unwrap();
-
-        let received1 = timeout(Duration::from_secs(2), consumer.receive())
-            .await
-            .expect("Timed out waiting for msg1")
-            .unwrap();
-        assert_eq!(received1.message.payload, msg1.payload);
-
-        let msg2 = CanonicalMessage::new(b"msg2".to_vec(), None);
-        publisher.send(msg2.clone()).await.unwrap();
-
-        let received2 = timeout(Duration::from_secs(2), consumer.receive())
-            .await
-            .expect("Timed out waiting for msg2")
-            .unwrap();
-        assert_eq!(received2.message.payload, msg2.payload);
-        close_db(&path).unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_sled_nack_requeue() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().to_str().unwrap().to_string();
-        let config = SledConfig {
-            path: path.clone(),
-            tree: None,
-            read_from_start: true,
-            delete_after_read: true,
-        };
-
-        let publisher = SledPublisher::new(&config).unwrap();
-        let mut consumer = SledConsumer::new(&config).unwrap();
-
-        let msg = CanonicalMessage::new(b"retry_me".to_vec(), None);
-        publisher.send(msg.clone()).await.unwrap();
-
-        // Receive and Nack
-        let received = consumer.receive().await.unwrap();
-        (received.commit)(MessageDisposition::Nack).await.unwrap();
-
-        // Should be available again
-        let received_retry = timeout(Duration::from_secs(2), consumer.receive())
-            .await
-            .expect("Timed out waiting for retry")
-            .unwrap();
-
-        assert_eq!(received_retry.message.payload, msg.payload);
-        close_db(&path).unwrap();
-    }
-}
 
 pub struct SledConsumer {
     _db: Db,
@@ -445,5 +339,113 @@ impl MessageConsumer for SledConsumer {
 
     fn as_any(&self) -> &dyn Any {
         self
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::CanonicalMessage;
+    use tempfile::tempdir;
+    use tokio::time::{timeout, Duration};
+
+    #[tokio::test]
+    async fn test_sled_queue_mode() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().to_str().unwrap().to_string();
+        let config = SledConfig {
+            path: path.clone(),
+            tree: None,
+            read_from_start: true,
+            delete_after_read: true,
+        };
+
+        let publisher = SledPublisher::new(&config).unwrap();
+        let mut consumer = SledConsumer::new(&config).unwrap();
+
+        let msg = CanonicalMessage::new(b"queue_item".to_vec(), None);
+        publisher.send(msg.clone()).await.unwrap();
+
+        let received = timeout(Duration::from_secs(2), consumer.receive())
+            .await
+            .expect("Timed out waiting for message")
+            .unwrap();
+
+        assert_eq!(received.message.payload, msg.payload);
+
+        // Commit (Ack)
+        (received.commit)(MessageDisposition::Ack).await.unwrap();
+
+        // Verify DB is empty
+        let db = get_or_open_db(&path).unwrap();
+        let tree = db.open_tree("default").unwrap();
+        assert!(tree.is_empty());
+        close_db(&path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_sled_topic_mode() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().to_str().unwrap().to_string();
+        let config = SledConfig {
+            path: path.clone(),
+            tree: Some("topic".to_string()),
+            read_from_start: true,
+            delete_after_read: false,
+        };
+
+        let publisher = SledPublisher::new(&config).unwrap();
+        let mut consumer = SledConsumer::new(&config).unwrap();
+
+        let msg1 = CanonicalMessage::new(b"msg1".to_vec(), None);
+        publisher.send(msg1.clone()).await.unwrap();
+
+        let received1 = timeout(Duration::from_secs(2), consumer.receive())
+            .await
+            .expect("Timed out waiting for msg1")
+            .unwrap();
+        assert_eq!(received1.message.payload, msg1.payload);
+
+        let msg2 = CanonicalMessage::new(b"msg2".to_vec(), None);
+        publisher.send(msg2.clone()).await.unwrap();
+
+        let received2 = timeout(Duration::from_secs(2), consumer.receive())
+            .await
+            .expect("Timed out waiting for msg2")
+            .unwrap();
+        assert_eq!(received2.message.payload, msg2.payload);
+        close_db(&path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_sled_nack_requeue() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().to_str().unwrap().to_string();
+        let config = SledConfig {
+            path: path.clone(),
+            tree: None,
+            read_from_start: true,
+            delete_after_read: true,
+        };
+
+        let publisher = SledPublisher::new(&config).unwrap();
+        let mut consumer = SledConsumer::new(&config).unwrap();
+
+        let msg = CanonicalMessage::new(b"retry_me".to_vec(), None);
+        publisher.send(msg.clone()).await.unwrap();
+
+        // Receive and Nack
+        let received = consumer.receive().await.unwrap();
+        (received.commit)(MessageDisposition::Nack).await.unwrap();
+
+        // Should be available again
+        let received_retry = timeout(Duration::from_secs(2), consumer.receive())
+            .await
+            .expect("Timed out waiting for retry")
+            .unwrap();
+
+        assert_eq!(received_retry.message.payload, msg.payload);
+        close_db(&path).unwrap();
     }
 }

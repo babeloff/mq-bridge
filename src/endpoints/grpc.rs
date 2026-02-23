@@ -302,7 +302,6 @@ mod tests {
             url: format!("http://{}", addr),
             timeout_ms: None,
             topic: Some("test_topic".to_string()),
-            tls: Default::default(),
             ..Default::default()
         };
 
@@ -378,7 +377,6 @@ mod tests {
             url: format!("http://{}", addr),
             timeout_ms: None,
             topic: Some("e2e_test_topic".to_string()),
-            tls: Default::default(),
             ..Default::default()
         };
 
@@ -409,11 +407,11 @@ mod tests {
         // 3. Setup and run routes using deploy()
         // Route 1: Memory -> gRPC (tests GrpcPublisher::send_batch)
         let route_to_grpc = Route::new(mem_source_ep, grpc_publisher_ep);
-        let _controller_to_grpc = route_to_grpc.deploy("route_to_grpc").await.unwrap();
+        route_to_grpc.deploy("route_to_grpc").await.unwrap();
 
         // Route 2: gRPC -> Memory (tests GrpcConsumer::receive_batch)
         let route_from_grpc = Route::new(grpc_consumer_ep, mem_dest_ep);
-        let _controller_from_grpc = route_from_grpc.deploy("route_from_grpc").await.unwrap();
+        route_from_grpc.deploy("route_from_grpc").await.unwrap();
 
         // 4. Execute test: Send a batch of messages into the first route
         let messages_to_send = vec![

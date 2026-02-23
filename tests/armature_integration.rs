@@ -111,7 +111,7 @@ fn armature_messaging_test() {
             )
             .replace(
                 "EndpointType::File(self.topic.clone())",
-                "EndpointType::File(mq_bridge::models::FileConfig { path: self.topic.clone(), subscribe_mode: false, delete: None })",
+                "EndpointType::File(mq_bridge::models::FileConfig { path: self.topic.clone(), ..Default::default() })",
             )
             .replace(
                 "concurrency: 1,",
