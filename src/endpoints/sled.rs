@@ -219,11 +219,11 @@ impl SledConsumer {
             .open_tree(tree_name)
             .context("Failed to open Sled tree")?;
 
-        let mut subscriber = tree.watch_prefix(vec![]);
+        let subscriber = tree.watch_prefix(vec![]);
         let (tx, rx) = async_channel::bounded(1);
 
         std::thread::spawn(move || {
-            while let Some(_event) = subscriber.next() {
+            for _event in subscriber {
                 if tx.send_blocking(()).is_err() {
                     break;
                 }

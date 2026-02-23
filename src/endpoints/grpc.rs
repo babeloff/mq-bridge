@@ -24,9 +24,8 @@ use proto::{BridgeMessage, SubscribeRequest};
 use tonic::Request;
 
 pub struct GrpcConsumer {
-    client: Mutex<BridgeClient<Channel>>,
+    _client: Mutex<BridgeClient<Channel>>,
     stream: Mutex<Option<tonic::Streaming<BridgeMessage>>>,
-    topic: String,
 }
 
 impl GrpcConsumer {
@@ -44,9 +43,8 @@ impl GrpcConsumer {
         let stream = client.subscribe(request).await?.into_inner();
 
         Ok(Self {
-            client: Mutex::new(client),
+            _client: Mutex::new(client),
             stream: Mutex::new(Some(stream)),
-            topic,
         })
     }
 }

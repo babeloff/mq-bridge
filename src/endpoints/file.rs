@@ -662,6 +662,7 @@ impl FileConsumer {
             let file = OpenOptions::new()
                 .write(true)
                 .create(true)
+                .truncate(false)
                 .open(&offset_path)
                 .await?;
             offset_file = Some(Arc::new(Mutex::new(file)));

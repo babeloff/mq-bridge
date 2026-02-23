@@ -1001,7 +1001,7 @@ pub enum ZeroMqSocketType {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct GrpcConfig {
-    /// The gRPC server URL (e.g., "http://[::1]:50051").
+    /// The gRPC server URL (e.g., "http://localhost:50051").
     pub url: String,
     /// The topic to subscribe to.
     pub topic: Option<String>,
