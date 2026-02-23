@@ -674,7 +674,7 @@ fn performance_benchmarks(c: &mut Criterion) {
         &BENCH_RESULTS,
         PERF_TEST_MESSAGE_COUNT,
         PERF_TEST_CONCURRENCY,
-        std::time::Duration::from_millis(100)
+        std::time::Duration::from_millis(200)
     );
     bench_backend!(
         "amqp",
