@@ -64,6 +64,7 @@
             "ca_file": null,
             "cert_file": null,
             "cert_password": null,
+            "domain_name": null,
             "key_file": null,
             "required": false
           }
@@ -543,6 +544,19 @@
           "format": "uint64",
           "minimum": 0
         },
+        "tls": {
+          "description": "TLS configuration.",
+          "$ref": "#/$defs/TlsConfig",
+          "default": {
+            "accept_invalid_certs": false,
+            "ca_file": null,
+            "cert_file": null,
+            "cert_password": null,
+            "domain_name": null,
+            "key_file": null,
+            "required": false
+          }
+        },
         "topic": {
           "description": "The topic to subscribe to.",
           "type": [
@@ -551,7 +565,7 @@
           ]
         },
         "url": {
-          "description": "The gRPC server URL (e.g., \"http://[::1]:50051\").",
+          "description": "The gRPC server URL (e.g., \"http://localhost:50051\").",
           "type": "string"
         }
       },
@@ -602,6 +616,7 @@
             "ca_file": null,
             "cert_file": null,
             "cert_password": null,
+            "domain_name": null,
             "key_file": null,
             "required": false
           }
@@ -683,6 +698,7 @@
             "ca_file": null,
             "cert_file": null,
             "cert_password": null,
+            "domain_name": null,
             "key_file": null,
             "required": false
           }
@@ -792,6 +808,7 @@
             "ca_file": null,
             "cert_file": null,
             "cert_password": null,
+            "domain_name": null,
             "key_file": null,
             "required": false
           }
@@ -1069,6 +1086,7 @@
             "ca_file": null,
             "cert_file": null,
             "cert_password": null,
+            "domain_name": null,
             "key_file": null,
             "required": false
           }
@@ -1196,6 +1214,7 @@
             "ca_file": null,
             "cert_file": null,
             "cert_password": null,
+            "domain_name": null,
             "key_file": null,
             "required": false
           }
@@ -1318,6 +1337,7 @@
             "ca_file": null,
             "cert_file": null,
             "cert_password": null,
+            "domain_name": null,
             "key_file": null,
             "required": false
           }
@@ -1528,6 +1548,13 @@
         },
         "cert_password": {
           "description": "Password for the private key (if encrypted).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "domain_name": {
+          "description": "The domain name to verify the server's certificate against.",
           "type": [
             "string",
             "null"
