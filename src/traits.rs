@@ -77,6 +77,24 @@ impl<T: Handler + ?Sized> Handler for Arc<T> {
     }
 }
 
+/// A helper trait that allows implementing handlers using native `async fn` syntax
+/// without the `#[async_trait]` macro.
+///
+/// Implementations of this trait can be adapted to `Handler` using `SimpleHandler`.
+pub trait AsyncHandler: Send + Sync + 'static {
+    fn handle<'a>(&'a self, msg: CanonicalMessage) -> BoxFuture<'a, Result<Handled, HandlerError>>;
+}
+
+/// A wrapper struct that adapts an `AsyncHandler` to the `Handler` trait.
+pub struct SimpleHandler<T>(pub T);
+
+#[async_trait]
+impl<T: AsyncHandler> Handler for SimpleHandler<T> {
+    async fn handle(&self, msg: CanonicalMessage) -> Result<Handled, HandlerError> {
+        self.0.handle(msg).await
+    }
+}
+
 /// A closure that can be called to commit the message.
 /// It returns a `BoxFuture` to allow for async commit operations.
 pub type CommitFunc =
@@ -448,5 +466,22 @@ mod tests {
             PublisherError::NonRetryable(e) => assert_eq!(e.to_string(), "inner"),
             _ => panic!("Expected NonRetryable error"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_simple_handler_wrapper() {
+        struct MyLogic;
+        impl AsyncHandler for MyLogic {
+            fn handle<'a>(
+                &'a self,
+                _msg: CanonicalMessage,
+            ) -> BoxFuture<'a, Result<Handled, HandlerError>> {
+                Box::pin(async { Ok(Handled::Ack) })
+            }
+        }
+
+        let handler = SimpleHandler(MyLogic);
+        let res = handler.handle(CanonicalMessage::from("test")).await;
+        assert!(matches!(res, Ok(Handled::Ack)));
     }
 }

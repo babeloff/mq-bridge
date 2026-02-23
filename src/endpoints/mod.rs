@@ -9,6 +9,8 @@ pub mod amqp;
 pub mod aws;
 pub mod fanout;
 pub mod file;
+#[cfg(feature = "grpc")]
+pub mod grpc;
 #[cfg(any(feature = "http-client", feature = "http-server"))]
 pub mod http;
 #[cfg(feature = "ibm-mq")]
@@ -23,7 +25,10 @@ pub mod mqtt;
 #[cfg(feature = "nats")]
 pub mod nats;
 pub mod null;
+pub mod reader;
 pub mod response;
+#[cfg(feature = "sled")]
+pub mod sled;
 pub mod static_endpoint;
 pub mod switch;
 #[cfg(feature = "zeromq")]
@@ -161,6 +166,8 @@ pub fn check_consumer(
         EndpointType::IbmMq(_) => Ok(()),
         #[cfg(feature = "mongodb")]
         EndpointType::MongoDb(_) => Ok(()),
+        #[cfg(feature = "grpc")]
+        EndpointType::Grpc(_) => Ok(()),
         #[cfg(any(feature = "http-client", feature = "http-server"))]
         EndpointType::Http(_) => {
             #[cfg(not(feature = "http-server"))]
@@ -170,12 +177,18 @@ pub fn check_consumer(
             #[cfg(feature = "http-server")]
             Ok(())
         }
+        #[cfg(feature = "sled")]
+        EndpointType::Sled(_) => Ok(()),
         EndpointType::Static(_) => Ok(()),
         EndpointType::Memory(_) => Ok(()),
         EndpointType::File(_) => Ok(()),
         EndpointType::Custom { .. } => Ok(()),
         EndpointType::Switch(_) => Err(anyhow!(
             "[route:{}] Switch endpoint is only supported as an output",
+            route_name
+        )),
+        EndpointType::Reader(_) => Err(anyhow!(
+            "[route:{}] Reader endpoint is only supported as an output",
             route_name
         )),
         #[allow(unreachable_patterns)]
@@ -263,6 +276,8 @@ async fn create_base_consumer(
         #[cfg(feature = "zeromq")]
         EndpointType::ZeroMq(cfg) => Ok(boxed(zeromq::ZeroMqConsumer::new(cfg).await?)),
         EndpointType::File(cfg) => Ok(boxed(file::FileConsumer::new(cfg).await?)),
+        #[cfg(feature = "grpc")]
+        EndpointType::Grpc(cfg) => Ok(boxed(grpc::GrpcConsumer::new(cfg).await?)),
         #[cfg(any(feature = "http-client", feature = "http-server"))]
         EndpointType::Http(cfg) => {
             #[cfg(feature = "http-server")]
@@ -276,6 +291,8 @@ async fn create_base_consumer(
         }
         EndpointType::Static(cfg) => Ok(boxed(static_endpoint::StaticRequestConsumer::new(cfg)?)),
         EndpointType::Memory(cfg) => Ok(boxed(memory::MemoryConsumer::new(cfg)?)),
+        #[cfg(feature = "sled")]
+        EndpointType::Sled(cfg) => Ok(boxed(sled::SledConsumer::new(cfg)?)),
         #[cfg(feature = "mongodb")]
         EndpointType::MongoDb(cfg) => {
             let mut config = cfg.clone();
@@ -364,11 +381,15 @@ fn check_publisher_recursive(
             #[cfg(feature = "reqwest")]
             Ok(())
         }
+        #[cfg(feature = "grpc")]
+        EndpointType::Grpc(_) => Ok(()),
         #[cfg(feature = "mongodb")]
         EndpointType::MongoDb(_) => Ok(()),
         EndpointType::File(_) => Ok(()),
         EndpointType::Static(_) => Ok(()),
         EndpointType::Memory(_) => Ok(()),
+        #[cfg(feature = "sled")]
+        EndpointType::Sled(_) => Ok(()),
         EndpointType::Null => Ok(()),
         EndpointType::Fanout(endpoints) => {
             for endpoint in endpoints {
@@ -387,6 +408,7 @@ fn check_publisher_recursive(
         }
         EndpointType::Response(_) => Ok(()),
         EndpointType::Custom { .. } => Ok(()),
+        EndpointType::Reader(inner) => check_consumer(route_name, inner, allowed_types),
         #[allow(unreachable_patterns)]
         _ => {
             if let Some(allowed) = allowed_types {
@@ -486,6 +508,10 @@ async fn create_base_publisher(
         EndpointType::ZeroMq(cfg) => {
             Ok(Box::new(zeromq::ZeroMqPublisher::new(cfg).await?) as Box<dyn MessagePublisher>)
         }
+        #[cfg(feature = "grpc")]
+        EndpointType::Grpc(cfg) => {
+            Ok(Box::new(grpc::GrpcPublisher::new(cfg).await?) as Box<dyn MessagePublisher>)
+        }
         #[cfg(any(feature = "http-client", feature = "http-server"))]
         EndpointType::Http(cfg) => {
             #[cfg(feature = "reqwest")]
@@ -516,6 +542,10 @@ async fn create_base_publisher(
         EndpointType::Memory(cfg) => {
             Ok(Box::new(memory::MemoryPublisher::new(cfg)?) as Box<dyn MessagePublisher>)
         }
+        #[cfg(feature = "sled")]
+        EndpointType::Sled(cfg) => {
+            Ok(Box::new(sled::SledPublisher::new(cfg)?) as Box<dyn MessagePublisher>)
+        }
         EndpointType::Null => Ok(Box::new(null::NullPublisher) as Box<dyn MessagePublisher>),
         EndpointType::Fanout(endpoints) => {
             let mut publishers = Vec::with_capacity(endpoints.len());
@@ -544,6 +574,10 @@ async fn create_base_publisher(
         }
         EndpointType::Response(_) => {
             Ok(Box::new(response::ResponsePublisher) as Box<dyn MessagePublisher>)
+        }
+        EndpointType::Reader(inner) => {
+            let consumer = create_consumer_from_route(route_name, inner).await?;
+            Ok(Box::new(reader::ReaderPublisher::new(consumer)) as Box<dyn MessagePublisher>)
         }
         EndpointType::Custom { name, config } => {
             let factory = get_endpoint_factory(name)

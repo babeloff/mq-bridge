@@ -476,8 +476,7 @@ pub mod file_helper {
 
         let config = FileConfig {
             path: path_str,
-            subscribe_mode: false,
-            delete: Some(false),
+            mode: mq_bridge::models::FileConsumerMode::Consume { delete: false },
         };
         Arc::new(Mutex::new(FileConsumer::new(&config).await.unwrap()))
     }
@@ -489,8 +488,7 @@ pub mod file_helper {
         };
         let config = FileConfig {
             path: path_str,
-            subscribe_mode: false,
-            delete: None,
+            mode: mq_bridge::models::FileConsumerMode::Consume { delete: false },
         };
         Arc::new(FilePublisher::new(&config).await.unwrap())
     }
@@ -522,8 +520,7 @@ pub mod file_delete_helper {
 
         let config = FileConfig {
             path: path_str,
-            subscribe_mode: false,
-            delete: Some(true),
+            mode: mq_bridge::models::FileConsumerMode::Consume { delete: true },
         };
         Arc::new(Mutex::new(FileConsumer::new(&config).await.unwrap()))
     }
@@ -535,8 +532,7 @@ pub mod file_delete_helper {
         };
         let config = FileConfig {
             path: path_str,
-            subscribe_mode: false,
-            delete: None,
+            mode: mq_bridge::models::FileConsumerMode::Consume { delete: false },
         };
         Arc::new(FilePublisher::new(&config).await.unwrap())
     }
@@ -678,7 +674,7 @@ fn performance_benchmarks(c: &mut Criterion) {
         &BENCH_RESULTS,
         PERF_TEST_MESSAGE_COUNT,
         PERF_TEST_CONCURRENCY,
-        std::time::Duration::from_millis(100)
+        std::time::Duration::from_millis(200)
     );
     bench_backend!(
         "amqp",

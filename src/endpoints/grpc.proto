@@ -1,0 +1,26 @@
+syntax = "proto3";
+package mqbridge;
+
+service Bridge {
+    // Publishes a message to the bridge
+    rpc Publish (BridgeMessage) returns (PublishResponse);
+    // Publishes a batch of messages using a client stream
+    rpc PublishBatch (stream BridgeMessage) returns (PublishResponse);
+    // Subscribes to a stream of messages from the bridge
+    rpc Subscribe (SubscribeRequest) returns (stream BridgeMessage);
+}
+
+message BridgeMessage {
+    bytes payload = 1;
+    string id = 2;
+    map<string, string> metadata = 3;
+}
+
+message PublishResponse {
+    bool success = 1;
+    string error = 2;
+}
+
+message SubscribeRequest {
+    string topic = 1;
+}

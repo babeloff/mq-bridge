@@ -4,7 +4,7 @@
 //  git clone https://github.com/marcomq/mq-bridge
 use crate::canonical_message::tracing_support::LazyMessageIds;
 use crate::event_store::{EventStore, EventStoreConsumer, RetentionPolicy};
-use crate::models::FileConfig;
+use crate::models::{FileConfig, FileConsumerMode};
 use crate::traits::{
     ConsumerError, MessageConsumer, MessagePublisher, PublisherError, ReceivedBatch, SentBatch,
 };
@@ -14,7 +14,6 @@ use async_trait::async_trait;
 use once_cell::sync::Lazy;
 use std::any::Any;
 use std::collections::HashMap;
-use std::io::SeekFrom;
 use std::io::{BufRead, Seek};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -46,7 +45,8 @@ pub struct FilePublisher {
 
 impl FilePublisher {
     pub async fn new(config: &FileConfig) -> anyhow::Result<Self> {
-        let path = Path::new(&config.path);
+        let path_str = &config.path;
+        let path = Path::new(path_str);
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent).await.with_context(|| {
                 format!("Failed to create parent directory for file: {:?}", parent)
@@ -58,15 +58,13 @@ impl FilePublisher {
             .append(true)
             .open(&path)
             .await
-            .with_context(|| {
-                format!("Failed to open or create file for writing: {}", config.path)
-            })?;
+            .with_context(|| format!("Failed to open or create file for writing: {}", path_str))?;
 
-        let file_lock = get_file_lock(&config.path);
+        let file_lock = get_file_lock(path_str);
 
-        info!(path = %config.path, "File sink opened for appending");
+        info!(path = %path_str, "File sink opened for appending");
         Ok(Self {
-            path: config.path.clone(),
+            path: path_str.to_string(),
             file_lock,
         })
     }
@@ -158,20 +156,15 @@ static FILE_EVENT_STORES: Lazy<Mutex<HashMap<String, Weak<EventStore>>>> =
 struct FileFeedState {
     /// For Consume mode: number of lines currently buffered in EventStore.
     lines_in_memory: usize,
-    /// For Subscribe mode: the file offset (bytes) where we stopped reading.
-    last_position: u64,
 }
 
 /// Creates an EventStore backed by a file.
 /// The EventStore acts as an in-memory buffer for the file content, allowing unified handling of Consume and Subscribe modes.
-async fn create_file_event_store(config: &FileConfig) -> anyhow::Result<Arc<EventStore>> {
-    let path = config.path.clone();
-    let should_delete = config.delete.unwrap_or(!config.subscribe_mode);
-
+async fn create_file_event_store(path: &str) -> anyhow::Result<Arc<EventStore>> {
+    let path = path.to_string();
     // Shared state to coordinate the reader and the drop (delete) logic.
     let feed_state = Arc::new(tokio::sync::Mutex::new(FileFeedState {
         lines_in_memory: 0,
-        last_position: 0,
     }));
 
     // Lock to serialize file modification operations
@@ -190,10 +183,7 @@ async fn create_file_event_store(config: &FileConfig) -> anyhow::Result<Arc<Even
     // 1. Create EventStore with on_drop callback
     let store = Arc::new(
         EventStore::new(retention).with_drop_callback(move |events| {
-            if !should_delete {
-                // If deletion is disabled, we don't modify the file.
-                return;
-            }
+            // In EventStore mode (Subscribe + Delete), we always delete.
             let count = events.len();
             if count == 0 {
                 return;
@@ -240,11 +230,7 @@ async fn create_file_event_store(config: &FileConfig) -> anyhow::Result<Arc<Even
             };
 
             // Acquire file op lock first to coordinate with GC
-            let file_guard = if should_delete {
-                Some(file_op_lock_clone.lock().await)
-            } else {
-                None
-            };
+            let file_guard = Some(file_op_lock_clone.lock().await);
 
             let mut state = feed_state_clone.lock().await;
 
@@ -262,48 +248,31 @@ async fn create_file_event_store(config: &FileConfig) -> anyhow::Result<Arc<Even
             };
 
             // Position the reader
-            if !should_delete {
-                if let Ok(metadata) = file.metadata().await {
-                    if metadata.len() < state.last_position {
-                        tracing::warn!(
-                            "File {} was truncated (size {} < pos {}). Resetting position to 0.",
-                            path_clone,
-                            metadata.len(),
-                            state.last_position
-                        );
-                        state.last_position = 0;
+            // In consume mode, we skip lines that are already buffered in memory
+            // because they are still in the file (until dropped).
+            let mut reader = BufReader::new(file);
+            let mut lines_skipped = 0;
+            let mut error = false;
+            let lines_to_skip = state.lines_in_memory;
+            while lines_skipped < lines_to_skip {
+                let mut buf = Vec::new();
+                match reader.read_until(b'\n', &mut buf).await {
+                    Ok(0) => break, // EOF
+                    Ok(_) => lines_skipped += 1,
+                    Err(e) => {
+                        tracing::error!("Error skipping lines in {}: {}", path_clone, e);
+                        error = true;
+                        break;
                     }
                 }
-                if let Err(e) = file.seek(SeekFrom::Start(state.last_position)).await {
-                    tracing::error!("Failed to seek in file {}: {}", path_clone, e);
-                }
-            } else {
-                // In consume mode, we skip lines that are already buffered in memory
-                // because they are still in the file (until dropped).
-                let mut reader = BufReader::new(file);
-                let mut lines_skipped = 0;
-                let mut error = false;
-                let lines_to_skip = state.lines_in_memory;
-                while lines_skipped < lines_to_skip {
-                    let mut buf = Vec::new();
-                    match reader.read_until(b'\n', &mut buf).await {
-                        Ok(0) => break, // EOF
-                        Ok(_) => lines_skipped += 1,
-                        Err(e) => {
-                            tracing::error!("Error skipping lines in {}: {}", path_clone, e);
-                            error = true;
-                            break;
-                        }
-                    }
-                }
-                if error {
-                    drop(state);
-                    drop(file_guard);
-                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                    continue;
-                }
-                file = reader.into_inner();
             }
+            if error {
+                drop(state);
+                drop(file_guard);
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                continue;
+            }
+            file = reader.into_inner();
 
             // Release file op lock to allow publisher to write while we read
             drop(file_guard);
@@ -316,23 +285,16 @@ async fn create_file_event_store(config: &FileConfig) -> anyhow::Result<Arc<Even
             loop {
                 let mut buffer = Vec::new();
                 match reader.read_until(b'\n', &mut buffer).await {
-                    Ok(0) => break, // EOF
-                    Ok(n) => {
-                        if buffer.ends_with(b"\n") {
-                            buffer.pop();
-                        }
-                        if buffer.ends_with(b"\r") {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        while buffer.ends_with(b"\n") || buffer.ends_with(b"\r") {
                             buffer.pop();
                         }
                         let msg = parse_message(&buffer);
                         batch.push(msg);
                         lines_read += 1;
 
-                        if !should_delete {
-                            state.last_position += n as u64;
-                        } else {
-                            state.lines_in_memory += 1;
-                        }
+                        state.lines_in_memory += 1;
 
                         if batch.len() >= 128 {
                             store_clone.append_batch(std::mem::take(&mut batch)).await;
@@ -409,20 +371,21 @@ async fn remove_lines_from_file(path: &str, count: usize) -> anyhow::Result<()> 
 struct FileTailConsumer {
     msg_rx: async_channel::Receiver<Vec<CanonicalMessage>>,
     buffer: Vec<CanonicalMessage>,
+    offset_file: Option<Arc<Mutex<tokio::fs::File>>>,
 }
 
 fn run_file_tail_task_sync(
     path: String,
     msg_tx: async_channel::Sender<Vec<CanonicalMessage>>,
-    start_at_end: bool,
+    initial_offset: u64,
+    group_id: Option<String>,
 ) {
-    let mut last_position: u64 = 0;
+    let mut last_position: u64 = initial_offset;
     let mut reader: Option<std::io::BufReader<std::fs::File>> = None;
     let mut current_sleep = std::time::Duration::from_millis(1);
     const MAX_SLEEP: std::time::Duration = std::time::Duration::from_millis(50);
     const BATCH_SIZE: usize = 1024;
     let mut buf = Vec::with_capacity(1024);
-    let mut initialized = false;
 
     loop {
         if reader.is_none() {
@@ -434,15 +397,6 @@ fn run_file_tail_task_sync(
                     continue;
                 }
             };
-
-            if !initialized {
-                if start_at_end {
-                    if let Ok(metadata) = file.metadata() {
-                        last_position = metadata.len();
-                    }
-                }
-                initialized = true;
-            }
 
             if let Ok(metadata) = file.metadata() {
                 if metadata.len() < last_position {
@@ -474,13 +428,15 @@ fn run_file_tail_task_sync(
                     Ok(0) => break, // EOF
                     Ok(n) => {
                         last_position += n as u64;
-                        if buf.ends_with(b"\n") {
+                        while buf.ends_with(b"\n") || buf.ends_with(b"\r") {
                             buf.pop();
                         }
-                        if buf.ends_with(b"\r") {
-                            buf.pop();
+                        let mut msg = parse_message(&buf);
+                        if group_id.is_some() {
+                            msg.metadata
+                                .insert("file_offset".to_string(), last_position.to_string());
                         }
-                        batch.push(parse_message(&buf));
+                        batch.push(msg);
                         lines_read_in_batch += 1;
                     }
                     Err(e) => {
@@ -570,10 +526,7 @@ fn run_file_queue_task(
                     match reader.read_until(b'\n', &mut buf) {
                         Ok(0) => break,
                         Ok(_) => {
-                            if buf.ends_with(b"\n") {
-                                buf.pop();
-                            }
-                            if buf.ends_with(b"\r") {
+                            while buf.ends_with(b"\n") || buf.ends_with(b"\r") {
                                 buf.pop();
                             }
                             batch.push(parse_message(&buf));
@@ -611,80 +564,125 @@ pub struct FileConsumer {
 
 impl FileConsumer {
     pub async fn new(config: &FileConfig) -> anyhow::Result<Self> {
-        let should_delete = config.delete.unwrap_or(!config.subscribe_mode);
+        match &config.mode {
+            FileConsumerMode::Consume { delete: false } => {
+                Self::new_tail(&config.path, false, None).await
+            }
+            FileConsumerMode::Subscribe { delete: false } => {
+                Self::new_tail(&config.path, true, None).await
+            }
+            FileConsumerMode::GroupSubscribe {
+                group_id,
+                read_from_tail,
+            } => {
+                let start_at_end = *read_from_tail;
+                Self::new_tail(&config.path, start_at_end, Some(group_id.clone())).await
+            }
+            FileConsumerMode::Consume { delete: true } => {
+                let (msg_tx, msg_rx) = async_channel::bounded(100);
+                let file_lock = get_file_lock(&config.path);
+                let lines_in_memory = Arc::new(AtomicUsize::new(0));
+                let lines_clone = lines_in_memory.clone();
+                let lock_clone = file_lock.clone();
+                let runtime = tokio::runtime::Handle::current();
+                let path_clone = config.path.clone();
 
-        if !should_delete {
-            let (msg_tx, msg_rx) = async_channel::bounded(100);
-            let path = config.path.clone();
-            let start_at_end = config.subscribe_mode;
+                std::thread::spawn(move || {
+                    run_file_queue_task(path_clone, msg_tx, lines_clone, lock_clone, runtime);
+                });
 
-            std::thread::spawn(move || {
-                run_file_tail_task_sync(path, msg_tx, start_at_end);
-            });
+                info!(path = %config.path, mode = "queue (delete, optimized)", "File consumer connected");
+                Ok(Self {
+                    backend: ConsumerBackend::Queue(FileQueueConsumer {
+                        msg_rx,
+                        lines_in_memory,
+                        path: config.path.clone(),
+                        file_lock,
+                        buffer: Arc::new(Mutex::new(Vec::new())),
+                    }),
+                })
+            }
+            FileConsumerMode::Subscribe { delete: true } => {
+                let key = format!("{}|subscribe|delete", config.path);
 
-            info!(path = %config.path, mode = "tail (no-delete, optimized)", "File consumer connected");
+                let store = if let Some(store) = {
+                    let mut stores = FILE_EVENT_STORES.lock().await;
+                    stores.retain(|_, v| v.strong_count() > 0);
+                    stores.get(&key).and_then(|w| w.upgrade())
+                } {
+                    store
+                } else {
+                    let created = create_file_event_store(&config.path).await?;
+                    let mut stores = FILE_EVENT_STORES.lock().await;
+                    let store = stores
+                        .get(&key)
+                        .and_then(|w| w.upgrade())
+                        .unwrap_or_else(|| {
+                            stores.insert(key.clone(), Arc::downgrade(&created));
+                            created
+                        });
+                    store
+                };
 
-            Ok(Self {
-                backend: ConsumerBackend::Tail(FileTailConsumer {
-                    msg_rx,
-                    buffer: Vec::new(),
-                }),
-            })
-        } else if !config.subscribe_mode {
-            let (msg_tx, msg_rx) = async_channel::bounded(100);
-            let path = config.path.clone();
-            let file_lock = get_file_lock(&path);
-            let lines_in_memory = Arc::new(AtomicUsize::new(0));
-            let lines_clone = lines_in_memory.clone();
-            let lock_clone = file_lock.clone();
-            let runtime = tokio::runtime::Handle::current();
+                let subscriber_id = format!("file-sub-{}", fast_uuid_v7::gen_id_str());
+                info!(path = %config.path, mode = "subscribe (delete)", subscriber_id = %subscriber_id, "File consumer connected");
 
-            std::thread::spawn(move || {
-                run_file_queue_task(path, msg_tx, lines_clone, lock_clone, runtime);
-            });
-
-            info!(path = %config.path, mode = "queue (delete, optimized)", "File consumer connected");
-            Ok(Self {
-                backend: ConsumerBackend::Queue(FileQueueConsumer {
-                    msg_rx,
-                    lines_in_memory,
-                    path: config.path.clone(),
-                    file_lock,
-                    buffer: Arc::new(Mutex::new(Vec::new())),
-                }),
-            })
-        } else {
-            let key = format!(
-                "{}|{}|{}",
-                config.path, config.subscribe_mode, should_delete
-            );
-
-            let store = if let Some(store) = {
-                let mut stores = FILE_EVENT_STORES.lock().await;
-                stores.retain(|_, v| v.strong_count() > 0);
-                stores.get(&key).and_then(|w| w.upgrade())
-            } {
-                store
-            } else {
-                let created = create_file_event_store(config).await?;
-                let mut stores = FILE_EVENT_STORES.lock().await;
-                let store = stores
-                    .get(&key)
-                    .and_then(|w| w.upgrade())
-                    .unwrap_or_else(|| {
-                        stores.insert(key.clone(), Arc::downgrade(&created));
-                        created
-                    });
-                store
-            };
-
-            let subscriber_id = format!("file-sub-{}", fast_uuid_v7::gen_id_str());
-            info!(path = %config.path, mode = ?if config.subscribe_mode { "subscribe" } else { "consume" }, subscriber_id = %subscriber_id, "File consumer connected");
-
-            Ok(Self {
-                backend: ConsumerBackend::EventStore(store.consumer(subscriber_id)),
-            })
+                Ok(Self {
+                    backend: ConsumerBackend::EventStore(store.consumer(subscriber_id)),
+                })
+            }
         }
+    }
+
+    async fn new_tail(
+        path: &str,
+        start_at_end: bool,
+        group_id: Option<String>,
+    ) -> anyhow::Result<Self> {
+        let (msg_tx, msg_rx) = async_channel::bounded(100);
+        let mut initial_offset = 0;
+        let mut offset_file = None;
+
+        if let Some(gid) = &group_id {
+            let offset_path = format!("{}.{}.offset", path, gid);
+            if let Ok(content) = tokio::fs::read_to_string(&offset_path).await {
+                if let Ok(pos) = content.trim().parse::<u64>() {
+                    initial_offset = pos;
+                    info!(
+                        "Restored offset {} for group {} from {}",
+                        pos, gid, offset_path
+                    );
+                }
+            }
+            let file = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&offset_path)
+                .await?;
+            offset_file = Some(Arc::new(Mutex::new(file)));
+        }
+
+        if initial_offset == 0 && start_at_end {
+            if let Ok(metadata) = tokio::fs::metadata(path).await {
+                initial_offset = metadata.len();
+            }
+        }
+
+        let path_clone = path.to_string();
+        std::thread::spawn(move || {
+            run_file_tail_task_sync(path_clone, msg_tx, initial_offset, group_id);
+        });
+
+        info!(path = %path, mode = "tail (no-delete, optimized)", "File consumer connected");
+
+        Ok(Self {
+            backend: ConsumerBackend::Tail(FileTailConsumer {
+                msg_rx,
+                buffer: Vec::new(),
+                offset_file,
+            }),
+        })
     }
 }
 
@@ -712,11 +710,54 @@ impl MessageConsumer for FileConsumer {
                 let count = std::cmp::min(c.buffer.len(), max_messages);
                 let messages: Vec<_> = c.buffer.drain(0..count).collect();
 
-                // No-op commit since we are not deleting
-                let commit = Box::new(|_dispositions: Vec<crate::traits::MessageDisposition>| {
-                    Box::pin(async move { Ok(()) })
-                        as crate::traits::BoxFuture<'static, anyhow::Result<()>>
-                });
+                let commit: crate::traits::BatchCommitFunc = if let Some(offset_file) =
+                    &c.offset_file
+                {
+                    let offset_file = offset_file.clone();
+                    let captured_messages = messages.clone();
+
+                    Box::new(
+                        move |dispositions: Vec<crate::traits::MessageDisposition>| {
+                            Box::pin(async move {
+                                let max_offset = dispositions
+                                    .iter()
+                                    .zip(captured_messages.iter())
+                                    .filter_map(|(d, m)| match d {
+                                        crate::traits::MessageDisposition::Ack
+                                        | crate::traits::MessageDisposition::Reply(_) => m
+                                            .metadata
+                                            .get("file_offset")
+                                            .and_then(|s| s.parse::<u64>().ok()),
+                                        _ => None,
+                                    })
+                                    .max();
+
+                                if let Some(offset) = max_offset {
+                                    let mut file = offset_file.lock().await;
+                                    if let Err(e) = file.rewind().await {
+                                        tracing::error!("Failed to rewind offset file: {}", e);
+                                    } else if let Err(e) = file.set_len(0).await {
+                                        tracing::error!("Failed to truncate offset file: {}", e);
+                                    } else if let Err(e) =
+                                        file.write_all(offset.to_string().as_bytes()).await
+                                    {
+                                        tracing::error!("Failed to write offset file: {}", e);
+                                    } else if let Err(e) = file.flush().await {
+                                        tracing::error!("Failed to flush offset file: {}", e);
+                                    }
+                                }
+                                Ok(())
+                            })
+                                as crate::traits::BoxFuture<'static, anyhow::Result<()>>
+                        },
+                    )
+                } else {
+                    // No-op commit since we are not deleting and no group_id to track
+                    Box::new(|_dispositions: Vec<crate::traits::MessageDisposition>| {
+                        Box::pin(async move { Ok(()) })
+                            as crate::traits::BoxFuture<'static, anyhow::Result<()>>
+                    })
+                };
 
                 Ok(ReceivedBatch { messages, commit })
             }
@@ -827,7 +868,7 @@ fn parse_message(buffer: &[u8]) -> CanonicalMessage {
 #[cfg(test)]
 mod tests {
     use crate::endpoints::file::{FileConsumer, FilePublisher};
-    use crate::models::FileConfig;
+    use crate::models::{FileConfig, FileConsumerMode};
     use crate::msg;
     use crate::traits::MessageConsumer;
     use crate::traits::MessagePublisher;
@@ -846,8 +887,7 @@ mod tests {
         // 2. Create a FileSink
         let config = FileConfig {
             path: file_path_str.clone(),
-            subscribe_mode: false,
-            delete: None,
+            mode: FileConsumerMode::Consume { delete: false },
         };
         let sink = FilePublisher::new(&config).await.unwrap();
 
@@ -897,8 +937,7 @@ mod tests {
 
         let config = FileConfig {
             path: file_path.to_str().unwrap().to_string(),
-            subscribe_mode: false,
-            delete: None,
+            mode: FileConsumerMode::Consume { delete: false },
         };
         let sink_result = FilePublisher::new(&config).await;
 
@@ -920,8 +959,7 @@ mod tests {
 
         let config = FileConfig {
             path: file_path_str,
-            subscribe_mode: false,
-            delete: None,
+            mode: FileConsumerMode::Consume { delete: true },
         };
         let mut consumer = FileConsumer::new(&config).await.unwrap();
 
@@ -981,8 +1019,7 @@ mod tests {
 
         let config = FileConfig {
             path: file_path_str.clone(),
-            subscribe_mode: false,
-            delete: None,
+            mode: FileConsumerMode::Consume { delete: true },
         };
         let mut consumer = FileConsumer::new(&config).await.unwrap();
 
@@ -1025,8 +1062,7 @@ mod tests {
 
         let config = FileConfig {
             path: file_path_str.clone(),
-            subscribe_mode: false,
-            delete: Some(false),
+            mode: FileConsumerMode::Consume { delete: false },
         };
         let mut consumer = FileConsumer::new(&config).await.unwrap();
 
@@ -1062,8 +1098,7 @@ mod tests {
 
         let config = FileConfig {
             path: file_path_str.clone(),
-            subscribe_mode: true,
-            delete: None,
+            mode: FileConsumerMode::Subscribe { delete: false },
         };
 
         let mut consumer = FileConsumer::new(&config).await.unwrap();
@@ -1104,8 +1139,7 @@ mod tests {
 
         let config = FileConfig {
             path: file_path_str.clone(),
-            subscribe_mode: false,
-            delete: Some(true),
+            mode: FileConsumerMode::Consume { delete: true },
         };
         let mut consumer = FileConsumer::new(&config).await.unwrap();
 
@@ -1138,8 +1172,7 @@ mod tests {
 
         let config = FileConfig {
             path: file_path_str.clone(),
-            subscribe_mode: true,
-            delete: Some(true),
+            mode: FileConsumerMode::Subscribe { delete: true },
         };
 
         let mut sub1 = FileConsumer::new(&config).await.unwrap();
@@ -1186,8 +1219,7 @@ mod tests {
 
         let config = FileConfig {
             path: file_path_str.clone(),
-            subscribe_mode: true,
-            delete: Some(false),
+            mode: FileConsumerMode::Subscribe { delete: false },
         };
 
         let mut consumer = FileConsumer::new(&config).await.unwrap();
@@ -1225,8 +1257,7 @@ mod tests {
 
         let input = Endpoint::new(EndpointType::File(FileConfig {
             path: file_path_str.clone(),
-            subscribe_mode: false,
-            delete: Some(true),
+            mode: FileConsumerMode::Consume { delete: true },
         }));
         let output = Endpoint::new_memory("out_consume_explicit_delete", 10);
         let route = Route::new(input, output.clone());
@@ -1272,8 +1303,7 @@ mod tests {
 
         let input = Endpoint::new(EndpointType::File(FileConfig {
             path: file_path_str.clone(),
-            subscribe_mode: true,
-            delete: Some(true),
+            mode: FileConsumerMode::Subscribe { delete: true },
         }));
         let output = Endpoint::new_memory("out_subscribe_delete", 10);
         let route = Route::new(input, output.clone());
@@ -1314,8 +1344,7 @@ mod tests {
 
         let input = Endpoint::new(EndpointType::File(FileConfig {
             path: file_path_str.clone(),
-            subscribe_mode: true,
-            delete: Some(false),
+            mode: FileConsumerMode::Subscribe { delete: false },
         }));
         let output = Endpoint::new_memory("out_subscribe_no_delete", 10);
         let route = Route::new(input, output.clone());
@@ -1355,8 +1384,7 @@ mod tests {
 
         let input = Endpoint::new(EndpointType::File(FileConfig {
             path: file_path_str.clone(),
-            subscribe_mode: false,
-            delete: Some(true),
+            mode: FileConsumerMode::Consume { delete: true },
         }));
         let output = Endpoint::new_memory("out_consume_all", 100);
         let route = Route::new(input, output.clone());
@@ -1387,5 +1415,86 @@ mod tests {
         assert_eq!(content, "");
 
         handle.stop().await;
+    }
+
+    #[tokio::test]
+    async fn test_file_consumer_group_id_persistence() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("group_id.log");
+        let file_path_str = file_path.to_str().unwrap().to_string();
+        let offset_path = dir.path().join("group_id.log.my_group.offset");
+
+        // Write initial content
+        tokio::fs::write(&file_path, b"msg1\nmsg2\n").await.unwrap();
+
+        let config = FileConfig {
+            path: file_path_str.clone(),
+            mode: FileConsumerMode::GroupSubscribe {
+                group_id: "my_group".to_string(),
+                read_from_tail: false,
+            },
+        };
+
+        // 1. First consumer reads msg1
+        let mut consumer1 = FileConsumer::new(&config).await.unwrap();
+        // Allow thread to start
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let batch1 = consumer1.receive_batch(1).await.unwrap();
+        assert_eq!(batch1.messages[0].payload.as_ref(), b"msg1");
+
+        // Commit msg1 -> should write offset
+        (batch1.commit)(vec![crate::traits::MessageDisposition::Ack])
+            .await
+            .unwrap();
+
+        // Verify offset file exists and contains correct offset (length of "msg1\n" is 5)
+        let offset_content = tokio::fs::read_to_string(&offset_path).await.unwrap();
+        assert_eq!(offset_content, "5");
+
+        drop(consumer1);
+
+        // 2. Second consumer (simulating restart) should start from offset 5 (msg2)
+        let mut consumer2 = FileConsumer::new(&config).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let batch2 = consumer2.receive_batch(1).await.unwrap();
+        assert_eq!(batch2.messages[0].payload.as_ref(), b"msg2");
+
+        (batch2.commit)(vec![crate::traits::MessageDisposition::Ack])
+            .await
+            .unwrap();
+
+        // Verify offset updated (5 + length of "msg2\n" (5) = 10)
+        let offset_content = tokio::fs::read_to_string(&offset_path).await.unwrap();
+        assert_eq!(offset_content, "10");
+    }
+
+    #[tokio::test]
+    async fn test_file_consumer_group_id_init_from_start() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("group_id_start.log");
+        let file_path_str = file_path.to_str().unwrap().to_string();
+
+        // Write initial content
+        tokio::fs::write(&file_path, b"msg1\nmsg2\n").await.unwrap();
+
+        let config = FileConfig {
+            path: file_path_str.clone(),
+            mode: FileConsumerMode::GroupSubscribe {
+                group_id: "my_group_start".to_string(),
+                read_from_tail: false,
+            },
+        };
+
+        // Consumer should start from beginning (msg1)
+        let mut consumer = FileConsumer::new(&config).await.unwrap();
+        // Allow thread to start
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let batch = consumer.receive_batch(2).await.unwrap();
+        assert_eq!(batch.messages.len(), 2);
+        assert_eq!(batch.messages[0].payload.as_ref(), b"msg1");
+        assert_eq!(batch.messages[1].payload.as_ref(), b"msg2");
     }
 }

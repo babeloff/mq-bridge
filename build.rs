@@ -1,4 +1,4 @@
-fn main() {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     if std::env::var("CARGO_FEATURE_IBM_MQ").is_ok() {
         // Ensure rebuild when these environment variables change
         println!("cargo:rerun-if-env-changed=MQ_INSTALLATION_PATH");
@@ -23,4 +23,15 @@ fn main() {
             println!("cargo:rustc-link-arg=-Wl,-rpath,{}", lib_path);
         }
     }
+    // Only compile protos if the grpc feature is enabled and the build dependency is present.
+    // Note: Cargo features for build-dependencies are separate, but we check the env var
+    // to see if the feature was requested for the package.
+    #[cfg(feature = "grpc")]
+    {
+        std::env::set_var("PROTOC", protoc_bin_vendored::protoc_bin_path().unwrap());
+        println!("cargo:rerun-if-changed=src/endpoints/grpc.proto");
+        tonic_prost_build::configure()
+            .compile_protos(&["src/endpoints/grpc.proto"], &["src/endpoints"])?;
+    }
+    Ok(())
 }
