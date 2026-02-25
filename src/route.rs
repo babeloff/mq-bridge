@@ -187,10 +187,23 @@ impl Route {
     /// # Arguments
     /// * `name` - The name of the route
     /// * `allowed_endpoints` - An optional list of allowed endpoint types
-    pub fn check(&self, name: &str, allowed_endpoints: Option<&[&str]>) -> anyhow::Result<()> {
-        crate::endpoints::check_consumer(name, &self.input, allowed_endpoints)?;
-        crate::endpoints::check_publisher(name, &self.output, allowed_endpoints)?;
-        Ok(())
+    pub fn check(
+        &self,
+        name: &str,
+        allowed_endpoints: Option<&[&str]>,
+    ) -> anyhow::Result<Vec<String>> {
+        let mut warnings = Vec::new();
+        warnings.extend(crate::endpoints::check_consumer(
+            name,
+            &self.input,
+            allowed_endpoints,
+        )?);
+        warnings.extend(crate::endpoints::check_publisher(
+            name,
+            &self.output,
+            allowed_endpoints,
+        )?);
+        Ok(warnings)
     }
 
     /// Runs the message processing route with concurrency, error handling, and graceful shutdown.
@@ -221,7 +234,10 @@ impl Route {
     /// # }
     /// ```
     pub async fn run(&self, name_str: &str) -> anyhow::Result<RouteHandle> {
-        self.check(name_str, None)?;
+        let warnings = self.check(name_str, None)?;
+        for warning in warnings {
+            tracing::warn!(route = name_str, "Configuration warning: {}", warning);
+        }
         let (shutdown_tx, shutdown_rx) = bounded(1);
         let (ready_tx, ready_rx) = bounded(1);
         // Use `Arc` so route/name clones are cheap (pointer copy) in the reconnect loop.

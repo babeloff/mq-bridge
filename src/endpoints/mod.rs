@@ -104,7 +104,7 @@ impl Endpoint {
         &self,
         route_name: &str,
         allowed_endpoints: Option<&[&str]>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<Vec<String>> {
         crate::endpoints::check_consumer(route_name, self, allowed_endpoints)
     }
 
@@ -112,7 +112,7 @@ impl Endpoint {
         &self,
         route_name: &str,
         allowed_endpoints: Option<&[&str]>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<Vec<String>> {
         crate::endpoints::check_publisher(route_name, self, allowed_endpoints)
     }
 }
@@ -122,7 +122,7 @@ pub fn check_consumer(
     route_name: &str,
     endpoint: &Endpoint,
     allowed_types: Option<&[&str]>,
-) -> Result<()> {
+) -> Result<Vec<String>> {
     check_consumer_recursive(route_name, endpoint, 0, allowed_types)
 }
 
@@ -131,7 +131,7 @@ fn check_consumer_recursive(
     endpoint: &Endpoint,
     depth: usize,
     allowed_types: Option<&[&str]>,
-) -> Result<()> {
+) -> Result<Vec<String>> {
     const MAX_DEPTH: usize = 16;
     if depth > MAX_DEPTH {
         return Err(anyhow!(
@@ -139,10 +139,11 @@ fn check_consumer_recursive(
             MAX_DEPTH
         ));
     }
+    let mut warnings = Vec::new();
     if endpoint.handler.is_some() {
-        tracing::warn!(
-            route = route_name,
+        warnings.push(
             "Endpoint 'handler' is set on an input endpoint. Handlers are currently only supported on output endpoints (publishers) and will be ignored here."
+            .to_string()
         );
     }
 
@@ -171,12 +172,40 @@ fn check_consumer_recursive(
             // for the check itself, as we just want to validate the core type.
             // However, to be thorough, we recurse on the referenced endpoint.
             // Note: This check ignores the middlewares on the 'ref' itself, which is acceptable for type checking.
-            check_consumer_recursive(route_name, &referenced, depth + 1, allowed_types)
+            warnings.extend(check_consumer_recursive(
+                route_name,
+                &referenced,
+                depth + 1,
+                allowed_types,
+            )?);
+            Ok(warnings)
         }
         #[cfg(feature = "aws")]
-        EndpointType::Aws(_) => Ok(()),
+        EndpointType::Aws(cfg) => {
+            if cfg.topic_arn.is_some() {
+                warnings.push(
+                    "Endpoint 'aws' is used as a consumer, but 'topic_arn' is a publisher-only option and will be ignored."
+                    .to_string()
+                );
+            }
+            Ok(warnings)
+        }
         #[cfg(feature = "kafka")]
-        EndpointType::Kafka(_) => Ok(()),
+        EndpointType::Kafka(cfg) => {
+            if cfg.delayed_ack {
+                warnings.push(
+                    "Endpoint 'kafka' is used as a consumer, but 'delayed_ack' is a publisher-only option and will be ignored."
+                    .to_string()
+                );
+            }
+            if cfg.producer_options.is_some() {
+                warnings.push(
+                    "Endpoint 'kafka' is used as a consumer, but 'producer_options' is a publisher-only option and will be ignored."
+                    .to_string()
+                );
+            }
+            Ok(warnings)
+        }
         #[cfg(feature = "nats")]
         EndpointType::Nats(cfg) => {
             if cfg.stream.is_none() {
@@ -185,20 +214,98 @@ fn check_consumer_recursive(
                     route_name
                 ));
             }
-            Ok(())
+            if cfg.request_reply {
+                warnings.push(
+                    "Endpoint 'nats' is used as a consumer, but 'request_reply' is a publisher-only option and will be ignored."
+                    .to_string()
+                );
+            }
+            if cfg.request_timeout_ms.is_some() {
+                warnings.push(
+                    "Endpoint 'nats' is used as a consumer, but 'request_timeout_ms' is a publisher-only option and will be ignored."
+                    .to_string()
+                );
+            }
+            if cfg.delayed_ack {
+                warnings.push(
+                    "Endpoint 'nats' is used as a consumer, but 'delayed_ack' is a publisher-only option and will be ignored."
+                    .to_string()
+                );
+            }
+            if cfg.stream_max_messages.is_some() {
+                warnings.push(
+                    "Endpoint 'nats' is used as a consumer, but 'stream_max_messages' is a publisher-only option and will be ignored."
+                    .to_string()
+                );
+            }
+            if cfg.stream_max_bytes.is_some() {
+                warnings.push(
+                    "Endpoint 'nats' is used as a consumer, but 'stream_max_bytes' is a publisher-only option and will be ignored."
+                    .to_string()
+                );
+            }
+            Ok(warnings)
         }
         #[cfg(feature = "amqp")]
-        EndpointType::Amqp(_) => Ok(()),
+        EndpointType::Amqp(cfg) => {
+            if cfg.delayed_ack {
+                warnings.push(
+                    "Endpoint 'amqp' is used as a consumer, but 'delayed_ack' is a publisher-only option and will be ignored."
+                    .to_string()
+                );
+            }
+            Ok(warnings)
+        }
         #[cfg(feature = "mqtt")]
-        EndpointType::Mqtt(_) => Ok(()),
+        EndpointType::Mqtt(cfg) => {
+            if cfg.delayed_ack {
+                warnings.push(
+                    "Endpoint 'mqtt' is used as a consumer, but 'delayed_ack' is a publisher-only option and will be ignored."
+                    .to_string()
+                );
+            }
+            Ok(warnings)
+        }
         #[cfg(feature = "zeromq")]
-        EndpointType::ZeroMq(_) => Ok(()),
+        EndpointType::ZeroMq(_) => Ok(warnings),
         #[cfg(feature = "ibm-mq")]
-        EndpointType::IbmMq(_) => Ok(()),
+        EndpointType::IbmMq(_) => Ok(warnings),
         #[cfg(feature = "mongodb")]
-        EndpointType::MongoDb(_) => Ok(()),
+        EndpointType::MongoDb(cfg) => {
+            if cfg.reply_polling_ms.is_some() {
+                warnings.push(
+                    "Endpoint 'mongodb' is used as a consumer, but 'reply_polling_ms' is a publisher-only option and will be ignored."
+                    .to_string()
+                );
+            }
+            if cfg.request_reply {
+                warnings.push(
+                    "Endpoint 'mongodb' is used as a consumer, but 'request_reply' is a publisher-only option and will be ignored."
+                    .to_string()
+                );
+            }
+            if cfg.request_timeout_ms.is_some() {
+                warnings.push(
+                    "Endpoint 'mongodb' is used as a consumer, but 'request_timeout_ms' is a publisher-only option and will be ignored."
+                    .to_string()
+                );
+            }
+            if cfg.ttl_seconds.is_some() {
+                warnings.push(
+                    "Endpoint 'mongodb' is used as a consumer, but 'ttl_seconds' is a publisher-only option and will be ignored."
+                    .to_string()
+                );
+            }
+            if cfg.capped_size_bytes.is_some() {
+                warnings.push(
+                    "Endpoint 'mongodb' is used as a consumer, but 'capped_size_bytes' is a publisher-only option and will be ignored."
+                    .to_string()
+                );
+            }
+            Ok(warnings)
+        }
         #[cfg(feature = "grpc")]
-        EndpointType::Grpc(_) => Ok(()),
+        EndpointType::Grpc(_) => Ok(warnings),
         #[cfg(any(feature = "http-client", feature = "http-server"))]
         EndpointType::Http(_) => {
             #[cfg(not(feature = "http-server"))]
@@ -206,14 +313,28 @@ fn check_consumer_recursive(
                 Err(anyhow!("HTTP consumer requires the 'http-server' feature"))
             }
             #[cfg(feature = "http-server")]
-            Ok(())
+            Ok(warnings)
         }
         #[cfg(feature = "sled")]
-        EndpointType::Sled(_) => Ok(()),
-        EndpointType::Static(_) => Ok(()),
-        EndpointType::Memory(_) => Ok(()),
-        EndpointType::File(_) => Ok(()),
-        EndpointType::Custom { .. } => Ok(()),
+        EndpointType::Sled(_) => Ok(warnings),
+        EndpointType::Static(_) => Ok(warnings),
+        EndpointType::Memory(cfg) => {
+            if cfg.request_reply {
+                warnings.push(
+                    "Endpoint 'memory' is used as a consumer, but 'request_reply' is a publisher-only option and will be ignored."
+                    .to_string()
+                );
+            }
+            if cfg.request_timeout_ms.is_some() {
+                warnings.push(
+                    "Endpoint 'memory' is used as a consumer, but 'request_timeout_ms' is a publisher-only option and will be ignored."
+                    .to_string()
+                );
+            }
+            Ok(warnings)
+        }
+        EndpointType::File(_) => Ok(warnings),
+        EndpointType::Custom { .. } => Ok(warnings),
         EndpointType::Switch(_) => Err(anyhow!(
             "[route:{}] Switch endpoint is only supported as an output",
             route_name
@@ -227,7 +348,7 @@ fn check_consumer_recursive(
             if let Some(allowed) = allowed_types {
                 let name = endpoint.endpoint_type.name();
                 if allowed.contains(&name) {
-                    return Ok(());
+                    return Ok(warnings);
                 }
             }
             Err(anyhow!(
@@ -409,7 +530,7 @@ pub fn check_publisher(
     route_name: &str,
     endpoint: &Endpoint,
     allowed_types: Option<&[&str]>,
-) -> Result<()> {
+) -> Result<Vec<String>> {
     check_publisher_recursive(route_name, endpoint, 0, allowed_types)
 }
 
@@ -418,7 +539,8 @@ fn check_publisher_recursive(
     endpoint: &Endpoint,
     depth: usize,
     allowed_types: Option<&[&str]>,
-) -> Result<()> {
+) -> Result<Vec<String>> {
+    let mut warnings = Vec::new();
     if let Some(allowed) = allowed_types {
         if !endpoint.endpoint_type.is_core() {
             let name = endpoint.endpoint_type.name();
@@ -448,15 +570,16 @@ fn check_publisher_recursive(
                 )
             });
             if let Ok(referenced) = referenced {
-                return check_publisher_recursive(
+                warnings.extend(check_publisher_recursive(
                     route_name,
                     &referenced,
                     depth + 1,
                     allowed_types,
-                );
+                )?);
+                return Ok(warnings);
             }
             if crate::publisher::get_publisher(name).is_some() {
-                return Ok(());
+                return Ok(warnings);
             }
             Err(anyhow!(
                 "[route:{}] Referenced endpoint '{}' not found in any registry",
@@ -465,60 +588,241 @@ fn check_publisher_recursive(
             ))
         }
         #[cfg(feature = "aws")]
-        EndpointType::Aws(_) => Ok(()),
+        EndpointType::Aws(cfg) => {
+            if cfg.max_messages.is_some() {
+                warnings.push(
+                    "Endpoint 'aws' is used as a publisher, but 'max_messages' is a consumer-only option and will be ignored."
+                    .to_string()
+                );
+            }
+            if cfg.wait_time_seconds.is_some() {
+                warnings.push(
+                    "Endpoint 'aws' is used as a publisher, but 'wait_time_seconds' is a consumer-only option and will be ignored."
+                    .to_string()
+                );
+            }
+            Ok(warnings)
+        }
         #[cfg(feature = "kafka")]
-        EndpointType::Kafka(_) => Ok(()),
+        EndpointType::Kafka(cfg) => {
+            if cfg.group_id.is_some() {
+                warnings.push(
+                    "Endpoint 'kafka' is used as a publisher, but 'group_id' is a consumer-only option and will be ignored."
+                    .to_string()
+                );
+            }
+            if cfg.consumer_options.is_some() {
+                warnings.push(
+                    "Endpoint 'kafka' is used as a publisher, but 'consumer_options' is a consumer-only option and will be ignored."
+                    .to_string()
+                );
+            }
+            Ok(warnings)
+        }
         #[cfg(feature = "nats")]
-        EndpointType::Nats(_) => Ok(()),
+        EndpointType::Nats(cfg) => {
+            if cfg.stream.is_some() {
+                warnings.push(
+                    "Endpoint 'nats' is used as a publisher, but 'stream' is a consumer-only option and will be ignored."
+                    .to_string()
+                );
+            }
+            if cfg.subscriber_mode {
+                warnings.push(
+                    "Endpoint 'nats' is used as a publisher, but 'subscriber_mode' is a consumer-only option and will be ignored."
+                    .to_string()
+                );
+            }
+            if cfg.prefetch_count.is_some() {
+                warnings.push(
+                    "Endpoint 'nats' is used as a publisher, but 'prefetch_count' is a consumer-only option and will be ignored."
+                    .to_string()
+                );
+            }
+            Ok(warnings)
+        }
         #[cfg(feature = "amqp")]
-        EndpointType::Amqp(_) => Ok(()),
+        EndpointType::Amqp(cfg) => {
+            if cfg.subscribe_mode {
+                warnings.push(
+                    "Endpoint 'amqp' is used as a publisher, but 'subscribe_mode' is a consumer-only option and will be ignored."
+                    .to_string()
+                );
+            }
+            if cfg.prefetch_count.is_some() {
+                warnings.push(
+                    "Endpoint 'amqp' is used as a publisher, but 'prefetch_count' is a consumer-only option and will be ignored."
+                    .to_string()
+                );
+            }
+            Ok(warnings)
+        }
         #[cfg(feature = "mqtt")]
-        EndpointType::Mqtt(_) => Ok(()),
+        EndpointType::Mqtt(cfg) => {
+            if cfg.clean_session {
+                warnings.push(
+                    "Endpoint 'mqtt' is used as a publisher, but 'clean_session' is a consumer-only option and will be ignored."
+                    .to_string()
+                );
+            }
+            Ok(warnings)
+        }
         #[cfg(feature = "zeromq")]
-        EndpointType::ZeroMq(_) => Ok(()),
+        EndpointType::ZeroMq(cfg) => {
+            if cfg.topic.is_some() {
+                warnings.push(
+                    "Endpoint 'zeromq' is used as a publisher, but 'topic' is a consumer-only option and will be ignored."
+                    .to_string()
+                );
+            }
+            Ok(warnings)
+        }
         #[cfg(any(feature = "http-client", feature = "http-server"))]
-        EndpointType::Http(_) => {
+        EndpointType::Http(cfg) => {
+            if cfg.workers.is_some() {
+                warnings.push(
+                    "Endpoint 'http' is used as a publisher, but 'workers' is a consumer-only option and will be ignored."
+                    .to_string()
+                );
+            }
+            if cfg.message_id_header.is_some() {
+                warnings.push(
+                    "Endpoint 'http' is used as a publisher, but 'message_id_header' is a consumer-only option and will be ignored."
+                    .to_string()
+                );
+            }
+            if cfg.request_timeout_ms.is_some() {
+                warnings.push(
+                    "Endpoint 'http' is used as a publisher, but 'request_timeout_ms' is a consumer-only option and will be ignored."
+                    .to_string()
+                );
+            }
+            if cfg.internal_buffer_size.is_some() {
+                warnings.push(
+                    "Endpoint 'http' is used as a publisher, but 'internal_buffer_size' is a consumer-only option and will be ignored."
+                    .to_string()
+                );
+            }
+            if cfg.fire_and_forget {
+                warnings.push(
+                    "Endpoint 'http' is used as a publisher, but 'fire_and_forget' is a consumer-only option and will be ignored."
+                    .to_string()
+                );
+            }
             #[cfg(not(feature = "reqwest"))]
             {
                 Err(anyhow!("HTTP publisher requires the 'reqwest' feature"))
             }
             #[cfg(feature = "reqwest")]
-            Ok(())
+            Ok(warnings)
         }
         #[cfg(feature = "grpc")]
-        EndpointType::Grpc(_) => Ok(()),
+        EndpointType::Grpc(_) => Ok(warnings),
+        #[cfg(feature = "ibm-mq")]
+        EndpointType::IbmMq(cfg) => {
+            if cfg.wait_timeout_ms != 1000 {
+                warnings.push(
+                    "Endpoint 'ibmmq' is used as a publisher, but 'wait_timeout_ms' is a consumer-only option and will be ignored."
+                    .to_string()
+                );
+            }
+            Ok(warnings)
+        }
         #[cfg(feature = "mongodb")]
-        EndpointType::MongoDb(_) => Ok(()),
-        EndpointType::File(_) => Ok(()),
-        EndpointType::Static(_) => Ok(()),
-        EndpointType::Memory(_) => Ok(()),
+        EndpointType::MongoDb(cfg) => {
+            if cfg.polling_interval_ms.is_some() {
+                warnings.push(
+                    "Endpoint 'mongodb' is used as a publisher, but 'polling_interval_ms' is a consumer-only option and will be ignored."
+                    .to_string()
+                );
+            }
+            if cfg.change_stream {
+                warnings.push(
+                    "Endpoint 'mongodb' is used as a publisher, but 'change_stream' is a consumer-only option and will be ignored."
+                    .to_string()
+                );
+            }
+            if cfg.cursor_id.is_some() {
+                warnings.push(
+                    "Endpoint 'mongodb' is used as a publisher, but 'cursor_id' is a consumer-only option and will be ignored."
+                    .to_string()
+                );
+            }
+            Ok(warnings)
+        }
+        EndpointType::File(_) => Ok(warnings),
+        EndpointType::Static(_) => Ok(warnings),
+        EndpointType::Memory(cfg) => {
+            if cfg.subscribe_mode {
+                warnings.push(
+                    "Endpoint 'memory' is used as a publisher, but 'subscribe_mode' is a consumer-only option and will be ignored."
+                    .to_string()
+                );
+            }
+            if cfg.enable_nack {
+                warnings.push(
+                    "Endpoint 'memory' is used as a publisher, but 'enable_nack' is a consumer-only option and will be ignored."
+                    .to_string()
+                );
+            }
+            Ok(warnings)
+        }
         #[cfg(feature = "sled")]
-        EndpointType::Sled(_) => Ok(()),
-        EndpointType::Null => Ok(()),
+        EndpointType::Sled(cfg) => {
+            if cfg.read_from_start {
+                warnings.push(
+                    "Endpoint 'sled' is used as a publisher, but 'read_from_start' is a consumer-only option and will be ignored."
+                    .to_string()
+                );
+            }
+            if cfg.delete_after_read {
+                warnings.push(
+                    "Endpoint 'sled' is used as a publisher, but 'delete_after_read' is a consumer-only option and will be ignored."
+                    .to_string()
+                );
+            }
+            Ok(warnings)
+        }
+        EndpointType::Null => Ok(warnings),
         EndpointType::Fanout(endpoints) => {
             for endpoint in endpoints {
-                check_publisher_recursive(route_name, endpoint, depth + 1, allowed_types)?;
+                warnings.extend(check_publisher_recursive(
+                    route_name,
+                    endpoint,
+                    depth + 1,
+                    allowed_types,
+                )?);
             }
-            Ok(())
+            Ok(warnings)
         }
         EndpointType::Switch(cfg) => {
             for endpoint in cfg.cases.values() {
-                check_publisher_recursive(route_name, endpoint, depth + 1, allowed_types)?;
+                warnings.extend(check_publisher_recursive(
+                    route_name,
+                    endpoint,
+                    depth + 1,
+                    allowed_types,
+                )?);
             }
             if let Some(endpoint) = &cfg.default {
-                check_publisher_recursive(route_name, endpoint, depth + 1, allowed_types)?;
+                warnings.extend(check_publisher_recursive(
+                    route_name,
+                    endpoint,
+                    depth + 1,
+                    allowed_types,
+                )?);
             }
-            Ok(())
+            Ok(warnings)
         }
-        EndpointType::Response(_) => Ok(()),
-        EndpointType::Custom { .. } => Ok(()),
+        EndpointType::Response(_) => Ok(warnings),
+        EndpointType::Custom { .. } => Ok(warnings),
         EndpointType::Reader(inner) => check_consumer(route_name, inner, allowed_types),
         #[allow(unreachable_patterns)]
         _ => {
             if let Some(allowed) = allowed_types {
                 let name = endpoint.endpoint_type.name();
                 if allowed.contains(&name) {
-                    return Ok(());
+                    return Ok(warnings);
                 }
             }
             Err(anyhow!(
