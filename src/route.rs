@@ -5,7 +5,7 @@
 
 use crate::endpoints::{create_consumer_from_route, create_publisher_from_route};
 pub use crate::models::Route;
-use crate::models::{Endpoint, RouteOptions};
+use crate::models::{Endpoint, EndpointType, RouteOptions};
 use crate::traits::{
     BatchCommitFunc, ConsumerError, Handler, HandlerError, MessageDisposition, PublisherError,
     SentBatch,
@@ -63,7 +63,7 @@ pub fn register_endpoint(name: &str, endpoint: Endpoint) {
         .write()
         .expect("Named endpoint registry lock poisoned");
     if writer.insert(name.to_string(), endpoint).is_some() {
-        warn!("Overwriting a registered endpoint named '{}'", name);
+        debug!("Overwriting a registered endpoint named '{}'", name);
     }
 }
 
@@ -104,10 +104,30 @@ impl Route {
         map.keys().cloned().collect()
     }
 
+    ///
+    pub fn is_ref(&self) -> bool {
+        matches!(self.input.endpoint_type, EndpointType::Ref(_))
+            && !matches!(self.output.endpoint_type, EndpointType::Ref(_))
+    }
+
     /// Registers the route's output endpoint under the given name.
     /// This allows other routes to reference this output using `ref: "name"`.
-    pub fn register_output_endpoint(&self, name: &str) {
-        register_endpoint(name, self.output.clone());
+    pub fn register_output_endpoint(&self, name: Option<&str>) -> Result<(), anyhow::Error> {
+        match name {
+            Some(name) => {
+                register_endpoint(name, self.output.clone());
+            }
+            None => {
+                if let EndpointType::Ref(name) = &self.input.endpoint_type {
+                    register_endpoint(name, self.output.clone());
+                } else {
+                    return Err(anyhow::anyhow!(
+                        "No name and input is not a reference endpoint"
+                    ));
+                }
+            }
+        };
+        Ok(())
     }
 
     /// Registers the route and starts it.

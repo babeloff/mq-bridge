@@ -194,7 +194,9 @@ async fn test_route_chaining_via_ref() {
     let route1 = Route::new(in_ep.clone(), mid_ep.clone());
 
     // Register route1's output as "mid_point"
-    route1.register_output_endpoint("mid_point");
+    route1.register_output_endpoint(Some("mid_point")).unwrap();
+
+    // Route 2: Ref("mid_point") -> Memory (out);
     route1.deploy("route1").await.unwrap();
 
     // Route 2: Ref("mid_point") -> Memory (out)
