@@ -153,7 +153,7 @@ pub async fn test_ibm_mq_performance_direct() {
         let config = get_config();
 
         let result = run_direct_perf_test(
-            "IBM-MQ",
+            "ibm-mq",
             || async {
                 let mut endpoint = config.clone();
                 endpoint.queue = Some(queue.to_string());

@@ -53,6 +53,28 @@ struct ActiveRoute {
 }
 
 static ROUTE_REGISTRY: OnceLock<RwLock<HashMap<String, ActiveRoute>>> = OnceLock::new();
+static ENDPOINT_REF_REGISTRY: OnceLock<RwLock<HashMap<String, Endpoint>>> = OnceLock::new();
+
+/// Registers a named endpoint that can be referenced by other endpoints using `ref: "name"`.
+/// This will overwrite any existing endpoint with the same name.
+pub fn register_endpoint(name: &str, endpoint: Endpoint) {
+    let registry = ENDPOINT_REF_REGISTRY.get_or_init(|| RwLock::new(HashMap::new()));
+    let mut writer = registry
+        .write()
+        .expect("Named endpoint registry lock poisoned");
+    if writer.insert(name.to_string(), endpoint).is_some() {
+        warn!("Overwriting a registered endpoint named '{}'", name);
+    }
+}
+
+/// Retrieves a registered endpoint by name.
+pub fn get_endpoint(name: &str) -> Option<Endpoint> {
+    let registry = ENDPOINT_REF_REGISTRY.get_or_init(|| RwLock::new(HashMap::new()));
+    let reader = registry
+        .read()
+        .expect("Named endpoint registry lock poisoned");
+    reader.get(name).cloned()
+}
 
 impl Route {
     /// Creates a new route with default concurrency (1) and batch size (128).
@@ -80,6 +102,12 @@ impl Route {
         let registry = ROUTE_REGISTRY.get_or_init(|| RwLock::new(HashMap::new()));
         let map = registry.read().expect("Route registry lock poisoned");
         map.keys().cloned().collect()
+    }
+
+    /// Registers the route's output endpoint under the given name.
+    /// This allows other routes to reference this output using `ref: "name"`.
+    pub fn register_output_endpoint(&self, name: &str) {
+        register_endpoint(name, self.output.clone());
     }
 
     /// Registers the route and starts it.

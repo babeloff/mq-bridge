@@ -82,6 +82,20 @@ impl Default for Route {
 }
 
 /// Fine-tuning options for a route's execution.
+///
+/// These options control concurrency, batching, and commit behavior for message processing.
+///
+/// # Examples
+///
+/// ```
+/// use mq_bridge::models::RouteOptions;
+///
+/// let options = RouteOptions {
+///     concurrency: 10,
+///     batch_size: 5,
+///     commit_concurrency_limit: 1024,
+/// };
+/// ```
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
@@ -155,11 +169,11 @@ fn is_known_endpoint_name(name: &str) -> bool {
             | "mongodb"
             | "mqtt"
             | "http"
-            | "ibm-mq"
             | "ibmmq"
             | "zeromq"
             | "grpc"
             | "fanout"
+            | "ref"
             | "switch"
             | "response"
     )
@@ -406,6 +420,7 @@ pub enum EndpointType {
     Nats(NatsConfig),
     File(FileConfig),
     Static(String),
+    Ref(String),
     Memory(MemoryConfig),
     Sled(SledConfig),
     Amqp(AmqpConfig),
@@ -435,6 +450,7 @@ impl EndpointType {
             EndpointType::Nats(_) => "nats",
             EndpointType::File(_) => "file",
             EndpointType::Static(_) => "static",
+            EndpointType::Ref(_) => "ref",
             EndpointType::Memory(_) => "memory",
             EndpointType::Sled(_) => "sled",
             EndpointType::Amqp(_) => "amqp",
@@ -458,6 +474,7 @@ impl EndpointType {
             self,
             EndpointType::File(_)
                 | EndpointType::Static(_)
+                | EndpointType::Ref(_)
                 | EndpointType::Memory(_)
                 | EndpointType::Fanout(_)
                 | EndpointType::Switch(_)
@@ -488,6 +505,9 @@ pub enum Middleware {
 }
 
 /// Deduplication middleware configuration.
+///
+/// Prevents duplicate messages from being processed using a Sled-backed database.
+/// Messages are identified by their deduplication key and removed after the TTL expires.
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
@@ -498,15 +518,24 @@ pub struct DeduplicationMiddleware {
     pub ttl_seconds: u64,
 }
 
-/// Metrics middleware configuration. It's currently a struct without fields
-/// but can be extended later. Its presence in the config enables the middleware.
+/// Metrics middleware configuration.
+///
+/// Enables collection and reporting of message processing metrics such as throughput,
+/// latency, and error rates. The presence of this middleware in the configuration
+/// enables metrics collection for the endpoint.
+///
+/// Metrics are typically exported via Prometheus or similar monitoring systems.
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct MetricsMiddleware {}
 
-/// Dead-Letter Queue (DLQ) middleware configuration. It is recommended that the
-/// endpoint is also using a retry to avoid message loss
+/// Dead-Letter Queue (DLQ) middleware configuration.
+///
+/// Routes failed messages to a designated endpoint for later analysis and recovery.
+/// It is recommended to pair this with the Retry middleware to avoid message loss.
+///
+/// Failed messages are sent to the configured endpoint when they are exhausted after retry attempts.
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
@@ -515,6 +544,10 @@ pub struct DeadLetterQueueMiddleware {
     pub endpoint: Endpoint,
 }
 
+/// Retry middleware configuration.
+///
+/// Implements exponential backoff retry logic for failed message processing.
+/// Failed messages are automatically retried with increasing delays between attempts.
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
@@ -533,6 +566,10 @@ pub struct RetryMiddleware {
     pub multiplier: f64,
 }
 
+/// Delay middleware configuration.
+///
+/// Introduces a fixed delay before processing each message.
+/// Useful for rate limiting, testing, or allowing time for dependent systems to become ready.
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
@@ -541,6 +578,11 @@ pub struct DelayMiddleware {
     pub delay_ms: u64,
 }
 
+/// Weak Join middleware configuration.
+///
+/// Groups and correlates messages based on a metadata key, waiting for a specified number
+/// of messages within a timeout window before processing them as a batch.
+/// Messages that exceed the timeout are processed individually.
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
@@ -553,6 +595,11 @@ pub struct WeakJoinMiddleware {
     pub timeout_ms: u64,
 }
 
+/// Random Panic middleware configuration.
+///
+/// Simulates random failures for chaos testing and resilience validation.
+/// Causes the middleware to panic with the specified probability, useful for testing
+/// error handling and recovery mechanisms.
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
@@ -610,6 +657,43 @@ pub struct AwsConfig {
     pub wait_time_seconds: Option<i32>,
 }
 
+impl AwsConfig {
+    /// Creates a new AWS configuration with default settings.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_queue_url(mut self, queue_url: impl Into<String>) -> Self {
+        self.queue_url = Some(queue_url.into());
+        self
+    }
+
+    pub fn with_topic_arn(mut self, topic_arn: impl Into<String>) -> Self {
+        self.topic_arn = Some(topic_arn.into());
+        self
+    }
+
+    pub fn with_region(mut self, region: impl Into<String>) -> Self {
+        self.region = Some(region.into());
+        self
+    }
+
+    pub fn with_endpoint_url(mut self, endpoint_url: impl Into<String>) -> Self {
+        self.endpoint_url = Some(endpoint_url.into());
+        self
+    }
+
+    pub fn with_credentials(
+        mut self,
+        access_key: impl Into<String>,
+        secret_key: impl Into<String>,
+    ) -> Self {
+        self.access_key = Some(access_key.into());
+        self.secret_key = Some(secret_key.into());
+        self
+    }
+}
+
 // --- Kafka Specific Configuration ---
 
 /// General Kafka connection configuration.
@@ -643,6 +727,56 @@ pub struct KafkaConfig {
     pub consumer_options: Option<Vec<(String, String)>>,
 }
 
+impl KafkaConfig {
+    /// Creates a new Kafka configuration with the specified broker URL.
+    pub fn new(url: impl Into<String>) -> Self {
+        Self {
+            url: url.into(),
+            ..Default::default()
+        }
+    }
+
+    pub fn with_topic(mut self, topic: impl Into<String>) -> Self {
+        self.topic = Some(topic.into());
+        self
+    }
+
+    pub fn with_group_id(mut self, group_id: impl Into<String>) -> Self {
+        self.group_id = Some(group_id.into());
+        self
+    }
+
+    pub fn with_credentials(
+        mut self,
+        username: impl Into<String>,
+        password: impl Into<String>,
+    ) -> Self {
+        self.username = Some(username.into());
+        self.password = Some(password.into());
+        self
+    }
+
+    pub fn with_producer_option(
+        mut self,
+        key: impl Into<String>,
+        value: impl Into<String>,
+    ) -> Self {
+        let options = self.producer_options.get_or_insert_with(Vec::new);
+        options.push((key.into(), value.into()));
+        self
+    }
+
+    pub fn with_consumer_option(
+        mut self,
+        key: impl Into<String>,
+        value: impl Into<String>,
+    ) -> Self {
+        let options = self.consumer_options.get_or_insert_with(Vec::new);
+        options.push((key.into(), value.into()));
+        self
+    }
+}
+
 // --- Sled Specific Configuration ---
 
 /// General Sled database configuration
@@ -660,6 +794,26 @@ pub struct SledConfig {
     /// (Consumer only) If true, delete messages after processing (Queue mode).
     #[serde(default)]
     pub delete_after_read: bool,
+}
+
+impl SledConfig {
+    /// Creates a new Sled configuration with the specified database path.
+    pub fn new(path: impl Into<String>) -> Self {
+        Self {
+            path: path.into(),
+            ..Default::default()
+        }
+    }
+
+    pub fn with_tree(mut self, tree: impl Into<String>) -> Self {
+        self.tree = Some(tree.into());
+        self
+    }
+
+    pub fn with_read_from_start(mut self, read_from_start: bool) -> Self {
+        self.read_from_start = read_from_start;
+        self
+    }
 }
 
 // --- File Specific Configuration ---
@@ -737,6 +891,22 @@ impl Default for FileConsumerMode {
         Self::Consume { delete: false }
     }
 }
+
+impl FileConfig {
+    /// Creates a new File configuration with the specified path.
+    pub fn new(path: impl Into<String>) -> Self {
+        Self {
+            path: path.into(),
+            mode: FileConsumerMode::default(),
+        }
+    }
+
+    pub fn with_mode(mut self, mode: FileConsumerMode) -> Self {
+        self.mode = mode;
+        self
+    }
+}
+
 // --- NATS Specific Configuration ---
 
 /// General NATS connection configuration.
@@ -783,6 +953,36 @@ pub struct NatsConfig {
     pub prefetch_count: Option<usize>,
 }
 
+impl NatsConfig {
+    /// Creates a new NATS configuration with the specified server URL.
+    pub fn new(url: impl Into<String>) -> Self {
+        Self {
+            url: url.into(),
+            ..Default::default()
+        }
+    }
+
+    pub fn with_subject(mut self, subject: impl Into<String>) -> Self {
+        self.subject = Some(subject.into());
+        self
+    }
+
+    pub fn with_stream(mut self, stream: impl Into<String>) -> Self {
+        self.stream = Some(stream.into());
+        self
+    }
+
+    pub fn with_credentials(
+        mut self,
+        username: impl Into<String>,
+        password: impl Into<String>,
+    ) -> Self {
+        self.username = Some(username.into());
+        self.password = Some(password.into());
+        self
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
@@ -817,6 +1017,11 @@ impl MemoryConfig {
             subscribe_mode,
             ..self
         }
+    }
+
+    pub fn with_request_reply(mut self, request_reply: bool) -> Self {
+        self.request_reply = request_reply;
+        self
     }
 }
 
@@ -855,6 +1060,39 @@ pub struct AmqpConfig {
     pub delayed_ack: bool,
 }
 
+impl AmqpConfig {
+    /// Creates a new AMQP configuration with the specified connection URL.
+    pub fn new(url: impl Into<String>) -> Self {
+        Self {
+            url: url.into(),
+            ..Default::default()
+        }
+    }
+
+    pub fn with_queue(mut self, queue: impl Into<String>) -> Self {
+        self.queue = Some(queue.into());
+        self
+    }
+
+    pub fn with_exchange(mut self, exchange: impl Into<String>) -> Self {
+        self.exchange = Some(exchange.into());
+        self
+    }
+
+    pub fn with_credentials(
+        mut self,
+        username: impl Into<String>,
+        password: impl Into<String>,
+    ) -> Self {
+        self.username = Some(username.into());
+        self.password = Some(password.into());
+        self
+    }
+}
+
+/// MongoDB message storage format.
+///
+/// Determines how messages are stored and retrieved from MongoDB collections.
 #[derive(Debug, Deserialize, Serialize, Clone, Default, PartialEq, Eq)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "lowercase")]
@@ -911,6 +1149,37 @@ pub struct MongoDbConfig {
     pub cursor_id: Option<String>,
 }
 
+impl MongoDbConfig {
+    /// Creates a new MongoDB configuration with the specified URL and database name.
+    pub fn new(url: impl Into<String>, database: impl Into<String>) -> Self {
+        Self {
+            url: url.into(),
+            database: database.into(),
+            ..Default::default()
+        }
+    }
+
+    pub fn with_collection(mut self, collection: impl Into<String>) -> Self {
+        self.collection = Some(collection.into());
+        self
+    }
+
+    pub fn with_credentials(
+        mut self,
+        username: impl Into<String>,
+        password: impl Into<String>,
+    ) -> Self {
+        self.username = Some(username.into());
+        self.password = Some(password.into());
+        self
+    }
+
+    pub fn with_change_stream(mut self, change_stream: bool) -> Self {
+        self.change_stream = change_stream;
+        self
+    }
+}
+
 // --- MQTT Specific Configuration ---
 
 /// General MQTT connection configuration.
@@ -953,6 +1222,39 @@ pub struct MqttConfig {
     pub delayed_ack: bool,
 }
 
+impl MqttConfig {
+    /// Creates a new MQTT configuration with the specified broker URL.
+    pub fn new(url: impl Into<String>) -> Self {
+        Self {
+            url: url.into(),
+            ..Default::default()
+        }
+    }
+
+    pub fn with_topic(mut self, topic: impl Into<String>) -> Self {
+        self.topic = Some(topic.into());
+        self
+    }
+
+    pub fn with_client_id(mut self, client_id: impl Into<String>) -> Self {
+        self.client_id = Some(client_id.into());
+        self
+    }
+
+    pub fn with_credentials(
+        mut self,
+        username: impl Into<String>,
+        password: impl Into<String>,
+    ) -> Self {
+        self.username = Some(username.into());
+        self.password = Some(password.into());
+        self
+    }
+}
+
+/// MQTT protocol version.
+///
+/// Specifies which version of the MQTT protocol to use for connections.
 #[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq, Eq)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "lowercase")]
@@ -983,6 +1285,30 @@ pub struct ZeroMqConfig {
     pub internal_buffer_size: Option<usize>,
 }
 
+impl ZeroMqConfig {
+    /// Creates a new ZeroMQ configuration with the specified URL.
+    pub fn new(url: impl Into<String>) -> Self {
+        Self {
+            url: url.into(),
+            ..Default::default()
+        }
+    }
+
+    pub fn with_socket_type(mut self, socket_type: ZeroMqSocketType) -> Self {
+        self.socket_type = Some(socket_type);
+        self
+    }
+
+    pub fn with_bind(mut self, bind: bool) -> Self {
+        self.bind = bind;
+        self
+    }
+}
+
+/// ZeroMQ socket type.
+///
+/// Defines the messaging pattern for ZeroMQ connections.
+/// Different patterns support different communication paradigms (request-reply, publish-subscribe, etc.).
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "lowercase")]
@@ -1012,6 +1338,21 @@ pub struct GrpcConfig {
     pub tls: TlsConfig,
 }
 
+impl GrpcConfig {
+    /// Creates a new gRPC configuration with the specified server URL.
+    pub fn new(url: impl Into<String>) -> Self {
+        Self {
+            url: url.into(),
+            ..Default::default()
+        }
+    }
+
+    pub fn with_topic(mut self, topic: impl Into<String>) -> Self {
+        self.topic = Some(topic.into());
+        self
+    }
+}
+
 // --- HTTP Specific Configuration ---
 
 /// General HTTP connection configuration.
@@ -1035,6 +1376,21 @@ pub struct HttpConfig {
     /// (Consumer only) If true, respond immediately with 202 Accepted without waiting for downstream processing. Defaults to false.
     #[serde(default)]
     pub fire_and_forget: bool,
+}
+
+impl HttpConfig {
+    /// Creates a new HTTP configuration with the specified URL.
+    pub fn new(url: impl Into<String>) -> Self {
+        Self {
+            url: url.into(),
+            ..Default::default()
+        }
+    }
+
+    pub fn with_workers(mut self, workers: usize) -> Self {
+        self.workers = Some(workers);
+        self
+    }
 }
 
 // --- IBM MQ Specific Configuration ---
@@ -1074,6 +1430,42 @@ pub struct IbmMqConfig {
     pub internal_buffer_size: Option<usize>,
 }
 
+impl IbmMqConfig {
+    /// Creates a new IBM MQ configuration with the specified connection URL, queue manager, and channel.
+    pub fn new(
+        url: impl Into<String>,
+        queue_manager: impl Into<String>,
+        channel: impl Into<String>,
+    ) -> Self {
+        Self {
+            url: url.into(),
+            queue_manager: queue_manager.into(),
+            channel: channel.into(),
+            ..Default::default()
+        }
+    }
+
+    pub fn with_queue(mut self, queue: impl Into<String>) -> Self {
+        self.queue = Some(queue.into());
+        self
+    }
+
+    pub fn with_topic(mut self, topic: impl Into<String>) -> Self {
+        self.topic = Some(topic.into());
+        self
+    }
+
+    pub fn with_credentials(
+        mut self,
+        username: impl Into<String>,
+        password: impl Into<String>,
+    ) -> Self {
+        self.username = Some(username.into());
+        self.password = Some(password.into());
+        self
+    }
+}
+
 fn default_max_message_size() -> usize {
     4 * 1024 * 1024 // 4MB default
 }
@@ -1101,12 +1493,29 @@ pub struct SwitchConfig {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct ResponseConfig {
-    // This struct is a marker and currently has no fields.
+    // This struct is a marker to and currently has no fields.
 }
 
 // --- Common Configuration ---
 
 /// TLS configuration for secure connections.
+///
+/// Configures Transport Layer Security (TLS/SSL) for encrypted communication.
+/// Supports both client certificate (mutual TLS) and server certificate validation.
+///
+/// # Examples
+///
+/// ```
+/// use mq_bridge::models::TlsConfig;
+///
+/// let tls = TlsConfig {
+///     required: true,
+///     ca_file: Some("/path/to/ca.pem".to_string()),
+///     cert_file: Some("/path/to/cert.pem".to_string()),
+///     key_file: Some("/path/to/key.pem".to_string()),
+///     ..Default::default()
+/// };
+/// ```
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
@@ -1128,9 +1537,39 @@ pub struct TlsConfig {
 }
 
 impl TlsConfig {
+    /// Creates a new TLS configuration with default settings (TLS not required).
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_ca_file(mut self, ca_file: impl Into<String>) -> Self {
+        self.ca_file = Some(ca_file.into());
+        self.required = true;
+        self
+    }
+
+    pub fn with_client_cert(
+        mut self,
+        cert_file: impl Into<String>,
+        key_file: impl Into<String>,
+    ) -> Self {
+        self.cert_file = Some(cert_file.into());
+        self.key_file = Some(key_file.into());
+        self.required = true;
+        self
+    }
+
+    pub fn with_insecure(mut self, accept_invalid_certs: bool) -> Self {
+        self.accept_invalid_certs = accept_invalid_certs;
+        self
+    }
+
+    /// Checks if mutual TLS (mTLS) client authentication is configured.
     pub fn is_mtls_client_configured(&self) -> bool {
         self.required && self.cert_file.is_some() && self.key_file.is_some()
     }
+
+    /// Checks if TLS server certificate authentication is configured.
     pub fn is_tls_server_configured(&self) -> bool {
         self.required && self.cert_file.is_some() && self.key_file.is_some()
     }

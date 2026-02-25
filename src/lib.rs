@@ -27,8 +27,8 @@ pub use outcomes::{Handled, Received, ReceivedBatch, Sent, SentBatch};
 pub use publisher::Publisher;
 
 pub use endpoints::memory::get_or_create_channel;
-pub use publisher::{get_publisher, unregister_publisher};
-pub use route::{get_route, list_routes, stop_route};
+pub use publisher::{get_publisher, register_publisher, unregister_publisher};
+pub use route::{get_route, list_routes, register_endpoint, stop_route};
 
 pub mod consumer {
     pub use crate::middleware::apply_middlewares_to_consumer as apply_middlewares;

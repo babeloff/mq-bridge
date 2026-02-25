@@ -123,12 +123,29 @@ pub fn check_consumer(
     endpoint: &Endpoint,
     allowed_types: Option<&[&str]>,
 ) -> Result<()> {
+    check_consumer_recursive(route_name, endpoint, 0, allowed_types)
+}
+
+fn check_consumer_recursive(
+    route_name: &str,
+    endpoint: &Endpoint,
+    depth: usize,
+    allowed_types: Option<&[&str]>,
+) -> Result<()> {
+    const MAX_DEPTH: usize = 16;
+    if depth > MAX_DEPTH {
+        return Err(anyhow!(
+            "Ref recursion depth exceeded limit of {}",
+            MAX_DEPTH
+        ));
+    }
     if endpoint.handler.is_some() {
         tracing::warn!(
             route = route_name,
             "Endpoint 'handler' is set on an input endpoint. Handlers are currently only supported on output endpoints (publishers) and will be ignored here."
         );
     }
+
     if let Some(allowed) = allowed_types {
         if !endpoint.endpoint_type.is_core() {
             let name = endpoint.endpoint_type.name();
@@ -142,6 +159,20 @@ pub fn check_consumer(
         }
     }
     match &endpoint.endpoint_type {
+        EndpointType::Ref(name) => {
+            let referenced = crate::route::get_endpoint(name).ok_or_else(|| {
+                anyhow!(
+                    "[route:{}] Referenced endpoint '{}' not found",
+                    route_name,
+                    name
+                )
+            })?;
+            // We need to check the referenced endpoint, but we don't need to merge middlewares
+            // for the check itself, as we just want to validate the core type.
+            // However, to be thorough, we recurse on the referenced endpoint.
+            // Note: This check ignores the middlewares on the 'ref' itself, which is acceptable for type checking.
+            check_consumer_recursive(route_name, &referenced, depth + 1, allowed_types)
+        }
         #[cfg(feature = "aws")]
         EndpointType::Aws(_) => Ok(()),
         #[cfg(feature = "kafka")]
@@ -207,14 +238,62 @@ pub fn check_consumer(
     }
 }
 
+fn resolve_endpoint(endpoint: &Endpoint, route_name: &str) -> Result<Endpoint> {
+    let mut visited = std::collections::HashSet::new();
+    resolve_endpoint_recursive(endpoint, route_name, &mut visited)
+}
+
+fn resolve_endpoint_recursive(
+    endpoint: &Endpoint,
+    route_name: &str,
+    visited: &mut std::collections::HashSet<String>,
+) -> Result<Endpoint> {
+    const MAX_DEPTH: usize = 16;
+    if visited.len() > MAX_DEPTH {
+        return Err(anyhow!(
+            "Reference recursion depth exceeded limit of {}",
+            MAX_DEPTH
+        ));
+    }
+
+    if let EndpointType::Ref(name) = &endpoint.endpoint_type {
+        if !visited.insert(name.clone()) {
+            return Err(anyhow!(
+                "[route:{}] Circular reference detected for endpoint '{}'",
+                route_name,
+                name
+            ));
+        }
+
+        let referenced_endpoint = crate::route::get_endpoint(name).ok_or_else(|| {
+            anyhow!(
+                "[route:{}] Referenced endpoint '{}' not found",
+                route_name,
+                name
+            )
+        })?;
+
+        let mut resolved = resolve_endpoint_recursive(&referenced_endpoint, route_name, visited)?;
+        // Merge middlewares: The ref's middlewares should be outer (applied last in the rev() loop).
+        // Since apply_middlewares_to_consumer iterates in reverse, we prepend the ref's middlewares.
+        let mut new_middlewares = endpoint.middlewares.clone();
+        new_middlewares.extend(resolved.middlewares);
+        resolved.middlewares = new_middlewares;
+        Ok(resolved)
+    } else {
+        Ok(endpoint.clone())
+    }
+}
+
 /// Creates a `MessageConsumer` based on the route's "in" configuration.
 pub async fn create_consumer_from_route(
     route_name: &str,
     endpoint: &Endpoint,
 ) -> Result<Box<dyn MessageConsumer>> {
-    check_consumer(route_name, endpoint, None)?;
-    let consumer = create_base_consumer(route_name, endpoint).await?;
-    apply_middlewares_to_consumer(consumer, endpoint, route_name).await
+    let resolved_endpoint = resolve_endpoint(endpoint, route_name)?;
+    check_consumer(route_name, &resolved_endpoint, None)?;
+    let consumer = create_base_consumer(route_name, &resolved_endpoint).await?;
+    apply_middlewares_to_consumer(consumer, &resolved_endpoint, route_name).await
 }
 
 async fn create_base_consumer(
@@ -360,6 +439,31 @@ fn check_publisher_recursive(
         ));
     }
     match &endpoint.endpoint_type {
+        EndpointType::Ref(name) => {
+            let referenced = crate::route::get_endpoint(name).ok_or_else(|| {
+                anyhow!(
+                    "[route:{}] Referenced endpoint '{}' not found in endpoint registry",
+                    route_name,
+                    name
+                )
+            });
+            if let Ok(referenced) = referenced {
+                return check_publisher_recursive(
+                    route_name,
+                    &referenced,
+                    depth + 1,
+                    allowed_types,
+                );
+            }
+            if crate::publisher::get_publisher(name).is_some() {
+                return Ok(());
+            }
+            Err(anyhow!(
+                "[route:{}] Referenced endpoint '{}' not found in any registry",
+                route_name,
+                name
+            ))
+        }
         #[cfg(feature = "aws")]
         EndpointType::Aws(_) => Ok(()),
         #[cfg(feature = "kafka")]
@@ -431,31 +535,78 @@ pub async fn create_publisher_from_route(
     endpoint: &Endpoint,
 ) -> Result<Arc<dyn MessagePublisher>> {
     check_publisher(route_name, endpoint, None)?;
-    create_publisher_with_depth(route_name, endpoint, 0).await
+    create_publisher_with_depth(route_name.to_string(), endpoint.clone(), 0).await
 }
 
-fn create_publisher_with_depth<'a>(
-    route_name: &'a str,
-    endpoint: &'a Endpoint,
+fn create_publisher_with_depth(
+    route_name: String,
+    endpoint: Endpoint,
     depth: usize,
-) -> BoxFuture<'a, Result<Arc<dyn MessagePublisher>>> {
+) -> BoxFuture<'static, Result<Arc<dyn MessagePublisher>>> {
     Box::pin(async move {
         const MAX_DEPTH: usize = 16;
         if depth > MAX_DEPTH {
             return Err(anyhow!(
-                "Fanout recursion depth exceeded limit of {}",
+                "Fanout/Ref recursion depth exceeded limit of {}",
                 MAX_DEPTH
             ));
         }
+
+        if let EndpointType::Ref(name) = &endpoint.endpoint_type {
+            let referenced_opt = crate::route::get_endpoint(name);
+
+            if referenced_opt.is_none() {
+                if let Some(pub_instance) = crate::publisher::get_publisher(name) {
+                    let inner = pub_instance.inner();
+                    let mut publisher: Box<dyn MessagePublisher> = Box::new(inner);
+
+                    if let Some(handler) = &endpoint.handler {
+                        publisher = Box::new(crate::command_handler::CommandPublisher::new(
+                            publisher,
+                            handler.clone(),
+                        ));
+                    }
+                    return crate::middleware::apply_middlewares_to_publisher(
+                        publisher,
+                        &endpoint,
+                        &route_name,
+                    )
+                    .await;
+                }
+            }
+
+            let referenced = referenced_opt.ok_or_else(|| {
+                anyhow!(
+                    "[route:{}] Referenced endpoint '{}' not found",
+                    route_name,
+                    name
+                )
+            })?;
+
+            let mut merged = referenced;
+            // Merge middlewares: The ref's middlewares should be outer (applied last).
+            // Since apply_middlewares_to_publisher iterates forward, we append the ref's middlewares to the referenced ones.
+            merged.middlewares.extend(endpoint.middlewares);
+
+            if endpoint.handler.is_some() {
+                if merged.handler.is_some() {
+                    return Err(anyhow!("[route:{}] Both ref endpoint and referenced endpoint '{}' have handlers defined. This is ambiguous.", route_name, name));
+                }
+                merged.handler = endpoint.handler;
+            }
+
+            return create_publisher_with_depth(route_name, merged, depth + 1).await;
+        }
+
         let mut publisher =
-            create_base_publisher(route_name, &endpoint.endpoint_type, depth).await?;
+            create_base_publisher(&route_name, &endpoint.endpoint_type, depth).await?;
         if let Some(handler) = &endpoint.handler {
             publisher = Box::new(crate::command_handler::CommandPublisher::new(
                 publisher,
                 handler.clone(),
             ));
         }
-        crate::middleware::apply_middlewares_to_publisher(publisher, endpoint, route_name).await
+        crate::middleware::apply_middlewares_to_publisher(publisher, &endpoint, &route_name).await
     })
 }
 
@@ -550,7 +701,12 @@ async fn create_base_publisher(
         EndpointType::Fanout(endpoints) => {
             let mut publishers = Vec::with_capacity(endpoints.len());
             for endpoint in endpoints {
-                let p = create_publisher_with_depth(route_name, endpoint, depth + 1).await?;
+                let p = create_publisher_with_depth(
+                    route_name.to_string(),
+                    endpoint.clone(),
+                    depth + 1,
+                )
+                .await?;
                 publishers.push(p);
             }
             Ok(Box::new(fanout::FanoutPublisher::new(publishers)) as Box<dyn MessagePublisher>)
@@ -558,11 +714,23 @@ async fn create_base_publisher(
         EndpointType::Switch(cfg) => {
             let mut cases = std::collections::HashMap::new();
             for (key, endpoint) in &cfg.cases {
-                let p = create_publisher_with_depth(route_name, endpoint, depth + 1).await?;
+                let p = create_publisher_with_depth(
+                    route_name.to_string(),
+                    endpoint.clone(),
+                    depth + 1,
+                )
+                .await?;
                 cases.insert(key.clone(), p);
             }
             let default = if let Some(endpoint) = &cfg.default {
-                Some(create_publisher_with_depth(route_name, endpoint, depth + 1).await?)
+                Some(
+                    create_publisher_with_depth(
+                        route_name.to_string(),
+                        (**endpoint).clone(),
+                        depth + 1,
+                    )
+                    .await?,
+                )
             } else {
                 None
             };
