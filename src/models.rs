@@ -1369,13 +1369,22 @@ pub struct HttpConfig {
     pub workers: Option<usize>,
     /// (Consumer only) Header key to extract the message ID from. Defaults to "message-id".
     pub message_id_header: Option<String>,
-    /// (Consumer only) Timeout for request-reply operations in milliseconds. Defaults to 30000ms.
+    /// Timeout for HTTP requests in milliseconds. For consumers, it's the request-reply timeout. For publishers, it's the timeout for each individual request. Defaults to 30000ms.
     pub request_timeout_ms: Option<u64>,
     /// (Consumer only) Internal buffer size for the channel. Defaults to 100.
     pub internal_buffer_size: Option<usize>,
     /// (Consumer only) If true, respond immediately with 202 Accepted without waiting for downstream processing. Defaults to false.
     #[serde(default)]
     pub fire_and_forget: bool,
+    /// (Publisher only) The number of concurrent HTTP requests to send in a batch. Defaults to 20.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub batch_concurrency: Option<usize>,
+    /// (Publisher only) TCP keepalive timeout for the underlying connection pool in milliseconds. Defaults to 60000ms.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tcp_keepalive_ms: Option<u64>,
+    /// (Publisher only) Timeout for idle connections in the connection pool in milliseconds. Defaults to 90000ms.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool_idle_timeout_ms: Option<u64>,
 }
 
 impl HttpConfig {

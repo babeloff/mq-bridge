@@ -307,13 +307,27 @@ fn check_consumer_recursive(
         #[cfg(feature = "grpc")]
         EndpointType::Grpc(_) => Ok(warnings),
         #[cfg(any(feature = "http-client", feature = "http-server"))]
-        EndpointType::Http(_) => {
+        EndpointType::Http(cfg) => {
             #[cfg(not(feature = "http-server"))]
             {
                 Err(anyhow!("HTTP consumer requires the 'http-server' feature"))
             }
             #[cfg(feature = "http-server")]
-            Ok(warnings)
+            {
+                if cfg.batch_concurrency.is_some() {
+                    warnings.push("Endpoint 'http' is used as a consumer, but 'batch_concurrency' is a publisher-only option and will be ignored.".to_string());
+                }
+                if cfg.tcp_keepalive_ms.is_some() {
+                    warnings.push("Endpoint 'http' is used as a consumer, but 'tcp_keepalive_ms' is a publisher-only option and will be ignored.".to_string());
+                }
+                if cfg.pool_idle_timeout_ms.is_some() {
+                    warnings.push(
+                        "Endpoint 'http' is used as a consumer, but 'pool_idle_timeout_ms' is a publisher-only option and will be ignored."
+                        .to_string(),
+                    );
+                }
+                Ok(warnings)
+            }
         }
         #[cfg(feature = "sled")]
         EndpointType::Sled(_) => Ok(warnings),
@@ -688,12 +702,6 @@ fn check_publisher_recursive(
             if cfg.message_id_header.is_some() {
                 warnings.push(
                     "Endpoint 'http' is used as a publisher, but 'message_id_header' is a consumer-only option and will be ignored."
-                    .to_string()
-                );
-            }
-            if cfg.request_timeout_ms.is_some() {
-                warnings.push(
-                    "Endpoint 'http' is used as a publisher, but 'request_timeout_ms' is a consumer-only option and will be ignored."
                     .to_string()
                 );
             }

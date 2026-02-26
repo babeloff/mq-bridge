@@ -181,7 +181,7 @@ impl MessageConsumer for HttpConsumer {
 }
 
 #[cfg(feature = "actix-web")]
-#[tracing::instrument(skip_all, fields(http.method = %req.method(), http.uri = %req.uri()))]
+#[tracing::instrument(level = "trace", skip_all, fields(http.method = %req.method(), http.uri = %req.uri()))]
 async fn handle_request(
     state: web::Data<HttpConsumerState>,
     req: HttpRequest,
@@ -204,16 +204,23 @@ async fn handle_request(
 
     let mut message = CanonicalMessage::new(payload, message_id);
     trace!(message_id = %format!("{:032x}", message.message_id), "Received HTTP request");
-    let mut metadata = HashMap::new();
-    for (key, value) in req.headers().iter() {
-        if let Ok(value_str) = value.to_str() {
-            metadata.insert(key.as_str().to_string(), value_str.to_string());
-        }
-    }
-    metadata.insert("http_method".to_string(), req.method().to_string());
-    metadata.insert("http_path".to_string(), req.path().to_string());
-    metadata.insert("http_query".to_string(), req.query_string().to_string());
-    metadata.insert("http_uri".to_string(), req.uri().to_string());
+    let headers = req.headers();
+    let mut metadata = HashMap::with_capacity(headers.len() + 5);
+    
+    metadata.extend([
+        ("http_method".to_string(), req.method().to_string()),
+        ("http_path".to_string(), req.path().to_string()),
+        ("http_query".to_string(), req.query_string().to_string()),
+        ("http_uri".to_string(), req.uri().to_string()),
+    ]);
+
+    metadata.extend(headers.iter().filter_map(|(key, value)| {
+        value
+            .to_str()
+            .ok()
+            .map(|v_str| (key.as_str().to_string(), v_str.to_string()))
+    }));
+
     if let Some(peer) = req.peer_addr() {
         metadata.insert("http_peer_addr".to_string(), peer.to_string());
     }
@@ -301,14 +308,28 @@ fn make_response(disposition: MessageDisposition) -> HttpResponse {
 pub struct HttpPublisher {
     client: reqwest::Client,
     url: String,
+    request_timeout: Option<std::time::Duration>,
+    batch_concurrency: usize,
 }
 
 #[cfg(feature = "reqwest")]
 impl HttpPublisher {
     pub async fn new(config: &HttpConfig) -> anyhow::Result<Self> {
+        let batch_concurrency = config.batch_concurrency.unwrap_or(20).max(1);
         let mut client_builder = reqwest::Client::builder()
-            .tcp_keepalive(std::time::Duration::from_secs(60))
-            .pool_idle_timeout(std::time::Duration::from_secs(90));
+            .http2_adaptive_window(true)
+            .pool_max_idle_per_host(batch_concurrency);
+
+        let keepalive = std::time::Duration::from_millis(config.tcp_keepalive_ms.unwrap_or(60000));
+        let idle_timeout =
+            std::time::Duration::from_millis(config.pool_idle_timeout_ms.unwrap_or(90000));
+        client_builder = client_builder
+            .tcp_keepalive(keepalive)
+            .pool_idle_timeout(idle_timeout);
+
+        if config.tls.required {
+            client_builder = client_builder.https_only(true);
+        }
 
         if config.tls.is_mtls_client_configured() {
             let cert_path = config.tls.cert_file.as_ref().unwrap();
@@ -328,9 +349,15 @@ impl HttpPublisher {
             format!("{}://{}", scheme, config.url)
         };
 
+        let request_timeout = config
+            .request_timeout_ms
+            .map(std::time::Duration::from_millis);
+
         Ok(Self {
             client: client_builder.build()?,
             url,
+            request_timeout,
+            batch_concurrency,
         })
     }
 }
@@ -348,6 +375,9 @@ impl MessagePublisher for HttpPublisher {
         for (key, value) in &message.metadata {
             request_builder = request_builder.header(key, value);
         }
+        if let Some(timeout) = self.request_timeout {
+            request_builder = request_builder.timeout(timeout);
+        }
 
         let response = request_builder
             .body(message.payload)
@@ -356,7 +386,7 @@ impl MessagePublisher for HttpPublisher {
             .with_context(|| format!("Failed to send HTTP request to {}", self.url))?;
 
         let response_status = response.status();
-        let mut response_metadata = HashMap::new();
+        let mut response_metadata = HashMap::with_capacity(response.headers().len());
         for (key, value) in response.headers() {
             if let Ok(value_str) = value.to_str() {
                 response_metadata.insert(key.as_str().to_string(), value_str.to_string());
@@ -371,7 +401,7 @@ impl MessagePublisher for HttpPublisher {
 
         if !response_status.is_success() {
             let error = anyhow::anyhow!(
-                "HTTP sink request failed with status {}: {:?}",
+                "HTTP send request failed with status {}: {:?}",
                 response_status,
                 String::from_utf8_lossy(&response_bytes)
             );
@@ -420,7 +450,7 @@ impl MessagePublisher for HttpPublisher {
         });
 
         // Limit concurrency to 20 to allow connection reuse within the batch
-        let mut stream = futures::stream::iter(send_futures).buffered(20);
+        let mut stream = futures::stream::iter(send_futures).buffered(self.batch_concurrency);
 
         let mut responses = Vec::new();
         let mut failed = Vec::new();

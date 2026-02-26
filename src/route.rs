@@ -804,30 +804,29 @@ fn spawn_sequencer(buffer_size: usize) -> (Sender<(u64, SequencerItem)>, JoinHan
                         Ok((seq, item)) => {
                             if seq < next_seq {
                                 let (_, _, notify) = item;
-                                let _ = notify.send(Err(anyhow::anyhow!("Sequencer received late item (seq {} < next_seq {})", seq, next_seq)));
+                                // This should not happen with the new timeout logic, but we'll keep the check.
+                                let _ = notify.send(Err(anyhow::anyhow!("Sequencer received late item (seq {} < next_seq {}), which is unexpected", seq, next_seq)));
                             } else {
                                 buffer.insert(seq, item);
                             }
                         }
                         Err(_) => {
                             for (_, (_, _, notify)) in std::mem::take(&mut buffer) {
-                                let _ = notify.send(Err(anyhow::anyhow!("Sequencer shutting down")));
+                                let _ = notify.send(Err(anyhow::anyhow!("Sequencer is shutting down")));
                             }
                             break;
                         }
                     }
                 }
                 _ = timeout_fut => {
-                    if let Some(&first_seq) = buffer.keys().next() {
-                        if first_seq > next_seq {
-                            warn!("Sequencer timed out waiting for seq {}. Jumping to {}.", next_seq, first_seq);
-                            next_seq = first_seq;
-                        } else {
-                            next_seq += 1;
-                        }
+                    if let Some(first_seq) = buffer.keys().next() {
+                        warn!("Sequencer timed out waiting for seq {}. Next in buffer is {}. Will reset timer and keep waiting.", next_seq, *first_seq);
                     } else {
-                        next_seq += 1;
+                        // This should be unreachable as a timeout can't occur on an empty buffer.
+                        warn!("Sequencer timed out on an empty buffer, which is unexpected.");
                     }
+                    // Reset the deadline to wait again. This prevents skipping messages that are just slow,
+                    // at the cost of potentially blocking if a message is truly lost.
                     deadline = None;
                 }
             }
