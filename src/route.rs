@@ -104,7 +104,7 @@ impl Route {
         map.keys().cloned().collect()
     }
 
-    ///
+    /// Returns true if the input is of type ref (and the output isn't)
     pub fn is_ref(&self) -> bool {
         matches!(self.input.endpoint_type, EndpointType::Ref(_))
             && !matches!(self.output.endpoint_type, EndpointType::Ref(_))

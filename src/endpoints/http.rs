@@ -49,7 +49,7 @@ struct HttpConsumerState {
     basic_auth: Option<(String, String)>,
     compression_enabled: bool,
     compression_threshold_bytes: usize,
-    custom_auth_headers: HashMap<String, String>,
+    custom_headers: HashMap<String, String>,
 }
 
 impl HttpConsumer {
@@ -74,7 +74,7 @@ impl HttpConsumer {
             basic_auth: config.basic_auth.clone(),
             compression_enabled: config.compression_enabled,
             compression_threshold_bytes,
-            custom_auth_headers: config.custom_headers.clone(),
+            custom_headers: config.custom_headers.clone(),
         };
 
         let listen_address = &config.url;
@@ -397,7 +397,7 @@ async fn handle_request(
     if let Err(e) = state.tx.send((message, commit)).await {
         tracing::error!("Failed to send request to bridge: {}", e);
         let mut builder = Response::builder().status(StatusCode::INTERNAL_SERVER_ERROR);
-        for (header_name, header_value) in &state.custom_auth_headers {
+        for (header_name, header_value) in &state.custom_headers {
             builder = builder.header(header_name.as_str(), header_value.as_str());
         }
         return Ok(builder
@@ -409,7 +409,7 @@ async fn handle_request(
 
     if state.fire_and_forget {
         let mut builder = Response::builder().status(StatusCode::ACCEPTED);
-        for (header_name, header_value) in &state.custom_auth_headers {
+        for (header_name, header_value) in &state.custom_headers {
             builder = builder.header(header_name.as_str(), header_value.as_str());
         }
         return Ok(builder
@@ -420,7 +420,7 @@ async fn handle_request(
     }
 
     let timeout_duration = state.request_timeout;
-    let custom_headers = state.custom_auth_headers.clone();
+    let custom_headers = state.custom_headers.clone();
     match tokio::time::timeout(timeout_duration, ack_rx).await {
         Ok(Ok(disposition)) => make_response(
             disposition,
@@ -540,7 +540,7 @@ pub struct HttpPublisher {
     compression_enabled: bool,
     compression_threshold_bytes: usize,
     basic_auth: Option<(String, String)>,
-    custom_auth_headers: HashMap<String, String>,
+    custom_headers: HashMap<String, String>,
 }
 
 impl HttpPublisher {
@@ -553,7 +553,7 @@ impl HttpPublisher {
 
         // Create HTTPS connector that handles both http and https, and http1/http2
         let https_connector = HttpsConnectorBuilder::new()
-            .with_tls_config(tls_client_config.into())
+            .with_tls_config(tls_client_config)
             .https_or_http()
             .enable_http1()
             .enable_http2()
@@ -590,7 +590,7 @@ impl HttpPublisher {
             compression_enabled: config.compression_enabled,
             compression_threshold_bytes,
             basic_auth: config.basic_auth.clone(),
-            custom_auth_headers: config.custom_headers.clone(),
+            custom_headers: config.custom_headers.clone(),
         })
     }
 }
@@ -620,7 +620,7 @@ impl MessagePublisher for HttpPublisher {
         }
 
         // Add custom authentication headers
-        for (header_name, header_value) in &self.custom_auth_headers {
+        for (header_name, header_value) in &self.custom_headers {
             request_builder = request_builder.header(header_name.as_str(), header_value.as_str());
         }
 
@@ -826,7 +826,7 @@ fn create_rustls_server_config(
             )
         })?);
         for cert in rustls_pemfile::certs(&mut pem) {
-            client_auth_roots.add(cert?.into())?;
+            client_auth_roots.add(cert?)?;
         }
         let client_verifier =
             rustls::server::WebPkiClientVerifier::builder(std::sync::Arc::new(client_auth_roots))
@@ -856,7 +856,7 @@ fn create_rustls_client_config(tls_config: &TlsConfig) -> anyhow::Result<rustls:
             File::open(ca_file).with_context(|| format!("Failed to open CA file: {}", ca_file))?,
         );
         for cert in rustls_pemfile::certs(&mut pem) {
-            root_cert_store.add(cert?.into())?;
+            root_cert_store.add(cert?)?;
         }
     } else {
         root_cert_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
