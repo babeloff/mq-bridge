@@ -11,7 +11,7 @@ pub mod fanout;
 pub mod file;
 #[cfg(feature = "grpc")]
 pub mod grpc;
-#[cfg(any(feature = "http-client", feature = "http-server"))]
+#[cfg(feature = "http")]
 pub mod http;
 #[cfg(feature = "ibm-mq")]
 pub mod ibm_mq;
@@ -306,28 +306,21 @@ fn check_consumer_recursive(
         }
         #[cfg(feature = "grpc")]
         EndpointType::Grpc(_) => Ok(warnings),
-        #[cfg(any(feature = "http-client", feature = "http-server"))]
+        #[cfg(feature = "http")]
         EndpointType::Http(cfg) => {
-            #[cfg(not(feature = "http-server"))]
-            {
-                Err(anyhow!("HTTP consumer requires the 'http-server' feature"))
+            if cfg.batch_concurrency.is_some() {
+                warnings.push("Endpoint 'http' is used as a consumer, but 'batch_concurrency' is a publisher-only option and will be ignored.".to_string());
             }
-            #[cfg(feature = "http-server")]
-            {
-                if cfg.batch_concurrency.is_some() {
-                    warnings.push("Endpoint 'http' is used as a consumer, but 'batch_concurrency' is a publisher-only option and will be ignored.".to_string());
-                }
-                if cfg.tcp_keepalive_ms.is_some() {
-                    warnings.push("Endpoint 'http' is used as a consumer, but 'tcp_keepalive_ms' is a publisher-only option and will be ignored.".to_string());
-                }
-                if cfg.pool_idle_timeout_ms.is_some() {
-                    warnings.push(
+            if cfg.tcp_keepalive_ms.is_some() {
+                warnings.push("Endpoint 'http' is used as a consumer, but 'tcp_keepalive_ms' is a publisher-only option and will be ignored.".to_string());
+            }
+            if cfg.pool_idle_timeout_ms.is_some() {
+                warnings.push(
                         "Endpoint 'http' is used as a consumer, but 'pool_idle_timeout_ms' is a publisher-only option and will be ignored."
                         .to_string(),
                     );
-                }
-                Ok(warnings)
             }
+            Ok(warnings)
         }
         #[cfg(feature = "sled")]
         EndpointType::Sled(_) => Ok(warnings),
@@ -492,17 +485,8 @@ async fn create_base_consumer(
         EndpointType::File(cfg) => Ok(boxed(file::FileConsumer::new(cfg).await?)),
         #[cfg(feature = "grpc")]
         EndpointType::Grpc(cfg) => Ok(boxed(grpc::GrpcConsumer::new(cfg).await?)),
-        #[cfg(any(feature = "http-client", feature = "http-server"))]
-        EndpointType::Http(cfg) => {
-            #[cfg(feature = "http-server")]
-            {
-                Ok(boxed(http::HttpConsumer::new(cfg).await?))
-            }
-            #[cfg(not(feature = "http-server"))]
-            {
-                Err(anyhow!("HTTP consumer requires the 'http-server' feature"))
-            }
-        }
+        #[cfg(feature = "http")]
+        EndpointType::Http(cfg) => Ok(boxed(http::HttpConsumer::new(cfg).await?)),
         EndpointType::Static(cfg) => Ok(boxed(static_endpoint::StaticRequestConsumer::new(cfg)?)),
         EndpointType::Memory(cfg) => Ok(boxed(memory::MemoryConsumer::new(cfg)?)),
         #[cfg(feature = "sled")]
@@ -691,37 +675,33 @@ fn check_publisher_recursive(
             }
             Ok(warnings)
         }
-        #[cfg(any(feature = "http-client", feature = "http-server"))]
-        EndpointType::Http(cfg) => {
-            if cfg.workers.is_some() {
+
+        #[cfg(feature = "http")]
+        EndpointType::Http(_cfg) => {
+            if _cfg.workers.is_some() {
                 warnings.push(
                     "Endpoint 'http' is used as a publisher, but 'workers' is a consumer-only option and will be ignored."
                     .to_string()
                 );
             }
-            if cfg.message_id_header.is_some() {
+            if _cfg.message_id_header.is_some() {
                 warnings.push(
                     "Endpoint 'http' is used as a publisher, but 'message_id_header' is a consumer-only option and will be ignored."
                     .to_string()
                 );
             }
-            if cfg.internal_buffer_size.is_some() {
+            if _cfg.internal_buffer_size.is_some() {
                 warnings.push(
                     "Endpoint 'http' is used as a publisher, but 'internal_buffer_size' is a consumer-only option and will be ignored."
                     .to_string()
                 );
             }
-            if cfg.fire_and_forget {
+            if _cfg.fire_and_forget {
                 warnings.push(
                     "Endpoint 'http' is used as a publisher, but 'fire_and_forget' is a consumer-only option and will be ignored."
                     .to_string()
                 );
             }
-            #[cfg(not(feature = "reqwest"))]
-            {
-                Err(anyhow!("HTTP publisher requires the 'reqwest' feature"))
-            }
-            #[cfg(feature = "reqwest")]
             Ok(warnings)
         }
         #[cfg(feature = "grpc")]
@@ -975,17 +955,10 @@ async fn create_base_publisher(
         EndpointType::Grpc(cfg) => {
             Ok(Box::new(grpc::GrpcPublisher::new(cfg).await?) as Box<dyn MessagePublisher>)
         }
-        #[cfg(any(feature = "http-client", feature = "http-server"))]
+        #[cfg(feature = "http")]
         EndpointType::Http(cfg) => {
-            #[cfg(feature = "reqwest")]
-            {
-                let sink = http::HttpPublisher::new(cfg).await?;
-                Ok(Box::new(sink) as Box<dyn MessagePublisher>)
-            }
-            #[cfg(not(feature = "reqwest"))]
-            {
-                Err(anyhow!("HTTP publisher requires the 'reqwest' feature"))
-            }
+            let sink = http::HttpPublisher::new(cfg).await?;
+            Ok(Box::new(sink) as Box<dyn MessagePublisher>)
         }
         #[cfg(feature = "mongodb")]
         EndpointType::MongoDb(cfg) => {

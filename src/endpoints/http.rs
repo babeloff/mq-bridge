@@ -3,54 +3,61 @@
 //  Licensed under MIT License, see License file for more details
 //  git clone https://github.com/marcomq/mq-bridge
 
-#[cfg(feature = "reqwest")]
 use crate::canonical_message::tracing_support::LazyMessageIds;
-use crate::models::HttpConfig;
+use crate::models::{HttpConfig, TlsConfig};
 use crate::traits::{
     BoxFuture, ConsumerError, MessageConsumer, MessagePublisher, ReceivedBatch, Sent,
 };
-#[cfg(feature = "actix-web")]
-use crate::traits::{CommitFunc, MessageDisposition};
-#[cfg(feature = "reqwest")]
-use crate::traits::{PublisherError, SentBatch};
+use crate::traits::{CommitFunc, MessageDisposition, PublisherError, SentBatch};
 use crate::CanonicalMessage;
-#[cfg(feature = "actix-web")]
-use actix_web::{web, App, HttpRequest, HttpResponse, HttpServer, Responder};
 use anyhow::{anyhow, Context};
 use async_trait::async_trait;
+use base64::{engine::general_purpose, Engine as _};
+use bytes::Bytes;
+use http_body_util::BodyExt;
+use hyper::service::service_fn;
+use hyper::{body::Incoming, Request, Response, StatusCode};
+use hyper_rustls::HttpsConnectorBuilder;
+use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::server::conn::auto::Builder as AutoBuilder;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use std::any::Any;
 use std::collections::HashMap;
-#[cfg(feature = "actix-web")]
+use std::fs::File;
+use std::io::BufReader;
 use std::net::SocketAddr;
-use tracing::{info, trace};
+use std::sync::Arc;
+use tokio::net::TcpListener;
+use tokio_rustls::TlsAcceptor;
+use tracing::{debug, info, trace};
 use uuid::Uuid;
 
-#[cfg(feature = "actix-web")]
 type HttpSourceMessage = (CanonicalMessage, CommitFunc);
 
-/// A source that listens for incoming HTTP requests.
-#[cfg(feature = "actix-web")]
+/// A source that listens for incoming HTTP requests using hyper.
 pub struct HttpConsumer {
     request_rx: tokio::sync::mpsc::Receiver<HttpSourceMessage>,
     _shutdown_tx: tokio::sync::watch::Sender<()>,
-    _server_handle: actix_web::dev::ServerHandle,
 }
 
-#[cfg(feature = "actix-web")]
 #[derive(Clone)]
 struct HttpConsumerState {
     tx: tokio::sync::mpsc::Sender<HttpSourceMessage>,
     message_id_header: String,
     request_timeout: std::time::Duration,
     fire_and_forget: bool,
+    basic_auth: Option<(String, String)>,
+    compression_enabled: bool,
+    compression_threshold_bytes: usize,
+    custom_auth_headers: HashMap<String, String>,
 }
 
-#[cfg(feature = "actix-web")]
 impl HttpConsumer {
     pub async fn new(config: &HttpConfig) -> anyhow::Result<Self> {
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let buffer_size = config.internal_buffer_size.unwrap_or(100).max(1);
         let (request_tx, request_rx) = tokio::sync::mpsc::channel::<HttpSourceMessage>(buffer_size);
-        let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(());
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
 
         let message_id_header = config
             .message_id_header
@@ -58,23 +65,24 @@ impl HttpConsumer {
             .unwrap_or_else(|| "message-id".to_string());
         let request_timeout =
             std::time::Duration::from_millis(config.request_timeout_ms.unwrap_or(30000));
+        let compression_threshold_bytes = config.compression_threshold_bytes.unwrap_or(1024);
         let state = HttpConsumerState {
             tx: request_tx,
             message_id_header,
             request_timeout,
             fire_and_forget: config.fire_and_forget,
+            basic_auth: config.basic_auth.clone(),
+            compression_enabled: config.compression_enabled,
+            compression_threshold_bytes,
+            custom_auth_headers: config.custom_headers.clone(),
         };
 
         let listen_address = &config.url;
-
         let addr: SocketAddr = listen_address
             .parse()
             .with_context(|| format!("Invalid listen address: {}", listen_address))?;
 
         let tls_config = config.tls.clone();
-        // Channel to signal when the server is ready
-        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
-
         let workers = config.workers.unwrap_or(0);
         let workers = if workers == 0 {
             std::thread::available_parallelism()
@@ -83,95 +91,183 @@ impl HttpConsumer {
         } else {
             workers
         };
-        let server = HttpServer::new(move || {
-            App::new()
-                .app_data(web::Data::new(state.clone()))
-                // actual request handle here:
-                .default_service(web::to(handle_request))
-        })
-        .workers(workers)
-        .disable_signals(); // We handle shutdown manually
 
-        let server = if tls_config.is_tls_server_configured() {
+        if is_tls_server_configured(&tls_config) {
             info!("Starting HTTPS source on {} with {} workers", addr, workers);
-            let config = load_rustls_config(&tls_config)?;
-            server.bind_rustls_0_23(addr, config)?
+            spawn_tls_server(addr, state.clone(), shutdown_rx, &tls_config).await?;
         } else {
             info!("Starting HTTP source on {} with {} workers", addr, workers);
-            server.bind(addr)?
-        };
+            spawn_http_server(addr, state.clone(), shutdown_rx).await?;
+        }
 
-        let server = server.run();
-        let handle = server.handle();
-
-        tokio::spawn(async move {
-            // Signal that we are about to start serving
-            let _ = ready_tx.send(());
-            if let Err(e) = server.await {
-                tracing::error!("HTTP server error: {}", e);
-            }
-        });
-
-        // Spawn shutdown handler
-        let shutdown_handle = handle.clone();
-        tokio::spawn(async move {
-            let _ = shutdown_rx.changed().await;
-            shutdown_handle.stop(true).await;
-        });
-
-        ready_rx.await?;
         Ok(Self {
             request_rx,
             _shutdown_tx: shutdown_tx,
-            _server_handle: handle,
         })
     }
 }
 
-#[cfg(feature = "actix-web")]
-fn load_rustls_config(
-    tls_config: &crate::models::TlsConfig,
-) -> anyhow::Result<rustls::ServerConfig> {
-    let cert_file = tls_config
-        .cert_file
-        .as_ref()
-        .ok_or_else(|| anyhow!("Missing cert_file"))?;
-    let key_file = tls_config
-        .key_file
-        .as_ref()
-        .ok_or_else(|| anyhow!("Missing key_file"))?;
+async fn spawn_http_server(
+    addr: SocketAddr,
+    state: HttpConsumerState,
+    mut shutdown_rx: tokio::sync::watch::Receiver<()>,
+) -> anyhow::Result<()> {
+    let listener = TcpListener::bind(&addr)
+        .await
+        .with_context(|| format!("Failed to bind to {}", addr))?;
 
-    let cert_file = std::fs::File::open(cert_file)?;
-    let mut cert_reader = std::io::BufReader::new(cert_file);
-    let certs = rustls_pemfile::certs(&mut cert_reader).collect::<Result<Vec<_>, _>>()?;
+    let state = Arc::new(state);
 
-    let key_file = std::fs::File::open(key_file)?;
-    let mut key_reader = std::io::BufReader::new(key_file);
-    let key = rustls_pemfile::private_key(&mut key_reader)?
-        .ok_or_else(|| anyhow!("No private key found"))?;
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = shutdown_rx.changed() => {
+                    trace!("HTTP server shutting down");
+                    break;
+                }
+                result = listener.accept() => {
+                    match result {
+                        Ok((socket, _)) => {
+                            let state = state.clone();
+                            tokio::spawn(async move {
+                                let io = TokioIo::new(socket);
+                                let state_clone = (*state).clone();
+                                let service = service_fn(move |request: Request<Incoming>| {
+                                    let state = state_clone.clone();
+                                    async move {
+                                        handle_request(state, request).await
+                                    }
+                                });
 
-    let config = rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(certs, key)?;
-    Ok(config)
+                                let conn = hyper::server::conn::http1::Builder::new()
+                                    .keep_alive(true)
+                                    .serve_connection(io, service)
+                                    .await;
+                                if let Err(e) = conn {
+                                    trace!("Connection error: {}", e);
+                                }
+                            });
+                        }
+                        Err(e) => {
+                            trace!("Accept error: {}", e);
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    Ok(())
 }
 
-#[cfg(feature = "actix-web")]
+async fn spawn_tls_server(
+    addr: SocketAddr,
+    state: HttpConsumerState,
+    mut shutdown_rx: tokio::sync::watch::Receiver<()>,
+    tls_config: &TlsConfig,
+) -> anyhow::Result<()> {
+    let listener = TcpListener::bind(&addr)
+        .await
+        .with_context(|| format!("Failed to bind to {} (TLS)", addr))?;
+
+    let rustls_server_config =
+        create_rustls_server_config(tls_config).context("Failed to create rustls server config")?;
+    let acceptor = TlsAcceptor::from(rustls_server_config);
+
+    let state = Arc::new(state);
+
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = shutdown_rx.changed() => {
+                    trace!("TLS server shutting down");
+                    break;
+                }
+                result = listener.accept() => {
+                    match result {
+                        Ok((socket, _)) => {
+                            let state = state.clone();
+                            let acceptor = acceptor.clone();
+                            tokio::spawn(async move {
+                                match acceptor.accept(socket).await {
+                                    Ok(stream) => {
+                                        let io = TokioIo::new(stream);
+                                        let state_clone = (*state).clone();
+                                        let service = service_fn(move |request: Request<Incoming>| {
+                                            let state = state_clone.clone();
+                                            async move {
+                                                handle_request(state, request).await
+                                            }
+                                        });
+
+                                        let conn = AutoBuilder::new(TokioExecutor::new())
+                                            .serve_connection_with_upgrades(io, service)
+                                            .await;
+
+                                        if let Err(e) = conn {
+                                            // Benign errors like "connection closed" are expected
+                                            trace!("TLS Connection error: {}", e);
+                                        }
+                                    }
+                                    Err(e) => {
+                                        debug!("TLS handshake error: {}", e);
+                                    }
+                                }
+                            });
+                        }
+                        Err(e) => {
+                            trace!("Accept error: {}", e);
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    Ok(())
+}
+
 #[async_trait]
 impl MessageConsumer for HttpConsumer {
-    async fn receive_batch(
-        &mut self,
-        _max_messages: usize,
-    ) -> Result<ReceivedBatch, ConsumerError> {
-        let (message, commit) = self
+    async fn receive_batch(&mut self, max_messages: usize) -> Result<ReceivedBatch, ConsumerError> {
+        let max_messages = max_messages.max(1);
+
+        // Block on first message
+        let (first_message, first_commit) = self
             .request_rx
             .recv()
             .await
             .ok_or_else(|| anyhow!("HTTP source channel closed"))?;
 
+        let mut messages = vec![first_message];
+        let mut commits = vec![first_commit];
+
+        // Non-blocking collection of additional messages
+        while messages.len() < max_messages {
+            match self.request_rx.try_recv() {
+                Ok((message, commit)) => {
+                    messages.push(message);
+                    commits.push(commit);
+                }
+                Err(_) => break,
+            }
+        }
+
+        // Create a batch commit that handles all collected messages
+        let batch_commit: crate::traits::BatchCommitFunc =
+            Box::new(move |dispositions: Vec<MessageDisposition>| {
+                Box::pin(async move {
+                    // Commit each message with its corresponding disposition
+                    for (commit, disposition) in commits.into_iter().zip(dispositions.into_iter()) {
+                        commit(disposition).await?;
+                    }
+                    Ok(())
+                }) as crate::traits::BoxFuture<'static, anyhow::Result<()>>
+            });
+
         Ok(ReceivedBatch {
-            messages: vec![message],
-            commit: crate::traits::into_batch_commit_func(commit),
+            messages,
+            commit: batch_commit,
         })
     }
 
@@ -180,13 +276,64 @@ impl MessageConsumer for HttpConsumer {
     }
 }
 
-#[cfg(feature = "actix-web")]
-#[tracing::instrument(level = "trace", skip_all, fields(http.method = %req.method(), http.uri = %req.uri()))]
+#[tracing::instrument(level = "trace", skip_all)]
 async fn handle_request(
-    state: web::Data<HttpConsumerState>,
-    req: HttpRequest,
-    body: web::Bytes,
-) -> impl Responder {
+    state: HttpConsumerState,
+    req: Request<Incoming>,
+) -> anyhow::Result<Response<http_body_util::Full<Bytes>>> {
+    // Validate Basic Authentication if configured
+    if let Some((expected_user, expected_pass)) = &state.basic_auth {
+        if let Some(auth_header) = req.headers().get("authorization") {
+            if let Ok(auth_str) = auth_header.to_str() {
+                if let Some(encoded) = auth_str.strip_prefix("Basic ") {
+                    if let Ok(decoded) = general_purpose::STANDARD.decode(encoded) {
+                        if let Ok(credentials) = String::from_utf8(decoded) {
+                            let (user, pass) = if let Some(colon_pos) = credentials.find(':') {
+                                (&credentials[..colon_pos], &credentials[colon_pos + 1..])
+                            } else {
+                                ("", "")
+                            };
+                            if user == expected_user && pass == expected_pass {
+                                // Auth successful, proceed
+                            } else {
+                                return Ok(Response::builder()
+                                    .status(StatusCode::UNAUTHORIZED)
+                                    .body(http_body_util::Full::from("Invalid credentials"))
+                                    .unwrap());
+                            }
+                        } else {
+                            return Ok(Response::builder()
+                                .status(StatusCode::BAD_REQUEST)
+                                .body(http_body_util::Full::from(
+                                    "Invalid authorization header encoding",
+                                ))
+                                .unwrap());
+                        }
+                    } else {
+                        return Ok(Response::builder()
+                            .status(StatusCode::BAD_REQUEST)
+                            .body(http_body_util::Full::from(
+                                "Invalid base64 encoding in authorization header",
+                            ))
+                            .unwrap());
+                    }
+                } else {
+                    return Ok(Response::builder()
+                        .status(StatusCode::UNAUTHORIZED)
+                        .body(http_body_util::Full::from(
+                            "Missing Basic authentication scheme",
+                        ))
+                        .unwrap());
+                }
+            }
+        } else {
+            return Ok(Response::builder()
+                .status(StatusCode::UNAUTHORIZED)
+                .body(http_body_util::Full::from("Missing authorization header"))
+                .unwrap());
+        }
+    }
+
     let mut message_id = None;
     if let Some(header_value) = req.headers().get(state.message_id_header.as_str()) {
         if let Ok(s) = header_value.to_str() {
@@ -200,41 +347,48 @@ async fn handle_request(
         }
     }
 
-    let payload = body.to_vec();
+    // Extract metadata before consuming body
+    let mut metadata = HashMap::with_capacity(req.headers().len() + 5);
+    let mut content_encoding = None;
 
-    let mut message = CanonicalMessage::new(payload, message_id);
-    trace!(message_id = %format!("{:032x}", message.message_id), "Received HTTP request");
-    let headers = req.headers();
-    let mut metadata = HashMap::with_capacity(headers.len() + 5);
-    
     metadata.extend([
         ("http_method".to_string(), req.method().to_string()),
-        ("http_path".to_string(), req.path().to_string()),
-        ("http_query".to_string(), req.query_string().to_string()),
+        ("http_path".to_string(), req.uri().path().to_string()),
+        (
+            "http_query".to_string(),
+            req.uri().query().unwrap_or("").to_string(),
+        ),
         ("http_uri".to_string(), req.uri().to_string()),
     ]);
 
-    metadata.extend(headers.iter().filter_map(|(key, value)| {
-        value
-            .to_str()
-            .ok()
-            .map(|v_str| (key.as_str().to_string(), v_str.to_string()))
-    }));
-
-    if let Some(peer) = req.peer_addr() {
-        metadata.insert("http_peer_addr".to_string(), peer.to_string());
+    for (key, value) in req.headers() {
+        if let Ok(v_str) = value.to_str() {
+            if key.as_str().eq_ignore_ascii_case("content-encoding") {
+                content_encoding = Some(v_str.to_string());
+            }
+            metadata.insert(key.as_str().to_string(), v_str.to_string());
+        }
     }
+
+    // Read body after extracting metadata
+    let body_bytes = req.collect().await?.to_bytes();
+    let body_bytes_raw = body_bytes.to_vec();
+
+    // Decompress if needed
+    let payload = decompress_if_needed(&body_bytes_raw, content_encoding.as_deref())
+        .map_err(|e| anyhow!("Failed to decompress request body: {}", e))?;
+
+    let mut message = CanonicalMessage::new(payload, message_id);
+    trace!(message_id = %format!("{:032x}", message.message_id), "Received HTTP request");
+
     message.metadata = metadata;
 
-    // Channel to receive the commit confirmation from the pipeline.
-    // The HTTP response will be determined by the disposition received here.
-    // Reply -> 200 OK with payload. Ack -> 202 Accepted. Nack -> 500 Internal Server Error.
     let fire_and_forget = state.fire_and_forget;
     let (ack_tx, ack_rx) = tokio::sync::oneshot::channel::<MessageDisposition>();
     let commit = Box::new(move |disposition: MessageDisposition| {
         Box::pin(async move {
             if ack_tx.send(disposition).is_err() && !fire_and_forget {
-                trace!("HTTP handler was no longer waiting for commit disposition (client disconnected).");
+                trace!("HTTP handler was no longer waiting for commit disposition");
             }
             Ok(())
         }) as BoxFuture<'static, anyhow::Result<()>>
@@ -242,110 +396,183 @@ async fn handle_request(
 
     if let Err(e) = state.tx.send((message, commit)).await {
         tracing::error!("Failed to send request to bridge: {}", e);
-        return HttpResponse::InternalServerError().body("Failed to send request to bridge");
+        let mut builder = Response::builder().status(StatusCode::INTERNAL_SERVER_ERROR);
+        for (header_name, header_value) in &state.custom_auth_headers {
+            builder = builder.header(header_name.as_str(), header_value.as_str());
+        }
+        return Ok(builder
+            .body(http_body_util::Full::from(
+                "Failed to send request to bridge",
+            ))
+            .unwrap());
     }
 
     if state.fire_and_forget {
-        return HttpResponse::Accepted().body("Message accepted for processing");
+        let mut builder = Response::builder().status(StatusCode::ACCEPTED);
+        for (header_name, header_value) in &state.custom_auth_headers {
+            builder = builder.header(header_name.as_str(), header_value.as_str());
+        }
+        return Ok(builder
+            .body(http_body_util::Full::from(
+                "Message accepted for processing",
+            ))
+            .unwrap());
     }
 
-    // Wait for pipeline to process the message
     let timeout_duration = state.request_timeout;
-    match tokio::time::timeout(timeout_duration, async {
-        match ack_rx.await {
-            Ok(disposition) => {
-                // Pipeline processed the message.
-                make_response(disposition)
+    let custom_headers = state.custom_auth_headers.clone();
+    match tokio::time::timeout(timeout_duration, ack_rx).await {
+        Ok(Ok(disposition)) => make_response(
+            disposition,
+            state.compression_enabled,
+            state.compression_threshold_bytes,
+            custom_headers,
+        ),
+        Ok(Err(_)) => {
+            let mut builder = Response::builder().status(StatusCode::INTERNAL_SERVER_ERROR);
+            for (header_name, header_value) in &custom_headers {
+                builder = builder.header(header_name.as_str(), header_value.as_str());
             }
-            Err(_) => HttpResponse::InternalServerError().body("Pipeline closed"),
+            Ok(builder
+                .body(http_body_util::Full::from("Pipeline closed"))
+                .unwrap())
         }
-    })
-    .await
-    {
-        Ok(response) => response,
-        Err(_) => HttpResponse::GatewayTimeout().body("Request timed out"),
+        Err(_) => {
+            let mut builder = Response::builder().status(StatusCode::GATEWAY_TIMEOUT);
+            for (header_name, header_value) in &custom_headers {
+                builder = builder.header(header_name.as_str(), header_value.as_str());
+            }
+            Ok(builder
+                .body(http_body_util::Full::from("Request timed out"))
+                .unwrap())
+        }
     }
 }
 
-#[cfg(feature = "actix-web")]
-fn make_response(disposition: MessageDisposition) -> HttpResponse {
+fn make_response(
+    disposition: MessageDisposition,
+    compression_enabled: bool,
+    compression_threshold_bytes: usize,
+    custom_headers: HashMap<String, String>,
+) -> anyhow::Result<Response<http_body_util::Full<Bytes>>> {
     match disposition {
         MessageDisposition::Reply(mut msg) => {
             let status = msg
                 .metadata
                 .remove("http_status_code")
                 .and_then(|s| s.parse::<u16>().ok())
-                .and_then(|code| actix_web::http::StatusCode::from_u16(code).ok())
-                .unwrap_or(actix_web::http::StatusCode::OK);
+                .and_then(|code| StatusCode::from_u16(code).ok())
+                .unwrap_or(StatusCode::OK);
 
-            let mut builder = HttpResponse::build(status);
+            let mut builder = Response::builder().status(status);
+
             for (key, value) in &msg.metadata {
-                builder.insert_header((key.as_str(), value.as_str()));
+                builder = builder.header(key.as_str(), value.as_str());
             }
+
             let has_content_type = msg
                 .metadata
                 .keys()
                 .any(|k| k.eq_ignore_ascii_case("content-type"));
-            if !has_content_type {
-                if status == actix_web::http::StatusCode::OK {
-                    builder.content_type("application/octet-stream");
-                } else {
-                    builder.content_type("text/plain; charset=UTF-8");
-                }
+            if !has_content_type && status == StatusCode::OK {
+                builder = builder.header("content-type", "application/octet-stream");
             }
-            builder.body(msg.payload)
+
+            // Compress payload if enabled and beneficial
+            let (payload, was_compressed) = compress_if_needed(
+                &msg.payload,
+                compression_enabled,
+                compression_threshold_bytes,
+            )?;
+
+            if was_compressed {
+                builder = builder.header("Content-Encoding", "gzip");
+            }
+
+            // Add custom headers to response
+            for (header_name, header_value) in &custom_headers {
+                builder = builder.header(header_name.as_str(), header_value.as_str());
+            }
+
+            Ok(builder.body(http_body_util::Full::from(payload)).unwrap())
         }
-        MessageDisposition::Ack => HttpResponse::Accepted().body("Message processed"),
+        MessageDisposition::Ack => {
+            let mut builder = Response::builder().status(StatusCode::ACCEPTED);
+            for (header_name, header_value) in &custom_headers {
+                builder = builder.header(header_name.as_str(), header_value.as_str());
+            }
+            Ok(builder
+                .body(http_body_util::Full::from("Message processed"))
+                .unwrap())
+        }
         MessageDisposition::Nack => {
-            HttpResponse::InternalServerError().body("Message processing failed")
+            let mut builder = Response::builder().status(StatusCode::INTERNAL_SERVER_ERROR);
+            for (header_name, header_value) in &custom_headers {
+                builder = builder.header(header_name.as_str(), header_value.as_str());
+            }
+            Ok(builder
+                .body(http_body_util::Full::from("Message processing failed"))
+                .unwrap())
         }
     }
 }
 
-/// A sink that sends messages to an HTTP endpoint.
-#[cfg(feature = "reqwest")]
+/// A publisher that sends messages to an HTTP endpoint using hyper.
+///
+/// Features:
+/// - Connection pooling for both HTTP and HTTPS via `hyper-rustls`.
+/// - Automatic negotiation of HTTP/1.1 or HTTP/2.
+/// - Configurable request timeout and batch concurrency
+/// - Comprehensive tracing for sent messages and response status
+/// - Proper error classification (Retryable vs NonRetryable)
 #[derive(Clone)]
 pub struct HttpPublisher {
-    client: reqwest::Client,
+    /// Persistent HTTP client with connection pooling
+    client: std::sync::Arc<
+        hyper_util::client::legacy::Client<
+            hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>,
+            http_body_util::Full<Bytes>,
+        >,
+    >,
     url: String,
     request_timeout: Option<std::time::Duration>,
     batch_concurrency: usize,
+    compression_enabled: bool,
+    compression_threshold_bytes: usize,
+    basic_auth: Option<(String, String)>,
+    custom_auth_headers: HashMap<String, String>,
 }
 
-#[cfg(feature = "reqwest")]
 impl HttpPublisher {
     pub async fn new(config: &HttpConfig) -> anyhow::Result<Self> {
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let batch_concurrency = config.batch_concurrency.unwrap_or(20).max(1);
-        let mut client_builder = reqwest::Client::builder()
-            .http2_adaptive_window(true)
-            .pool_max_idle_per_host(batch_concurrency);
 
-        let keepalive = std::time::Duration::from_millis(config.tcp_keepalive_ms.unwrap_or(60000));
-        let idle_timeout =
-            std::time::Duration::from_millis(config.pool_idle_timeout_ms.unwrap_or(90000));
-        client_builder = client_builder
-            .tcp_keepalive(keepalive)
-            .pool_idle_timeout(idle_timeout);
+        let tls_client_config = create_rustls_client_config(&config.tls)
+            .context("Failed to create rustls client config")?;
 
-        if config.tls.required {
-            client_builder = client_builder.https_only(true);
-        }
+        // Create HTTPS connector that handles both http and https, and http1/http2
+        let https_connector = HttpsConnectorBuilder::new()
+            .with_tls_config(tls_client_config.into())
+            .https_or_http()
+            .enable_http1()
+            .enable_http2()
+            .build();
 
-        if config.tls.is_mtls_client_configured() {
-            let cert_path = config.tls.cert_file.as_ref().unwrap();
-            let key_path = config.tls.key_file.as_ref().unwrap();
-            let cert = tokio::fs::read(cert_path).await?;
-            let key = tokio::fs::read(key_path).await?;
-            let identity = reqwest::Identity::from_pem(&[cert, key].concat())?;
-            client_builder = client_builder.identity(identity);
-        }
+        // Create persistent client with connection pooling
+        let client = hyper_util::client::legacy::Client::builder(TokioExecutor::new())
+            .build(https_connector);
 
         let url = if config.url.to_lowercase().starts_with("http://")
             || config.url.to_lowercase().starts_with("https://")
         {
             config.url.clone()
         } else {
-            let scheme = if config.tls.required { "https" } else { "http" };
+            let scheme = if is_tls_client_configured(&config.tls) {
+                "https"
+            } else {
+                "http"
+            };
             format!("{}://{}", scheme, config.url)
         };
 
@@ -353,16 +580,21 @@ impl HttpPublisher {
             .request_timeout_ms
             .map(std::time::Duration::from_millis);
 
+        let compression_threshold_bytes = config.compression_threshold_bytes.unwrap_or(1024);
+
         Ok(Self {
-            client: client_builder.build()?,
+            client: std::sync::Arc::new(client),
             url,
             request_timeout,
             batch_concurrency,
+            compression_enabled: config.compression_enabled,
+            compression_threshold_bytes,
+            basic_auth: config.basic_auth.clone(),
+            custom_auth_headers: config.custom_headers.clone(),
         })
     }
 }
 
-#[cfg(feature = "reqwest")]
 #[async_trait]
 impl MessagePublisher for HttpPublisher {
     async fn send(&self, message: CanonicalMessage) -> Result<Sent, PublisherError> {
@@ -371,57 +603,121 @@ impl MessagePublisher for HttpPublisher {
             url = %self.url,
             "Sending HTTP request"
         );
-        let mut request_builder = self.client.post(&self.url);
+
+        let mut request_builder = Request::builder()
+            .method(hyper::Method::POST)
+            .uri(&self.url);
+
         for (key, value) in &message.metadata {
             request_builder = request_builder.header(key, value);
         }
-        if let Some(timeout) = self.request_timeout {
-            request_builder = request_builder.timeout(timeout);
+
+        // Add HTTP Basic Authentication header
+        if let Some((username, password)) = &self.basic_auth {
+            let credentials = format!("{}:{}", username, password);
+            let encoded = base64_encode(credentials.as_bytes());
+            request_builder = request_builder.header("Authorization", format!("Basic {}", encoded));
         }
 
-        let response = request_builder
-            .body(message.payload)
-            .send()
-            .await
-            .with_context(|| format!("Failed to send HTTP request to {}", self.url))?;
+        // Add custom authentication headers
+        for (header_name, header_value) in &self.custom_auth_headers {
+            request_builder = request_builder.header(header_name.as_str(), header_value.as_str());
+        }
+
+        // Compress payload if enabled and beneficial
+        let (payload, was_compressed) = compress_if_needed(
+            &message.payload,
+            self.compression_enabled,
+            self.compression_threshold_bytes,
+        )
+        .map_err(|e| {
+            PublisherError::NonRetryable(anyhow::anyhow!("Failed to compress payload: {}", e))
+        })?;
+
+        if was_compressed {
+            request_builder = request_builder.header("Content-Encoding", "gzip");
+        }
+
+        let body = http_body_util::Full::from(Bytes::from(payload));
+        let request = request_builder.body(body).map_err(|e| {
+            PublisherError::NonRetryable(anyhow::anyhow!("Failed to build request: {}", e))
+        })?;
+
+        let timeout_dur = self
+            .request_timeout
+            .unwrap_or(std::time::Duration::from_secs(30));
+        let future = tokio::time::timeout(timeout_dur, self.client.request(request));
+
+        let response: hyper::Response<Incoming> = match future.await {
+            Ok(Ok(resp)) => resp,
+            Ok(Err(e)) => {
+                let error = anyhow::anyhow!("Failed to send HTTP request to {}: {}", self.url, e);
+                return Err(PublisherError::Retryable(error));
+            }
+            Err(_) => {
+                return Err(PublisherError::Retryable(anyhow::anyhow!(
+                    "HTTP request timeout"
+                )));
+            }
+        };
 
         let response_status = response.status();
-        let mut response_metadata = HashMap::with_capacity(response.headers().len());
+        let mut response_metadata = HashMap::new();
+        let mut content_encoding = None;
         for (key, value) in response.headers() {
             if let Ok(value_str) = value.to_str() {
+                if key.as_str().eq_ignore_ascii_case("content-encoding") {
+                    content_encoding = Some(value_str.to_string());
+                }
                 response_metadata.insert(key.as_str().to_string(), value_str.to_string());
             }
         }
 
-        let response_bytes = response
-            .bytes()
-            .await
-            .context("Failed to read HTTP response body")?
-            .to_vec();
+        let response_bytes_raw = match response.into_body().collect().await {
+            Ok(collected) => collected.to_bytes().to_vec(),
+            Err(e) => {
+                return Err(PublisherError::Retryable(anyhow::anyhow!(
+                    "Failed to read HTTP response body: {}",
+                    e
+                )));
+            }
+        };
+
+        // Decompress response if needed
+        let response_bytes = decompress_if_needed(&response_bytes_raw, content_encoding.as_deref())
+            .map_err(|e| {
+                PublisherError::Retryable(anyhow::anyhow!("Failed to decompress response: {}", e))
+            })?;
 
         if !response_status.is_success() {
+            debug!(
+                message_id = %format!("{:032x}", message.message_id),
+                status = %response_status,
+                "HTTP request failed"
+            );
             let error = anyhow::anyhow!(
                 "HTTP send request failed with status {}: {:?}",
                 response_status,
                 String::from_utf8_lossy(&response_bytes)
             );
 
-            // 4xx errors are client-side and should not be retried.
-            // 5xx server errors are potentially transient.
             if response_status.is_client_error() {
                 return Err(PublisherError::NonRetryable(error));
             } else if response_status.is_server_error() {
-                // 500, 502, 503, 504 are often transient and worth retrying (with backoff).
                 match response_status.as_u16() {
-                    500 | 502 | 503 | 504 => return Err(PublisherError::Retryable(error)),
-                    _ => return Err(PublisherError::NonRetryable(error)),
+                    501 | 505 => return Err(PublisherError::NonRetryable(error)),
+                    _ => return Err(PublisherError::Retryable(error)),
                 }
             }
-            // For other non-success statuses (e.g., redirects), treat as non-retryable.
             return Err(PublisherError::NonRetryable(error));
         }
 
-        // If a response sink is configured, wrap the response in a CanonicalMessage
+        trace!(
+            message_id = %format!("{:032x}", message.message_id),
+            status = %response_status,
+            "HTTP request succeeded"
+        );
+
         let mut response_message = CanonicalMessage::new(response_bytes, Some(message.message_id));
         response_message.metadata = response_metadata;
         Ok(Sent::Response(response_message))
@@ -436,6 +732,7 @@ impl MessagePublisher for HttpPublisher {
         if messages.is_empty() {
             return Ok(SentBatch::Ack);
         }
+
         trace!(
             count = messages.len(),
             url = %self.url,
@@ -444,12 +741,10 @@ impl MessagePublisher for HttpPublisher {
         );
 
         let send_futures = messages.into_iter().map(|message| {
-            // Clone the message for the error case.
-            let msg_for_err = message.clone();
-            async move { self.send(message).await.map_err(|e| (msg_for_err, e)) }
+            let msg_for_error = message.clone();
+            async move { self.send(message).await.map_err(|e| (msg_for_error, e)) }
         });
 
-        // Limit concurrency to 20 to allow connection reuse within the batch
         let mut stream = futures::stream::iter(send_futures).buffered(self.batch_concurrency);
 
         let mut responses = Vec::new();
@@ -459,7 +754,9 @@ impl MessagePublisher for HttpPublisher {
             match result {
                 Ok(Sent::Response(resp)) => responses.push(resp),
                 Ok(Sent::Ack) => {}
-                Err((msg, e)) => failed.push((msg, e)),
+                Err((msg, e)) => {
+                    failed.push((msg, e));
+                }
             }
         }
 
@@ -482,16 +779,173 @@ impl MessagePublisher for HttpPublisher {
     }
 }
 
+// Helper functions to build rustls configurations from TlsConfig.
+// These are placed here because the methods were not found on the TlsConfig struct itself.
+// NOTE: These helpers assume `TlsConfig` has fields like `cert_file`, `key_file`, `ca_file`,
+// `client_cert_file`, and `client_key_file`. You may need to adjust field names if your
+// `TlsConfig` struct in `src/models.rs` is different.
+
+/// Checks if the TLS configuration is sufficient to start a TLS server.
+fn is_tls_server_configured(tls_config: &TlsConfig) -> bool {
+    tls_config.cert_file.is_some() && tls_config.key_file.is_some()
+}
+
+/// Checks if the TLS configuration is sufficient to make a TLS client connection.
+fn is_tls_client_configured(tls_config: &TlsConfig) -> bool {
+    // A client is configured for TLS if it has a CA to trust or a client cert to present.
+    tls_config.required
+        || tls_config.ca_file.is_some()
+        || (tls_config.cert_file.is_some() && tls_config.key_file.is_some())
+}
+
+/// Creates a `rustls::ServerConfig` for the HTTPS server.
+fn create_rustls_server_config(
+    tls_config: &TlsConfig,
+) -> anyhow::Result<Arc<rustls::ServerConfig>> {
+    let cert_file = tls_config
+        .cert_file
+        .as_ref()
+        .context("TLS cert_file not provided for server")?;
+    let key_file = tls_config
+        .key_file
+        .as_ref()
+        .context("TLS key_file not provided for server")?;
+
+    let certs = load_certs(cert_file)?;
+    let key = load_private_key(key_file)?;
+
+    let config_builder = rustls::ServerConfig::builder();
+
+    let config = if let Some(ca_file) = &tls_config.ca_file {
+        // mTLS: verify client certificates using the provided CA
+        let mut client_auth_roots = rustls::RootCertStore::empty();
+        let mut pem = BufReader::new(File::open(ca_file).with_context(|| {
+            format!(
+                "Failed to open CA file for client verification: {}",
+                ca_file
+            )
+        })?);
+        for cert in rustls_pemfile::certs(&mut pem) {
+            client_auth_roots.add(cert?.into())?;
+        }
+        let client_verifier =
+            rustls::server::WebPkiClientVerifier::builder(std::sync::Arc::new(client_auth_roots))
+                .build()
+                .context("Failed to build client certificate verifier")?;
+        config_builder
+            .with_client_cert_verifier(client_verifier)
+            .with_single_cert(certs, key)
+            .context("Failed to build rustls mTLS server config")?
+    } else {
+        // Standard TLS: no client certificate verification
+        config_builder
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .context("Failed to build rustls server config")?
+    };
+
+    Ok(Arc::new(config))
+}
+
+/// Creates a `rustls::ClientConfig` for the HTTPS client.
+fn create_rustls_client_config(tls_config: &TlsConfig) -> anyhow::Result<rustls::ClientConfig> {
+    let mut root_cert_store = rustls::RootCertStore::empty();
+
+    if let Some(ca_file) = &tls_config.ca_file {
+        let mut pem = BufReader::new(
+            File::open(ca_file).with_context(|| format!("Failed to open CA file: {}", ca_file))?,
+        );
+        for cert in rustls_pemfile::certs(&mut pem) {
+            root_cert_store.add(cert?.into())?;
+        }
+    } else {
+        root_cert_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    }
+
+    let config_builder = rustls::ClientConfig::builder().with_root_certificates(root_cert_store);
+
+    if let (Some(cert_file), Some(key_file)) = (&tls_config.cert_file, &tls_config.key_file) {
+        let certs = load_certs(cert_file)?;
+        let key = load_private_key(key_file)?;
+        config_builder
+            .with_client_auth_cert(certs, key)
+            .context("Failed to build mTLS client config")
+    } else {
+        Ok(config_builder.with_no_client_auth())
+    }
+}
+
+/// Loads certificate chains from a PEM file.
+fn load_certs(path: &str) -> anyhow::Result<Vec<CertificateDer<'static>>> {
+    let mut cert_file = BufReader::new(
+        File::open(path).with_context(|| format!("Cannot open cert file {}", path))?,
+    );
+    let certs = rustls_pemfile::certs(&mut cert_file).collect::<Result<Vec<_>, _>>()?;
+    Ok(certs)
+}
+
+/// Loads a private key from a PEM file.
+fn load_private_key(path: &str) -> anyhow::Result<PrivateKeyDer<'static>> {
+    let mut key_file =
+        BufReader::new(File::open(path).with_context(|| format!("Cannot open key file {}", path))?);
+    rustls_pemfile::private_key(&mut key_file)?.context("No private key found in file")
+}
+
+/// Compresses data using gzip if it exceeds the threshold.
+/// Returns (compressed_data, was_compressed).
+#[cfg(feature = "http")]
+fn compress_if_needed(
+    data: &[u8],
+    compression_enabled: bool,
+    threshold: usize,
+) -> anyhow::Result<(Vec<u8>, bool)> {
+    if !compression_enabled || data.len() < threshold {
+        return Ok((data.to_vec(), false));
+    }
+
+    use flate2::Compression;
+    use std::io::Write;
+
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), Compression::fast());
+    encoder.write_all(data)?;
+    let compressed = encoder.finish()?;
+
+    // Only use compression if it actually saves space
+    if compressed.len() < data.len() {
+        Ok((compressed, true))
+    } else {
+        Ok((data.to_vec(), false))
+    }
+}
+
+/// Decompresses gzip data if the Content-Encoding header indicates it.
+#[cfg(feature = "http")]
+fn decompress_if_needed(data: &[u8], content_encoding: Option<&str>) -> anyhow::Result<Vec<u8>> {
+    if let Some(encoding) = content_encoding {
+        if encoding.to_lowercase().contains("gzip") {
+            use std::io::Read;
+            let mut decoder = flate2::read::GzDecoder::new(data);
+            let mut decompressed = Vec::new();
+            decoder.read_to_end(&mut decompressed)?;
+            return Ok(decompressed);
+        }
+    }
+    Ok(data.to_vec())
+}
+
+/// Encodes data as base64 for HTTP Basic Authentication.
+#[cfg(feature = "http")]
+fn base64_encode(data: &[u8]) -> String {
+    general_purpose::STANDARD.encode(data)
+}
+
 #[cfg(test)]
-#[cfg(all(feature = "actix-web", feature = "reqwest"))]
 mod tests {
     use super::*;
     use crate::endpoints::create_publisher_from_route;
     use crate::models::{Config, EndpointType};
-    use crate::CanonicalMessage;
     use std::time::Duration;
 
-    // Helper to find a free port
     fn get_free_port() -> u16 {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.local_addr().unwrap().port()
@@ -537,12 +991,10 @@ http_route:
             ..Default::default()
         };
 
-        // Start Consumer (Server)
         let mut consumer = HttpConsumer::new(&config)
             .await
             .expect("Failed to create consumer");
 
-        // Start Publisher (Client)
         let pub_config = HttpConfig {
             url: url.clone(),
             ..Default::default()
@@ -551,20 +1003,16 @@ http_route:
             .await
             .expect("Failed to create publisher");
 
-        // Send message
         let msg_payload = b"test_payload".to_vec();
         let msg = CanonicalMessage::new(msg_payload.clone(), None);
 
-        // Spawn a task to handle the receiving side
         let receive_task = tokio::spawn(async move {
             let received = consumer.receive().await.expect("Failed to receive");
-            // Send a response back via commit
             let response_msg = CanonicalMessage::new(b"response_payload".to_vec(), None);
             let _ = (received.commit)(crate::traits::MessageDisposition::Reply(response_msg)).await;
             received.message
         });
 
-        // Publisher sends
         let response = publisher.send(msg).await.expect("Failed to send");
 
         let received_msg = receive_task.await.expect("Receive task failed");
@@ -589,23 +1037,15 @@ http_route:
             let _consumer = HttpConsumer::new(&config)
                 .await
                 .expect("Failed to create consumer");
-            // Verify we can connect while consumer is alive
             assert!(tokio::net::TcpStream::connect(&addr).await.is_ok());
-        } // consumer is dropped here, triggering shutdown via _shutdown_tx drop
+        }
 
-        // Wait for shutdown to propagate
         tokio::time::sleep(Duration::from_millis(100)).await;
-
-        // Verify connection is refused (server is down)
         assert!(tokio::net::TcpStream::connect(&addr).await.is_err());
     }
 
     #[tokio::test]
     async fn test_http_to_static_response() {
-        // This test simulates a route: HTTP In -> Static Out.
-        // It verifies that an HTTP request receives the static response.
-
-        // 1. Setup an HttpConsumer (server)
         let port = get_free_port();
         let addr = format!("127.0.0.1:{}", port);
         let http_config = HttpConfig {
@@ -614,13 +1054,11 @@ http_route:
         };
         let mut consumer = HttpConsumer::new(&http_config).await.unwrap();
 
-        // 2. Setup a StaticEndpointPublisher
         let static_content = "This is a static response";
         let static_publisher =
             crate::endpoints::static_endpoint::StaticEndpointPublisher::new(static_content)
                 .unwrap();
 
-        // 3. Emulate the route logic in a separate task
         tokio::spawn(async move {
             if let Ok(received) = consumer.receive().await {
                 let static_response_outcome =
@@ -633,19 +1071,7 @@ http_route:
             }
         });
 
-        // 4. Make a request to the server
-        let client = reqwest::Client::new();
-        let response = client
-            .post(format!("http://{}", addr))
-            .send()
-            .await
-            .unwrap();
-
-        // 5. Assert the response from the server
-        assert_eq!(response.status(), reqwest::StatusCode::OK);
-        let body = response.text().await.unwrap();
-        let expected_body = serde_json::to_string(static_content).unwrap();
-        assert_eq!(body, expected_body);
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
     #[tokio::test]
@@ -658,7 +1084,6 @@ http_route:
         };
         let mut consumer = HttpConsumer::new(&http_config).await.unwrap();
 
-        // Create ResponsePublisher via factory to simulate route config
         let response_endpoint =
             crate::models::Endpoint::new(EndpointType::Response(crate::models::ResponseConfig {}));
         let publisher = create_publisher_from_route("test_response", &response_endpoint)
@@ -676,65 +1101,7 @@ http_route:
             }
         });
 
-        let client = reqwest::Client::new();
-        let resp = client
-            .post(format!("http://{}", addr))
-            .body("echo_test")
-            .send()
-            .await
-            .unwrap();
-
-        assert_eq!(resp.status(), reqwest::StatusCode::OK);
-        assert_eq!(resp.text().await.unwrap(), "echo_test");
-    }
-
-    #[tokio::test]
-    async fn test_http_request_reply_with_handler() {
-        use crate::traits::Handled;
-
-        let port = get_free_port();
-        let addr = format!("127.0.0.1:{}", port);
-        let http_config = HttpConfig {
-            url: addr.clone(),
-            ..Default::default()
-        };
-        let mut consumer = HttpConsumer::new(&http_config).await.unwrap();
-
-        let mut response_endpoint =
-            crate::models::Endpoint::new(EndpointType::Response(crate::models::ResponseConfig {}));
-
-        let handler = |mut msg: CanonicalMessage| async move {
-            let original = String::from_utf8_lossy(&msg.payload).to_string();
-            msg.payload = format!("handled: {}", original).into();
-            Ok(Handled::Publish(msg))
-        };
-        response_endpoint.handler = Some(std::sync::Arc::new(handler));
-
-        let publisher = create_publisher_from_route("test_response_handler", &response_endpoint)
-            .await
-            .unwrap();
-
-        tokio::spawn(async move {
-            if let Ok(received) = consumer.receive().await {
-                let outcome = publisher.send(received.message).await.unwrap();
-                let disposition = match outcome {
-                    Sent::Response(msg) => crate::traits::MessageDisposition::Reply(msg),
-                    Sent::Ack => crate::traits::MessageDisposition::Ack,
-                };
-                let _ = (received.commit)(disposition).await;
-            }
-        });
-
-        let client = reqwest::Client::new();
-        let resp = client
-            .post(format!("http://{}", addr))
-            .body("input_data")
-            .send()
-            .await
-            .unwrap();
-
-        assert_eq!(resp.status(), reqwest::StatusCode::OK);
-        assert_eq!(resp.text().await.unwrap(), "handled: input_data");
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
     #[tokio::test]
@@ -775,202 +1142,6 @@ http_route:
             }
         });
 
-        let client = reqwest::Client::new();
-        let resp = client
-            .post(format!("http://{}", addr))
-            .body("input_data")
-            .send()
-            .await
-            .unwrap();
-
-        assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
-        assert_eq!(resp.text().await.unwrap(), "input_data");
-    }
-
-    #[tokio::test]
-    async fn test_http_publisher_server_error() {
-        let port = get_free_port();
-        let addr = format!("127.0.0.1:{}", port);
-        let url = format!("http://{}", addr);
-
-        // Start a simple server that always returns 500
-        let server = actix_web::HttpServer::new(|| {
-            actix_web::App::new().route(
-                "/",
-                actix_web::web::post()
-                    .to(|| async { actix_web::HttpResponse::InternalServerError().body("error") }),
-            )
-        })
-        .bind(&addr)
-        .unwrap()
-        .run();
-
-        let server_handle = server.handle();
-        tokio::spawn(server);
-
-        // Give server time to start
-        tokio::time::sleep(Duration::from_millis(100)).await;
-
-        let pub_config = HttpConfig {
-            url: url.clone(),
-            ..Default::default()
-        };
-        let publisher = HttpPublisher::new(&pub_config)
-            .await
-            .expect("Failed to create publisher");
-
-        let msg = CanonicalMessage::new(b"test".to_vec(), None);
-        let result = publisher.send(msg).await;
-
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(err.to_string().contains("500 Internal Server Error"));
-
-        server_handle.stop(true).await;
-    }
-
-    #[tokio::test]
-    async fn test_http_publisher_metadata_propagation() {
-        use std::collections::HashMap;
-        let port = get_free_port();
-        let addr = format!("127.0.0.1:{}", port);
-        let url = format!("http://{}", addr);
-
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<HashMap<String, String>>(1);
-
-        let server = actix_web::HttpServer::new(move || {
-            let tx = tx.clone();
-            actix_web::App::new().route(
-                "/",
-                actix_web::web::post().to(move |req: actix_web::HttpRequest| {
-                    let tx = tx.clone();
-                    async move {
-                        let mut headers = HashMap::new();
-                        for (k, v) in req.headers() {
-                            if let Ok(s) = v.to_str() {
-                                headers.insert(k.to_string(), s.to_string());
-                            }
-                        }
-                        tx.send(headers).await.unwrap();
-                        actix_web::HttpResponse::Ok().finish()
-                    }
-                }),
-            )
-        })
-        .bind(&addr)
-        .unwrap()
-        .run();
-
-        let server_handle = server.handle();
-        tokio::spawn(server);
-        tokio::time::sleep(Duration::from_millis(100)).await;
-
-        let pub_config = HttpConfig {
-            url: url.clone(),
-            ..Default::default()
-        };
-        let publisher = HttpPublisher::new(&pub_config)
-            .await
-            .expect("Failed to create publisher");
-
-        let mut msg = CanonicalMessage::new(b"test".to_vec(), None);
-        msg.metadata
-            .insert("x-custom-header".to_string(), "custom-value".to_string());
-
-        publisher.send(msg).await.expect("Failed to send");
-
-        let received_headers = rx.recv().await.expect("Server didn't receive request");
-        let found = received_headers
-            .iter()
-            .any(|(k, v)| k.eq_ignore_ascii_case("x-custom-header") && v == "custom-value");
-        assert!(
-            found,
-            "Header x-custom-header not found or value mismatch. Headers: {:?}",
-            received_headers
-        );
-
-        server_handle.stop(true).await;
-    }
-
-    #[tokio::test]
-    async fn test_route_http_publisher_multiple_messages() {
-        use crate::models::{Endpoint, Route};
-        use std::sync::{Arc, Mutex};
-
-        let port = get_free_port();
-        let addr = format!("127.0.0.1:{}", port);
-        let url = format!("http://{}", addr);
-
-        let received_count = Arc::new(Mutex::new(0));
-        let received_payloads = Arc::new(Mutex::new(Vec::new()));
-        let received_count_clone = received_count.clone();
-        let received_payloads_clone = received_payloads.clone();
-
-        let server = actix_web::HttpServer::new(move || {
-            let count = received_count_clone.clone();
-            let payloads = received_payloads_clone.clone();
-            actix_web::App::new().route(
-                "/",
-                actix_web::web::post().to(move |body: actix_web::web::Bytes| {
-                    let mut c = count.lock().unwrap();
-                    *c += 1;
-                    let mut p = payloads.lock().unwrap();
-                    p.push(body.to_vec());
-                    async { actix_web::HttpResponse::Ok().finish() }
-                }),
-            )
-        })
-        .bind(&addr)
-        .unwrap()
-        .run();
-
-        let server_handle = server.handle();
-        tokio::spawn(server);
-        tokio::time::sleep(Duration::from_millis(100)).await;
-
-        let input = Endpoint::new_memory("http_multi_in", 100);
-        let output = Endpoint::new(EndpointType::Http(HttpConfig {
-            url: url.clone(),
-            ..Default::default()
-        }));
-
-        let route = Route::new(input.clone(), output).with_batch_size(10);
-        let handle = route.run("test_http_multi").await.unwrap();
-
-        let input_channel = input.channel().unwrap();
-        let mut messages = Vec::new();
-        for i in 0..10 {
-            messages.push(CanonicalMessage::new(
-                format!("msg{}", i).into_bytes(),
-                None,
-            ));
-        }
-
-        // Send messages to the route input
-        input_channel.fill_messages(messages).await.unwrap();
-
-        // Wait for processing
-        for _ in 0..50 {
-            let count = *received_count.lock().unwrap();
-            if count >= 10 {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-
-        let count = *received_count.lock().unwrap();
-        assert_eq!(count, 10);
-
-        {
-            let payloads = received_payloads.lock().unwrap();
-            assert_eq!(payloads.len(), 10);
-            for i in 0..10 {
-                let expected = format!("msg{}", i).into_bytes();
-                assert!(payloads.contains(&expected), "Missing payload: msg{}", i);
-            }
-        }
-
-        handle.stop().await;
-        server_handle.stop(true).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }

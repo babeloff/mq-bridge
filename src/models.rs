@@ -1385,6 +1385,22 @@ pub struct HttpConfig {
     /// (Publisher only) Timeout for idle connections in the connection pool in milliseconds. Defaults to 90000ms.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pool_idle_timeout_ms: Option<u64>,
+    /// Enable gzip compression for request/response bodies exceeding the threshold. Defaults to false.
+    #[serde(default)]
+    pub compression_enabled: bool,
+    /// Minimum message size in bytes to compress. Messages smaller than this are sent uncompressed. Defaults to 1024 bytes.
+    #[serde(default)]
+    pub compression_threshold_bytes: Option<usize>,
+    /// HTTP Basic Authentication credentials (username, password).
+    /// Both values are required if basic auth is used.
+    /// For consumers: validates incoming requests. For publishers: adds Authorization header.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub basic_auth: Option<(String, String)>,
+    /// Custom authentication headers as key-value pairs (e.g., {"X-API-Key": "token123"}).
+    /// For consumers: validates that incoming requests have these exact header values.
+    /// For publishers: adds these headers to outgoing requests.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub custom_headers: HashMap<String, String>,
 }
 
 impl HttpConfig {

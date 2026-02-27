@@ -1497,4 +1497,97 @@ mod tests {
         assert_eq!(batch.messages[0].payload.as_ref(), b"msg1");
         assert_eq!(batch.messages[1].payload.as_ref(), b"msg2");
     }
+
+    #[tokio::test]
+    async fn test_file_tail_concurrent_publish_and_consume() {
+        // This test verifies that the tail reader can work concurrently with the publisher
+        // writing to the file. This is critical for Windows compatibility where file locking
+        // semantics may prevent concurrent access if not handled correctly.
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("concurrent.log");
+        let file_path_str = file_path.to_str().unwrap().to_string();
+
+        // Create file with initial message
+        tokio::fs::write(&file_path, b"msg0\n").await.unwrap();
+
+        let config = FileConfig {
+            path: file_path_str.clone(),
+            mode: FileConsumerMode::Subscribe { delete: false },
+        };
+
+        // Start the tail consumer
+        let mut consumer = FileConsumer::new(&config).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // Spawn a task that continuously publishes messages while the consumer is reading
+        let publisher_path = file_path_str.clone();
+        let publish_handle = tokio::spawn(async move {
+            let pub_config = FileConfig {
+                path: publisher_path,
+                mode: FileConsumerMode::Subscribe { delete: false },
+            };
+            let publisher = FilePublisher::new(&pub_config).await.unwrap();
+
+            for i in 1..10 {
+                let msg = msg!(json!({"id": i, "data": format!("message_{}", i)}));
+                publisher.send_batch(vec![msg]).await.unwrap();
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        });
+
+        // Consumer should be able to read messages while publisher is writing
+        let mut received_count = 0;
+        let mut message_ids = Vec::new();
+
+        for attempt in 0..100 {
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(200),
+                consumer.receive_batch(1),
+            )
+            .await
+            {
+                Ok(Ok(batch)) => {
+                    for msg in &batch.messages {
+                        received_count += 1;
+                        if let Ok(json_msg) =
+                            serde_json::from_slice::<serde_json::Value>(&msg.payload)
+                        {
+                            if let Some(id) = json_msg.get("id").and_then(|v| v.as_i64()) {
+                                message_ids.push(id);
+                            }
+                        }
+                    }
+                    (batch.commit)(vec![crate::traits::MessageDisposition::Ack])
+                        .await
+                        .unwrap();
+                }
+                Ok(Err(_)) => break, // Stream ended
+                Err(_) => {
+                    // Timeout waiting for message
+                    if attempt > 50 && received_count >= 5 {
+                        break; // Got enough messages, publisher task may be finishing
+                    }
+                }
+            }
+        }
+
+        publish_handle.await.unwrap();
+
+        // Verify we received at least some messages from the publisher
+        // We should receive msg0 (initial) + some messages from the concurrent publisher
+        assert!(
+            received_count >= 5,
+            "Expected at least 5 messages, got {}. This may indicate file locking issues on this platform.",
+            received_count
+        );
+
+        // Verify the file still exists and can be read (not locked/deleted)
+        let final_content = tokio::fs::read_to_string(&file_path)
+            .await
+            .expect("File should still be readable after concurrent access");
+        assert!(
+            !final_content.is_empty(),
+            "File should contain messages after concurrent access"
+        );
+    }
 }
