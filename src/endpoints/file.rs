@@ -1547,8 +1547,8 @@ mod tests {
         let mut received_count = 0;
         let mut message_ids = Vec::new();
 
-        // We expect 1 initial + 100 published = 101 messages
-        let expected_count = 101;
+        // We expect 100 published messages (initial msg0 is skipped in Subscribe mode)
+        let expected_count = 100;
         let start = std::time::Instant::now();
 
         while received_count < expected_count {
@@ -1587,7 +1587,7 @@ mod tests {
         publish_handle.await.unwrap();
 
         // Verify we received at least some messages from the publisher
-        // We should receive msg0 (initial) + some messages from the concurrent publisher
+        // We should receive the messages from the concurrent publisher
         assert!(
             received_count == expected_count,
             "Expected {} messages, got {}. This may indicate file locking issues on this platform.",

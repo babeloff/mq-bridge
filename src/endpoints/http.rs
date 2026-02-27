@@ -18,6 +18,7 @@ use http_body_util::BodyExt;
 use hyper::service::service_fn;
 use hyper::{body::Incoming, Request, Response, StatusCode};
 use hyper_rustls::HttpsConnectorBuilder;
+use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder as AutoBuilder;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -551,17 +552,26 @@ impl HttpPublisher {
         let tls_client_config = create_rustls_client_config(&config.tls)
             .context("Failed to create rustls client config")?;
 
+        let mut http_connector = HttpConnector::new();
+        http_connector.enforce_http(false);
+        if let Some(keepalive) = config.tcp_keepalive_ms {
+            http_connector.set_keepalive(Some(std::time::Duration::from_millis(keepalive)));
+        }
+
         // Create HTTPS connector that handles both http and https, and http1/http2
         let https_connector = HttpsConnectorBuilder::new()
             .with_tls_config(tls_client_config)
             .https_or_http()
             .enable_http1()
             .enable_http2()
-            .build();
+            .wrap_connector(http_connector);
 
         // Create persistent client with connection pooling
-        let client = hyper_util::client::legacy::Client::builder(TokioExecutor::new())
-            .build(https_connector);
+        let mut client_builder = hyper_util::client::legacy::Client::builder(TokioExecutor::new());
+        if let Some(timeout) = config.pool_idle_timeout_ms {
+            client_builder.pool_idle_timeout(std::time::Duration::from_millis(timeout));
+        }
+        let client = client_builder.build(https_connector);
 
         let url = if config.url.to_lowercase().starts_with("http://")
             || config.url.to_lowercase().starts_with("https://")
