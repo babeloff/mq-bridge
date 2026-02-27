@@ -604,11 +604,22 @@ impl MessagePublisher for HttpPublisher {
             "Sending HTTP request"
         );
 
-        let mut request_builder = Request::builder()
-            .method(hyper::Method::POST)
-            .uri(&self.url);
+        let method = message
+            .metadata
+            .get("http_method")
+            .and_then(|m| hyper::Method::from_bytes(m.as_bytes()).ok())
+            .unwrap_or(hyper::Method::POST);
+
+        let mut request_builder = Request::builder().method(method).uri(&self.url);
 
         for (key, value) in &message.metadata {
+            if key == "http_method"
+                || key == "http_path"
+                || key == "http_query"
+                || key == "http_uri"
+            {
+                continue;
+            }
             request_builder = request_builder.header(key, value);
         }
 
