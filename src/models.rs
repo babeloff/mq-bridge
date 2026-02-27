@@ -1514,7 +1514,7 @@ pub struct SwitchConfig {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct ResponseConfig {
-    // This struct is a marker to and currently has no fields.
+    // This struct is a marker and currently has no fields.
 }
 
 // --- Common Configuration ---
@@ -1592,7 +1592,7 @@ impl TlsConfig {
 
     /// Checks if TLS server certificate authentication is configured.
     pub fn is_tls_server_configured(&self) -> bool {
-        self.required && self.cert_file.is_some() && self.key_file.is_some()
+        self.cert_file.is_some() && self.key_file.is_some()
     }
 }
 

@@ -1588,11 +1588,10 @@ mod tests {
 
         // Verify we received at least some messages from the publisher
         // We should receive the messages from the concurrent publisher
-        assert!(
-            received_count == expected_count,
+        assert_eq!(
+            received_count, expected_count,
             "Expected {} messages, got {}. This may indicate file locking issues on this platform.",
-            expected_count,
-            received_count
+            expected_count, received_count
         );
 
         // Verify the file still exists and can be read (not locked/deleted)

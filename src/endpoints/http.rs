@@ -367,7 +367,15 @@ async fn handle_request(
             if key.as_str().eq_ignore_ascii_case("content-encoding") {
                 content_encoding = Some(v_str.to_string());
             }
-            metadata.insert(key.as_str().to_string(), v_str.to_string());
+            let k_str = key.as_str();
+            if k_str == "http_method"
+                || k_str == "http_path"
+                || k_str == "http_query"
+                || k_str == "http_uri"
+            {
+                continue;
+            }
+            metadata.insert(k_str.to_string(), v_str.to_string());
         }
     }
 
@@ -620,7 +628,47 @@ impl MessagePublisher for HttpPublisher {
             .and_then(|m| hyper::Method::from_bytes(m.as_bytes()).ok())
             .unwrap_or(hyper::Method::POST);
 
-        let mut request_builder = Request::builder().method(method).uri(&self.url);
+        let uri = if let Some(path) = message.metadata.get("http_path") {
+            let mut parts = self
+                .url
+                .parse::<hyper::Uri>()
+                .map_err(|e| {
+                    PublisherError::NonRetryable(anyhow::anyhow!(
+                        "Invalid configured URL '{}': {}",
+                        self.url,
+                        e
+                    ))
+                })?
+                .into_parts();
+
+            let mut path_and_query = path.clone();
+            if let Some(query) = message.metadata.get("http_query") {
+                if !query.is_empty() {
+                    path_and_query.push('?');
+                    path_and_query.push_str(query);
+                }
+            }
+
+            parts.path_and_query = Some(
+                http::uri::PathAndQuery::from_shared(Bytes::from(path_and_query)).map_err(|e| {
+                    PublisherError::NonRetryable(anyhow::anyhow!("Invalid path/query: {}", e))
+                })?,
+            );
+
+            hyper::Uri::from_parts(parts).map_err(|e| {
+                PublisherError::NonRetryable(anyhow::anyhow!("Failed to build URI: {}", e))
+            })?
+        } else {
+            self.url.parse::<hyper::Uri>().map_err(|e| {
+                PublisherError::NonRetryable(anyhow::anyhow!(
+                    "Invalid configured URL '{}': {}",
+                    self.url,
+                    e
+                ))
+            })?
+        };
+
+        let mut request_builder = Request::builder().method(method).uri(uri);
 
         for (key, value) in &message.metadata {
             if key == "http_method"
