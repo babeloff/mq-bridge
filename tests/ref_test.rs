@@ -220,7 +220,7 @@ async fn test_route_chaining_via_ref() {
     let received = tokio::time::timeout(Duration::from_secs(2), async {
         loop {
             if let Ok(batch) = channel_out.receiver.recv().await {
-                for msg in batch {
+                if let Some(msg) = batch.into_iter().next() {
                     return msg;
                 }
             }

@@ -1503,6 +1503,10 @@ mod tests {
         // This test verifies that the tail reader can work concurrently with the publisher
         // writing to the file. This is critical for Windows compatibility where file locking
         // semantics may prevent concurrent access if not handled correctly.
+        // Note: Even though this runs in the same process, Windows file sharing modes are
+        // enforced per-handle. Since the consumer does not participate in the `FILE_LOCKS`
+        // mutex used by the publisher, this effectively tests that the OS allows the
+        // publisher to open/write while the consumer has the file open for reading.
         let dir = tempdir().unwrap();
         let file_path = dir.path().join("concurrent.log");
         let file_path_str = file_path.to_str().unwrap().to_string();
@@ -1528,10 +1532,14 @@ mod tests {
             };
             let publisher = FilePublisher::new(&pub_config).await.unwrap();
 
-            for i in 1..10 {
+            // Send enough messages to ensure overlap between reading and writing
+            for i in 1..=100 {
                 let msg = msg!(json!({"id": i, "data": format!("message_{}", i)}));
                 publisher.send_batch(vec![msg]).await.unwrap();
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                // Small delay to allow consumer to catch up and potentially open the file
+                if i % 10 == 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
             }
         });
 
@@ -1539,10 +1547,17 @@ mod tests {
         let mut received_count = 0;
         let mut message_ids = Vec::new();
 
-        for attempt in 0..100 {
+        // We expect 1 initial + 100 published = 101 messages
+        let expected_count = 101;
+        let start = std::time::Instant::now();
+
+        while received_count < expected_count {
+            if start.elapsed() > std::time::Duration::from_secs(10) {
+                break;
+            }
             match tokio::time::timeout(
                 std::time::Duration::from_millis(200),
-                consumer.receive_batch(1),
+                consumer.receive_batch(10),
             )
             .await
             {
@@ -1557,17 +1572,15 @@ mod tests {
                             }
                         }
                     }
-                    (batch.commit)(vec![crate::traits::MessageDisposition::Ack])
-                        .await
-                        .unwrap();
+                    (batch.commit)(vec![
+                        crate::traits::MessageDisposition::Ack;
+                        batch.messages.len()
+                    ])
+                    .await
+                    .unwrap();
                 }
                 Ok(Err(_)) => break, // Stream ended
-                Err(_) => {
-                    // Timeout waiting for message
-                    if attempt > 50 && received_count >= 5 {
-                        break; // Got enough messages, publisher task may be finishing
-                    }
-                }
+                Err(_) => continue,  // Timeout waiting for message
             }
         }
 
@@ -1576,8 +1589,9 @@ mod tests {
         // Verify we received at least some messages from the publisher
         // We should receive msg0 (initial) + some messages from the concurrent publisher
         assert!(
-            received_count >= 5,
-            "Expected at least 5 messages, got {}. This may indicate file locking issues on this platform.",
+            received_count == expected_count,
+            "Expected {} messages, got {}. This may indicate file locking issues on this platform.",
+            expected_count,
             received_count
         );
 
