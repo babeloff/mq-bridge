@@ -1604,8 +1604,10 @@ pub trait SecretExtractor {
 
 impl SecretExtractor for Route {
     fn extract_secrets(&mut self, prefix: &str, secrets: &mut HashMap<String, String>) {
-        self.input.extract_secrets(&format!("{}__{}", prefix, "INPUT"), secrets);
-        self.output.extract_secrets(&format!("{}__{}", prefix, "OUTPUT"), secrets);
+        self.input
+            .extract_secrets(&format!("{}__{}", prefix, "INPUT"), secrets);
+        self.output
+            .extract_secrets(&format!("{}__{}", prefix, "OUTPUT"), secrets);
     }
 }
 
@@ -1621,15 +1623,33 @@ impl SecretExtractor for Endpoint {
 impl SecretExtractor for EndpointType {
     fn extract_secrets(&mut self, prefix: &str, secrets: &mut HashMap<String, String>) {
         match self {
-            EndpointType::Aws(cfg) => cfg.extract_secrets(&format!("{}__{}", prefix, "AWS"), secrets),
-            EndpointType::Kafka(cfg) => cfg.extract_secrets(&format!("{}__{}", prefix, "KAFKA"), secrets),
-            EndpointType::Nats(cfg) => cfg.extract_secrets(&format!("{}__{}", prefix, "NATS"), secrets),
-            EndpointType::Amqp(cfg) => cfg.extract_secrets(&format!("{}__{}", prefix, "AMQP"), secrets),
-            EndpointType::MongoDb(cfg) => cfg.extract_secrets(&format!("{}__{}", prefix, "MONGODB"), secrets),
-            EndpointType::Mqtt(cfg) => cfg.extract_secrets(&format!("{}__{}", prefix, "MQTT"), secrets),
-            EndpointType::Http(cfg) => cfg.extract_secrets(&format!("{}__{}", prefix, "HTTP"), secrets),
-            EndpointType::IbmMq(cfg) => cfg.extract_secrets(&format!("{}__{}", prefix, "IBMMQ"), secrets),
-            EndpointType::Grpc(cfg) => cfg.extract_secrets(&format!("{}__{}", prefix, "GRPC"), secrets),
+            EndpointType::Aws(cfg) => {
+                cfg.extract_secrets(&format!("{}__{}", prefix, "AWS"), secrets)
+            }
+            EndpointType::Kafka(cfg) => {
+                cfg.extract_secrets(&format!("{}__{}", prefix, "KAFKA"), secrets)
+            }
+            EndpointType::Nats(cfg) => {
+                cfg.extract_secrets(&format!("{}__{}", prefix, "NATS"), secrets)
+            }
+            EndpointType::Amqp(cfg) => {
+                cfg.extract_secrets(&format!("{}__{}", prefix, "AMQP"), secrets)
+            }
+            EndpointType::MongoDb(cfg) => {
+                cfg.extract_secrets(&format!("{}__{}", prefix, "MONGODB"), secrets)
+            }
+            EndpointType::Mqtt(cfg) => {
+                cfg.extract_secrets(&format!("{}__{}", prefix, "MQTT"), secrets)
+            }
+            EndpointType::Http(cfg) => {
+                cfg.extract_secrets(&format!("{}__{}", prefix, "HTTP"), secrets)
+            }
+            EndpointType::IbmMq(cfg) => {
+                cfg.extract_secrets(&format!("{}__{}", prefix, "IBMMQ"), secrets)
+            }
+            EndpointType::Grpc(cfg) => {
+                cfg.extract_secrets(&format!("{}__{}", prefix, "GRPC"), secrets)
+            }
             EndpointType::Fanout(endpoints) => {
                 for (i, ep) in endpoints.iter_mut().enumerate() {
                     ep.extract_secrets(&format!("{}__{}__{}", prefix, "FANOUT", i), secrets);
@@ -1637,13 +1657,18 @@ impl SecretExtractor for EndpointType {
             }
             EndpointType::Switch(cfg) => {
                 for (key, ep) in cfg.cases.iter_mut() {
-                    ep.extract_secrets(&format!("{}__{}__{}", prefix, "SWITCH__CASES", key.to_uppercase()), secrets);
+                    ep.extract_secrets(
+                        &format!("{}__{}__{}", prefix, "SWITCH__CASES", key.to_uppercase()),
+                        secrets,
+                    );
                 }
                 if let Some(default) = &mut cfg.default {
                     default.extract_secrets(&format!("{}__{}", prefix, "SWITCH__DEFAULT"), secrets);
                 }
             }
-            EndpointType::Reader(ep) => ep.extract_secrets(&format!("{}__{}", prefix, "READER"), secrets),
+            EndpointType::Reader(ep) => {
+                ep.extract_secrets(&format!("{}__{}", prefix, "READER"), secrets)
+            }
             _ => {}
         }
     }
@@ -1652,57 +1677,91 @@ impl SecretExtractor for EndpointType {
 impl SecretExtractor for Middleware {
     fn extract_secrets(&mut self, prefix: &str, secrets: &mut HashMap<String, String>) {
         if let Middleware::Dlq(cfg) = self {
-            cfg.endpoint.extract_secrets(&format!("{}__{}__{}", prefix, "DLQ", "ENDPOINT"), secrets);
+            cfg.endpoint
+                .extract_secrets(&format!("{}__{}__{}", prefix, "DLQ", "ENDPOINT"), secrets);
         }
     }
 }
 
 impl SecretExtractor for AwsConfig {
     fn extract_secrets(&mut self, prefix: &str, secrets: &mut HashMap<String, String>) {
-        if let Some(val) = self.access_key.take() { secrets.insert(format!("{}__{}", prefix, "ACCESS_KEY"), val); }
-        if let Some(val) = self.secret_key.take() { secrets.insert(format!("{}__{}", prefix, "SECRET_KEY"), val); }
-        if let Some(val) = self.session_token.take() { secrets.insert(format!("{}__{}", prefix, "SESSION_TOKEN"), val); }
+        if let Some(val) = self.access_key.take() {
+            secrets.insert(format!("{}__{}", prefix, "ACCESS_KEY"), val);
+        }
+        if let Some(val) = self.secret_key.take() {
+            secrets.insert(format!("{}__{}", prefix, "SECRET_KEY"), val);
+        }
+        if let Some(val) = self.session_token.take() {
+            secrets.insert(format!("{}__{}", prefix, "SESSION_TOKEN"), val);
+        }
     }
 }
 
 impl SecretExtractor for KafkaConfig {
     fn extract_secrets(&mut self, prefix: &str, secrets: &mut HashMap<String, String>) {
-        if let Some(val) = self.username.take() { secrets.insert(format!("{}__{}", prefix, "USERNAME"), val); }
-        if let Some(val) = self.password.take() { secrets.insert(format!("{}__{}", prefix, "PASSWORD"), val); }
-        self.tls.extract_secrets(&format!("{}__{}", prefix, "TLS"), secrets);
+        if let Some(val) = self.username.take() {
+            secrets.insert(format!("{}__{}", prefix, "USERNAME"), val);
+        }
+        if let Some(val) = self.password.take() {
+            secrets.insert(format!("{}__{}", prefix, "PASSWORD"), val);
+        }
+        self.tls
+            .extract_secrets(&format!("{}__{}", prefix, "TLS"), secrets);
     }
 }
 
 impl SecretExtractor for NatsConfig {
     fn extract_secrets(&mut self, prefix: &str, secrets: &mut HashMap<String, String>) {
-        if let Some(val) = self.username.take() { secrets.insert(format!("{}__{}", prefix, "USERNAME"), val); }
-        if let Some(val) = self.password.take() { secrets.insert(format!("{}__{}", prefix, "PASSWORD"), val); }
-        if let Some(val) = self.token.take() { secrets.insert(format!("{}__{}", prefix, "TOKEN"), val); }
-        self.tls.extract_secrets(&format!("{}__{}", prefix, "TLS"), secrets);
+        if let Some(val) = self.username.take() {
+            secrets.insert(format!("{}__{}", prefix, "USERNAME"), val);
+        }
+        if let Some(val) = self.password.take() {
+            secrets.insert(format!("{}__{}", prefix, "PASSWORD"), val);
+        }
+        if let Some(val) = self.token.take() {
+            secrets.insert(format!("{}__{}", prefix, "TOKEN"), val);
+        }
+        self.tls
+            .extract_secrets(&format!("{}__{}", prefix, "TLS"), secrets);
     }
 }
 
 impl SecretExtractor for AmqpConfig {
     fn extract_secrets(&mut self, prefix: &str, secrets: &mut HashMap<String, String>) {
-        if let Some(val) = self.username.take() { secrets.insert(format!("{}__{}", prefix, "USERNAME"), val); }
-        if let Some(val) = self.password.take() { secrets.insert(format!("{}__{}", prefix, "PASSWORD"), val); }
-        self.tls.extract_secrets(&format!("{}__{}", prefix, "TLS"), secrets);
+        if let Some(val) = self.username.take() {
+            secrets.insert(format!("{}__{}", prefix, "USERNAME"), val);
+        }
+        if let Some(val) = self.password.take() {
+            secrets.insert(format!("{}__{}", prefix, "PASSWORD"), val);
+        }
+        self.tls
+            .extract_secrets(&format!("{}__{}", prefix, "TLS"), secrets);
     }
 }
 
 impl SecretExtractor for MongoDbConfig {
     fn extract_secrets(&mut self, prefix: &str, secrets: &mut HashMap<String, String>) {
-        if let Some(val) = self.username.take() { secrets.insert(format!("{}__{}", prefix, "USERNAME"), val); }
-        if let Some(val) = self.password.take() { secrets.insert(format!("{}__{}", prefix, "PASSWORD"), val); }
-        self.tls.extract_secrets(&format!("{}__{}", prefix, "TLS"), secrets);
+        if let Some(val) = self.username.take() {
+            secrets.insert(format!("{}__{}", prefix, "USERNAME"), val);
+        }
+        if let Some(val) = self.password.take() {
+            secrets.insert(format!("{}__{}", prefix, "PASSWORD"), val);
+        }
+        self.tls
+            .extract_secrets(&format!("{}__{}", prefix, "TLS"), secrets);
     }
 }
 
 impl SecretExtractor for MqttConfig {
     fn extract_secrets(&mut self, prefix: &str, secrets: &mut HashMap<String, String>) {
-        if let Some(val) = self.username.take() { secrets.insert(format!("{}__{}", prefix, "USERNAME"), val); }
-        if let Some(val) = self.password.take() { secrets.insert(format!("{}__{}", prefix, "PASSWORD"), val); }
-        self.tls.extract_secrets(&format!("{}__{}", prefix, "TLS"), secrets);
+        if let Some(val) = self.username.take() {
+            secrets.insert(format!("{}__{}", prefix, "USERNAME"), val);
+        }
+        if let Some(val) = self.password.take() {
+            secrets.insert(format!("{}__{}", prefix, "PASSWORD"), val);
+        }
+        self.tls
+            .extract_secrets(&format!("{}__{}", prefix, "TLS"), secrets);
     }
 }
 
@@ -1712,21 +1771,28 @@ impl SecretExtractor for HttpConfig {
             secrets.insert(format!("{}__{}__{}", prefix, "BASIC_AUTH", 0), u);
             secrets.insert(format!("{}__{}__{}", prefix, "BASIC_AUTH", 1), p);
         }
-        self.tls.extract_secrets(&format!("{}__{}", prefix, "TLS"), secrets);
+        self.tls
+            .extract_secrets(&format!("{}__{}", prefix, "TLS"), secrets);
     }
 }
 
 impl SecretExtractor for IbmMqConfig {
     fn extract_secrets(&mut self, prefix: &str, secrets: &mut HashMap<String, String>) {
-        if let Some(val) = self.username.take() { secrets.insert(format!("{}__{}", prefix, "USERNAME"), val); }
-        if let Some(val) = self.password.take() { secrets.insert(format!("{}__{}", prefix, "PASSWORD"), val); }
-        self.tls.extract_secrets(&format!("{}__{}", prefix, "TLS"), secrets);
+        if let Some(val) = self.username.take() {
+            secrets.insert(format!("{}__{}", prefix, "USERNAME"), val);
+        }
+        if let Some(val) = self.password.take() {
+            secrets.insert(format!("{}__{}", prefix, "PASSWORD"), val);
+        }
+        self.tls
+            .extract_secrets(&format!("{}__{}", prefix, "TLS"), secrets);
     }
 }
 
 impl SecretExtractor for GrpcConfig {
     fn extract_secrets(&mut self, prefix: &str, secrets: &mut HashMap<String, String>) {
-        self.tls.extract_secrets(&format!("{}__{}", prefix, "TLS"), secrets);
+        self.tls
+            .extract_secrets(&format!("{}__{}", prefix, "TLS"), secrets);
     }
 }
 
@@ -1962,40 +2028,65 @@ kafka_to_nats:
     fn test_extract_secrets() {
         let mut config = Config::new();
         let mut route = Route::default();
-        
+
         // Setup Kafka with secrets
         let mut kafka_config = KafkaConfig::new("localhost:9092");
         kafka_config.username = Some("user".to_string());
         kafka_config.password = Some("pass".to_string());
         kafka_config.tls.cert_password = Some("certpass".to_string());
-        
+
         route.input = Endpoint {
             endpoint_type: EndpointType::Kafka(kafka_config),
             middlewares: vec![],
             handler: None,
         };
-        
+
         // Setup HTTP with basic auth
         let mut http_config = HttpConfig::new("http://localhost");
         http_config.basic_auth = Some(("httpuser".to_string(), "httppass".to_string()));
-        
+
         route.output = Endpoint {
             endpoint_type: EndpointType::Http(http_config),
             middlewares: vec![],
             handler: None,
         };
-        
+
         config.insert("test_route".to_string(), route);
-        
+
         let secrets = extract_config_secrets(&mut config);
-        
+
         // Verify secrets extracted
-        assert_eq!(secrets.get("MQB__TEST_ROUTE__INPUT__KAFKA__USERNAME").map(|s| s.as_str()), Some("user"));
-        assert_eq!(secrets.get("MQB__TEST_ROUTE__INPUT__KAFKA__PASSWORD").map(|s| s.as_str()), Some("pass"));
-        assert_eq!(secrets.get("MQB__TEST_ROUTE__INPUT__KAFKA__TLS__CERT_PASSWORD").map(|s| s.as_str()), Some("certpass"));
-        assert_eq!(secrets.get("MQB__TEST_ROUTE__OUTPUT__HTTP__BASIC_AUTH__0").map(|s| s.as_str()), Some("httpuser"));
-        assert_eq!(secrets.get("MQB__TEST_ROUTE__OUTPUT__HTTP__BASIC_AUTH__1").map(|s| s.as_str()), Some("httppass"));
-        
+        assert_eq!(
+            secrets
+                .get("MQB__TEST_ROUTE__INPUT__KAFKA__USERNAME")
+                .map(|s| s.as_str()),
+            Some("user")
+        );
+        assert_eq!(
+            secrets
+                .get("MQB__TEST_ROUTE__INPUT__KAFKA__PASSWORD")
+                .map(|s| s.as_str()),
+            Some("pass")
+        );
+        assert_eq!(
+            secrets
+                .get("MQB__TEST_ROUTE__INPUT__KAFKA__TLS__CERT_PASSWORD")
+                .map(|s| s.as_str()),
+            Some("certpass")
+        );
+        assert_eq!(
+            secrets
+                .get("MQB__TEST_ROUTE__OUTPUT__HTTP__BASIC_AUTH__0")
+                .map(|s| s.as_str()),
+            Some("httpuser")
+        );
+        assert_eq!(
+            secrets
+                .get("MQB__TEST_ROUTE__OUTPUT__HTTP__BASIC_AUTH__1")
+                .map(|s| s.as_str()),
+            Some("httppass")
+        );
+
         // Verify config cleared
         let route = config.get("test_route").unwrap();
         if let EndpointType::Kafka(k) = &route.input.endpoint_type {
