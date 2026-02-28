@@ -79,7 +79,7 @@ To achieve **Subscriber** (Pub/Sub) behavior—where messages are broadcast to a
 | **MongoDB** | Persistent (Collection) | Set `change_stream: true` | Yes |
 | **AWS** | Persistent (SQS) | Not supported directly (Use SNS->SQS) | No |
 | **Memory** | Ephemeral (Channel) | Set `subscribe_mode: true` | Yes |
-| **File** | Persistent (Delete after read) | Set `subscribe_mode: true` (Tail) | No |
+| **File** | Queue (Reads from start) | Set `mode: subscribe` (Tails file) or `mode: group_subscribe` (Persistent tail) | No |
 | **HTTP** | Ephemeral (Request) | N/A | Yes (Implicit) |
 | **ZeroMQ** | Ephemeral (PULL) | Set `socket_type: "sub"` | No |
 

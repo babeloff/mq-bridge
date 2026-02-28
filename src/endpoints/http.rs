@@ -629,17 +629,13 @@ impl MessagePublisher for HttpPublisher {
             .unwrap_or(hyper::Method::POST);
 
         let uri = if let Some(path) = message.metadata.get("http_path") {
-            let mut parts = self
-                .url
-                .parse::<hyper::Uri>()
-                .map_err(|e| {
-                    PublisherError::NonRetryable(anyhow::anyhow!(
-                        "Invalid configured URL '{}': {}",
-                        self.url,
-                        e
-                    ))
-                })?
-                .into_parts();
+            let base_uri = self.url.parse::<hyper::Uri>().map_err(|e| {
+                PublisherError::NonRetryable(anyhow::anyhow!(
+                    "Invalid configured URL '{}': {}",
+                    self.url,
+                    e
+                ))
+            })?;
 
             let mut path_and_query = path.clone();
             if let Some(query) = message.metadata.get("http_query") {
@@ -648,16 +644,19 @@ impl MessagePublisher for HttpPublisher {
                     path_and_query.push_str(query);
                 }
             }
-
-            parts.path_and_query = Some(
-                http::uri::PathAndQuery::from_shared(Bytes::from(path_and_query)).map_err(|e| {
-                    PublisherError::NonRetryable(anyhow::anyhow!("Invalid path/query: {}", e))
-                })?,
-            );
-
-            hyper::Uri::from_parts(parts).map_err(|e| {
-                PublisherError::NonRetryable(anyhow::anyhow!("Failed to build URI: {}", e))
-            })?
+            let mut builder = hyper::Uri::builder();
+            if let Some(scheme) = base_uri.scheme() {
+                builder = builder.scheme(scheme.clone());
+            }
+            if let Some(authority) = base_uri.authority() {
+                builder = builder.authority(authority.clone());
+            }
+            builder
+                .path_and_query(path_and_query)
+                .build()
+                .map_err(|e| {
+                    PublisherError::NonRetryable(anyhow::anyhow!("Failed to build URI: {}", e))
+                })?
         } else {
             self.url.parse::<hyper::Uri>().map_err(|e| {
                 PublisherError::NonRetryable(anyhow::anyhow!(

@@ -1603,4 +1603,61 @@ mod tests {
             "File should contain messages after concurrent access"
         );
     }
+
+    /// Simulates an external process (like a Python script or log writer) appending to the file.
+    /// Unlike `test_file_tail_concurrent_publish_and_consume`, this test:
+    /// 1. Does not use `FilePublisher` (bypassing internal `FILE_LOCKS`).
+    /// 2. Keeps the file handle open across multiple writes (simulating a long-running writer),
+    ///    which stresses file locking/sharing semantics on OSs like Windows.
+    #[tokio::test]
+    async fn test_file_subscribe_concurrent_external_write() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("external_write.log");
+        let file_path_str = file_path.to_str().unwrap().to_string();
+
+        // Create empty file
+        tokio::fs::write(&file_path, b"").await.unwrap();
+
+        let config = FileConfig {
+            path: file_path_str.clone(),
+            mode: FileConsumerMode::Subscribe { delete: false },
+        };
+
+        let mut consumer = FileConsumer::new(&config).await.unwrap();
+
+        // Give the background tailer a moment to initialize
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let file_path_clone = file_path.clone();
+        let write_task = tokio::spawn(async move {
+            let mut file = OpenOptions::new()
+                .append(true)
+                .open(&file_path_clone)
+                .await
+                .unwrap();
+
+            for i in 0..5 {
+                let line = format!("message {}\n", i);
+                file.write_all(line.as_bytes()).await.unwrap();
+                file.flush().await.unwrap();
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        });
+
+        for i in 0..5 {
+            let received =
+                tokio::time::timeout(std::time::Duration::from_secs(5), consumer.receive())
+                    .await
+                    .expect("Timed out waiting for message")
+                    .unwrap();
+
+            let expected_payload = format!("message {}", i);
+            assert_eq!(received.message.get_payload_str().trim(), expected_payload);
+            (received.commit)(crate::traits::MessageDisposition::Ack)
+                .await
+                .unwrap();
+        }
+
+        write_task.await.unwrap();
+    }
 }
