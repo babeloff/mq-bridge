@@ -89,6 +89,60 @@ impl Endpoint {
         Self::new(EndpointType::Null)
     }
 
+    pub fn with_retry(mut self, retry: crate::models::RetryMiddleware) -> Self {
+        // Retry should be inner to DLQ and Metrics.
+        // We insert it before any existing DLQ or Metrics middleware.
+        let mut insert_idx = self.middlewares.len();
+        for (i, m) in self.middlewares.iter().enumerate() {
+            if matches!(m, Middleware::Dlq(_) | Middleware::Metrics(_)) {
+                insert_idx = i;
+                break;
+            }
+        }
+        self.middlewares.insert(insert_idx, Middleware::Retry(retry));
+        self
+    }
+
+    pub fn with_dlq(mut self, dlq: crate::models::DeadLetterQueueMiddleware) -> Self {
+        // DLQ should be outer to Retry, but inner to Metrics.
+        let mut insert_idx = self.middlewares.len();
+        for (i, m) in self.middlewares.iter().enumerate() {
+            if matches!(m, Middleware::Metrics(_)) {
+                insert_idx = i;
+                break;
+            }
+        }
+        self.middlewares.insert(insert_idx, Middleware::Dlq(Box::new(dlq)));
+        self
+    }
+
+    pub fn with_deduplication(mut self, dedup: crate::models::DeduplicationMiddleware) -> Self {
+        // Deduplication is consumer-only.
+        // We insert it at the beginning so it is applied last (innermost) for consumers,
+        // or second to last if metrics are at 0.
+        // List: [Dedup, ...] -> Consumer: ... ( Dedup ( base ) )
+        self.middlewares.insert(0, Middleware::Deduplication(dedup));
+        self
+    }
+
+    pub fn with_consumer_metrics(mut self) -> Self {
+        // For consumers, the first middleware in the list is the outermost (applied last).
+        // Inserting at 0 ensures it wraps everything else (Ingestion Metrics).
+        // List: [Metrics, Dedup] -> Consumer: Metrics ( Dedup ( base ) )
+        if !self.middlewares.iter().any(|m| matches!(m, Middleware::Metrics(_))) {
+            self.middlewares.insert(0, Middleware::Metrics(crate::models::MetricsMiddleware {}));
+        }
+        self
+    }
+
+    pub fn with_metrics(mut self) -> Self {
+        // Metrics should be outer to everything (last in the list for publishers).
+        if !self.middlewares.iter().any(|m| matches!(m, Middleware::Metrics(_))) {
+            self.middlewares.push(Middleware::Metrics(crate::models::MetricsMiddleware {}));
+        }
+        self
+    }
+
     pub async fn create_consumer(
         &self,
         route_name: &str,
@@ -1095,5 +1149,33 @@ mod tests {
             .as_any()
             .is::<crate::endpoints::memory::MemoryConsumer>();
         assert!(is_subscriber, "Factory should create MemoryConsumer");
+    }
+
+    #[test]
+    fn test_endpoint_middleware_ordering_helpers() {
+        let endpoint = Endpoint::new_memory("test", 10)
+            .with_metrics()
+            .with_dlq(crate::models::DeadLetterQueueMiddleware::default())
+            .with_retry(crate::models::RetryMiddleware::default());
+
+        // Expected order: Retry, Dlq, Metrics
+        assert_eq!(endpoint.middlewares.len(), 3);
+        assert!(matches!(endpoint.middlewares[0], Middleware::Retry(_)));
+        assert!(matches!(endpoint.middlewares[1], Middleware::Dlq(_)));
+        assert!(matches!(endpoint.middlewares[2], Middleware::Metrics(_)));
+    }
+
+    #[test]
+    fn test_consumer_middleware_ordering() {
+        let endpoint = Endpoint::new_memory("test", 10)
+            .with_deduplication(crate::models::DeduplicationMiddleware { sled_path: "".into(), ttl_seconds: 10 })
+            .with_consumer_metrics();
+
+        // Expected order in list: [Metrics, Dedup]
+        // Consumer application (rev): Dedup -> Metrics.
+        // Execution: Metrics( Dedup ( base ) ). Metrics is Outer.
+        assert_eq!(endpoint.middlewares.len(), 2);
+        assert!(matches!(endpoint.middlewares[0], Middleware::Metrics(_)));
+        assert!(matches!(endpoint.middlewares[1], Middleware::Deduplication(_)));
     }
 }
