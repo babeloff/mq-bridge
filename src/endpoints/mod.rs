@@ -99,7 +99,8 @@ impl Endpoint {
                 break;
             }
         }
-        self.middlewares.insert(insert_idx, Middleware::Retry(retry));
+        self.middlewares
+            .insert(insert_idx, Middleware::Retry(retry));
         self
     }
 
@@ -112,7 +113,8 @@ impl Endpoint {
                 break;
             }
         }
-        self.middlewares.insert(insert_idx, Middleware::Dlq(Box::new(dlq)));
+        self.middlewares
+            .insert(insert_idx, Middleware::Dlq(Box::new(dlq)));
         self
     }
 
@@ -129,16 +131,26 @@ impl Endpoint {
         // For consumers, the first middleware in the list is the outermost (applied last).
         // Inserting at 0 ensures it wraps everything else (Ingestion Metrics).
         // List: [Metrics, Dedup] -> Consumer: Metrics ( Dedup ( base ) )
-        if !self.middlewares.iter().any(|m| matches!(m, Middleware::Metrics(_))) {
-            self.middlewares.insert(0, Middleware::Metrics(crate::models::MetricsMiddleware {}));
+        if !self
+            .middlewares
+            .iter()
+            .any(|m| matches!(m, Middleware::Metrics(_)))
+        {
+            self.middlewares
+                .insert(0, Middleware::Metrics(crate::models::MetricsMiddleware {}));
         }
         self
     }
 
     pub fn with_metrics(mut self) -> Self {
         // Metrics should be outer to everything (last in the list for publishers).
-        if !self.middlewares.iter().any(|m| matches!(m, Middleware::Metrics(_))) {
-            self.middlewares.push(Middleware::Metrics(crate::models::MetricsMiddleware {}));
+        if !self
+            .middlewares
+            .iter()
+            .any(|m| matches!(m, Middleware::Metrics(_)))
+        {
+            self.middlewares
+                .push(Middleware::Metrics(crate::models::MetricsMiddleware {}));
         }
         self
     }
@@ -1168,7 +1180,10 @@ mod tests {
     #[test]
     fn test_consumer_middleware_ordering() {
         let endpoint = Endpoint::new_memory("test", 10)
-            .with_deduplication(crate::models::DeduplicationMiddleware { sled_path: "".into(), ttl_seconds: 10 })
+            .with_deduplication(crate::models::DeduplicationMiddleware {
+                sled_path: "".into(),
+                ttl_seconds: 10,
+            })
             .with_consumer_metrics();
 
         // Expected order in list: [Metrics, Dedup]
@@ -1176,6 +1191,9 @@ mod tests {
         // Execution: Metrics( Dedup ( base ) ). Metrics is Outer.
         assert_eq!(endpoint.middlewares.len(), 2);
         assert!(matches!(endpoint.middlewares[0], Middleware::Metrics(_)));
-        assert!(matches!(endpoint.middlewares[1], Middleware::Deduplication(_)));
+        assert!(matches!(
+            endpoint.middlewares[1],
+            Middleware::Deduplication(_)
+        ));
     }
 }
