@@ -913,12 +913,10 @@ fn map_responses_to_dispositions(
     for id in message_ids {
         if failed_ids.contains(id) {
             dispositions.push(MessageDisposition::Nack);
+        } else if let Some(resp) = response_iter.next() {
+            dispositions.push(MessageDisposition::Reply(resp));
         } else {
-            if let Some(resp) = response_iter.next() {
-                dispositions.push(MessageDisposition::Reply(resp));
-            } else {
-                dispositions.push(MessageDisposition::Ack);
-            }
+            dispositions.push(MessageDisposition::Ack);
         }
     }
     dispositions
