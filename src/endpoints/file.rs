@@ -14,7 +14,7 @@ use async_trait::async_trait;
 use once_cell::sync::Lazy;
 use std::any::Any;
 use std::collections::HashMap;
-use std::io::{BufRead, Seek};
+use std::io::Seek;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, Weak};
@@ -37,10 +37,59 @@ fn get_file_lock(path: &str) -> Arc<Mutex<()>> {
         .clone()
 }
 
+fn parse_delimiter(delimiter: Option<&str>) -> anyhow::Result<Vec<u8>> {
+    let bytes = match delimiter {
+        Some(s) if s.starts_with("0x") => {
+            let hex = s.trim_start_matches("0x");
+            if hex.len() != 2 {
+                return Err(anyhow::anyhow!(
+                    "Hex delimiter must be 1 byte (2 hex chars)"
+                ));
+            }
+            (0..hex.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&hex[i..i + 2], 16))
+                .collect::<Result<Vec<u8>, _>>()
+                .map_err(|e| anyhow::anyhow!("Invalid hex delimiter: {}", e))?
+        }
+        Some(s) => s.as_bytes().to_vec(),
+        None => vec![b'\n'],
+    };
+
+    if bytes.is_empty() {
+        return Err(anyhow::anyhow!("Delimiter cannot be empty"));
+    }
+
+    Ok(bytes)
+}
+
+async fn read_until_bytes<R: AsyncBufReadExt + Unpin>(
+    reader: &mut R,
+    delimiter: &[u8],
+    buf: &mut Vec<u8>,
+) -> std::io::Result<usize> {
+    if delimiter.len() == 1 {
+        return reader.read_until(delimiter[0], buf).await;
+    }
+    let last_byte = delimiter[delimiter.len() - 1];
+    let mut total_read = 0;
+    loop {
+        let n = reader.read_until(last_byte, buf).await?;
+        if n == 0 {
+            return Ok(total_read);
+        }
+        total_read += n;
+        if buf.len() >= delimiter.len() && &buf[buf.len() - delimiter.len()..] == delimiter {
+            return Ok(total_read);
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct FilePublisher {
     path: String,
     file_lock: Arc<Mutex<()>>,
+    delimiter: Vec<u8>,
 }
 
 impl FilePublisher {
@@ -61,11 +110,13 @@ impl FilePublisher {
             .with_context(|| format!("Failed to open or create file for writing: {}", path_str))?;
 
         let file_lock = get_file_lock(path_str);
+        let delimiter = parse_delimiter(config.delimiter.as_deref())?;
 
         info!(path = %path_str, "File sink opened for appending");
         Ok(Self {
             path: path_str.to_string(),
             file_lock,
+            delimiter,
         })
     }
 }
@@ -121,8 +172,8 @@ impl MessagePublisher for FilePublisher {
             if let Err(e) = writer.write_all(&serialized_msg).await {
                 tracing::error!("Failed to write message to file: {}", e);
                 failed_messages.push((msg, PublisherError::NonRetryable(anyhow::anyhow!(e))));
-            } else if let Err(e) = writer.write_all(b"\n").await {
-                tracing::error!("Failed to write newline to file: {}", e);
+            } else if let Err(e) = writer.write_all(&self.delimiter).await {
+                tracing::error!("Failed to write delimiter to file: {}", e);
                 return Err(PublisherError::NonRetryable(anyhow::anyhow!(e)));
             }
         }
@@ -160,7 +211,10 @@ struct FileFeedState {
 
 /// Creates an EventStore backed by a file.
 /// The EventStore acts as an in-memory buffer for the file content, allowing unified handling of Consume and Subscribe modes.
-async fn create_file_event_store(path: &str) -> anyhow::Result<Arc<EventStore>> {
+async fn create_file_event_store(
+    path: &str,
+    delimiter: Vec<u8>,
+) -> anyhow::Result<Arc<EventStore>> {
     let path = path.to_string();
     // Shared state to coordinate the reader and the drop (delete) logic.
     let feed_state = Arc::new(tokio::sync::Mutex::new(FileFeedState {
@@ -173,6 +227,7 @@ async fn create_file_event_store(path: &str) -> anyhow::Result<Arc<EventStore>> 
     let feed_state_clone = feed_state.clone();
     let path_clone = path.clone();
     let file_op_lock_clone = file_op_lock.clone();
+    let delimiter_clone = delimiter.clone();
 
     let retention = RetentionPolicy {
         gc_interval: std::time::Duration::ZERO,
@@ -191,6 +246,7 @@ async fn create_file_event_store(path: &str) -> anyhow::Result<Arc<EventStore>> 
             let state = feed_state_clone.clone();
             let path = path_clone.clone();
             let file_op_lock = file_op_lock_clone.clone();
+            let delimiter = delimiter_clone.clone();
 
             tokio::spawn(async move {
                 // Serialize file operations to prevent race conditions between multiple GCs
@@ -201,7 +257,7 @@ async fn create_file_event_store(path: &str) -> anyhow::Result<Arc<EventStore>> 
                     s.lines_in_memory = s.lines_in_memory.saturating_sub(count);
                 }
 
-                if let Err(e) = remove_lines_from_file(&path, count).await {
+                if let Err(e) = remove_lines_from_file(&path, count, &delimiter).await {
                     tracing::error!("Failed to remove lines from file {}: {}", path, e);
                     // Note: In this simplified model, if deletion fails, lines_in_memory
                     // might become out of sync, leading to reprocessing on restart.
@@ -256,7 +312,7 @@ async fn create_file_event_store(path: &str) -> anyhow::Result<Arc<EventStore>> 
             let lines_to_skip = state.lines_in_memory;
             while lines_skipped < lines_to_skip {
                 let mut buf = Vec::new();
-                match reader.read_until(b'\n', &mut buf).await {
+                match read_until_bytes(&mut reader, &delimiter, &mut buf).await {
                     Ok(0) => break, // EOF
                     Ok(_) => lines_skipped += 1,
                     Err(e) => {
@@ -284,10 +340,14 @@ async fn create_file_event_store(path: &str) -> anyhow::Result<Arc<EventStore>> 
 
             loop {
                 let mut buffer = Vec::new();
-                match reader.read_until(b'\n', &mut buffer).await {
+                match read_until_bytes(&mut reader, &delimiter, &mut buffer).await {
                     Ok(0) => break,
                     Ok(_) => {
-                        while buffer.ends_with(b"\n") || buffer.ends_with(b"\r") {
+                        if buffer.ends_with(&delimiter) {
+                            buffer.truncate(buffer.len() - delimiter.len());
+                        }
+                        if delimiter.len() == 1 && delimiter[0] == b'\n' && buffer.ends_with(b"\r")
+                        {
                             buffer.pop();
                         }
                         let msg = parse_message(&buffer);
@@ -327,7 +387,7 @@ async fn create_file_event_store(path: &str) -> anyhow::Result<Arc<EventStore>> 
     Ok(store)
 }
 
-async fn remove_lines_from_file(path: &str, count: usize) -> anyhow::Result<()> {
+async fn remove_lines_from_file(path: &str, count: usize, delimiter: &[u8]) -> anyhow::Result<()> {
     let unique_id = fast_uuid_v7::gen_id_str();
     let temp_path = format!("{}.{}.tmp", path, unique_id);
 
@@ -339,7 +399,7 @@ async fn remove_lines_from_file(path: &str, count: usize) -> anyhow::Result<()> 
     let mut lines_skipped = 0;
     while lines_skipped < count {
         let mut buf = Vec::new();
-        if reader.read_until(b'\n', &mut buf).await? == 0 {
+        if read_until_bytes(&mut reader, delimiter, &mut buf).await? == 0 {
             break;
         }
         lines_skipped += 1;
@@ -374,11 +434,34 @@ struct FileTailConsumer {
     offset_file: Option<Arc<Mutex<tokio::fs::File>>>,
 }
 
+fn read_until_bytes_sync<R: std::io::BufRead>(
+    reader: &mut R,
+    delimiter: &[u8],
+    buf: &mut Vec<u8>,
+) -> std::io::Result<usize> {
+    if delimiter.len() == 1 {
+        return reader.read_until(delimiter[0], buf);
+    }
+    let last_byte = delimiter[delimiter.len() - 1];
+    let mut total_read = 0;
+    loop {
+        let n = reader.read_until(last_byte, buf)?;
+        if n == 0 {
+            return Ok(total_read);
+        }
+        total_read += n;
+        if buf.len() >= delimiter.len() && &buf[buf.len() - delimiter.len()..] == delimiter {
+            return Ok(total_read);
+        }
+    }
+}
+
 fn run_file_tail_task_sync(
     path: String,
     msg_tx: async_channel::Sender<Vec<CanonicalMessage>>,
     initial_offset: u64,
     group_id: Option<String>,
+    delimiter: Vec<u8>,
 ) {
     let mut last_position: u64 = initial_offset;
     let mut reader: Option<std::io::BufReader<std::fs::File>> = None;
@@ -424,11 +507,14 @@ fn run_file_tail_task_sync(
         if let Some(r) = reader.as_mut() {
             for _ in 0..BATCH_SIZE {
                 buf.clear();
-                match r.read_until(b'\n', &mut buf) {
+                match read_until_bytes_sync(r, &delimiter, &mut buf) {
                     Ok(0) => break, // EOF
                     Ok(n) => {
                         last_position += n as u64;
-                        while buf.ends_with(b"\n") || buf.ends_with(b"\r") {
+                        if buf.ends_with(&delimiter) {
+                            buf.truncate(buf.len() - delimiter.len());
+                        }
+                        if delimiter.len() == 1 && delimiter[0] == b'\n' && buf.ends_with(b"\r") {
                             buf.pop();
                         }
                         let mut msg = parse_message(&buf);
@@ -471,6 +557,7 @@ struct FileQueueConsumer {
     path: String,
     file_lock: Arc<Mutex<()>>,
     buffer: Arc<Mutex<Vec<CanonicalMessage>>>,
+    delimiter: Vec<u8>,
 }
 
 fn run_file_queue_task(
@@ -479,6 +566,7 @@ fn run_file_queue_task(
     lines_in_memory: Arc<AtomicUsize>,
     file_lock: Arc<Mutex<()>>,
     runtime_handle: tokio::runtime::Handle,
+    delimiter: Vec<u8>,
 ) {
     let mut current_sleep = std::time::Duration::from_millis(1);
     const MAX_SLEEP: std::time::Duration = std::time::Duration::from_millis(100);
@@ -509,7 +597,7 @@ fn run_file_queue_task(
 
             while skipped < skip_count {
                 buf.clear();
-                match reader.read_until(b'\n', &mut buf) {
+                match read_until_bytes_sync(&mut reader, &delimiter, &mut buf) {
                     Ok(0) => break,
                     Ok(_) => skipped += 1,
                     Err(e) => {
@@ -523,10 +611,14 @@ fn run_file_queue_task(
             if !error {
                 for _ in 0..128 {
                     buf.clear();
-                    match reader.read_until(b'\n', &mut buf) {
+                    match read_until_bytes_sync(&mut reader, &delimiter, &mut buf) {
                         Ok(0) => break,
                         Ok(_) => {
-                            while buf.ends_with(b"\n") || buf.ends_with(b"\r") {
+                            if buf.ends_with(&delimiter) {
+                                buf.truncate(buf.len() - delimiter.len());
+                            }
+                            if delimiter.len() == 1 && delimiter[0] == b'\n' && buf.ends_with(b"\r")
+                            {
                                 buf.pop();
                             }
                             batch.push(parse_message(&buf));
@@ -564,19 +656,26 @@ pub struct FileConsumer {
 
 impl FileConsumer {
     pub async fn new(config: &FileConfig) -> anyhow::Result<Self> {
+        let delimiter = parse_delimiter(config.delimiter.as_deref())?;
         match &config.mode {
             FileConsumerMode::Consume { delete: false } => {
-                Self::new_tail(&config.path, false, None).await
+                Self::new_tail(&config.path, false, None, delimiter.clone()).await
             }
             FileConsumerMode::Subscribe { delete: false } => {
-                Self::new_tail(&config.path, true, None).await
+                Self::new_tail(&config.path, true, None, delimiter.clone()).await
             }
             FileConsumerMode::GroupSubscribe {
                 group_id,
                 read_from_tail,
             } => {
                 let start_at_end = *read_from_tail;
-                Self::new_tail(&config.path, start_at_end, Some(group_id.clone())).await
+                Self::new_tail(
+                    &config.path,
+                    start_at_end,
+                    Some(group_id.clone()),
+                    delimiter.clone(),
+                )
+                .await
             }
             FileConsumerMode::Consume { delete: true } => {
                 let (msg_tx, msg_rx) = async_channel::bounded(100);
@@ -587,8 +686,16 @@ impl FileConsumer {
                 let runtime = tokio::runtime::Handle::current();
                 let path_clone = config.path.clone();
 
+                let delimiter_clone = delimiter.clone();
                 std::thread::spawn(move || {
-                    run_file_queue_task(path_clone, msg_tx, lines_clone, lock_clone, runtime);
+                    run_file_queue_task(
+                        path_clone,
+                        msg_tx,
+                        lines_clone,
+                        lock_clone,
+                        runtime,
+                        delimiter_clone,
+                    );
                 });
 
                 info!(path = %config.path, mode = "queue (delete, optimized)", "File consumer connected");
@@ -599,6 +706,7 @@ impl FileConsumer {
                         path: config.path.clone(),
                         file_lock,
                         buffer: Arc::new(Mutex::new(Vec::new())),
+                        delimiter,
                     }),
                 })
             }
@@ -612,7 +720,7 @@ impl FileConsumer {
                 } {
                     store
                 } else {
-                    let created = create_file_event_store(&config.path).await?;
+                    let created = create_file_event_store(&config.path, delimiter.clone()).await?;
                     let mut stores = FILE_EVENT_STORES.lock().await;
                     let store = stores
                         .get(&key)
@@ -638,6 +746,7 @@ impl FileConsumer {
         path: &str,
         start_at_end: bool,
         group_id: Option<String>,
+        delimiter: Vec<u8>,
     ) -> anyhow::Result<Self> {
         let (msg_tx, msg_rx) = async_channel::bounded(100);
         let mut initial_offset = 0;
@@ -671,7 +780,7 @@ impl FileConsumer {
 
         let path_clone = path.to_string();
         std::thread::spawn(move || {
-            run_file_tail_task_sync(path_clone, msg_tx, initial_offset, group_id);
+            run_file_tail_task_sync(path_clone, msg_tx, initial_offset, group_id, delimiter);
         });
 
         info!(path = %path, mode = "tail (no-delete, optimized)", "File consumer connected");
@@ -790,6 +899,7 @@ impl MessageConsumer for FileConsumer {
                 let buffer_clone = c.buffer.clone();
                 let lines_mem = c.lines_in_memory.clone();
                 let batch_for_commit = batch.clone();
+                let delimiter = c.delimiter.clone();
 
                 let commit = Box::new(
                     move |dispositions: Vec<crate::traits::MessageDisposition>| {
@@ -829,7 +939,9 @@ impl MessageConsumer for FileConsumer {
 
                             if leading_acks > 0 {
                                 let _guard = lock.lock().await;
-                                if let Err(e) = remove_lines_from_file(&path, leading_acks).await {
+                                if let Err(e) =
+                                    remove_lines_from_file(&path, leading_acks, &delimiter).await
+                                {
                                     tracing::error!("Failed to remove lines from {}: {}", path, e);
                                 }
                                 lines_mem.fetch_sub(leading_acks, Ordering::SeqCst);
@@ -888,6 +1000,7 @@ mod tests {
         let config = FileConfig {
             path: file_path_str.clone(),
             mode: FileConsumerMode::Consume { delete: false },
+            delimiter: None,
         };
         let sink = FilePublisher::new(&config).await.unwrap();
 
@@ -938,6 +1051,7 @@ mod tests {
         let config = FileConfig {
             path: file_path.to_str().unwrap().to_string(),
             mode: FileConsumerMode::Consume { delete: false },
+            delimiter: None,
         };
         let sink_result = FilePublisher::new(&config).await;
 
@@ -960,6 +1074,7 @@ mod tests {
         let config = FileConfig {
             path: file_path_str,
             mode: FileConsumerMode::Consume { delete: true },
+            delimiter: None,
         };
         let mut consumer = FileConsumer::new(&config).await.unwrap();
 
@@ -1020,6 +1135,7 @@ mod tests {
         let config = FileConfig {
             path: file_path_str.clone(),
             mode: FileConsumerMode::Consume { delete: true },
+            delimiter: None,
         };
         let mut consumer = FileConsumer::new(&config).await.unwrap();
 
@@ -1063,6 +1179,7 @@ mod tests {
         let config = FileConfig {
             path: file_path_str.clone(),
             mode: FileConsumerMode::Consume { delete: false },
+            delimiter: None,
         };
         let mut consumer = FileConsumer::new(&config).await.unwrap();
 
@@ -1099,6 +1216,7 @@ mod tests {
         let config = FileConfig {
             path: file_path_str.clone(),
             mode: FileConsumerMode::Subscribe { delete: false },
+            delimiter: None,
         };
 
         let mut consumer = FileConsumer::new(&config).await.unwrap();
@@ -1140,6 +1258,7 @@ mod tests {
         let config = FileConfig {
             path: file_path_str.clone(),
             mode: FileConsumerMode::Consume { delete: true },
+            delimiter: None,
         };
         let mut consumer = FileConsumer::new(&config).await.unwrap();
 
@@ -1173,6 +1292,7 @@ mod tests {
         let config = FileConfig {
             path: file_path_str.clone(),
             mode: FileConsumerMode::Subscribe { delete: true },
+            delimiter: None,
         };
 
         let mut sub1 = FileConsumer::new(&config).await.unwrap();
@@ -1220,6 +1340,7 @@ mod tests {
         let config = FileConfig {
             path: file_path_str.clone(),
             mode: FileConsumerMode::Subscribe { delete: false },
+            delimiter: None,
         };
 
         let mut consumer = FileConsumer::new(&config).await.unwrap();
@@ -1258,6 +1379,7 @@ mod tests {
         let input = Endpoint::new(EndpointType::File(FileConfig {
             path: file_path_str.clone(),
             mode: FileConsumerMode::Consume { delete: true },
+            delimiter: None,
         }));
         let output = Endpoint::new_memory("out_consume_explicit_delete", 10);
         let route = Route::new(input, output.clone());
@@ -1304,6 +1426,7 @@ mod tests {
         let input = Endpoint::new(EndpointType::File(FileConfig {
             path: file_path_str.clone(),
             mode: FileConsumerMode::Subscribe { delete: true },
+            delimiter: None,
         }));
         let output = Endpoint::new_memory("out_subscribe_delete", 10);
         let route = Route::new(input, output.clone());
@@ -1345,6 +1468,7 @@ mod tests {
         let input = Endpoint::new(EndpointType::File(FileConfig {
             path: file_path_str.clone(),
             mode: FileConsumerMode::Subscribe { delete: false },
+            delimiter: None,
         }));
         let output = Endpoint::new_memory("out_subscribe_no_delete", 10);
         let route = Route::new(input, output.clone());
@@ -1385,6 +1509,7 @@ mod tests {
         let input = Endpoint::new(EndpointType::File(FileConfig {
             path: file_path_str.clone(),
             mode: FileConsumerMode::Consume { delete: true },
+            delimiter: None,
         }));
         let output = Endpoint::new_memory("out_consume_all", 100);
         let route = Route::new(input, output.clone());
@@ -1433,6 +1558,7 @@ mod tests {
                 group_id: "my_group".to_string(),
                 read_from_tail: false,
             },
+            delimiter: None,
         };
 
         // 1. First consumer reads msg1
@@ -1485,6 +1611,7 @@ mod tests {
                 group_id: "my_group_start".to_string(),
                 read_from_tail: false,
             },
+            delimiter: None,
         };
 
         // Consumer should start from beginning (msg1)
@@ -1496,5 +1623,237 @@ mod tests {
         assert_eq!(batch.messages.len(), 2);
         assert_eq!(batch.messages[0].payload.as_ref(), b"msg1");
         assert_eq!(batch.messages[1].payload.as_ref(), b"msg2");
+    }
+
+    #[tokio::test]
+    async fn test_file_tail_concurrent_publish_and_consume() {
+        // This test verifies that the tail reader can work concurrently with the publisher
+        // writing to the file. This is critical for Windows compatibility where file locking
+        // semantics may prevent concurrent access if not handled correctly.
+        // Note: Even though this runs in the same process, Windows file sharing modes are
+        // enforced per-handle. Since the consumer does not participate in the `FILE_LOCKS`
+        // mutex used by the publisher, this effectively tests that the OS allows the
+        // publisher to open/write while the consumer has the file open for reading.
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("concurrent.log");
+        let file_path_str = file_path.to_str().unwrap().to_string();
+
+        // Create file with initial message
+        tokio::fs::write(&file_path, b"msg0\n").await.unwrap();
+
+        let config = FileConfig {
+            path: file_path_str.clone(),
+            mode: FileConsumerMode::Subscribe { delete: false },
+            delimiter: None,
+        };
+
+        // Start the tail consumer
+        let mut consumer = FileConsumer::new(&config).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // Spawn a task that continuously publishes messages while the consumer is reading
+        let publisher_path = file_path_str.clone();
+        let publish_handle = tokio::spawn(async move {
+            let pub_config = FileConfig {
+                path: publisher_path,
+                mode: FileConsumerMode::Subscribe { delete: false },
+                delimiter: None,
+            };
+            let publisher = FilePublisher::new(&pub_config).await.unwrap();
+
+            // Send enough messages to ensure overlap between reading and writing
+            for i in 1..=100 {
+                let msg = msg!(json!({"id": i, "data": format!("message_{}", i)}));
+                publisher.send_batch(vec![msg]).await.unwrap();
+                // Small delay to allow consumer to catch up and potentially open the file
+                if i % 10 == 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            }
+        });
+
+        // Consumer should be able to read messages while publisher is writing
+        let mut received_count = 0;
+        let mut message_ids = Vec::new();
+
+        // We expect 100 published messages (initial msg0 is skipped in Subscribe mode)
+        let expected_count = 100;
+        let start = std::time::Instant::now();
+
+        while received_count < expected_count {
+            if start.elapsed() > std::time::Duration::from_secs(10) {
+                break;
+            }
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(200),
+                consumer.receive_batch(10),
+            )
+            .await
+            {
+                Ok(Ok(batch)) => {
+                    for msg in &batch.messages {
+                        received_count += 1;
+                        if let Ok(json_msg) =
+                            serde_json::from_slice::<serde_json::Value>(&msg.payload)
+                        {
+                            if let Some(id) = json_msg.get("id").and_then(|v| v.as_i64()) {
+                                message_ids.push(id);
+                            }
+                        }
+                    }
+                    (batch.commit)(vec![
+                        crate::traits::MessageDisposition::Ack;
+                        batch.messages.len()
+                    ])
+                    .await
+                    .unwrap();
+                }
+                Ok(Err(_)) => break, // Stream ended
+                Err(_) => continue,  // Timeout waiting for message
+            }
+        }
+
+        publish_handle.await.unwrap();
+
+        // Verify we received at least some messages from the publisher
+        // We should receive the messages from the concurrent publisher
+        assert_eq!(
+            received_count, expected_count,
+            "Expected {} messages, got {}. This may indicate file locking issues on this platform.",
+            expected_count, received_count
+        );
+
+        // Verify the file still exists and can be read (not locked/deleted)
+        let final_content = tokio::fs::read_to_string(&file_path)
+            .await
+            .expect("File should still be readable after concurrent access");
+        assert!(
+            !final_content.is_empty(),
+            "File should contain messages after concurrent access"
+        );
+    }
+
+    /// Simulates an external process (like a Python script or log writer) appending to the file.
+    /// Unlike `test_file_tail_concurrent_publish_and_consume`, this test:
+    /// 1. Does not use `FilePublisher` (bypassing internal `FILE_LOCKS`).
+    /// 2. Keeps the file handle open across multiple writes (simulating a long-running writer),
+    ///    which stresses file locking/sharing semantics on OSs like Windows.
+    #[tokio::test]
+    async fn test_file_subscribe_concurrent_external_write() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("external_write.log");
+        let file_path_str = file_path.to_str().unwrap().to_string();
+
+        // Create empty file
+        tokio::fs::write(&file_path, b"").await.unwrap();
+
+        let config = FileConfig {
+            path: file_path_str.clone(),
+            mode: FileConsumerMode::Subscribe { delete: false },
+            delimiter: None,
+        };
+
+        let mut consumer = FileConsumer::new(&config).await.unwrap();
+
+        // Give the background tailer a moment to initialize
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let file_path_clone = file_path.clone();
+        let write_task = tokio::spawn(async move {
+            let mut file = OpenOptions::new()
+                .append(true)
+                .open(&file_path_clone)
+                .await
+                .unwrap();
+
+            for i in 0..5 {
+                let line = format!("message {}\n", i);
+                file.write_all(line.as_bytes()).await.unwrap();
+                file.flush().await.unwrap();
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        });
+
+        for i in 0..5 {
+            let received =
+                tokio::time::timeout(std::time::Duration::from_secs(5), consumer.receive())
+                    .await
+                    .expect("Timed out waiting for message")
+                    .unwrap();
+
+            let expected_payload = format!("message {}", i);
+            assert_eq!(received.message.get_payload_str().trim(), expected_payload);
+            (received.commit)(crate::traits::MessageDisposition::Ack)
+                .await
+                .unwrap();
+        }
+
+        write_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_file_custom_delimiter() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("custom_delim.log");
+        let file_path_str = file_path.to_str().unwrap().to_string();
+
+        let config = FileConfig {
+            path: file_path_str.clone(),
+            delimiter: Some("|".to_string()),
+            mode: FileConsumerMode::Consume { delete: false },
+        };
+
+        let publisher = FilePublisher::new(&config).await.unwrap();
+        let mut consumer = FileConsumer::new(&config).await.unwrap();
+
+        let msg1 = crate::CanonicalMessage::from("msg1").with_raw_format();
+        let msg2 = crate::CanonicalMessage::from("msg2").with_raw_format();
+
+        publisher.send_batch(vec![msg1, msg2]).await.unwrap();
+        publisher.flush().await.unwrap();
+        drop(publisher); // Release lock
+
+        // Verify file content has pipes
+        let content = tokio::fs::read_to_string(&file_path).await.unwrap();
+        assert_eq!(content, "msg1|msg2|");
+
+        let received1 = consumer.receive().await.unwrap();
+        assert_eq!(received1.message.get_payload_str(), "msg1");
+
+        let received2 = consumer.receive().await.unwrap();
+        assert_eq!(received2.message.get_payload_str(), "msg2");
+    }
+
+    #[tokio::test]
+    async fn test_file_xml_delimiter() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("xml_delim.log");
+        let file_path_str = file_path.to_str().unwrap().to_string();
+
+        let config = FileConfig {
+            path: file_path_str.clone(),
+            delimiter: Some("</message>".to_string()),
+            mode: FileConsumerMode::Consume { delete: false },
+        };
+
+        let publisher = FilePublisher::new(&config).await.unwrap();
+        let mut consumer = FileConsumer::new(&config).await.unwrap();
+
+        let msg1 = crate::CanonicalMessage::from("<xml>content1").with_raw_format();
+        let msg2 = crate::CanonicalMessage::from("<xml>content2").with_raw_format();
+
+        publisher.send_batch(vec![msg1, msg2]).await.unwrap();
+        publisher.flush().await.unwrap();
+        drop(publisher); // Release lock
+
+        // Verify file content has tags
+        let content = tokio::fs::read_to_string(&file_path).await.unwrap();
+        assert_eq!(content, "<xml>content1</message><xml>content2</message>");
+
+        let received1 = consumer.receive().await.unwrap();
+        assert_eq!(received1.message.get_payload_str(), "<xml>content1");
+
+        let received2 = consumer.receive().await.unwrap();
+        assert_eq!(received2.message.get_payload_str(), "<xml>content2");
     }
 }

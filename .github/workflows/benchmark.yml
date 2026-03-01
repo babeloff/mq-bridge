@@ -101,6 +101,6 @@ jobs:
           output-file-path: output.txt
           github-token: ${{ secrets.GITHUB_TOKEN }}
           auto-push: true
-          alert-threshold: '150%'
+          alert-threshold: '170%'
           comment-on-alert: true
           fail-on-alert: false

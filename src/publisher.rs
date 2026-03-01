@@ -38,6 +38,10 @@ impl Publisher {
             .map_err(|e| anyhow::anyhow!(e))
     }
 
+    pub fn inner(&self) -> std::sync::Arc<dyn traits::MessagePublisher> {
+        self.publisher.clone()
+    }
+
     /// Registers this publisher globally with a given name.
     pub fn register(&self, name: &str) -> Option<Self> {
         let registry = PUBLISHER_REGISTRY.get_or_init(|| RwLock::new(HashMap::new()));
@@ -62,6 +66,10 @@ impl Publisher {
 
 pub fn get_publisher(name: &str) -> Option<Publisher> {
     Publisher::get(name)
+}
+
+pub fn register_publisher(name: &str, publisher: Publisher) -> Option<Publisher> {
+    publisher.register(name)
 }
 
 pub fn unregister_publisher(name: &str) -> Option<Publisher> {

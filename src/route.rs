@@ -5,7 +5,7 @@
 
 use crate::endpoints::{create_consumer_from_route, create_publisher_from_route};
 pub use crate::models::Route;
-use crate::models::{Endpoint, RouteOptions};
+use crate::models::{Endpoint, EndpointType, RouteOptions};
 use crate::traits::{
     BatchCommitFunc, ConsumerError, Handler, HandlerError, MessageDisposition, PublisherError,
     SentBatch,
@@ -53,6 +53,28 @@ struct ActiveRoute {
 }
 
 static ROUTE_REGISTRY: OnceLock<RwLock<HashMap<String, ActiveRoute>>> = OnceLock::new();
+static ENDPOINT_REF_REGISTRY: OnceLock<RwLock<HashMap<String, Endpoint>>> = OnceLock::new();
+
+/// Registers a named endpoint that can be referenced by other endpoints using `ref: "name"`.
+/// This will overwrite any existing endpoint with the same name.
+pub fn register_endpoint(name: &str, endpoint: Endpoint) {
+    let registry = ENDPOINT_REF_REGISTRY.get_or_init(|| RwLock::new(HashMap::new()));
+    let mut writer = registry
+        .write()
+        .expect("Named endpoint registry lock poisoned");
+    if writer.insert(name.to_string(), endpoint).is_some() {
+        debug!("Overwriting a registered endpoint named '{}'", name);
+    }
+}
+
+/// Retrieves a registered endpoint by name.
+pub fn get_endpoint(name: &str) -> Option<Endpoint> {
+    let registry = ENDPOINT_REF_REGISTRY.get_or_init(|| RwLock::new(HashMap::new()));
+    let reader = registry
+        .read()
+        .expect("Named endpoint registry lock poisoned");
+    reader.get(name).cloned()
+}
 
 impl Route {
     /// Creates a new route with default concurrency (1) and batch size (128).
@@ -80,6 +102,32 @@ impl Route {
         let registry = ROUTE_REGISTRY.get_or_init(|| RwLock::new(HashMap::new()));
         let map = registry.read().expect("Route registry lock poisoned");
         map.keys().cloned().collect()
+    }
+
+    /// Returns true if the input is of type ref (and the output isn't)
+    pub fn is_ref(&self) -> bool {
+        matches!(self.input.endpoint_type, EndpointType::Ref(_))
+            && !matches!(self.output.endpoint_type, EndpointType::Ref(_))
+    }
+
+    /// Registers the route's output endpoint under the given name.
+    /// This allows other routes to reference this output using `ref: "name"`.
+    pub fn register_output_endpoint(&self, name: Option<&str>) -> Result<(), anyhow::Error> {
+        match name {
+            Some(name) => {
+                register_endpoint(name, self.output.clone());
+            }
+            None => {
+                if let EndpointType::Ref(name) = &self.input.endpoint_type {
+                    register_endpoint(name, self.output.clone());
+                } else {
+                    return Err(anyhow::anyhow!(
+                        "No name and input is not a reference endpoint"
+                    ));
+                }
+            }
+        };
+        Ok(())
     }
 
     /// Registers the route and starts it.
@@ -159,10 +207,23 @@ impl Route {
     /// # Arguments
     /// * `name` - The name of the route
     /// * `allowed_endpoints` - An optional list of allowed endpoint types
-    pub fn check(&self, name: &str, allowed_endpoints: Option<&[&str]>) -> anyhow::Result<()> {
-        crate::endpoints::check_consumer(name, &self.input, allowed_endpoints)?;
-        crate::endpoints::check_publisher(name, &self.output, allowed_endpoints)?;
-        Ok(())
+    pub fn check(
+        &self,
+        name: &str,
+        allowed_endpoints: Option<&[&str]>,
+    ) -> anyhow::Result<Vec<String>> {
+        let mut warnings = Vec::new();
+        warnings.extend(crate::endpoints::check_consumer(
+            name,
+            &self.input,
+            allowed_endpoints,
+        )?);
+        warnings.extend(crate::endpoints::check_publisher(
+            name,
+            &self.output,
+            allowed_endpoints,
+        )?);
+        Ok(warnings)
     }
 
     /// Runs the message processing route with concurrency, error handling, and graceful shutdown.
@@ -193,7 +254,10 @@ impl Route {
     /// # }
     /// ```
     pub async fn run(&self, name_str: &str) -> anyhow::Result<RouteHandle> {
-        self.check(name_str, None)?;
+        let warnings = self.check(name_str, None)?;
+        for warning in warnings {
+            tracing::warn!(route = name_str, "Configuration warning: {}", warning);
+        }
         let (shutdown_tx, shutdown_rx) = bounded(1);
         let (ready_tx, ready_rx) = bounded(1);
         // Use `Arc` so route/name clones are cheap (pointer copy) in the reconnect loop.
@@ -295,6 +359,7 @@ impl Route {
         if let Some(tx) = ready_tx {
             let _ = tx.send(()).await;
         }
+        let mut message_ids = Vec::with_capacity(self.options.batch_size);
         let run_result = loop {
             select! {
                 Ok(err) = err_rx.recv() => break Err(err),
@@ -331,6 +396,8 @@ impl Route {
                     seq_counter += 1;
                     let commit = wrap_commit(received_batch.commit, seq, seq_tx.clone());
                     let batch_len = received_batch.messages.len();
+                    message_ids.clear();
+                    message_ids.extend(received_batch.messages.iter().map(|m| m.message_id));
 
                     match publisher.send_batch(received_batch.messages).await {
                         Ok(SentBatch::Ack) => {
@@ -353,19 +420,27 @@ impl Route {
                                     .into_iter()
                                     .find(|(_, e)| matches!(e, PublisherError::Retryable(_)))
                                     .expect("has_retryable is true");
-                                break Err(anyhow::anyhow!(
+                                let err = anyhow::anyhow!(
                                     "Failed to send {} messages in batch. First retryable error: {}",
                                     failed_count,
                                     first_error
-                                ));
+                                );
+                                // Nack the commit to fill the sequencer slot before breaking.
+                                // Without this, the sequencer would time out waiting for a gap that
+                                // can never be filled (the wrapped commit was never called).
+                                commit_tasks.spawn(async move {
+                                    let _ = commit(vec![MessageDisposition::Nack; batch_len]).await;
+                                });
+                                break Err(err);
                             }
                             for (msg, e) in &failed {
                                 error!("Dropping message (ID: {:032x}) due to non-retryable error: {}", msg.message_id, e);
                             }
                             let permit = commit_semaphore.clone().acquire_owned().await.map_err(|e| anyhow::anyhow!("Semaphore error: {}", e))?;
                             let err_tx = err_tx.clone();
+                            let ids = std::mem::take(&mut message_ids);
                             commit_tasks.spawn(async move {
-                                let dispositions = map_responses_to_dispositions(batch_len, responses, &failed);
+                                let dispositions = map_responses_to_dispositions(&ids, responses, &failed);
                                 if let Err(e) = commit(dispositions).await {
                                     error!("Commit failed: {}", e);
                                     let _ = err_tx.send(e).await;
@@ -373,7 +448,13 @@ impl Route {
                                 drop(permit);
                             });
                         }
-                        Err(e) => break Err(e.into()), // Propagate error to trigger reconnect
+                        Err(e) => {
+                            // Nack the commit to fill the sequencer slot before breaking.
+                            commit_tasks.spawn(async move {
+                                let _ = commit(vec![MessageDisposition::Nack; batch_len]).await;
+                            });
+                            break Err(e.into()); // Propagate error to trigger reconnect
+                        }
                     }
                 }
             }
@@ -425,9 +506,10 @@ impl Route {
         // --- Ordered Commit Sequencer ---
         // To prevent data loss with cumulative-ack brokers (Kafka/AMQP), commits must happen in order.
         // We assign a sequence number to each batch and use a sequencer task to enforce order.
-        let (seq_tx, sequencer_handle) = spawn_sequencer(self.options.concurrency * 2);
+        let (seq_tx, sequencer_handle) = spawn_sequencer(self.options.commit_concurrency_limit);
 
         // --- Worker Pool ---
+        let batch_size = self.options.batch_size;
         let mut join_set = JoinSet::new();
         for i in 0..self.options.concurrency {
             let work_rx_clone = work_rx.clone();
@@ -437,8 +519,11 @@ impl Route {
             let mut commit_tasks = JoinSet::new();
             join_set.spawn(async move {
                 debug!("Starting worker {}", i);
+                let mut message_ids = Vec::with_capacity(batch_size);
                 while let Ok((messages, commit)) = work_rx_clone.recv().await {
                     let batch_len = messages.len();
+                    message_ids.clear();
+                    message_ids.extend(messages.iter().map(|m| m.message_id));
                     match publisher.send_batch(messages).await {
                         Ok(SentBatch::Ack) => {
                             let permit = match commit_semaphore.clone().acquire_owned().await {
@@ -471,6 +556,11 @@ impl Route {
                                     first_error
                                 );
                                 error!("Worker failed to send message batch: {}", e);
+                                // Nack the commit to fill the sequencer slot and prevent a deadlock.
+                                // Other workers may have already sent later sequence numbers to the
+                                // sequencer; dropping this commit without filling it leaves a gap
+                                // that blocks the sequencer and all commit tasks indefinitely.
+                                let _ = commit(vec![MessageDisposition::Nack; batch_len]).await;
                                 if err_tx.send(e).await.is_err() {
                                     warn!("Could not send error to main task, it might be down.");
                                 }
@@ -487,8 +577,9 @@ impl Route {
                                 }
                             };
                             let err_tx = err_tx.clone();
+                            let ids = std::mem::take(&mut message_ids);
                             commit_tasks.spawn(async move {
-                                let dispositions = map_responses_to_dispositions(batch_len, responses, &failed);
+                                let dispositions = map_responses_to_dispositions(&ids, responses, &failed);
                                 if let Err(e) = commit(dispositions).await {
                                     error!("Commit failed: {}", e);
                                     let _ = err_tx.send(e).await;
@@ -498,6 +589,8 @@ impl Route {
                         }
                         Err(e) => {
                             error!("Worker failed to send message batch: {}", e);
+                            // Nack the commit to fill the sequencer slot and prevent a deadlock.
+                            let _ = commit(vec![MessageDisposition::Nack; batch_len]).await;
                             // Send the error back to the main task to tear down the route.
                             if err_tx.send(e.into()).await.is_err() {
                                 warn!("Could not send error to main task, it might be down.");
@@ -512,26 +605,30 @@ impl Route {
         }
 
         let mut seq_counter = 0u64;
+        // Holds an error that caused the loop to break, to be returned after graceful shutdown.
+        let mut loop_error: Option<anyhow::Error> = None;
         loop {
             select! {
                 biased; // Prioritize checking for errors
 
                 Ok(err) = err_rx.recv() => {
                     error!("A worker reported a critical error. Shutting down route.");
-                    return Err(err);
+                    loop_error = Some(err);
+                    break;
                 }
 
                 Some(res) = join_set.join_next() => {
                     match res {
                         Ok(_) => {
                             error!("A worker task finished unexpectedly. Shutting down route.");
-                            return Err(anyhow::anyhow!("Worker task finished unexpectedly"));
+                            loop_error = Some(anyhow::anyhow!("Worker task finished unexpectedly"));
                         }
                         Err(e) => {
                             error!("A worker task panicked: {}. Shutting down route.", e);
-                            return Err(e.into());
+                            loop_error = Some(e.into());
                         }
                     }
+                    break;
                 }
 
                 _ = shutdown_rx.recv() => {
@@ -553,11 +650,13 @@ impl Route {
                         }
                         Err(ConsumerError::Connection(e)) => {
                             // Propagate error to trigger reconnect by the outer loop
-                            return Err(e);
+                            loop_error = Some(e);
+                            break;
                         }
                         Err(ConsumerError::Gap { requested, base }) => {
                             // Propagate gap error to trigger reconnect by the outer loop
-                            return Err(ConsumerError::Gap { requested, base }.into());
+                            loop_error = Some(ConsumerError::Gap { requested, base }.into());
+                            break;
                         }
                     };
                     debug!("Received a batch of {} messages concurrently", messages.len());
@@ -576,7 +675,9 @@ impl Route {
         }
 
         // --- Graceful Shutdown ---
-        // Close the work channel. Workers will finish their current message and then exit the loop.
+        // Close the work channel so workers drain their current messages and exit the loop.
+        // This applies on both normal shutdown AND error paths, ensuring in-flight commits
+        // are not aborted mid-sequence.
         drop(work_tx);
         // Wait for all worker tasks to complete.
         while join_set.join_next().await.is_some() {}
@@ -584,6 +685,10 @@ impl Route {
         // Close sequencer
         drop(seq_tx);
         let _ = sequencer_handle.await;
+
+        if let Some(err) = loop_error {
+            return Err(err);
+        }
 
         if let Ok(err) = err_rx.try_recv() {
             return Err(err);
@@ -740,29 +845,29 @@ fn spawn_sequencer(buffer_size: usize) -> (Sender<(u64, SequencerItem)>, JoinHan
                         Ok((seq, item)) => {
                             if seq < next_seq {
                                 let (_, _, notify) = item;
-                                let _ = notify.send(Err(anyhow::anyhow!("Sequencer received late item (seq {} < next_seq {})", seq, next_seq)));
+                                // This should not happen with the new timeout logic, but we'll keep the check.
+                                let _ = notify.send(Err(anyhow::anyhow!("Sequencer received late item (seq {} < next_seq {}), which is unexpected", seq, next_seq)));
                             } else {
                                 buffer.insert(seq, item);
                             }
                         }
                         Err(_) => {
                             for (_, (_, _, notify)) in std::mem::take(&mut buffer) {
-                                let _ = notify.send(Err(anyhow::anyhow!("Sequencer shutting down")));
+                                let _ = notify.send(Err(anyhow::anyhow!("Sequencer is shutting down")));
                             }
                             break;
                         }
                     }
                 }
                 _ = timeout_fut => {
-                    if let Some(&first_seq) = buffer.keys().next() {
-                        if first_seq > next_seq {
-                            warn!("Sequencer timed out waiting for seq {}. Jumping to {}.", next_seq, first_seq);
-                            next_seq = first_seq;
-                        } else {
-                            next_seq += 1;
-                        }
+                    if let Some(first_seq) = buffer.keys().next() {
+                        // With the Nack-on-failure fix, all sequence slots are always filled before
+                        // a worker exits. A timeout here indicates a bug: a commit was lost without
+                        // being called. The sequencer will keep waiting to avoid skipping messages.
+                        error!("Sequencer timed out waiting for seq {}. Next in buffer is {}. This is a bug - a commit slot was never filled.", next_seq, *first_seq);
                     } else {
-                        next_seq += 1;
+                        // This should be unreachable as a timeout can't occur on an empty buffer.
+                        error!("Sequencer timed out on an empty buffer, which is unexpected.");
                     }
                     deadline = None;
                 }
@@ -803,43 +908,25 @@ fn wrap_commit(
 }
 
 fn map_responses_to_dispositions(
-    total_count: usize,
+    message_ids: &[u128],
     responses: Option<Vec<crate::CanonicalMessage>>,
     failed: &[(crate::CanonicalMessage, PublisherError)],
 ) -> Vec<MessageDisposition> {
-    if failed.is_empty() {
-        if let Some(resps) = responses {
-            if resps.len() == total_count {
-                return resps.into_iter().map(MessageDisposition::Reply).collect();
-            }
+    let mut dispositions = Vec::with_capacity(message_ids.len());
+    let failed_ids: std::collections::HashSet<u128> =
+        failed.iter().map(|(m, _)| m.message_id).collect();
+    let mut response_iter = responses.unwrap_or_default().into_iter();
+
+    for id in message_ids {
+        if failed_ids.contains(id) {
+            dispositions.push(MessageDisposition::Nack);
+        } else if let Some(resp) = response_iter.next() {
+            dispositions.push(MessageDisposition::Reply(resp));
         } else {
-            // If there are no failures and no responses, everything is Ack.
-            return vec![MessageDisposition::Ack; total_count];
+            dispositions.push(MessageDisposition::Ack);
         }
     }
-
-    // If we have failures, we should Nack them.
-    // However, we don't have easy access to the original indices here to map 1:1 perfectly
-    // if we don't assume order.
-    // But `send_batch` usually processes in order.
-    // If `responses` is Some, it contains responses for successful messages in order.
-
-    // Simplified logic assuming order preservation for successful messages:
-    // We construct a vector of dispositions.
-    // Since we can't easily match by ID without iterating everything, and `failed` might be sparse,
-    // we'll use a heuristic:
-    // If we have explicit responses, we use them.
-    // If we have failures, we might not be able to map them back to the exact index in the batch
-    // without O(N^2) or a map, because `failed` is a subset.
-    //
-    // For F10 implementation, we will assume that if *any* message failed in the batch,
-    // and we are in a Partial state, we might want to Nack the ones that failed.
-    // But since we can't easily map back to the index in `received_batch.messages` (which we don't have here in this helper),
-    // and `commit` expects a vector of size `total_count` corresponding to the input batch...
-
-    // Current best effort: Return Ack for everything to avoid hanging, but log that we can't map precisely yet.
-    // In a real implementation of F10, `send_batch` should probably return `Vec<Result<Sent, PublisherError>>` to map 1:1.
-    vec![MessageDisposition::Ack; total_count]
+    dispositions
 }
 
 pub fn get_route(name: &str) -> Option<Route> {
@@ -858,7 +945,9 @@ pub async fn stop_route(name: &str) -> bool {
 mod tests {
     use super::*;
     use crate::models::{Endpoint, Middleware};
-    use crate::traits::{CustomMiddlewareFactory, MessageConsumer, ReceivedBatch};
+    use crate::traits::{
+        CustomMiddlewareFactory, MessageConsumer, MessagePublisher, ReceivedBatch,
+    };
     use std::any::Any;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
@@ -975,5 +1064,136 @@ mod tests {
 
         // Cleanup
         Route::stop("panic_test").await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_route_sequencer_deadlock_fix() {
+        // This test ensures that when a worker fails to send a batch (and thus drops the commit handle),
+        // the sequencer doesn't deadlock waiting for that sequence number.
+        // The fix ensures that even on failure, the commit function is called (with Nack) to fill the sequence gap.
+
+        let unique_id = fast_uuid_v7::gen_id().to_string();
+        let factory_name = format!("fail_factory_{}", unique_id);
+        let in_topic = format!("deadlock_in_{}", unique_id);
+        let out_topic = format!("deadlock_out_{}", unique_id);
+
+        #[derive(Debug)]
+        struct FailingMiddlewareFactory {
+            fail_flag: Arc<AtomicBool>,
+        }
+
+        #[async_trait::async_trait]
+        impl CustomMiddlewareFactory for FailingMiddlewareFactory {
+            async fn apply_publisher(
+                &self,
+                publisher: Box<dyn MessagePublisher>,
+                _route_name: &str,
+                _config: &serde_json::Value,
+            ) -> anyhow::Result<Box<dyn MessagePublisher>> {
+                Ok(Box::new(FailingPublisher {
+                    inner: publisher,
+                    fail_flag: self.fail_flag.clone(),
+                }))
+            }
+            async fn apply_consumer(
+                &self,
+                consumer: Box<dyn MessageConsumer>,
+                _route_name: &str,
+                _config: &serde_json::Value,
+            ) -> anyhow::Result<Box<dyn MessageConsumer>> {
+                Ok(consumer)
+            }
+        }
+
+        struct FailingPublisher {
+            inner: Box<dyn MessagePublisher>,
+            fail_flag: Arc<AtomicBool>,
+        }
+
+        #[async_trait::async_trait]
+        impl MessagePublisher for FailingPublisher {
+            async fn send_batch(
+                &self,
+                messages: Vec<crate::CanonicalMessage>,
+            ) -> Result<SentBatch, PublisherError> {
+                // We want to fail one batch to trigger the error path in the worker.
+                // We use compare_exchange to ensure only one failure happens.
+                if self
+                    .fail_flag
+                    .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+                {
+                    return Err(PublisherError::Retryable(anyhow::anyhow!(
+                        "Simulated failure"
+                    )));
+                }
+                // Add a small delay for successful batches to ensure the failed one (if it created a gap)
+                // would block the sequencer if the gap wasn't filled.
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                self.inner.send_batch(messages).await
+            }
+            async fn send(
+                &self,
+                msg: crate::CanonicalMessage,
+            ) -> Result<crate::traits::Sent, PublisherError> {
+                self.inner.send(msg).await
+            }
+            async fn flush(&self) -> anyhow::Result<()> {
+                self.inner.flush().await
+            }
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        let fail_flag = Arc::new(AtomicBool::new(true));
+        register_middleware_factory(
+            &factory_name,
+            Arc::new(FailingMiddlewareFactory {
+                fail_flag: fail_flag.clone(),
+            }),
+        );
+
+        let input = Endpoint::new_memory(&in_topic, 100);
+        let output = Endpoint::new_memory(&out_topic, 100).add_middleware(Middleware::Custom {
+            name: factory_name,
+            config: serde_json::Value::Null,
+        });
+
+        // Concurrency > 1 is required to have multiple workers and potential out-of-order completion
+        let route = Route::new(input.clone(), output.clone())
+            .with_concurrency(2)
+            .with_batch_size(1);
+
+        // Send messages
+        let input_ch = input.channel().unwrap();
+        input_ch.send_message("msg1".into()).await.unwrap();
+        input_ch.send_message("msg2".into()).await.unwrap();
+        input_ch.send_message("msg3".into()).await.unwrap();
+
+        // Run the route. It should fail eventually due to the simulated error,
+        // but it MUST NOT deadlock.
+        let run_fut = async {
+            let (_shutdown_tx, shutdown_rx) = async_channel::bounded(1);
+            route
+                .run_until_err("deadlock_test", Some(shutdown_rx), None)
+                .await
+        };
+
+        // If deadlock exists, this timeout will trigger.
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), run_fut).await;
+
+        match result {
+            Ok(res) => {
+                // We expect an error because the publisher returns Err.
+                assert!(
+                    res.is_err(),
+                    "Route should have failed with simulated error"
+                );
+            }
+            Err(_) => {
+                panic!("Route deadlocked! The sequencer likely didn't receive the Nack for the failed batch.");
+            }
+        }
     }
 }
