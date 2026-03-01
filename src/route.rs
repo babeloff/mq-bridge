@@ -359,6 +359,7 @@ impl Route {
         if let Some(tx) = ready_tx {
             let _ = tx.send(()).await;
         }
+        let mut message_ids = Vec::with_capacity(self.options.batch_size);
         let run_result = loop {
             select! {
                 Ok(err) = err_rx.recv() => break Err(err),
@@ -395,7 +396,8 @@ impl Route {
                     seq_counter += 1;
                     let commit = wrap_commit(received_batch.commit, seq, seq_tx.clone());
                     let batch_len = received_batch.messages.len();
-                    let message_ids: Vec<u128> = received_batch.messages.iter().map(|m| m.message_id).collect();
+                    message_ids.clear();
+                    message_ids.extend(received_batch.messages.iter().map(|m| m.message_id));
 
                     match publisher.send_batch(received_batch.messages).await {
                         Ok(SentBatch::Ack) => {
@@ -436,8 +438,9 @@ impl Route {
                             }
                             let permit = commit_semaphore.clone().acquire_owned().await.map_err(|e| anyhow::anyhow!("Semaphore error: {}", e))?;
                             let err_tx = err_tx.clone();
+                            let ids = std::mem::take(&mut message_ids);
                             commit_tasks.spawn(async move {
-                                let dispositions = map_responses_to_dispositions(&message_ids, responses, &failed);
+                                let dispositions = map_responses_to_dispositions(&ids, responses, &failed);
                                 if let Err(e) = commit(dispositions).await {
                                     error!("Commit failed: {}", e);
                                     let _ = err_tx.send(e).await;
@@ -506,6 +509,7 @@ impl Route {
         let (seq_tx, sequencer_handle) = spawn_sequencer(self.options.commit_concurrency_limit);
 
         // --- Worker Pool ---
+        let batch_size = self.options.batch_size;
         let mut join_set = JoinSet::new();
         for i in 0..self.options.concurrency {
             let work_rx_clone = work_rx.clone();
@@ -515,9 +519,11 @@ impl Route {
             let mut commit_tasks = JoinSet::new();
             join_set.spawn(async move {
                 debug!("Starting worker {}", i);
+                let mut message_ids = Vec::with_capacity(batch_size);
                 while let Ok((messages, commit)) = work_rx_clone.recv().await {
                     let batch_len = messages.len();
-                    let message_ids: Vec<u128> = messages.iter().map(|m| m.message_id).collect();
+                    message_ids.clear();
+                    message_ids.extend(messages.iter().map(|m| m.message_id));
                     match publisher.send_batch(messages).await {
                         Ok(SentBatch::Ack) => {
                             let permit = match commit_semaphore.clone().acquire_owned().await {
@@ -571,8 +577,9 @@ impl Route {
                                 }
                             };
                             let err_tx = err_tx.clone();
+                            let ids = std::mem::take(&mut message_ids);
                             commit_tasks.spawn(async move {
-                                let dispositions = map_responses_to_dispositions(&message_ids, responses, &failed);
+                                let dispositions = map_responses_to_dispositions(&ids, responses, &failed);
                                 if let Err(e) = commit(dispositions).await {
                                     error!("Commit failed: {}", e);
                                     let _ = err_tx.send(e).await;
