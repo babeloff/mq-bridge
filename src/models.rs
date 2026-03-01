@@ -823,6 +823,10 @@ impl SledConfig {
 pub struct FileConfig {
     /// Path to the file.
     pub path: String,
+    /// Optional delimiter for messages. Defaults to newline ("\n").
+    /// Can be a string or a hex sequence (e.g. "0x00").
+    /// Currently only single-byte delimiters are supported.
+    pub delimiter: Option<String>,
     #[serde(default, flatten)]
     pub mode: FileConsumerMode,
 }
@@ -835,6 +839,7 @@ impl<'de> Deserialize<'de> for FileConfig {
         #[derive(Deserialize)]
         struct FileConfigHelper {
             path: String,
+            delimiter: Option<String>,
             #[serde(flatten)]
             extra: serde_json::Value,
         }
@@ -856,6 +861,7 @@ impl<'de> Deserialize<'de> for FileConfig {
 
         Ok(FileConfig {
             path: helper.path,
+            delimiter: helper.delimiter,
             mode,
         })
     }
@@ -898,6 +904,7 @@ impl FileConfig {
         Self {
             path: path.into(),
             mode: FileConsumerMode::default(),
+            delimiter: None,
         }
     }
 
