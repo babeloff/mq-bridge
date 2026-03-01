@@ -941,7 +941,9 @@ pub async fn stop_route(name: &str) -> bool {
 mod tests {
     use super::*;
     use crate::models::{Endpoint, Middleware};
-    use crate::traits::{CustomMiddlewareFactory, MessageConsumer, MessagePublisher, ReceivedBatch};
+    use crate::traits::{
+        CustomMiddlewareFactory, MessageConsumer, MessagePublisher, ReceivedBatch,
+    };
     use std::any::Any;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
@@ -1126,7 +1128,10 @@ mod tests {
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                 self.inner.send_batch(messages).await
             }
-            async fn send(&self, msg: crate::CanonicalMessage) -> Result<crate::traits::Sent, PublisherError> {
+            async fn send(
+                &self,
+                msg: crate::CanonicalMessage,
+            ) -> Result<crate::traits::Sent, PublisherError> {
                 self.inner.send(msg).await
             }
             async fn flush(&self) -> anyhow::Result<()> {
@@ -1177,7 +1182,10 @@ mod tests {
         match result {
             Ok(res) => {
                 // We expect an error because the publisher returns Err.
-                assert!(res.is_err(), "Route should have failed with simulated error");
+                assert!(
+                    res.is_err(),
+                    "Route should have failed with simulated error"
+                );
             }
             Err(_) => {
                 panic!("Route deadlocked! The sequencer likely didn't receive the Nack for the failed batch.");
