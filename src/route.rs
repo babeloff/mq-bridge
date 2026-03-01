@@ -417,11 +417,18 @@ impl Route {
                                     .into_iter()
                                     .find(|(_, e)| matches!(e, PublisherError::Retryable(_)))
                                     .expect("has_retryable is true");
-                                break Err(anyhow::anyhow!(
+                                let err = anyhow::anyhow!(
                                     "Failed to send {} messages in batch. First retryable error: {}",
                                     failed_count,
                                     first_error
-                                ));
+                                );
+                                // Nack the commit to fill the sequencer slot before breaking.
+                                // Without this, the sequencer would time out waiting for a gap that
+                                // can never be filled (the wrapped commit was never called).
+                                commit_tasks.spawn(async move {
+                                    let _ = commit(vec![MessageDisposition::Nack; batch_len]).await;
+                                });
+                                break Err(err);
                             }
                             for (msg, e) in &failed {
                                 error!("Dropping message (ID: {:032x}) due to non-retryable error: {}", msg.message_id, e);
@@ -437,7 +444,13 @@ impl Route {
                                 drop(permit);
                             });
                         }
-                        Err(e) => break Err(e.into()), // Propagate error to trigger reconnect
+                        Err(e) => {
+                            // Nack the commit to fill the sequencer slot before breaking.
+                            commit_tasks.spawn(async move {
+                                let _ = commit(vec![MessageDisposition::Nack; batch_len]).await;
+                            });
+                            break Err(e.into()); // Propagate error to trigger reconnect
+                        }
                     }
                 }
             }
@@ -535,6 +548,11 @@ impl Route {
                                     first_error
                                 );
                                 error!("Worker failed to send message batch: {}", e);
+                                // Nack the commit to fill the sequencer slot and prevent a deadlock.
+                                // Other workers may have already sent later sequence numbers to the
+                                // sequencer; dropping this commit without filling it leaves a gap
+                                // that blocks the sequencer and all commit tasks indefinitely.
+                                let _ = commit(vec![MessageDisposition::Nack; batch_len]).await;
                                 if err_tx.send(e).await.is_err() {
                                     warn!("Could not send error to main task, it might be down.");
                                 }
@@ -562,6 +580,8 @@ impl Route {
                         }
                         Err(e) => {
                             error!("Worker failed to send message batch: {}", e);
+                            // Nack the commit to fill the sequencer slot and prevent a deadlock.
+                            let _ = commit(vec![MessageDisposition::Nack; batch_len]).await;
                             // Send the error back to the main task to tear down the route.
                             if err_tx.send(e.into()).await.is_err() {
                                 warn!("Could not send error to main task, it might be down.");
@@ -921,7 +941,7 @@ pub async fn stop_route(name: &str) -> bool {
 mod tests {
     use super::*;
     use crate::models::{Endpoint, Middleware};
-    use crate::traits::{CustomMiddlewareFactory, MessageConsumer, ReceivedBatch};
+    use crate::traits::{CustomMiddlewareFactory, MessageConsumer, MessagePublisher, ReceivedBatch};
     use std::any::Any;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
@@ -1038,5 +1058,130 @@ mod tests {
 
         // Cleanup
         Route::stop("panic_test").await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_route_sequencer_deadlock_fix() {
+        // This test ensures that when a worker fails to send a batch (and thus drops the commit handle),
+        // the sequencer doesn't deadlock waiting for that sequence number.
+        // The fix ensures that even on failure, the commit function is called (with Nack) to fill the sequence gap.
+
+        let unique_id = fast_uuid_v7::gen_id().to_string();
+        let factory_name = format!("fail_factory_{}", unique_id);
+        let in_topic = format!("deadlock_in_{}", unique_id);
+        let out_topic = format!("deadlock_out_{}", unique_id);
+
+        #[derive(Debug)]
+        struct FailingMiddlewareFactory {
+            fail_flag: Arc<AtomicBool>,
+        }
+
+        #[async_trait::async_trait]
+        impl CustomMiddlewareFactory for FailingMiddlewareFactory {
+            async fn apply_publisher(
+                &self,
+                publisher: Box<dyn MessagePublisher>,
+                _route_name: &str,
+                _config: &serde_json::Value,
+            ) -> anyhow::Result<Box<dyn MessagePublisher>> {
+                Ok(Box::new(FailingPublisher {
+                    inner: publisher,
+                    fail_flag: self.fail_flag.clone(),
+                }))
+            }
+            async fn apply_consumer(
+                &self,
+                consumer: Box<dyn MessageConsumer>,
+                _route_name: &str,
+                _config: &serde_json::Value,
+            ) -> anyhow::Result<Box<dyn MessageConsumer>> {
+                Ok(consumer)
+            }
+        }
+
+        struct FailingPublisher {
+            inner: Box<dyn MessagePublisher>,
+            fail_flag: Arc<AtomicBool>,
+        }
+
+        #[async_trait::async_trait]
+        impl MessagePublisher for FailingPublisher {
+            async fn send_batch(
+                &self,
+                messages: Vec<crate::CanonicalMessage>,
+            ) -> Result<SentBatch, PublisherError> {
+                // We want to fail one batch to trigger the error path in the worker.
+                // We use compare_exchange to ensure only one failure happens.
+                if self
+                    .fail_flag
+                    .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+                {
+                    return Err(PublisherError::Retryable(anyhow::anyhow!(
+                        "Simulated failure"
+                    )));
+                }
+                // Add a small delay for successful batches to ensure the failed one (if it created a gap)
+                // would block the sequencer if the gap wasn't filled.
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                self.inner.send_batch(messages).await
+            }
+            async fn send(&self, msg: crate::CanonicalMessage) -> Result<crate::traits::Sent, PublisherError> {
+                self.inner.send(msg).await
+            }
+            async fn flush(&self) -> anyhow::Result<()> {
+                self.inner.flush().await
+            }
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        let fail_flag = Arc::new(AtomicBool::new(true));
+        register_middleware_factory(
+            &factory_name,
+            Arc::new(FailingMiddlewareFactory {
+                fail_flag: fail_flag.clone(),
+            }),
+        );
+
+        let input = Endpoint::new_memory(&in_topic, 100);
+        let output = Endpoint::new_memory(&out_topic, 100).add_middleware(Middleware::Custom {
+            name: factory_name,
+            config: serde_json::Value::Null,
+        });
+
+        // Concurrency > 1 is required to have multiple workers and potential out-of-order completion
+        let route = Route::new(input.clone(), output.clone())
+            .with_concurrency(2)
+            .with_batch_size(1);
+
+        // Send messages
+        let input_ch = input.channel().unwrap();
+        input_ch.send_message("msg1".into()).await.unwrap();
+        input_ch.send_message("msg2".into()).await.unwrap();
+        input_ch.send_message("msg3".into()).await.unwrap();
+
+        // Run the route. It should fail eventually due to the simulated error,
+        // but it MUST NOT deadlock.
+        let run_fut = async {
+            let (_shutdown_tx, shutdown_rx) = async_channel::bounded(1);
+            route
+                .run_until_err("deadlock_test", Some(shutdown_rx), None)
+                .await
+        };
+
+        // If deadlock exists, this timeout will trigger.
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), run_fut).await;
+
+        match result {
+            Ok(res) => {
+                // We expect an error because the publisher returns Err.
+                assert!(res.is_err(), "Route should have failed with simulated error");
+            }
+            Err(_) => {
+                panic!("Route deadlocked! The sequencer likely didn't receive the Nack for the failed batch.");
+            }
+        }
     }
 }
