@@ -395,6 +395,7 @@ impl Route {
                     seq_counter += 1;
                     let commit = wrap_commit(received_batch.commit, seq, seq_tx.clone());
                     let batch_len = received_batch.messages.len();
+                    let message_ids: Vec<u128> = received_batch.messages.iter().map(|m| m.message_id).collect();
 
                     match publisher.send_batch(received_batch.messages).await {
                         Ok(SentBatch::Ack) => {
@@ -436,7 +437,7 @@ impl Route {
                             let permit = commit_semaphore.clone().acquire_owned().await.map_err(|e| anyhow::anyhow!("Semaphore error: {}", e))?;
                             let err_tx = err_tx.clone();
                             commit_tasks.spawn(async move {
-                                let dispositions = map_responses_to_dispositions(batch_len, responses, &failed);
+                                let dispositions = map_responses_to_dispositions(&message_ids, responses, &failed);
                                 if let Err(e) = commit(dispositions).await {
                                     error!("Commit failed: {}", e);
                                     let _ = err_tx.send(e).await;
@@ -502,7 +503,7 @@ impl Route {
         // --- Ordered Commit Sequencer ---
         // To prevent data loss with cumulative-ack brokers (Kafka/AMQP), commits must happen in order.
         // We assign a sequence number to each batch and use a sequencer task to enforce order.
-        let (seq_tx, sequencer_handle) = spawn_sequencer(self.options.concurrency * 2);
+        let (seq_tx, sequencer_handle) = spawn_sequencer(self.options.commit_concurrency_limit);
 
         // --- Worker Pool ---
         let mut join_set = JoinSet::new();
@@ -516,6 +517,7 @@ impl Route {
                 debug!("Starting worker {}", i);
                 while let Ok((messages, commit)) = work_rx_clone.recv().await {
                     let batch_len = messages.len();
+                    let message_ids: Vec<u128> = messages.iter().map(|m| m.message_id).collect();
                     match publisher.send_batch(messages).await {
                         Ok(SentBatch::Ack) => {
                             let permit = match commit_semaphore.clone().acquire_owned().await {
@@ -570,7 +572,7 @@ impl Route {
                             };
                             let err_tx = err_tx.clone();
                             commit_tasks.spawn(async move {
-                                let dispositions = map_responses_to_dispositions(batch_len, responses, &failed);
+                                let dispositions = map_responses_to_dispositions(&message_ids, responses, &failed);
                                 if let Err(e) = commit(dispositions).await {
                                     error!("Commit failed: {}", e);
                                     let _ = err_tx.send(e).await;
@@ -596,26 +598,30 @@ impl Route {
         }
 
         let mut seq_counter = 0u64;
+        // Holds an error that caused the loop to break, to be returned after graceful shutdown.
+        let mut loop_error: Option<anyhow::Error> = None;
         loop {
             select! {
                 biased; // Prioritize checking for errors
 
                 Ok(err) = err_rx.recv() => {
                     error!("A worker reported a critical error. Shutting down route.");
-                    return Err(err);
+                    loop_error = Some(err);
+                    break;
                 }
 
                 Some(res) = join_set.join_next() => {
                     match res {
                         Ok(_) => {
                             error!("A worker task finished unexpectedly. Shutting down route.");
-                            return Err(anyhow::anyhow!("Worker task finished unexpectedly"));
+                            loop_error = Some(anyhow::anyhow!("Worker task finished unexpectedly"));
                         }
                         Err(e) => {
                             error!("A worker task panicked: {}. Shutting down route.", e);
-                            return Err(e.into());
+                            loop_error = Some(e.into());
                         }
                     }
+                    break;
                 }
 
                 _ = shutdown_rx.recv() => {
@@ -637,11 +643,13 @@ impl Route {
                         }
                         Err(ConsumerError::Connection(e)) => {
                             // Propagate error to trigger reconnect by the outer loop
-                            return Err(e);
+                            loop_error = Some(e);
+                            break;
                         }
                         Err(ConsumerError::Gap { requested, base }) => {
                             // Propagate gap error to trigger reconnect by the outer loop
-                            return Err(ConsumerError::Gap { requested, base }.into());
+                            loop_error = Some(ConsumerError::Gap { requested, base }.into());
+                            break;
                         }
                     };
                     debug!("Received a batch of {} messages concurrently", messages.len());
@@ -660,7 +668,9 @@ impl Route {
         }
 
         // --- Graceful Shutdown ---
-        // Close the work channel. Workers will finish their current message and then exit the loop.
+        // Close the work channel so workers drain their current messages and exit the loop.
+        // This applies on both normal shutdown AND error paths, ensuring in-flight commits
+        // are not aborted mid-sequence.
         drop(work_tx);
         // Wait for all worker tasks to complete.
         while join_set.join_next().await.is_some() {}
@@ -668,6 +678,10 @@ impl Route {
         // Close sequencer
         drop(seq_tx);
         let _ = sequencer_handle.await;
+
+        if let Some(err) = loop_error {
+            return Err(err);
+        }
 
         if let Ok(err) = err_rx.try_recv() {
             return Err(err);
@@ -840,13 +854,14 @@ fn spawn_sequencer(buffer_size: usize) -> (Sender<(u64, SequencerItem)>, JoinHan
                 }
                 _ = timeout_fut => {
                     if let Some(first_seq) = buffer.keys().next() {
-                        warn!("Sequencer timed out waiting for seq {}. Next in buffer is {}. Will reset timer and keep waiting.", next_seq, *first_seq);
+                        // With the Nack-on-failure fix, all sequence slots are always filled before
+                        // a worker exits. A timeout here indicates a bug: a commit was lost without
+                        // being called. The sequencer will keep waiting to avoid skipping messages.
+                        error!("Sequencer timed out waiting for seq {}. Next in buffer is {}. This is a bug - a commit slot was never filled.", next_seq, *first_seq);
                     } else {
                         // This should be unreachable as a timeout can't occur on an empty buffer.
-                        warn!("Sequencer timed out on an empty buffer, which is unexpected.");
+                        error!("Sequencer timed out on an empty buffer, which is unexpected.");
                     }
-                    // Reset the deadline to wait again. This prevents skipping messages that are just slow,
-                    // at the cost of potentially blocking if a message is truly lost.
                     deadline = None;
                 }
             }
@@ -886,43 +901,27 @@ fn wrap_commit(
 }
 
 fn map_responses_to_dispositions(
-    total_count: usize,
+    message_ids: &[u128],
     responses: Option<Vec<crate::CanonicalMessage>>,
     failed: &[(crate::CanonicalMessage, PublisherError)],
 ) -> Vec<MessageDisposition> {
-    if failed.is_empty() {
-        if let Some(resps) = responses {
-            if resps.len() == total_count {
-                return resps.into_iter().map(MessageDisposition::Reply).collect();
-            }
+    let mut dispositions = Vec::with_capacity(message_ids.len());
+    let failed_ids: std::collections::HashSet<u128> =
+        failed.iter().map(|(m, _)| m.message_id).collect();
+    let mut response_iter = responses.unwrap_or_default().into_iter();
+
+    for id in message_ids {
+        if failed_ids.contains(id) {
+            dispositions.push(MessageDisposition::Nack);
         } else {
-            // If there are no failures and no responses, everything is Ack.
-            return vec![MessageDisposition::Ack; total_count];
+            if let Some(resp) = response_iter.next() {
+                dispositions.push(MessageDisposition::Reply(resp));
+            } else {
+                dispositions.push(MessageDisposition::Ack);
+            }
         }
     }
-
-    // If we have failures, we should Nack them.
-    // However, we don't have easy access to the original indices here to map 1:1 perfectly
-    // if we don't assume order.
-    // But `send_batch` usually processes in order.
-    // If `responses` is Some, it contains responses for successful messages in order.
-
-    // Simplified logic assuming order preservation for successful messages:
-    // We construct a vector of dispositions.
-    // Since we can't easily match by ID without iterating everything, and `failed` might be sparse,
-    // we'll use a heuristic:
-    // If we have explicit responses, we use them.
-    // If we have failures, we might not be able to map them back to the exact index in the batch
-    // without O(N^2) or a map, because `failed` is a subset.
-    //
-    // For F10 implementation, we will assume that if *any* message failed in the batch,
-    // and we are in a Partial state, we might want to Nack the ones that failed.
-    // But since we can't easily map back to the index in `received_batch.messages` (which we don't have here in this helper),
-    // and `commit` expects a vector of size `total_count` corresponding to the input batch...
-
-    // Current best effort: Return Ack for everything to avoid hanging, but log that we can't map precisely yet.
-    // In a real implementation of F10, `send_batch` should probably return `Vec<Result<Sent, PublisherError>>` to map 1:1.
-    vec![MessageDisposition::Ack; total_count]
+    dispositions
 }
 
 pub fn get_route(name: &str) -> Option<Route> {
