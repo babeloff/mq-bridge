@@ -818,7 +818,7 @@ impl SledConfig {
 
 // --- File Specific Configuration ---
 
-#[derive(Debug, Clone, Serialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct FileConfig {
     /// Path to the file.
@@ -827,44 +827,10 @@ pub struct FileConfig {
     /// Can be a string or a hex sequence (e.g. "0x00").
     /// Currently only single-byte delimiters are supported.
     pub delimiter: Option<String>,
-    #[serde(default, flatten)]
-    pub mode: FileConsumerMode,
-}
-
-impl<'de> Deserialize<'de> for FileConfig {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        #[derive(Deserialize)]
-        struct FileConfigHelper {
-            path: String,
-            delimiter: Option<String>,
-            #[serde(flatten)]
-            extra: serde_json::Value,
-        }
-
-        let helper = FileConfigHelper::deserialize(deserializer)?;
-        let mut extra = helper.extra;
-
-        if let serde_json::Value::Object(ref mut map) = extra {
-            if !map.contains_key("mode") {
-                map.insert(
-                    "mode".to_string(),
-                    serde_json::Value::String("consume".to_string()),
-                );
-            }
-        }
-
-        let mode: FileConsumerMode =
-            serde_json::from_value(extra).map_err(serde::de::Error::custom)?;
-
-        Ok(FileConfig {
-            path: helper.path,
-            delimiter: helper.delimiter,
-            mode,
-        })
-    }
+    /// The consumption mode. If not specified, defaults to `consume`.
+    /// For publishers, this setting is ignored.
+    #[serde(flatten, default)]
+    pub mode: Option<FileConsumerMode>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -903,14 +869,19 @@ impl FileConfig {
     pub fn new(path: impl Into<String>) -> Self {
         Self {
             path: path.into(),
-            mode: FileConsumerMode::default(),
+            mode: Some(FileConsumerMode::default()),
             delimiter: None,
         }
     }
 
     pub fn with_mode(mut self, mode: FileConsumerMode) -> Self {
-        self.mode = mode;
+        self.mode = Some(mode);
         self
+    }
+
+    /// Returns the effective consumer mode, defaulting to `Consume` if not set.
+    pub fn effective_mode(&self) -> FileConsumerMode {
+        self.mode.clone().unwrap_or_default()
     }
 }
 
@@ -2115,7 +2086,9 @@ group_id: "my_group"
 "#;
         let config: FileConfig = serde_yaml_ng::from_str(yaml).unwrap();
         match config.mode {
-            FileConsumerMode::GroupSubscribe { group_id, .. } => assert_eq!(group_id, "my_group"),
+            Some(FileConsumerMode::GroupSubscribe { group_id, .. }) => {
+                assert_eq!(group_id, "my_group")
+            }
             _ => panic!("Expected GroupSubscribe"),
         }
 
@@ -2125,7 +2098,7 @@ path: "/tmp/test"
 "#;
         let config_queue: FileConfig = serde_yaml_ng::from_str(yaml_queue).unwrap();
         match config_queue.mode {
-            FileConsumerMode::Consume { delete } => assert!(!delete),
+            Some(FileConsumerMode::Consume { delete }) => assert!(!delete),
             _ => panic!("Expected Consume"),
         }
     }

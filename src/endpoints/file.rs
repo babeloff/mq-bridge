@@ -658,16 +658,16 @@ impl FileConsumer {
     pub async fn new(config: &FileConfig) -> anyhow::Result<Self> {
         let delimiter = parse_delimiter(config.delimiter.as_deref())?;
         match &config.mode {
-            FileConsumerMode::Consume { delete: false } => {
+            None | Some(FileConsumerMode::Consume { delete: false }) => {
                 Self::new_tail(&config.path, false, None, delimiter.clone()).await
             }
-            FileConsumerMode::Subscribe { delete: false } => {
+            Some(FileConsumerMode::Subscribe { delete: false }) => {
                 Self::new_tail(&config.path, true, None, delimiter.clone()).await
             }
-            FileConsumerMode::GroupSubscribe {
+            Some(FileConsumerMode::GroupSubscribe {
                 group_id,
                 read_from_tail,
-            } => {
+            }) => {
                 let start_at_end = *read_from_tail;
                 Self::new_tail(
                     &config.path,
@@ -677,7 +677,7 @@ impl FileConsumer {
                 )
                 .await
             }
-            FileConsumerMode::Consume { delete: true } => {
+            Some(FileConsumerMode::Consume { delete: true }) => {
                 let (msg_tx, msg_rx) = async_channel::bounded(100);
                 let file_lock = get_file_lock(&config.path);
                 let lines_in_memory = Arc::new(AtomicUsize::new(0));
@@ -710,7 +710,7 @@ impl FileConsumer {
                     }),
                 })
             }
-            FileConsumerMode::Subscribe { delete: true } => {
+            Some(FileConsumerMode::Subscribe { delete: true }) => {
                 let key = format!("{}|subscribe|delete", config.path);
 
                 let store = if let Some(store) = {
@@ -999,7 +999,7 @@ mod tests {
         // 2. Create a FileSink
         let config = FileConfig {
             path: file_path_str.clone(),
-            mode: FileConsumerMode::Consume { delete: false },
+            mode: None,
             delimiter: None,
         };
         let sink = FilePublisher::new(&config).await.unwrap();
@@ -1050,7 +1050,7 @@ mod tests {
 
         let config = FileConfig {
             path: file_path.to_str().unwrap().to_string(),
-            mode: FileConsumerMode::Consume { delete: false },
+            mode: None,
             delimiter: None,
         };
         let sink_result = FilePublisher::new(&config).await;
@@ -1073,7 +1073,7 @@ mod tests {
 
         let config = FileConfig {
             path: file_path_str,
-            mode: FileConsumerMode::Consume { delete: true },
+            mode: Some(FileConsumerMode::Consume { delete: true }),
             delimiter: None,
         };
         let mut consumer = FileConsumer::new(&config).await.unwrap();
@@ -1134,7 +1134,7 @@ mod tests {
 
         let config = FileConfig {
             path: file_path_str.clone(),
-            mode: FileConsumerMode::Consume { delete: true },
+            mode: Some(FileConsumerMode::Consume { delete: true }),
             delimiter: None,
         };
         let mut consumer = FileConsumer::new(&config).await.unwrap();
@@ -1178,7 +1178,7 @@ mod tests {
 
         let config = FileConfig {
             path: file_path_str.clone(),
-            mode: FileConsumerMode::Consume { delete: false },
+            mode: None,
             delimiter: None,
         };
         let mut consumer = FileConsumer::new(&config).await.unwrap();
@@ -1215,7 +1215,7 @@ mod tests {
 
         let config = FileConfig {
             path: file_path_str.clone(),
-            mode: FileConsumerMode::Subscribe { delete: false },
+            mode: Some(FileConsumerMode::Subscribe { delete: false }),
             delimiter: None,
         };
 
@@ -1257,7 +1257,7 @@ mod tests {
 
         let config = FileConfig {
             path: file_path_str.clone(),
-            mode: FileConsumerMode::Consume { delete: true },
+            mode: Some(FileConsumerMode::Consume { delete: true }),
             delimiter: None,
         };
         let mut consumer = FileConsumer::new(&config).await.unwrap();
@@ -1291,7 +1291,7 @@ mod tests {
 
         let config = FileConfig {
             path: file_path_str.clone(),
-            mode: FileConsumerMode::Subscribe { delete: true },
+            mode: Some(FileConsumerMode::Subscribe { delete: true }),
             delimiter: None,
         };
 
@@ -1339,7 +1339,7 @@ mod tests {
 
         let config = FileConfig {
             path: file_path_str.clone(),
-            mode: FileConsumerMode::Subscribe { delete: false },
+            mode: Some(FileConsumerMode::Subscribe { delete: false }),
             delimiter: None,
         };
 
@@ -1378,7 +1378,7 @@ mod tests {
 
         let input = Endpoint::new(EndpointType::File(FileConfig {
             path: file_path_str.clone(),
-            mode: FileConsumerMode::Consume { delete: true },
+            mode: Some(FileConsumerMode::Consume { delete: true }),
             delimiter: None,
         }));
         let output = Endpoint::new_memory("out_consume_explicit_delete", 10);
@@ -1425,7 +1425,7 @@ mod tests {
 
         let input = Endpoint::new(EndpointType::File(FileConfig {
             path: file_path_str.clone(),
-            mode: FileConsumerMode::Subscribe { delete: true },
+            mode: Some(FileConsumerMode::Subscribe { delete: true }),
             delimiter: None,
         }));
         let output = Endpoint::new_memory("out_subscribe_delete", 10);
@@ -1467,7 +1467,7 @@ mod tests {
 
         let input = Endpoint::new(EndpointType::File(FileConfig {
             path: file_path_str.clone(),
-            mode: FileConsumerMode::Subscribe { delete: false },
+            mode: Some(FileConsumerMode::Subscribe { delete: false }),
             delimiter: None,
         }));
         let output = Endpoint::new_memory("out_subscribe_no_delete", 10);
@@ -1508,7 +1508,7 @@ mod tests {
 
         let input = Endpoint::new(EndpointType::File(FileConfig {
             path: file_path_str.clone(),
-            mode: FileConsumerMode::Consume { delete: true },
+            mode: Some(FileConsumerMode::Consume { delete: true }),
             delimiter: None,
         }));
         let output = Endpoint::new_memory("out_consume_all", 100);
@@ -1554,10 +1554,10 @@ mod tests {
 
         let config = FileConfig {
             path: file_path_str.clone(),
-            mode: FileConsumerMode::GroupSubscribe {
+            mode: Some(FileConsumerMode::GroupSubscribe {
                 group_id: "my_group".to_string(),
                 read_from_tail: false,
-            },
+            }),
             delimiter: None,
         };
 
@@ -1607,10 +1607,10 @@ mod tests {
 
         let config = FileConfig {
             path: file_path_str.clone(),
-            mode: FileConsumerMode::GroupSubscribe {
+            mode: Some(FileConsumerMode::GroupSubscribe {
                 group_id: "my_group_start".to_string(),
                 read_from_tail: false,
-            },
+            }),
             delimiter: None,
         };
 
@@ -1643,7 +1643,7 @@ mod tests {
 
         let config = FileConfig {
             path: file_path_str.clone(),
-            mode: FileConsumerMode::Subscribe { delete: false },
+            mode: Some(FileConsumerMode::Subscribe { delete: false }),
             delimiter: None,
         };
 
@@ -1656,7 +1656,7 @@ mod tests {
         let publish_handle = tokio::spawn(async move {
             let pub_config = FileConfig {
                 path: publisher_path,
-                mode: FileConsumerMode::Subscribe { delete: false },
+                mode: Some(FileConsumerMode::Subscribe { delete: false }),
                 delimiter: None,
             };
             let publisher = FilePublisher::new(&pub_config).await.unwrap();
@@ -1749,7 +1749,7 @@ mod tests {
 
         let config = FileConfig {
             path: file_path_str.clone(),
-            mode: FileConsumerMode::Subscribe { delete: false },
+            mode: Some(FileConsumerMode::Subscribe { delete: false }),
             delimiter: None,
         };
 
@@ -1800,7 +1800,7 @@ mod tests {
         let config = FileConfig {
             path: file_path_str.clone(),
             delimiter: Some("|".to_string()),
-            mode: FileConsumerMode::Consume { delete: false },
+            mode: Some(FileConsumerMode::Consume { delete: false }),
         };
 
         let publisher = FilePublisher::new(&config).await.unwrap();
@@ -1833,7 +1833,7 @@ mod tests {
         let config = FileConfig {
             path: file_path_str.clone(),
             delimiter: Some("</message>".to_string()),
-            mode: FileConsumerMode::Consume { delete: false },
+            mode: Some(FileConsumerMode::Consume { delete: false }),
         };
 
         let publisher = FilePublisher::new(&config).await.unwrap();
