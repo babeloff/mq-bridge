@@ -818,7 +818,7 @@ impl SledConfig {
 
 // --- File Specific Configuration ---
 
-#[derive(Debug, Clone, Serialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct FileConfig {
     /// Path to the file.
@@ -827,44 +827,10 @@ pub struct FileConfig {
     /// Can be a string or a hex sequence (e.g. "0x00").
     /// Currently only single-byte delimiters are supported.
     pub delimiter: Option<String>,
-    #[serde(default, flatten)]
-    pub mode: FileConsumerMode,
-}
-
-impl<'de> Deserialize<'de> for FileConfig {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        #[derive(Deserialize)]
-        struct FileConfigHelper {
-            path: String,
-            delimiter: Option<String>,
-            #[serde(flatten)]
-            extra: serde_json::Value,
-        }
-
-        let helper = FileConfigHelper::deserialize(deserializer)?;
-        let mut extra = helper.extra;
-
-        if let serde_json::Value::Object(ref mut map) = extra {
-            if !map.contains_key("mode") {
-                map.insert(
-                    "mode".to_string(),
-                    serde_json::Value::String("consume".to_string()),
-                );
-            }
-        }
-
-        let mode: FileConsumerMode =
-            serde_json::from_value(extra).map_err(serde::de::Error::custom)?;
-
-        Ok(FileConfig {
-            path: helper.path,
-            delimiter: helper.delimiter,
-            mode,
-        })
-    }
+    /// The consumption mode. If not specified, defaults to `consume`.
+    /// For publishers, this setting is ignored.
+    #[serde(flatten, default)]
+    pub mode: Option<FileConsumerMode>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -903,14 +869,19 @@ impl FileConfig {
     pub fn new(path: impl Into<String>) -> Self {
         Self {
             path: path.into(),
-            mode: FileConsumerMode::default(),
+            mode: Some(FileConsumerMode::default()),
             delimiter: None,
         }
     }
 
     pub fn with_mode(mut self, mode: FileConsumerMode) -> Self {
-        self.mode = mode;
+        self.mode = Some(mode);
         self
+    }
+
+    /// Returns the effective consumer mode, defaulting to `Consume` if not set.
+    pub fn effective_mode(&self) -> FileConsumerMode {
+        self.mode.clone().unwrap_or_default()
     }
 }
 
@@ -1399,11 +1370,41 @@ pub struct HttpConfig {
     #[serde(default)]
     pub compression_threshold_bytes: Option<usize>,
     /// HTTP Basic Authentication credentials (username, password). For consumers: validates incoming requests. For publishers: adds Authorization header.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_basic_auth")]
     pub basic_auth: Option<(String, String)>,
     /// Custom headers as key-value pairs (e.g., {"X-API-Key": "token123"}). Added to outgoing HTTP headers for both consumers and publishers.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub custom_headers: HashMap<String, String>,
+}
+
+fn deserialize_basic_auth<'de, D>(deserializer: D) -> Result<Option<(String, String)>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let val = serde_json::Value::deserialize(deserializer)?;
+    match val {
+        serde_json::Value::Null => Ok(None),
+        serde_json::Value::Array(arr) => {
+            if arr.len() != 2 {
+                return Err(serde::de::Error::custom("basic_auth must have 2 elements"));
+            }
+            let u = arr[0]
+                .as_str()
+                .ok_or_else(|| serde::de::Error::custom("basic_auth[0] must be string"))?
+                .to_string();
+            let p = arr[1]
+                .as_str()
+                .ok_or_else(|| serde::de::Error::custom("basic_auth[1] must be string"))?
+                .to_string();
+            Ok(Some((u, p)))
+        }
+        serde_json::Value::Object(map) => {
+            let u = map.get("0").and_then(|v| v.as_str()).ok_or_else(|| serde::de::Error::custom("basic_auth map missing '0'"))?.to_string();
+            let p = map.get("1").and_then(|v| v.as_str()).ok_or_else(|| serde::de::Error::custom("basic_auth map missing '1'"))?.to_string();
+            Ok(Some((u, p)))
+        }
+        _ => Err(serde::de::Error::custom("invalid type for basic_auth")),
+    }
 }
 
 impl HttpConfig {
@@ -2115,7 +2116,9 @@ group_id: "my_group"
 "#;
         let config: FileConfig = serde_yaml_ng::from_str(yaml).unwrap();
         match config.mode {
-            FileConsumerMode::GroupSubscribe { group_id, .. } => assert_eq!(group_id, "my_group"),
+            Some(FileConsumerMode::GroupSubscribe { group_id, .. }) => {
+                assert_eq!(group_id, "my_group")
+            }
             _ => panic!("Expected GroupSubscribe"),
         }
 
@@ -2125,7 +2128,7 @@ path: "/tmp/test"
 "#;
         let config_queue: FileConfig = serde_yaml_ng::from_str(yaml_queue).unwrap();
         match config_queue.mode {
-            FileConsumerMode::Consume { delete } => assert!(!delete),
+            Some(FileConsumerMode::Consume { delete }) => assert!(!delete),
             _ => panic!("Expected Consume"),
         }
     }

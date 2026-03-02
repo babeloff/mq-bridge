@@ -161,7 +161,7 @@
       "additionalProperties": false
     },
     "DeadLetterQueueMiddleware": {
-      "description": "Dead-Letter Queue (DLQ) middleware configuration. It is recommended that the\nendpoint is also using a retry to avoid message loss",
+      "description": "Dead-Letter Queue (DLQ) middleware configuration.\n\nRoutes failed messages to a designated endpoint for later analysis and recovery.\nIt is recommended to pair this with the Retry middleware to avoid message loss.\n\nFailed messages are sent to the configured endpoint when they are exhausted after retry attempts.",
       "type": "object",
       "properties": {
         "endpoint": {
@@ -175,7 +175,7 @@
       ]
     },
     "DeduplicationMiddleware": {
-      "description": "Deduplication middleware configuration.",
+      "description": "Deduplication middleware configuration.\n\nPrevents duplicate messages from being processed using a Sled-backed database.\nMessages are identified by their deduplication key and removed after the TTL expires.",
       "type": "object",
       "properties": {
         "sled_path": {
@@ -196,6 +196,7 @@
       ]
     },
     "DelayMiddleware": {
+      "description": "Delay middleware configuration.\n\nIntroduces a fixed delay before processing each message.\nUseful for rate limiting, testing, or allowing time for dependent systems to become ready.",
       "type": "object",
       "properties": {
         "delay_ms": {
@@ -277,6 +278,17 @@
           },
           "required": [
             "static"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "ref": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "ref"
           ]
         },
         {
@@ -463,69 +475,81 @@
     "FileConfig": {
       "type": "object",
       "properties": {
+        "delimiter": {
+          "description": "Optional delimiter for messages. Defaults to newline (\"\\n\").\nCan be a string or a hex sequence (e.g. \"0x00\").\nCurrently only single-byte delimiters are supported.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "path": {
           "description": "Path to the file.",
           "type": "string"
         }
       },
-      "oneOf": [
+      "anyOf": [
         {
-          "description": "**Queue Mode**: Reads from the beginning of the file.",
-          "type": "object",
-          "properties": {
-            "delete": {
-              "type": "boolean",
-              "default": false
+          "oneOf": [
+            {
+              "description": "**Queue Mode**: Reads from the beginning of the file.",
+              "type": "object",
+              "properties": {
+                "delete": {
+                  "type": "boolean",
+                  "default": false
+                },
+                "mode": {
+                  "type": "string",
+                  "const": "consume"
+                }
+              },
+              "required": [
+                "mode"
+              ]
             },
-            "mode": {
-              "type": "string",
-              "const": "consume"
+            {
+              "description": "**Broadcast Mode**: Tails the file (starts at the end).",
+              "type": "object",
+              "properties": {
+                "delete": {
+                  "type": "boolean",
+                  "default": false
+                },
+                "mode": {
+                  "type": "string",
+                  "const": "subscribe"
+                }
+              },
+              "required": [
+                "mode"
+              ]
+            },
+            {
+              "description": "**Persistent Mode**: Reads the file with offset tracking.",
+              "type": "object",
+              "properties": {
+                "group_id": {
+                  "description": "The consumer group ID that is used for offset tracking. Should be unique.",
+                  "type": "string"
+                },
+                "mode": {
+                  "type": "string",
+                  "const": "group_subscribe"
+                },
+                "read_from_tail": {
+                  "description": "If true, starts reading from the end of the file if no offset is stored.\nIf false, starts reading from the beginning.",
+                  "type": "boolean",
+                  "default": false
+                }
+              },
+              "required": [
+                "mode",
+                "group_id"
+              ]
             }
-          },
-          "required": [
-            "mode"
           ]
         },
-        {
-          "description": "**Broadcast Mode**: Tails the file (starts at the end).",
-          "type": "object",
-          "properties": {
-            "delete": {
-              "type": "boolean",
-              "default": false
-            },
-            "mode": {
-              "type": "string",
-              "const": "subscribe"
-            }
-          },
-          "required": [
-            "mode"
-          ]
-        },
-        {
-          "description": "**Persistent Mode**: Reads the file with offset tracking.",
-          "type": "object",
-          "properties": {
-            "group_id": {
-              "description": "The consumer group ID that is used for offset tracking. Should be unique.",
-              "type": "string"
-            },
-            "mode": {
-              "type": "string",
-              "const": "group_subscribe"
-            },
-            "read_from_tail": {
-              "description": "If true, starts reading from the end of the file if no offset is stored.\nIf false, starts reading from the beginning.",
-              "type": "boolean",
-              "default": false
-            }
-          },
-          "required": [
-            "mode",
-            "group_id"
-          ]
-        }
+        {}
       ],
       "required": [
         "path"
@@ -576,6 +600,54 @@
       "description": "General HTTP connection configuration.",
       "type": "object",
       "properties": {
+        "basic_auth": {
+          "description": "HTTP Basic Authentication credentials (username, password). For consumers: validates incoming requests. For publishers: adds Authorization header.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "maxItems": 2,
+          "minItems": 2,
+          "prefixItems": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "string"
+            }
+          ]
+        },
+        "batch_concurrency": {
+          "description": "(Publisher only) The number of concurrent HTTP requests to send in a batch. Defaults to 20.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0
+        },
+        "compression_enabled": {
+          "description": "Enable gzip compression for request/response bodies exceeding the threshold. Defaults to false.",
+          "type": "boolean",
+          "default": false
+        },
+        "compression_threshold_bytes": {
+          "description": "Minimum message size in bytes to compress. Messages smaller than this are sent uncompressed. Defaults to 1024 bytes.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "default": null,
+          "minimum": 0
+        },
+        "custom_headers": {
+          "description": "Custom headers as key-value pairs (e.g., {\"X-API-Key\": \"token123\"}). Added to outgoing HTTP headers for both consumers and publishers.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
         "fire_and_forget": {
           "description": "(Consumer only) If true, respond immediately with 202 Accepted without waiting for downstream processing. Defaults to false.",
           "type": "boolean",
@@ -597,8 +669,26 @@
             "null"
           ]
         },
+        "pool_idle_timeout_ms": {
+          "description": "(Publisher only) Timeout for idle connections in the connection pool in milliseconds. Defaults to 90000ms.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
         "request_timeout_ms": {
-          "description": "(Consumer only) Timeout for request-reply operations in milliseconds. Defaults to 30000ms.",
+          "description": "Timeout for HTTP requests in milliseconds. For consumers, it's the request-reply timeout. For publishers, it's the timeout for each individual request. Defaults to 30000ms.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "tcp_keepalive_ms": {
+          "description": "(Publisher only) TCP keepalive timeout for the underlying connection pool in milliseconds. Defaults to 60000ms.",
           "type": [
             "integer",
             "null"
@@ -879,7 +969,7 @@
       ]
     },
     "MetricsMiddleware": {
-      "description": "Metrics middleware configuration. It's currently a struct without fields\nbut can be extended later. Its presence in the config enables the middleware.",
+      "description": "Metrics middleware configuration.\n\nEnables collection and reporting of message processing metrics such as throughput,\nlatency, and error rates. The presence of this middleware in the configuration\nenables metrics collection for the endpoint.\n\nMetrics are typically exported via Prometheus or similar monitoring systems.",
       "type": "object",
       "additionalProperties": false
     },
@@ -1113,6 +1203,7 @@
       ]
     },
     "MongoDbFormat": {
+      "description": "MongoDB message storage format.\n\nDetermines how messages are stored and retrieved from MongoDB collections.",
       "type": "string",
       "enum": [
         "normal",
@@ -1237,6 +1328,7 @@
       ]
     },
     "MqttProtocol": {
+      "description": "MQTT protocol version.\n\nSpecifies which version of the MQTT protocol to use for connections.",
       "type": "string",
       "enum": [
         "v5",
@@ -1359,6 +1451,7 @@
       ]
     },
     "RandomPanicMiddleware": {
+      "description": "Random Panic middleware configuration.\n\nSimulates random failures for chaos testing and resilience validation.\nCauses the middleware to panic with the specified probability, useful for testing\nerror handling and recovery mechanisms.",
       "type": "object",
       "properties": {
         "probability": {
@@ -1377,6 +1470,7 @@
       "additionalProperties": false
     },
     "RetryMiddleware": {
+      "description": "Retry middleware configuration.\n\nImplements exponential backoff retry logic for failed message processing.\nFailed messages are automatically retried with increasing delays between attempts.",
       "type": "object",
       "properties": {
         "initial_interval_ms": {
@@ -1516,7 +1610,7 @@
       ]
     },
     "TlsConfig": {
-      "description": "TLS configuration for secure connections.",
+      "description": "TLS configuration for secure connections.\n\nConfigures Transport Layer Security (TLS/SSL) for encrypted communication.\nSupports both client certificate (mutual TLS) and server certificate validation.\n\n# Examples\n\n```\nuse mq_bridge::models::TlsConfig;\n\nlet tls = TlsConfig {\n    required: true,\n    ca_file: Some(\"/path/to/ca.pem\".to_string()),\n    cert_file: Some(\"/path/to/cert.pem\".to_string()),\n    key_file: Some(\"/path/to/key.pem\".to_string()),\n    ..Default::default()\n};\n```",
       "type": "object",
       "properties": {
         "accept_invalid_certs": {
@@ -1561,6 +1655,7 @@
       "additionalProperties": false
     },
     "WeakJoinMiddleware": {
+      "description": "Weak Join middleware configuration.\n\nGroups and correlates messages based on a metadata key, waiting for a specified number\nof messages within a timeout window before processing them as a batch.\nMessages that exceed the timeout are processed individually.",
       "type": "object",
       "properties": {
         "expected_count": {
@@ -1635,6 +1730,7 @@
       ]
     },
     "ZeroMqSocketType": {
+      "description": "ZeroMQ socket type.\n\nDefines the messaging pattern for ZeroMQ connections.\nDifferent patterns support different communication paradigms (request-reply, publish-subscribe, etc.).",
       "type": "string",
       "enum": [
         "push",
