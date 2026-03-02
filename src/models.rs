@@ -1370,7 +1370,11 @@ pub struct HttpConfig {
     #[serde(default)]
     pub compression_threshold_bytes: Option<usize>,
     /// HTTP Basic Authentication credentials (username, password). For consumers: validates incoming requests. For publishers: adds Authorization header.
-    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_basic_auth")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_basic_auth"
+    )]
     pub basic_auth: Option<(String, String)>,
     /// Custom headers as key-value pairs (e.g., {"X-API-Key": "token123"}). Added to outgoing HTTP headers for both consumers and publishers.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
@@ -1399,8 +1403,16 @@ where
             Ok(Some((u, p)))
         }
         serde_json::Value::Object(map) => {
-            let u = map.get("0").and_then(|v| v.as_str()).ok_or_else(|| serde::de::Error::custom("basic_auth map missing '0'"))?.to_string();
-            let p = map.get("1").and_then(|v| v.as_str()).ok_or_else(|| serde::de::Error::custom("basic_auth map missing '1'"))?.to_string();
+            let u = map
+                .get("0")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| serde::de::Error::custom("basic_auth map missing '0'"))?
+                .to_string();
+            let p = map
+                .get("1")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| serde::de::Error::custom("basic_auth map missing '1'"))?
+                .to_string();
             Ok(Some((u, p)))
         }
         _ => Err(serde::de::Error::custom("invalid type for basic_auth")),
