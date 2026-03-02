@@ -1370,11 +1370,41 @@ pub struct HttpConfig {
     #[serde(default)]
     pub compression_threshold_bytes: Option<usize>,
     /// HTTP Basic Authentication credentials (username, password). For consumers: validates incoming requests. For publishers: adds Authorization header.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_basic_auth")]
     pub basic_auth: Option<(String, String)>,
     /// Custom headers as key-value pairs (e.g., {"X-API-Key": "token123"}). Added to outgoing HTTP headers for both consumers and publishers.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub custom_headers: HashMap<String, String>,
+}
+
+fn deserialize_basic_auth<'de, D>(deserializer: D) -> Result<Option<(String, String)>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let val = serde_json::Value::deserialize(deserializer)?;
+    match val {
+        serde_json::Value::Null => Ok(None),
+        serde_json::Value::Array(arr) => {
+            if arr.len() != 2 {
+                return Err(serde::de::Error::custom("basic_auth must have 2 elements"));
+            }
+            let u = arr[0]
+                .as_str()
+                .ok_or_else(|| serde::de::Error::custom("basic_auth[0] must be string"))?
+                .to_string();
+            let p = arr[1]
+                .as_str()
+                .ok_or_else(|| serde::de::Error::custom("basic_auth[1] must be string"))?
+                .to_string();
+            Ok(Some((u, p)))
+        }
+        serde_json::Value::Object(map) => {
+            let u = map.get("0").and_then(|v| v.as_str()).ok_or_else(|| serde::de::Error::custom("basic_auth map missing '0'"))?.to_string();
+            let p = map.get("1").and_then(|v| v.as_str()).ok_or_else(|| serde::de::Error::custom("basic_auth map missing '1'"))?.to_string();
+            Ok(Some((u, p)))
+        }
+        _ => Err(serde::de::Error::custom("invalid type for basic_auth")),
+    }
 }
 
 impl HttpConfig {
