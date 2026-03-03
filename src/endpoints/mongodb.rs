@@ -49,6 +49,7 @@ impl TryFrom<MongoMessageRaw> for CanonicalMessage {
 
         let payload = match raw.payload {
             Bson::Binary(bin) => bin.bytes.into(),
+            Bson::String(s) => s.into_bytes().into(),
             Bson::Document(doc) => {
                 let json = serde_json::to_vec(&doc)?;
                 json.into()
@@ -109,6 +110,16 @@ fn message_to_document(
                     bytes: message.payload.to_vec(),
                 })
             }
+        } else {
+            Bson::Binary(mongodb::bson::Binary {
+                subtype: mongodb::bson::spec::BinarySubtype::Generic,
+                bytes: message.payload.to_vec(),
+            })
+        }
+    } else if matches!(format, MongoDbFormat::Text) {
+        if let Ok(text) = std::str::from_utf8(&message.payload) {
+            metadata.insert("type".to_string(), "text".to_string());
+            Bson::String(text.to_string())
         } else {
             Bson::Binary(mongodb::bson::Binary {
                 subtype: mongodb::bson::spec::BinarySubtype::Generic,

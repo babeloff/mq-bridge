@@ -4,7 +4,7 @@
 //  git clone https://github.com/marcomq/mq-bridge
 use crate::canonical_message::tracing_support::LazyMessageIds;
 use crate::event_store::{EventStore, EventStoreConsumer, RetentionPolicy};
-use crate::models::{FileConfig, FileConsumerMode};
+use crate::models::{FileConfig, FileConsumerMode, FileFormat};
 use crate::traits::{
     ConsumerError, MessageConsumer, MessagePublisher, PublisherError, ReceivedBatch, SentBatch,
 };
@@ -22,7 +22,7 @@ use tokio::fs::{self, File, OpenOptions};
 use tokio::io::{self, AsyncBufReadExt, AsyncSeekExt, BufReader};
 use tokio::io::{AsyncWriteExt, BufWriter};
 use tokio::sync::Mutex;
-use tracing::{info, instrument, trace};
+use tracing::{info, instrument, trace, warn};
 
 /// A sink that writes messages to a file, one per line.
 static FILE_LOCKS: Lazy<StdMutex<HashMap<String, Arc<Mutex<()>>>>> =
@@ -90,6 +90,7 @@ pub struct FilePublisher {
     path: String,
     file_lock: Arc<Mutex<()>>,
     delimiter: Vec<u8>,
+    format: FileFormat,
 }
 
 impl FilePublisher {
@@ -111,12 +112,14 @@ impl FilePublisher {
 
         let file_lock = get_file_lock(path_str);
         let delimiter = parse_delimiter(config.delimiter.as_deref())?;
+        let format = config.format.clone();
 
-        info!(path = %path_str, "File sink opened for appending");
+        info!(path = %path_str, format = ?format, "File sink opened for appending");
         Ok(Self {
             path: path_str.to_string(),
             file_lock,
             delimiter,
+            format,
         })
     }
 }
@@ -151,24 +154,67 @@ impl MessagePublisher for FilePublisher {
 
         // Iterate over messages, consuming them
         for msg in messages {
-            let serialized_msg = if msg
-                .metadata
-                .get("mq_bridge.original_format")
-                .map(|s| s.as_str())
-                == Some("raw")
-            {
-                msg.payload.to_vec()
-            } else {
-                match serde_json::to_vec(&msg) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        tracing::error!("Failed to serialize message for file sink: {}", e);
-                        failed_messages
-                            .push((msg, PublisherError::NonRetryable(anyhow::anyhow!(e))));
-                        continue;
+            let serialized_msg = match self.format {
+                FileFormat::Raw => Ok(msg.payload.to_vec()),
+                FileFormat::Normal => {
+                    if msg
+                        .metadata
+                        .get("mq_bridge.original_format")
+                        .map(|s| s.as_str())
+                        == Some("raw")
+                    {
+                        // If the message was originally raw, pass its payload through directly
+                        // to support raw file-to-file copies without re-wrapping.
+                        Ok(msg.payload.to_vec())
+                    } else {
+                        serde_json::to_vec(&msg)
+                    }
+                }
+                FileFormat::Json => {
+                    if let Ok(json_val) = serde_json::from_slice::<serde_json::Value>(&msg.payload)
+                    {
+                        #[derive(serde::Serialize)]
+                        struct JsonWrapper<'a> {
+                            message_id: u128,
+                            payload: serde_json::Value,
+                            metadata: &'a HashMap<String, String>,
+                        }
+                        serde_json::to_vec(&JsonWrapper {
+                            message_id: msg.message_id,
+                            payload: json_val,
+                            metadata: &msg.metadata,
+                        })
+                    } else {
+                        serde_json::to_vec(&msg)
+                    }
+                }
+                FileFormat::Text => {
+                    if let Ok(text) = std::str::from_utf8(&msg.payload) {
+                        #[derive(serde::Serialize)]
+                        struct TextWrapper<'a> {
+                            message_id: u128,
+                            payload: &'a str,
+                            metadata: &'a HashMap<String, String>,
+                        }
+                        serde_json::to_vec(&TextWrapper {
+                            message_id: msg.message_id,
+                            payload: text,
+                            metadata: &msg.metadata,
+                        })
+                    } else {
+                        serde_json::to_vec(&msg)
                     }
                 }
             };
+            let serialized_msg = match serialized_msg {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::error!("Failed to serialize message for file sink: {}", e);
+                    failed_messages.push((msg, PublisherError::NonRetryable(anyhow::anyhow!(e))));
+                    continue;
+                }
+            };
+
             if let Err(e) = writer.write_all(&serialized_msg).await {
                 tracing::error!("Failed to write message to file: {}", e);
                 failed_messages.push((msg, PublisherError::NonRetryable(anyhow::anyhow!(e))));
@@ -214,12 +260,11 @@ struct FileFeedState {
 async fn create_file_event_store(
     path: &str,
     delimiter: Vec<u8>,
+    format: FileFormat,
 ) -> anyhow::Result<Arc<EventStore>> {
     let path = path.to_string();
     // Shared state to coordinate the reader and the drop (delete) logic.
-    let feed_state = Arc::new(tokio::sync::Mutex::new(FileFeedState {
-        lines_in_memory: 0,
-    }));
+    let feed_state = Arc::new(Mutex::new(FileFeedState { lines_in_memory: 0 }));
 
     // Lock to serialize file modification operations
     let file_op_lock = get_file_lock(&path);
@@ -273,6 +318,7 @@ async fn create_file_event_store(
     let path_clone = path.clone();
     let feed_state_clone = feed_state.clone();
     let file_op_lock_clone = file_op_lock.clone();
+    let format_clone = format;
 
     tokio::spawn(async move {
         let mut current_sleep = std::time::Duration::from_millis(1);
@@ -350,7 +396,7 @@ async fn create_file_event_store(
                         {
                             buffer.pop();
                         }
-                        let msg = parse_message(&buffer);
+                        let msg = parse_message(&buffer, &format_clone);
                         batch.push(msg);
                         lines_read += 1;
 
@@ -462,6 +508,7 @@ fn run_file_tail_task_sync(
     initial_offset: u64,
     group_id: Option<String>,
     delimiter: Vec<u8>,
+    format: FileFormat,
 ) {
     let mut last_position: u64 = initial_offset;
     let mut reader: Option<std::io::BufReader<std::fs::File>> = None;
@@ -517,7 +564,7 @@ fn run_file_tail_task_sync(
                         if delimiter.len() == 1 && delimiter[0] == b'\n' && buf.ends_with(b"\r") {
                             buf.pop();
                         }
-                        let mut msg = parse_message(&buf);
+                        let mut msg = parse_message(&buf, &format);
                         if group_id.is_some() {
                             msg.metadata
                                 .insert("file_offset".to_string(), last_position.to_string());
@@ -567,6 +614,7 @@ fn run_file_queue_task(
     file_lock: Arc<Mutex<()>>,
     runtime_handle: tokio::runtime::Handle,
     delimiter: Vec<u8>,
+    format: FileFormat,
 ) {
     let mut current_sleep = std::time::Duration::from_millis(1);
     const MAX_SLEEP: std::time::Duration = std::time::Duration::from_millis(100);
@@ -621,7 +669,7 @@ fn run_file_queue_task(
                             {
                                 buf.pop();
                             }
-                            batch.push(parse_message(&buf));
+                            batch.push(parse_message(&buf, &format));
                             lines_read += 1;
                         }
                         Err(_) => break,
@@ -657,12 +705,13 @@ pub struct FileConsumer {
 impl FileConsumer {
     pub async fn new(config: &FileConfig) -> anyhow::Result<Self> {
         let delimiter = parse_delimiter(config.delimiter.as_deref())?;
+        let format = config.format.clone();
         match &config.mode {
             None | Some(FileConsumerMode::Consume { delete: false }) => {
-                Self::new_tail(&config.path, false, None, delimiter.clone()).await
+                Self::new_tail(&config.path, false, None, delimiter.clone(), format).await
             }
             Some(FileConsumerMode::Subscribe { delete: false }) => {
-                Self::new_tail(&config.path, true, None, delimiter.clone()).await
+                Self::new_tail(&config.path, true, None, delimiter.clone(), format).await
             }
             Some(FileConsumerMode::GroupSubscribe {
                 group_id,
@@ -674,6 +723,7 @@ impl FileConsumer {
                     start_at_end,
                     Some(group_id.clone()),
                     delimiter.clone(),
+                    format,
                 )
                 .await
             }
@@ -687,6 +737,7 @@ impl FileConsumer {
                 let path_clone = config.path.clone();
 
                 let delimiter_clone = delimiter.clone();
+                let format_clone = format.clone();
                 std::thread::spawn(move || {
                     run_file_queue_task(
                         path_clone,
@@ -695,6 +746,7 @@ impl FileConsumer {
                         lock_clone,
                         runtime,
                         delimiter_clone,
+                        format_clone,
                     );
                 });
 
@@ -720,7 +772,8 @@ impl FileConsumer {
                 } {
                     store
                 } else {
-                    let created = create_file_event_store(&config.path, delimiter.clone()).await?;
+                    let created =
+                        create_file_event_store(&config.path, delimiter.clone(), format).await?;
                     let mut stores = FILE_EVENT_STORES.lock().await;
                     let store = stores
                         .get(&key)
@@ -747,6 +800,7 @@ impl FileConsumer {
         start_at_end: bool,
         group_id: Option<String>,
         delimiter: Vec<u8>,
+        format: FileFormat,
     ) -> anyhow::Result<Self> {
         let (msg_tx, msg_rx) = async_channel::bounded(100);
         let mut initial_offset = 0;
@@ -779,8 +833,16 @@ impl FileConsumer {
         }
 
         let path_clone = path.to_string();
+        let format_clone = format;
         std::thread::spawn(move || {
-            run_file_tail_task_sync(path_clone, msg_tx, initial_offset, group_id, delimiter);
+            run_file_tail_task_sync(
+                path_clone,
+                msg_tx,
+                initial_offset,
+                group_id,
+                delimiter,
+                format_clone,
+            );
         });
 
         info!(path = %path, mode = "tail (no-delete, optimized)", "File consumer connected");
@@ -965,14 +1027,53 @@ impl MessageConsumer for FileConsumer {
     }
 }
 
-fn parse_message(buffer: &[u8]) -> CanonicalMessage {
-    match serde_json::from_slice::<CanonicalMessage>(buffer) {
-        Ok(msg) => msg,
-        Err(_) => {
+fn parse_message(buffer: &[u8], format: &FileFormat) -> CanonicalMessage {
+    match format {
+        FileFormat::Raw => {
             let mut msg = CanonicalMessage::new(buffer.to_vec(), None);
             msg.metadata
                 .insert("mq_bridge.original_format".to_string(), "raw".to_string());
             msg
+        }
+        FileFormat::Normal | FileFormat::Json | FileFormat::Text => {
+            #[derive(serde::Deserialize)]
+            struct AnyPayloadMessage {
+                message_id: u128,
+                payload: serde_json::Value,
+                #[serde(default)]
+                metadata: HashMap<String, String>,
+            }
+
+            match serde_json::from_slice::<AnyPayloadMessage>(buffer) {
+                Ok(wrapper) => {
+                    let payload_bytes = match wrapper.payload {
+                        serde_json::Value::String(s) => s.into_bytes(),
+                        serde_json::Value::Array(arr) => {
+                            if let Ok(bytes) = serde_json::from_value::<Vec<u8>>(
+                                serde_json::Value::Array(arr.clone()),
+                            ) {
+                                bytes
+                            } else {
+                                serde_json::to_vec(&serde_json::Value::Array(arr))
+                                    .unwrap_or_default()
+                            }
+                        }
+                        other => serde_json::to_vec(&other).unwrap_or_default(),
+                    };
+                    CanonicalMessage {
+                        message_id: wrapper.message_id,
+                        payload: payload_bytes.into(),
+                        metadata: wrapper.metadata,
+                    }
+                }
+                Err(e) => {
+                    warn!(error = %e, content = %String::from_utf8_lossy(buffer), "Failed to parse file line as JSON, treating as raw.");
+                    let mut msg = CanonicalMessage::new(buffer.to_vec(), None);
+                    msg.metadata
+                        .insert("mq_bridge.original_format".to_string(), "raw".to_string());
+                    msg
+                }
+            }
         }
     }
 }
@@ -980,7 +1081,7 @@ fn parse_message(buffer: &[u8]) -> CanonicalMessage {
 #[cfg(test)]
 mod tests {
     use crate::endpoints::file::{FileConsumer, FilePublisher};
-    use crate::models::{FileConfig, FileConsumerMode};
+    use crate::models::{FileConfig, FileConsumerMode, FileFormat};
     use crate::msg;
     use crate::traits::MessageConsumer;
     use crate::traits::MessagePublisher;
@@ -999,8 +1100,7 @@ mod tests {
         // 2. Create a FileSink
         let config = FileConfig {
             path: file_path_str.clone(),
-            mode: None,
-            delimiter: None,
+            ..Default::default()
         };
         let sink = FilePublisher::new(&config).await.unwrap();
 
@@ -1050,8 +1150,7 @@ mod tests {
 
         let config = FileConfig {
             path: file_path.to_str().unwrap().to_string(),
-            mode: None,
-            delimiter: None,
+            ..Default::default()
         };
         let sink_result = FilePublisher::new(&config).await;
 
@@ -1074,7 +1173,7 @@ mod tests {
         let config = FileConfig {
             path: file_path_str,
             mode: Some(FileConsumerMode::Consume { delete: true }),
-            delimiter: None,
+            ..Default::default()
         };
         let mut consumer = FileConsumer::new(&config).await.unwrap();
 
@@ -1135,7 +1234,7 @@ mod tests {
         let config = FileConfig {
             path: file_path_str.clone(),
             mode: Some(FileConsumerMode::Consume { delete: true }),
-            delimiter: None,
+            ..Default::default()
         };
         let mut consumer = FileConsumer::new(&config).await.unwrap();
 
@@ -1178,8 +1277,7 @@ mod tests {
 
         let config = FileConfig {
             path: file_path_str.clone(),
-            mode: None,
-            delimiter: None,
+            ..Default::default()
         };
         let mut consumer = FileConsumer::new(&config).await.unwrap();
 
@@ -1216,7 +1314,7 @@ mod tests {
         let config = FileConfig {
             path: file_path_str.clone(),
             mode: Some(FileConsumerMode::Subscribe { delete: false }),
-            delimiter: None,
+            ..Default::default()
         };
 
         let mut consumer = FileConsumer::new(&config).await.unwrap();
@@ -1258,7 +1356,7 @@ mod tests {
         let config = FileConfig {
             path: file_path_str.clone(),
             mode: Some(FileConsumerMode::Consume { delete: true }),
-            delimiter: None,
+            ..Default::default()
         };
         let mut consumer = FileConsumer::new(&config).await.unwrap();
 
@@ -1292,7 +1390,7 @@ mod tests {
         let config = FileConfig {
             path: file_path_str.clone(),
             mode: Some(FileConsumerMode::Subscribe { delete: true }),
-            delimiter: None,
+            ..Default::default()
         };
 
         let mut sub1 = FileConsumer::new(&config).await.unwrap();
@@ -1340,7 +1438,7 @@ mod tests {
         let config = FileConfig {
             path: file_path_str.clone(),
             mode: Some(FileConsumerMode::Subscribe { delete: false }),
-            delimiter: None,
+            ..Default::default()
         };
 
         let mut consumer = FileConsumer::new(&config).await.unwrap();
@@ -1379,7 +1477,7 @@ mod tests {
         let input = Endpoint::new(EndpointType::File(FileConfig {
             path: file_path_str.clone(),
             mode: Some(FileConsumerMode::Consume { delete: true }),
-            delimiter: None,
+            ..Default::default()
         }));
         let output = Endpoint::new_memory("out_consume_explicit_delete", 10);
         let route = Route::new(input, output.clone());
@@ -1426,7 +1524,7 @@ mod tests {
         let input = Endpoint::new(EndpointType::File(FileConfig {
             path: file_path_str.clone(),
             mode: Some(FileConsumerMode::Subscribe { delete: true }),
-            delimiter: None,
+            ..Default::default()
         }));
         let output = Endpoint::new_memory("out_subscribe_delete", 10);
         let route = Route::new(input, output.clone());
@@ -1468,7 +1566,7 @@ mod tests {
         let input = Endpoint::new(EndpointType::File(FileConfig {
             path: file_path_str.clone(),
             mode: Some(FileConsumerMode::Subscribe { delete: false }),
-            delimiter: None,
+            ..Default::default()
         }));
         let output = Endpoint::new_memory("out_subscribe_no_delete", 10);
         let route = Route::new(input, output.clone());
@@ -1509,7 +1607,7 @@ mod tests {
         let input = Endpoint::new(EndpointType::File(FileConfig {
             path: file_path_str.clone(),
             mode: Some(FileConsumerMode::Consume { delete: true }),
-            delimiter: None,
+            ..Default::default()
         }));
         let output = Endpoint::new_memory("out_consume_all", 100);
         let route = Route::new(input, output.clone());
@@ -1558,7 +1656,7 @@ mod tests {
                 group_id: "my_group".to_string(),
                 read_from_tail: false,
             }),
-            delimiter: None,
+            ..Default::default()
         };
 
         // 1. First consumer reads msg1
@@ -1611,7 +1709,7 @@ mod tests {
                 group_id: "my_group_start".to_string(),
                 read_from_tail: false,
             }),
-            delimiter: None,
+            ..Default::default()
         };
 
         // Consumer should start from beginning (msg1)
@@ -1644,7 +1742,7 @@ mod tests {
         let config = FileConfig {
             path: file_path_str.clone(),
             mode: Some(FileConsumerMode::Subscribe { delete: false }),
-            delimiter: None,
+            ..Default::default()
         };
 
         // Start the tail consumer
@@ -1657,7 +1755,7 @@ mod tests {
             let pub_config = FileConfig {
                 path: publisher_path,
                 mode: Some(FileConsumerMode::Subscribe { delete: false }),
-                delimiter: None,
+                ..Default::default()
             };
             let publisher = FilePublisher::new(&pub_config).await.unwrap();
 
@@ -1750,7 +1848,7 @@ mod tests {
         let config = FileConfig {
             path: file_path_str.clone(),
             mode: Some(FileConsumerMode::Subscribe { delete: false }),
-            delimiter: None,
+            ..Default::default()
         };
 
         let mut consumer = FileConsumer::new(&config).await.unwrap();
@@ -1801,6 +1899,7 @@ mod tests {
             path: file_path_str.clone(),
             delimiter: Some("|".to_string()),
             mode: Some(FileConsumerMode::Consume { delete: false }),
+            ..Default::default()
         };
 
         let publisher = FilePublisher::new(&config).await.unwrap();
@@ -1834,6 +1933,7 @@ mod tests {
             path: file_path_str.clone(),
             delimiter: Some("</message>".to_string()),
             mode: Some(FileConsumerMode::Consume { delete: false }),
+            ..Default::default()
         };
 
         let publisher = FilePublisher::new(&config).await.unwrap();
@@ -1855,5 +1955,86 @@ mod tests {
 
         let received2 = consumer.receive().await.unwrap();
         assert_eq!(received2.message.get_payload_str(), "<xml>content2");
+    }
+
+    #[tokio::test]
+    async fn test_file_formats_and_fallbacks() {
+        let dir = tempdir().unwrap();
+
+        // 1. Test JSON Format Roundtrip
+        let json_path = dir.path().join("json.log");
+        let json_config = FileConfig {
+            path: json_path.to_str().unwrap().to_string(),
+            format: FileFormat::Json,
+            ..Default::default()
+        };
+
+        let json_publisher = FilePublisher::new(&json_config).await.unwrap();
+        let mut json_consumer = FileConsumer::new(&json_config).await.unwrap();
+
+        let json_payload = json!({"key": "value", "num": 123});
+        let msg = msg!(json_payload.clone());
+
+        json_publisher.send_batch(vec![msg.clone()]).await.unwrap();
+        json_publisher.flush().await.unwrap();
+        drop(json_publisher); // Release lock
+
+        let received = json_consumer.receive().await.unwrap();
+        let received_json: serde_json::Value =
+            serde_json::from_slice(&received.message.payload).unwrap();
+        assert_eq!(received_json, json_payload);
+        (received.commit)(crate::traits::MessageDisposition::Ack)
+            .await
+            .unwrap();
+
+        // 2. Test Text Format Roundtrip
+        let text_path = dir.path().join("text.log");
+        let text_config = FileConfig {
+            path: text_path.to_str().unwrap().to_string(),
+            format: FileFormat::Text,
+            ..Default::default()
+        };
+
+        let text_publisher = FilePublisher::new(&text_config).await.unwrap();
+        let mut text_consumer = FileConsumer::new(&text_config).await.unwrap();
+
+        let text_payload = "Hello World";
+        let msg = crate::CanonicalMessage::from(text_payload);
+
+        text_publisher.send_batch(vec![msg.clone()]).await.unwrap();
+        text_publisher.flush().await.unwrap();
+        drop(text_publisher);
+
+        let received = text_consumer.receive().await.unwrap();
+        assert_eq!(received.message.get_payload_str(), text_payload);
+        (received.commit)(crate::traits::MessageDisposition::Ack)
+            .await
+            .unwrap();
+
+        // 3. Test Fallback (Corrupted/Raw line in Json format)
+        // We append a raw line that isn't the expected JSON wrapper structure
+        {
+            let mut file = OpenOptions::new()
+                .append(true)
+                .open(&json_path)
+                .await
+                .unwrap();
+            file.write_all(b"Not a JSON wrapper\n").await.unwrap();
+        }
+
+        let received_fallback = json_consumer.receive().await.unwrap();
+        // Should be treated as raw
+        assert_eq!(
+            received_fallback.message.get_payload_str(),
+            "Not a JSON wrapper"
+        );
+        assert_eq!(
+            received_fallback
+                .message
+                .metadata
+                .get("mq_bridge.original_format")
+                .map(|s| s.as_str()),
+            Some("raw")
+        );
     }
 }

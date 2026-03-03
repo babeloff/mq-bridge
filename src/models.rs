@@ -816,6 +816,22 @@ impl SledConfig {
     }
 }
 
+/// Format for messages written to or read from a file.
+#[derive(Debug, Deserialize, Serialize, Clone, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum FileFormat {
+    /// The full `CanonicalMessage` is serialized to JSON. Payload is a byte array.
+    #[default]
+    Normal,
+    /// The full `CanonicalMessage` is serialized to JSON. Payload is rendered as a JSON value if possible.
+    Json,
+    /// The full `CanonicalMessage` is serialized to JSON. Payload is rendered as a string if possible.
+    Text,
+    /// The raw payload of the message is written. For consumers, the line is read as raw bytes.
+    Raw,
+}
+
 // --- File Specific Configuration ---
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -831,6 +847,9 @@ pub struct FileConfig {
     /// For publishers, this setting is ignored.
     #[serde(flatten, default)]
     pub mode: Option<FileConsumerMode>,
+    /// The format for writing messages to the file (Publisher) or interpreting them (Consumer). Defaults to `json`.
+    #[serde(default)]
+    pub format: FileFormat,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -871,6 +890,7 @@ impl FileConfig {
             path: path.into(),
             mode: Some(FileConsumerMode::default()),
             delimiter: None,
+            format: FileFormat::default(),
         }
     }
 
@@ -1078,6 +1098,7 @@ pub enum MongoDbFormat {
     #[default]
     Normal,
     Json,
+    Text,
     Raw,
 }
 
