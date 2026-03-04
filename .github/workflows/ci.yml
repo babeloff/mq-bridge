@@ -51,13 +51,14 @@ jobs:
           - ""
           - "full"
           - "kafka"
-          - "amqp"
+          #  "amqp" # no recent changes, already included in full
           - "nats"
+          - "grpc"
           - "mqtt"
           - "mongodb"
-          # - "http" # needs too long, already included in full
+          - "http"
           # - "aws"  # needs too long, already included in full
-          - "zeromq"
+          # - "zeromq" # no recent changes, already included in full
     steps:
       - uses: actions/checkout@v4
       
