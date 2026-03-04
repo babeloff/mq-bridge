@@ -816,6 +816,22 @@ impl SledConfig {
     }
 }
 
+/// Format for messages written to or read from a file.
+#[derive(Debug, Deserialize, Serialize, Clone, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum FileFormat {
+    /// The full `CanonicalMessage` is serialized to JSON. Payload is a byte array.
+    #[default]
+    Normal,
+    /// The full `CanonicalMessage` is serialized to JSON. Payload is rendered as a JSON value if possible.
+    Json,
+    /// The full `CanonicalMessage` is serialized to JSON. Payload is rendered as a string if possible.
+    Text,
+    /// The raw payload of the message is written. For consumers, the line is read as raw bytes.
+    Raw,
+}
+
 // --- File Specific Configuration ---
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -831,6 +847,9 @@ pub struct FileConfig {
     /// For publishers, this setting is ignored.
     #[serde(flatten, default)]
     pub mode: Option<FileConsumerMode>,
+    /// The format for writing messages to the file (Publisher) or interpreting them (Consumer). Defaults to `normal`.
+    #[serde(default)]
+    pub format: FileFormat,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -871,6 +890,7 @@ impl FileConfig {
             path: path.into(),
             mode: Some(FileConsumerMode::default()),
             delimiter: None,
+            format: FileFormat::default(),
         }
     }
 
@@ -1078,6 +1098,7 @@ pub enum MongoDbFormat {
     #[default]
     Normal,
     Json,
+    Text,
     Raw,
 }
 
@@ -1370,7 +1391,11 @@ pub struct HttpConfig {
     #[serde(default)]
     pub compression_threshold_bytes: Option<usize>,
     /// HTTP Basic Authentication credentials (username, password). For consumers: validates incoming requests. For publishers: adds Authorization header.
-    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_basic_auth")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_basic_auth"
+    )]
     pub basic_auth: Option<(String, String)>,
     /// Custom headers as key-value pairs (e.g., {"X-API-Key": "token123"}). Added to outgoing HTTP headers for both consumers and publishers.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
@@ -1399,8 +1424,16 @@ where
             Ok(Some((u, p)))
         }
         serde_json::Value::Object(map) => {
-            let u = map.get("0").and_then(|v| v.as_str()).ok_or_else(|| serde::de::Error::custom("basic_auth map missing '0'"))?.to_string();
-            let p = map.get("1").and_then(|v| v.as_str()).ok_or_else(|| serde::de::Error::custom("basic_auth map missing '1'"))?.to_string();
+            let u = map
+                .get("0")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| serde::de::Error::custom("basic_auth map missing '0'"))?
+                .to_string();
+            let p = map
+                .get("1")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| serde::de::Error::custom("basic_auth map missing '1'"))?
+                .to_string();
             Ok(Some((u, p)))
         }
         _ => Err(serde::de::Error::custom("invalid type for basic_auth")),
