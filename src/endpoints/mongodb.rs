@@ -57,6 +57,10 @@ impl TryFrom<MongoMessageRaw> for CanonicalMessage {
                 let json = serde_json::to_vec(&arr)?;
                 json.into()
             }
+            Bson::String(s) => {
+                // Preserve the raw UTF-8 bytes of the string, not a JSON-encoded string
+                s.into_bytes().into()
+            }
             _ => {
                 let json_val: serde_json::Value = mongodb::bson::from_bson(raw.payload)?;
                 serde_json::to_vec(&json_val)?.into()
@@ -109,6 +113,17 @@ fn message_to_document(
                     bytes: message.payload.to_vec(),
                 })
             }
+        } else {
+            // Fallback to binary if not valid JSON
+            Bson::Binary(mongodb::bson::Binary {
+                subtype: mongodb::bson::spec::BinarySubtype::Generic,
+                bytes: message.payload.to_vec(),
+            })
+        }
+    } else if matches!(format, MongoDbFormat::Text) {
+        if let Ok(text) = std::str::from_utf8(&message.payload) {
+            metadata.insert("type".to_string(), "text".to_string());
+            Bson::String(text.to_string())
         } else {
             Bson::Binary(mongodb::bson::Binary {
                 subtype: mongodb::bson::spec::BinarySubtype::Generic,
