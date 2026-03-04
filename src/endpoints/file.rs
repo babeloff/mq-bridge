@@ -763,7 +763,10 @@ impl FileConsumer {
                 })
             }
             Some(FileConsumerMode::Subscribe { delete: true }) => {
-                let key = format!("{}|subscribe|delete", config.path);
+                let key = format!(
+                    "{}|subscribe|delete|{:?}|{:?}",
+                    config.path, format, delimiter
+                );
 
                 let store = if let Some(store) = {
                     let mut stores = FILE_EVENT_STORES.lock().await;
@@ -1046,19 +1049,23 @@ fn parse_message(buffer: &[u8], format: &FileFormat) -> CanonicalMessage {
 
             match serde_json::from_slice::<AnyPayloadMessage>(buffer) {
                 Ok(wrapper) => {
-                    let payload_bytes = match wrapper.payload {
-                        serde_json::Value::String(s) => s.into_bytes(),
-                        serde_json::Value::Array(arr) => {
-                            if let Ok(bytes) = serde_json::from_value::<Vec<u8>>(
-                                serde_json::Value::Array(arr.clone()),
-                            ) {
-                                bytes
-                            } else {
-                                serde_json::to_vec(&serde_json::Value::Array(arr))
-                                    .unwrap_or_default()
+                    let payload_bytes = if matches!(format, FileFormat::Json) {
+                        serde_json::to_vec(&wrapper.payload).unwrap_or_default()
+                    } else {
+                        match wrapper.payload {
+                            serde_json::Value::String(s) => s.into_bytes(),
+                            serde_json::Value::Array(arr) => {
+                                if let Ok(bytes) = serde_json::from_value::<Vec<u8>>(
+                                    serde_json::Value::Array(arr.clone()),
+                                ) {
+                                    bytes
+                                } else {
+                                    serde_json::to_vec(&serde_json::Value::Array(arr))
+                                        .unwrap_or_default()
+                                }
                             }
+                            other => serde_json::to_vec(&other).unwrap_or_default(),
                         }
-                        other => serde_json::to_vec(&other).unwrap_or_default(),
                     };
                     CanonicalMessage {
                         message_id: wrapper.message_id,
@@ -1067,7 +1074,7 @@ fn parse_message(buffer: &[u8], format: &FileFormat) -> CanonicalMessage {
                     }
                 }
                 Err(e) => {
-                    warn!(error = %e, content = %String::from_utf8_lossy(buffer), "Failed to parse file line as JSON, treating as raw.");
+                    warn!(error = %e, content_length = buffer.len(), "Failed to parse file line as JSON, treating as raw.");
                     let mut msg = CanonicalMessage::new(buffer.to_vec(), None);
                     msg.metadata
                         .insert("mq_bridge.original_format".to_string(), "raw".to_string());

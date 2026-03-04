@@ -847,7 +847,7 @@ pub struct FileConfig {
     /// For publishers, this setting is ignored.
     #[serde(flatten, default)]
     pub mode: Option<FileConsumerMode>,
-    /// The format for writing messages to the file (Publisher) or interpreting them (Consumer). Defaults to `json`.
+    /// The format for writing messages to the file (Publisher) or interpreting them (Consumer). Defaults to `normal`.
     #[serde(default)]
     pub format: FileFormat,
 }

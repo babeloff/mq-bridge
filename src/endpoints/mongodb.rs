@@ -49,7 +49,7 @@ impl TryFrom<MongoMessageRaw> for CanonicalMessage {
 
         let payload = match raw.payload {
             Bson::Binary(bin) => bin.bytes.into(),
-            Bson::String(s) => s.into_bytes().into(),
+            Bson::String(s) => serde_json::to_vec(&s)?.into(),
             Bson::Document(doc) => {
                 let json = serde_json::to_vec(&doc)?;
                 json.into()
