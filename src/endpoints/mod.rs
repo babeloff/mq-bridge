@@ -29,6 +29,8 @@ pub mod reader;
 pub mod response;
 #[cfg(feature = "sled")]
 pub mod sled;
+#[cfg(feature = "sqlx")]
+pub mod sqlx;
 pub mod static_endpoint;
 pub mod switch;
 #[cfg(feature = "zeromq")]
@@ -551,6 +553,8 @@ async fn create_base_consumer(
         EndpointType::File(cfg) => Ok(boxed(file::FileConsumer::new(cfg).await?)),
         #[cfg(feature = "grpc")]
         EndpointType::Grpc(cfg) => Ok(boxed(grpc::GrpcConsumer::new(cfg).await?)),
+        #[cfg(feature = "sqlx")]
+        EndpointType::Sqlx(cfg) => Ok(boxed(sqlx::SqlxConsumer::new(cfg).await?)),
         #[cfg(feature = "http")]
         EndpointType::Http(cfg) => Ok(boxed(http::HttpConsumer::new(cfg).await?)),
         EndpointType::Static(cfg) => Ok(boxed(static_endpoint::StaticRequestConsumer::new(cfg)?)),
@@ -772,6 +776,28 @@ fn check_publisher_recursive(
         }
         #[cfg(feature = "grpc")]
         EndpointType::Grpc(_) => Ok(warnings),
+        #[cfg(feature = "sqlx")]
+        EndpointType::Sqlx(cfg) => {
+            if cfg.select_query.is_some() {
+                warnings.push(
+                    "Endpoint 'sqlx' is used as a publisher, but 'select_query' is a consumer-only option and will be ignored."
+                    .to_string()
+                );
+            }
+            if cfg.delete_after_read {
+                warnings.push(
+                    "Endpoint 'sqlx' is used as a publisher, but 'delete_after_read' is a consumer-only option and will be ignored."
+                    .to_string()
+                );
+            }
+            if cfg.polling_interval_ms.is_some() {
+                warnings.push(
+                    "Endpoint 'sqlx' is used as a publisher, but 'polling_interval_ms' is a consumer-only option and will be ignored."
+                    .to_string()
+                );
+            }
+            Ok(warnings)
+        }
         #[cfg(feature = "ibm-mq")]
         EndpointType::IbmMq(cfg) => {
             if cfg.wait_timeout_ms != 1000 {
@@ -1020,6 +1046,10 @@ async fn create_base_publisher(
         #[cfg(feature = "grpc")]
         EndpointType::Grpc(cfg) => {
             Ok(Box::new(grpc::GrpcPublisher::new(cfg).await?) as Box<dyn MessagePublisher>)
+        }
+        #[cfg(feature = "sqlx")]
+        EndpointType::Sqlx(cfg) => {
+            Ok(Box::new(sqlx::SqlxPublisher::new(cfg).await?) as Box<dyn MessagePublisher>)
         }
         #[cfg(feature = "http")]
         EndpointType::Http(cfg) => {

@@ -179,6 +179,7 @@ fn is_known_endpoint_name(name: &str) -> bool {
             | "ref"
             | "switch"
             | "response"
+            | "sqlx"
     )
 }
 
@@ -433,6 +434,7 @@ pub enum EndpointType {
     IbmMq(IbmMqConfig),
     ZeroMq(ZeroMqConfig),
     Grpc(GrpcConfig),
+    Sqlx(SqlxConfig),
     Fanout(Vec<Endpoint>),
     Switch(SwitchConfig),
     Response(ResponseConfig),
@@ -463,6 +465,7 @@ impl EndpointType {
             EndpointType::IbmMq(_) => "ibmmq",
             EndpointType::ZeroMq(_) => "zeromq",
             EndpointType::Grpc(_) => "grpc",
+            EndpointType::Sqlx(_) => "sqlx",
             EndpointType::Fanout(_) => "fanout",
             EndpointType::Switch(_) => "switch",
             EndpointType::Response(_) => "response",
@@ -1599,6 +1602,30 @@ pub struct ResponseConfig {
     // This struct is a marker and currently has no fields.
 }
 
+// --- SQLx Specific Configuration ---
+
+/// General SQLx connection configuration.
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct SqlxConfig {
+    /// Database connection URL.
+    pub url: String,
+    /// The table to interact with.
+    pub table: String,
+    /// (Publisher only) A custom SQL INSERT query. Use `?` as a placeholder for the payload.
+    /// If not provided, a default `INSERT INTO {table} (payload) VALUES (?)` is used.
+    pub insert_query: Option<String>,
+    /// (Consumer only) A custom SQL SELECT query to fetch messages.
+    /// The query should select rows to be processed.
+    pub select_query: Option<String>,
+    /// (Consumer only) If true, delete messages after processing.
+    #[serde(default)]
+    pub delete_after_read: bool,
+    /// (Consumer only) Polling interval in milliseconds. Defaults to 100ms.
+    pub polling_interval_ms: Option<u64>,
+}
+
 // --- Common Configuration ---
 
 /// TLS configuration for secure connections.
@@ -1731,6 +1758,9 @@ impl SecretExtractor for EndpointType {
             }
             EndpointType::Grpc(cfg) => {
                 cfg.extract_secrets(&format!("{}__{}", prefix, "GRPC"), secrets)
+            }
+            EndpointType::Sqlx(cfg) => {
+                cfg.extract_secrets(&format!("{}__{}", prefix, "SQLX"), secrets)
             }
             EndpointType::Fanout(endpoints) => {
                 for (i, ep) in endpoints.iter_mut().enumerate() {
@@ -1868,6 +1898,13 @@ impl SecretExtractor for IbmMqConfig {
         }
         self.tls
             .extract_secrets(&format!("{}__{}", prefix, "TLS"), secrets);
+    }
+}
+
+impl SecretExtractor for SqlxConfig {
+    fn extract_secrets(&mut self, _prefix: &str, _secrets: &mut HashMap<String, String>) {
+        // The URL might contain a password, but sqlx recommends using env vars for this.
+        // For now, we won't parse the URL to extract secrets.
     }
 }
 

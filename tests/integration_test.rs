@@ -76,6 +76,13 @@ async fn test_all_performance_direct() {
             integration::ibm_mq::test_ibm_mq_performance_direct().await;
         }
     }
+    #[cfg(feature = "sqlx")]
+    {
+        if should_run("sqlx") {
+            println!("\n\n>>> Starting SQLx Direct Performance Test...");
+            integration::sqlx::test_sqlx_performance_direct().await;
+        }
+    }
 
     // The summary table will be printed here when `_summary_printer` is dropped.
 }
@@ -141,4 +148,11 @@ async fn test_all_chaos() {
     }
 
     // AWS chaos test is excluded by default as it requires LocalStack which can be heavy/flaky in some envs
+    #[cfg(feature = "sqlx")]
+    {
+        if should_run("sqlx") {
+            println!("\n\n>>> Starting SQLx Chaos Test...");
+            integration::sqlx::test_sqlx_chaos().await;
+        }
+    }
 }

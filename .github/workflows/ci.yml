@@ -141,7 +141,7 @@ jobs:
       
       - name: Pre-pull docker images
         run: |
-          find tests/integration/docker-compose -name "*.yml" | xargs -P 4 -I {} docker compose -f {} pull -q
+          find tests/integration/docker-compose -name "*.yml" | xargs -P 5 -I {} docker compose -f {} pull -q
 
       - name: Run armature integration tests
         run: |

@@ -393,6 +393,17 @@
         {
           "type": "object",
           "properties": {
+            "sqlx": {
+              "$ref": "#/$defs/SqlxConfig"
+            }
+          },
+          "required": [
+            "sqlx"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
             "fanout": {
               "type": "array",
               "items": {
@@ -1648,6 +1659,53 @@
       "additionalProperties": false,
       "required": [
         "path"
+      ]
+    },
+    "SqlxConfig": {
+      "description": "General SQLx connection configuration.",
+      "type": "object",
+      "properties": {
+        "delete_after_read": {
+          "description": "(Consumer only) If true, delete messages after processing.",
+          "type": "boolean",
+          "default": false
+        },
+        "insert_query": {
+          "description": "(Publisher only) A custom SQL INSERT query. Use `?` as a placeholder for the payload.\nIf not provided, a default `INSERT INTO {table} (payload) VALUES (?)` is used.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "polling_interval_ms": {
+          "description": "(Consumer only) Polling interval in milliseconds. Defaults to 100ms.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "select_query": {
+          "description": "(Consumer only) A custom SQL SELECT query to fetch messages.\nThe query should select rows to be processed.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "table": {
+          "description": "The table to interact with.",
+          "type": "string"
+        },
+        "url": {
+          "description": "Database connection URL.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "url",
+        "table"
       ]
     },
     "SwitchConfig": {
