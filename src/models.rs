@@ -7,7 +7,10 @@ use serde::{
     de::{MapAccess, Visitor},
     Deserialize, Deserializer, Serialize,
 };
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::{atomic::AtomicUsize, Arc},
+};
 
 use crate::traits::Handler;
 use tracing::trace;
@@ -595,31 +598,69 @@ pub struct WeakJoinMiddleware {
     pub timeout_ms: u64,
 }
 
-/// Random Panic middleware configuration.
-///
-/// Simulates random failures for chaos testing and resilience validation.
-/// Causes the middleware to panic with the specified probability, useful for testing
-/// error handling and recovery mechanisms.
-#[derive(Debug, Deserialize, Serialize, Clone)]
+/// Fault injection modes for testing error handling and recovery mechanisms.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-#[serde(deny_unknown_fields)]
-pub struct RandomPanicMiddleware {
-    /// Probability of panic (0.0 to 1.0).
-    #[serde(deserialize_with = "deserialize_probability")]
-    pub probability: f64,
+#[serde(rename_all = "snake_case")]
+pub enum FaultMode {
+    /// Trigger a thread panic.
+    #[default]
+    Panic,
+    /// Simulate a connection/network error (retryable).
+    Disconnect,
+    /// Simulate a timeout error (retryable).
+    Timeout,
+    /// Simulate a JSON format error (non-retryable).
+    JsonFormatError,
+    /// Return a negative acknowledgement (for handlers).
+    Nack,
 }
 
-fn deserialize_probability<'de, D>(deserializer: D) -> Result<f64, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let value = f64::deserialize(deserializer)?;
-    if !(0.0..=1.0).contains(&value) {
-        return Err(serde::de::Error::custom(
-            "probability must be between 0.0 and 1.0",
-        ));
+impl std::fmt::Display for FaultMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FaultMode::Panic => write!(f, "panic"),
+            FaultMode::Disconnect => write!(f, "disconnect"),
+            FaultMode::Timeout => write!(f, "timeout"),
+            FaultMode::JsonFormatError => write!(f, "json_format_error"),
+            FaultMode::Nack => write!(f, "nack"),
+        }
     }
-    Ok(value)
+}
+
+/// Middleware for fault injection testing.
+///
+/// Allows testing error handling and recovery mechanisms by injecting faults
+/// at specific points in the message processing pipeline.
+///
+/// # Examples
+///
+/// ```yaml
+/// random_panic:
+///   mode: panic
+///   trigger_on_message: 3  # Trigger on the 3rd message
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct RandomPanicMiddleware {
+    /// The type of fault to inject.
+    pub mode: FaultMode,
+    /// Trigger the fault on the Nth message (1-indexed). None = trigger on every message.
+    pub trigger_on_message: Option<usize>,
+    /// Enable/disable the fault injection without removing the configuration.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(skip, default = "default_atomic_usize_arc")]
+    #[cfg_attr(feature = "schema", schemars(skip))]
+    pub(crate) message_count: Arc<AtomicUsize>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_atomic_usize_arc() -> Arc<AtomicUsize> {
+    Arc::new(AtomicUsize::new(0))
 }
 
 fn deserialize_null_as_false<'de, D>(deserializer: D) -> Result<bool, D::Error>
@@ -1878,7 +1919,7 @@ kafka_to_nats:
           max_attempts: 5
           initial_interval_ms: 200
       - random_panic:
-          probability: 0.1
+          mode: nack
       - dlq:
           endpoint:
             nats:
@@ -1947,7 +1988,7 @@ kafka_to_nats:
                     has_retry = true;
                 }
                 Middleware::RandomPanic(rp) => {
-                    assert!((rp.probability - 0.1).abs() < f64::EPSILON);
+                    assert!(rp.mode == FaultMode::Nack);
                     has_random_panic = true;
                 }
                 Middleware::Delay(_) => {}

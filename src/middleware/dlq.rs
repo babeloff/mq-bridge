@@ -117,11 +117,12 @@ impl MessagePublisher for DlqPublisher {
                     }
                 }
             }
-            Err(e @ PublisherError::NonRetryable(_)) => {
+            Err(e) => {
                 let error_msg = e.to_string();
                 error!(
-                    "Failed to send a batch of {} messages (complete failure). Attempting to send all to DLQ.",
-                    messages.len()
+                    "Failed to send a batch of {} messages (complete failure). Attempting to send all to DLQ. Error: {}",
+                    messages.len(),
+                    error_msg
                 );
 
                 // Attempt to send all messages to the DLQ
@@ -156,7 +157,6 @@ impl MessagePublisher for DlqPublisher {
                     }
                 }
             }
-            Err(e @ PublisherError::Retryable(_)) => Err(e), // Propagate retryable errors
         }
     }
 

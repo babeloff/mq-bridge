@@ -109,6 +109,9 @@ jobs:
       
       - name: Run unit tests
         run: cargo test --lib --features=full 
+# currently - just random panic test
+#      - name: Run long-running unit tests
+#        run: cargo test --lib --features=full -- --ignored --nocapture
 
   # Integration tests (requires Docker)
   integration-test:
@@ -144,15 +147,17 @@ jobs:
         run: |
           cargo test --test armature_integration  -- --ignored --nocapture --test-threads=1 
 
-      - name: Run integration tests
+      - name: Run request-reply integration tests
         run: |
-          cargo test --test integration_test --features full --release -- --nocapture --test-threads=1
-        continue-on-error: true  # Integration tests may be flaky, don't fail CI
+          cargo test --test request_reply_test --features full -- --ignored --nocapture --test-threads=1
+
+      - name: Run chaos/stability tests
+        run: |
+          cargo test --test integration_test --features full -- test_all_chaos --ignored --nocapture --test-threads=1
 
       - name: Run integration performance tests
         run: |
           cargo test --test integration_test --features full --release -- test_all_performance_direct --ignored --nocapture --test-threads=1 
-        continue-on-error: true  # Integration tests may be flaky, don't fail CI
   # Documentation
   docs:
     name: Documentation

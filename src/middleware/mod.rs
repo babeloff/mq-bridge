@@ -15,7 +15,6 @@ mod delay;
 mod dlq;
 #[cfg(feature = "metrics")]
 mod metrics;
-#[cfg(feature = "panic")]
 mod random_panic;
 mod retry;
 mod weak_join;
@@ -26,7 +25,6 @@ use delay::{DelayConsumer, DelayPublisher};
 use dlq::DlqPublisher;
 #[cfg(feature = "metrics")]
 use metrics::{MetricsConsumer, MetricsPublisher};
-#[cfg(feature = "panic")]
 use random_panic::{RandomPanicConsumer, RandomPanicPublisher};
 use retry::RetryPublisher;
 use weak_join::WeakJoinConsumer;
@@ -59,7 +57,6 @@ pub async fn apply_middlewares_to_consumer(
                 consumer
             }
             Middleware::Delay(cfg) => Box::new(DelayConsumer::new(consumer, cfg)),
-            #[cfg(feature = "panic")]
             Middleware::RandomPanic(cfg) => Box::new(RandomPanicConsumer::new(consumer, cfg)),
             Middleware::WeakJoin(cfg) => Box::new(WeakJoinConsumer::new(consumer, cfg)),
             Middleware::Custom { name, config } => {
@@ -104,7 +101,6 @@ pub async fn apply_middlewares_to_publisher(
             }
             Middleware::Retry(cfg) => Box::new(RetryPublisher::new(publisher, cfg.clone())),
             Middleware::Delay(cfg) => Box::new(DelayPublisher::new(publisher, cfg)),
-            #[cfg(feature = "panic")]
             Middleware::RandomPanic(cfg) => Box::new(RandomPanicPublisher::new(publisher, cfg)),
             Middleware::Custom { name, config } => {
                 let factory = get_middleware_factory(name).ok_or_else(|| {
