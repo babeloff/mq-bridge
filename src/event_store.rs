@@ -547,3 +547,101 @@ impl MessageConsumer for EventStoreConsumer {
         self
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::errors::ConsumerError;
+    use std::sync::Arc;
+    use tokio::time::{sleep, Duration};
+
+    #[tokio::test]
+    async fn test_event_store_lifecycle() {
+        let store = Arc::new(EventStore::new(RetentionPolicy::default()));
+
+        // Append
+        let id1 = store.append(CanonicalMessage::from("msg1")).await;
+        assert_eq!(id1, 1);
+        let id2 = store.append(CanonicalMessage::from("msg2")).await;
+        assert_eq!(id2, 2);
+
+        // Retrieve
+        let events = store.get_events_since(0, 10).await.unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].offset, 1);
+        assert_eq!(events[1].offset, 2);
+
+        // Retrieve partial
+        let events = store.get_events_since(1, 10).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].offset, 2);
+    }
+
+    #[tokio::test]
+    async fn test_retention_policy_max_count() {
+        let policy = RetentionPolicy {
+            max_count: Some(2),
+            ..Default::default()
+        };
+        let store = EventStore::new(policy);
+
+        store.append(CanonicalMessage::from("1")).await;
+        store.append(CanonicalMessage::from("2")).await;
+        store.append(CanonicalMessage::from("3")).await;
+
+        // Should have dropped "1" (offset 1). Base offset should be 2.
+        // get_events_since(0) asks for offset 1.
+        let res = store.get_events_since(0, 10).await;
+        match res {
+            Err(ConsumerError::Gap { requested, base }) => {
+                assert_eq!(requested, 1);
+                assert_eq!(base, 2);
+            }
+            _ => panic!("Expected Gap error"),
+        }
+
+        let events = store.get_events_since(1, 10).await.unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].message.get_payload_str(), "2");
+        assert_eq!(events[1].message.get_payload_str(), "3");
+    }
+
+    #[tokio::test]
+    async fn test_subscriber_ack_gc() {
+        let policy = RetentionPolicy {
+            max_count: None,
+            gc_interval: Duration::from_millis(10), // Fast GC
+            subscriber_timeout: Duration::from_secs(60),
+            max_age: None,
+        };
+        let store = Arc::new(EventStore::new(policy));
+
+        store.append(CanonicalMessage::from("1")).await; // Offset 1
+        store.append(CanonicalMessage::from("2")).await; // Offset 2
+
+        // Register subscriber
+        store.register_subscriber("subA".into()).await;
+
+        // Ack offset 1
+        store.ack("subA", 1).await;
+
+        // Force GC (store logic checks interval)
+        // We need to wait a bit to satisfy the duration check
+        sleep(Duration::from_millis(20)).await;
+        store.run_gc().await;
+
+        // Offset 1 should be removed
+        let res = store.get_events_since(0, 10).await;
+        match res {
+            Err(ConsumerError::Gap { requested, base }) => {
+                assert_eq!(requested, 1);
+                assert_eq!(base, 2);
+            }
+            _ => panic!("Expected Gap error, got {:?}", res),
+        }
+
+        let events = store.get_events_since(1, 10).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].offset, 2);
+    }
+}

@@ -1196,4 +1196,19 @@ mod tests {
             Middleware::Deduplication(_)
         ));
     }
+
+    #[test]
+    fn test_check_consumer_invalid_config() {
+        let config = crate::models::MemoryConfig {
+            topic: "test".to_string(),
+            request_reply: true, // Invalid for consumer
+            ..Default::default()
+        };
+        let endpoint = Endpoint::new(EndpointType::Memory(config));
+
+        let warnings = check_consumer("test_route", &endpoint, None).unwrap();
+        assert!(warnings
+            .iter()
+            .any(|w| w.contains("request_reply") && w.contains("publisher-only")));
+    }
 }
