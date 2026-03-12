@@ -51,12 +51,7 @@ fn contains_payload_clause(query: &str) -> bool {
 }
 
 fn build_sqlx_url_with_tls(config: &SqlxConfig) -> anyhow::Result<String> {
-    if !config.tls.required && config.username.is_none() && config.password.is_none() {
-        return Ok(config.url.clone());
-    }
-
     let mut url = url::Url::parse(&config.url)?;
-    let scheme = url.scheme().to_string();
 
     if let Some(username) = &config.username {
         url.set_username(username)
@@ -67,48 +62,51 @@ fn build_sqlx_url_with_tls(config: &SqlxConfig) -> anyhow::Result<String> {
             .map_err(|_| anyhow!("Cannot set password on sqlx URL"))?;
     }
 
-    match scheme.as_str() {
-        "postgres" | "postgresql" => {
-            let mut query_pairs = url.query_pairs_mut();
-            if config.tls.accept_invalid_certs {
-                query_pairs.append_pair("sslmode", "require");
-            } else if config.tls.ca_file.is_some() {
-                query_pairs.append_pair("sslmode", "verify-ca");
-            } else {
-                query_pairs.append_pair("sslmode", "require");
-            }
+    if config.tls.required {
+        let scheme = url.scheme().to_string();
+        match scheme.as_str() {
+            "postgres" | "postgresql" => {
+                let mut query_pairs = url.query_pairs_mut();
+                if config.tls.accept_invalid_certs {
+                    query_pairs.append_pair("sslmode", "require");
+                } else if config.tls.ca_file.is_some() {
+                    query_pairs.append_pair("sslmode", "verify-ca");
+                } else {
+                    query_pairs.append_pair("sslmode", "require");
+                }
 
-            if let Some(ca) = &config.tls.ca_file {
-                query_pairs.append_pair("sslrootcert", ca);
+                if let Some(ca) = &config.tls.ca_file {
+                    query_pairs.append_pair("sslrootcert", ca);
+                }
+                if let Some(cert) = &config.tls.cert_file {
+                    query_pairs.append_pair("sslcert", cert);
+                }
+                if let Some(key) = &config.tls.key_file {
+                    query_pairs.append_pair("sslkey", key);
+                }
+                if let Some(pass) = &config.tls.cert_password {
+                    query_pairs.append_pair("sslpassword", pass);
+                }
             }
-            if let Some(cert) = &config.tls.cert_file {
-                query_pairs.append_pair("sslcert", cert);
+            "mysql" | "mariadb" => {
+                // MySQL/MariaDB support for TLS options in URL is more limited.
+                // It's generally better to use a client-side configuration file (`my.cnf`)
+                // for complex TLS setups. We'll add what we can.
+                warn!("For complex MySQL/MariaDB TLS setups, using a client configuration file (my.cnf) is recommended over URL parameters.");
+                let mut query_pairs = url.query_pairs_mut();
+                query_pairs.append_pair("ssl-mode", "REQUIRED");
             }
-            if let Some(key) = &config.tls.key_file {
-                query_pairs.append_pair("sslkey", key);
+            "mssql" | "sqlserver" => {
+                let mut query_pairs = url.query_pairs_mut();
+                if config.tls.accept_invalid_certs {
+                    query_pairs.append_pair("encrypt", "true");
+                    query_pairs.append_pair("trust-server-certificate", "true");
+                } else {
+                    query_pairs.append_pair("encrypt", "strict");
+                }
             }
-            if let Some(pass) = &config.tls.cert_password {
-                query_pairs.append_pair("sslpassword", pass);
-            }
+            _ => {}
         }
-        "mysql" | "mariadb" => {
-            // MySQL/MariaDB support for TLS options in URL is more limited.
-            // It's generally better to use a client-side configuration file (`my.cnf`)
-            // for complex TLS setups. We'll add what we can.
-            warn!("For complex MySQL/MariaDB TLS setups, using a client configuration file (my.cnf) is recommended over URL parameters.");
-            let mut query_pairs = url.query_pairs_mut();
-            query_pairs.append_pair("ssl-mode", "REQUIRED");
-        }
-        "mssql" | "sqlserver" => {
-            let mut query_pairs = url.query_pairs_mut();
-            if config.tls.accept_invalid_certs {
-                query_pairs.append_pair("encrypt", "true");
-                query_pairs.append_pair("trust-server-certificate", "true");
-            } else {
-                query_pairs.append_pair("encrypt", "strict");
-            }
-        }
-        _ => {}
     }
 
     Ok(url.to_string())
@@ -161,7 +159,7 @@ impl SqlxPublisher {
         let driver_name = conn.backend_name().to_string();
         drop(conn);
 
-        info!(url = %config.url, table = %config.table, driver = %driver_name, "SQLx publisher connected to {}", driver_name);
+        info!(table = %config.table, driver = %driver_name, "SQLx publisher connected to {}", driver_name);
 
         if config.auto_create_table {
             // --- Auto-create table and index ---
@@ -345,7 +343,7 @@ impl SqlxConsumer {
         let driver_name = conn.backend_name().to_string();
         // Immediately return the connection to the pool.
         drop(conn);
-        info!(url = %config.url, table = %config.table, driver = %driver_name, "SQLx consumer connected");
+        info!(table = %config.table, driver = %driver_name, "SQLx consumer connected");
 
         let select_query =
             config
@@ -407,7 +405,7 @@ impl SqlxConsumer {
     ) -> Result<Vec<sqlx::any::AnyRow>, ConsumerError> {
         let mut tx = self
             .pool
-            .begin_with("BEGIN IMMEDIATE")
+            .begin()
             .await
             .map_err(|e| ConsumerError::Connection(e.into()))?;
 
@@ -550,6 +548,12 @@ impl SqlxConsumer {
 #[async_trait]
 impl MessageConsumer for SqlxConsumer {
     async fn receive_batch(&mut self, max_messages: usize) -> Result<ReceivedBatch, ConsumerError> {
+        if max_messages == 0 {
+            return Ok(ReceivedBatch {
+                messages: Vec::new(),
+                commit: Box::new(|_| Box::pin(async { Ok(()) })),
+            });
+        }
         loop {
             let rows = match self.driver_name.as_str() {
                 "PostgreSQL" | "Microsoft SQL Server" => sqlx::query(&self.select_query)
