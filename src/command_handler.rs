@@ -42,8 +42,12 @@ impl CommandPublisher {
 #[async_trait]
 impl MessagePublisher for CommandPublisher {
     async fn send(&self, message: CanonicalMessage) -> Result<Sent, PublisherError> {
+        let original_id = message.message_id;
         match self.handler.handle(message).await {
-            Ok(Handled::Publish(response_msg)) => self.inner.send(response_msg).await, // Propagate result
+            Ok(Handled::Publish(mut response_msg)) => {
+                response_msg.message_id = original_id;
+                self.inner.send(response_msg).await
+            }
             Ok(Handled::Ack) => Ok(Sent::Ack),
             Err(e) => Err(e), // Converts HandlerError to PublisherError
         }

@@ -90,7 +90,7 @@ async fn test_memory_route() {
 
 ### Medium Priority (Important Features)
 
-- [ ] All endpoint types (Kafka, NATS, AMQP, MQTT, MongoDB, SQLx, HTTP)
+- [ ] All endpoint types (Kafka, NATS, AMQP, MQTT, MongoDB, SQLx, gRPC, ZeroMQ, File, AWS, IBM MQ, HTTP)
 - [ ] Middleware implementations (retry, DLQ, deduplication)
 - [ ] Type handlers
 - [ ] Fanout and switch endpoints

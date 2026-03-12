@@ -18,18 +18,31 @@ use std::time::Duration;
 use tracing::{info, trace, warn};
 
 fn is_valid_table_name(name: &str) -> bool {
-    !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    if name.is_empty() || name.starts_with('.') || name.ends_with('.') || name.contains("..") {
+        return false;
+    }
+    name.split('.')
+        .all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
 }
 
 fn build_sqlx_url_with_tls(config: &SqlxConfig) -> anyhow::Result<String> {
-    if !config.tls.required {
+    if !config.tls.required && config.username.is_none() && config.password.is_none() {
         return Ok(config.url.clone());
     }
 
     let mut url = url::Url::parse(&config.url)?;
-    let scheme = url.scheme();
+    let scheme = url.scheme().to_string();
 
-    match scheme {
+    if let Some(username) = &config.username {
+        url.set_username(username)
+            .map_err(|_| anyhow!("Cannot set username on sqlx URL"))?;
+    }
+    if let Some(password) = &config.password {
+        url.set_password(Some(password))
+            .map_err(|_| anyhow!("Cannot set password on sqlx URL"))?;
+    }
+
+    match scheme.as_str() {
         "postgres" | "postgresql" => {
             let mut query_pairs = url.query_pairs_mut();
             if config.tls.accept_invalid_certs {
@@ -125,41 +138,43 @@ impl SqlxPublisher {
 
         info!(url = %config.url, table = %config.table, driver = %driver_name, "SQLx publisher connected to {}", driver_name);
 
-        // --- Auto-create table and index ---
-        let create_table_query = match driver_name.as_str() {
-            "PostgreSQL" => format!(
-                "CREATE TABLE IF NOT EXISTS {} (id BIGSERIAL PRIMARY KEY, payload BYTEA NOT NULL, locked_until TIMESTAMPTZ, created_at TIMESTAMPTZ DEFAULT NOW())",
-                config.table
-            ),
-            "MySQL" | "MariaDB" => format!(
-                "CREATE TABLE IF NOT EXISTS {} (id BIGINT AUTO_INCREMENT PRIMARY KEY, payload BLOB NOT NULL, locked_until DATETIME, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)",
-                config.table
-            ),
-            "SQLite" => format!(
-                "CREATE TABLE IF NOT EXISTS {} (id INTEGER PRIMARY KEY AUTOINCREMENT, payload BLOB NOT NULL, locked_until DATETIME, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)",
-                config.table
-            ),
-            "Microsoft SQL Server" => format!(
-                "IF NOT EXISTS (SELECT * FROM sys.objects WHERE object_id = OBJECT_ID(N'[dbo].[{0}]') AND type in (N'U'))
-                CREATE TABLE [dbo].[{0}] (id BIGINT IDENTITY(1,1) PRIMARY KEY, payload VARBINARY(MAX) NOT NULL, locked_until DATETIME2, created_at DATETIME2 DEFAULT GETUTCDATE())",
-                config.table
-            ),
-            _ => "".to_string(), // Don't attempt for unknown drivers
-        };
-
-        if !create_table_query.is_empty() {
-            if let Err(e) = sqlx::query(&create_table_query).execute(&pool).await {
-                warn!(
-                    "Failed to auto-create table '{}': {}. Please ensure it exists.",
-                    config.table, e
-                );
-            } else {
-                let create_index_query = format!(
-                    "CREATE INDEX IF NOT EXISTS idx_{0}_locked_until ON {0} (locked_until)",
+        if config.auto_create_table {
+            // --- Auto-create table and index ---
+            let create_table_query = match driver_name.as_str() {
+                "PostgreSQL" => format!(
+                    "CREATE TABLE IF NOT EXISTS {} (id BIGSERIAL PRIMARY KEY, payload BYTEA NOT NULL, locked_until TIMESTAMPTZ, created_at TIMESTAMPTZ DEFAULT NOW())",
                     config.table
-                );
-                // MySQL doesn't support `IF NOT EXISTS` on `CREATE INDEX`, so we ignore the error if it already exists.
-                let _ = sqlx::query(&create_index_query).execute(&pool).await;
+                ),
+                "MySQL" | "MariaDB" => format!(
+                    "CREATE TABLE IF NOT EXISTS {} (id BIGINT AUTO_INCREMENT PRIMARY KEY, payload BLOB NOT NULL, locked_until DATETIME, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)",
+                    config.table
+                ),
+                "SQLite" => format!(
+                    "CREATE TABLE IF NOT EXISTS {} (id INTEGER PRIMARY KEY AUTOINCREMENT, payload BLOB NOT NULL, locked_until DATETIME, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)",
+                    config.table
+                ),
+                "Microsoft SQL Server" => format!(
+                    "IF NOT EXISTS (SELECT * FROM sys.objects WHERE object_id = OBJECT_ID(N'[dbo].[{0}]') AND type in (N'U'))
+                CREATE TABLE [dbo].[{0}] (id BIGINT IDENTITY(1,1) PRIMARY KEY, payload VARBINARY(MAX) NOT NULL, locked_until DATETIME2, created_at DATETIME2 DEFAULT GETUTCDATE())",
+                    config.table
+                ),
+                _ => "".to_string(), // Don't attempt for unknown drivers
+            };
+
+            if !create_table_query.is_empty() {
+                if let Err(e) = sqlx::query(&create_table_query).execute(&pool).await {
+                    warn!(
+                        "Failed to auto-create table '{}': {}. Please ensure it exists.",
+                        config.table, e
+                    );
+                } else {
+                    let create_index_query = format!(
+                        "CREATE INDEX IF NOT EXISTS idx_{0}_locked_until ON {0} (locked_until)",
+                        config.table
+                    );
+                    // MySQL doesn't support `IF NOT EXISTS` on `CREATE INDEX`, so we ignore the error if it already exists.
+                    let _ = sqlx::query(&create_index_query).execute(&pool).await;
+                }
             }
         }
 
@@ -367,7 +382,7 @@ impl SqlxConsumer {
     ) -> Result<Vec<sqlx::any::AnyRow>, ConsumerError> {
         let mut tx = self
             .pool
-            .begin()
+            .begin_with("BEGIN IMMEDIATE")
             .await
             .map_err(|e| ConsumerError::Connection(e.into()))?;
 

@@ -49,7 +49,8 @@ webhook_to_mongo:
 # Route 3: File to AMQP (RabbitMQ)
 file_ingest:
   input:
-    file: "./data/input.jsonl"
+    file:
+      path: "./data/input.jsonl"
   output:
     amqp:
       url: "amqp://localhost:5672"
@@ -74,12 +75,12 @@ aws_sqs_to_sns:
 # Route 5: IBM MQ Example
 ibm_mq_route:
   input:
-    ibm_mq:
+    ibmmq:
       queue_manager: "QM1"
-      connection_name: "localhost(1414)"
+      url: "localhost(1414)"
       channel: "DEV.APP.SVRCONN"
       queue: "DEV.QUEUE.1"
-      user: "app"
+      username: "app"
       password: "admin"
   output:
     memory:

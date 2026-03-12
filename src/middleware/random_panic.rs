@@ -171,9 +171,15 @@ impl MessagePublisher for RandomPanicPublisher {
         messages: Vec<CanonicalMessage>,
     ) -> Result<SentBatch, PublisherError> {
         if self.should_trigger_fault() {
-            self.inject_fault()?;
-            // This shouldn't be reached due to inject_fault returning an error in most cases
-            unreachable!()
+            match self.inject_fault() {
+                Ok(_) => {
+                    // The fault was triggered but didn't result in an error.
+                    // This path is unexpected for current fault modes but we handle it defensively.
+                    // We'll consider the batch "handled" by the fault injection.
+                    Ok(SentBatch::Ack)
+                }
+                Err(e) => Err(e),
+            }
         } else {
             self.inner.send_batch(messages).await
         }

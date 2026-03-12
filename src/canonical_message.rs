@@ -4,7 +4,7 @@
 //  git clone https://github.com/marcomq/mq-bridge
 
 use bytes::Bytes;
-use serde::de::DeserializeOwned;
+use serde::de::{DeserializeOwned, Error};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use uuid::Uuid;
@@ -65,6 +65,9 @@ impl CanonicalMessage {
                     message_id = Some(n);
                 }
             } else if let Some(n) = val.as_i64() {
+                if n < 0 {
+                    return Err(Error::custom("message_id cannot be negative"));
+                }
                 message_id = Some(n as u128);
             } else if let Some(n) = val.as_u64() {
                 message_id = Some(n as u128);
@@ -260,6 +263,10 @@ mod tests {
         // Numeric
         let msg = CanonicalMessage::from_json(json!({ "id": 100 })).unwrap();
         assert_eq!(msg.message_id, 100);
+
+        // Negative numeric
+        let msg_err = CanonicalMessage::from_json(json!({ "id": -1 }));
+        assert!(msg_err.is_err());
 
         // Mongo OID
         let oid = "507f1f77bcf86cd799439011";

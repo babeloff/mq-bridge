@@ -649,6 +649,7 @@ pub struct RandomPanicMiddleware {
     /// The type of fault to inject.
     pub mode: FaultMode,
     /// Trigger the fault on the Nth message (1-indexed). None = trigger on every message.
+    #[cfg_attr(feature = "schema", schemars(range(min = 1)))]
     pub trigger_on_message: Option<usize>,
     /// Enable/disable the fault injection without removing the configuration.
     #[serde(default = "default_true")]
@@ -1611,6 +1612,12 @@ pub struct ResponseConfig {
 pub struct SqlxConfig {
     /// Database connection URL.
     pub url: String,
+    /// Optional username. Takes precedence over any credentials embedded in the `url`.
+    #[serde(default)]
+    pub username: Option<String>,
+    /// Optional password. Takes precedence over any credentials embedded in the `url`.
+    #[serde(default)]
+    pub password: Option<String>,
     /// The table to interact with.
     pub table: String,
     /// (Publisher only) Optional. A custom SQL INSERT query. Use `?` as a placeholder for the payload.
@@ -1623,6 +1630,9 @@ pub struct SqlxConfig {
     /// (Consumer only) If true, delete messages after processing.
     #[serde(default)]
     pub delete_after_read: bool,
+    /// (Publisher only) If true, automatically create the table and indexes if they don't exist. Defaults to false.
+    #[serde(default)]
+    pub auto_create_table: bool,
     /// (Consumer only) Polling interval in milliseconds. Defaults to 100ms.
     pub polling_interval_ms: Option<u64>,
     /// TLS configuration for the database connection.
@@ -1917,6 +1927,12 @@ impl SecretExtractor for IbmMqConfig {
 
 impl SecretExtractor for SqlxConfig {
     fn extract_secrets(&mut self, prefix: &str, secrets: &mut HashMap<String, String>) {
+        if let Some(val) = self.username.take() {
+            secrets.insert(format!("{}__{}", prefix, "USERNAME"), val);
+        }
+        if let Some(val) = self.password.take() {
+            secrets.insert(format!("{}__{}", prefix, "PASSWORD"), val);
+        }
         self.tls
             .extract_secrets(&format!("{}__{}", prefix, "TLS"), secrets);
     }

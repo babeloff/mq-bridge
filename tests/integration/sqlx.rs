@@ -5,12 +5,22 @@ use mq_bridge::test_utils::{
     add_performance_result, run_chaos_pipeline_test, run_direct_perf_test, run_pipeline_test,
     run_test_with_docker, run_test_with_docker_controller, setup_logging, PERF_TEST_MESSAGE_COUNT,
 };
-use sqlx::postgres::PgPoolOptions;
 use std::sync::Arc;
 
 const DOCKER_COMPOSE_FILE: &str = "tests/integration/docker-compose/postgres.yml";
 const DATABASE_URL: &str = "postgres://testuser:testpass@localhost:5432/testdb";
 const TABLE_NAME: &str = "messages";
+
+async fn setup_db() {
+    let config = mq_bridge::models::SqlxConfig {
+        url: DATABASE_URL.to_string(),
+        table: TABLE_NAME.to_string(),
+        auto_create_table: true,
+        ..Default::default()
+    };
+    // This will trigger table creation
+    let _publisher = SqlxPublisher::new(&config).await.unwrap();
+}
 
 const CONFIG_YAML: &str = r#"
 routes:
@@ -44,47 +54,10 @@ routes:
       memory: { topic: "sqlx-test-out", capacity: {out_capacity} }
 "#;
 
-async fn setup_db() {
-    // Wait for DB to be ready
-    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-    let pool = PgPoolOptions::new()
-        .max_connections(5)
-        .connect(DATABASE_URL)
-        .await
-        .expect("Failed to connect to Postgres");
-
-    // Drop table if exists and create new one
-    sqlx::query(&format!("DROP TABLE IF EXISTS {}", TABLE_NAME))
-        .execute(&pool)
-        .await
-        .expect("Failed to drop table");
-
-    // The consumer expects an 'id' and 'payload' column.
-    // 'id' should be auto-incrementing.
-    sqlx::query(&format!(
-        r#"
-            CREATE TABLE {} (
-                id BIGSERIAL PRIMARY KEY,
-                payload BYTEA NOT NULL,
-                locked_until TIMESTAMPTZ
-            )
-            "#,
-        TABLE_NAME
-    ))
-    .execute(&pool)
-    .await
-    .expect("Failed to create table");
-
-    // Add an index on locked_until for efficient polling
-    sqlx::query(&format!("CREATE INDEX ON {} (locked_until)", TABLE_NAME))
-        .execute(&pool)
-        .await
-        .expect("Failed to create index on locked_until");
-}
-
 pub async fn test_sqlx_pipeline() {
     setup_logging();
     run_test_with_docker(DOCKER_COMPOSE_FILE, || async {
+        setup_db().await;
         let config_yaml = CONFIG_YAML.replace(
             "{out_capacity}",
             &(PERF_TEST_MESSAGE_COUNT + 1000).to_string(),
@@ -97,6 +70,7 @@ pub async fn test_sqlx_pipeline() {
 pub async fn test_sqlx_chaos() {
     setup_logging();
     run_test_with_docker_controller(DOCKER_COMPOSE_FILE, |controller| async move {
+        setup_db().await;
         let config_yaml = CONFIG_YAML.replace(
             "{out_capacity}",
             &(10000 + 1000).to_string(), // Using a smaller number for chaos tests
@@ -109,11 +83,13 @@ pub async fn test_sqlx_chaos() {
 pub async fn test_sqlx_performance_direct() {
     setup_logging();
     run_test_with_docker(DOCKER_COMPOSE_FILE, || async {
+        setup_db().await;
         let config = mq_bridge::models::SqlxConfig {
             url: DATABASE_URL.to_string(),
             table: TABLE_NAME.to_string(),
             delete_after_read: true,
             polling_interval_ms: Some(1),
+            auto_create_table: true,
             ..Default::default()
         };
 

@@ -685,10 +685,10 @@ mod tests {
 
     #[test]
     fn test_process_message_id_from_header_uuid() {
-        let uuid = Uuid::new_v4();
+        let uuid = fast_uuid_v7::gen_id();
         let headers = OwnedHeaders::new().insert(Header {
             key: "message_id",
-            value: Some(uuid.to_string().as_bytes()),
+            value: Some(fast_uuid_v7::format_uuid(uuid).to_string().as_bytes()),
         });
         let msg = create_mock_message(Some(b"payload"), None, Some(headers), 0, 0);
 
@@ -697,7 +697,7 @@ mod tests {
         process_message(&msg, &mut messages, &mut tpl).unwrap();
 
         assert_eq!(messages.len(), 1);
-        assert_eq!(messages[0].message_id, uuid.as_u128());
+        assert_eq!(messages[0].message_id, uuid);
     }
 
     #[test]
