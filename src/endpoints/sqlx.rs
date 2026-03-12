@@ -642,10 +642,15 @@ mod tests {
         sqlx::any::install_default_drivers();
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.db");
+
+        #[cfg(windows)]
+        let url = format!("sqlite:///{}", path.to_string_lossy().replace('\\', "/"));
+        #[cfg(not(windows))]
         let url = format!("sqlite://{}", path.to_str().unwrap());
 
-        // Explicitly create the file first to ensure it exists before connect.
-        tokio::fs::File::create(&path).await.unwrap();
+        // Explicitly create the file first and drop the handle to avoid locking issues on Windows.
+        // The `connect` call will create the file if it doesn't exist, but this can be racy in tests.
+        drop(tokio::fs::File::create(&path).await.unwrap());
 
         let mut conn = sqlx::AnyConnection::connect(&url).await.unwrap();
         sqlx::query(

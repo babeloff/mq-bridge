@@ -1280,14 +1280,15 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
     use std::sync::Mutex;
 
+    type ConsumerBehavior =
+        Arc<Mutex<dyn FnMut() -> Result<Box<dyn MessageConsumer>, anyhow::Error> + Send + Sync>>;
+    type PublisherBehavior =
+        Arc<Mutex<dyn FnMut() -> Result<Box<dyn MessagePublisher>, anyhow::Error> + Send + Sync>>;
+
     struct MockEndpointFactory {
         create_consumer_fail: bool,
-        consumer_behavior: Arc<
-            Mutex<dyn FnMut() -> Result<Box<dyn MessageConsumer>, anyhow::Error> + Send + Sync>,
-        >,
-        publisher_behavior: Arc<
-            Mutex<dyn FnMut() -> Result<Box<dyn MessagePublisher>, anyhow::Error> + Send + Sync>,
-        >,
+        consumer_behavior: ConsumerBehavior,
+        publisher_behavior: PublisherBehavior,
     }
 
     impl std::fmt::Debug for MockEndpointFactory {
