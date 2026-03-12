@@ -1665,17 +1665,62 @@
       "description": "General SQLx connection configuration.",
       "type": "object",
       "properties": {
+        "acquire_timeout_ms": {
+          "description": "Timeout for acquiring a connection from the pool in milliseconds. Defaults to 30000ms.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
         "delete_after_read": {
           "description": "(Consumer only) If true, delete messages after processing.",
           "type": "boolean",
           "default": false
         },
+        "idle_timeout_ms": {
+          "description": "Maximum idle time for a connection in milliseconds. Defaults to 600000ms (10 minutes).",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
         "insert_query": {
-          "description": "(Publisher only) A custom SQL INSERT query. Use `?` as a placeholder for the payload.\nIf not provided, a default `INSERT INTO {table} (payload) VALUES (?)` is used.",
+          "description": "(Publisher only) Optional. A custom SQL INSERT query. Use `?` as a placeholder for the payload.\nIf not provided, a default `INSERT INTO {table} (payload) VALUES (?)` is used.",
           "type": [
             "string",
             "null"
           ]
+        },
+        "max_connections": {
+          "description": "Maximum number of connections in the pool. Defaults to 10.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "max_lifetime_ms": {
+          "description": "Maximum lifetime of a connection in milliseconds. Defaults to 1800000ms (30 minutes).",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "min_connections": {
+          "description": "Minimum number of connections to keep in the pool. Defaults to 0.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
         },
         "polling_interval_ms": {
           "description": "(Consumer only) Polling interval in milliseconds. Defaults to 100ms.",
@@ -1687,7 +1732,7 @@
           "minimum": 0
         },
         "select_query": {
-          "description": "(Consumer only) A custom SQL SELECT query to fetch messages.\nThe query should select rows to be processed.",
+          "description": "(Consumer only) Optional. A custom SQL SELECT query to fetch messages. The query should select rows\nto be processed. **It should not include a `LIMIT` clause**, as the bridge will append\none based on the route's `batch_size`.",
           "type": [
             "string",
             "null"
@@ -1696,6 +1741,18 @@
         "table": {
           "description": "The table to interact with.",
           "type": "string"
+        },
+        "tls": {
+          "description": "TLS configuration for the database connection.",
+          "$ref": "#/$defs/TlsConfig",
+          "default": {
+            "accept_invalid_certs": false,
+            "ca_file": null,
+            "cert_file": null,
+            "cert_password": null,
+            "key_file": null,
+            "required": false
+          }
         },
         "url": {
           "description": "Database connection URL.",
