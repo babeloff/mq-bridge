@@ -12,7 +12,6 @@ use crate::traits::{
 use crate::CanonicalMessage;
 use anyhow::{anyhow, Context};
 use async_trait::async_trait;
-use regex::Regex;
 use sqlx::any::AnyPoolOptions;
 use sqlx::{AnyPool, Row};
 use std::time::Duration;
@@ -24,6 +23,31 @@ fn is_valid_table_name(name: &str) -> bool {
     }
     name.split('.')
         .all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
+}
+
+/// Checks if a SQL query string contains a `(payload)` clause, ignoring case and whitespace.
+fn contains_payload_clause(query: &str) -> bool {
+    let lower_query = query.to_lowercase();
+    let mut search_start = 0;
+    while let Some(open_paren_idx) = lower_query[search_start..].find('(') {
+        let absolute_open_idx = search_start + open_paren_idx;
+        // Find the matching closing parenthesis
+        if let Some(close_paren_idx) = lower_query[absolute_open_idx..].find(')') {
+            let absolute_close_idx = absolute_open_idx + close_paren_idx;
+            // Extract content between parentheses
+            let content = &lower_query[absolute_open_idx + 1..absolute_close_idx];
+            // Trim whitespace and check if it's "payload"
+            if content.trim() == "payload" {
+                return true;
+            }
+            // Continue searching after the found closing parenthesis
+            search_start = absolute_close_idx + 1;
+        } else {
+            // No closing parenthesis found, stop searching
+            break;
+        }
+    }
+    false
 }
 
 fn build_sqlx_url_with_tls(config: &SqlxConfig) -> anyhow::Result<String> {
@@ -232,9 +256,7 @@ impl MessagePublisher for SqlxPublisher {
             }
         };
 
-        // Use a regex for a more robust check that is case-insensitive and whitespace-tolerant.
-        let payload_re = Regex::new(r"(?i)\(\s*payload\s*\)").unwrap();
-        if !payload_re.is_match(base_query) {
+        if !contains_payload_clause(base_query) {
             warn!("Could not optimize batch insert due to custom query format. Falling back to iterative inserts.");
             return self.send_batch_iterative(messages).await;
         }
