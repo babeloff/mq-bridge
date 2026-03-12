@@ -19,8 +19,8 @@ use rdkafka::{
     ClientConfig, Message, TopicPartitionList,
 };
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
-use tracing::{debug, info, trace, warn};
+use std::time::Duration;
+use tracing::{debug, info, trace};
 use uuid::Uuid;
 
 pub struct KafkaPublisher {
@@ -355,7 +355,7 @@ impl MessageConsumer for KafkaConsumer {
             .context("Failed to receive Kafka message")?;
         let mut tpl = TopicPartitionList::new();
         let mut messages = Vec::new();
-        process_message(message, &mut messages, &mut tpl)?;
+        process_message(&message, &mut messages, &mut tpl)?;
         let canonical_message = messages.pop().unwrap();
 
         let reply_topic = canonical_message.metadata.get("reply_to").cloned();
@@ -424,8 +424,8 @@ impl MessageConsumer for KafkaConsumer {
 }
 
 /// Helper function to process a Kafka message and add it to the batch.
-fn process_message(
-    message: rdkafka::message::BorrowedMessage,
+fn process_message<M: Message>(
+    message: &M,
     messages: &mut Vec<CanonicalMessage>,
     last_offset_tpl: &mut TopicPartitionList,
 ) -> anyhow::Result<()> {
@@ -561,7 +561,7 @@ async fn receive_batch_internal(
             for message_result in chunk {
                 match message_result {
                     Ok(message) => {
-                        process_message(message, &mut messages, &mut last_offset_tpl)?;
+                        process_message(&message, &mut messages, &mut last_offset_tpl)?;
                         // process_message pushes to messages, so we can peek the last one
                         if let Some(last_msg) = messages.last() {
                             reply_infos.push((
@@ -648,19 +648,17 @@ async fn handle_kafka_replies(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rdkafka::message::{BorrowedMessage, Header, OwnedMessage};
+    use rdkafka::message::{Header, OwnedMessage};
 
     // A helper to create a mock message for testing process_message
-    fn create_mock_message<'a>(
-        payload: Option<&'a [u8]>,
-        key: Option<&'a [u8]>,
+    fn create_mock_message(
+        payload: Option<&[u8]>,
+        key: Option<&[u8]>,
         headers: Option<OwnedHeaders>,
         offset: i64,
         partition: i32,
-    ) -> BorrowedMessage<'a> {
-        // This is a bit of a hack. We create an OwnedMessage and then borrow it.
-        // This is the easiest way to get a BorrowedMessage with all the fields we need.
-        let owned_message = OwnedMessage::new(
+    ) -> OwnedMessage {
+        OwnedMessage::new(
             payload.map(|p| p.to_vec()),
             key.map(|k| k.to_vec()),
             "test_topic".to_string(),
@@ -668,8 +666,7 @@ mod tests {
             partition,
             offset,
             headers,
-        );
-        owned_message.borrow()
+        )
     }
 
     #[test]
@@ -680,7 +677,7 @@ mod tests {
 
         let mut messages = Vec::new();
         let mut tpl = TopicPartitionList::new();
-        process_message(msg, &mut messages, &mut tpl).unwrap();
+        process_message(&msg, &mut messages, &mut tpl).unwrap();
 
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].message_id, message_id);
@@ -697,7 +694,7 @@ mod tests {
 
         let mut messages = Vec::new();
         let mut tpl = TopicPartitionList::new();
-        process_message(msg, &mut messages, &mut tpl).unwrap();
+        process_message(&msg, &mut messages, &mut tpl).unwrap();
 
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].message_id, uuid.as_u128());
@@ -712,7 +709,7 @@ mod tests {
 
         let mut messages = Vec::new();
         let mut tpl = TopicPartitionList::new();
-        process_message(msg, &mut messages, &mut tpl).unwrap();
+        process_message(&msg, &mut messages, &mut tpl).unwrap();
 
         let expected_id = ((partition as u32 as u128) << 64) | (offset as u64 as u128);
         assert_eq!(messages.len(), 1);
