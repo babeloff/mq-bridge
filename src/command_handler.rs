@@ -45,7 +45,13 @@ impl MessagePublisher for CommandPublisher {
         let original_id = message.message_id;
         match self.handler.handle(message).await {
             Ok(Handled::Publish(mut response_msg)) => {
-                response_msg.message_id = original_id;
+                // For request-reply correlation, we ensure the original message's ID is
+                // available in the response metadata. This doesn't overwrite an existing
+                // correlation_id, which might be important if the handler is part of a chain.
+                response_msg
+                    .metadata
+                    .entry("correlation_id".to_string())
+                    .or_insert_with(|| format!("{:032x}", original_id));
                 self.inner.send(response_msg).await
             }
             Ok(Handled::Ack) => Ok(Sent::Ack),

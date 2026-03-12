@@ -12,6 +12,7 @@ use crate::traits::{
 use crate::CanonicalMessage;
 use anyhow::{anyhow, Context};
 use async_trait::async_trait;
+use regex::Regex;
 use sqlx::any::AnyPoolOptions;
 use sqlx::{AnyPool, Row};
 use std::time::Duration;
@@ -231,7 +232,9 @@ impl MessagePublisher for SqlxPublisher {
             }
         };
 
-        if !base_query.to_uppercase().contains("(PAYLOAD)") {
+        // Use a regex for a more robust check that is case-insensitive and whitespace-tolerant.
+        let payload_re = Regex::new(r"(?i)\(\s*payload\s*\)").unwrap();
+        if !payload_re.is_match(base_query) {
             warn!("Could not optimize batch insert due to custom query format. Falling back to iterative inserts.");
             return self.send_batch_iterative(messages).await;
         }
@@ -455,9 +458,11 @@ impl SqlxConsumer {
         &self,
         limit: usize,
     ) -> Result<Vec<sqlx::any::AnyRow>, ConsumerError> {
+        // Use `BEGIN IMMEDIATE` to acquire a RESERVED lock on the database file,
+        // preventing other connections from reading until this transaction is complete.
         let mut tx = self
             .pool
-            .begin()
+            .begin_with("BEGIN IMMEDIATE")
             .await
             .map_err(|e| ConsumerError::Connection(e.into()))?;
 
