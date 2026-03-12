@@ -14,6 +14,7 @@ use anyhow::{anyhow, Context};
 use async_trait::async_trait;
 use sqlx::any::AnyPoolOptions;
 use sqlx::{AnyPool, Row};
+use std::borrow::Cow;
 use std::time::Duration;
 use tracing::{info, trace, warn};
 
@@ -159,7 +160,7 @@ impl SqlxPublisher {
         let driver_name = conn.backend_name().to_string();
         drop(conn);
 
-        info!(table = %config.table, driver = %driver_name, "SQLx publisher connected to {}", driver_name);
+        info!(table = %config.table, driver = %driver_name, "SQLx publisher connected");
 
         if config.auto_create_table {
             // --- Auto-create table and index ---
@@ -191,12 +192,47 @@ impl SqlxPublisher {
                         config.table, e
                     );
                 } else {
-                    let create_index_query = format!(
-                        "CREATE INDEX IF NOT EXISTS idx_{0}_locked_until ON {0} (locked_until)",
-                        config.table
-                    );
-                    // MySQL doesn't support `IF NOT EXISTS` on `CREATE INDEX`, so we ignore the error if it already exists.
-                    let _ = sqlx::query(&create_index_query).execute(&pool).await;
+                    let table_name_for_index =
+                        config.table.split('.').last().unwrap_or(&config.table);
+                    let index_name = format!("idx_{}_locked_until", table_name_for_index);
+
+                    let create_index_query = match driver_name.as_str() {
+                        "PostgreSQL" | "SQLite" => {
+                            format!(
+                                "CREATE INDEX IF NOT EXISTS {} ON {} (locked_until)",
+                                index_name, config.table
+                            )
+                        }
+                        "MySQL" | "MariaDB" => {
+                            format!(
+                                "CREATE INDEX {} ON {} (locked_until)",
+                                index_name, config.table
+                            )
+                        }
+                        "Microsoft SQL Server" => {
+                            format!(
+                                "IF NOT EXISTS (SELECT * FROM sys.indexes WHERE name = N'{}' AND object_id = OBJECT_ID(N'{}'))
+                                CREATE INDEX {} ON {} (locked_until)",
+                                index_name, config.table, index_name, config.table
+                            )
+                        }
+                        _ => "".to_string(),
+                    };
+
+                    if !create_index_query.is_empty() {
+                        if let Err(e) = sqlx::query(&create_index_query).execute(&pool).await {
+                            if (driver_name.as_str() == "MySQL"
+                                || driver_name.as_str() == "MariaDB")
+                                && e.as_database_error().map_or(false, |db_err| {
+                                    db_err.code() == Some(Cow::from("1061"))
+                                })
+                            {
+                                trace!("Index {} on {} already exists.", index_name, config.table);
+                            } else {
+                                warn!("Failed to create index on '{}': {}", config.table, e);
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -345,17 +381,32 @@ impl SqlxConsumer {
         drop(conn);
         info!(table = %config.table, driver = %driver_name, "SQLx consumer connected");
 
-        let select_query =
-            config
-                .select_query
-                .clone()
-                .unwrap_or_else(|| match driver_name.as_str() {
-                    "PostgreSQL" => {
-                        // This CTE-based query atomically finds available rows, locks them,
-                        // updates their `locked_until` timestamp, and returns them.
-                        // This is a robust pattern for a work queue with multiple consumers.
-                        format!(
-                            r#"
+        let select_query = if let Some(query) = &config.select_query {
+            match driver_name.as_str() {
+                "PostgreSQL" => {
+                    if !query.contains("$1") {
+                        return Err(anyhow!("Custom select_query for PostgreSQL must contain a '$1' placeholder for the batch size limit."));
+                    }
+                    query.clone()
+                }
+                "Microsoft SQL Server" => {
+                    if !query.contains("@p1") {
+                        return Err(anyhow!("Custom select_query for SQL Server must contain a '@p1' placeholder for the batch size limit."));
+                    }
+                    query.clone()
+                }
+                _ => {
+                    return Err(anyhow!("Custom select_query is not supported for the '{}' driver. It is only supported for PostgreSQL and Microsoft SQL Server.", driver_name));
+                }
+            }
+        } else {
+            match driver_name.as_str() {
+                "PostgreSQL" => {
+                    // This CTE-based query atomically finds available rows, locks them,
+                    // updates their `locked_until` timestamp, and returns them.
+                    // This is a robust pattern for a work queue with multiple consumers.
+                    format!(
+                        r#"
 WITH available AS (
     SELECT id FROM {0}
     WHERE locked_until IS NULL OR locked_until < NOW()
@@ -370,23 +421,24 @@ updated AS (
     RETURNING id, payload
 )
 SELECT id, payload FROM updated"#,
-                            config.table,
-                        )
-                    }
-                    "Microsoft SQL Server" => {
-                        // This query atomically finds available rows, locks them,
-                        // updates their `locked_until` timestamp, and returns them.
-                        format!(
-                            r#"
+                        config.table,
+                    )
+                }
+                "Microsoft SQL Server" => {
+                    // This query atomically finds available rows, locks them,
+                    // updates their `locked_until` timestamp, and returns them.
+                    format!(
+                        r#"
 UPDATE {0}
 SET locked_until = DATEADD(second, 60, GETUTCDATE())
 OUTPUT INSERTED.id, INSERTED.payload
 WHERE id IN (SELECT TOP (@p1) id FROM {0} WITH (UPDLOCK, READPAST) WHERE locked_until IS NULL OR locked_until < GETUTCDATE() ORDER BY id)"#,
-                            config.table
-                        )
-                    }
-                    _ => format!("SELECT id, payload FROM {}", config.table),
-                });
+                        config.table
+                    )
+                }
+                _ => format!("SELECT id, payload FROM {}", config.table),
+            }
+        };
         Ok(Self {
             pool,
             select_query,
