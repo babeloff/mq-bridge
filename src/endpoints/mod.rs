@@ -390,6 +390,16 @@ fn check_consumer_recursive(
             }
             Ok(warnings)
         }
+        #[cfg(feature = "sqlx")]
+        EndpointType::Sqlx(cfg) => {
+            if cfg.insert_query.is_some() {
+                warnings.push(
+                    "Endpoint 'sqlx' is used as a consumer, but 'insert_query' is a publisher-only option and will be ignored."
+                    .to_string()
+                );
+            }
+            Ok(warnings)
+        }
         #[cfg(feature = "sled")]
         EndpointType::Sled(_) => Ok(warnings),
         EndpointType::Static(_) => Ok(warnings),

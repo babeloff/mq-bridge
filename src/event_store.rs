@@ -644,4 +644,138 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].offset, 2);
     }
+
+    #[tokio::test]
+    async fn test_append_batch() {
+        let store = Arc::new(EventStore::new(RetentionPolicy::default()));
+        let messages = vec![
+            CanonicalMessage::from("batch1"),
+            CanonicalMessage::from("batch2"),
+        ];
+        let last_offset = store.append_batch(messages).await;
+        assert_eq!(last_offset, 2);
+
+        let events = store.get_events_since(0, 10).await.unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].offset, 1);
+        assert_eq!(events[1].offset, 2);
+    }
+
+    #[tokio::test]
+    async fn test_retention_policy_max_age() {
+        let policy = RetentionPolicy {
+            max_age: Some(Duration::from_millis(50)),
+            gc_interval: Duration::from_millis(10),
+            max_count: None,
+            ..Default::default()
+        };
+        let store = Arc::new(EventStore::new(policy));
+        store.register_subscriber("subA".into()).await;
+
+        store.append(CanonicalMessage::from("1")).await;
+        sleep(Duration::from_millis(60)).await;
+        store.append(CanonicalMessage::from("2")).await;
+
+        // Acking offset 0 for subA will not remove anything based on acks, but it will trigger GC.
+        store.ack("subA", 0).await;
+        sleep(Duration::from_millis(20)).await; // ensure gc_interval is met
+        store.run_gc().await;
+
+        // "1" should be removed due to max_age.
+        let res = store.get_events_since(0, 10).await;
+        match res {
+            Err(ConsumerError::Gap { requested, base }) => {
+                assert_eq!(requested, 1);
+                assert_eq!(base, 2);
+            }
+            _ => panic!("Expected Gap error, got {:?}", res),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_subscriber_timeout_gc() {
+        let policy = RetentionPolicy {
+            max_count: None,
+            gc_interval: Duration::from_millis(10),
+            subscriber_timeout: Duration::from_millis(50), // Short timeout
+            max_age: None,
+        };
+        let store = Arc::new(EventStore::new(policy));
+
+        store.append(CanonicalMessage::from("1")).await; // Offset 1
+        store.append(CanonicalMessage::from("2")).await; // Offset 2
+
+        // Register two subscribers
+        store.register_subscriber("subA".into()).await; // Will time out
+        store.register_subscriber("subB".into()).await; // Will stay active
+
+        // Ack offset 1 for subA
+        store.ack("subA", 1).await;
+
+        // Wait for subA to time out
+        sleep(Duration::from_millis(60)).await;
+
+        // Ack offset 2 for subB
+        store.ack("subB", 2).await;
+
+        // Force GC. It should ignore subA's ack state (stuck at 1) and GC up to subB's ack (2).
+        store.run_gc().await;
+
+        // Both messages should be gone.
+        let res = store.get_events_since(0, 10).await;
+        match res {
+            Err(ConsumerError::Gap { requested, base }) => {
+                assert_eq!(requested, 1);
+                assert_eq!(base, 3); // Base offset is next_offset (1-based)
+            }
+            _ => panic!("Expected Gap error, got {:?}", res),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_event_store_consumer_waits_for_events() {
+        let store = Arc::new(EventStore::new(RetentionPolicy::default()));
+        let mut consumer = store.consumer("consumer1".to_string());
+
+        let producer_task = tokio::spawn({
+            let store = store.clone();
+            async move {
+                sleep(Duration::from_millis(50)).await;
+                store.append(CanonicalMessage::from("event1")).await;
+            }
+        });
+
+        // Consumer should wait for the event
+        let batch = consumer.receive_batch(1).await.unwrap();
+        assert_eq!(batch.messages.len(), 1);
+        assert_eq!(batch.messages[0].get_payload_str(), "event1");
+
+        // Ack the batch
+        (batch.commit)(vec![MessageDisposition::Ack]).await.unwrap();
+
+        producer_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_event_store_consumer_nack() {
+        let store = Arc::new(EventStore::new(RetentionPolicy::default()));
+        let mut consumer = store.consumer("consumer_nack".to_string());
+
+        store.append(CanonicalMessage::from("event1")).await;
+
+        // Receive first batch and Nack it
+        let batch1 = consumer.receive_batch(1).await.unwrap();
+        (batch1.commit)(vec![MessageDisposition::Nack])
+            .await
+            .unwrap();
+
+        // Receive again, should get the same message
+        let batch2 = consumer.receive_batch(1).await.unwrap();
+        assert_eq!(batch2.messages[0].get_payload_str(), "event1");
+
+        // Ack it this time
+        (batch2.commit)(vec![MessageDisposition::Ack])
+            .await
+            .unwrap();
+    }
 }

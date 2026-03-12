@@ -12,30 +12,182 @@ use crate::traits::{
 use crate::CanonicalMessage;
 use anyhow::{anyhow, Context};
 use async_trait::async_trait;
+use sqlx::any::AnyPoolOptions;
 use sqlx::{AnyPool, Row};
-use std::any::Any;
 use std::time::Duration;
-use tracing::trace;
+use tracing::{info, trace, warn};
+
+fn is_valid_table_name(name: &str) -> bool {
+    !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+fn build_sqlx_url_with_tls(config: &SqlxConfig) -> anyhow::Result<String> {
+    if !config.tls.required {
+        return Ok(config.url.clone());
+    }
+
+    let mut url = url::Url::parse(&config.url)?;
+    let scheme = url.scheme();
+
+    match scheme {
+        "postgres" | "postgresql" => {
+            let mut query_pairs = url.query_pairs_mut();
+            if config.tls.accept_invalid_certs {
+                query_pairs.append_pair("sslmode", "require");
+            } else if config.tls.ca_file.is_some() {
+                query_pairs.append_pair("sslmode", "verify-ca");
+            } else {
+                query_pairs.append_pair("sslmode", "require");
+            }
+
+            if let Some(ca) = &config.tls.ca_file {
+                query_pairs.append_pair("sslrootcert", ca);
+            }
+            if let Some(cert) = &config.tls.cert_file {
+                query_pairs.append_pair("sslcert", cert);
+            }
+            if let Some(key) = &config.tls.key_file {
+                query_pairs.append_pair("sslkey", key);
+            }
+            if let Some(pass) = &config.tls.cert_password {
+                query_pairs.append_pair("sslpassword", pass);
+            }
+        }
+        "mysql" | "mariadb" => {
+            // MySQL/MariaDB support for TLS options in URL is more limited.
+            // It's generally better to use a client-side configuration file (`my.cnf`)
+            // for complex TLS setups. We'll add what we can.
+            warn!("For complex MySQL/MariaDB TLS setups, using a client configuration file (my.cnf) is recommended over URL parameters.");
+            let mut query_pairs = url.query_pairs_mut();
+            query_pairs.append_pair("ssl-mode", "REQUIRED");
+        }
+        "mssql" | "sqlserver" => {
+            let mut query_pairs = url.query_pairs_mut();
+            if config.tls.accept_invalid_certs {
+                query_pairs.append_pair("encrypt", "true");
+                query_pairs.append_pair("trust-server-certificate", "true");
+            } else {
+                query_pairs.append_pair("encrypt", "strict");
+            }
+        }
+        _ => {}
+    }
+
+    Ok(url.to_string())
+}
+
+async fn create_sqlx_pool(config: &SqlxConfig) -> anyhow::Result<AnyPool> {
+    let url = build_sqlx_url_with_tls(config)?;
+    let mut pool_options = AnyPoolOptions::new();
+
+    if let Some(max_conn) = config.max_connections {
+        pool_options = pool_options.max_connections(max_conn);
+    }
+    if let Some(min_conn) = config.min_connections {
+        pool_options = pool_options.min_connections(min_conn);
+    }
+    if let Some(timeout) = config.acquire_timeout_ms {
+        pool_options = pool_options.acquire_timeout(Duration::from_millis(timeout));
+    }
+    if let Some(timeout) = config.idle_timeout_ms {
+        pool_options = pool_options.idle_timeout(Duration::from_millis(timeout));
+    }
+    if let Some(lifetime) = config.max_lifetime_ms {
+        pool_options = pool_options.max_lifetime(Duration::from_millis(lifetime));
+    }
+
+    Ok(pool_options.connect(&url).await?)
+}
 
 pub struct SqlxPublisher {
     pool: AnyPool,
     insert_query: String,
+    driver_name: String,
+    table: String,
 }
 
 impl SqlxPublisher {
     pub async fn new(config: &SqlxConfig) -> anyhow::Result<Self> {
-        let pool = AnyPool::connect(&config.url).await?;
-        let insert_query = config
-            .insert_query
-            .clone()
-            .unwrap_or_else(|| format!("INSERT INTO {} (payload) VALUES (?)", config.table));
-        Ok(Self { pool, insert_query })
+        sqlx::any::install_default_drivers();
+        if !is_valid_table_name(&config.table) {
+            return Err(anyhow!(
+                "Invalid table name: '{}'. Only alphanumeric characters and underscores are allowed.",
+                config.table
+            ));
+        }
+        let pool = create_sqlx_pool(config).await?;
+        let table = config.table.clone();
+
+        // Acquire a connection to determine the driver so we can use the correct SQL syntax.
+        let conn = pool.acquire().await?;
+        let driver_name = conn.backend_name().to_string();
+        drop(conn);
+
+        info!(url = %config.url, table = %config.table, driver = %driver_name, "SQLx publisher connected to {}", driver_name);
+
+        // --- Auto-create table and index ---
+        let create_table_query = match driver_name.as_str() {
+            "PostgreSQL" => format!(
+                "CREATE TABLE IF NOT EXISTS {} (id BIGSERIAL PRIMARY KEY, payload BYTEA NOT NULL, locked_until TIMESTAMPTZ, created_at TIMESTAMPTZ DEFAULT NOW())",
+                config.table
+            ),
+            "MySQL" | "MariaDB" => format!(
+                "CREATE TABLE IF NOT EXISTS {} (id BIGINT AUTO_INCREMENT PRIMARY KEY, payload BLOB NOT NULL, locked_until DATETIME, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)",
+                config.table
+            ),
+            "SQLite" => format!(
+                "CREATE TABLE IF NOT EXISTS {} (id INTEGER PRIMARY KEY AUTOINCREMENT, payload BLOB NOT NULL, locked_until DATETIME, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)",
+                config.table
+            ),
+            "Microsoft SQL Server" => format!(
+                "IF NOT EXISTS (SELECT * FROM sys.objects WHERE object_id = OBJECT_ID(N'[dbo].[{0}]') AND type in (N'U'))
+                CREATE TABLE [dbo].[{0}] (id BIGINT IDENTITY(1,1) PRIMARY KEY, payload VARBINARY(MAX) NOT NULL, locked_until DATETIME2, created_at DATETIME2 DEFAULT GETUTCDATE())",
+                config.table
+            ),
+            _ => "".to_string(), // Don't attempt for unknown drivers
+        };
+
+        if !create_table_query.is_empty() {
+            if let Err(e) = sqlx::query(&create_table_query).execute(&pool).await {
+                warn!(
+                    "Failed to auto-create table '{}': {}. Please ensure it exists.",
+                    config.table, e
+                );
+            } else {
+                let create_index_query = format!(
+                    "CREATE INDEX IF NOT EXISTS idx_{0}_locked_until ON {0} (locked_until)",
+                    config.table
+                );
+                // MySQL doesn't support `IF NOT EXISTS` on `CREATE INDEX`, so we ignore the error if it already exists.
+                let _ = sqlx::query(&create_index_query).execute(&pool).await;
+            }
+        }
+
+        let insert_query =
+            config
+                .insert_query
+                .clone()
+                .unwrap_or_else(|| match driver_name.as_str() {
+                    "PostgreSQL" => format!("INSERT INTO {} (payload) VALUES ($1)", config.table),
+                    "Microsoft SQL Server" => {
+                        format!("INSERT INTO {} (payload) VALUES (@p1)", config.table)
+                    }
+                    _ => format!("INSERT INTO {} (payload) VALUES (?)", config.table),
+                });
+
+        Ok(Self {
+            pool,
+            insert_query,
+            driver_name,
+            table,
+        })
     }
 }
 
 #[async_trait]
 impl MessagePublisher for SqlxPublisher {
     async fn send(&self, message: CanonicalMessage) -> Result<Sent, PublisherError> {
+        trace!(message_id = %format!("{:032x}", message.message_id), table = %self.table, "Publishing to SQL");
         sqlx::query(&self.insert_query)
             .bind(message.payload.to_vec())
             .execute(&self.pool)
@@ -48,13 +200,72 @@ impl MessagePublisher for SqlxPublisher {
         &self,
         messages: Vec<CanonicalMessage>,
     ) -> Result<SentBatch, PublisherError> {
+        if messages.is_empty() {
+            return Ok(SentBatch::Ack);
+        }
+
         trace!(count = messages.len(), message_ids = ?LazyMessageIds(&messages), "Publishing batch to SQLx");
+
+        // Manually construct the query with appropriate placeholders because
+        // sqlx::QueryBuilder with the `Any` driver does not correctly rewrite `?` to `$N`.
+        let base_query = match self.insert_query.to_uppercase().rfind("VALUES") {
+            Some(pos) => &self.insert_query[..pos],
+            None => {
+                warn!("Could not optimize batch insert due to custom query format. Falling back to iterative inserts.");
+                return self.send_batch_iterative(messages).await;
+            }
+        };
+
+        if !base_query.to_uppercase().contains("(PAYLOAD)") {
+            warn!("Could not optimize batch insert due to custom query format. Falling back to iterative inserts.");
+            return self.send_batch_iterative(messages).await;
+        }
+
+        let mut placeholders = String::new();
+        for i in 0..messages.len() {
+            if i > 0 {
+                placeholders.push_str(", ");
+            }
+            placeholders.push('(');
+            match self.driver_name.as_str() {
+                "PostgreSQL" => placeholders.push_str(&format!("${}", i + 1)),
+                "Microsoft SQL Server" => placeholders.push_str(&format!("@p{}", i + 1)),
+                _ => placeholders.push('?'),
+            }
+            placeholders.push(')');
+        }
+
+        let sql = format!("{} VALUES {}", base_query, placeholders);
+
+        let mut query = sqlx::query(&sql);
+        for msg in messages {
+            query = query.bind(msg.payload.to_vec());
+        }
+
+        query
+            .execute(&self.pool)
+            .await
+            .map_err(|e| PublisherError::Retryable(anyhow!(e)))?;
+        Ok(SentBatch::Ack)
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+impl SqlxPublisher {
+    /// Fallback implementation that inserts messages one by one within a transaction.
+    /// This is less performant than a single multi-row insert statement.
+    async fn send_batch_iterative(
+        &self,
+        messages: Vec<CanonicalMessage>,
+    ) -> Result<SentBatch, PublisherError> {
         let mut tx = self
             .pool
             .begin()
             .await
             .map_err(|e| PublisherError::Retryable(anyhow!(e)))?;
-
         for msg in messages {
             sqlx::query(&self.insert_query)
                 .bind(msg.payload.to_vec())
@@ -62,16 +273,10 @@ impl MessagePublisher for SqlxPublisher {
                 .await
                 .map_err(|e| PublisherError::Retryable(anyhow!(e)))?;
         }
-
         tx.commit()
             .await
             .map_err(|e| PublisherError::Retryable(anyhow!(e)))?;
-
         Ok(SentBatch::Ack)
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 }
 
@@ -81,23 +286,222 @@ pub struct SqlxConsumer {
     delete_after_read: bool,
     table: String,
     polling_interval: Duration,
+    driver_name: String,
 }
 
 impl SqlxConsumer {
     pub async fn new(config: &SqlxConfig) -> anyhow::Result<Self> {
-        let pool = AnyPool::connect(&config.url).await?;
-        let select_query = config.select_query.clone().unwrap_or_else(|| {
-            // A basic select query that might need adjustment for different SQL dialects
-            // regarding locking and fetching. This is a reasonable default.
-            format!("SELECT id, payload FROM {} LIMIT 100", config.table)
-        });
+        sqlx::any::install_default_drivers();
+        if !is_valid_table_name(&config.table) {
+            return Err(anyhow!(
+                "Invalid table name: '{}'. Only alphanumeric characters and underscores are allowed.",
+                config.table
+            ));
+        }
+        let pool = create_sqlx_pool(config).await?;
+
+        // Acquire a connection to determine the driver so we can use the correct SQL syntax later.
+        let conn = pool.acquire().await?;
+        let driver_name = conn.backend_name().to_string();
+        // Immediately return the connection to the pool.
+        drop(conn);
+        info!(url = %config.url, table = %config.table, driver = %driver_name, "SQLx consumer connected");
+
+        let select_query =
+            config
+                .select_query
+                .clone()
+                .unwrap_or_else(|| match driver_name.as_str() {
+                    "PostgreSQL" => {
+                        // This CTE-based query atomically finds available rows, locks them,
+                        // updates their `locked_until` timestamp, and returns them.
+                        // This is a robust pattern for a work queue with multiple consumers.
+                        format!(
+                            r#"
+WITH available AS (
+    SELECT id FROM {0}
+    WHERE locked_until IS NULL OR locked_until < NOW()
+    ORDER BY id
+    LIMIT $1
+    FOR UPDATE SKIP LOCKED
+),
+updated AS (
+    UPDATE {0}
+    SET locked_until = NOW() + interval '60 seconds'
+    WHERE id IN (SELECT id FROM available)
+    RETURNING id, payload
+)
+SELECT id, payload FROM updated"#,
+                            config.table,
+                        )
+                    }
+                    "Microsoft SQL Server" => {
+                        // This query atomically finds available rows, locks them,
+                        // updates their `locked_until` timestamp, and returns them.
+                        format!(
+                            r#"
+UPDATE {0}
+SET locked_until = DATEADD(second, 60, GETUTCDATE())
+OUTPUT INSERTED.id, INSERTED.payload
+WHERE id IN (SELECT TOP (@p1) id FROM {0} WITH (UPDLOCK, READPAST) WHERE locked_until IS NULL OR locked_until < GETUTCDATE() ORDER BY id)"#,
+                            config.table
+                        )
+                    }
+                    _ => format!("SELECT id, payload FROM {}", config.table),
+                });
         Ok(Self {
             pool,
             select_query,
             delete_after_read: config.delete_after_read,
             table: config.table.clone(),
             polling_interval: Duration::from_millis(config.polling_interval_ms.unwrap_or(100)),
+            driver_name,
         })
+    }
+}
+
+impl SqlxConsumer {
+    async fn fetch_and_lock_mysql(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<sqlx::any::AnyRow>, ConsumerError> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| ConsumerError::Connection(e.into()))?;
+
+        // 1. Find and lock rows
+        let lock_query = format!(
+            "SELECT id FROM {} WHERE locked_until IS NULL OR locked_until < NOW() ORDER BY id LIMIT ? FOR UPDATE SKIP LOCKED",
+            self.table
+        );
+
+        let locked_ids: Vec<i64> = sqlx::query(&lock_query)
+            .bind(limit as i64)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(|e| ConsumerError::Connection(e.into()))?
+            .into_iter()
+            .map(|row| row.get("id"))
+            .collect();
+
+        if locked_ids.is_empty() {
+            tx.commit().await.ok(); // Nothing to do, commit and return
+            return Ok(vec![]);
+        }
+
+        // 2. Update the `locked_until` for the locked rows
+        let placeholders = locked_ids
+            .iter()
+            .map(|_| "?")
+            .collect::<Vec<_>>()
+            .join(", ");
+        let update_query = format!(
+            "UPDATE {} SET locked_until = NOW() + INTERVAL 60 SECOND WHERE id IN ({})",
+            self.table, placeholders
+        );
+
+        let mut query = sqlx::query(&update_query);
+        for id in &locked_ids {
+            query = query.bind(*id);
+        }
+
+        query
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| ConsumerError::Connection(e.into()))?;
+
+        // 3. Select the full rows that we just locked
+        let select_query = format!(
+            "SELECT id, payload FROM {} WHERE id IN ({})",
+            self.table, placeholders
+        );
+
+        let mut query = sqlx::query(&select_query);
+        for id in &locked_ids {
+            query = query.bind(*id);
+        }
+
+        let rows = query
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(|e| ConsumerError::Connection(e.into()))?;
+
+        // 4. Commit the transaction
+        tx.commit()
+            .await
+            .map_err(|e| ConsumerError::Connection(e.into()))?;
+
+        Ok(rows)
+    }
+
+    async fn fetch_and_lock_sqlite(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<sqlx::any::AnyRow>, ConsumerError> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| ConsumerError::Connection(e.into()))?;
+
+        let select_query = format!(
+            "SELECT id FROM {} WHERE locked_until IS NULL OR locked_until < datetime('now') ORDER BY id LIMIT ?",
+            self.table
+        );
+
+        let locked_ids: Vec<i64> = sqlx::query(&select_query)
+            .bind(limit as i64)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(|e| ConsumerError::Connection(e.into()))?
+            .into_iter()
+            .map(|row| row.get("id"))
+            .collect();
+
+        if locked_ids.is_empty() {
+            tx.commit().await.ok();
+            return Ok(vec![]);
+        }
+
+        let placeholders = locked_ids
+            .iter()
+            .map(|_| "?")
+            .collect::<Vec<_>>()
+            .join(", ");
+        let update_query = format!(
+            "UPDATE {} SET locked_until = datetime('now', '+60 seconds') WHERE id IN ({})",
+            self.table, placeholders
+        );
+
+        let mut query = sqlx::query(&update_query);
+        for id in &locked_ids {
+            query = query.bind(*id);
+        }
+        query
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| ConsumerError::Connection(e.into()))?;
+
+        let select_payload_query = format!(
+            "SELECT id, payload FROM {} WHERE id IN ({})",
+            self.table, placeholders
+        );
+        let mut query = sqlx::query(&select_payload_query);
+        for id in &locked_ids {
+            query = query.bind(*id);
+        }
+        let rows = query
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(|e| ConsumerError::Connection(e.into()))?;
+
+        tx.commit()
+            .await
+            .map_err(|e| ConsumerError::Connection(e.into()))?;
+
+        Ok(rows)
     }
 }
 
@@ -105,10 +509,25 @@ impl SqlxConsumer {
 impl MessageConsumer for SqlxConsumer {
     async fn receive_batch(&mut self, max_messages: usize) -> Result<ReceivedBatch, ConsumerError> {
         loop {
-            let rows = sqlx::query(&self.select_query)
-                .fetch_all(&self.pool)
-                .await
-                .map_err(|e| ConsumerError::Connection(anyhow!(e)))?;
+            let rows = match self.driver_name.as_str() {
+                "PostgreSQL" | "Microsoft SQL Server" => sqlx::query(&self.select_query)
+                    .bind(max_messages as i64)
+                    .fetch_all(&self.pool)
+                    .await
+                    .map_err(|e| ConsumerError::Connection(anyhow!(e)))?,
+                "MySQL" | "MariaDB" => self.fetch_and_lock_mysql(max_messages).await?,
+                "SQLite" => self.fetch_and_lock_sqlite(max_messages).await?,
+                _ => {
+                    // Fallback for unknown drivers with a simple, non-locking read.
+                    warn!("SQLx consumer for driver '{}' is using a non-locking read strategy. This is not safe for concurrent consumers.", self.driver_name);
+                    let final_query = format!("{} LIMIT ?", self.select_query);
+                    sqlx::query(&final_query)
+                        .bind(max_messages as i64)
+                        .fetch_all(&self.pool)
+                        .await
+                        .map_err(|e| ConsumerError::Connection(anyhow!(e)))?
+                }
+            };
 
             if !rows.is_empty() {
                 let mut messages = Vec::new();
@@ -122,15 +541,18 @@ impl MessageConsumer for SqlxConsumer {
                     messages.push(CanonicalMessage::new(payload, None));
                     ids_to_delete.push(id);
                 }
+                trace!(count = messages.len(), "Received batch of SQLx messages");
 
                 let pool = self.pool.clone();
                 let table = self.table.clone();
                 let delete = self.delete_after_read;
+                let driver_name = self.driver_name.clone();
 
                 let commit = Box::new(move |dispositions: Vec<MessageDisposition>| {
                     let pool = pool.clone();
                     let table = table.clone();
                     let ids = ids_to_delete.clone();
+                    let driver_name = driver_name.clone();
                     Box::pin(async move {
                         if !delete {
                             return Ok(());
@@ -148,18 +570,31 @@ impl MessageConsumer for SqlxConsumer {
                         }
 
                         if !ids_to_ack.is_empty() {
-                            // This query works for postgres, but might need adjustment for mysql/sqlite
-                            let placeholders = ids_to_ack
-                                .iter()
-                                .map(|_| "?")
-                                .collect::<Vec<_>>()
-                                .join(", ");
-                            let query_str =
+                            // Manually construct the query with appropriate placeholders
+                            // because sqlx::QueryBuilder with the `Any` driver does not
+                            // correctly rewrite `?` to `$N` for PostgreSQL in this context.
+                            let mut placeholders = String::new();
+                            for i in 0..ids_to_ack.len() {
+                                if i > 0 {
+                                    placeholders.push_str(", ");
+                                }
+                                match driver_name.as_str() {
+                                    "PostgreSQL" => placeholders.push_str(&format!("${}", i + 1)),
+                                    "Microsoft SQL Server" => {
+                                        placeholders.push_str(&format!("@p{}", i + 1))
+                                    }
+                                    _ => placeholders.push('?'),
+                                }
+                            }
+
+                            let sql =
                                 format!("DELETE FROM {} WHERE id IN ({})", table, placeholders);
-                            let mut query = sqlx::query(&query_str);
+
+                            let mut query = sqlx::query(&sql);
                             for id in ids_to_ack {
                                 query = query.bind(id);
                             }
+
                             query
                                 .execute(&pool)
                                 .await
@@ -176,7 +611,105 @@ impl MessageConsumer for SqlxConsumer {
         }
     }
 
-    fn as_any(&self) -> &dyn Any {
+    fn as_any(&self) -> &dyn std::any::Any {
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::traits::MessageConsumer;
+    use tempfile::tempdir;
+
+    async fn setup_db_file() -> (tempfile::TempDir, String) {
+        use sqlx::Connection;
+        sqlx::any::install_default_drivers();
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let url = format!("sqlite://{}", path.to_str().unwrap());
+
+        // Explicitly create the file first to ensure it exists before connect.
+        tokio::fs::File::create(&path).await.unwrap();
+
+        let mut conn = sqlx::AnyConnection::connect(&url).await.unwrap();
+        sqlx::query(
+            "CREATE TABLE messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                payload BLOB NOT NULL,
+                locked_until DATETIME,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )",
+        )
+        .execute(&mut conn)
+        .await
+        .unwrap();
+        conn.close().await.unwrap();
+        (dir, url)
+    }
+
+    #[tokio::test]
+    async fn test_sqlx_roundtrip_delete() {
+        let (_dir, url) = setup_db_file().await;
+
+        let config = SqlxConfig {
+            url: url.clone(),
+            table: "messages".to_string(),
+            delete_after_read: true,
+            ..Default::default()
+        };
+
+        let publisher = SqlxPublisher::new(&config).await.unwrap();
+        let msg_payload = b"hello sqlx".to_vec();
+        let msg = CanonicalMessage::new(msg_payload.clone(), None);
+        publisher.send(msg).await.unwrap();
+
+        let mut consumer = SqlxConsumer::new(&config).await.unwrap();
+        let received_batch = consumer.receive_batch(1).await.unwrap();
+        assert_eq!(received_batch.messages.len(), 1);
+        assert_eq!(received_batch.messages[0].payload.as_ref(), &msg_payload);
+
+        (received_batch.commit)(vec![MessageDisposition::Ack])
+            .await
+            .unwrap();
+
+        let pool = AnyPool::connect(&url).await.unwrap();
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn test_sqlx_roundtrip_no_delete() {
+        let (_dir, url) = setup_db_file().await;
+
+        let config = SqlxConfig {
+            url: url.clone(),
+            table: "messages".to_string(),
+            delete_after_read: false,
+            ..Default::default()
+        };
+
+        let publisher = SqlxPublisher::new(&config).await.unwrap();
+        let msg_payload = b"hello sqlx no delete".to_vec();
+        let msg = CanonicalMessage::new(msg_payload.clone(), None);
+        publisher.send(msg).await.unwrap();
+
+        let mut consumer = SqlxConsumer::new(&config).await.unwrap();
+        let received_batch = consumer.receive_batch(1).await.unwrap();
+        assert_eq!(received_batch.messages.len(), 1);
+
+        (received_batch.commit)(vec![MessageDisposition::Ack])
+            .await
+            .unwrap();
+
+        let pool = AnyPool::connect(&url).await.unwrap();
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 1);
     }
 }

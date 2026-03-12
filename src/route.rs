@@ -915,18 +915,56 @@ fn map_responses_to_dispositions(
     let mut dispositions = Vec::with_capacity(message_ids.len());
     let failed_ids: std::collections::HashSet<u128> =
         failed.iter().map(|(m, _)| m.message_id).collect();
-    let mut response_iter = responses.unwrap_or_default().into_iter();
+
+    // Create a map from message_id to response message for efficient lookup.
+    let mut response_map: std::collections::HashMap<u128, crate::CanonicalMessage> = responses
+        .unwrap_or_default()
+        .into_iter()
+        .map(|r| (r.message_id, r))
+        .collect();
 
     for id in message_ids {
         if failed_ids.contains(id) {
             dispositions.push(MessageDisposition::Nack);
-        } else if let Some(resp) = response_iter.next() {
+        } else if let Some(resp) = response_map.remove(id) {
+            // If a response exists for this specific ID, use it.
             dispositions.push(MessageDisposition::Reply(resp));
         } else {
+            // Otherwise, it was a successful send that did not produce a response.
             dispositions.push(MessageDisposition::Ack);
         }
     }
     dispositions
+}
+
+#[cfg(test)]
+fn test_map_responses_to_dispositions_logic() {
+    use crate::{traits::PublisherError, CanonicalMessage};
+    use anyhow::anyhow;
+
+    let ids = vec![1, 2, 3, 4];
+
+    let mut resp1 = CanonicalMessage::from("resp1");
+    resp1.message_id = 1;
+    let mut resp4 = CanonicalMessage::from("resp4");
+    resp4.message_id = 4;
+
+    let responses = Some(vec![
+        resp1, // Corresponds to id 1
+        resp4, // Corresponds to id 4
+    ]);
+
+    let mut msg2 = CanonicalMessage::from("msg2");
+    msg2.message_id = 2;
+    let failed = vec![(msg2, PublisherError::NonRetryable(anyhow!("failed")))];
+
+    let dispositions = map_responses_to_dispositions(&ids, responses, &failed);
+
+    assert_eq!(dispositions.len(), 4);
+    assert!(matches!(dispositions[0], MessageDisposition::Reply(_))); // from responses
+    assert!(matches!(dispositions[1], MessageDisposition::Nack)); // from failed
+    assert!(matches!(dispositions[2], MessageDisposition::Ack)); // implicit ack
+    assert!(matches!(dispositions[3], MessageDisposition::Reply(_))); // from responses
 }
 
 pub fn get_route(name: &str) -> Option<Route> {
@@ -957,10 +995,11 @@ mod tests {
         mode: FaultMode,
         expected_payload: &str,
         route_should_restart: bool,
+        concurrency: usize,
     ) {
         let unique_suffix = fast_uuid_v7::gen_id().to_string();
-        let in_topic = format!("fault_in_{}_{}", mode, unique_suffix);
-        let out_topic = format!("fault_out_{}_{}", mode, unique_suffix);
+        let in_topic = format!("fault_in_{}_{}_{}", mode, concurrency, unique_suffix);
+        let out_topic = format!("fault_out_{}_{}_{}", mode, concurrency, unique_suffix);
 
         let fault_config = RandomPanicMiddleware {
             mode,
@@ -973,8 +1012,8 @@ mod tests {
             .add_middleware(Middleware::RandomPanic(fault_config));
         let output = Endpoint::new_memory(&out_topic, 10);
 
-        let route_name = format!("fault_test_{}", mode);
-        let route = Route::new(input.clone(), output.clone());
+        let route_name = format!("fault_test_{}_{}", mode, concurrency);
+        let route = Route::new(input.clone(), output.clone()).with_concurrency(concurrency);
 
         // Start the route
         route
@@ -1074,14 +1113,24 @@ mod tests {
     async fn test_route_recovery_from_faults() {
         let original_payload = "persistent_msg";
 
-        // These faults cause a route restart, after which the original message is processed.
-        run_consumer_fault_test(FaultMode::Panic, original_payload, true).await;
-        run_consumer_fault_test(FaultMode::Disconnect, original_payload, true).await;
-        run_consumer_fault_test(FaultMode::Timeout, original_payload, true).await;
-        run_consumer_fault_test(FaultMode::Nack, original_payload, true).await;
+        // Test with concurrency > 1
+        run_consumer_fault_test(FaultMode::Panic, original_payload, true, 2).await;
+        run_consumer_fault_test(FaultMode::Disconnect, original_payload, true, 2).await;
+        run_consumer_fault_test(FaultMode::Timeout, original_payload, true, 2).await;
+        run_consumer_fault_test(FaultMode::Nack, original_payload, true, 2).await;
 
         // This fault replaces the message but does not restart the route.
-        run_consumer_fault_test(FaultMode::JsonFormatError, "{invalid json}", false).await;
+        run_consumer_fault_test(FaultMode::JsonFormatError, "{invalid json}", false, 2).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "Takes too much time for regular tests"]
+    async fn test_route_recovery_from_faults_sequential() {
+        let original_payload = "persistent_msg";
+
+        // Test with concurrency = 1
+        run_consumer_fault_test(FaultMode::Panic, original_payload, true, 1).await;
+        run_consumer_fault_test(FaultMode::Disconnect, original_payload, true, 1).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1560,5 +1609,10 @@ mod tests {
         assert_eq!(received.message.payload, large_payload.as_slice());
 
         Route::stop("test_large_msg").await;
+    }
+
+    #[test]
+    fn test_map_responses_to_dispositions_unit() {
+        test_map_responses_to_dispositions_logic();
     }
 }

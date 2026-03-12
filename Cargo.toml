@@ -135,7 +135,7 @@ ibm-mq = ["mqi"]
 zeromq = ["dep:zeromq"]
 # Note: The grpc feature requires protobuf-src which can significantly increase build times.
 grpc = ["tonic", "prost", "tokio-stream", "tonic-prost", "tonic-prost-build", "protoc-bin-vendored"]
-sqlx = ["dep:sqlx"]
+sqlx = ["dep:sqlx", "url"]
 
 [dev-dependencies]
 config = { version = "0.15" }

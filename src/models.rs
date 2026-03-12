@@ -1613,17 +1613,31 @@ pub struct SqlxConfig {
     pub url: String,
     /// The table to interact with.
     pub table: String,
-    /// (Publisher only) A custom SQL INSERT query. Use `?` as a placeholder for the payload.
+    /// (Publisher only) Optional. A custom SQL INSERT query. Use `?` as a placeholder for the payload.
     /// If not provided, a default `INSERT INTO {table} (payload) VALUES (?)` is used.
     pub insert_query: Option<String>,
-    /// (Consumer only) A custom SQL SELECT query to fetch messages.
-    /// The query should select rows to be processed.
+    /// (Consumer only) Optional. A custom SQL SELECT query to fetch messages. The query should select rows
+    /// to be processed. **It should not include a `LIMIT` clause**, as the bridge will append
+    /// one based on the route's `batch_size`.
     pub select_query: Option<String>,
     /// (Consumer only) If true, delete messages after processing.
     #[serde(default)]
     pub delete_after_read: bool,
     /// (Consumer only) Polling interval in milliseconds. Defaults to 100ms.
     pub polling_interval_ms: Option<u64>,
+    /// TLS configuration for the database connection.
+    #[serde(default)]
+    pub tls: TlsConfig,
+    /// Maximum number of connections in the pool. Defaults to 10.
+    pub max_connections: Option<u32>,
+    /// Minimum number of connections to keep in the pool. Defaults to 0.
+    pub min_connections: Option<u32>,
+    /// Timeout for acquiring a connection from the pool in milliseconds. Defaults to 30000ms.
+    pub acquire_timeout_ms: Option<u64>,
+    /// Maximum idle time for a connection in milliseconds. Defaults to 600000ms (10 minutes).
+    pub idle_timeout_ms: Option<u64>,
+    /// Maximum lifetime of a connection in milliseconds. Defaults to 1800000ms (30 minutes).
+    pub max_lifetime_ms: Option<u64>,
 }
 
 // --- Common Configuration ---
@@ -1756,11 +1770,11 @@ impl SecretExtractor for EndpointType {
             EndpointType::IbmMq(cfg) => {
                 cfg.extract_secrets(&format!("{}__{}", prefix, "IBMMQ"), secrets)
             }
-            EndpointType::Grpc(cfg) => {
-                cfg.extract_secrets(&format!("{}__{}", prefix, "GRPC"), secrets)
-            }
             EndpointType::Sqlx(cfg) => {
                 cfg.extract_secrets(&format!("{}__{}", prefix, "SQLX"), secrets)
+            }
+            EndpointType::Grpc(cfg) => {
+                cfg.extract_secrets(&format!("{}__{}", prefix, "GRPC"), secrets)
             }
             EndpointType::Fanout(endpoints) => {
                 for (i, ep) in endpoints.iter_mut().enumerate() {
@@ -1902,9 +1916,9 @@ impl SecretExtractor for IbmMqConfig {
 }
 
 impl SecretExtractor for SqlxConfig {
-    fn extract_secrets(&mut self, _prefix: &str, _secrets: &mut HashMap<String, String>) {
-        // The URL might contain a password, but sqlx recommends using env vars for this.
-        // For now, we won't parse the URL to extract secrets.
+    fn extract_secrets(&mut self, prefix: &str, secrets: &mut HashMap<String, String>) {
+        self.tls
+            .extract_secrets(&format!("{}__{}", prefix, "TLS"), secrets);
     }
 }
 

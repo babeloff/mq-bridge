@@ -28,6 +28,7 @@ routes:
       sqlx:
         url: "postgres://testuser:testpass@localhost:5432/testdb"
         table: "messages"
+        min_connections: 2
 
   sqlx_to_memory:
     concurrency: 4
@@ -37,7 +38,8 @@ routes:
         url: "postgres://testuser:testpass@localhost:5432/testdb"
         table: "messages"
         delete_after_read: true
-        polling_interval_ms: 10
+        polling_interval_ms: 20
+        min_connections: 2
     output:
       memory: { topic: "sqlx-test-out", capacity: {out_capacity} }
 "#;
@@ -60,18 +62,29 @@ async fn setup_db() {
     // The consumer expects an 'id' and 'payload' column.
     // 'id' should be auto-incrementing.
     sqlx::query(&format!(
-        "CREATE TABLE {} (id BIGSERIAL PRIMARY KEY, payload BYTEA NOT NULL)",
+        r#"
+            CREATE TABLE {} (
+                id BIGSERIAL PRIMARY KEY,
+                payload BYTEA NOT NULL,
+                locked_until TIMESTAMPTZ
+            )
+            "#,
         TABLE_NAME
     ))
     .execute(&pool)
     .await
     .expect("Failed to create table");
+
+    // Add an index on locked_until for efficient polling
+    sqlx::query(&format!("CREATE INDEX ON {} (locked_until)", TABLE_NAME))
+        .execute(&pool)
+        .await
+        .expect("Failed to create index on locked_until");
 }
 
 pub async fn test_sqlx_pipeline() {
     setup_logging();
     run_test_with_docker(DOCKER_COMPOSE_FILE, || async {
-        setup_db().await;
         let config_yaml = CONFIG_YAML.replace(
             "{out_capacity}",
             &(PERF_TEST_MESSAGE_COUNT + 1000).to_string(),
@@ -84,7 +97,6 @@ pub async fn test_sqlx_pipeline() {
 pub async fn test_sqlx_chaos() {
     setup_logging();
     run_test_with_docker_controller(DOCKER_COMPOSE_FILE, |controller| async move {
-        setup_db().await;
         let config_yaml = CONFIG_YAML.replace(
             "{out_capacity}",
             &(10000 + 1000).to_string(), // Using a smaller number for chaos tests
@@ -97,7 +109,6 @@ pub async fn test_sqlx_chaos() {
 pub async fn test_sqlx_performance_direct() {
     setup_logging();
     run_test_with_docker(DOCKER_COMPOSE_FILE, || async {
-        setup_db().await;
         let config = mq_bridge::models::SqlxConfig {
             url: DATABASE_URL.to_string(),
             table: TABLE_NAME.to_string(),

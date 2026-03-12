@@ -206,7 +206,8 @@ mod tests {
     #[async_trait]
     impl MessagePublisher for MockSuccessPublisher {
         async fn send(&self, _msg: CanonicalMessage) -> Result<Sent, PublisherError> {
-            *self.calls.lock().unwrap() += 1;
+            let mut calls = self.calls.lock().unwrap();
+            *calls += 1;
             Ok(Sent::Ack)
         }
 
@@ -214,6 +215,8 @@ mod tests {
             &self,
             _messages: Vec<CanonicalMessage>,
         ) -> Result<SentBatch, PublisherError> {
+            let mut calls = self.calls.lock().unwrap();
+            *calls += _messages.len();
             Ok(SentBatch::Ack)
         }
 
@@ -314,5 +317,144 @@ mod tests {
         let dlq_msgs = dlq_channel.drain_messages();
         assert_eq!(dlq_msgs.len(), 1);
         assert_eq!(dlq_msgs[0].payload, msg_payload.as_slice());
+    }
+
+    #[derive(Clone)]
+    struct MockFailingBatchPublisher {
+        calls: Arc<Mutex<usize>>,
+        fail_on_call: usize,
+        partial_fail: bool,
+    }
+
+    #[async_trait]
+    impl MessagePublisher for MockFailingBatchPublisher {
+        async fn send(&self, _msg: CanonicalMessage) -> Result<Sent, PublisherError> {
+            unimplemented!()
+        }
+
+        async fn send_batch(
+            &self,
+            messages: Vec<CanonicalMessage>,
+        ) -> Result<SentBatch, PublisherError> {
+            let mut calls = self.calls.lock().unwrap();
+            *calls += 1;
+            if *calls == self.fail_on_call {
+                if self.partial_fail {
+                    // Fail one message in the batch
+                    let (head, _) = messages.split_at(1);
+                    return Ok(SentBatch::Partial {
+                        responses: None,
+                        failed: vec![(
+                            head[0].clone(),
+                            PublisherError::Retryable(anyhow::anyhow!("Partial batch fail")),
+                        )],
+                    });
+                } else {
+                    // Fail the whole batch
+                    return Err(PublisherError::Retryable(anyhow::anyhow!(
+                        "Batch send failed"
+                    )));
+                }
+            }
+            // Succeed
+            Ok(SentBatch::Ack)
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    #[tokio::test]
+    async fn test_dlq_send_batch_full_failure() {
+        let target_calls = Arc::new(Mutex::new(0));
+        // This publisher will fail the first time send_batch is called
+        let failing_target = MockFailingBatchPublisher {
+            calls: target_calls.clone(),
+            fail_on_call: 1,
+            partial_fail: false,
+        };
+
+        let dlq_calls = Arc::new(Mutex::new(0));
+        let dlq_target = MockSuccessPublisher {
+            calls: dlq_calls.clone(),
+        };
+
+        let dlq_middleware = DlqPublisher {
+            inner: Box::new(failing_target),
+            dlq_publisher: Arc::new(dlq_target),
+        };
+
+        let messages = vec![CanonicalMessage::from("1"), CanonicalMessage::from("2")];
+
+        // Execute
+        let result = dlq_middleware.send_batch(messages).await;
+
+        // Assertions
+        assert!(result.is_ok(), "DLQ should handle the batch failure");
+        assert_eq!(
+            *target_calls.lock().unwrap(),
+            1,
+            "Target should be called once"
+        );
+        // The successful DLQ publisher's `send` will be called for each message in the failed batch
+        assert_eq!(
+            *dlq_calls.lock().unwrap(),
+            2,
+            "DLQ should be called for each message in the failed batch"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_dlq_send_batch_partial_failure() {
+        let target_calls = Arc::new(Mutex::new(0));
+        let failing_target = MockFailingBatchPublisher {
+            calls: target_calls.clone(),
+            fail_on_call: 1,
+            partial_fail: true,
+        };
+
+        let dlq_calls = Arc::new(Mutex::new(0));
+        let dlq_target = MockSuccessPublisher {
+            calls: dlq_calls.clone(),
+        };
+
+        let dlq_middleware = DlqPublisher {
+            inner: Box::new(failing_target),
+            dlq_publisher: Arc::new(dlq_target),
+        };
+
+        let messages = vec![CanonicalMessage::from("1"), CanonicalMessage::from("2")];
+        let result = dlq_middleware.send_batch(messages).await;
+
+        assert!(result.is_ok());
+        if let Ok(SentBatch::Partial { failed, .. }) = result {
+            assert!(
+                failed.is_empty(),
+                "DLQ should have handled the failed message"
+            );
+        } else {
+            panic!("Expected partial success");
+        }
+
+        assert_eq!(*target_calls.lock().unwrap(), 1);
+        // Only the one failed message should go to DLQ
+        assert_eq!(*dlq_calls.lock().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_dlq_failure_propagates_error() {
+        let failing_target = MockFailingPublisher {
+            calls: Arc::new(Mutex::new(0)),
+        };
+        let failing_dlq = MockFailingPublisher {
+            calls: Arc::new(Mutex::new(0)),
+        };
+        let dlq_middleware = DlqPublisher {
+            inner: Box::new(failing_target),
+            dlq_publisher: Arc::new(failing_dlq),
+        };
+        let result = dlq_middleware.send("test".into()).await;
+        assert!(result.is_err());
     }
 }

@@ -19,8 +19,8 @@ use rdkafka::{
     ClientConfig, Message, TopicPartitionList,
 };
 use std::sync::Arc;
-use std::time::Duration;
-use tracing::{debug, info, trace};
+use std::time::{Duration, SystemTime};
+use tracing::{debug, info, trace, warn};
 use uuid::Uuid;
 
 pub struct KafkaPublisher {
@@ -67,10 +67,12 @@ impl KafkaPublisher {
             for result in results {
                 match result {
                     Ok(topic_name) => {
-                        info!(topic = %topic_name, "Kafka topic created or already exists")
+                        info!(topic = %topic_name, "Kafka topic created successfully")
                     }
                     Err((topic_name, error_code)) => {
-                        if error_code != RDKafkaErrorCode::TopicAlreadyExists {
+                        if error_code == RDKafkaErrorCode::TopicAlreadyExists {
+                            debug!(topic = %topic_name, "Kafka topic already exists, skipping creation.");
+                        } else {
                             return Err(anyhow!(
                                 "Failed to create Kafka topic '{}': {}",
                                 topic_name,
@@ -394,7 +396,7 @@ impl MessageConsumer for KafkaConsumer {
                 // Ack failure may result in redelivery. Enable deduplication middleware to handle duplicates.
                 if let Err(e) = consumer_clone.commit(&tpl, CommitMode::Async) {
                     tracing::error!("Failed to commit Kafka message: {:?}", e);
-                    return Err(anyhow::anyhow!("Failed to commit Kafka message: {:?}", e));
+                    return Err(anyhow!("Failed to commit Kafka message: {:?}", e));
                 }
                 Ok(())
             }) as BoxFuture<'static, anyhow::Result<()>>
@@ -506,7 +508,7 @@ fn process_message(
             message.partition(),
             Offset::Offset(message.offset() + 1),
         )
-        .map_err(|e| anyhow::anyhow!(e))
+        .map_err(|e| anyhow!(e))
 }
 
 fn create_common_config(config: &KafkaConfig) -> ClientConfig {
@@ -640,5 +642,83 @@ async fn handle_kafka_replies(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rdkafka::message::{BorrowedMessage, Header, OwnedMessage};
+
+    // A helper to create a mock message for testing process_message
+    fn create_mock_message<'a>(
+        payload: Option<&'a [u8]>,
+        key: Option<&'a [u8]>,
+        headers: Option<OwnedHeaders>,
+        offset: i64,
+        partition: i32,
+    ) -> BorrowedMessage<'a> {
+        // This is a bit of a hack. We create an OwnedMessage and then borrow it.
+        // This is the easiest way to get a BorrowedMessage with all the fields we need.
+        let owned_message = OwnedMessage::new(
+            payload.map(|p| p.to_vec()),
+            key.map(|k| k.to_vec()),
+            "test_topic".to_string(),
+            rdkafka::Timestamp::now(),
+            partition,
+            offset,
+            headers,
+        );
+        owned_message.borrow()
+    }
+
+    #[test]
+    fn test_process_message_id_from_key() {
+        let message_id = 0x1234567890abcdef1234567890abcdef_u128;
+        let key = message_id.to_be_bytes();
+        let msg = create_mock_message(Some(b"payload"), Some(&key), None, 0, 0);
+
+        let mut messages = Vec::new();
+        let mut tpl = TopicPartitionList::new();
+        process_message(msg, &mut messages, &mut tpl).unwrap();
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].message_id, message_id);
+    }
+
+    #[test]
+    fn test_process_message_id_from_header_uuid() {
+        let uuid = Uuid::new_v4();
+        let headers = OwnedHeaders::new().insert(Header {
+            key: "message_id",
+            value: Some(uuid.to_string().as_bytes()),
+        });
+        let msg = create_mock_message(Some(b"payload"), None, Some(headers), 0, 0);
+
+        let mut messages = Vec::new();
+        let mut tpl = TopicPartitionList::new();
+        process_message(msg, &mut messages, &mut tpl).unwrap();
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].message_id, uuid.as_u128());
+    }
+
+    #[test]
+    fn test_process_message_id_fallback_to_offset() {
+        // No key, no headers with message_id
+        let msg = create_mock_message(Some(b"payload"), None, None, 123, 4);
+        let partition = msg.partition();
+        let offset = msg.offset();
+
+        let mut messages = Vec::new();
+        let mut tpl = TopicPartitionList::new();
+        process_message(msg, &mut messages, &mut tpl).unwrap();
+
+        let expected_id = ((partition as u32 as u128) << 64) | (offset as u64 as u128);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].message_id, expected_id);
+        // Check that the TPL was updated correctly
+        let committed_offset = tpl.find_partition("test_topic", 4).unwrap().offset();
+        assert_eq!(committed_offset, Offset::Offset(124));
     }
 }
