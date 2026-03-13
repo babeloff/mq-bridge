@@ -193,7 +193,7 @@ impl SqlxPublisher {
                     );
                 } else {
                     let table_name_for_index =
-                        config.table.split('.').last().unwrap_or(&config.table);
+                        config.table.split('.').next_back().unwrap_or(&config.table);
                     let index_name = format!("idx_{}_locked_until", table_name_for_index);
 
                     let create_index_query = match driver_name.as_str() {
@@ -223,7 +223,7 @@ impl SqlxPublisher {
                         if let Err(e) = sqlx::query(&create_index_query).execute(&pool).await {
                             if (driver_name.as_str() == "MySQL"
                                 || driver_name.as_str() == "MariaDB")
-                                && e.as_database_error().map_or(false, |db_err| {
+                                && e.as_database_error().is_some_and(|db_err| {
                                     db_err.code() == Some(Cow::from("1061"))
                                 })
                             {
