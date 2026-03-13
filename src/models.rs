@@ -659,7 +659,7 @@ pub struct RandomPanicMiddleware {
     pub enabled: bool,
     #[serde(skip, default = "default_atomic_usize_arc")]
     #[cfg_attr(feature = "schema", schemars(skip))]
-    pub(crate) message_count: Arc<AtomicUsize>,
+    pub message_count: Arc<AtomicUsize>,
 }
 
 fn default_true() -> bool {

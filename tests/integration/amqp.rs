@@ -103,6 +103,90 @@ async fn test_amqp_publisher_handles_nack() {
     .await;
 }
 
+#[tokio::test]
+#[ignore = "requires docker compose"]
+async fn test_amqp_publisher_handles_disconnect() {
+    use mq_bridge::models::{
+        Endpoint, EndpointType, FaultMode, Middleware, RandomPanicMiddleware, RetryMiddleware,
+    };
+    use mq_bridge::Route;
+
+    setup_logging();
+    run_test_with_docker("tests/integration/docker-compose/amqp.yml", || async {
+        let in_topic = "amqp_disconnect_in";
+        let out_queue = "amqp_disconnect_out";
+        let verify_topic = "amqp_disconnect_verify";
+
+        // 1. The route that will experience the fault.
+        // The input needs NACK support to re-deliver the message after the route restarts.
+        let mut input_config = mq_bridge::models::MemoryConfig::new(in_topic, Some(10));
+        input_config.enable_nack = true;
+        let input_ep = Endpoint::new(EndpointType::Memory(input_config));
+
+        let output_ep = Endpoint::new(EndpointType::Amqp(mq_bridge::models::AmqpConfig {
+            url: "amqp://guest:guest@localhost:5672/%2f".to_string(),
+            queue: Some(out_queue.to_string()),
+            ..Default::default()
+        }))
+        .add_middleware(Middleware::RandomPanic(RandomPanicMiddleware {
+            mode: FaultMode::Disconnect,
+            trigger_on_message: Some(1),
+            enabled: true,
+            ..Default::default()
+        }))
+        .add_middleware(Middleware::Retry(RetryMiddleware {
+            max_attempts: 2,
+            initial_interval_ms: 10,
+            ..Default::default()
+        }));
+
+        let route_to_test = Route::new(input_ep.clone(), output_ep);
+        route_to_test.deploy("amqp_fault_test").await.unwrap();
+
+        // 2. A verifier route to get the message out of AMQP.
+        let amqp_input_ep = Endpoint::new(EndpointType::Amqp(mq_bridge::models::AmqpConfig {
+            url: "amqp://guest:guest@localhost:5672/%2f".to_string(),
+            queue: Some(out_queue.to_string()),
+            ..Default::default()
+        }));
+        let verify_output_ep = Endpoint::new_memory(verify_topic, 10);
+        let verifier_route = Route::new(amqp_input_ep, verify_output_ep.clone());
+        verifier_route.deploy("amqp_verifier").await.unwrap();
+
+        // 3. Send a message.
+        let input_channel = input_ep.channel().unwrap();
+        let test_payload = "this message should survive a disconnect";
+        input_channel
+            .send_message(test_payload.into())
+            .await
+            .unwrap();
+
+        // 4. Wait for the route to fail and restart.
+        // The fault is injected -> NonRetryable error -> route restarts after 5s.
+        // 6 seconds should be enough for recovery and processing.
+        println!("Waiting for route to recover from simulated disconnect...");
+        tokio::time::sleep(std::time::Duration::from_secs(6)).await;
+
+        // 5. Verify the message arrived at the final destination.
+        let verify_channel = verify_output_ep.channel().unwrap();
+        let received_msgs = verify_channel.drain_messages();
+
+        assert_eq!(
+            received_msgs.len(),
+            1,
+            "Expected exactly one message to be received after recovery"
+        );
+        assert_eq!(received_msgs[0].get_payload_str(), test_payload);
+
+        println!("AMQP disconnect handling test passed!");
+
+        // 6. Cleanup.
+        Route::stop("amqp_fault_test").await;
+        Route::stop("amqp_verifier").await;
+    })
+    .await;
+}
+
 pub async fn test_amqp_chaos() {
     setup_logging();
     run_test_with_docker_controller(
