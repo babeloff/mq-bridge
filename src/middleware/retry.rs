@@ -1,6 +1,7 @@
 use crate::models::RetryMiddleware;
 use crate::traits::{MessagePublisher, PublisherError, Sent, SentBatch};
 use crate::CanonicalMessage;
+use anyhow::anyhow;
 use async_trait::async_trait;
 use std::any::Any;
 use std::time::Duration;
@@ -31,7 +32,11 @@ impl RetryPublisher {
                 Err(e @ PublisherError::NonRetryable(_)) => return Err(e), // Don't retry non-retryable errors
                 Err(e @ PublisherError::Retryable(_)) => {
                     if attempt >= self.config.max_attempts {
-                        return Err(e);
+                        return Err(PublisherError::NonRetryable(anyhow!(
+                            "Retries exhausted after {} attempts: {}",
+                            self.config.max_attempts,
+                            e
+                        )));
                     }
                     warn!(
                         "Operation failed (attempt {}/{}): {}. Retrying in {}ms...",
@@ -113,7 +118,15 @@ impl MessagePublisher for RetryPublisher {
                         });
                     }
                     if attempt >= self.config.max_attempts {
-                        all_failed.extend(retryable);
+                        // After exhausting retries, convert all remaining retryable errors to non-retryable
+                        // so the DLQ middleware will handle them.
+                        let non_retryable_failures = retryable.into_iter().map(|(msg, e)| {
+                            (
+                                msg,
+                                PublisherError::NonRetryable(anyhow!("Retries exhausted: {}", e)),
+                            )
+                        });
+                        all_failed.extend(non_retryable_failures);
                         return Ok(SentBatch::Partial {
                             responses: if all_responses.is_empty() {
                                 None
@@ -131,7 +144,11 @@ impl MessagePublisher for RetryPublisher {
                         return Err(e);
                     }
                     if attempt >= self.config.max_attempts {
-                        return Err(e);
+                        return Err(PublisherError::NonRetryable(anyhow!(
+                            "Retries exhausted after {} attempts: {}",
+                            self.config.max_attempts,
+                            e
+                        )));
                     }
                     warn!(
                         "Batch send failed (attempt {}/{}): {}. Retrying...",

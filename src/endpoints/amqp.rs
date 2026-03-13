@@ -140,7 +140,8 @@ impl MessagePublisher for AmqpPublisher {
         let mut pending_confirms = Vec::with_capacity(messages.len());
         let mut failed_messages = Vec::new();
 
-        for message in messages {
+        let mut iter = messages.into_iter();
+        while let Some(message) = iter.next() {
             let mut properties = if self.no_persistence {
                 BasicProperties::default()
             } else {
@@ -180,10 +181,23 @@ impl MessagePublisher for AmqpPublisher {
                 .await
             {
                 Ok(confirmation) => pending_confirms.push((message, confirmation)),
-                Err(e) => failed_messages.push((
-                    message,
-                    PublisherError::Retryable(anyhow::anyhow!("Failed to publish: {}", e)),
-                )),
+                Err(e) => {
+                    failed_messages.push((
+                        message,
+                        PublisherError::Retryable(anyhow::anyhow!("Failed to publish: {}", e)),
+                    ));
+                    // If one publish fails due to a channel/connection error,
+                    // the rest will likely fail too. Stop and mark remaining as failed.
+                    for rest_msg in iter {
+                        failed_messages.push((
+                            rest_msg,
+                            PublisherError::Retryable(anyhow::anyhow!(
+                                "Batch aborted due to previous error"
+                            )),
+                        ));
+                    }
+                    break;
+                }
             }
         }
 
