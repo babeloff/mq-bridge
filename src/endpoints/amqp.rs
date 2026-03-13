@@ -6,7 +6,7 @@ use crate::traits::{
 };
 use crate::CanonicalMessage;
 use crate::APP_NAME;
-use anyhow::{anyhow, Context};
+use anyhow::{anyhow, bail, Context};
 use async_trait::async_trait;
 use futures::{FutureExt, StreamExt, TryStreamExt};
 use lapin::tcp::{OwnedIdentity, OwnedTLSConfig};
@@ -625,28 +625,30 @@ async fn handle_dispositions(
     ackers: Vec<Acker>,
     dispositions: Vec<MessageDisposition>,
 ) -> anyhow::Result<()> {
-    let futures = ackers
+    let ackers_len = ackers.len();
+    let mut futures = futures::stream::iter(ackers
         .into_iter()
         .zip(dispositions)
         .map(|(acker, disposition)| async move {
             match disposition {
                 MessageDisposition::Ack | MessageDisposition::Reply(_) => {
                     acker.ack(BasicAckOptions::default()).await
-                }
+                },
                 MessageDisposition::Nack => {
                     // Nack with requeue. This will return the message to the front of the queue.
                     acker
                         .nack(lapin::options::BasicNackOptions {
                             requeue: true,
                             ..Default::default()
-                        })
-                        .await
+                        }).await
                 }
             }
-        });
-    for res in futures::future::join_all(futures).await {
+        }))
+    .buffer_unordered(ackers_len);
+
+    while let Some(res) = futures.next().await {
         if let Err(e) = res {
-            return Err(anyhow::anyhow!("Failed to ack/nack AMQP message: {}", e));
+            bail!("Failed to ack/nack AMQP message: {}", e);
         }
     }
     Ok(())
