@@ -986,6 +986,7 @@ mod tests {
     use crate::traits::{
         CustomMiddlewareFactory, MessageConsumer, MessagePublisher, ReceivedBatch,
     };
+    use crate::CanonicalMessage;
     use std::any::Any;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
@@ -1503,6 +1504,177 @@ mod tests {
 
         assert!(Route::get("test_invalid_input").is_some());
         Route::stop("test_invalid_input").await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_dlq_and_retry_batch_integration() {
+        use crate::models::{DeadLetterQueueMiddleware, Middleware, RetryMiddleware};
+        use crate::traits::{MessagePublisher, PublisherError, SentBatch};
+        use std::collections::HashMap;
+        use std::sync::Mutex;
+
+        // Mock publisher that fails messages with even-numbered IDs
+        #[derive(Clone)]
+        struct PartialFailPublisher {
+            attempts: Arc<Mutex<HashMap<u128, usize>>>,
+        }
+
+        #[async_trait::async_trait]
+        impl MessagePublisher for PartialFailPublisher {
+            async fn send_batch(
+                &self,
+                messages: Vec<CanonicalMessage>,
+            ) -> Result<SentBatch, PublisherError> {
+                let mut failed = Vec::new();
+                let mut attempts = self.attempts.lock().unwrap();
+
+                for msg in messages {
+                    let msg_num: u32 = serde_json::from_slice::<serde_json::Value>(&msg.payload)
+                        .unwrap()["id"]
+                        .as_u64()
+                        .unwrap() as u32;
+
+                    let attempt_count = attempts.entry(msg.message_id).or_insert(0);
+                    *attempt_count += 1;
+
+                    if msg_num % 2 == 0 {
+                        // Fail even numbers
+                        failed.push((
+                            msg,
+                            PublisherError::Retryable(anyhow::anyhow!("simulated failure")),
+                        ));
+                    }
+                    // Odd numbers succeed implicitly by not being in `failed`
+                }
+
+                if failed.is_empty() {
+                    Ok(SentBatch::Ack)
+                } else {
+                    Ok(SentBatch::Partial {
+                        responses: None,
+                        failed,
+                    })
+                }
+            }
+            async fn send(
+                &self,
+                _msg: CanonicalMessage,
+            ) -> Result<crate::traits::Sent, PublisherError> {
+                unimplemented!()
+            }
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        // 1. Setup
+        let in_topic = "batch_retry_dlq_in";
+        let out_topic = "batch_retry_dlq_out";
+        let dlq_topic = "batch_retry_dlq_dlq";
+
+        let input = Endpoint::new_memory(in_topic, 10);
+        let dlq_endpoint = Endpoint::new_memory(dlq_topic, 10);
+
+        let mock_publisher = PartialFailPublisher {
+            attempts: Arc::new(Mutex::new(HashMap::new())),
+        };
+
+        let mut output_with_middlewares = Endpoint::new_memory(out_topic, 10);
+        output_with_middlewares.middlewares = vec![
+            Middleware::Retry(RetryMiddleware {
+                max_attempts: 2,
+                initial_interval_ms: 1,
+                ..Default::default()
+            }),
+            Middleware::Dlq(Box::new(DeadLetterQueueMiddleware {
+                endpoint: dlq_endpoint.clone(),
+            })),
+        ];
+
+        let route = Route::new(input.clone(), output_with_middlewares).with_batch_size(4);
+        // Inject the mock publisher into the route's output
+        let final_publisher = crate::middleware::apply_middlewares_to_publisher(
+            Box::new(mock_publisher.clone()),
+            &route.output,
+            "test_route",
+        )
+        .await
+        .unwrap();
+
+        // We need a way to run the route with our mocked publisher.
+        // The simplest way is to manually drive the core logic.
+        let (work_tx, work_rx) =
+            async_channel::bounded::<(Vec<crate::CanonicalMessage>, BatchCommitFunc)>(1);
+        let (seq_tx, _sequencer_handle) = spawn_sequencer(1);
+
+        // Spawn a worker to process one batch
+        tokio::spawn(async move {
+            if let Ok((messages, commit)) = work_rx.recv().await {
+                let batch_len = messages.len();
+                match final_publisher.send_batch(messages).await {
+                    Ok(SentBatch::Ack) => {
+                        let _ = commit(vec![MessageDisposition::Ack; batch_len]).await;
+                    }
+                    Ok(SentBatch::Partial { failed, .. }) => {
+                        // In a real route, we'd map responses, but here we just care about failure.
+                        let dispositions = if failed.is_empty() {
+                            vec![MessageDisposition::Ack; batch_len]
+                        } else {
+                            // This is a simplification for the test. A real implementation
+                            // would map dispositions based on message IDs.
+                            vec![MessageDisposition::Nack; batch_len]
+                        };
+                        let _ = commit(dispositions).await;
+                    }
+                    Err(_) => {
+                        let _ = commit(vec![MessageDisposition::Nack; batch_len]).await;
+                    }
+                }
+            }
+        });
+
+        // 2. Send a batch of messages
+        let mut messages = Vec::new();
+        for i in 1..=4 {
+            // 1 (ok), 2 (fail), 3 (ok), 4 (fail)
+            messages.push(CanonicalMessage::from_json(serde_json::json!({"id": i})).unwrap());
+        }
+        let commit = wrap_commit(Box::new(|_| Box::pin(async { Ok(()) })), 0, seq_tx.clone());
+        work_tx.send((messages, commit)).await.unwrap();
+
+        // 3. Verify
+        let dlq_channel = dlq_endpoint.channel().unwrap();
+
+        let start = std::time::Instant::now();
+        while dlq_channel.len() < 2 {
+            if start.elapsed() > std::time::Duration::from_secs(5) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        let dlq_msgs = dlq_channel.drain_messages();
+
+        assert_eq!(dlq_msgs.len(), 2, "Expected 2 messages to go to DLQ");
+
+        let dlq_ids: std::collections::HashSet<u32> = dlq_msgs
+            .iter()
+            .map(|m| {
+                serde_json::from_slice::<serde_json::Value>(&m.payload).unwrap()["id"]
+                    .as_u64()
+                    .unwrap() as u32
+            })
+            .collect();
+
+        assert!(dlq_ids.contains(&2));
+        assert!(dlq_ids.contains(&4));
+
+        // Verify retry attempts
+        let attempts = mock_publisher.attempts.lock().unwrap();
+        // Messages 2 and 4 should be tried `max_attempts` times.
+        assert_eq!(attempts.values().filter(|&&c| c == 2).count(), 2);
+        // Messages 1 and 3 should be tried once.
+        assert_eq!(attempts.values().filter(|&&c| c == 1).count(), 2);
     }
 
     #[tokio::test(flavor = "multi_thread")]
