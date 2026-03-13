@@ -338,5 +338,20 @@ cargo bench --features "full"
 ```
 The times are not stable yet, it is therefore recommended to perform the integration performance test if you want to measure throughput.
 
+## AI Disclaimer
+
+This library has been widely written with AI assistance. I used Gemini for planning and writing,
+CodeRabbit for reviews and Copilot/Claude for bugfixing and other small things.
+While some of the AI output was great, some other output wasn't.
+I am aware that in year 2026, AI is still not generating perfect code and sometimes
+even breaks simple stuff. I reviewed all the
+output code and re-specified it or changed the code manually whan insuficcient.
+I didn't change the AI code appearance, so you will sometimes still see code that just
+looks as it is plain from AI and also most of the readme here was actually written
+by AI. I don't think it is bad practice, to keep the original code and text appearance. 
+I'm not an english native speaker, so the AI output for text is mostly just
+way better what I could write. For AI code, the readability is usually
+sufficient, even if it is sometimes much more verbose what I would write in code.
+
 ## License
 `mq-bridge` is licensed under the MIT License.
