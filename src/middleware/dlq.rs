@@ -61,11 +61,20 @@ impl MessagePublisher for DlqPublisher {
                 );
                 match self.dlq_publisher.send(message).await {
                     Ok(_) => Ok(Sent::Ack),
-                    Err(dlq_combined_error) => Err(PublisherError::NonRetryable(anyhow::anyhow!(
-                        "Primary send failed: '{}'. DLQ send also failed: {}",
-                        error_msg,
-                        dlq_combined_error
-                    ))),
+                    Err(dlq_error) => {
+                        // If the DLQ itself has a connection error, we must propagate it to trigger a route restart.
+                        // Otherwise, the message would be lost.
+                        if let PublisherError::NonRetryable(err) = &dlq_error {
+                            if err.to_string().contains("__CONNECTION_ERROR__") {
+                                return Err(dlq_error);
+                            }
+                        }
+                        Err(PublisherError::NonRetryable(anyhow::anyhow!(
+                            "Primary send failed: '{}'. DLQ send also failed: {}",
+                            error_msg,
+                            dlq_error
+                        )))
+                    }
                 }
             }
         }
@@ -130,12 +139,18 @@ impl MessagePublisher for DlqPublisher {
                         })
                     }
                     Err(dlq_error) => {
+                        // If the DLQ itself has a connection error, propagate it to restart the route.
+                        if let PublisherError::NonRetryable(err) = &dlq_error {
+                            if err.to_string().contains("__CONNECTION_ERROR__") {
+                                return Err(dlq_error);
+                            }
+                        }
                         error!(
                             "DLQ send failed: {}. Propagating original errors.",
                             dlq_error
                         );
                         Err(anyhow::anyhow!(
-                            "Primary send had non-retryable errors, but DLQ send also failed: {}",
+                            "Primary send had non-retryable errors, but sending to DLQ also failed: {}",
                             dlq_error
                         )
                         .into())
@@ -182,11 +197,18 @@ impl MessagePublisher for DlqPublisher {
                         })
                     }
                     Err(dlq_error) => {
+                        // If the DLQ itself has a connection error, propagate it to restart the route.
+                        if let PublisherError::NonRetryable(err) = &dlq_error {
+                            if err.to_string().contains("__CONNECTION_ERROR__") {
+                                return Err(dlq_error);
+                            }
+                        }
                         error!(
                             "DLQ send failed: {}. Propagating original error.",
                             dlq_error
                         );
-                        Err(e)
+                        // The original error `e` is what caused the DLQ attempt. We wrap it to indicate the DLQ also failed.
+                        Err(PublisherError::NonRetryable(anyhow::anyhow!("Primary send failed: '{}'. DLQ send also failed: {}", e, dlq_error)))
                     }
                 }
             }

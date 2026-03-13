@@ -26,6 +26,13 @@ use std::time::Duration;
 use tracing::{info, trace};
 use uuid::Uuid;
 
+fn is_connection_error(e: &lapin::Error) -> bool {
+    matches!(
+        e.kind(),
+        lapin::ErrorKind::InvalidChannelState(..) | lapin::ErrorKind::ProtocolError(_)
+    )
+}
+
 pub struct AmqpPublisher {
     _conn: Connection,
     channel: Channel,
@@ -120,13 +127,25 @@ impl MessagePublisher for AmqpPublisher {
                 properties,
             )
             .await
-            .context("Failed to publish AMQP message")?;
+            .map_err(|e| {
+                if is_connection_error(&e) {
+                    PublisherError::NonRetryable(anyhow!("__CONNECTION_ERROR__: {}", e))
+                } else {
+                    PublisherError::Retryable(anyhow!(e).context("Failed to publish AMQP message"))
+                }
+            })?;
 
         if !self.delayed_ack {
             // Wait for the broker's publisher confirmation.
-            let confirm = confirmation
-                .await
-                .context("Failed to get AMQP publisher confirmation")?;
+            let confirm = confirmation.await.map_err(|e| {
+                if is_connection_error(&e) {
+                    PublisherError::NonRetryable(anyhow!("__CONNECTION_ERROR__: {}", e))
+                } else {
+                    PublisherError::Retryable(
+                        anyhow!(e).context("Failed to get AMQP publisher confirmation"),
+                    )
+                }
+            })?;
             if let lapin::publisher_confirm::Confirmation::Nack(_) = confirm {
                 return Err(PublisherError::Retryable(anyhow::anyhow!(
                     "Broker Nacked the message"
@@ -151,8 +170,7 @@ impl MessagePublisher for AmqpPublisher {
         let mut pending_confirms = Vec::with_capacity(messages.len());
         let mut failed_messages = Vec::new();
 
-        let mut iter = messages.into_iter();
-        while let Some(message) = iter.next() {
+        for message in messages {
             let mut properties = if self.no_persistence {
                 BasicProperties::default()
             } else {
@@ -191,23 +209,19 @@ impl MessagePublisher for AmqpPublisher {
                 )
                 .await
             {
-                Ok(confirmation) => pending_confirms.push((message, confirmation)),
+                Ok(confirmation) => {
+                    pending_confirms.push((message, confirmation));
+                }
                 Err(e) => {
-                    failed_messages.push((
-                        message,
-                        PublisherError::Retryable(anyhow::anyhow!("Failed to publish: {}", e)),
-                    ));
-                    // If one publish fails due to a channel/connection error,
-                    // the rest will likely fail too. Stop and mark remaining as failed.
-                    for rest_msg in iter {
-                        failed_messages.push((
-                            rest_msg,
-                            PublisherError::Retryable(anyhow::anyhow!(
-                                "Batch aborted due to previous error"
-                            )),
-                        ));
+                    if is_connection_error(&e) {
+                        return Err(PublisherError::NonRetryable(anyhow!(
+                            "__CONNECTION_ERROR__: {}",
+                            e
+                        )));
                     }
-                    break;
+                    return Err(PublisherError::Retryable(
+                        anyhow!(e).context("Failed to publish message in batch"),
+                    ));
                 }
             }
         }
@@ -223,6 +237,12 @@ impl MessagePublisher for AmqpPublisher {
                     }
                 }
                 Err(e) => {
+                    if is_connection_error(&e) {
+                        return Err(PublisherError::NonRetryable(anyhow!(
+                            "__CONNECTION_ERROR__: {}",
+                            e
+                        )));
+                    }
                     failed_messages.push((
                         message,
                         PublisherError::Retryable(anyhow::anyhow!(
