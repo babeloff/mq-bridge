@@ -223,9 +223,8 @@ impl SqlxPublisher {
                         if let Err(e) = sqlx::query(&create_index_query).execute(&pool).await {
                             if (driver_name.as_str() == "MySQL"
                                 || driver_name.as_str() == "MariaDB")
-                                && e.as_database_error().is_some_and(|db_err| {
-                                    db_err.code() == Some(Cow::from("1061"))
-                                })
+                                && e.as_database_error()
+                                    .is_some_and(|db_err| db_err.code() == Some(Cow::from("1061")))
                             {
                                 trace!("Index {} on {} already exists.", index_name, config.table);
                             } else {
