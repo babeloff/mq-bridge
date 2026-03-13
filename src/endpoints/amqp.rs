@@ -626,24 +626,24 @@ async fn handle_dispositions(
     dispositions: Vec<MessageDisposition>,
 ) -> anyhow::Result<()> {
     let ackers_len = ackers.len();
-    let mut futures = futures::stream::iter(ackers
-        .into_iter()
-        .zip(dispositions)
-        .map(|(acker, disposition)| async move {
+    let mut futures = futures::stream::iter(ackers.into_iter().zip(dispositions).map(
+        |(acker, disposition)| async move {
             match disposition {
                 MessageDisposition::Ack | MessageDisposition::Reply(_) => {
                     acker.ack(BasicAckOptions::default()).await
-                },
+                }
                 MessageDisposition::Nack => {
                     // Nack with requeue. This will return the message to the front of the queue.
                     acker
                         .nack(lapin::options::BasicNackOptions {
                             requeue: true,
                             ..Default::default()
-                        }).await
+                        })
+                        .await
                 }
             }
-        }))
+        },
+    ))
     .buffer_unordered(ackers_len);
 
     while let Some(res) = futures.next().await {
