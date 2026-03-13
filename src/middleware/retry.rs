@@ -32,7 +32,7 @@ impl RetryPublisher {
                 Err(e @ PublisherError::NonRetryable(_)) => return Err(e), // Don't retry non-retryable errors
                 Err(e @ PublisherError::Retryable(_)) => {
                     if attempt >= self.config.max_attempts {
-                        return Err(PublisherError::NonRetryable(anyhow!(
+                        return Err(PublisherError::Retryable(anyhow!(
                             "Retries exhausted after {} attempts: {}",
                             self.config.max_attempts,
                             e
@@ -123,7 +123,7 @@ impl MessagePublisher for RetryPublisher {
                         let non_retryable_failures = retryable.into_iter().map(|(msg, e)| {
                             (
                                 msg,
-                                PublisherError::NonRetryable(anyhow!("Retries exhausted: {}", e)),
+                                PublisherError::Retryable(anyhow!("Retries exhausted: {}", e)),
                             )
                         });
                         all_failed.extend(non_retryable_failures);
@@ -144,7 +144,7 @@ impl MessagePublisher for RetryPublisher {
                         return Err(e);
                     }
                     if attempt >= self.config.max_attempts {
-                        return Err(PublisherError::NonRetryable(anyhow!(
+                        return Err(PublisherError::Retryable(anyhow!(
                             "Retries exhausted after {} attempts: {}",
                             self.config.max_attempts,
                             e

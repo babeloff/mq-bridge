@@ -644,12 +644,15 @@ impl std::fmt::Display for FaultMode {
 ///   trigger_on_message: 3  # Trigger on the 3rd message
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct RandomPanicMiddleware {
     /// The type of fault to inject.
+    #[serde(default)]
     pub mode: FaultMode,
     /// Trigger the fault on the Nth message (1-indexed). None = trigger on every message.
     #[cfg_attr(feature = "schema", schemars(range(min = 1)))]
+    #[serde(default)]
     pub trigger_on_message: Option<usize>,
     /// Enable/disable the fault injection without removing the configuration.
     #[serde(default = "default_true")]
@@ -1626,9 +1629,9 @@ pub struct SqlxConfig {
     /// (Publisher only) Optional. A custom SQL INSERT query. Use `?` as a placeholder for the payload.
     /// If not provided, a default `INSERT INTO {table} (payload) VALUES (?)` is used.
     pub insert_query: Option<String>,
-    /// (Consumer only) Optional. A custom SQL SELECT query to fetch messages. The query should select rows
-    /// to be processed. **It should not include a `LIMIT` clause**, as the bridge will append
-    /// one based on the route's `batch_size`.
+    /// (Consumer only) Optional. A custom SQL SELECT query to fetch messages. This is only supported for PostgreSQL and Microsoft SQL Server.
+    /// The query must include a placeholder for the batch size (`$1` for PostgreSQL, `@p1` for SQL Server).
+    /// The bridge will bind the route's `batch_size` to this placeholder.
     pub select_query: Option<String>,
     /// (Consumer only) If true, delete messages after processing.
     #[serde(default)]

@@ -1538,7 +1538,8 @@
         },
         "mode": {
           "description": "The type of fault to inject.",
-          "$ref": "#/$defs/FaultMode"
+          "$ref": "#/$defs/FaultMode",
+          "default": "panic"
         },
         "trigger_on_message": {
           "description": "Trigger the fault on the Nth message (1-indexed). None = trigger on every message.",
@@ -1547,12 +1548,11 @@
             "null"
           ],
           "format": "uint",
+          "default": null,
           "minimum": 1
         }
       },
-      "required": [
-        "mode"
-      ]
+      "additionalProperties": false
     },
     "ResponseConfig": {
       "type": "object",
@@ -1750,7 +1750,7 @@
           "minimum": 0
         },
         "select_query": {
-          "description": "(Consumer only) Optional. A custom SQL SELECT query to fetch messages. The query should select rows\nto be processed. **It should not include a `LIMIT` clause**, as the bridge will append\none based on the route's `batch_size`.",
+          "description": "(Consumer only) Optional. A custom SQL SELECT query to fetch messages. This is only supported for PostgreSQL and Microsoft SQL Server.\nThe query must include a placeholder for the batch size (`$1` for PostgreSQL, `@p1` for SQL Server).\nThe bridge will bind the route's `batch_size` to this placeholder.",
           "type": [
             "string",
             "null"

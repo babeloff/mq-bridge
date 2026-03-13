@@ -51,7 +51,7 @@ It may still be possible that there are issues with
 *   **Resilient Pipelines**: Apply uniform reliability patterns (Retries, DLQ, Deduplication) across all your data flows.
 *   **Database Integration**: Easily combine databases with message brokers. Use it to ingest messages into a database (SQL/NoSQL) or to implement the Outbox Pattern by forwarding database rows to a broker.
 *   **Sidecar / Gateway**: Deploy as a standalone service to ingest, filter, and route messages before they reach your core services.
-*   **Polyglot Services**: Enable communication between services written in different languages (e.g., Node.js, Python, Go) that prefer different protocols (HTTP, gRPC, Redis, AMQP) by acting as a universal translator and buffer.
+*   **Polyglot Services**: Enable communication between services written in different languages (e.g., Node.js, Python, Go) that prefer different protocols (HTTP, gRPC, Kafka, AMQP) by acting as a universal translator and buffer.
 
 ### When NOT to use mq-bridge
 *   **Stateful Stream Processing**: For windowing, joins, or complex aggregations over time, dedicated stream processing engines are more suitable.

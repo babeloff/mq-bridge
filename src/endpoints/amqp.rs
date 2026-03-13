@@ -614,7 +614,7 @@ async fn handle_dispositions(
                     acker.ack(BasicAckOptions::default()).await
                 }
                 MessageDisposition::Nack => {
-                    // Nack without requeue. This will drop the message or route it to a DLX if configured.
+                    // Nack with requeue. This will return the message to the front of the queue.
                     acker
                         .nack(lapin::options::BasicNackOptions {
                             requeue: true,

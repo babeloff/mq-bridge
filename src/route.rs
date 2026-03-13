@@ -1466,12 +1466,18 @@ mod tests {
             .unwrap();
 
         // Should receive msg1
-        let msg1 = verifier.receive().await.unwrap();
+        let msg1 = tokio::time::timeout(std::time::Duration::from_secs(10), verifier.receive())
+            .await
+            .expect("Timed out waiting for msg1")
+            .unwrap();
         assert_eq!(msg1.message.get_payload_str(), "msg1");
 
         // Route encounters error, sleeps 5s (skipped by pause), reconnects.
         // Should receive msg2
-        let msg2 = verifier.receive().await.unwrap();
+        let msg2 = tokio::time::timeout(std::time::Duration::from_secs(10), verifier.receive())
+            .await
+            .expect("Timed out waiting for msg2")
+            .unwrap();
         assert_eq!(msg2.message.get_payload_str(), "msg2");
 
         assert!(connection_attempts.load(Ordering::SeqCst) >= 2);
@@ -1482,7 +1488,7 @@ mod tests {
     async fn test_non_retryable_handler_error_does_not_crash_route() {
         let unique_id = fast_uuid_v7::gen_id().to_string();
         let in_topic = format!("bad_input_in_{}", unique_id);
-        let out_topic = format!("bad_input_out_{}", unique_id);
+        let out_topic = format!("bad_input_out_{}", unique_id); // Not used, but good practice
 
         let input = Endpoint::new_memory(&in_topic, 10);
         let output = Endpoint::new_memory(&out_topic, 10);
@@ -1492,7 +1498,7 @@ mod tests {
             if msg.get_payload_str() == "poison" {
                 Err(HandlerError::NonRetryable(anyhow::anyhow!("Invalid input")))
             } else {
-                Ok(crate::Handled::Ack)
+                Ok(crate::Handled::Publish(msg))
             }
         };
 
@@ -1500,6 +1506,7 @@ mod tests {
         route.deploy("test_invalid_input").await.unwrap();
 
         let input_ch = input.channel().unwrap();
+        let out_channel = route.output.channel().unwrap();
 
         // 1. Send poison message
         input_ch.send_message("poison".into()).await.unwrap();
@@ -1507,13 +1514,18 @@ mod tests {
         // 2. Send valid message
         input_ch.send_message("valid".into()).await.unwrap();
 
-        // We can't easily check the output since the handler ACKs (and doesn't publish) on success/fail in this config,
-        // but we verify the route is still alive by ensuring the valid message is processed.
-        // Since we didn't hook into the ack mechanism here, we rely on the fact that if the route crashed,
-        // the channel would likely close or we wouldn't be able to interact with it.
-        // To be sure, let's verify the route status.
-
-        assert!(Route::get("test_invalid_input").is_some());
+        // 3. Verify the valid message was processed and published
+        let received = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Some(msg) = out_channel.drain_messages().pop() {
+                    return msg;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("Timed out waiting for valid message to be processed");
+        assert_eq!(received.get_payload_str(), "valid");
         Route::stop("test_invalid_input").await;
     }
 
