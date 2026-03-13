@@ -6,7 +6,6 @@ use mq_bridge::test_utils::{
     run_performance_pipeline_test, run_pipeline_test, run_test_with_docker,
     run_test_with_docker_controller, setup_logging, PERF_TEST_MESSAGE_COUNT,
 };
-use mq_bridge::traits::MessagePublisher;
 use std::sync::Arc;
 
 const CONFIG_YAML: &str = r#"
@@ -48,6 +47,7 @@ pub async fn test_amqp_pipeline() {
 #[tokio::test]
 #[ignore = "requires docker compose"]
 async fn test_amqp_publisher_handles_nack() {
+    use mq_bridge::traits::MessagePublisher;
     setup_logging();
     run_test_with_docker("tests/integration/docker-compose/amqp.yml", || async {
         let nack_queue = "test_nack_queue";
