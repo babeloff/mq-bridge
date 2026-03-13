@@ -208,7 +208,11 @@ impl MessagePublisher for DlqPublisher {
                             dlq_error
                         );
                         // The original error `e` is what caused the DLQ attempt. We wrap it to indicate the DLQ also failed.
-                        Err(PublisherError::NonRetryable(anyhow::anyhow!("Primary send failed: '{}'. DLQ send also failed: {}", e, dlq_error)))
+                        Err(PublisherError::NonRetryable(anyhow::anyhow!(
+                            "Primary send failed: '{}'. DLQ send also failed: {}",
+                            e,
+                            dlq_error
+                        )))
                     }
                 }
             }
