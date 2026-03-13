@@ -1098,6 +1098,9 @@ pub struct AmqpConfig {
     /// If true, declare queues as non-durable (transient). Defaults to false. Affects both Consumer (queue durability) and Publisher (message persistence).
     #[serde(default)]
     pub no_persistence: bool,
+    /// (Publisher only) If true, do not attempt to declare the queue. Assumes the queue already exists. Defaults to false.
+    #[serde(default)]
+    pub no_declare_queue: bool,
     /// (Publisher only) If true, do not wait for an acknowledgement when sending to broker. Defaults to false.
     #[serde(default)]
     pub delayed_ack: bool,

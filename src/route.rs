@@ -406,7 +406,9 @@ impl Route {
                             commit_tasks.spawn(async move {
                                 if let Err(e) = commit(vec![MessageDisposition::Ack; batch_len]).await {
                                     error!("Commit failed: {}", e);
-                                    let _ = err_tx.send(e).await;
+                                    if err_tx.try_send(e).is_err() {
+                                        warn!("Could not send commit error to main task, it might be down or busy.");
+                                    }
                                 }
                                 // Permit is dropped here, releasing the slot
                                 drop(permit);
@@ -417,7 +419,7 @@ impl Route {
                             if has_retryable {
                                 let failed_count = failed.len();
                                 let (_, first_error) = failed
-                                    .into_iter()
+                                    .iter()
                                     .find(|(_, e)| matches!(e, PublisherError::Retryable(_)))
                                     .expect("has_retryable is true");
                                 let err = anyhow::anyhow!(
@@ -425,12 +427,13 @@ impl Route {
                                     failed_count,
                                     first_error
                                 );
-                                // Nack the commit to fill the sequencer slot before breaking.
-                                // Without this, the sequencer would time out waiting for a gap that
-                                // can never be filled (the wrapped commit was never called).
-                                commit_tasks.spawn(async move {
-                                    let _ = commit(vec![MessageDisposition::Nack; batch_len]).await;
-                                });
+                                // Partially ack/nack the batch to fill the sequencer slot.
+                                let dispositions =
+                                    map_responses_to_dispositions(&message_ids, responses, &failed);
+                                if let Err(commit_err) = commit(dispositions).await {
+                                    warn!("Commit after partial send failure also failed (this is expected during a disconnect): {}", commit_err);
+                                }
+
                                 break Err(err);
                             }
                             for (msg, e) in &failed {
@@ -443,16 +446,16 @@ impl Route {
                                 let dispositions = map_responses_to_dispositions(&ids, responses, &failed);
                                 if let Err(e) = commit(dispositions).await {
                                     error!("Commit failed: {}", e);
-                                    let _ = err_tx.send(e).await;
+                                    if err_tx.try_send(e).is_err() {
+                                        warn!("Could not send commit error to main task, it might be down or busy.");
+                                    }
                                 }
                                 drop(permit);
                             });
                         }
                         Err(e) => {
                             // Nack the commit to fill the sequencer slot before breaking.
-                            commit_tasks.spawn(async move {
-                                let _ = commit(vec![MessageDisposition::Nack; batch_len]).await;
-                            });
+                            let _ = commit(vec![MessageDisposition::Nack; batch_len]).await;
                             break Err(e.into()); // Propagate error to trigger reconnect
                         }
                     }
@@ -537,7 +540,9 @@ impl Route {
                             commit_tasks.spawn(async move {
                                 if let Err(e) = commit(vec![MessageDisposition::Ack; batch_len]).await {
                                     error!("Commit failed: {}", e);
-                                    let _ = err_tx.send(e).await;
+                                    if err_tx.try_send(e).is_err() {
+                                        warn!("Could not send commit error to main task, it might be down or busy.");
+                                    }
                                 }
                                 drop(permit);
                             });
@@ -547,7 +552,7 @@ impl Route {
                             if has_retryable {
                                 let failed_count = failed.len();
                                 let (_, first_error) = failed
-                                    .into_iter()
+                                    .iter()
                                     .find(|(_, e)| matches!(e, PublisherError::Retryable(_)))
                                     .expect("has_retryable is true");
                                 let e = anyhow::anyhow!(
@@ -556,13 +561,17 @@ impl Route {
                                     first_error
                                 );
                                 error!("Worker failed to send message batch: {}", e);
-                                // Nack the commit to fill the sequencer slot and prevent a deadlock.
-                                // Other workers may have already sent later sequence numbers to the
-                                // sequencer; dropping this commit without filling it leaves a gap
-                                // that blocks the sequencer and all commit tasks indefinitely.
-                                let _ = commit(vec![MessageDisposition::Nack; batch_len]).await;
-                                if err_tx.send(e).await.is_err() {
-                                    warn!("Could not send error to main task, it might be down.");
+                                // Partially ack/nack the batch to fill the sequencer slot.
+                                // This is crucial to prevent deadlocks. Even if this commit fails
+                                // due to a broken connection, it's important to attempt it.
+                                let dispositions =
+                                    map_responses_to_dispositions(&message_ids, responses, &failed);
+                                if let Err(commit_err) = commit(dispositions).await {
+                                    warn!("Commit after partial send failure also failed (this is expected during a disconnect): {}", commit_err);
+                                }
+
+                                if err_tx.try_send(e).is_err() {
+                                    warn!("Could not send error to main task, it might be down or busy.");
                                 }
                                 break; // Stop processing this batch
                             }
@@ -582,7 +591,9 @@ impl Route {
                                 let dispositions = map_responses_to_dispositions(&ids, responses, &failed);
                                 if let Err(e) = commit(dispositions).await {
                                     error!("Commit failed: {}", e);
-                                    let _ = err_tx.send(e).await;
+                                    if err_tx.try_send(e).is_err() {
+                                        warn!("Could not send commit error to main task, it might be down or busy.");
+                                    }
                                 }
                                 drop(permit);
                             });
@@ -592,8 +603,8 @@ impl Route {
                             // Nack the commit to fill the sequencer slot and prevent a deadlock.
                             let _ = commit(vec![MessageDisposition::Nack; batch_len]).await;
                             // Send the error back to the main task to tear down the route.
-                            if err_tx.send(e.into()).await.is_err() {
-                                warn!("Could not send error to main task, it might be down.");
+                            if err_tx.try_send(e.into()).is_err() {
+                                warn!("Could not send error to main task, it might be down or busy.");
                             }
                             break;
                         }

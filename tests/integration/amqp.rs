@@ -6,6 +6,7 @@ use mq_bridge::test_utils::{
     run_performance_pipeline_test, run_pipeline_test, run_test_with_docker,
     run_test_with_docker_controller, setup_logging, PERF_TEST_MESSAGE_COUNT,
 };
+use mq_bridge::traits::MessagePublisher;
 use std::sync::Arc;
 
 const CONFIG_YAML: &str = r#"
@@ -18,7 +19,7 @@ routes:
     output:
       middlewares:
         - retry:
-            max_attempts: 20
+            max_attempts: 10
             initial_interval_ms: 500
             max_interval_ms: 2000
       amqp: { url: "amqp://guest:guest@localhost:5672/%2f", queue: "test_queue_amqp" }
@@ -40,6 +41,64 @@ pub async fn test_amqp_pipeline() {
             &(PERF_TEST_MESSAGE_COUNT + 1000).to_string(),
         );
         run_pipeline_test("AMQP", &config_yaml).await;
+    })
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "requires docker compose"]
+async fn test_amqp_publisher_handles_nack() {
+    setup_logging();
+    run_test_with_docker("tests/integration/docker-compose/amqp.yml", || async {
+        let nack_queue = "test_nack_queue";
+        let config = mq_bridge::models::AmqpConfig {
+            url: "amqp://guest:guest@localhost:5672/%2f".to_string(),
+            queue: Some(nack_queue.to_string()),
+            no_declare_queue: true, // The test manually declares the queue with special args
+            ..Default::default()
+        };
+
+        let conn = lapin::Connection::connect(&config.url, lapin::ConnectionProperties::default())
+            .await
+            .unwrap();
+        let channel = conn.create_channel().await.unwrap();
+        // Manually create a queue that will cause a NACK.
+        // A queue with max-length 0 and overflow "reject-publish" will reject messages.
+        let mut args = lapin::types::FieldTable::default();
+        args.insert("x-max-length".into(), lapin::types::AMQPValue::LongInt(0));
+        args.insert(
+            "x-overflow".into(),
+            lapin::types::AMQPValue::LongString("reject-publish".into()),
+        );
+        channel
+            .queue_declare(
+                nack_queue,
+                lapin::options::QueueDeclareOptions::default(),
+                args,
+            )
+            .await
+            .unwrap();
+
+        // Create our publisher
+        let publisher = AmqpPublisher::new(&config).await.unwrap();
+
+        // Send a message that should be NACKed
+        let msg = mq_bridge::CanonicalMessage::from("this will be nacked");
+        let result = publisher.send(msg).await;
+
+        // Assert that we received a Retryable error because of the NACK
+        assert!(result.is_err(), "Expected send to fail with a NACK");
+        let err = result.unwrap_err();
+        assert!(matches!(
+            err,
+            mq_bridge::traits::PublisherError::Retryable(_)
+        ));
+        assert!(
+            err.to_string().contains("Broker Nacked the message"),
+            "Error message should indicate a NACK"
+        );
+
+        println!("AMQP NACK handling test passed!");
     })
     .await;
 }

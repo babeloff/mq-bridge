@@ -22,6 +22,11 @@
             "null"
           ]
         },
+        "no_declare_queue": {
+          "description": "(Publisher only) If true, do not attempt to declare the queue. Assumes the queue already exists. Defaults to false.",
+          "type": "boolean",
+          "default": false
+        },
         "no_persistence": {
           "description": "If true, declare queues as non-durable (transient). Defaults to false. Affects both Consumer (queue durability) and Publisher (message persistence).",
           "type": "boolean",
@@ -1542,7 +1547,7 @@
             "null"
           ],
           "format": "uint",
-          "minimum": 0
+          "minimum": 1
         }
       },
       "required": [
@@ -1674,6 +1679,11 @@
           "format": "uint64",
           "minimum": 0
         },
+        "auto_create_table": {
+          "description": "(Publisher only) If true, automatically create the table and indexes if they don't exist. Defaults to false.",
+          "type": "boolean",
+          "default": false
+        },
         "delete_after_read": {
           "description": "(Consumer only) If true, delete messages after processing.",
           "type": "boolean",
@@ -1722,6 +1732,14 @@
           "format": "uint32",
           "minimum": 0
         },
+        "password": {
+          "description": "Optional password. Takes precedence over any credentials embedded in the `url`.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
         "polling_interval_ms": {
           "description": "(Consumer only) Polling interval in milliseconds. Defaults to 100ms.",
           "type": [
@@ -1757,6 +1775,14 @@
         "url": {
           "description": "Database connection URL.",
           "type": "string"
+        },
+        "username": {
+          "description": "Optional username. Takes precedence over any credentials embedded in the `url`.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
         }
       },
       "additionalProperties": false,
