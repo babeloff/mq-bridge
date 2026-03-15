@@ -43,12 +43,12 @@ impl CommandPublisher {
 impl MessagePublisher for CommandPublisher {
     async fn send(&self, message: CanonicalMessage) -> Result<Sent, PublisherError> {
         let inbound_correlation_id = message.metadata.get("correlation_id").cloned();
-        let original_id = message.message_id; // Keep for fallback
+        let original_id = message.message_id;
         match self.handler.handle(message).await {
             Ok(Handled::Publish(mut response_msg)) => {
-                // For request-reply correlation, we ensure the original message's ID is
-                // available in the response metadata. This doesn't overwrite an existing
-                // correlation_id, which might be important if the handler is part of a chain.
+                // For internal correlation, set the response message's ID to the original.
+                response_msg.message_id = original_id;
+                // For end-to-end tracing, propagate or create a correlation_id.
                 let fallback_correlation_id =
                     inbound_correlation_id.unwrap_or_else(|| format!("{:032x}", original_id));
                 response_msg
@@ -242,5 +242,23 @@ mod tests {
         let result = publisher.send("test".into()).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("inner fail"));
+    }
+
+    #[tokio::test]
+    async fn test_command_handler_preserves_message_id() {
+        let memory_publisher = MemoryPublisher::new_local("test_cmd_id_preservation", 10);
+        let channel = memory_publisher.channel();
+
+        let handler = |_msg: CanonicalMessage| async move {
+            let new_msg = CanonicalMessage::new(b"response".to_vec(), None);
+            Ok(Handled::Publish(new_msg))
+        };
+
+        let publisher = CommandPublisher::new(memory_publisher, handler);
+        let original_id = 987654321u128;
+        publisher.send(CanonicalMessage::new(b"req".to_vec(), Some(original_id))).await.unwrap();
+
+        let received = channel.drain_messages();
+        assert_eq!(received[0].message_id, original_id);
     }
 }
