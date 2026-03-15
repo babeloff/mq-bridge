@@ -15,14 +15,6 @@
         This enables distributed tracing across microservices connected via the bridge.
         @src/middleware.rs
       status: "Postpone"
-    - title: "SQL Endpoint (sqlx)"
-      id: "G11"
-      description: |
-        Implement a generic SQL endpoint using `sqlx` supporting Postgres, MySQL, and SQLite.
-        Consumer: Poll table based on cursor (id/timestamp) or queue-like (lock/delete).
-        Publisher: Insert message payload/metadata into table.
-        @src/endpoints/sql.rs
-      status: "Postpone"
     - title: "Reliable Event Store & Handlers"
       id: "H12"
       description: |

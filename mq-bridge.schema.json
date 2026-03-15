@@ -22,6 +22,11 @@
             "null"
           ]
         },
+        "no_declare_queue": {
+          "description": "(Publisher only) If true, do not attempt to declare the queue. Assumes the queue already exists. Defaults to false.",
+          "type": "boolean",
+          "default": false
+        },
         "no_persistence": {
           "description": "If true, declare queues as non-durable (transient). Defaults to false. Affects both Consumer (queue durability) and Publisher (message persistence).",
           "type": "boolean",
@@ -393,6 +398,17 @@
         {
           "type": "object",
           "properties": {
+            "sqlx": {
+              "$ref": "#/$defs/SqlxConfig"
+            }
+          },
+          "required": [
+            "sqlx"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
             "fanout": {
               "type": "array",
               "items": {
@@ -472,6 +488,36 @@
       ],
       "unevaluatedProperties": false
     },
+    "FaultMode": {
+      "description": "Fault injection modes for testing error handling and recovery mechanisms.",
+      "oneOf": [
+        {
+          "description": "Trigger a thread panic.",
+          "type": "string",
+          "const": "panic"
+        },
+        {
+          "description": "Simulate a connection/network error (retryable).",
+          "type": "string",
+          "const": "disconnect"
+        },
+        {
+          "description": "Simulate a timeout error (retryable).",
+          "type": "string",
+          "const": "timeout"
+        },
+        {
+          "description": "Simulate a JSON format error (non-retryable).",
+          "type": "string",
+          "const": "json_format_error"
+        },
+        {
+          "description": "Return a negative acknowledgement (for handlers).",
+          "type": "string",
+          "const": "nack"
+        }
+      ]
+    },
     "FileConfig": {
       "type": "object",
       "properties": {
@@ -481,6 +527,11 @@
             "string",
             "null"
           ]
+        },
+        "format": {
+          "description": "The format for writing messages to the file (Publisher) or interpreting them (Consumer). Defaults to `normal`.",
+          "$ref": "#/$defs/FileFormat",
+          "default": "normal"
         },
         "path": {
           "description": "Path to the file.",
@@ -553,6 +604,31 @@
       ],
       "required": [
         "path"
+      ]
+    },
+    "FileFormat": {
+      "description": "Format for messages written to or read from a file.",
+      "oneOf": [
+        {
+          "description": "The full `CanonicalMessage` is serialized to JSON. Payload is a byte array.",
+          "type": "string",
+          "const": "normal"
+        },
+        {
+          "description": "The full `CanonicalMessage` is serialized to JSON. Payload is rendered as a JSON value if possible.",
+          "type": "string",
+          "const": "json"
+        },
+        {
+          "description": "The full `CanonicalMessage` is serialized to JSON. Payload is rendered as a string if possible.",
+          "type": "string",
+          "const": "text"
+        },
+        {
+          "description": "The raw payload of the message is written. For consumers, the line is read as raw bytes.",
+          "type": "string",
+          "const": "raw"
+        }
       ]
     },
     "GrpcConfig": {
@@ -1208,6 +1284,7 @@
       "enum": [
         "normal",
         "json",
+        "text",
         "raw"
       ]
     },
@@ -1451,19 +1528,31 @@
       ]
     },
     "RandomPanicMiddleware": {
-      "description": "Random Panic middleware configuration.\n\nSimulates random failures for chaos testing and resilience validation.\nCauses the middleware to panic with the specified probability, useful for testing\nerror handling and recovery mechanisms.",
+      "description": "Middleware for fault injection testing.\n\nAllows testing error handling and recovery mechanisms by injecting faults\nat specific points in the message processing pipeline.\n\n# Examples\n\n```yaml\nrandom_panic:\n  mode: panic\n  trigger_on_message: 3  # Trigger on the 3rd message\n```",
       "type": "object",
       "properties": {
-        "probability": {
-          "description": "Probability of panic (0.0 to 1.0).",
-          "type": "number",
-          "format": "double"
+        "enabled": {
+          "description": "Enable/disable the fault injection without removing the configuration.",
+          "type": "boolean",
+          "default": true
+        },
+        "mode": {
+          "description": "The type of fault to inject.",
+          "$ref": "#/$defs/FaultMode",
+          "default": "panic"
+        },
+        "trigger_on_message": {
+          "description": "Trigger the fault on the Nth message (1-indexed). None = trigger on every message.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "default": null,
+          "minimum": 1
         }
       },
-      "additionalProperties": false,
-      "required": [
-        "probability"
-      ]
+      "additionalProperties": false
     },
     "ResponseConfig": {
       "type": "object",
@@ -1528,6 +1617,10 @@
           "default": 1,
           "minimum": 1
         },
+        "description": {
+          "description": "A human-readable description of the route's purpose. Defaults to an empty string.",
+          "type": "string"
+        },
         "input": {
           "description": "The input/source endpoint for the route.",
           "$ref": "#/$defs/Endpoint"
@@ -1575,6 +1668,131 @@
       "additionalProperties": false,
       "required": [
         "path"
+      ]
+    },
+    "SqlxConfig": {
+      "description": "General SQLx connection configuration.",
+      "type": "object",
+      "properties": {
+        "acquire_timeout_ms": {
+          "description": "Timeout for acquiring a connection from the pool in milliseconds. Defaults to 30000ms.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "auto_create_table": {
+          "description": "(Publisher only) If true, automatically create the table and indexes if they don't exist. Defaults to false.",
+          "type": "boolean",
+          "default": false
+        },
+        "delete_after_read": {
+          "description": "(Consumer only) If true, delete messages after processing.",
+          "type": "boolean",
+          "default": false
+        },
+        "idle_timeout_ms": {
+          "description": "Maximum idle time for a connection in milliseconds. Defaults to 600000ms (10 minutes).",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "insert_query": {
+          "description": "(Publisher only) Optional. A custom SQL INSERT query. Use `?` as a placeholder for the payload.\nIf not provided, a default `INSERT INTO {table} (payload) VALUES (?)` is used.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "max_connections": {
+          "description": "Maximum number of connections in the pool. Defaults to 10.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "max_lifetime_ms": {
+          "description": "Maximum lifetime of a connection in milliseconds. Defaults to 1800000ms (30 minutes).",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "min_connections": {
+          "description": "Minimum number of connections to keep in the pool. Defaults to 0.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "password": {
+          "description": "Optional password. Takes precedence over any credentials embedded in the `url`.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "polling_interval_ms": {
+          "description": "(Consumer only) Polling interval in milliseconds. Defaults to 100ms.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "select_query": {
+          "description": "(Consumer only) Optional. A custom SQL SELECT query to fetch messages. This is only supported for PostgreSQL and Microsoft SQL Server.\nThe query must include a placeholder for the batch size (`$1` for PostgreSQL, `@p1` for SQL Server).\nThe bridge will bind the route's `batch_size` to this placeholder.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "table": {
+          "description": "The table to interact with.",
+          "type": "string"
+        },
+        "tls": {
+          "description": "TLS configuration for the database connection.",
+          "$ref": "#/$defs/TlsConfig",
+          "default": {
+            "accept_invalid_certs": false,
+            "ca_file": null,
+            "cert_file": null,
+            "cert_password": null,
+            "key_file": null,
+            "required": false
+          }
+        },
+        "url": {
+          "description": "Database connection URL.",
+          "type": "string"
+        },
+        "username": {
+          "description": "Optional username. Takes precedence over any credentials embedded in the `url`.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "url",
+        "table"
       ]
     },
     "SwitchConfig": {

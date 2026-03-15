@@ -7,7 +7,10 @@ use serde::{
     de::{MapAccess, Visitor},
     Deserialize, Deserializer, Serialize,
 };
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::{atomic::AtomicUsize, Arc},
+};
 
 use crate::traits::Handler;
 use tracing::trace;
@@ -91,15 +94,19 @@ impl Default for Route {
 /// use mq_bridge::models::RouteOptions;
 ///
 /// let options = RouteOptions {
+///     description: "My Route".to_string(),
 ///     concurrency: 10,
 ///     batch_size: 5,
 ///     commit_concurrency_limit: 1024,
 /// };
 /// ```
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct RouteOptions {
+    /// A human-readable description of the route's purpose. Defaults to an empty string.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
     /// (Optional) Number of concurrent processing tasks for this route. Defaults to 1.
     #[serde(default = "default_concurrency")]
     #[cfg_attr(feature = "schema", schemars(range(min = 1)))]
@@ -116,6 +123,7 @@ pub struct RouteOptions {
 impl Default for RouteOptions {
     fn default() -> Self {
         Self {
+            description: String::new(),
             concurrency: default_concurrency(),
             batch_size: default_batch_size(),
             commit_concurrency_limit: default_commit_concurrency_limit(),
@@ -176,6 +184,7 @@ fn is_known_endpoint_name(name: &str) -> bool {
             | "ref"
             | "switch"
             | "response"
+            | "sqlx"
     )
 }
 
@@ -430,6 +439,7 @@ pub enum EndpointType {
     IbmMq(IbmMqConfig),
     ZeroMq(ZeroMqConfig),
     Grpc(GrpcConfig),
+    Sqlx(SqlxConfig),
     Fanout(Vec<Endpoint>),
     Switch(SwitchConfig),
     Response(ResponseConfig),
@@ -460,6 +470,7 @@ impl EndpointType {
             EndpointType::IbmMq(_) => "ibmmq",
             EndpointType::ZeroMq(_) => "zeromq",
             EndpointType::Grpc(_) => "grpc",
+            EndpointType::Sqlx(_) => "sqlx",
             EndpointType::Fanout(_) => "fanout",
             EndpointType::Switch(_) => "switch",
             EndpointType::Response(_) => "response",
@@ -595,31 +606,73 @@ pub struct WeakJoinMiddleware {
     pub timeout_ms: u64,
 }
 
-/// Random Panic middleware configuration.
-///
-/// Simulates random failures for chaos testing and resilience validation.
-/// Causes the middleware to panic with the specified probability, useful for testing
-/// error handling and recovery mechanisms.
-#[derive(Debug, Deserialize, Serialize, Clone)]
+/// Fault injection modes for testing error handling and recovery mechanisms.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-#[serde(deny_unknown_fields)]
-pub struct RandomPanicMiddleware {
-    /// Probability of panic (0.0 to 1.0).
-    #[serde(deserialize_with = "deserialize_probability")]
-    pub probability: f64,
+#[serde(rename_all = "snake_case")]
+pub enum FaultMode {
+    /// Trigger a thread panic.
+    #[default]
+    Panic,
+    /// Simulate a connection/network error (retryable).
+    Disconnect,
+    /// Simulate a timeout error (retryable).
+    Timeout,
+    /// Simulate a JSON format error (non-retryable).
+    JsonFormatError,
+    /// Return a negative acknowledgement (for handlers).
+    Nack,
 }
 
-fn deserialize_probability<'de, D>(deserializer: D) -> Result<f64, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let value = f64::deserialize(deserializer)?;
-    if !(0.0..=1.0).contains(&value) {
-        return Err(serde::de::Error::custom(
-            "probability must be between 0.0 and 1.0",
-        ));
+impl std::fmt::Display for FaultMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FaultMode::Panic => write!(f, "panic"),
+            FaultMode::Disconnect => write!(f, "disconnect"),
+            FaultMode::Timeout => write!(f, "timeout"),
+            FaultMode::JsonFormatError => write!(f, "json_format_error"),
+            FaultMode::Nack => write!(f, "nack"),
+        }
     }
-    Ok(value)
+}
+
+/// Middleware for fault injection testing.
+///
+/// Allows testing error handling and recovery mechanisms by injecting faults
+/// at specific points in the message processing pipeline.
+///
+/// # Examples
+///
+/// ```yaml
+/// random_panic:
+///   mode: panic
+///   trigger_on_message: 3  # Trigger on the 3rd message
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct RandomPanicMiddleware {
+    /// The type of fault to inject.
+    #[serde(default)]
+    pub mode: FaultMode,
+    /// Trigger the fault on the Nth message (1-indexed). None = trigger on every message.
+    #[cfg_attr(feature = "schema", schemars(range(min = 1)))]
+    #[serde(default)]
+    pub trigger_on_message: Option<usize>,
+    /// Enable/disable the fault injection without removing the configuration.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(skip, default = "default_atomic_usize_arc")]
+    #[cfg_attr(feature = "schema", schemars(skip))]
+    pub message_count: Arc<AtomicUsize>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_atomic_usize_arc() -> Arc<AtomicUsize> {
+    Arc::new(AtomicUsize::new(0))
 }
 
 fn deserialize_null_as_false<'de, D>(deserializer: D) -> Result<bool, D::Error>
@@ -1053,6 +1106,9 @@ pub struct AmqpConfig {
     /// If true, declare queues as non-durable (transient). Defaults to false. Affects both Consumer (queue durability) and Publisher (message persistence).
     #[serde(default)]
     pub no_persistence: bool,
+    /// (Publisher only) If true, do not attempt to declare the queue. Assumes the queue already exists. Defaults to false.
+    #[serde(default)]
+    pub no_declare_queue: bool,
     /// (Publisher only) If true, do not wait for an acknowledgement when sending to broker. Defaults to false.
     #[serde(default)]
     pub delayed_ack: bool,
@@ -1215,8 +1271,9 @@ pub struct MqttConfig {
     pub protocol: MqttProtocol,
     /// Session expiry interval in seconds (MQTT v5 only).
     pub session_expiry_interval: Option<u32>,
-    /// (Publisher only) If true, messages are acknowledged immediately upon receipt (auto-ack).
+    /// (Consumer only) If true, messages are acknowledged immediately upon receipt (auto-ack).
     /// If false (default), messages are acknowledged after processing (manual-ack).
+    /// Note: This setting does not currently enable synchronous publishing (waiting for PubAck) for the MQTT publisher.
     #[serde(default)]
     pub delayed_ack: bool,
 }
@@ -1558,6 +1615,53 @@ pub struct ResponseConfig {
     // This struct is a marker and currently has no fields.
 }
 
+// --- SQLx Specific Configuration ---
+
+/// General SQLx connection configuration.
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct SqlxConfig {
+    /// Database connection URL.
+    pub url: String,
+    /// Optional username. Takes precedence over any credentials embedded in the `url`.
+    #[serde(default)]
+    pub username: Option<String>,
+    /// Optional password. Takes precedence over any credentials embedded in the `url`.
+    #[serde(default)]
+    pub password: Option<String>,
+    /// The table to interact with.
+    pub table: String,
+    /// (Publisher only) Optional. A custom SQL INSERT query. Use `?` as a placeholder for the payload.
+    /// If not provided, a default `INSERT INTO {table} (payload) VALUES (?)` is used.
+    pub insert_query: Option<String>,
+    /// (Consumer only) Optional. A custom SQL SELECT query to fetch messages. This is only supported for PostgreSQL and Microsoft SQL Server.
+    /// The query must include a placeholder for the batch size (`$1` for PostgreSQL, `@p1` for SQL Server).
+    /// The bridge will bind the route's `batch_size` to this placeholder.
+    pub select_query: Option<String>,
+    /// (Consumer only) If true, delete messages after processing.
+    #[serde(default)]
+    pub delete_after_read: bool,
+    /// (Publisher only) If true, automatically create the table and indexes if they don't exist. Defaults to false.
+    #[serde(default)]
+    pub auto_create_table: bool,
+    /// (Consumer only) Polling interval in milliseconds. Defaults to 100ms.
+    pub polling_interval_ms: Option<u64>,
+    /// TLS configuration for the database connection.
+    #[serde(default)]
+    pub tls: TlsConfig,
+    /// Maximum number of connections in the pool. Defaults to 10.
+    pub max_connections: Option<u32>,
+    /// Minimum number of connections to keep in the pool. Defaults to 0.
+    pub min_connections: Option<u32>,
+    /// Timeout for acquiring a connection from the pool in milliseconds. Defaults to 30000ms.
+    pub acquire_timeout_ms: Option<u64>,
+    /// Maximum idle time for a connection in milliseconds. Defaults to 600000ms (10 minutes).
+    pub idle_timeout_ms: Option<u64>,
+    /// Maximum lifetime of a connection in milliseconds. Defaults to 1800000ms (30 minutes).
+    pub max_lifetime_ms: Option<u64>,
+}
+
 // --- Common Configuration ---
 
 /// TLS configuration for secure connections.
@@ -1687,6 +1791,9 @@ impl SecretExtractor for EndpointType {
             }
             EndpointType::IbmMq(cfg) => {
                 cfg.extract_secrets(&format!("{}__{}", prefix, "IBMMQ"), secrets)
+            }
+            EndpointType::Sqlx(cfg) => {
+                cfg.extract_secrets(&format!("{}__{}", prefix, "SQLX"), secrets)
             }
             EndpointType::Grpc(cfg) => {
                 cfg.extract_secrets(&format!("{}__{}", prefix, "GRPC"), secrets)
@@ -1830,6 +1937,19 @@ impl SecretExtractor for IbmMqConfig {
     }
 }
 
+impl SecretExtractor for SqlxConfig {
+    fn extract_secrets(&mut self, prefix: &str, secrets: &mut HashMap<String, String>) {
+        if let Some(val) = self.username.take() {
+            secrets.insert(format!("{}__{}", prefix, "USERNAME"), val);
+        }
+        if let Some(val) = self.password.take() {
+            secrets.insert(format!("{}__{}", prefix, "PASSWORD"), val);
+        }
+        self.tls
+            .extract_secrets(&format!("{}__{}", prefix, "TLS"), secrets);
+    }
+}
+
 impl SecretExtractor for GrpcConfig {
     fn extract_secrets(&mut self, prefix: &str, secrets: &mut HashMap<String, String>) {
         self.tls
@@ -1878,7 +1998,7 @@ kafka_to_nats:
           max_attempts: 5
           initial_interval_ms: 200
       - random_panic:
-          probability: 0.1
+          mode: nack
       - dlq:
           endpoint:
             nats:
@@ -1947,7 +2067,7 @@ kafka_to_nats:
                     has_retry = true;
                 }
                 Middleware::RandomPanic(rp) => {
-                    assert!((rp.probability - 0.1).abs() < f64::EPSILON);
+                    assert!(rp.mode == FaultMode::Nack);
                     has_random_panic = true;
                 }
                 Middleware::Delay(_) => {}

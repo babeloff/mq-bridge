@@ -29,6 +29,8 @@ pub mod reader;
 pub mod response;
 #[cfg(feature = "sled")]
 pub mod sled;
+#[cfg(feature = "sqlx")]
+pub mod sqlx;
 pub mod static_endpoint;
 pub mod switch;
 #[cfg(feature = "zeromq")]
@@ -388,6 +390,16 @@ fn check_consumer_recursive(
             }
             Ok(warnings)
         }
+        #[cfg(feature = "sqlx")]
+        EndpointType::Sqlx(cfg) => {
+            if cfg.insert_query.is_some() {
+                warnings.push(
+                    "Endpoint 'sqlx' is used as a consumer, but 'insert_query' is a publisher-only option and will be ignored."
+                    .to_string()
+                );
+            }
+            Ok(warnings)
+        }
         #[cfg(feature = "sled")]
         EndpointType::Sled(_) => Ok(warnings),
         EndpointType::Static(_) => Ok(warnings),
@@ -551,6 +563,8 @@ async fn create_base_consumer(
         EndpointType::File(cfg) => Ok(boxed(file::FileConsumer::new(cfg).await?)),
         #[cfg(feature = "grpc")]
         EndpointType::Grpc(cfg) => Ok(boxed(grpc::GrpcConsumer::new(cfg).await?)),
+        #[cfg(feature = "sqlx")]
+        EndpointType::Sqlx(cfg) => Ok(boxed(sqlx::SqlxConsumer::new(cfg).await?)),
         #[cfg(feature = "http")]
         EndpointType::Http(cfg) => Ok(boxed(http::HttpConsumer::new(cfg).await?)),
         EndpointType::Static(cfg) => Ok(boxed(static_endpoint::StaticRequestConsumer::new(cfg)?)),
@@ -772,6 +786,28 @@ fn check_publisher_recursive(
         }
         #[cfg(feature = "grpc")]
         EndpointType::Grpc(_) => Ok(warnings),
+        #[cfg(feature = "sqlx")]
+        EndpointType::Sqlx(cfg) => {
+            if cfg.select_query.is_some() {
+                warnings.push(
+                    "Endpoint 'sqlx' is used as a publisher, but 'select_query' is a consumer-only option and will be ignored."
+                    .to_string()
+                );
+            }
+            if cfg.delete_after_read {
+                warnings.push(
+                    "Endpoint 'sqlx' is used as a publisher, but 'delete_after_read' is a consumer-only option and will be ignored."
+                    .to_string()
+                );
+            }
+            if cfg.polling_interval_ms.is_some() {
+                warnings.push(
+                    "Endpoint 'sqlx' is used as a publisher, but 'polling_interval_ms' is a consumer-only option and will be ignored."
+                    .to_string()
+                );
+            }
+            Ok(warnings)
+        }
         #[cfg(feature = "ibm-mq")]
         EndpointType::IbmMq(cfg) => {
             if cfg.wait_timeout_ms != 1000 {
@@ -1021,6 +1057,10 @@ async fn create_base_publisher(
         EndpointType::Grpc(cfg) => {
             Ok(Box::new(grpc::GrpcPublisher::new(cfg).await?) as Box<dyn MessagePublisher>)
         }
+        #[cfg(feature = "sqlx")]
+        EndpointType::Sqlx(cfg) => {
+            Ok(Box::new(sqlx::SqlxPublisher::new(cfg).await?) as Box<dyn MessagePublisher>)
+        }
         #[cfg(feature = "http")]
         EndpointType::Http(cfg) => {
             let sink = http::HttpPublisher::new(cfg).await?;
@@ -1195,5 +1235,20 @@ mod tests {
             endpoint.middlewares[1],
             Middleware::Deduplication(_)
         ));
+    }
+
+    #[test]
+    fn test_check_consumer_invalid_config() {
+        let config = crate::models::MemoryConfig {
+            topic: "test".to_string(),
+            request_reply: true, // Invalid for consumer
+            ..Default::default()
+        };
+        let endpoint = Endpoint::new(EndpointType::Memory(config));
+
+        let warnings = check_consumer("test_route", &endpoint, None).unwrap();
+        assert!(warnings
+            .iter()
+            .any(|w| w.contains("request_reply") && w.contains("publisher-only")));
     }
 }

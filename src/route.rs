@@ -406,7 +406,9 @@ impl Route {
                             commit_tasks.spawn(async move {
                                 if let Err(e) = commit(vec![MessageDisposition::Ack; batch_len]).await {
                                     error!("Commit failed: {}", e);
-                                    let _ = err_tx.send(e).await;
+                                    if err_tx.try_send(e).is_err() {
+                                        warn!("Could not send commit error to main task, it might be down or busy.");
+                                    }
                                 }
                                 // Permit is dropped here, releasing the slot
                                 drop(permit);
@@ -417,7 +419,7 @@ impl Route {
                             if has_retryable {
                                 let failed_count = failed.len();
                                 let (_, first_error) = failed
-                                    .into_iter()
+                                    .iter()
                                     .find(|(_, e)| matches!(e, PublisherError::Retryable(_)))
                                     .expect("has_retryable is true");
                                 let err = anyhow::anyhow!(
@@ -425,12 +427,13 @@ impl Route {
                                     failed_count,
                                     first_error
                                 );
-                                // Nack the commit to fill the sequencer slot before breaking.
-                                // Without this, the sequencer would time out waiting for a gap that
-                                // can never be filled (the wrapped commit was never called).
-                                commit_tasks.spawn(async move {
-                                    let _ = commit(vec![MessageDisposition::Nack; batch_len]).await;
-                                });
+                                // Partially ack/nack the batch to fill the sequencer slot.
+                                let dispositions =
+                                    map_responses_to_dispositions(&message_ids, responses, &failed);
+                                if let Err(commit_err) = commit(dispositions).await {
+                                    warn!("Commit after partial send failure also failed (this is expected during a disconnect): {}", commit_err);
+                                }
+
                                 break Err(err);
                             }
                             for (msg, e) in &failed {
@@ -443,16 +446,16 @@ impl Route {
                                 let dispositions = map_responses_to_dispositions(&ids, responses, &failed);
                                 if let Err(e) = commit(dispositions).await {
                                     error!("Commit failed: {}", e);
-                                    let _ = err_tx.send(e).await;
+                                    if err_tx.try_send(e).is_err() {
+                                        warn!("Could not send commit error to main task, it might be down or busy.");
+                                    }
                                 }
                                 drop(permit);
                             });
                         }
                         Err(e) => {
                             // Nack the commit to fill the sequencer slot before breaking.
-                            commit_tasks.spawn(async move {
-                                let _ = commit(vec![MessageDisposition::Nack; batch_len]).await;
-                            });
+                            let _ = commit(vec![MessageDisposition::Nack; batch_len]).await;
                             break Err(e.into()); // Propagate error to trigger reconnect
                         }
                     }
@@ -537,7 +540,9 @@ impl Route {
                             commit_tasks.spawn(async move {
                                 if let Err(e) = commit(vec![MessageDisposition::Ack; batch_len]).await {
                                     error!("Commit failed: {}", e);
-                                    let _ = err_tx.send(e).await;
+                                    if err_tx.try_send(e).is_err() {
+                                        warn!("Could not send commit error to main task, it might be down or busy.");
+                                    }
                                 }
                                 drop(permit);
                             });
@@ -547,7 +552,7 @@ impl Route {
                             if has_retryable {
                                 let failed_count = failed.len();
                                 let (_, first_error) = failed
-                                    .into_iter()
+                                    .iter()
                                     .find(|(_, e)| matches!(e, PublisherError::Retryable(_)))
                                     .expect("has_retryable is true");
                                 let e = anyhow::anyhow!(
@@ -556,13 +561,17 @@ impl Route {
                                     first_error
                                 );
                                 error!("Worker failed to send message batch: {}", e);
-                                // Nack the commit to fill the sequencer slot and prevent a deadlock.
-                                // Other workers may have already sent later sequence numbers to the
-                                // sequencer; dropping this commit without filling it leaves a gap
-                                // that blocks the sequencer and all commit tasks indefinitely.
-                                let _ = commit(vec![MessageDisposition::Nack; batch_len]).await;
-                                if err_tx.send(e).await.is_err() {
-                                    warn!("Could not send error to main task, it might be down.");
+                                // Partially ack/nack the batch to fill the sequencer slot.
+                                // This is crucial to prevent deadlocks. Even if this commit fails
+                                // due to a broken connection, it's important to attempt it.
+                                let dispositions =
+                                    map_responses_to_dispositions(&message_ids, responses, &failed);
+                                if let Err(commit_err) = commit(dispositions).await {
+                                    warn!("Commit after partial send failure also failed (this is expected during a disconnect): {}", commit_err);
+                                }
+
+                                if err_tx.try_send(e).is_err() {
+                                    warn!("Could not send error to main task, it might be down or busy.");
                                 }
                                 break; // Stop processing this batch
                             }
@@ -582,7 +591,9 @@ impl Route {
                                 let dispositions = map_responses_to_dispositions(&ids, responses, &failed);
                                 if let Err(e) = commit(dispositions).await {
                                     error!("Commit failed: {}", e);
-                                    let _ = err_tx.send(e).await;
+                                    if err_tx.try_send(e).is_err() {
+                                        warn!("Could not send commit error to main task, it might be down or busy.");
+                                    }
                                 }
                                 drop(permit);
                             });
@@ -592,8 +603,8 @@ impl Route {
                             // Nack the commit to fill the sequencer slot and prevent a deadlock.
                             let _ = commit(vec![MessageDisposition::Nack; batch_len]).await;
                             // Send the error back to the main task to tear down the route.
-                            if err_tx.send(e.into()).await.is_err() {
-                                warn!("Could not send error to main task, it might be down.");
+                            if err_tx.try_send(e.into()).is_err() {
+                                warn!("Could not send error to main task, it might be down or busy.");
                             }
                             break;
                         }
@@ -915,18 +926,56 @@ fn map_responses_to_dispositions(
     let mut dispositions = Vec::with_capacity(message_ids.len());
     let failed_ids: std::collections::HashSet<u128> =
         failed.iter().map(|(m, _)| m.message_id).collect();
-    let mut response_iter = responses.unwrap_or_default().into_iter();
+
+    // Create a map from message_id to response message for efficient lookup.
+    let mut response_map: std::collections::HashMap<u128, crate::CanonicalMessage> = responses
+        .unwrap_or_default()
+        .into_iter()
+        .map(|r| (r.message_id, r))
+        .collect();
 
     for id in message_ids {
         if failed_ids.contains(id) {
             dispositions.push(MessageDisposition::Nack);
-        } else if let Some(resp) = response_iter.next() {
+        } else if let Some(resp) = response_map.remove(id) {
+            // If a response exists for this specific ID, use it.
             dispositions.push(MessageDisposition::Reply(resp));
         } else {
+            // Otherwise, it was a successful send that did not produce a response.
             dispositions.push(MessageDisposition::Ack);
         }
     }
     dispositions
+}
+
+#[cfg(test)]
+fn test_map_responses_to_dispositions_logic() {
+    use crate::{traits::PublisherError, CanonicalMessage};
+    use anyhow::anyhow;
+
+    let ids = vec![1, 2, 3, 4];
+
+    let mut resp1 = CanonicalMessage::from("resp1");
+    resp1.message_id = 1;
+    let mut resp4 = CanonicalMessage::from("resp4");
+    resp4.message_id = 4;
+
+    let responses = Some(vec![
+        resp1, // Corresponds to id 1
+        resp4, // Corresponds to id 4
+    ]);
+
+    let mut msg2 = CanonicalMessage::from("msg2");
+    msg2.message_id = 2;
+    let failed = vec![(msg2, PublisherError::NonRetryable(anyhow!("failed")))];
+
+    let dispositions = map_responses_to_dispositions(&ids, responses, &failed);
+
+    assert_eq!(dispositions.len(), 4);
+    assert!(matches!(dispositions[0], MessageDisposition::Reply(_))); // from responses
+    assert!(matches!(dispositions[1], MessageDisposition::Nack)); // from failed
+    assert!(matches!(dispositions[2], MessageDisposition::Ack)); // implicit ack
+    assert!(matches!(dispositions[3], MessageDisposition::Reply(_))); // from responses
 }
 
 pub fn get_route(name: &str) -> Option<Route> {
@@ -944,126 +993,168 @@ pub async fn stop_route(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::{Endpoint, Middleware};
+    use crate::models::{Endpoint, EndpointType, FaultMode, Middleware, RandomPanicMiddleware};
     use crate::traits::{
         CustomMiddlewareFactory, MessageConsumer, MessagePublisher, ReceivedBatch,
     };
+    use crate::CanonicalMessage;
     use std::any::Any;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
 
-    #[derive(Debug)]
-    struct PanicMiddlewareFactory {
-        should_panic: Arc<AtomicBool>,
-    }
-
-    #[async_trait::async_trait]
-    impl CustomMiddlewareFactory for PanicMiddlewareFactory {
-        async fn apply_consumer(
-            &self,
-            consumer: Box<dyn MessageConsumer>,
-            _route_name: &str,
-            _config: &serde_json::Value,
-        ) -> anyhow::Result<Box<dyn MessageConsumer>> {
-            Ok(Box::new(PanicConsumer {
-                inner: consumer,
-                should_panic: self.should_panic.clone(),
-            }))
-        }
-    }
-
-    struct PanicConsumer {
-        inner: Box<dyn MessageConsumer>,
-        should_panic: Arc<AtomicBool>,
-    }
-
-    #[async_trait::async_trait]
-    impl MessageConsumer for PanicConsumer {
-        async fn receive_batch(
-            &mut self,
-            max_messages: usize,
-        ) -> Result<ReceivedBatch, ConsumerError> {
-            // Panic on the first call to verify route recovery
-            if self
-                .should_panic
-                .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst)
-                .is_ok()
-            {
-                panic!("Simulated panic for testing recovery");
-            }
-            self.inner.receive_batch(max_messages).await
-        }
-
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[ignore = "Takes too much time for regular tests"]
-    async fn test_route_recovery_from_panic() {
-        // Use unique topic names to avoid interference from other tests sharing the static memory channels
+    // Helper function to run a fault injection test on the consumer side.
+    async fn run_consumer_fault_test(
+        mode: FaultMode,
+        expected_payload: &str,
+        route_should_restart: bool,
+        concurrency: usize,
+    ) {
         let unique_suffix = fast_uuid_v7::gen_id().to_string();
-        let in_topic = format!("panic_in_{}", unique_suffix);
-        let out_topic = format!("panic_out_{}", unique_suffix);
+        let in_topic = format!("fault_in_{}_{}_{}", mode, concurrency, unique_suffix);
+        let out_topic = format!("fault_out_{}_{}_{}", mode, concurrency, unique_suffix);
 
-        let should_panic = Arc::new(AtomicBool::new(true));
-        let factory = PanicMiddlewareFactory {
-            should_panic: should_panic.clone(),
+        let fault_config = RandomPanicMiddleware {
+            mode,
+            trigger_on_message: Some(1), // Panic on the first message
+            enabled: true,
+            ..Default::default()
         };
-        register_middleware_factory("panic_factory", Arc::new(factory));
 
-        let input = Endpoint::new_memory(&in_topic, 10).add_middleware(Middleware::Custom {
-            name: "panic_factory".to_string(),
-            config: serde_json::Value::Null,
-        });
+        let input = Endpoint::new_memory(&in_topic, 10)
+            .add_middleware(Middleware::RandomPanic(fault_config));
         let output = Endpoint::new_memory(&out_topic, 10);
 
-        let route = Route::new(input.clone(), output.clone());
+        let route_name = format!("fault_test_{}_{}", mode, concurrency);
+        let route = Route::new(input.clone(), output.clone()).with_concurrency(concurrency);
 
         // Start the route
         route
-            .deploy("panic_test")
+            .deploy(&route_name)
             .await
             .expect("Failed to deploy route");
-        // 1. Send a message. The consumer will panic before picking it up.
+        // Send a message. The consumer will inject a fault when it tries to receive it.
         let input_ch = input.channel().unwrap();
         input_ch
             .send_message("persistent_msg".into())
             .await
             .unwrap();
 
-        // 2. Wait for the panic to occur and the route to enter sleep.
-        // We loop briefly to allow the spawned task to execute and panic.
-        let panic_wait_start = std::time::Instant::now();
-        while panic_wait_start.elapsed() < std::time::Duration::from_secs(5) {
-            if !should_panic.load(Ordering::SeqCst) {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        if route_should_restart {
+            // The route's worker will fail, and the supervisor will wait 5 seconds before restarting.
+            // We wait for a bit longer than that to ensure recovery has happened.
+            tokio::time::sleep(std::time::Duration::from_secs(6)).await;
+        } else {
+            // Route doesn't restart, just wait a bit for the (faulty) message to pass through.
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         }
-        assert!(
-            !should_panic.load(Ordering::SeqCst),
-            "Route should have panicked"
-        );
 
-        // 3. Wait for recovery (5s backoff + restart time).
-        // We sleep the minimum backoff, then poll with a generous timeout to handle loaded CI environments.
-        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-
-        // 4. Verify the message is processed after recovery.
+        // Verify the outcome.
         let mut verifier = route.connect_to_output("verifier").await.unwrap();
         let received = tokio::time::timeout(std::time::Duration::from_secs(10), verifier.receive())
             .await
-            .expect("Timed out waiting for message after recovery")
-            .expect("Stream closed");
+            .expect("Timed out waiting for message after fault")
+            .expect("Stream closed while waiting for message");
 
-        assert_eq!(received.message.get_payload_str(), "persistent_msg");
-        // not necessary here, but it's a good idea to commit
+        assert_eq!(received.message.get_payload_str(), expected_payload);
         (received.commit)(MessageDisposition::Ack).await.unwrap();
 
         // Cleanup
-        Route::stop("panic_test").await;
+        Route::stop(&route_name).await;
+    }
+
+    // Helper function to run a fault injection test on the publisher side.
+    async fn run_publisher_fault_test(
+        mode: FaultMode,
+        expected_payload: &str,
+        route_should_restart: bool,
+    ) {
+        let unique_suffix = fast_uuid_v7::gen_id().to_string();
+        let in_topic = format!("pub_fault_in_{}_{}", mode, unique_suffix);
+        let out_topic = format!("pub_fault_out_{}_{}", mode, unique_suffix);
+
+        let fault_config = RandomPanicMiddleware {
+            mode,
+            trigger_on_message: Some(1), // Trigger on the first message
+            enabled: true,
+            ..Default::default()
+        };
+
+        let mut input = Endpoint::new_memory(&in_topic, 10);
+        // Enable NACK on input so messages aren't lost when publisher crashes
+        if let EndpointType::Memory(ref mut cfg) = input.endpoint_type {
+            cfg.enable_nack = true;
+        }
+        // Apply fault middleware to output
+        let output = Endpoint::new_memory(&out_topic, 10)
+            .add_middleware(Middleware::RandomPanic(fault_config));
+
+        let route_name = format!("pub_fault_test_{}", mode);
+        let route = Route::new(input.clone(), output.clone());
+
+        route
+            .deploy(&route_name)
+            .await
+            .expect("Failed to deploy route");
+
+        let input_ch = input.channel().unwrap();
+        input_ch
+            .send_message(expected_payload.into())
+            .await
+            .unwrap();
+
+        if route_should_restart {
+            tokio::time::sleep(std::time::Duration::from_secs(6)).await;
+        } else {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+
+        let mut verifier = route.connect_to_output("verifier").await.unwrap();
+        let received = tokio::time::timeout(std::time::Duration::from_secs(10), verifier.receive())
+            .await
+            .expect("Timed out waiting for message after publisher fault")
+            .expect("Stream closed");
+
+        assert_eq!(received.message.get_payload_str(), expected_payload);
+        (received.commit)(MessageDisposition::Ack).await.unwrap();
+
+        Route::stop(&route_name).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "Takes too much time for regular tests"]
+    async fn test_route_recovery_from_faults() {
+        let original_payload = "persistent_msg";
+
+        // Test with concurrency > 1
+        run_consumer_fault_test(FaultMode::Panic, original_payload, true, 2).await;
+        run_consumer_fault_test(FaultMode::Disconnect, original_payload, true, 2).await;
+        run_consumer_fault_test(FaultMode::Timeout, original_payload, true, 2).await;
+        run_consumer_fault_test(FaultMode::Nack, original_payload, true, 2).await;
+
+        // This fault replaces the message but does not restart the route.
+        run_consumer_fault_test(FaultMode::JsonFormatError, "{invalid json}", false, 2).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "Takes too much time for regular tests"]
+    async fn test_route_recovery_from_faults_sequential() {
+        let original_payload = "persistent_msg";
+
+        // Test with concurrency = 1
+        run_consumer_fault_test(FaultMode::Panic, original_payload, true, 1).await;
+        run_consumer_fault_test(FaultMode::Disconnect, original_payload, true, 1).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "Takes too much time for regular tests"]
+    async fn test_publisher_recovery_from_faults() {
+        let original_payload = "persistent_msg";
+        // Test publisher-side faults causing restart/retry.
+        // `FaultMode::Panic` is not tested here because the `MemoryConsumer` used for input
+        // does not support crash-safe at-least-once delivery. A panic in the publisher
+        // worker would cause the in-flight message to be lost.
+        run_publisher_fault_test(FaultMode::Disconnect, original_payload, true).await;
+        run_publisher_fault_test(FaultMode::Timeout, original_payload, true).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1195,5 +1286,529 @@ mod tests {
                 panic!("Route deadlocked! The sequencer likely didn't receive the Nack for the failed batch.");
             }
         }
+    }
+
+    use crate::traits::{CustomEndpointFactory, Sent};
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::Mutex;
+
+    type ConsumerBehavior =
+        Arc<Mutex<dyn FnMut() -> Result<Box<dyn MessageConsumer>, anyhow::Error> + Send + Sync>>;
+    type PublisherBehavior =
+        Arc<Mutex<dyn FnMut() -> Result<Box<dyn MessagePublisher>, anyhow::Error> + Send + Sync>>;
+
+    struct MockEndpointFactory {
+        create_consumer_fail: bool,
+        consumer_behavior: ConsumerBehavior,
+        publisher_behavior: PublisherBehavior,
+    }
+
+    impl std::fmt::Debug for MockEndpointFactory {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("MockEndpointFactory")
+                .field("create_consumer_fail", &self.create_consumer_fail)
+                .finish()
+        }
+    }
+
+    impl MockEndpointFactory {
+        fn new() -> Self {
+            Self {
+                create_consumer_fail: false,
+                consumer_behavior: Arc::new(Mutex::new(|| Err(anyhow::anyhow!("Not implemented")))),
+                publisher_behavior: Arc::new(Mutex::new(|| {
+                    Ok(Box::new(NoOpPublisher) as Box<dyn MessagePublisher>)
+                })),
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    struct NoOpPublisher;
+    #[async_trait::async_trait]
+    impl MessagePublisher for NoOpPublisher {
+        async fn send_batch(
+            &self,
+            _: Vec<crate::CanonicalMessage>,
+        ) -> Result<SentBatch, PublisherError> {
+            Ok(SentBatch::Ack)
+        }
+        async fn send(&self, _: crate::CanonicalMessage) -> Result<Sent, PublisherError> {
+            Ok(Sent::Ack)
+        }
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl CustomEndpointFactory for MockEndpointFactory {
+        async fn create_consumer(
+            &self,
+            _: &str,
+            _: &serde_json::Value,
+        ) -> anyhow::Result<Box<dyn MessageConsumer>> {
+            if self.create_consumer_fail {
+                return Err(anyhow::anyhow!("Endpoint unavailable"));
+            }
+            (self.consumer_behavior.lock().unwrap())()
+        }
+        async fn create_publisher(
+            &self,
+            _: &str,
+            _: &serde_json::Value,
+        ) -> anyhow::Result<Box<dyn MessagePublisher>> {
+            (self.publisher_behavior.lock().unwrap())()
+        }
+    }
+
+    #[tokio::test]
+    async fn test_start_fails_on_unavailable_endpoint() {
+        // tokio::time::pause();
+        let unique_id = fast_uuid_v7::gen_id().to_string();
+        let factory_name = format!("unavailable_{}", unique_id);
+
+        let factory = Arc::new(MockEndpointFactory {
+            create_consumer_fail: true,
+            ..MockEndpointFactory::new()
+        });
+        register_endpoint_factory(&factory_name, factory);
+
+        let input = Endpoint {
+            endpoint_type: EndpointType::Custom {
+                name: factory_name,
+                config: serde_json::Value::Null,
+            },
+            middlewares: vec![],
+            handler: None,
+        };
+        let output = Endpoint::new_memory("out", 10);
+        let route = Route::new(input, output);
+
+        // The route should fail to start because the input endpoint fails to create.
+        // The run() method waits for a ready signal which never comes.
+        let result = route.run("test_start_fail").await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("failed to start"));
+    }
+
+    #[tokio::test]
+    async fn test_reconnect_on_consumer_error() {
+        // tokio::time::pause();
+        let unique_id = fast_uuid_v7::gen_id().to_string();
+        let factory_name = format!("reconnect_{}", unique_id);
+
+        // Shared state to track connection attempts
+        let connection_attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_clone = connection_attempts.clone();
+
+        let consumer_logic = move || -> Result<Box<dyn MessageConsumer>, anyhow::Error> {
+            let attempt = attempts_clone.fetch_add(1, Ordering::SeqCst);
+
+            struct FlakyConsumer {
+                attempt: usize,
+            }
+            #[async_trait::async_trait]
+            impl MessageConsumer for FlakyConsumer {
+                async fn receive_batch(
+                    &mut self,
+                    _max: usize,
+                ) -> Result<ReceivedBatch, ConsumerError> {
+                    if self.attempt == 0 {
+                        // First connection works for one batch, then fails
+                        self.attempt = 999; // prevent infinite loop in this instance
+                        Ok(ReceivedBatch {
+                            messages: vec![crate::CanonicalMessage::from("msg1")],
+                            commit: Box::new(|_| Box::pin(async { Ok(()) })),
+                        })
+                    } else if self.attempt == 999 {
+                        // Simulate connection drop
+                        Err(ConsumerError::Connection(anyhow::anyhow!(
+                            "Connection dropped"
+                        )))
+                    } else {
+                        // Subsequent connections work
+                        // Sleep a bit to prevent busy loop in test
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        Ok(ReceivedBatch {
+                            messages: vec![crate::CanonicalMessage::from("msg2")],
+                            commit: Box::new(|_| Box::pin(async { Ok(()) })),
+                        })
+                    }
+                }
+                fn as_any(&self) -> &dyn Any {
+                    self
+                }
+            }
+            Ok(Box::new(FlakyConsumer { attempt }))
+        };
+
+        let mut factory = MockEndpointFactory::new();
+        factory.consumer_behavior = Arc::new(Mutex::new(consumer_logic));
+        register_endpoint_factory(&factory_name, Arc::new(factory));
+
+        let input = Endpoint {
+            endpoint_type: EndpointType::Custom {
+                name: factory_name,
+                config: serde_json::Value::Null,
+            },
+            middlewares: vec![],
+            handler: None,
+        };
+        let output = Endpoint::new_memory(&format!("out_{}", unique_id), 10);
+        let route = Route::new(input, output.clone());
+
+        route.deploy("test_reconnect").await.unwrap();
+
+        // Wait for reconnection and messages
+        let mut verifier = create_consumer_from_route("verifier", &output)
+            .await
+            .unwrap();
+
+        // Should receive msg1
+        let msg1 = tokio::time::timeout(std::time::Duration::from_secs(10), verifier.receive())
+            .await
+            .expect("Timed out waiting for msg1")
+            .unwrap();
+        assert_eq!(msg1.message.get_payload_str(), "msg1");
+
+        // Route encounters error, sleeps 5s (skipped by pause), reconnects.
+        // Should receive msg2
+        let msg2 = tokio::time::timeout(std::time::Duration::from_secs(10), verifier.receive())
+            .await
+            .expect("Timed out waiting for msg2")
+            .unwrap();
+        assert_eq!(msg2.message.get_payload_str(), "msg2");
+
+        assert!(connection_attempts.load(Ordering::SeqCst) >= 2);
+        Route::stop("test_reconnect").await;
+    }
+
+    #[tokio::test]
+    async fn test_non_retryable_handler_error_does_not_crash_route() {
+        let unique_id = fast_uuid_v7::gen_id().to_string();
+        let in_topic = format!("bad_input_in_{}", unique_id);
+        let out_topic = format!("bad_input_out_{}", unique_id); // Not used, but good practice
+
+        let input = Endpoint::new_memory(&in_topic, 10);
+        let output = Endpoint::new_memory(&out_topic, 10);
+
+        // A handler that fails on specific input
+        let handler = |msg: crate::CanonicalMessage| async move {
+            if msg.get_payload_str() == "poison" {
+                Err(HandlerError::NonRetryable(anyhow::anyhow!("Invalid input")))
+            } else {
+                Ok(crate::Handled::Publish(msg))
+            }
+        };
+
+        let route = Route::new(input.clone(), output).with_handler(handler);
+        route.deploy("test_invalid_input").await.unwrap();
+
+        let input_ch = input.channel().unwrap();
+        let out_channel = route.output.channel().unwrap();
+
+        // 1. Send poison message
+        input_ch.send_message("poison".into()).await.unwrap();
+
+        // 2. Send valid message
+        input_ch.send_message("valid".into()).await.unwrap();
+
+        // 3. Verify the valid message was processed and published
+        let received = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Some(msg) = out_channel.drain_messages().pop() {
+                    return msg;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("Timed out waiting for valid message to be processed");
+        assert_eq!(received.get_payload_str(), "valid");
+        Route::stop("test_invalid_input").await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_dlq_and_retry_batch_integration() {
+        use crate::models::{DeadLetterQueueMiddleware, Middleware, RetryMiddleware};
+        use crate::traits::{MessagePublisher, PublisherError, SentBatch};
+        use std::collections::HashMap;
+        use std::sync::Mutex;
+
+        // Mock publisher that fails messages with even-numbered IDs
+        #[derive(Clone)]
+        struct PartialFailPublisher {
+            attempts: Arc<Mutex<HashMap<u128, usize>>>,
+        }
+
+        #[async_trait::async_trait]
+        impl MessagePublisher for PartialFailPublisher {
+            async fn send_batch(
+                &self,
+                messages: Vec<CanonicalMessage>,
+            ) -> Result<SentBatch, PublisherError> {
+                let mut failed = Vec::new();
+                let mut attempts = self.attempts.lock().unwrap();
+
+                for msg in messages {
+                    let msg_num: u32 = serde_json::from_slice::<serde_json::Value>(&msg.payload)
+                        .unwrap()["id"]
+                        .as_u64()
+                        .unwrap() as u32;
+
+                    let attempt_count = attempts.entry(msg.message_id).or_insert(0);
+                    *attempt_count += 1;
+
+                    if msg_num % 2 == 0 {
+                        // Fail even numbers
+                        failed.push((
+                            msg,
+                            PublisherError::Retryable(anyhow::anyhow!("simulated failure")),
+                        ));
+                    }
+                    // Odd numbers succeed implicitly by not being in `failed`
+                }
+
+                if failed.is_empty() {
+                    Ok(SentBatch::Ack)
+                } else {
+                    Ok(SentBatch::Partial {
+                        responses: None,
+                        failed,
+                    })
+                }
+            }
+            async fn send(
+                &self,
+                _msg: CanonicalMessage,
+            ) -> Result<crate::traits::Sent, PublisherError> {
+                unimplemented!()
+            }
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        // 1. Setup
+        let in_topic = "batch_retry_dlq_in";
+        let out_topic = "batch_retry_dlq_out";
+        let dlq_topic = "batch_retry_dlq_dlq";
+
+        let input = Endpoint::new_memory(in_topic, 10);
+        let dlq_endpoint = Endpoint::new_memory(dlq_topic, 10);
+
+        let mock_publisher = PartialFailPublisher {
+            attempts: Arc::new(Mutex::new(HashMap::new())),
+        };
+
+        let mut output_with_middlewares = Endpoint::new_memory(out_topic, 10);
+        output_with_middlewares.middlewares = vec![
+            Middleware::Retry(RetryMiddleware {
+                max_attempts: 2,
+                initial_interval_ms: 1,
+                ..Default::default()
+            }),
+            Middleware::Dlq(Box::new(DeadLetterQueueMiddleware {
+                endpoint: dlq_endpoint.clone(),
+            })),
+        ];
+
+        let route = Route::new(input.clone(), output_with_middlewares).with_batch_size(4);
+        // Inject the mock publisher into the route's output
+        let final_publisher = crate::middleware::apply_middlewares_to_publisher(
+            Box::new(mock_publisher.clone()),
+            &route.output,
+            "test_route",
+        )
+        .await
+        .unwrap();
+
+        // We need a way to run the route with our mocked publisher.
+        // The simplest way is to manually drive the core logic.
+        let (work_tx, work_rx) =
+            async_channel::bounded::<(Vec<crate::CanonicalMessage>, BatchCommitFunc)>(1);
+        let (seq_tx, _sequencer_handle) = spawn_sequencer(1);
+
+        // Spawn a worker to process one batch
+        tokio::spawn(async move {
+            if let Ok((messages, commit)) = work_rx.recv().await {
+                let batch_len = messages.len();
+                match final_publisher.send_batch(messages).await {
+                    Ok(SentBatch::Ack) => {
+                        let _ = commit(vec![MessageDisposition::Ack; batch_len]).await;
+                    }
+                    Ok(SentBatch::Partial { failed, .. }) => {
+                        // In a real route, we'd map responses, but here we just care about failure.
+                        let dispositions = if failed.is_empty() {
+                            vec![MessageDisposition::Ack; batch_len]
+                        } else {
+                            // This is a simplification for the test. A real implementation
+                            // would map dispositions based on message IDs.
+                            vec![MessageDisposition::Nack; batch_len]
+                        };
+                        let _ = commit(dispositions).await;
+                    }
+                    Err(_) => {
+                        let _ = commit(vec![MessageDisposition::Nack; batch_len]).await;
+                    }
+                }
+            }
+        });
+
+        // 2. Send a batch of messages
+        let mut messages = Vec::new();
+        for i in 1..=4 {
+            // 1 (ok), 2 (fail), 3 (ok), 4 (fail)
+            messages.push(CanonicalMessage::from_json(serde_json::json!({"id": i})).unwrap());
+        }
+        let commit = wrap_commit(Box::new(|_| Box::pin(async { Ok(()) })), 0, seq_tx.clone());
+        work_tx.send((messages, commit)).await.unwrap();
+
+        // 3. Verify
+        let dlq_channel = dlq_endpoint.channel().unwrap();
+
+        let start = std::time::Instant::now();
+        while dlq_channel.len() < 2 {
+            if start.elapsed() > std::time::Duration::from_secs(5) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        let dlq_msgs = dlq_channel.drain_messages();
+
+        assert_eq!(dlq_msgs.len(), 2, "Expected 2 messages to go to DLQ");
+
+        let dlq_ids: std::collections::HashSet<u32> = dlq_msgs
+            .iter()
+            .map(|m| {
+                serde_json::from_slice::<serde_json::Value>(&m.payload).unwrap()["id"]
+                    .as_u64()
+                    .unwrap() as u32
+            })
+            .collect();
+
+        assert!(dlq_ids.contains(&2));
+        assert!(dlq_ids.contains(&4));
+
+        // Verify retry attempts
+        let attempts = mock_publisher.attempts.lock().unwrap();
+        // Messages 2 and 4 should be tried `max_attempts` times.
+        assert_eq!(attempts.values().filter(|&&c| c == 2).count(), 2);
+        // Messages 1 and 3 should be tried once.
+        assert_eq!(attempts.values().filter(|&&c| c == 1).count(), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_route_dlq_integration() {
+        // Setup: Input -> [Panic(Disconnect) -> Retry -> DLQ] -> Output
+        // Panic(Disconnect) simulates transient failure.
+        // Retry handles it up to N times.
+        // If max attempts reached, DLQ catches it.
+        // Note: Middleware application order is [Panic, Retry, DLQ] in list to wrap as DLQ(Retry(Panic(Endpoint))).
+
+        let unique_id = fast_uuid_v7::gen_id().to_string();
+        let in_topic = format!("dlq_in_{}", unique_id);
+        let out_topic = format!("dlq_out_{}", unique_id);
+        let dlq_topic = format!("dlq_target_{}", unique_id);
+
+        let input = Endpoint::new_memory(&in_topic, 10);
+
+        let dlq_endpoint = Endpoint::new_memory(&dlq_topic, 10);
+
+        let mut output = Endpoint::new_memory(&out_topic, 10);
+        output.middlewares = vec![
+            // Inner-most: Fail always
+            Middleware::RandomPanic(RandomPanicMiddleware {
+                mode: FaultMode::Disconnect, // Returns Retryable error
+                trigger_on_message: None,    // Fail always
+                enabled: true,
+                ..Default::default()
+            }),
+            // Middle: Retry
+            Middleware::Retry(crate::models::RetryMiddleware {
+                max_attempts: 2,
+                initial_interval_ms: 10,
+                max_interval_ms: 100,
+                multiplier: 1.0,
+            }),
+            // Outer-most: DLQ
+            Middleware::Dlq(Box::new(crate::models::DeadLetterQueueMiddleware {
+                endpoint: dlq_endpoint.clone(),
+            })),
+        ];
+
+        let route = Route::new(input.clone(), output);
+        route.deploy("test_dlq_integration").await.unwrap();
+
+        // Send message
+        let input_ch = input.channel().unwrap();
+        input_ch.send_message("fail_msg".into()).await.unwrap();
+
+        // Verify:
+        // 1. Output channel is empty (msg failed to go there)
+        // 2. DLQ channel has message
+
+        let dlq_ch = dlq_endpoint.channel().unwrap();
+
+        // Wait for DLQ
+        let received = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let batch = dlq_ch.drain_messages();
+                if !batch.is_empty() {
+                    return batch[0].clone();
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("Timed out waiting for DLQ");
+
+        assert_eq!(received.get_payload_str(), "fail_msg");
+
+        let out_ch_target = mq_bridge::endpoints::memory::get_or_create_channel(
+            &mq_bridge::models::MemoryConfig::new(&out_topic, None),
+        );
+        assert!(out_ch_target.is_empty(), "Message should not reach target");
+
+        Route::stop("test_dlq_integration").await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_large_message_handling() {
+        let unique_id = fast_uuid_v7::gen_id().to_string();
+        let in_topic = format!("large_in_{}", unique_id);
+        let out_topic = format!("large_out_{}", unique_id);
+
+        let input = Endpoint::new_memory(&in_topic, 5); // Small capacity
+        let output = Endpoint::new_memory(&out_topic, 5);
+
+        let route = Route::new(input.clone(), output.clone());
+        route.deploy("test_large_msg").await.unwrap();
+
+        let large_payload = vec![b'x'; 5 * 1024 * 1024]; // 5MB
+        let input_ch = input.channel().unwrap();
+
+        input_ch
+            .send_message(large_payload.clone().into())
+            .await
+            .unwrap();
+
+        let mut verifier = route.connect_to_output("verifier").await.unwrap();
+        let received = tokio::time::timeout(std::time::Duration::from_secs(10), verifier.receive())
+            .await
+            .expect("Timed out receiving large message")
+            .unwrap();
+
+        assert_eq!(received.message.payload.len(), large_payload.len());
+        assert_eq!(received.message.payload, large_payload.as_slice());
+
+        Route::stop("test_large_msg").await;
+    }
+
+    #[test]
+    fn test_map_responses_to_dispositions_unit() {
+        test_map_responses_to_dispositions_logic();
     }
 }

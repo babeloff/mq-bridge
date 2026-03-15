@@ -76,6 +76,13 @@ async fn test_all_performance_direct() {
             integration::ibm_mq::test_ibm_mq_performance_direct().await;
         }
     }
+    #[cfg(feature = "sqlx")]
+    {
+        if should_run("sqlx") {
+            println!("\n\n>>> Starting SQLx Direct Performance Test...");
+            integration::sqlx::test_sqlx_performance_direct().await;
+        }
+    }
 
     // The summary table will be printed here when `_summary_printer` is dropped.
 }
@@ -115,12 +122,8 @@ async fn test_all_chaos() {
         if should_run("mqtt") {
             println!("\n\n>>> Starting MQTT Chaos Test...");
             // MQTT chaos tests are currently flaky due to issues with session persistence/QoS handling
-            // in the test environment (Mosquitto + rumqttc). We allow this to fail for now.
-            let handle = tokio::spawn(integration::mqtt::test_mqtt_chaos());
-            if let Err(e) = handle.await {
-                println!("WARNING: MQTT Chaos Test failed. Ignoring failure as MQTT reliability is currently known to be flaky.");
-                println!("Error details: {:?}", e);
-            }
+            // in the test environment (Mosquitto + rumqttc).
+            integration::mqtt::test_mqtt_chaos().await;
         }
     }
 
@@ -141,4 +144,11 @@ async fn test_all_chaos() {
     }
 
     // AWS chaos test is excluded by default as it requires LocalStack which can be heavy/flaky in some envs
+    #[cfg(feature = "sqlx")]
+    {
+        if should_run("sqlx") {
+            println!("\n\n>>> Starting SQLx Chaos Test...");
+            integration::sqlx::test_sqlx_chaos().await;
+        }
+    }
 }

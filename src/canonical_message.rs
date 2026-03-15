@@ -4,7 +4,7 @@
 //  git clone https://github.com/marcomq/mq-bridge
 
 use bytes::Bytes;
-use serde::de::DeserializeOwned;
+use serde::de::{DeserializeOwned, Error};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use uuid::Uuid;
@@ -65,6 +65,9 @@ impl CanonicalMessage {
                     message_id = Some(n);
                 }
             } else if let Some(n) = val.as_i64() {
+                if n < 0 {
+                    return Err(Error::custom("message_id cannot be negative"));
+                }
                 message_id = Some(n as u128);
             } else if let Some(n) = val.as_u64() {
                 message_id = Some(n as u128);
@@ -239,4 +242,49 @@ macro_rules! msg {
             message
         }
     };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn test_message_id_parsing() {
+        // String UUID
+        let uuid = "550e8400-e29b-41d4-a716-446655440000";
+        let msg = CanonicalMessage::from_json(json!({ "id": uuid })).unwrap();
+        assert_eq!(msg.message_id, 113059749145936325402354257176981405696);
+
+        // Hex string
+        let msg = CanonicalMessage::from_json(json!({ "id": "0xFF" })).unwrap();
+        assert_eq!(msg.message_id, 255);
+
+        // Numeric
+        let msg = CanonicalMessage::from_json(json!({ "id": 100 })).unwrap();
+        assert_eq!(msg.message_id, 100);
+
+        // Negative numeric
+        let msg_err = CanonicalMessage::from_json(json!({ "id": -1 }));
+        assert!(msg_err.is_err());
+
+        // Mongo OID
+        let oid = "507f1f77bcf86cd799439011";
+        let msg = CanonicalMessage::from_json(json!({ "_id": { "$oid": oid } })).unwrap();
+        let expected = u128::from_str_radix(oid, 16).unwrap();
+        assert_eq!(msg.message_id, expected);
+    }
+
+    #[test]
+    fn test_metadata_builder() {
+        let msg = CanonicalMessage::new(b"payload".to_vec(), None)
+            .with_metadata_kv("key1", "val1")
+            .with_type_key("my_type");
+
+        assert_eq!(msg.metadata.get("key1").map(|s| s.as_str()), Some("val1"));
+        assert_eq!(
+            msg.metadata.get("kind").map(|s| s.as_str()),
+            Some("my_type")
+        );
+    }
 }

@@ -1,12 +1,12 @@
 use crate::canonical_message::tracing_support::LazyMessageIds;
 use crate::models::AmqpConfig;
 use crate::traits::{
-    BoxFuture, ConsumerError, MessageConsumer, MessageDisposition, MessagePublisher,
-    PublisherError, ReceivedBatch, Sent, SentBatch,
+    BatchCommitFunc, BoxFuture, ConsumerError, MessageConsumer, MessageDisposition,
+    MessagePublisher, PublisherError, ReceivedBatch, Sent, SentBatch,
 };
 use crate::CanonicalMessage;
 use crate::APP_NAME;
-use anyhow::{anyhow, Context};
+use anyhow::{anyhow, bail, Context};
 use async_trait::async_trait;
 use futures::{FutureExt, StreamExt, TryStreamExt};
 use lapin::tcp::{OwnedIdentity, OwnedTLSConfig};
@@ -19,13 +19,21 @@ use lapin::{
     types::{FieldTable, ShortString},
     BasicProperties, Channel, Connection, ConnectionProperties, Consumer, ExchangeKind,
 };
-use std::any::Any;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
-use tracing::{info, trace, warn};
+use std::{any::Any, sync::Arc};
+use tokio::sync::RwLock;
+use tracing::{error, info, trace};
 use uuid::Uuid;
 
-pub struct AmqpPublisher {
+struct AmqpState {
+    connection: Connection,
     channel: Channel,
+}
+
+pub struct AmqpPublisher {
+    state: Arc<RwLock<AmqpState>>,
+    config: AmqpConfig,
     exchange: String,
     queue: String,
     no_persistence: bool,
@@ -34,6 +42,24 @@ pub struct AmqpPublisher {
 
 impl AmqpPublisher {
     pub async fn new(config: &AmqpConfig) -> anyhow::Result<Self> {
+        let state = Self::connect(config).await?;
+        let queue = config
+            .queue
+            .as_deref()
+            .ok_or_else(|| anyhow!("Queue name is required for AMQP publisher"))?
+            .to_string();
+
+        Ok(Self {
+            state: Arc::new(RwLock::new(state)),
+            config: config.clone(),
+            exchange: config.exchange.clone().unwrap_or_default(),
+            queue,
+            no_persistence: config.no_persistence,
+            delayed_ack: config.delayed_ack,
+        })
+    }
+
+    async fn connect(config: &AmqpConfig) -> anyhow::Result<AmqpState> {
         let queue = config
             .queue
             .as_deref()
@@ -45,26 +71,46 @@ impl AmqpPublisher {
             .confirm_select(lapin::options::ConfirmSelectOptions::default())
             .await?;
 
-        // Ensure the queue exists before we try to publish to it. This is idempotent.
-        info!(queue = %queue, "Declaring AMQP queue in sink");
-        channel
-            .queue_declare(
-                queue,
-                QueueDeclareOptions {
-                    durable: !config.no_persistence,
-                    ..Default::default()
-                },
-                FieldTable::default(),
-            )
-            .await?;
+        if !config.no_declare_queue {
+            // Ensure the queue exists before we try to publish to it. This is idempotent.
+            info!(queue = %queue, "Declaring AMQP queue in sink");
+            channel
+                .queue_declare(
+                    queue,
+                    QueueDeclareOptions {
+                        durable: !config.no_persistence,
+                        ..Default::default()
+                    },
+                    FieldTable::default(),
+                )
+                .await?;
+        }
 
-        Ok(Self {
+        Ok(AmqpState {
+            connection: conn,
             channel,
-            exchange: config.exchange.clone().unwrap_or_default(),
-            queue: queue.to_string(),
-            no_persistence: config.no_persistence,
-            delayed_ack: config.delayed_ack,
         })
+    }
+
+    async fn get_channel(&self) -> Channel {
+        self.state.read().await.channel.clone()
+    }
+
+    async fn reconnect(&self) {
+        let mut state = self.state.write().await;
+        if state.connection.status().connected() && state.channel.status().connected() {
+            return;
+        }
+        info!("Reconnecting AMQP publisher...");
+        match Self::connect(&self.config).await {
+            Ok(new_state) => {
+                *state = new_state;
+                info!("AMQP publisher reconnected.");
+            }
+            Err(e) => {
+                error!("Failed to reconnect AMQP publisher: {}", e);
+            }
+        }
     }
 }
 
@@ -91,21 +137,21 @@ impl MessagePublisher for AmqpPublisher {
         }
         if !message.metadata.is_empty() {
             let mut table = FieldTable::default();
-            for (key, value) in message.metadata {
-                // Skip reply_to and correlation_id since they're already set as native properties
+            for (key, value) in &message.metadata {
+                // Skip reply_to and correlation_id since they are already set as native properties
                 if key == "reply_to" || key == "correlation_id" {
                     continue;
                 }
                 table.insert(
-                    ShortString::from(key),
-                    lapin::types::AMQPValue::LongString(value.into()),
+                    ShortString::from(key.as_str()),
+                    lapin::types::AMQPValue::LongString(value.clone().into()),
                 );
             }
             properties = properties.with_headers(table);
         }
 
-        let confirmation = self
-            .channel
+        let channel = self.get_channel().await;
+        let confirmation_result = channel
             .basic_publish(
                 &self.exchange,
                 &self.queue,
@@ -113,14 +159,36 @@ impl MessagePublisher for AmqpPublisher {
                 &message.payload,
                 properties,
             )
-            .await
-            .context("Failed to publish AMQP message")?;
+            .await;
+
+        let confirmation = match confirmation_result {
+            Ok(c) => c,
+            Err(e) => {
+                self.reconnect().await;
+                return Err(PublisherError::Retryable(anyhow!(
+                    "Failed to publish AMQP message: {}",
+                    e
+                )));
+            }
+        };
 
         if !self.delayed_ack {
             // Wait for the broker's publisher confirmation.
-            confirmation
-                .await
-                .context("Failed to get AMQP publisher confirmation")?;
+            let confirm = match confirmation.await {
+                Ok(c) => c,
+                Err(e) => {
+                    self.reconnect().await;
+                    return Err(PublisherError::Retryable(anyhow!(
+                        "Failed to get AMQP publisher confirmation: {}",
+                        e
+                    )));
+                }
+            };
+            if let lapin::publisher_confirm::Confirmation::Nack(_) = confirm {
+                return Err(PublisherError::Retryable(anyhow::anyhow!(
+                    "Broker Nacked the message"
+                )));
+            }
         }
         Ok(Sent::Ack)
     }
@@ -137,6 +205,7 @@ impl MessagePublisher for AmqpPublisher {
             .await;
         }
 
+        let channel = self.get_channel().await;
         let mut pending_confirms = Vec::with_capacity(messages.len());
         let mut failed_messages = Vec::new();
 
@@ -156,7 +225,7 @@ impl MessagePublisher for AmqpPublisher {
             if !message.metadata.is_empty() {
                 let mut table = FieldTable::default();
                 for (key, value) in &message.metadata {
-                    // Skip reply_to and correlation_id since they're already set as native properties
+                    // Skip reply_to and correlation_id since they are already set as native properties
                     if key == "reply_to" || key == "correlation_id" {
                         continue;
                     }
@@ -168,8 +237,7 @@ impl MessagePublisher for AmqpPublisher {
                 properties = properties.with_headers(table);
             }
 
-            match self
-                .channel
+            match channel
                 .basic_publish(
                     &self.exchange,
                     &self.queue,
@@ -179,25 +247,44 @@ impl MessagePublisher for AmqpPublisher {
                 )
                 .await
             {
-                Ok(confirmation) => pending_confirms.push((message, confirmation)),
-                Err(e) => failed_messages.push((
-                    message,
-                    PublisherError::Retryable(anyhow::anyhow!("Failed to publish: {}", e)),
-                )),
+                Ok(confirmation) => {
+                    pending_confirms.push((message, confirmation));
+                }
+                Err(e) => {
+                    failed_messages.push((
+                        message,
+                        PublisherError::Retryable(
+                            anyhow!(e).context("Failed to publish message in batch"),
+                        ),
+                    ));
+                }
             }
         }
 
         for (message, confirmation) in pending_confirms {
             match confirmation.await {
-                Ok(_) => {}
-                Err(e) => failed_messages.push((
-                    message,
-                    PublisherError::Retryable(anyhow::anyhow!(
-                        "Publisher confirmation failed: {}",
-                        e
-                    )),
-                )),
+                Ok(confirm) => {
+                    if let lapin::publisher_confirm::Confirmation::Nack(_) = confirm {
+                        failed_messages.push((
+                            message,
+                            PublisherError::Retryable(anyhow::anyhow!("Broker Nacked the message")),
+                        ));
+                    }
+                }
+                Err(e) => {
+                    failed_messages.push((
+                        message,
+                        PublisherError::Retryable(anyhow::anyhow!(
+                            "Publisher confirmation failed: {}",
+                            e
+                        )),
+                    ));
+                }
             }
+        }
+
+        if !failed_messages.is_empty() {
+            self.reconnect().await;
         }
 
         if failed_messages.is_empty() {
@@ -216,9 +303,11 @@ impl MessagePublisher for AmqpPublisher {
 }
 
 pub struct AmqpConsumer {
+    _conn: Connection,
     consumer: Consumer,
     channel: Channel,
     queue: String,
+    is_poisoned: Arc<AtomicBool>,
 }
 
 impl AmqpConsumer {
@@ -315,25 +404,30 @@ impl AmqpConsumer {
             .await?;
 
         Ok(Self {
+            _conn: conn,
             consumer,
             channel,
             queue: queue_name,
+            is_poisoned: Arc::new(AtomicBool::new(false)),
         })
     }
 }
 
 async fn create_amqp_connection(config: &AmqpConfig) -> anyhow::Result<Connection> {
     info!(url = %config.url, "Connecting to AMQP broker");
-    let mut conn_uri = config.url.clone();
+    let mut url = url::Url::parse(&config.url).context("Failed to parse AMQP URL")?;
 
     if let (Some(user), Some(pass)) = (&config.username, &config.password) {
-        let mut url = url::Url::parse(&conn_uri)?;
         url.set_username(user)
             .map_err(|_| anyhow!("Failed to set username on AMQP URL"))?;
         url.set_password(Some(pass))
             .map_err(|_| anyhow!("Failed to set password on AMQP URL"))?;
-        conn_uri = url.to_string();
     }
+
+    if !url.query_pairs().any(|(k, _)| k == "heartbeat") {
+        url.query_pairs_mut().append_pair("heartbeat", "15");
+    }
+    let conn_uri = url.to_string();
 
     let mut last_error = None;
     for attempt in 1..=5 {
@@ -429,6 +523,12 @@ fn delivery_to_canonical_message(delivery: &lapin::message::Delivery) -> Canonic
 #[async_trait]
 impl MessageConsumer for AmqpConsumer {
     async fn receive_batch(&mut self, max_messages: usize) -> Result<ReceivedBatch, ConsumerError> {
+        if self.is_poisoned.load(Ordering::Relaxed) {
+            return Err(ConsumerError::Connection(anyhow::anyhow!(
+                "AMQP consumer is poisoned due to a previous commit failure."
+            )));
+        }
+
         if max_messages == 0 {
             return Ok(ReceivedBatch {
                 messages: Vec::new(),
@@ -437,12 +537,15 @@ impl MessageConsumer for AmqpConsumer {
         }
 
         // 1. Wait for the first message. This will block until a message is available.
-        let first_delivery = self
-            .consumer
-            .next()
-            .await
-            .ok_or(ConsumerError::EndOfStream)?
-            .context("Failed to get message from AMQP consumer stream")?;
+        let first_delivery = match self.consumer.next().await {
+            Some(Ok(delivery)) => delivery,
+            Some(Err(e)) => return Err(ConsumerError::Connection(anyhow::anyhow!(e))),
+            None => {
+                return Err(ConsumerError::Connection(anyhow::anyhow!(
+                    "AMQP consumer stream ended unexpectedly"
+                )))
+            }
+        };
 
         let mut messages = Vec::with_capacity(max_messages);
         let mut ackers = Vec::with_capacity(max_messages);
@@ -470,9 +573,8 @@ impl MessageConsumer for AmqpConsumer {
                 }
                 Some(Ok(None)) => break, // Stream ended
                 Some(Err(e)) => {
-                    // An error occurred, but we have some messages. Process them and let the next call handle the error.
-                    warn!("Error receiving subsequent AMQP message: {}", e);
-                    break;
+                    // An error occurred. Propagate it immediately.
+                    return Err(ConsumerError::Connection(anyhow::anyhow!(e)));
                 }
                 None => break, // Stream is pending (no messages ready immediately)
             }
@@ -482,7 +584,8 @@ impl MessageConsumer for AmqpConsumer {
         let messages_len = messages.len();
         trace!(count = messages_len, queue = %self.queue, message_ids = ?LazyMessageIds(&messages), "Received batch of AMQP messages");
         let channel = self.channel.clone();
-        let commit = Box::new(move |dispositions: Vec<MessageDisposition>| {
+        let is_poisoned = self.is_poisoned.clone();
+        let commit: BatchCommitFunc = Box::new(move |dispositions: Vec<MessageDisposition>| {
             Box::pin(async move {
                 if dispositions.len() != reply_infos.len() {
                     tracing::error!(
@@ -497,8 +600,20 @@ impl MessageConsumer for AmqpConsumer {
                     ));
                 }
 
-                handle_replies(&channel, &reply_infos, &dispositions).await;
-                handle_dispositions(ackers, dispositions).await
+                let commit_op = async {
+                    handle_replies(&channel, &reply_infos, &dispositions).await;
+                    handle_dispositions(ackers, dispositions).await
+                };
+
+                let result = match tokio::time::timeout(Duration::from_secs(5), commit_op).await {
+                    Ok(res) => res,
+                    Err(_) => Err(anyhow::anyhow!("AMQP commit timed out")),
+                };
+
+                if result.is_err() {
+                    is_poisoned.store(true, Ordering::Relaxed);
+                }
+                result
             }) as BoxFuture<'static, anyhow::Result<()>>
         });
 
@@ -543,25 +658,30 @@ async fn handle_dispositions(
     ackers: Vec<Acker>,
     dispositions: Vec<MessageDisposition>,
 ) -> anyhow::Result<()> {
-    let futures = ackers
-        .into_iter()
-        .zip(dispositions)
-        .map(|(acker, disposition)| async move {
+    let ackers_len = ackers.len();
+    let mut futures = futures::stream::iter(ackers.into_iter().zip(dispositions).map(
+        |(acker, disposition)| async move {
             match disposition {
                 MessageDisposition::Ack | MessageDisposition::Reply(_) => {
                     acker.ack(BasicAckOptions::default()).await
                 }
                 MessageDisposition::Nack => {
-                    // Nack without requeue. This will drop the message or route it to a DLX if configured.
+                    // Nack with requeue. This will return the message to the front of the queue.
                     acker
-                        .nack(lapin::options::BasicNackOptions::default())
+                        .nack(lapin::options::BasicNackOptions {
+                            requeue: true,
+                            ..Default::default()
+                        })
                         .await
                 }
             }
-        });
-    for res in futures::future::join_all(futures).await {
+        },
+    ))
+    .buffer_unordered(ackers_len);
+
+    while let Some(res) = futures.next().await {
         if let Err(e) = res {
-            return Err(anyhow::anyhow!("Failed to ack/nack AMQP message: {}", e));
+            bail!("Failed to ack/nack AMQP message: {}", e);
         }
     }
     Ok(())

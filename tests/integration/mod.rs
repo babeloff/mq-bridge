@@ -12,6 +12,8 @@ pub mod mongodb;
 pub mod mqtt;
 #[cfg(feature = "nats")]
 pub mod nats;
+#[cfg(feature = "sqlx")]
+pub mod sqlx;
 #[cfg(feature = "zeromq")]
 pub mod zeromq;
 

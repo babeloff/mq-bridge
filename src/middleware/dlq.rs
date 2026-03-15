@@ -41,26 +41,39 @@ impl MessagePublisher for DlqPublisher {
         match self.inner.send(message.clone()).await {
             Ok(response) => Ok(response),
             Err(e) => {
-                let error_msg = e.to_string();
-                error!("Failed to send message: {}", error_msg);
+                let is_non_retryable = match &e {
+                    PublisherError::NonRetryable(_) => true,
+                    // If retries are exhausted, we treat it as a non-retryable error for DLQ purposes.
+                    PublisherError::Retryable(err) => err.to_string().contains("Retries exhausted"),
+                };
 
-                // Attempt to send the message to the DLQ.
-                // If this fails, we immediately return the original error.
-                // Use a retry middleware if you want to retry sending the message to the DLQ.
+                if !is_non_retryable {
+                    // It's a transient error that hasn't exhausted retries yet, propagate it.
+                    return Err(e);
+                }
+
+                // At this point, the error is either NonRetryable or an exhausted Retryable.
+                // Both should go to the DLQ.
+                let error_msg = e.to_string();
+                error!(
+                    "Message send failed permanently, sending to DLQ: {}",
+                    error_msg
+                );
                 match self.dlq_publisher.send(message).await {
-                    Ok(_) => {
-                        // Message successfully sent to DLQ. We return Ok(None) to signal that
-                        // the message was "handled" (by the DLQ) and should be committed upstream.
-                        Ok(Sent::Ack)
-                    }
-                    Err(dlq_combined_error) => {
-                        // DLQ send failed; propagate the combined error that includes both contexts
-                        Err(anyhow::anyhow!(
-                            "Primary send failed: {}. DLQ send also failed: {}",
+                    Ok(_) => Ok(Sent::Ack),
+                    Err(dlq_error) => {
+                        // If the DLQ itself has a connection error, we must propagate it to trigger a route restart.
+                        // Otherwise, the message would be lost.
+                        if let PublisherError::NonRetryable(err) = &dlq_error {
+                            if err.to_string().contains("__CONNECTION_ERROR__") {
+                                return Err(dlq_error);
+                            }
+                        }
+                        Err(PublisherError::NonRetryable(anyhow::anyhow!(
+                            "Primary send failed: '{}'. DLQ send also failed: {}",
                             error_msg,
-                            dlq_combined_error
-                        )
-                        .into())
+                            dlq_error
+                        )))
                     }
                 }
             }
@@ -73,58 +86,99 @@ impl MessagePublisher for DlqPublisher {
     ) -> Result<SentBatch, PublisherError> {
         match self.inner.send_batch(messages.clone()).await {
             Ok(SentBatch::Ack) => Ok(SentBatch::Ack),
-            Ok(SentBatch::Partial { responses, failed }) if failed.is_empty() => {
-                Ok(SentBatch::Partial { responses, failed })
-            }
             Ok(SentBatch::Partial { responses, failed }) => {
-                let error_msg = format!("{} messages failed to send", failed.len());
+                if failed.is_empty() {
+                    return Ok(SentBatch::Partial { responses, failed });
+                }
+
+                let (retryable, mut non_retryable): (Vec<_>, Vec<_>) = failed
+                    .into_iter()
+                    .partition(|(_, e)| matches!(e, PublisherError::Retryable(_)));
+
+                // Separate exhausted retries from still-retryable ones.
+                let (exhausted, still_retryable): (Vec<_>, Vec<_>) = retryable
+                    .into_iter()
+                    .partition(|(_, e)| e.to_string().contains("Retries exhausted"));
+
+                non_retryable.extend(exhausted);
+
+                if non_retryable.is_empty() {
+                    return Ok(SentBatch::Partial {
+                        responses,
+                        failed: still_retryable,
+                    });
+                }
+
                 error!(
-                    "Failed to send a batch of {} messages. Attempting to send to DLQ.",
-                    failed.len()
+                    "{} messages failed with non-retryable errors. Sending to DLQ.",
+                    non_retryable.len()
                 );
 
-                let messages_to_retry: Vec<CanonicalMessage> =
-                    failed.iter().map(|(msg, _)| msg.clone()).collect();
+                let messages_to_dlq: Vec<CanonicalMessage> =
+                    non_retryable.iter().map(|(msg, _)| msg.clone()).collect();
 
-                match self.dlq_publisher.send_batch(messages_to_retry).await {
+                let final_failed = still_retryable;
+
+                match self.dlq_publisher.send_batch(messages_to_dlq).await {
                     Ok(SentBatch::Ack) => Ok(SentBatch::Partial {
                         responses,
-                        failed: Vec::new(),
+                        failed: final_failed,
                     }),
                     Ok(SentBatch::Partial {
                         failed: dlq_failed, ..
                     }) => {
+                        let mut final_failed = final_failed;
                         error!(
                             "DLQ bulk send partially failed. {} messages could not be sent to DLQ.",
                             dlq_failed.len()
                         );
+                        final_failed.extend(dlq_failed);
                         Ok(SentBatch::Partial {
                             responses,
-                            failed: dlq_failed,
+                            failed: final_failed,
                         })
                     }
                     Err(dlq_error) => {
+                        // If the DLQ itself has a connection error, propagate it to restart the route.
+                        if let PublisherError::NonRetryable(err) = &dlq_error {
+                            if err.to_string().contains("__CONNECTION_ERROR__") {
+                                return Err(dlq_error);
+                            }
+                        }
                         error!(
-                            "DLQ bulk send failed: {}. Original primary send error: {}",
-                            dlq_error, error_msg
+                            "DLQ send failed: {}. Propagating original errors.",
+                            dlq_error
                         );
                         Err(anyhow::anyhow!(
-                            "Primary send failed: {}. DLQ bulk send also failed: {}",
-                            error_msg,
+                            "Primary send had non-retryable errors, but sending to DLQ also failed: {}",
                             dlq_error
                         )
                         .into())
                     }
                 }
             }
-            Err(e @ PublisherError::NonRetryable(_)) => {
+            Err(e) => {
+                let is_non_retryable = match &e {
+                    PublisherError::NonRetryable(_) => true,
+                    // If retries are exhausted, we treat it as a non-retryable error for DLQ purposes.
+                    PublisherError::Retryable(err) => err.to_string().contains("Retries exhausted"),
+                };
+
+                if !is_non_retryable {
+                    // It's a transient error that hasn't exhausted retries yet, propagate it.
+                    return Err(e);
+                }
+
+                // At this point, the error is either NonRetryable or an exhausted Retryable.
+                // Both should go to the DLQ.
                 let error_msg = e.to_string();
                 error!(
-                    "Failed to send a batch of {} messages (complete failure). Attempting to send all to DLQ.",
-                    messages.len()
+                    "Batch send failed permanently ({} messages). Attempting to send all to DLQ. Error: {}",
+                    messages.len(),
+                    error_msg
                 );
 
-                // Attempt to send all messages to the DLQ
+                // We attempt to send the original batch to the DLQ.
                 match self.dlq_publisher.send_batch(messages).await {
                     Ok(SentBatch::Ack) => {
                         debug!("Batch successfully sent to DLQ after complete primary failure.");
@@ -143,20 +197,25 @@ impl MessagePublisher for DlqPublisher {
                         })
                     }
                     Err(dlq_error) => {
+                        // If the DLQ itself has a connection error, propagate it to restart the route.
+                        if let PublisherError::NonRetryable(err) = &dlq_error {
+                            if err.to_string().contains("__CONNECTION_ERROR__") {
+                                return Err(dlq_error);
+                            }
+                        }
                         error!(
-                            "DLQ bulk send failed: {}. Original primary send error: {}",
-                            dlq_error, error_msg
-                        );
-                        Err(anyhow::anyhow!(
-                            "Primary send failed: {}. DLQ bulk send also failed: {}",
-                            error_msg,
+                            "DLQ send failed: {}. Propagating original error.",
                             dlq_error
-                        )
-                        .into())
+                        );
+                        // The original error `e` is what caused the DLQ attempt. We wrap it to indicate the DLQ also failed.
+                        Err(PublisherError::NonRetryable(anyhow::anyhow!(
+                            "Primary send failed: '{}'. DLQ send also failed: {}",
+                            e,
+                            dlq_error
+                        )))
                     }
                 }
             }
-            Err(e @ PublisherError::Retryable(_)) => Err(e), // Propagate retryable errors
         }
     }
 
@@ -173,6 +232,30 @@ mod tests {
     use crate::CanonicalMessage;
     use async_trait::async_trait;
     use std::sync::Mutex;
+
+    #[derive(Clone)]
+    struct MockNonRetryablePublisher {
+        calls: Arc<Mutex<usize>>,
+    }
+
+    #[async_trait]
+    impl MessagePublisher for MockNonRetryablePublisher {
+        async fn send(&self, _msg: CanonicalMessage) -> Result<Sent, PublisherError> {
+            *self.calls.lock().unwrap() += 1;
+            Err(PublisherError::NonRetryable(anyhow::anyhow!(
+                "Always fails non-retryable"
+            )))
+        }
+        async fn send_batch(
+            &self,
+            _messages: Vec<CanonicalMessage>,
+        ) -> Result<SentBatch, PublisherError> {
+            Ok(SentBatch::Ack)
+        }
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
 
     #[derive(Clone)]
     struct MockFailingPublisher {
@@ -206,7 +289,8 @@ mod tests {
     #[async_trait]
     impl MessagePublisher for MockSuccessPublisher {
         async fn send(&self, _msg: CanonicalMessage) -> Result<Sent, PublisherError> {
-            *self.calls.lock().unwrap() += 1;
+            let mut calls = self.calls.lock().unwrap();
+            *calls += 1;
             Ok(Sent::Ack)
         }
 
@@ -214,6 +298,8 @@ mod tests {
             &self,
             _messages: Vec<CanonicalMessage>,
         ) -> Result<SentBatch, PublisherError> {
+            let mut calls = self.calls.lock().unwrap();
+            *calls += _messages.len();
             Ok(SentBatch::Ack)
         }
 
@@ -314,5 +400,148 @@ mod tests {
         let dlq_msgs = dlq_channel.drain_messages();
         assert_eq!(dlq_msgs.len(), 1);
         assert_eq!(dlq_msgs[0].payload, msg_payload.as_slice());
+    }
+
+    #[derive(Clone)]
+    struct MockFailingBatchPublisher {
+        calls: Arc<Mutex<usize>>,
+        fail_on_call: usize,
+        partial_fail: bool,
+    }
+
+    #[async_trait]
+    impl MessagePublisher for MockFailingBatchPublisher {
+        async fn send(&self, _msg: CanonicalMessage) -> Result<Sent, PublisherError> {
+            unimplemented!()
+        }
+
+        async fn send_batch(
+            &self,
+            messages: Vec<CanonicalMessage>,
+        ) -> Result<SentBatch, PublisherError> {
+            let mut calls = self.calls.lock().unwrap();
+            *calls += 1;
+            if *calls == self.fail_on_call {
+                if self.partial_fail {
+                    // Fail one message in the batch
+                    let (head, _) = messages.split_at(1);
+                    return Ok(SentBatch::Partial {
+                        responses: None,
+                        failed: vec![(
+                            head[0].clone(),
+                            PublisherError::NonRetryable(anyhow::anyhow!("Partial batch fail")),
+                        )],
+                    });
+                } else {
+                    // Fail the whole batch
+                    return Err(PublisherError::NonRetryable(anyhow::anyhow!(
+                        "Batch send failed"
+                    )));
+                }
+            }
+            // Succeed
+            Ok(SentBatch::Ack)
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    #[tokio::test]
+    async fn test_dlq_send_batch_full_failure() {
+        let target_calls = Arc::new(Mutex::new(0));
+        // This publisher will fail the first time send_batch is called
+        let failing_target = MockFailingBatchPublisher {
+            calls: target_calls.clone(),
+            fail_on_call: 1,
+            partial_fail: false,
+        };
+
+        let dlq_calls = Arc::new(Mutex::new(0));
+        let dlq_target = MockSuccessPublisher {
+            calls: dlq_calls.clone(),
+        };
+
+        let dlq_middleware = DlqPublisher {
+            inner: Box::new(failing_target),
+            dlq_publisher: Arc::new(dlq_target),
+        };
+
+        let messages = vec![CanonicalMessage::from("1"), CanonicalMessage::from("2")];
+
+        // Execute
+        let result = dlq_middleware.send_batch(messages).await;
+
+        // Assertions
+        assert!(result.is_ok(), "DLQ should handle the batch failure");
+        assert_eq!(
+            *target_calls.lock().unwrap(),
+            1,
+            "Target should be called once"
+        );
+        // The successful DLQ publisher's `send` will be called for each message in the failed batch
+        assert_eq!(
+            *dlq_calls.lock().unwrap(),
+            2,
+            "DLQ should be called for each message in the failed batch"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_dlq_send_batch_partial_failure() {
+        let target_calls = Arc::new(Mutex::new(0));
+        let failing_target = MockFailingBatchPublisher {
+            calls: target_calls.clone(),
+            fail_on_call: 1,
+            partial_fail: true,
+        };
+
+        let dlq_calls = Arc::new(Mutex::new(0));
+        let dlq_target = MockSuccessPublisher {
+            calls: dlq_calls.clone(),
+        };
+
+        let dlq_middleware = DlqPublisher {
+            inner: Box::new(failing_target),
+            dlq_publisher: Arc::new(dlq_target),
+        };
+
+        let messages = vec![CanonicalMessage::from("1"), CanonicalMessage::from("2")];
+        let result = dlq_middleware.send_batch(messages).await;
+
+        assert!(result.is_ok());
+        if let Ok(SentBatch::Partial { failed, .. }) = result {
+            assert!(
+                failed.is_empty(),
+                "DLQ should have handled the failed message"
+            );
+        } else {
+            panic!("Expected partial success");
+        }
+
+        assert_eq!(*target_calls.lock().unwrap(), 1);
+        // Only the one failed message should go to DLQ
+        assert_eq!(*dlq_calls.lock().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_dlq_failure_propagates_error() {
+        let failing_target = MockNonRetryablePublisher {
+            calls: Arc::new(Mutex::new(0)),
+        };
+        let failing_dlq = MockFailingPublisher {
+            calls: Arc::new(Mutex::new(0)),
+        };
+        let dlq_middleware = DlqPublisher {
+            inner: Box::new(failing_target.clone()),
+            dlq_publisher: Arc::new(failing_dlq),
+        };
+        let result = dlq_middleware.send("test".into()).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(err, PublisherError::NonRetryable(_)));
+        assert!(err.to_string().contains("DLQ send also failed"));
+        assert_eq!(*failing_target.calls.lock().unwrap(), 1);
     }
 }

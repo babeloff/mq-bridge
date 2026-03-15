@@ -42,8 +42,21 @@ impl CommandPublisher {
 #[async_trait]
 impl MessagePublisher for CommandPublisher {
     async fn send(&self, message: CanonicalMessage) -> Result<Sent, PublisherError> {
+        let inbound_correlation_id = message.metadata.get("correlation_id").cloned();
+        let original_id = message.message_id; // Keep for fallback
         match self.handler.handle(message).await {
-            Ok(Handled::Publish(response_msg)) => self.inner.send(response_msg).await, // Propagate result
+            Ok(Handled::Publish(mut response_msg)) => {
+                // For request-reply correlation, we ensure the original message's ID is
+                // available in the response metadata. This doesn't overwrite an existing
+                // correlation_id, which might be important if the handler is part of a chain.
+                let fallback_correlation_id =
+                    inbound_correlation_id.unwrap_or_else(|| format!("{:032x}", original_id));
+                response_msg
+                    .metadata
+                    .entry("correlation_id".to_string())
+                    .or_insert(fallback_correlation_id);
+                self.inner.send(response_msg).await
+            }
             Ok(Handled::Ack) => Ok(Sent::Ack),
             Err(e) => Err(e), // Converts HandlerError to PublisherError
         }
