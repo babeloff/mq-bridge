@@ -256,7 +256,10 @@ mod tests {
 
         let publisher = CommandPublisher::new(memory_publisher, handler);
         let original_id = 987654321u128;
-        publisher.send(CanonicalMessage::new(b"req".to_vec(), Some(original_id))).await.unwrap();
+        publisher
+            .send(CanonicalMessage::new(b"req".to_vec(), Some(original_id)))
+            .await
+            .unwrap();
 
         let received = channel.drain_messages();
         assert_eq!(received[0].message_id, original_id);
