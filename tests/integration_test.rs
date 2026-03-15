@@ -122,7 +122,7 @@ async fn test_all_chaos() {
         if should_run("mqtt") {
             println!("\n\n>>> Starting MQTT Chaos Test...");
             // MQTT chaos tests are currently flaky due to issues with session persistence/QoS handling
-            // in the test environment (Mosquitto + rumqttc). 
+            // in the test environment (Mosquitto + rumqttc).
             // We may allow this to fail if this creates issues with tests.
             integration::mqtt::test_mqtt_chaos().await;
         }

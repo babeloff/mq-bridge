@@ -94,15 +94,19 @@ impl Default for Route {
 /// use mq_bridge::models::RouteOptions;
 ///
 /// let options = RouteOptions {
+///     description: "My Route".to_string(),
 ///     concurrency: 10,
 ///     batch_size: 5,
 ///     commit_concurrency_limit: 1024,
 /// };
 /// ```
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct RouteOptions {
+    /// A human-readable description of the route's purpose. Defaults to an empty string.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
     /// (Optional) Number of concurrent processing tasks for this route. Defaults to 1.
     #[serde(default = "default_concurrency")]
     #[cfg_attr(feature = "schema", schemars(range(min = 1)))]
@@ -119,6 +123,7 @@ pub struct RouteOptions {
 impl Default for RouteOptions {
     fn default() -> Self {
         Self {
+            description: String::new(),
             concurrency: default_concurrency(),
             batch_size: default_batch_size(),
             commit_concurrency_limit: default_commit_concurrency_limit(),

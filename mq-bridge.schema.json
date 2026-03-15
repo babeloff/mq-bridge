@@ -1617,6 +1617,10 @@
           "default": 1,
           "minimum": 1
         },
+        "description": {
+          "description": "A human-readable description of the route's purpose. Defaults to an empty string.",
+          "type": "string"
+        },
         "input": {
           "description": "The input/source endpoint for the route.",
           "$ref": "#/$defs/Endpoint"
