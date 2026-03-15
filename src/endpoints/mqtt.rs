@@ -207,10 +207,19 @@ impl MessagePublisher for MqttPublisher {
         }
 
         if let Some(e) = first_error {
-            warn!("MQTT batch send failed, marking all {} messages for retry. First error: {}", messages.len(), e);
+            warn!(
+                "MQTT batch send failed, marking all {} messages for retry. First error: {}",
+                messages.len(),
+                e
+            );
             let failed_messages = messages
                 .into_iter()
-                .map(|m| (m, PublisherError::Retryable(anyhow!("Batch failed due to connection issue"))))
+                .map(|m| {
+                    (
+                        m,
+                        PublisherError::Retryable(anyhow!("Batch failed due to connection issue")),
+                    )
+                })
                 .collect();
 
             Ok(SentBatch::Partial {
