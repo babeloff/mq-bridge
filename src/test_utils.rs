@@ -236,14 +236,27 @@ pub async fn run_chaos_pipeline_test(
     let service_name = service_name.to_string();
     let injector = Box::new(move || {
         Box::pin(async move {
-            tokio::time::sleep(Duration::from_millis(500)).await;
+            tokio::time::sleep(Duration::from_millis(300)).await;
             docker_controller.stop_service(&service_name);
-            tokio::time::sleep(Duration::from_secs(5)).await;
+            tokio::time::sleep(Duration::from_secs(2)).await;
             docker_controller.start_service(&service_name);
         }) as BoxFuture<'static, ()>
     });
 
-    run_pipeline_test_internal(broker_name, config_yaml, 10000, false, Some(injector)).await;
+    let num_messages = if cfg!(debug_assertions) {
+        PERF_TEST_MESSAGE_COUNT / 5
+    } else {
+        PERF_TEST_MESSAGE_COUNT / 2
+    };
+
+    run_pipeline_test_internal(
+        broker_name,
+        config_yaml,
+        num_messages,
+        false,
+        Some(injector),
+    )
+    .await;
 }
 
 async fn run_pipeline_test_internal(

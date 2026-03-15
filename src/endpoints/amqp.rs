@@ -19,23 +19,21 @@ use lapin::{
     types::{FieldTable, ShortString},
     BasicProperties, Channel, Connection, ConnectionProperties, Consumer, ExchangeKind,
 };
-use std::any::Any;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 use std::time::Duration;
-use tracing::{info, trace};
+use std::{any::Any, sync::Arc};
+use tokio::sync::RwLock;
+use tracing::{error, info, trace};
 use uuid::Uuid;
 
-fn is_connection_error(e: &lapin::Error) -> bool {
-    matches!(
-        e.kind(),
-        lapin::ErrorKind::InvalidChannelState(..) | lapin::ErrorKind::ProtocolError(_)
-    )
+struct AmqpState {
+    connection: Connection,
+    channel: Channel,
 }
 
 pub struct AmqpPublisher {
-    _conn: Connection,
-    channel: Channel,
+    state: Arc<RwLock<AmqpState>>,
+    config: AmqpConfig,
     exchange: String,
     queue: String,
     no_persistence: bool,
@@ -44,6 +42,24 @@ pub struct AmqpPublisher {
 
 impl AmqpPublisher {
     pub async fn new(config: &AmqpConfig) -> anyhow::Result<Self> {
+        let state = Self::connect(config).await?;
+        let queue = config
+            .queue
+            .as_deref()
+            .ok_or_else(|| anyhow!("Queue name is required for AMQP publisher"))?
+            .to_string();
+
+        Ok(Self {
+            state: Arc::new(RwLock::new(state)),
+            config: config.clone(),
+            exchange: config.exchange.clone().unwrap_or_default(),
+            queue,
+            no_persistence: config.no_persistence,
+            delayed_ack: config.delayed_ack,
+        })
+    }
+
+    async fn connect(config: &AmqpConfig) -> anyhow::Result<AmqpState> {
         let queue = config
             .queue
             .as_deref()
@@ -70,14 +86,31 @@ impl AmqpPublisher {
                 .await?;
         }
 
-        Ok(Self {
-            _conn: conn,
+        Ok(AmqpState {
+            connection: conn,
             channel,
-            exchange: config.exchange.clone().unwrap_or_default(),
-            queue: queue.to_string(),
-            no_persistence: config.no_persistence,
-            delayed_ack: config.delayed_ack,
         })
+    }
+
+    async fn get_channel(&self) -> Channel {
+        self.state.read().await.channel.clone()
+    }
+
+    async fn reconnect(&self) {
+        let mut state = self.state.write().await;
+        if state.connection.status().connected() && state.channel.status().connected() {
+            return;
+        }
+        info!("Reconnecting AMQP publisher...");
+        match Self::connect(&self.config).await {
+            Ok(new_state) => {
+                *state = new_state;
+                info!("AMQP publisher reconnected.");
+            }
+            Err(e) => {
+                error!("Failed to reconnect AMQP publisher: {}", e);
+            }
+        }
     }
 }
 
@@ -104,21 +137,21 @@ impl MessagePublisher for AmqpPublisher {
         }
         if !message.metadata.is_empty() {
             let mut table = FieldTable::default();
-            for (key, value) in message.metadata {
-                // Skip reply_to and correlation_id since they're already set as native properties
+            for (key, value) in &message.metadata {
+                // Skip reply_to and correlation_id since they are already set as native properties
                 if key == "reply_to" || key == "correlation_id" {
                     continue;
                 }
                 table.insert(
-                    ShortString::from(key),
-                    lapin::types::AMQPValue::LongString(value.into()),
+                    ShortString::from(key.as_str()),
+                    lapin::types::AMQPValue::LongString(value.clone().into()),
                 );
             }
             properties = properties.with_headers(table);
         }
 
-        let confirmation = self
-            .channel
+        let channel = self.get_channel().await;
+        let confirmation_result = channel
             .basic_publish(
                 &self.exchange,
                 &self.queue,
@@ -126,26 +159,31 @@ impl MessagePublisher for AmqpPublisher {
                 &message.payload,
                 properties,
             )
-            .await
-            .map_err(|e| {
-                if is_connection_error(&e) {
-                    PublisherError::NonRetryable(anyhow!("__CONNECTION_ERROR__: {}", e))
-                } else {
-                    PublisherError::Retryable(anyhow!(e).context("Failed to publish AMQP message"))
-                }
-            })?;
+            .await;
+
+        let confirmation = match confirmation_result {
+            Ok(c) => c,
+            Err(e) => {
+                self.reconnect().await;
+                return Err(PublisherError::Retryable(anyhow!(
+                    "Failed to publish AMQP message: {}",
+                    e
+                )));
+            }
+        };
 
         if !self.delayed_ack {
             // Wait for the broker's publisher confirmation.
-            let confirm = confirmation.await.map_err(|e| {
-                if is_connection_error(&e) {
-                    PublisherError::NonRetryable(anyhow!("__CONNECTION_ERROR__: {}", e))
-                } else {
-                    PublisherError::Retryable(
-                        anyhow!(e).context("Failed to get AMQP publisher confirmation"),
-                    )
+            let confirm = match confirmation.await {
+                Ok(c) => c,
+                Err(e) => {
+                    self.reconnect().await;
+                    return Err(PublisherError::Retryable(anyhow!(
+                        "Failed to get AMQP publisher confirmation: {}",
+                        e
+                    )));
                 }
-            })?;
+            };
             if let lapin::publisher_confirm::Confirmation::Nack(_) = confirm {
                 return Err(PublisherError::Retryable(anyhow::anyhow!(
                     "Broker Nacked the message"
@@ -167,6 +205,7 @@ impl MessagePublisher for AmqpPublisher {
             .await;
         }
 
+        let channel = self.get_channel().await;
         let mut pending_confirms = Vec::with_capacity(messages.len());
         let mut failed_messages = Vec::new();
 
@@ -186,7 +225,7 @@ impl MessagePublisher for AmqpPublisher {
             if !message.metadata.is_empty() {
                 let mut table = FieldTable::default();
                 for (key, value) in &message.metadata {
-                    // Skip reply_to and correlation_id since they're already set as native properties
+                    // Skip reply_to and correlation_id since they are already set as native properties
                     if key == "reply_to" || key == "correlation_id" {
                         continue;
                     }
@@ -198,8 +237,7 @@ impl MessagePublisher for AmqpPublisher {
                 properties = properties.with_headers(table);
             }
 
-            match self
-                .channel
+            match channel
                 .basic_publish(
                     &self.exchange,
                     &self.queue,
@@ -213,14 +251,11 @@ impl MessagePublisher for AmqpPublisher {
                     pending_confirms.push((message, confirmation));
                 }
                 Err(e) => {
-                    if is_connection_error(&e) {
-                        return Err(PublisherError::NonRetryable(anyhow!(
-                            "__CONNECTION_ERROR__: {}",
-                            e
-                        )));
-                    }
-                    return Err(PublisherError::Retryable(
-                        anyhow!(e).context("Failed to publish message in batch"),
+                    failed_messages.push((
+                        message,
+                        PublisherError::Retryable(
+                            anyhow!(e).context("Failed to publish message in batch"),
+                        ),
                     ));
                 }
             }
@@ -237,12 +272,6 @@ impl MessagePublisher for AmqpPublisher {
                     }
                 }
                 Err(e) => {
-                    if is_connection_error(&e) {
-                        return Err(PublisherError::NonRetryable(anyhow!(
-                            "__CONNECTION_ERROR__: {}",
-                            e
-                        )));
-                    }
                     failed_messages.push((
                         message,
                         PublisherError::Retryable(anyhow::anyhow!(
@@ -252,6 +281,10 @@ impl MessagePublisher for AmqpPublisher {
                     ));
                 }
             }
+        }
+
+        if !failed_messages.is_empty() {
+            self.reconnect().await;
         }
 
         if failed_messages.is_empty() {
