@@ -6,7 +6,7 @@ use crate::traits::{
 };
 use crate::CanonicalMessage;
 use crate::APP_NAME;
-use anyhow::{anyhow, Context};
+use anyhow::anyhow;
 use async_channel::{bounded, Receiver, Sender};
 use async_trait::async_trait;
 use rumqttc::v5::mqttbytes::v5::{Publish as PublishV5, PublishProperties};
@@ -21,6 +21,7 @@ use std::fmt::Debug;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
+use tokio::sync::RwLock;
 use tracing::{debug, error, info, trace, warn};
 
 #[derive(Clone)]
@@ -98,10 +99,14 @@ impl Client {
     }
 }
 
-pub struct MqttPublisher {
+struct MqttState {
     client: Client,
-    topic: String,
     _stop_tx: mpsc::Sender<()>,
+}
+
+pub struct MqttPublisher {
+    state: Arc<RwLock<MqttState>>,
+    topic: String,
     qos: QoS,
 }
 
@@ -115,11 +120,20 @@ impl MqttPublisher {
             sanitize_for_client_id(&format!("{}-{}", APP_NAME, fast_uuid_v7::gen_id()))
         });
 
-        let (client, eventloop) = create_client_and_eventloop(config, &client_id).await?;
+        let state = Self::connect(config, &client_id).await?;
         let qos = parse_qos(config.qos.unwrap_or(1));
+
+        Ok(Self {
+            state: Arc::new(RwLock::new(state)),
+            topic: topic.to_string(),
+            qos,
+        })
+    }
+
+    async fn connect(config: &MqttConfig, client_id: &str) -> anyhow::Result<MqttState> {
+        let (client, eventloop) = create_client_and_eventloop(config, client_id).await?;
         let (stop_tx, stop_rx) = mpsc::channel(1);
 
-        // The publisher needs a background event loop to handle keep-alives and other control packets.
         tokio::spawn(run_eventloop(
             eventloop,
             None::<Sender<MqttInternalMessage>>,
@@ -128,11 +142,9 @@ impl MqttPublisher {
             !config.delayed_ack,
         ));
 
-        Ok(Self {
+        Ok(MqttState {
             client,
-            topic: topic.to_string(),
             _stop_tx: stop_tx,
-            qos,
         })
     }
 }
@@ -147,11 +159,19 @@ impl MessagePublisher for MqttPublisher {
             "Publishing MQTT message"
         );
 
-        self.client
-            .publish(&self.topic, self.qos, message)
-            .await
-            .context("Failed to publish MQTT message")?;
-        Ok(Sent::Ack)
+        let client = self.state.read().await.client.clone();
+        let publish_future = client.publish(&self.topic, self.qos, message);
+
+        // We use a longer timeout here (10s) to allow for transient connection drops/reconnects
+        // without immediately failing the batch, while still preventing indefinite hangs.
+        match tokio::time::timeout(Duration::from_secs(10), publish_future).await {
+            Ok(Ok(_)) => Ok(Sent::Ack),
+            Ok(Err(e)) => Err(PublisherError::Retryable(anyhow!(
+                "Failed to publish MQTT message: {}",
+                e
+            ))),
+            Err(_) => Err(PublisherError::Retryable(anyhow!("MQTT publish timed out"))),
+        }
     }
 
     async fn send_batch(
@@ -159,13 +179,47 @@ impl MessagePublisher for MqttPublisher {
         messages: Vec<CanonicalMessage>,
     ) -> Result<SentBatch, PublisherError> {
         trace!(count = messages.len(), topic = %self.topic, message_ids = ?LazyMessageIds(&messages), "Publishing batch of MQTT messages");
-        for message in messages {
-            self.client
-                .publish(&self.topic, self.qos, message)
-                .await
-                .context("Failed to publish MQTT message")?;
+        let client = self.state.read().await.client.clone();
+
+        let mut first_error: Option<anyhow::Error> = None;
+
+        for message in &messages {
+            // If an error has already occurred, we can stop trying to publish.
+            if first_error.is_some() {
+                break;
+            }
+
+            let publish_future = client.publish(&self.topic, self.qos, message.clone());
+
+            match tokio::time::timeout(Duration::from_secs(10), publish_future).await {
+                Ok(Ok(_)) => {
+                    // Successfully enqueued
+                }
+                Ok(Err(e)) => {
+                    // Enqueueing failed.
+                    first_error = Some(anyhow!("Failed to publish MQTT message in batch: {}", e));
+                }
+                Err(_) => {
+                    // Timeout.
+                    first_error = Some(anyhow!("MQTT publish timed out in batch"));
+                }
+            }
         }
-        Ok(SentBatch::Ack)
+
+        if let Some(e) = first_error {
+            warn!("MQTT batch send failed, marking all {} messages for retry. First error: {}", messages.len(), e);
+            let failed_messages = messages
+                .into_iter()
+                .map(|m| (m, PublisherError::Retryable(anyhow!("Batch failed due to connection issue"))))
+                .collect();
+
+            Ok(SentBatch::Partial {
+                responses: None,
+                failed: failed_messages,
+            })
+        } else {
+            Ok(SentBatch::Ack)
+        }
     }
 
     fn as_any(&self) -> &dyn Any {

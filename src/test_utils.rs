@@ -244,7 +244,7 @@ pub async fn run_chaos_pipeline_test(
     });
 
     let num_messages = if cfg!(debug_assertions) {
-        PERF_TEST_MESSAGE_COUNT / 5
+        PERF_TEST_MESSAGE_COUNT / 4
     } else {
         PERF_TEST_MESSAGE_COUNT / 2
     };

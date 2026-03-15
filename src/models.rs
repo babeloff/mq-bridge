@@ -1271,8 +1271,9 @@ pub struct MqttConfig {
     pub protocol: MqttProtocol,
     /// Session expiry interval in seconds (MQTT v5 only).
     pub session_expiry_interval: Option<u32>,
-    /// (Publisher only) If true, messages are acknowledged immediately upon receipt (auto-ack).
+    /// (Consumer only) If true, messages are acknowledged immediately upon receipt (auto-ack).
     /// If false (default), messages are acknowledged after processing (manual-ack).
+    /// Note: This setting does not currently enable synchronous publishing (waiting for PubAck) for the MQTT publisher.
     #[serde(default)]
     pub delayed_ack: bool,
 }

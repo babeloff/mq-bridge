@@ -42,7 +42,6 @@ It may still be possible that there are issues with
 - specific settings of the brokers
 - subscribe / event and response patterns if those are not available natively
 - nats, if jetstream support is disabled
-- mqtt, the tests are randomly showing missed messages on full flight broker restart
 - TLS integration, as this also hasn't been tested a lot and is usually non-trivial to set up
 
 ### When to use mq-bridge
