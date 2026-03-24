@@ -1547,6 +1547,9 @@ pub struct IbmMqConfig {
     /// Internal buffer size for the channel. Defaults to 100.
     #[serde(default)]
     pub internal_buffer_size: Option<usize>,
+    /// If false, attempt to open the queue with INQUIRE permissions to fetch queue depth for status checks. Defaults to false.
+    #[serde(default)]
+    pub disable_status_inq: bool,
 }
 
 impl IbmMqConfig {
@@ -1560,6 +1563,7 @@ impl IbmMqConfig {
             url: url.into(),
             queue_manager: queue_manager.into(),
             channel: channel.into(),
+            disable_status_inq: false,
             ..Default::default()
         }
     }

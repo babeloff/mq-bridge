@@ -131,3 +131,84 @@ pub async fn test_aws_performance_direct() {
     })
     .await;
 }
+
+pub async fn test_aws_status() {
+    use mq_bridge::traits::{MessageConsumer, MessagePublisher};
+    use tokio::time::{sleep, Duration};
+
+    setup_logging();
+    run_test_with_docker_controller(
+        "tests/integration/docker-compose/aws.yml",
+        |controller| async move {
+            ensure_queue_exists().await;
+            let config = mq_bridge::models::AwsConfig {
+                queue_url: Some("http://localhost:4566/000000000000/test-queue".to_string()),
+                region: Some("us-east-1".to_string()),
+                endpoint_url: Some("http://localhost:4566".to_string()),
+                access_key: Some("test".to_string()),
+                secret_key: Some("test".to_string()),
+                ..Default::default()
+            };
+
+            let publisher = AwsPublisher::new(&config).await.unwrap();
+            let consumer = AwsConsumer::new(&config).await.unwrap();
+
+            println!("[AWS] Checking initial status...");
+            sleep(Duration::from_secs(2)).await;
+            let pub_status = publisher.status().await;
+            let con_status = consumer.status().await;
+            assert!(
+                pub_status.healthy,
+                "Publisher should be healthy initially. Status: {:?}",
+                pub_status
+            );
+            assert!(
+                con_status.healthy,
+                "Consumer should be healthy initially. Status: {:?}",
+                con_status
+            );
+            println!("[AWS] Initial status check OK.");
+
+            controller.stop_service("localstack");
+            println!("[AWS] Service 'localstack' stopped. Waiting for disconnect detection...");
+
+            let start = std::time::Instant::now();
+            loop {
+                let pub_status = publisher.status().await;
+                let con_status = consumer.status().await;
+                if !pub_status.healthy && !con_status.healthy {
+                    println!("[AWS] Disconnect detected.");
+                    break;
+                }
+                if start.elapsed() > Duration::from_secs(20) {
+                    panic!(
+                        "[AWS] Timeout waiting for disconnect. Pub: {:?}, Con: {:?}",
+                        pub_status, con_status
+                    );
+                }
+                sleep(Duration::from_secs(1)).await;
+            }
+
+            controller.start_service("localstack");
+            println!("[AWS] Service 'localstack' started. Waiting for reconnect...");
+
+            // AWS SDK is slow to recover, so we give it more time.
+            sleep(Duration::from_secs(10)).await;
+
+            let pub_status = publisher.status().await;
+            let con_status = consumer.status().await;
+            assert!(
+                pub_status.healthy,
+                "Publisher should be healthy after reconnect. Status: {:?}",
+                pub_status
+            );
+            assert!(
+                con_status.healthy,
+                "Consumer should be healthy after reconnect. Status: {:?}",
+                con_status
+            );
+            println!("[AWS] Status test successful.");
+        },
+    )
+    .await;
+}

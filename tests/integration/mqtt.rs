@@ -105,3 +105,84 @@ pub async fn test_mqtt_performance_direct() {
     })
     .await;
 }
+
+pub async fn test_mqtt_status() {
+    use mq_bridge::traits::{MessageConsumer, MessagePublisher};
+    use tokio::time::{sleep, Duration};
+
+    setup_logging();
+    run_test_with_docker_controller(
+        "tests/integration/docker-compose/mqtt.yml",
+        |controller| async move {
+            let topic = "status_test_mqtt";
+            let config = mq_bridge::models::MqttConfig {
+                url: "mqtt://localhost:1883".to_string(),
+                topic: Some(topic.to_string()),
+                ..Default::default()
+            };
+
+            let publisher_id = format!("pub-status-{}", fast_uuid_v7::gen_id());
+            let mut pub_config = config.clone();
+            pub_config.client_id = Some(publisher_id);
+            let publisher = MqttPublisher::new(&pub_config).await.unwrap();
+
+            let consumer_id = format!("sub-status-{}", fast_uuid_v7::gen_id());
+            let mut consumer_config = config.clone();
+            consumer_config.client_id = Some(consumer_id);
+            let consumer = MqttConsumer::new(&consumer_config).await.unwrap();
+
+            println!("[MQTT] Checking initial status...");
+            sleep(Duration::from_secs(2)).await;
+            let pub_status = publisher.status().await;
+            let con_status = consumer.status().await;
+            assert!(
+                pub_status.healthy,
+                "Publisher should be healthy initially. Status: {:?}",
+                pub_status
+            );
+            assert!(
+                con_status.healthy,
+                "Consumer should be healthy initially. Status: {:?}",
+                con_status
+            );
+            println!("[MQTT] Initial status check OK.");
+
+            controller.stop_service("mosquitto");
+            println!("[MQTT] Service 'mosquitto' stopped. Waiting for disconnect detection...");
+
+            let start = std::time::Instant::now();
+            loop {
+                let pub_status = publisher.status().await;
+                let con_status = consumer.status().await;
+                if !pub_status.healthy && !con_status.healthy {
+                    println!("[MQTT] Disconnect detected.");
+                    break;
+                }
+                if start.elapsed() > Duration::from_secs(20) {
+                    panic!(
+                        "[MQTT] Timeout waiting for disconnect. Pub: {:?}, Con: {:?}",
+                        pub_status, con_status
+                    );
+                }
+                sleep(Duration::from_secs(1)).await;
+            }
+
+            controller.start_service("mosquitto");
+            println!("[MQTT] Service 'mosquitto' started. Waiting for reconnect...");
+
+            let start = std::time::Instant::now();
+            loop {
+                if publisher.status().await.healthy && consumer.status().await.healthy {
+                    println!("[MQTT] Reconnect detected.");
+                    break;
+                }
+                if start.elapsed() > Duration::from_secs(20) {
+                    panic!("[MQTT] Timeout waiting for reconnect.");
+                }
+                sleep(Duration::from_secs(1)).await;
+            }
+            println!("[MQTT] Status test successful.");
+        },
+    )
+    .await;
+}

@@ -216,3 +216,82 @@ pub async fn test_ibm_mq_performance_direct2() {
     })
     .await;
 }
+
+pub async fn test_ibm_mq_status() {
+    use mq_bridge::traits::{MessageConsumer, MessagePublisher};
+    use tokio::time::{sleep, Duration};
+
+    setup_logging();
+    run_test_with_docker_controller(
+        "tests/integration/docker-compose/ibm_mq.yml",
+        |controller| async move {
+            let mut config = get_config();
+            config.queue = Some("DEV.QUEUE.1".to_string());
+
+            let publisher = IbmMqPublisher::new(&config).await.unwrap();
+            let consumer = IbmMqConsumer::new(&config).await.unwrap();
+
+            println!("[IBM MQ] Checking initial status...");
+            sleep(Duration::from_secs(5)).await;
+            let pub_status = publisher.status().await;
+            let con_status = consumer.status().await;
+            assert!(
+                pub_status.healthy,
+                "Publisher should be healthy initially. Status: {:?}",
+                pub_status
+            );
+            assert!(
+                con_status.healthy,
+                "Consumer should be healthy initially. Status: {:?}",
+                con_status
+            );
+            println!("[IBM MQ] Initial status check OK.");
+
+            controller.stop_service("mq");
+            println!("[IBM MQ] Service 'mq' stopped. Waiting for disconnect detection...");
+
+            let start = std::time::Instant::now();
+            loop {
+                let pub_status = publisher.status().await;
+                let con_status = consumer.status().await;
+                if !pub_status.healthy && !con_status.healthy {
+                    println!("[IBM MQ] Disconnect detected.");
+                    break;
+                }
+                if start.elapsed() > Duration::from_secs(20) {
+                    panic!(
+                        "[IBM MQ] Timeout waiting for disconnect. Pub: {:?}, Con: {:?}",
+                        pub_status, con_status
+                    );
+                }
+                sleep(Duration::from_secs(1)).await;
+            }
+
+            controller.start_service("mq");
+            println!("[IBM MQ] Service 'mq' started. Waiting for reconnect...");
+
+            let start = std::time::Instant::now();
+            loop {
+                // Create new instances to force reconnection
+                if let (Ok(p), Ok(c)) = (
+                    IbmMqPublisher::new(&config).await,
+                    IbmMqConsumer::new(&config).await,
+                ) {
+                    let pub_status = p.status().await;
+                    let con_status = c.status().await;
+                    if pub_status.healthy && con_status.healthy {
+                        println!("[IBM MQ] Reconnect detected.");
+                        break;
+                    }
+                }
+                if start.elapsed() > Duration::from_secs(45) {
+                    // IBM MQ can be slow to start
+                    panic!("[IBM MQ] Timeout waiting for reconnect.");
+                }
+                sleep(Duration::from_secs(2)).await;
+            }
+            println!("[IBM MQ] Status test successful.");
+        },
+    )
+    .await;
+}

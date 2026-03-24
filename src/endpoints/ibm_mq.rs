@@ -125,7 +125,11 @@ impl IbmMqPublisher {
                 };
 
                 let queue = match (|| -> anyhow::Result<_> {
-                    let open_options = constants::MQOO_OUTPUT | constants::MQOO_FAIL_IF_QUIESCING;
+                    let mut open_options =
+                        constants::MQOO_OUTPUT | constants::MQOO_FAIL_IF_QUIESCING;
+                    if !config.disable_status_inq {
+                        open_options |= constants::MQOO_INQUIRE;
+                    }
                     let qm_ref = qm.connection_ref();
 
                     if let Some(topic) = &config.topic {
@@ -205,9 +209,13 @@ impl IbmMqPublisher {
                             let mut healthy = true;
                             let mut last_error = None;
                             if let Err(e) = queue.inquire(&[mqi::attribute::MQIA_DEF_PRIORITY]) {
-                                healthy = false;
-                                last_error =
-                                    Some(format!("Failed to inquire object status: {}", e));
+                                if e.2 != constants::MQRC_NOT_OPEN_FOR_INQUIRE
+                                    && e.2 != constants::MQRC_NOT_AUTHORIZED
+                                {
+                                    healthy = false;
+                                    last_error =
+                                        Some(format!("Failed to inquire object status: {}", e));
+                                }
                             }
 
                             let _ = reply_tx.send(EndpointStatus {
@@ -356,8 +364,11 @@ async fn spawn_consumer_thread(
                     })?;
                     let q_name = MqStr::<48>::try_from(q_name_str).context("Invalid queue name")?;
                     let od = QueueName(q_name);
-                    let open_options =
+                    let mut open_options =
                         constants::MQOO_INPUT_AS_Q_DEF | constants::MQOO_FAIL_IF_QUIESCING;
+                    if !config.disable_status_inq {
+                        open_options |= constants::MQOO_INQUIRE;
+                    }
                     let obj = Object::open(qm_ref, &(od, open_options))
                         .map_err(|e| anyhow::anyhow!("MQ open failed: {}", e))?
                         .discard_warning();
@@ -512,8 +523,13 @@ async fn spawn_consumer_thread(
                             }
 
                             Err(e) => {
-                                healthy = false;
-                                last_error = Some(format!("Failed to inquire queue status: {}", e));
+                                if e.2 != constants::MQRC_NOT_OPEN_FOR_INQUIRE
+                                    && e.2 != constants::MQRC_NOT_AUTHORIZED
+                                {
+                                    healthy = false;
+                                    last_error =
+                                        Some(format!("Failed to inquire queue status: {}", e));
+                                }
                             }
                         }
 
