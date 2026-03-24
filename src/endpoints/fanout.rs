@@ -1,4 +1,4 @@
-use crate::traits::{MessagePublisher, PublisherError, Sent, SentBatch};
+use crate::traits::{EndpointStatus, MessagePublisher, PublisherError, Sent, SentBatch};
 use crate::CanonicalMessage;
 use async_trait::async_trait;
 use std::any::Any;
@@ -50,6 +50,40 @@ impl MessagePublisher for FanoutPublisher {
         }
 
         Ok(SentBatch::Ack)
+    }
+
+    async fn status(&self) -> EndpointStatus {
+        use futures::future::join_all;
+
+        let status_futs = self.publishers.iter().map(|p| p.status());
+        let results = join_all(status_futs).await;
+
+        let mut healthy = true;
+        let mut pending = 0;
+        let mut capacity = 0;
+        let mut last_error: Option<String> = None;
+        let mut details = Vec::new();
+
+        for status in results {
+            if !status.healthy {
+                healthy = false;
+                if last_error.is_none() {
+                    last_error = status.last_error.clone();
+                }
+            }
+            pending += status.pending.unwrap_or(0);
+            capacity += status.capacity.unwrap_or(0);
+            details.push(status);
+        }
+
+        EndpointStatus {
+            healthy,
+            pending: if pending > 0 { Some(pending) } else { None },
+            capacity: if capacity > 0 { Some(capacity) } else { None },
+            last_error,
+            details: serde_json::json!({ "destinations": details }),
+            ..Default::default()
+        }
     }
 
     fn as_any(&self) -> &dyn Any {

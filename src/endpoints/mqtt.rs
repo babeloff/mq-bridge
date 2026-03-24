@@ -15,9 +15,10 @@ use rumqttc::v5::{
     AsyncClient as AsyncClientV5, EventLoop as EventLoopV5, MqttOptions as MqttOptionsV5,
 };
 use rumqttc::Publish as PublishV3;
-use rumqttc::{tokio_rustls::rustls, AsyncClient, MqttOptions, QoS, Transport};
+use rumqttc::{tokio_rustls::rustls, AsyncClient, Event, MqttOptions, QoS, Transport};
 use std::any::Any;
 use std::fmt::Debug;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -38,6 +39,7 @@ fn to_qos_v5(qos: QoS) -> QoSV5 {
     }
 }
 
+use crate::traits::EndpointStatus;
 impl Client {
     async fn ack(&self, ack: &MqttAck) -> anyhow::Result<()> {
         match (self, ack) {
@@ -102,6 +104,7 @@ impl Client {
 struct MqttState {
     client: Client,
     _stop_tx: mpsc::Sender<()>,
+    is_connected: Arc<AtomicBool>,
 }
 
 pub struct MqttPublisher {
@@ -133,6 +136,7 @@ impl MqttPublisher {
     async fn connect(config: &MqttConfig, client_id: &str) -> anyhow::Result<MqttState> {
         let (client, eventloop) = create_client_and_eventloop(config, client_id).await?;
         let (stop_tx, stop_rx) = mpsc::channel(1);
+        let is_connected = Arc::new(AtomicBool::new(false));
 
         tokio::spawn(run_eventloop(
             eventloop,
@@ -140,11 +144,13 @@ impl MqttPublisher {
             stop_rx,
             None,
             !config.delayed_ack,
+            Some(is_connected.clone()),
         ));
 
         Ok(MqttState {
             client,
             _stop_tx: stop_tx,
+            is_connected,
         })
     }
 }
@@ -231,6 +237,21 @@ impl MessagePublisher for MqttPublisher {
         }
     }
 
+    async fn status(&self) -> EndpointStatus {
+        let state = self.state.read().await;
+        let healthy = state.is_connected.load(Ordering::Relaxed);
+        EndpointStatus {
+            healthy,
+            target: self.topic.clone(),
+            last_error: if healthy {
+                None
+            } else {
+                Some("Disconnected".to_string())
+            },
+            ..Default::default()
+        }
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -297,6 +318,8 @@ struct MqttListener {
     _stop_tx: mpsc::Sender<()>,
     message_rx: Receiver<MqttInternalMessage>,
     capacity: usize,
+    is_connected: Arc<AtomicBool>,
+    topic: String,
 }
 
 impl MqttListener {
@@ -311,6 +334,7 @@ impl MqttListener {
         let queue_capacity = config.queue_capacity.unwrap_or(100);
         let (tx, rx) = bounded(queue_capacity);
         let (stop_tx, stop_rx) = mpsc::channel(1);
+        let is_connected = Arc::new(AtomicBool::new(false));
 
         let sub_info = Some((client.clone(), topic.to_string(), qos));
         tokio::spawn(run_eventloop(
@@ -319,6 +343,7 @@ impl MqttListener {
             stop_rx,
             sub_info,
             !config.delayed_ack,
+            Some(is_connected.clone()),
         ));
 
         client.subscribe(topic, qos).await?;
@@ -329,6 +354,8 @@ impl MqttListener {
             _stop_tx: stop_tx,
             message_rx: rx,
             capacity: queue_capacity,
+            is_connected,
+            topic: topic.to_string(),
         })
     }
 }
@@ -437,9 +464,17 @@ impl MessageConsumer for MqttListener {
     }
 
     async fn status(&self) -> crate::traits::EndpointStatus {
+        let healthy = self.is_connected.load(Ordering::Relaxed);
         crate::traits::EndpointStatus {
-            healthy: true,
+            healthy,
+            target: self.topic.clone(),
+            pending: Some(self.message_rx.len()),
             capacity: Some(self.capacity),
+            last_error: if healthy {
+                None
+            } else {
+                Some("Disconnected".to_string())
+            },
             ..Default::default()
         }
     }
@@ -553,6 +588,7 @@ async fn run_eventloop(
     mut stop_rx: mpsc::Receiver<()>,
     subscription_info: Option<(Client, String, QoS)>,
     manual_acks: bool,
+    is_connected: Option<Arc<AtomicBool>>,
 ) {
     let mut stopping = false;
     // A future that is always pending until we decide to start the timeout
@@ -573,80 +609,101 @@ async fn run_eventloop(
             }
             event_result = poll_event(&mut eventloop) => {
                 match event_result {
-            Ok(event) => match event {
-                EventWrapper::V3(rumqttc::Event::Incoming(incoming)) => match incoming {
-                    rumqttc::Incoming::Publish(p) => {
-                        if let Some(tx) = &message_tx {
-                            let topic = p.topic.clone();
-                            let msg = publish_to_canonical_message_v3(&p);
-                            let ack = if manual_acks && p.qos != QoS::AtMostOnce { MqttAck::V3(p) } else { MqttAck::None };
-                            let internal = MqttInternalMessage {
-                                msg, ack
-                            };
-                            trace!(message_id = %format!("{:032x}", internal.msg.message_id), %topic, "Received MQTT v3 message");
-                            if tx.send(internal).await.is_err() {
-                                break;
-                            }
-                        }
-                    }
-                    rumqttc::Incoming::ConnAck(ack) => {
-                        if !ack.session_present {
-                            if let Some((client, topic, qos)) = &subscription_info {
-                                let client = client.clone();
-                                let topic = topic.clone();
-                                let qos = *qos;
-                                info!("Session not present on V3 connection, resubscribing to {}", topic);
-                                tokio::spawn(async move {
-                                    if let Err(e) = client.subscribe(&topic, qos).await {
-                                        error!("Failed to resubscribe: {}", e);
-                                    }
-                                });
-                            }
-                        } else {
-                            info!("Session present on V3 connection, resuming...");
-                        }
-                    }
-                    _ => {}
-                },
-                EventWrapper::V5(event) => {
-                    match *event {
-                        rumqttc::v5::Event::Incoming(rumqttc::v5::Incoming::Publish(p)) => {
-                            if let Some(tx) = &message_tx {
-                                let topic_bytes = p.topic.clone();
-                                let msg = publish_to_canonical_message_v5(&p);
-                                let ack = if manual_acks && p.qos != QoSV5::AtMostOnce { MqttAck::V5(p) } else { MqttAck::None };
-                                let internal = MqttInternalMessage {
-                                    msg, ack
-                                };
-                                trace!(message_id = %format!("{:032x}", internal.msg.message_id), topic = %String::from_utf8_lossy(&topic_bytes), "Received MQTT v5 message");
-                                if tx.send(internal).await.is_err() {
-                                    break;
+                    Ok(event) => {
+                        if let Some(conn) = &is_connected {
+                            match &event {
+                                EventWrapper::V3(Event::Incoming(rumqttc::Incoming::ConnAck(_))) => {
+                                    conn.store(true, Ordering::Relaxed)
                                 }
+                                EventWrapper::V3(Event::Incoming(rumqttc::Incoming::Disconnect)) => {
+                                    conn.store(false, Ordering::Relaxed)
+                                }
+                                EventWrapper::V5(event) => match **event {
+                                    rumqttc::v5::Event::Incoming(rumqttc::v5::Incoming::ConnAck(_)) => conn.store(true, Ordering::Relaxed),
+                                    rumqttc::v5::Event::Incoming(rumqttc::v5::Incoming::Disconnect(_)) => conn.store(false, Ordering::Relaxed),
+                                    _ => {}
+                                }
+                                _ => {}
                             }
                         }
-                        rumqttc::v5::Event::Incoming(rumqttc::v5::Incoming::ConnAck(ack)) => {
-                            if !ack.session_present {
-                                if let Some((client, topic, qos)) = &subscription_info {
-                                    let client = client.clone();
-                                    let topic = topic.clone();
-                                    let qos = *qos;
-                                    info!("Session not present on V5 connection, resubscribing to {}", topic);
-                                    tokio::spawn(async move {
-                                        if let Err(e) = client.subscribe(&topic, qos).await {
-                                            error!("Failed to resubscribe: {}", e);
+                        match event {
+                            EventWrapper::V3(rumqttc::Event::Incoming(incoming)) => match incoming {
+                                rumqttc::Incoming::Publish(p) => {
+                                    if let Some(tx) = &message_tx {
+                                        let topic = p.topic.clone();
+                                        let msg = publish_to_canonical_message_v3(&p);
+                                        let ack = if manual_acks && p.qos != QoS::AtMostOnce { MqttAck::V3(p) } else { MqttAck::None };
+                                        let internal = MqttInternalMessage {
+                                            msg, ack
+                                        };
+                                        trace!(message_id = %format!("{:032x}", internal.msg.message_id), %topic, "Received MQTT v3 message");
+                                        if tx.send(internal).await.is_err() {
+                                            break;
                                         }
-                                    });
+                                    }
                                 }
-                            } else {
-                                info!("Session present on V5 connection, resuming...");
+                                rumqttc::Incoming::ConnAck(ack) => {
+                                    if !ack.session_present {
+                                        if let Some((client, topic, qos)) = &subscription_info {
+                                            let client = client.clone();
+                                            let topic = topic.clone();
+                                            let qos = *qos;
+                                            info!("Session not present on V3 connection, resubscribing to {}", topic);
+                                            tokio::spawn(async move {
+                                                if let Err(e) = client.subscribe(&topic, qos).await {
+                                                    error!("Failed to resubscribe: {}", e);
+                                                }
+                                            });
+                                        }
+                                    } else {
+                                        info!("Session present on V3 connection, resuming...");
+                                    }
+                                }
+                                _ => {}
+                            },
+                            EventWrapper::V5(event) => {
+                                match *event {
+                                    rumqttc::v5::Event::Incoming(rumqttc::v5::Incoming::Publish(p)) => {
+                                        if let Some(tx) = &message_tx {
+                                            let topic_bytes = p.topic.clone();
+                                            let msg = publish_to_canonical_message_v5(&p);
+                                            let ack = if manual_acks && p.qos != QoSV5::AtMostOnce { MqttAck::V5(p) } else { MqttAck::None };
+                                            let internal = MqttInternalMessage {
+                                                msg, ack
+                                            };
+                                            trace!(message_id = %format!("{:032x}", internal.msg.message_id), topic = %String::from_utf8_lossy(&topic_bytes), "Received MQTT v5 message");
+                                            if tx.send(internal).await.is_err() {
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    rumqttc::v5::Event::Incoming(rumqttc::v5::Incoming::ConnAck(ack)) => {
+                                        if !ack.session_present {
+                                            if let Some((client, topic, qos)) = &subscription_info {
+                                                let client = client.clone();
+                                                let topic = topic.clone();
+                                                let qos = *qos;
+                                                info!("Session not present on V5 connection, resubscribing to {}", topic);
+                                                tokio::spawn(async move {
+                                                    if let Err(e) = client.subscribe(&topic, qos).await {
+                                                        error!("Failed to resubscribe: {}", e);
+                                                    }
+                                                });
+                                            }
+                                        } else {
+                                            info!("Session present on V5 connection, resuming...");
+                                        }
+                                    }
+                                    _ => {}
+                                }
                             }
+                            _ => {}
                         }
-                        _ => {}
                     }
-                }
-                _ => {}
-            },
                     Err(e) => {
+                        if let Some(conn) = &is_connected {
+                            conn.store(false, Ordering::Relaxed);
+                        }
                         error!("MQTT EventLoop error: {}. Reconnecting...", e);
                         tokio::time::sleep(Duration::from_secs(1)).await;
                     }

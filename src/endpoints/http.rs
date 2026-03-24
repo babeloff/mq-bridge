@@ -57,6 +57,7 @@ pub struct HttpConsumer {
     request_rx: tokio::sync::mpsc::Receiver<HttpSourceMessage>,
     _shutdown_tx: tokio::sync::watch::Sender<()>,
     buffer_size: usize,
+    url: String,
 }
 
 #[derive(Clone)]
@@ -106,6 +107,7 @@ pub fn create_http_consumer_and_service(
         request_rx,
         _shutdown_tx: shutdown_tx,
         buffer_size: config.internal_buffer_size.unwrap_or(100),
+        url: config.url.clone(),
     };
 
     Ok((consumer, service))
@@ -144,6 +146,7 @@ impl HttpConsumer {
             request_rx,
             _shutdown_tx: shutdown_tx,
             buffer_size: config.internal_buffer_size.unwrap_or(100),
+            url: config.url.clone(),
         })
     }
 }
@@ -351,6 +354,8 @@ impl MessageConsumer for HttpConsumer {
     async fn status(&self) -> crate::traits::EndpointStatus {
         crate::traits::EndpointStatus {
             healthy: true,
+            target: self.url.clone(),
+            pending: Some(self.request_rx.len()),
             capacity: Some(self.buffer_size),
             ..Default::default()
         }

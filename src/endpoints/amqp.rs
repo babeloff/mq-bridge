@@ -299,9 +299,21 @@ impl MessagePublisher for AmqpPublisher {
 
     async fn status(&self) -> EndpointStatus {
         let state = self.state.read().await;
-        let healthy = state.connection.status().connected() && state.channel.status().connected();
+        let conn_status = state.connection.status();
+        let chan_status = state.channel.status();
+        let healthy = conn_status.connected() && chan_status.connected();
+        let last_error = if !healthy {
+            Some(format!(
+                "Connection: '{:?}', Channel: '{:?}'",
+                conn_status.state(),
+                chan_status.state()
+            ))
+        } else {
+            None
+        };
         EndpointStatus {
             healthy,
+            last_error,
             target: self.exchange.clone(),
             details: serde_json::json!({ "queue": self.queue, "delayed_ack": self.delayed_ack }),
             ..Default::default()
@@ -634,29 +646,38 @@ impl MessageConsumer for AmqpConsumer {
     }
 
     async fn status(&self) -> EndpointStatus {
-        let mut healthy = self._conn.status().connected() && self.channel.status().connected();
+        let conn_status = self._conn.status();
+        let chan_status = self.channel.status();
+        let mut healthy = conn_status.connected() && chan_status.connected();
         let mut pending: Option<usize> = None;
         let mut last_error: Option<String> = None;
 
         if healthy {
-            match self
-                .channel
-                .queue_declare(
-                    &self.queue,
-                    lapin::options::QueueDeclareOptions {
-                        passive: true,
-                        ..Default::default()
-                    },
-                    lapin::types::FieldTable::default(),
-                )
-                .await
-            {
-                Ok(q) => pending = Some(q.message_count() as usize),
+            let passive_declare = self.channel.queue_declare(
+                &self.queue,
+                lapin::options::QueueDeclareOptions {
+                    passive: true,
+                    ..Default::default()
+                },
+                lapin::types::FieldTable::default(),
+            );
+            match tokio::time::timeout(Duration::from_secs(2), passive_declare).await {
+                Ok(Ok(q)) => pending = Some(q.message_count() as usize),
+                Ok(Err(e)) => {
+                    healthy = false;
+                    last_error = Some(e.to_string());
+                }
                 Err(e) => {
                     healthy = false;
                     last_error = Some(e.to_string());
                 }
             }
+        } else {
+            last_error = Some(format!(
+                "Connection: '{:?}', Channel: '{:?}'",
+                conn_status.state(),
+                chan_status.state()
+            ));
         }
 
         EndpointStatus {

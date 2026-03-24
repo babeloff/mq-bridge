@@ -549,13 +549,43 @@ impl MessagePublisher for AwsPublisher {
     }
 
     async fn status(&self) -> EndpointStatus {
+        let mut healthy = true;
+        let mut last_error = None;
+        let mut details = serde_json::json!({});
+
+        if let (Some(client), Some(url)) = (&self.sqs_client, &self.queue_url) {
+            match client.get_queue_attributes().queue_url(url).send().await {
+                Ok(_) => { /* SQS is healthy */ }
+                Err(e) => {
+                    healthy = false;
+                    last_error = Some(format!("SQS: {}", e));
+                }
+            }
+        }
+
+        if let (Some(client), Some(arn)) = (&self.sns_client, &self.topic_arn) {
+            if healthy {
+                // Don't overwrite the first error
+                match client.get_topic_attributes().topic_arn(arn).send().await {
+                    Ok(resp) => {
+                        if let Some(attrs) = resp.attributes {
+                            details["sns_attributes"] = serde_json::json!(attrs);
+                        }
+                    }
+                    Err(e) => {
+                        healthy = false;
+                        last_error = Some(format!("SNS: {}", e));
+                    }
+                }
+            }
+        }
+
+        let target = self.queue_url.clone().or_else(|| self.topic_arn.clone());
         EndpointStatus {
-            healthy: true,
-            target: self
-                .queue_url
-                .clone()
-                .or(self.topic_arn.clone())
-                .unwrap_or_default(),
+            healthy,
+            last_error,
+            target: target.unwrap_or_default(),
+            details,
             ..Default::default()
         }
     }
