@@ -1,7 +1,7 @@
 use crate::canonical_message::tracing_support::LazyMessageIds;
 use crate::models::KafkaConfig;
 use crate::traits::{
-    BatchCommitFunc, BoxFuture, ConsumerError, MessageConsumer, MessageDisposition,
+    BatchCommitFunc, BoxFuture, ConsumerError, EndpointStatus, MessageConsumer, MessageDisposition,
     MessagePublisher, PublisherError, Received, ReceivedBatch, Sent, SentBatch,
 };
 use crate::CanonicalMessage;
@@ -248,6 +248,37 @@ impl MessagePublisher for KafkaPublisher {
             .map_err(|e| anyhow!("Kafka flush error: {}", e))
     }
 
+    async fn status(&self) -> EndpointStatus {
+        let producer = self.producer.clone();
+        let topic = self.topic.clone();
+        let (healthy, pending, last_error) = tokio::task::spawn_blocking(move || {
+            let meta_topic = if topic.is_empty() {
+                None
+            } else {
+                Some(topic.as_str())
+            };
+            let (healthy, last_error) = match producer
+                .client()
+                .fetch_metadata(meta_topic, Duration::from_secs(1))
+            {
+                Ok(_) => (true, None),
+                Err(e) => (false, Some(e.to_string())),
+            };
+            let pending = producer.in_flight_count() as usize;
+            (healthy, pending, last_error)
+        })
+        .await
+        .unwrap_or((false, 0, Some("status task panicked".to_string())));
+
+        EndpointStatus {
+            healthy,
+            last_error,
+            target: self.topic.clone(),
+            pending: Some(pending),
+            ..Default::default()
+        }
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
@@ -416,6 +447,81 @@ impl MessageConsumer for KafkaConsumer {
             &self.topic,
         )
         .await
+    }
+
+    async fn status(&self) -> EndpointStatus {
+        let consumer = self.consumer.clone();
+        let topic = self.topic.clone();
+
+        let (healthy, pending, last_error) = tokio::task::spawn_blocking(move || {
+            let meta_topic = if topic.is_empty() {
+                None
+            } else {
+                Some(topic.as_str())
+            };
+            let (mut healthy, mut last_error) = match consumer
+                .client()
+                .fetch_metadata(meta_topic, Duration::from_secs(1))
+            {
+                Ok(_) => (true, None),
+                Err(e) => (false, Some(e.to_string())),
+            };
+
+            let mut total_lag = 0;
+            if healthy {
+                if let Ok(tpl) = consumer.assignment() {
+                    // Fetch local position (next offset to read)
+                    match consumer.position() {
+                        Ok(position_tpl) => {
+                            for partition in tpl.elements() {
+                                let p_id = partition.partition();
+                                let t_name = partition.topic();
+
+                                if let Some(pos_elem) = position_tpl.find_partition(t_name, p_id) {
+                                    if let rdkafka::Offset::Offset(current) = pos_elem.offset() {
+                                        // Fetch high watermark from broker (latest offset)
+                                        match consumer.fetch_watermarks(
+                                            t_name,
+                                            p_id,
+                                            Duration::from_secs(1),
+                                        ) {
+                                            Ok((_low, high)) => {
+                                                if high > current {
+                                                    total_lag += (high - current) as usize;
+                                                }
+                                            }
+                                            Err(e) => {
+                                                last_error = Some(format!(
+                                                    "Failed to fetch watermarks: {}",
+                                                    e
+                                                ));
+                                                healthy = false;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            last_error = Some(format!("Failed to get consumer position: {}", e));
+                            healthy = false;
+                        }
+                    }
+                }
+            }
+            (healthy, total_lag, last_error)
+        })
+        .await
+        .unwrap_or((false, 0, Some("status task panicked".to_string())));
+
+        EndpointStatus {
+            healthy,
+            target: self.topic.clone(),
+            pending: if healthy { Some(pending) } else { None },
+            last_error,
+            ..Default::default()
+        }
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -591,7 +697,7 @@ async fn receive_batch_internal(
                 .iter()
                 .any(|d| matches!(d, MessageDisposition::Nack));
 
-            handle_kafka_replies(producer, &reply_infos, &dispositions).await;
+            handle_kafka_replies(producer, &reply_infos, dispositions).await;
 
             // Only commit if there are offsets to commit AND no messages were Nacked.
             // If any message is Nacked, we skip the commit for the whole batch to ensure at-least-once delivery.
@@ -614,7 +720,7 @@ async fn receive_batch_internal(
 async fn handle_kafka_replies(
     producer: Option<FutureProducer>,
     reply_infos: &[(Option<String>, Option<String>)],
-    dispositions: &[MessageDisposition],
+    dispositions: Vec<MessageDisposition>,
 ) {
     if let Some(prod) = producer {
         if dispositions.len() != reply_infos.len() {
@@ -624,21 +730,25 @@ async fn handle_kafka_replies(
                 "Response count mismatch with received messages"
             );
         }
-        for ((reply_topic, correlation_id), disposition) in reply_infos.iter().zip(dispositions) {
-            if let (Some(rt), MessageDisposition::Reply(resp)) = (reply_topic, disposition) {
-                let mut record: FutureRecord<'_, (), _> =
-                    FutureRecord::to(rt).payload(&resp.payload[..]);
-                let mut headers = OwnedHeaders::new();
-                if let Some(cid) = correlation_id {
-                    headers = headers.insert(rdkafka::message::Header {
-                        key: "correlation_id",
-                        value: Some(cid.as_bytes()),
-                    });
-                }
-                record = record.headers(headers);
+        for ((reply_topic, correlation_id), disposition) in
+            reply_infos.iter().zip(dispositions.into_iter())
+        {
+            if let MessageDisposition::Reply(resp) = disposition {
+                if let Some(rt) = reply_topic {
+                    let mut record: FutureRecord<'_, (), _> =
+                        FutureRecord::to(rt).payload(&resp.payload[..]);
+                    let mut headers = OwnedHeaders::new();
+                    if let Some(cid) = correlation_id {
+                        headers = headers.insert(rdkafka::message::Header {
+                            key: "correlation_id",
+                            value: Some(cid.as_bytes()),
+                        });
+                    }
+                    record = record.headers(headers);
 
-                if let Err((e, _)) = prod.send(record, Duration::from_secs(0)).await {
-                    tracing::error!(topic = %rt, error = %e, "Failed to publish Kafka reply");
+                    if let Err((e, _)) = prod.send(record, Duration::from_secs(0)).await {
+                        tracing::error!(topic = %rt, error = %e, "Failed to publish Kafka reply");
+                    }
                 }
             }
         }

@@ -8,7 +8,7 @@ use crate::event_store::{
 };
 use crate::models::MemoryConfig;
 use crate::traits::{
-    BatchCommitFunc, BoxFuture, ConsumerError, MessageConsumer, MessageDisposition,
+    BatchCommitFunc, BoxFuture, ConsumerError, EndpointStatus, MessageConsumer, MessageDisposition,
     MessagePublisher, PublisherError, Received, ReceivedBatch, Sent, SentBatch,
 };
 use crate::CanonicalMessage;
@@ -344,6 +344,26 @@ impl MessagePublisher for MemoryPublisher {
         }
     }
 
+    async fn status(&self) -> EndpointStatus {
+        match &self.backend {
+            PublisherBackend::Queue(sender) => EndpointStatus {
+                healthy: !sender.is_closed(),
+                target: self.topic.clone(),
+                pending: Some(sender.len()),
+                capacity: Some(sender.capacity().unwrap_or(0)),
+                ..Default::default()
+            },
+            PublisherBackend::Log(_store) => EndpointStatus {
+                healthy: true,
+                target: self.topic.clone(),
+                details: serde_json::json!({
+                    "mode": "event_store"
+                }),
+                ..Default::default()
+            },
+        }
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -508,25 +528,8 @@ impl MessageConsumer for MemoryQueueConsumer {
 
                 for (i, disposition) in dispositions.into_iter().enumerate() {
                     match disposition {
-                        MessageDisposition::Reply(mut resp) => {
-                            if !resp.metadata.contains_key("correlation_id") {
-                                if let Some(Some(cid)) = correlation_ids.get(i) {
-                                    resp.metadata
-                                        .insert("correlation_id".to_string(), cid.clone());
-                                }
-                            }
-
-                            // If the receiver is dropped, sending will fail. We can ignore it.
-                            let mut handled = false;
-                            if let Some(cid) = resp.metadata.get("correlation_id") {
-                                if let Some(tx) = response_channel.remove_waiter(cid).await {
-                                    let _ = tx.send(resp.clone());
-                                    handled = true;
-                                }
-                            }
-                            if !handled {
-                                let _ = response_channel.sender.send(resp).await;
-                            }
+                        MessageDisposition::Reply(resp) => {
+                            handle_memory_reply(resp, i, &correlation_ids, &response_channel).await;
                         }
                         MessageDisposition::Nack => {
                             // Re-queue the message if Nacked
@@ -556,8 +559,45 @@ impl MessageConsumer for MemoryQueueConsumer {
         Ok(ReceivedBatch { messages, commit })
     }
 
+    async fn status(&self) -> EndpointStatus {
+        let pending = self.receiver.len();
+        let capacity = self.receiver.capacity().unwrap_or(0);
+        EndpointStatus {
+            healthy: !self.receiver.is_closed(),
+            target: self.topic.clone(),
+            pending: Some(pending),
+            capacity: Some(capacity),
+            ..Default::default()
+        }
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
+    }
+}
+
+async fn handle_memory_reply(
+    mut resp: CanonicalMessage,
+    index: usize,
+    correlation_ids: &[Option<String>],
+    response_channel: &MemoryResponseChannel,
+) {
+    if !resp.metadata.contains_key("correlation_id") {
+        if let Some(Some(cid)) = correlation_ids.get(index) {
+            resp.metadata
+                .insert("correlation_id".to_string(), cid.clone());
+        }
+    }
+
+    let mut handled = false;
+    if let Some(cid) = resp.metadata.get("correlation_id") {
+        if let Some(tx) = response_channel.remove_waiter(cid).await {
+            let _ = tx.send(resp.clone());
+            handled = true;
+        }
+    }
+    if !handled {
+        let _ = response_channel.sender.send(resp).await;
     }
 }
 
@@ -567,6 +607,13 @@ impl MessageConsumer for MemoryConsumer {
         match self {
             Self::Queue(q) => q.receive_batch(max_messages).await,
             Self::Log { consumer, .. } => consumer.receive_batch(max_messages).await,
+        }
+    }
+
+    async fn status(&self) -> EndpointStatus {
+        match self {
+            Self::Queue(q) => q.status().await,
+            Self::Log { consumer, .. } => consumer.status().await,
         }
     }
 

@@ -378,13 +378,10 @@ impl MessageConsumer for ZeroMqConsumer {
             Box::pin(async move {
                 for (i, ctx_opt) in contexts.into_iter().enumerate() {
                     if let Some(ctx) = ctx_opt {
-                        let resp = dispositions.get(i).and_then(|d| {
-                            if let MessageDisposition::Reply(r) = d {
-                                Some(r.clone())
-                            } else {
-                                None
-                            }
-                        });
+                        let resp = match dispositions.get(i) {
+                            Some(MessageDisposition::Reply(r)) => Some(r.clone()),
+                            _ => None,
+                        };
 
                         let mut state = ctx.state.lock().unwrap();
                         state.responses[ctx.index] = resp;

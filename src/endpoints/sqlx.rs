@@ -6,8 +6,8 @@
 use crate::canonical_message::tracing_support::LazyMessageIds;
 use crate::models::SqlxConfig;
 use crate::traits::{
-    BoxFuture, ConsumerError, MessageConsumer, MessageDisposition, MessagePublisher,
-    PublisherError, ReceivedBatch, Sent, SentBatch,
+    BoxFuture, ConsumerError, EndpointStatus, MessageConsumer, MessageDisposition,
+    MessagePublisher, PublisherError, ReceivedBatch, Sent, SentBatch,
 };
 use crate::CanonicalMessage;
 use anyhow::{anyhow, Context};
@@ -322,6 +322,21 @@ impl MessagePublisher for SqlxPublisher {
         Ok(SentBatch::Ack)
     }
 
+    async fn status(&self) -> EndpointStatus {
+        let (healthy, last_error) = match self.pool.acquire().await {
+            Ok(_) => (true, None),
+            Err(e) => (false, Some(e.to_string())),
+        };
+
+        EndpointStatus {
+            healthy,
+            target: self.table.clone(),
+            last_error,
+            details: serde_json::json!({ "driver": self.driver_name, "pool_size": self.pool.size(), "pool_idle": self.pool.num_idle() }),
+            ..Default::default()
+        }
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
@@ -594,8 +609,30 @@ impl SqlxConsumer {
 
         Ok(rows)
     }
-}
+    async fn get_pending_count(&self) -> Option<usize> {
+        let query = match self.driver_name.as_str() {
+            "PostgreSQL" | "MySQL" | "MariaDB" => format!(
+                "SELECT COUNT(*) FROM {} WHERE locked_until IS NULL OR locked_until < NOW()",
+                self.table
+            ),
+            "SQLite" => format!(
+                "SELECT COUNT(*) FROM {} WHERE locked_until IS NULL OR locked_until < datetime('now')",
+                self.table
+            ),
+            "Microsoft SQL Server" => format!(
+                "SELECT COUNT(*) FROM {} WHERE locked_until IS NULL OR locked_until < GETUTCDATE()",
+                self.table
+            ),
+            _ => return None,
+        };
 
+        let row: sqlx::any::AnyRow = sqlx::query(&query).fetch_one(&self.pool).await.ok()?;
+        row.try_get::<i64, _>(0)
+            .ok()
+            .map(|c| c as usize)
+            .or_else(|| row.try_get::<i32, _>(0).ok().map(|c| c as usize))
+    }
+}
 #[async_trait]
 impl MessageConsumer for SqlxConsumer {
     async fn receive_batch(&mut self, max_messages: usize) -> Result<ReceivedBatch, ConsumerError> {
@@ -656,10 +693,16 @@ impl MessageConsumer for SqlxConsumer {
                         }
                         let mut ids_to_ack = Vec::new();
                         for (i, disp) in dispositions.iter().enumerate() {
-                            if matches!(
-                                disp,
-                                MessageDisposition::Ack | MessageDisposition::Reply(_)
-                            ) {
+                            let should_ack = match disp {
+                                MessageDisposition::Ack => true,
+                                MessageDisposition::Reply(_) => {
+                                    tracing::warn!("SQLx consumer received a Reply/StreamReply, but replying is not supported by this endpoint. The reply payload is dropped, and the original message is acknowledged.");
+                                    true
+                                }
+                                MessageDisposition::Nack => false,
+                            };
+
+                            if should_ack {
                                 if let Some(id) = ids.get(i) {
                                     ids_to_ack.push(*id);
                                 }
@@ -708,6 +751,28 @@ impl MessageConsumer for SqlxConsumer {
         }
     }
 
+    async fn status(&self) -> EndpointStatus {
+        let (healthy, last_error) = match self.pool.acquire().await {
+            Ok(_) => (true, None),
+            Err(e) => (false, Some(e.to_string())),
+        };
+
+        let pending = if healthy {
+            self.get_pending_count().await
+        } else {
+            None
+        };
+
+        EndpointStatus {
+            healthy,
+            target: self.table.clone(),
+            pending,
+            last_error,
+            details: serde_json::json!({ "driver": self.driver_name, "pool_size": self.pool.size(), "pool_idle": self.pool.num_idle() }),
+            ..Default::default()
+        }
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
@@ -716,7 +781,7 @@ impl MessageConsumer for SqlxConsumer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::traits::MessageConsumer;
+    use crate::traits::{MessageConsumer, MessagePublisher};
     use tempfile::tempdir;
 
     async fn setup_db_file() -> (tempfile::TempDir, String) {
@@ -813,5 +878,21 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn test_sqlx_status() {
+        let (_dir, url) = setup_db_file().await;
+        let config = SqlxConfig {
+            url: url.clone(),
+            table: "messages".to_string(),
+            ..Default::default()
+        };
+
+        let publisher = SqlxPublisher::new(&config).await.unwrap();
+        let status = publisher.status().await;
+        assert!(status.healthy);
+        assert_eq!(status.target, "messages");
+        assert!(status.details.get("driver").is_some());
     }
 }

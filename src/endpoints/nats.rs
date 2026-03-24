@@ -664,21 +664,28 @@ async fn handle_jetstream_replies(
 ) {
     for (msg, disposition) in messages.iter().zip(dispositions.iter()) {
         // Only send a reply if the NATS message has a reply subject and the disposition is a Reply.
-        if let (Some(reply), MessageDisposition::Reply(resp)) = (msg.reply.as_ref(), disposition) {
-            let publish_result = tokio::time::timeout(
-                std::time::Duration::from_secs(60),
-                client.publish(reply.clone(), resp.payload.clone()),
-            )
-            .await;
+        if let Some(reply) = msg.reply.as_ref() {
+            let payload = match disposition {
+                MessageDisposition::Reply(resp) => Some(resp.payload.clone()),
+                _ => None,
+            };
 
-            match publish_result {
-                Err(_) => {
-                    tracing::error!(subject = %reply, "Failed to publish NATS reply (timeout)");
+            if let Some(p) = payload {
+                let publish_result = tokio::time::timeout(
+                    std::time::Duration::from_secs(60),
+                    client.publish(reply.clone(), p),
+                )
+                .await;
+
+                match publish_result {
+                    Err(_) => {
+                        tracing::error!(subject = %reply, "Failed to publish NATS reply (timeout)");
+                    }
+                    Ok(Err(e)) => {
+                        tracing::error!(subject = %reply, error = %e, "Failed to publish NATS reply");
+                    }
+                    Ok(Ok(_)) => {}
                 }
-                Ok(Err(e)) => {
-                    tracing::error!(subject = %reply, error = %e, "Failed to publish NATS reply");
-                }
-                Ok(Ok(_)) => {}
             }
         }
     }

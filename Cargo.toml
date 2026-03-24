@@ -76,6 +76,7 @@ hyper = { version = "1.8", optional = true, features = ["client", "server", "htt
 hyper-util = { version = "0.1", optional = true, features = ["tokio", "client", "client-legacy", "server", "http1", "http2"] }
 hyper-rustls = { version = "0.27", optional = true, features = ["http2"] }
 http-body-util = { version = "0.1", optional = true }
+http-body = { version = "1.0", optional = true }
 h2 = { version = "0.4", optional = true }
 flate2 = { version = "1.0", optional = true }
 base64 = { version = "0.22", optional = true }
@@ -129,7 +130,7 @@ amqp = ["lapin", "rustls", "rustls-pemfile", "url"]
 nats = ["async-nats", "rustls", "rustls-pemfile"]
 mongodb = ["dep:mongodb"]
 mqtt = ["rumqttc", "rustls", "tokio-rustls", "rustls-pemfile", "url"]
-http = ["hyper", "hyper-util", "hyper-rustls", "http-body-util", "rustls", "tokio-rustls", "rustls-pemfile", "webpki-roots", "h2", "dep:flate2", "dep:base64"]
+http = ["hyper", "hyper-util", "hyper-rustls", "http-body-util", "dep:http-body", "rustls", "tokio-rustls", "rustls-pemfile", "webpki-roots", "h2", "dep:flate2", "dep:base64"]
 aws = ["aws-config", "aws-sdk-sqs", "aws-sdk-sns"]
 ibm-mq = ["mqi"]
 zeromq = ["dep:zeromq"]

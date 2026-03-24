@@ -6,8 +6,8 @@
 use crate::canonical_message::tracing_support::LazyMessageIds;
 use crate::models::SledConfig;
 use crate::traits::{
-    ConsumerError, MessageConsumer, MessageDisposition, MessagePublisher, PublisherError, Received,
-    ReceivedBatch, Sent, SentBatch,
+    ConsumerError, EndpointStatus, MessageConsumer, MessageDisposition, MessagePublisher,
+    PublisherError, Received, ReceivedBatch, Sent, SentBatch,
 };
 use crate::CanonicalMessage;
 use anyhow::{anyhow, Context};
@@ -109,6 +109,14 @@ impl MessagePublisher for SledPublisher {
             .map_err(|e| PublisherError::Retryable(anyhow!(e)))?;
 
         Ok(SentBatch::Ack)
+    }
+
+    async fn status(&self) -> EndpointStatus {
+        EndpointStatus {
+            healthy: true,
+            target: String::from_utf8_lossy(&self.tree.name()).to_string(),
+            ..Default::default()
+        }
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -264,6 +272,14 @@ impl MessageConsumer for SledConsumer {
                     Box::pin(async move {
                         if delete {
                             match disposition {
+                                MessageDisposition::Ack => { /* delete */ }
+                                MessageDisposition::Reply(_) => {
+                                    tracing::warn!("Sled consumer received a Reply/StreamReply, but replying is not supported. Dropping reply.");
+                                }
+                                _ => {}
+                            }
+
+                            match disposition {
                                 MessageDisposition::Ack | MessageDisposition::Reply(_) => {
                                     inflight_tree.remove(key_clone).map_err(|e| anyhow!(e))?;
                                 }
@@ -334,6 +350,19 @@ impl MessageConsumer for SledConsumer {
                 })
             }),
         })
+    }
+
+    async fn status(&self) -> EndpointStatus {
+        let pending = self.tree.len();
+        EndpointStatus {
+            healthy: true,
+            target: String::from_utf8_lossy(&self.tree.name()).to_string(),
+            pending: Some(pending),
+            details: serde_json::json!({
+                "inflight": self.inflight_tree.len()
+            }),
+            ..Default::default()
+        }
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -444,6 +473,23 @@ mod tests {
             .unwrap();
 
         assert_eq!(received_retry.message.payload, msg.payload);
+        close_db(&path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_sled_status() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().to_str().unwrap().to_string();
+        let config = SledConfig {
+            path: path.clone(),
+            tree: Some("status_tree".to_string()),
+            ..Default::default()
+        };
+
+        let publisher = SledPublisher::new(&config).unwrap();
+        let status = publisher.status().await;
+        assert!(status.healthy);
+        assert_eq!(status.target, "status_tree");
         close_db(&path).unwrap();
     }
 }

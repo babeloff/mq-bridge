@@ -1,7 +1,7 @@
 use crate::canonical_message::tracing_support::LazyMessageIds;
 use crate::models::AmqpConfig;
 use crate::traits::{
-    BatchCommitFunc, BoxFuture, ConsumerError, MessageConsumer, MessageDisposition,
+    BatchCommitFunc, BoxFuture, ConsumerError, EndpointStatus, MessageConsumer, MessageDisposition,
     MessagePublisher, PublisherError, ReceivedBatch, Sent, SentBatch,
 };
 use crate::CanonicalMessage;
@@ -297,6 +297,17 @@ impl MessagePublisher for AmqpPublisher {
         }
     }
 
+    async fn status(&self) -> EndpointStatus {
+        let state = self.state.read().await;
+        let healthy = state.connection.status().connected() && state.channel.status().connected();
+        EndpointStatus {
+            healthy,
+            target: self.exchange.clone(),
+            details: serde_json::json!({ "queue": self.queue, "delayed_ack": self.delayed_ack }),
+            ..Default::default()
+        }
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -308,6 +319,7 @@ pub struct AmqpConsumer {
     channel: Channel,
     queue: String,
     is_poisoned: Arc<AtomicBool>,
+    prefetch: u16,
 }
 
 impl AmqpConsumer {
@@ -409,6 +421,7 @@ impl AmqpConsumer {
             channel,
             queue: queue_name,
             is_poisoned: Arc::new(AtomicBool::new(false)),
+            prefetch: prefetch_count,
         })
     }
 }
@@ -585,7 +598,7 @@ impl MessageConsumer for AmqpConsumer {
         trace!(count = messages_len, queue = %self.queue, message_ids = ?LazyMessageIds(&messages), "Received batch of AMQP messages");
         let channel = self.channel.clone();
         let is_poisoned = self.is_poisoned.clone();
-        let commit: BatchCommitFunc = Box::new(move |dispositions: Vec<MessageDisposition>| {
+        let commit: BatchCommitFunc = Box::new(move |mut dispositions: Vec<MessageDisposition>| {
             Box::pin(async move {
                 if dispositions.len() != reply_infos.len() {
                     tracing::error!(
@@ -601,7 +614,7 @@ impl MessageConsumer for AmqpConsumer {
                 }
 
                 let commit_op = async {
-                    handle_replies(&channel, &reply_infos, &dispositions).await;
+                    handle_replies(&channel, &reply_infos, &mut dispositions).await;
                     handle_dispositions(ackers, dispositions).await
                 };
 
@@ -620,6 +633,42 @@ impl MessageConsumer for AmqpConsumer {
         Ok(ReceivedBatch { messages, commit })
     }
 
+    async fn status(&self) -> EndpointStatus {
+        let mut healthy = self._conn.status().connected() && self.channel.status().connected();
+        let mut pending: Option<usize> = None;
+        let mut last_error: Option<String> = None;
+
+        if healthy {
+            match self
+                .channel
+                .queue_declare(
+                    &self.queue,
+                    lapin::options::QueueDeclareOptions {
+                        passive: true,
+                        ..Default::default()
+                    },
+                    lapin::types::FieldTable::default(),
+                )
+                .await
+            {
+                Ok(q) => pending = Some(q.message_count() as usize),
+                Err(e) => {
+                    healthy = false;
+                    last_error = Some(e.to_string());
+                }
+            }
+        }
+
+        EndpointStatus {
+            healthy,
+            target: self.queue.clone(),
+            pending,
+            last_error,
+            capacity: Some(self.prefetch as usize),
+            ..Default::default()
+        }
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -628,10 +677,23 @@ impl MessageConsumer for AmqpConsumer {
 async fn handle_replies(
     channel: &Channel,
     reply_infos: &[(Option<String>, Option<String>)],
-    dispositions: &[MessageDisposition],
+    dispositions: &mut [MessageDisposition],
 ) {
-    for ((reply_to, correlation_id), disposition) in reply_infos.iter().zip(dispositions.iter()) {
-        if let (Some(rt), MessageDisposition::Reply(resp)) = (reply_to, disposition) {
+    for ((reply_to, correlation_id), disposition) in reply_infos.iter().zip(dispositions.iter_mut())
+    {
+        let payload = match disposition {
+            MessageDisposition::Reply(resp) => {
+                if reply_to.is_none() {
+                    tracing::warn!("MessageDisposition::Reply received but no reply_to address found in original message");
+                    None
+                } else {
+                    Some(resp.payload.clone())
+                }
+            }
+            _ => None,
+        };
+
+        if let (Some(rt), Some(body)) = (reply_to, payload) {
             let mut props = BasicProperties::default();
             if let Some(cid) = correlation_id {
                 props = props.with_correlation_id(cid.clone().into());
@@ -643,7 +705,7 @@ async fn handle_replies(
                     "", // Default exchange
                     rt,
                     BasicPublishOptions::default(),
-                    &resp.payload,
+                    &body,
                     props,
                 )
                 .await

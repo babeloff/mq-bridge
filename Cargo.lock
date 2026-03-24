@@ -2910,6 +2910,7 @@ dependencies = [
  "flate2",
  "futures",
  "h2 0.4.13",
+ "http-body 1.0.1",
  "http-body-util",
  "hyper 1.8.1",
  "hyper-rustls 0.27.7",

@@ -262,6 +262,9 @@ impl MessageConsumer for MqttConsumer {
     async fn receive_batch(&mut self, max_messages: usize) -> Result<ReceivedBatch, ConsumerError> {
         self.0.receive_batch(max_messages).await
     }
+    async fn status(&self) -> crate::traits::EndpointStatus {
+        self.0.status().await
+    }
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -293,6 +296,7 @@ struct MqttListener {
     client: Client,
     _stop_tx: mpsc::Sender<()>,
     message_rx: Receiver<MqttInternalMessage>,
+    capacity: usize,
 }
 
 impl MqttListener {
@@ -324,6 +328,7 @@ impl MqttListener {
             client,
             _stop_tx: stop_tx,
             message_rx: rx,
+            capacity: queue_capacity,
         })
     }
 }
@@ -429,6 +434,14 @@ impl MessageConsumer for MqttListener {
             }) as BoxFuture<'static, anyhow::Result<()>>
         });
         Ok(ReceivedBatch { messages, commit })
+    }
+
+    async fn status(&self) -> crate::traits::EndpointStatus {
+        crate::traits::EndpointStatus {
+            healthy: true,
+            capacity: Some(self.capacity),
+            ..Default::default()
+        }
     }
 
     fn as_any(&self) -> &dyn Any {

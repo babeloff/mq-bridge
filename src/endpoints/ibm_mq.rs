@@ -12,10 +12,11 @@ use crate::{
     canonical_message::CanonicalMessage,
     outcomes::SentBatch,
     traits::{
-        self, ConsumerError, MessageConsumer, MessageDisposition, MessagePublisher, PublisherError,
-        ReceivedBatch,
+        self, ConsumerError, EndpointStatus, MessageConsumer, MessageDisposition, MessagePublisher,
+        PublisherError, ReceivedBatch,
     },
 };
+use mqi::attribute::{InqResItem, SetItems, MQIA_CURRENT_Q_DEPTH, MQIA_MAX_Q_DEPTH};
 use mqi::{
     connection::{Credentials, MqServer, ThreadNone, Tls},
     constants, get, mqstr, open,
@@ -88,19 +89,22 @@ macro_rules! connect_mq {
     };
 }
 
-type BatchJob = (
-    Vec<CanonicalMessage>,
-    oneshot::Sender<Result<SentBatch, PublisherError>>,
-);
+enum PublisherJob {
+    SendBatch(
+        Vec<CanonicalMessage>,
+        oneshot::Sender<Result<SentBatch, PublisherError>>,
+    ),
+    Status(oneshot::Sender<EndpointStatus>),
+}
 
 pub struct IbmMqPublisher {
-    tx: mpsc::Sender<BatchJob>,
+    tx: mpsc::Sender<PublisherJob>,
 }
 
 impl IbmMqPublisher {
     pub async fn new(config: &IbmMqConfig) -> Result<Self, PublisherError> {
         let buffer_size = config.internal_buffer_size.unwrap_or(100).max(1);
-        let (tx, mut rx) = mpsc::channel::<BatchJob>(buffer_size);
+        let (tx, mut rx) = mpsc::channel::<PublisherJob>(buffer_size);
         let (init_tx, init_rx) = oneshot::channel();
         let config = config.clone();
         info!("Starting IBM MQ publisher");
@@ -157,45 +161,73 @@ impl IbmMqPublisher {
                 }
 
                 let mut connection_error = false;
-                while let Some((messages, reply_tx)) = rx.blocking_recv() {
-                    let mut result = Ok(SentBatch::Ack);
-                    let syncpoint = Some(Syncpoint::new(&qm));
+                while let Some(job) = rx.blocking_recv() {
+                    match job {
+                        PublisherJob::SendBatch(messages, reply_tx) => {
+                            let mut result = Ok(SentBatch::Ack);
+                            let syncpoint = Some(Syncpoint::new(&qm));
 
-                    for msg in messages {
-                        let pmo = constants::MQPMO_SYNCPOINT | constants::MQPMO_FAIL_IF_QUIESCING;
+                            for msg in messages {
+                                let pmo =
+                                    constants::MQPMO_SYNCPOINT | constants::MQPMO_FAIL_IF_QUIESCING;
 
-                        if let Err(e) = queue.put_message(&pmo, &(&msg.payload[..], FORMAT_NONE)) {
-                            result = Err(PublisherError::Retryable(anyhow::anyhow!(
-                                "MQ put failed: {}",
-                                e
-                            )));
-                            break;
-                        };
-                    }
-
-                    if result.is_ok() {
-                        if let Some(sp) = syncpoint {
-                            if let Err(e) = sp.commit() {
-                                result = Err(PublisherError::Retryable(anyhow::anyhow!(
-                                    "MQ commit failed: {}",
-                                    e
-                                )));
-                                let _ = Syncpoint::new(&qm).backout();
+                                if let Err(e) =
+                                    queue.put_message(&pmo, &(&msg.payload[..], FORMAT_NONE))
+                                {
+                                    result = Err(PublisherError::Retryable(anyhow::anyhow!(
+                                        "MQ put failed: {}",
+                                        e
+                                    )));
+                                    break;
+                                };
                             }
-                        }
-                    } else if let Some(sp) = syncpoint {
-                        let _ = sp.backout();
-                    }
 
-                    if result.is_err() {
-                        connection_error = true;
+                            if result.is_ok() {
+                                if let Some(sp) = syncpoint {
+                                    if let Err(e) = sp.commit() {
+                                        result = Err(PublisherError::Retryable(anyhow::anyhow!(
+                                            "MQ commit failed: {}",
+                                            e
+                                        )));
+                                        let _ = Syncpoint::new(&qm).backout();
+                                    }
+                                }
+                            } else if let Some(sp) = syncpoint {
+                                let _ = sp.backout();
+                            }
+
+                            if result.is_err() {
+                                connection_error = true;
+                            }
+                            let _ = reply_tx.send(result);
+                        }
+                        PublisherJob::Status(reply_tx) => {
+                            let mut healthy = true;
+                            let mut last_error = None;
+                            if let Err(e) = queue.inquire(&[mqi::attribute::MQIA_DEF_PRIORITY]) {
+                                healthy = false;
+                                last_error =
+                                    Some(format!("Failed to inquire object status: {}", e));
+                            }
+
+                            let _ = reply_tx.send(EndpointStatus {
+                                healthy,
+                                target: config
+                                    .queue
+                                    .clone()
+                                    .or(config.topic.clone())
+                                    .unwrap_or_default(),
+                                pending: None,
+                                last_error,
+                                capacity: Some(config.internal_buffer_size.unwrap_or(100).max(1)),
+                                ..Default::default()
+                            });
+                        }
                     }
-                    let _ = reply_tx.send(result);
                     if connection_error {
                         break;
                     }
                 }
-
                 if !connection_error {
                     break;
                 }
@@ -220,13 +252,40 @@ impl MessagePublisher for IbmMqPublisher {
     ) -> Result<SentBatch, PublisherError> {
         trace!(count = messages.len(), message_ids = ?LazyMessageIds(&messages), "Publishing batch of IBM MQ messages");
         let (reply_tx, reply_rx) = oneshot::channel();
-        self.tx.send((messages, reply_tx)).await.map_err(|_| {
-            PublisherError::Retryable(anyhow::anyhow!("MQ publisher thread disconnected"))
-        })?;
+        self.tx
+            .send(PublisherJob::SendBatch(messages, reply_tx))
+            .await
+            .map_err(|_| {
+                PublisherError::Retryable(anyhow::anyhow!("MQ publisher thread disconnected"))
+            })?;
 
         reply_rx.await.map_err(|_| {
             PublisherError::Retryable(anyhow::anyhow!("MQ publisher thread dropped reply"))
         })?
+    }
+
+    async fn status(&self) -> EndpointStatus {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        if self.tx.send(PublisherJob::Status(reply_tx)).await.is_err() {
+            return EndpointStatus {
+                healthy: false,
+                last_error: Some("Publisher thread disconnected".to_string()),
+                ..Default::default()
+            };
+        }
+        match tokio::time::timeout(Duration::from_secs(1), reply_rx).await {
+            Ok(Ok(status)) => status,
+            Ok(Err(_)) => EndpointStatus {
+                healthy: false,
+                last_error: Some("Publisher thread dropped status request".to_string()),
+                ..Default::default()
+            },
+            Err(_) => EndpointStatus {
+                healthy: false,
+                last_error: Some("Status check timed out".to_string()),
+                ..Default::default()
+            },
+        }
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -244,6 +303,9 @@ enum ConsumerJob {
     },
     Backout {
         reply_tx: oneshot::Sender<Result<(), ConsumerError>>,
+    },
+    Status {
+        reply_tx: oneshot::Sender<EndpointStatus>,
     },
 }
 
@@ -432,6 +494,42 @@ async fn spawn_consumer_thread(
                         }
                         let _ = reply_tx.send(res);
                     }
+                    ConsumerJob::Status { reply_tx } => {
+                        let mut healthy = true;
+                        let mut pending = None;
+                        let mut capacity = None;
+                        let mut last_error = None;
+
+                        match obj.inquire(&[MQIA_CURRENT_Q_DEPTH, MQIA_MAX_Q_DEPTH]) {
+                            Ok(values) => {
+                                let mut iter = values.iter();
+                                if let Some(InqResItem::Long(int_item)) = iter.next() {
+                                    pending = Some(int_item.int_attr()[0] as usize);
+                                }
+                                if let Some(InqResItem::Long(int_item)) = iter.next() {
+                                    capacity = Some(int_item.int_attr()[0] as usize);
+                                }
+                            }
+
+                            Err(e) => {
+                                healthy = false;
+                                last_error = Some(format!("Failed to inquire queue status: {}", e));
+                            }
+                        }
+
+                        let _ = reply_tx.send(EndpointStatus {
+                            healthy,
+                            target: config
+                                .queue
+                                .clone()
+                                .or(config.topic.clone())
+                                .unwrap_or_default(),
+                            pending,
+                            capacity,
+                            last_error,
+                            ..Default::default()
+                        });
+                    }
                 }
 
                 if connection_error {
@@ -478,6 +576,35 @@ impl MessageConsumer for IbmMqConsumer {
         reply_rx.await.map_err(|_| {
             ConsumerError::Connection(anyhow::anyhow!("MQ consumer thread dropped reply"))
         })?
+    }
+
+    async fn status(&self) -> EndpointStatus {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        if self
+            .tx
+            .send(ConsumerJob::Status { reply_tx })
+            .await
+            .is_err()
+        {
+            return EndpointStatus {
+                healthy: false,
+                last_error: Some("Consumer thread disconnected".to_string()),
+                ..Default::default()
+            };
+        }
+        match tokio::time::timeout(Duration::from_secs(1), reply_rx).await {
+            Ok(Ok(status)) => status,
+            Ok(Err(_)) => EndpointStatus {
+                healthy: false,
+                last_error: Some("Consumer thread dropped status request".to_string()),
+                ..Default::default()
+            },
+            Err(_) => EndpointStatus {
+                healthy: false,
+                last_error: Some("Status check timed out".to_string()),
+                ..Default::default()
+            },
+        }
     }
 
     fn as_any(&self) -> &dyn std::any::Any {

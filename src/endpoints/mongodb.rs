@@ -1,7 +1,7 @@
 use crate::canonical_message::tracing_support::LazyMessageIds;
 use crate::models::{MongoDbConfig, MongoDbFormat};
 use crate::traits::{
-    BatchCommitFunc, BoxFuture, ConsumerError, MessageConsumer, MessageDisposition,
+    BatchCommitFunc, BoxFuture, ConsumerError, EndpointStatus, MessageConsumer, MessageDisposition,
     MessagePublisher, PublisherError, Received, ReceivedBatch, Sent, SentBatch,
 };
 use crate::CanonicalMessage;
@@ -619,6 +619,20 @@ impl MessagePublisher for MongoDbPublisher {
         }
     }
 
+    async fn status(&self) -> EndpointStatus {
+        let (healthy, last_error) = match self.db.run_command(doc! { "ping": 1 }).await {
+            Ok(_) => (true, None),
+            Err(e) => (false, Some(e.to_string())),
+        };
+        EndpointStatus {
+            healthy,
+            target: self.collection_name.clone(),
+            last_error,
+            details: serde_json::json!({ "database": self.db.name(), "request_reply": self.request_reply }),
+            ..Default::default()
+        }
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -749,6 +763,43 @@ impl MessageConsumer for MongoDbConsumer {
                 // Standalone: Sleep for polling interval.
                 tokio::time::sleep(self.polling_interval).await;
             }
+        }
+    }
+
+    async fn status(&self) -> EndpointStatus {
+        let mut last_error = None;
+        let healthy = match self.db.run_command(doc! { "ping": 1 }).await {
+            Ok(_) => true,
+            Err(e) => {
+                last_error = Some(e.to_string());
+                false
+            }
+        };
+
+        let pending = if healthy {
+            let now = SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64;
+            let filter = Self::available_message_filter(now);
+            match self.collection.count_documents(filter).await {
+                Ok(c) => Some(c as usize),
+                Err(e) => {
+                    last_error = Some(format!("Failed to count pending documents: {}", e));
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        EndpointStatus {
+            healthy,
+            target: self.collection_name.clone(),
+            pending,
+            last_error,
+            details: serde_json::json!({ "database": self.db.name(), "mode": if self.change_stream.is_some() { "change_stream" } else { "polling" } }),
+            ..Default::default()
         }
     }
 
@@ -1011,23 +1062,21 @@ async fn process_mongodb_batch_commit(
         // Only send a reply if the message has a 'reply_to' destination and the disposition is a Reply.
         // This allows for fire-and-forget patterns (no reply_to) or explicit replies.
         match disposition {
-            MessageDisposition::Reply(resp) => {
-                match handle_reply(
-                    db,
-                    reply_coll_opt.as_ref(),
-                    correlation_id_opt.as_ref(),
-                    resp,
-                )
-                .await
-                {
-                    Ok(_) => ids_to_delete.push(id.clone()),
-                    Err(e) => {
-                        tracing::error!(id = %id, error = %e, "Failed to send reply");
-                        errors.push(e);
-                        ids_to_unlock.push(id.clone());
-                    }
+            MessageDisposition::Reply(resp) => match handle_reply(
+                db,
+                reply_coll_opt.as_ref(),
+                correlation_id_opt.as_ref(),
+                resp,
+            )
+            .await
+            {
+                Ok(_) => ids_to_delete.push(id.clone()),
+                Err(e) => {
+                    tracing::error!(id = %id, error = %e, "Failed to send reply");
+                    errors.push(e);
+                    ids_to_unlock.push(id.clone());
                 }
-            }
+            },
             MessageDisposition::Ack => {
                 ids_to_delete.push(id.clone());
             }
@@ -1080,6 +1129,7 @@ async fn process_mongodb_batch_commit(
 pub struct MongoDbSubscriber {
     collection: Collection<Document>,
     polling_interval: Duration,
+    db: Database,
     cursor_id: Option<String>,
     last_seq: Arc<AtomicI64>,
 }
@@ -1120,6 +1170,7 @@ impl MongoDbSubscriber {
         Ok(Self {
             collection,
             polling_interval: Duration::from_millis(config.polling_interval_ms.unwrap_or(100)),
+            db,
             cursor_id: config.cursor_id.clone(),
             last_seq: Arc::new(AtomicI64::new(last_seq)),
         })
@@ -1206,6 +1257,66 @@ impl MessageConsumer for MongoDbSubscriber {
                 return Ok(ReceivedBatch { messages, commit });
             }
             tokio::time::sleep(self.polling_interval).await;
+        }
+    }
+
+    async fn status(&self) -> EndpointStatus {
+        let mut last_error = None;
+        let healthy = match self.db.run_command(doc! { "ping": 1 }).await {
+            Ok(_) => true,
+            Err(e) => {
+                last_error = Some(e.to_string());
+                false
+            }
+        };
+
+        let pending = if healthy {
+            let last_seq = self.last_seq.load(Ordering::Relaxed);
+            let filter = doc! { "seq": { "$gt": last_seq }, "payload": { "$exists": true } };
+            match self.collection.count_documents(filter).await {
+                Ok(c) => Some(c as usize),
+                Err(e) => {
+                    last_error = Some(format!("Failed to count pending: {}", e));
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        let (capacity, details) = if healthy {
+            match self
+                .db
+                .run_command(doc! { "collStats": self.collection.name() })
+                .await
+            {
+                Ok(stats) => {
+                    let is_capped = stats.get_bool("capped").unwrap_or(false);
+                    let cap = if is_capped {
+                        stats.get_i64("maxSize").ok().map(|s| s as usize)
+                    } else {
+                        None
+                    };
+                    let mut details = serde_json::json!({ "cursor_id": self.cursor_id });
+                    if is_capped {
+                        details["capped"] = serde_json::Value::Bool(true);
+                    }
+                    (cap, details)
+                }
+                Err(_) => (None, serde_json::json!({ "cursor_id": self.cursor_id })),
+            }
+        } else {
+            (None, serde_json::json!({ "cursor_id": self.cursor_id }))
+        };
+
+        EndpointStatus {
+            healthy,
+            target: self.collection.name().to_string(),
+            pending,
+            capacity,
+            details,
+            last_error,
+            ..Default::default()
         }
     }
 
