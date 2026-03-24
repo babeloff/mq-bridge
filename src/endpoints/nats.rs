@@ -296,7 +296,7 @@ impl MessageConsumer for NatsConsumer {
                 }
                 NatsCore::JetStream { consumer, .. } => match consumer.get_info().await {
                     Ok(info) => {
-                        pending = Some(info.num_pending as usize);
+                        pending = Some(info.num_pending.try_into().unwrap_or(usize::MAX));
                     }
                     Err(e) => {
                         last_error = Some(format!("Failed to get consumer info: {}", e));
