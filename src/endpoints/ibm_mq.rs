@@ -471,10 +471,16 @@ async fn spawn_consumer_thread(
                                         as traits::BoxFuture<'static, anyhow::Result<()>>
                                 });
 
-                            let _ = reply_tx.send(Ok(ReceivedBatch {
-                                messages,
-                                commit: commit_fn,
-                            }));
+                            if reply_tx
+                                .send(Ok(ReceivedBatch {
+                                    messages,
+                                    commit: commit_fn,
+                                }))
+                                .is_err()
+                            {
+                                warn!("Consumer dropped reply channel, backing out transaction");
+                                let _ = Syncpoint::new(&qm).backout();
+                            }
                         } else if let Some(e) = error {
                             connection_error = true;
                             let _ = reply_tx.send(Err(e));
@@ -549,6 +555,8 @@ async fn spawn_consumer_thread(
                 }
 
                 if connection_error {
+                    warn!("Connection error detected in consumer thread, backing out any active transaction before reconnecting.");
+                    let _ = Syncpoint::new(&qm).backout();
                     break;
                 }
             }

@@ -423,6 +423,28 @@ impl MemoryConsumer {
     }
 }
 
+impl Drop for MemoryQueueConsumer {
+    fn drop(&mut self) {
+        if !self.buffer.is_empty() {
+            let mut messages = std::mem::take(&mut self.buffer);
+            // Buffer is reversed, reverse back to original order
+            messages.reverse();
+
+            let channel = get_or_create_channel(&MemoryConfig {
+                topic: self.topic.clone(),
+                capacity: None,
+                ..Default::default()
+            });
+
+            if let Err(e) = channel.sender.try_send(messages) {
+                tracing::warn!(topic = %self.topic, "Failed to requeue buffered messages on consumer drop (channel full or closed): {}", e);
+            } else {
+                tracing::info!(topic = %self.topic, "Requeued buffered messages on consumer drop");
+            }
+        }
+    }
+}
+
 impl MemoryQueueConsumer {
     pub fn new(config: &MemoryConfig) -> anyhow::Result<Self> {
         let channel = get_or_create_channel(config);
@@ -466,6 +488,46 @@ impl MemoryQueueConsumer {
     }
 }
 
+struct RequeueGuard {
+    topic: String,
+    messages: Vec<CanonicalMessage>,
+}
+
+impl Drop for RequeueGuard {
+    fn drop(&mut self) {
+        if !self.messages.is_empty() {
+            let topic = self.topic.clone();
+            let count = self.messages.len();
+            let messages = std::mem::take(&mut self.messages);
+
+            let channel = get_or_create_channel(&MemoryConfig {
+                topic: topic.clone(),
+                capacity: None,
+                ..Default::default()
+            });
+
+            match channel.sender.try_send(messages) {
+                Ok(_) => {
+                    tracing::info!(topic = %topic, count, "Requeued dropped batch via RequeueGuard");
+                }
+                Err(e) => {
+                    let msgs = match e {
+                        async_channel::TrySendError::Full(m) => m,
+                        async_channel::TrySendError::Closed(m) => m,
+                    };
+                    tracing::warn!(topic = %topic, count, "Failed to requeue dropped batch (channel full/closed), spawning retry");
+                    let sender = channel.sender.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = sender.send(msgs).await {
+                            tracing::error!("Failed to requeue dropped batch in background: {}", e);
+                        }
+                    });
+                }
+            }
+        }
+    }
+}
+
 #[async_trait]
 impl MessageConsumer for MemoryQueueConsumer {
     async fn receive_batch(&mut self, max_messages: usize) -> Result<ReceivedBatch, ConsumerError> {
@@ -505,15 +567,16 @@ impl MessageConsumer for MemoryQueueConsumer {
             .map(|m| m.metadata.get("correlation_id").cloned())
             .collect();
 
-        // This clone is necessary to support NACKs. The commit function needs access
-        // to the messages to re-queue them, but the `ReceivedBatch` must also return
-        // ownership of the messages to the caller. Without changing the core traits,
-        // cloning is the only way to satisfy both owners.
-        let messages_for_retry = if self.enable_nack {
-            Some(messages.clone())
+        // Guard to requeue messages if the batch is dropped without commit/nack.
+        let mut guard = if self.enable_nack {
+            Some(RequeueGuard {
+                topic: self.topic.clone(),
+                messages: messages.clone(),
+            })
         } else {
             None
         };
+
         let commit = Box::new(move |dispositions: Vec<MessageDisposition>| {
             Box::pin(async move {
                 if dispositions.len() != expected_count {
@@ -523,6 +586,14 @@ impl MessageConsumer for MemoryQueueConsumer {
                         dispositions.len()
                     ));
                 }
+
+                // Take messages from guard to disable auto-requeue and use for Nack retry
+                let messages_for_retry = if let Some(g) = &mut guard {
+                    std::mem::take(&mut g.messages)
+                } else {
+                    Vec::new()
+                };
+
                 let response_channel = get_or_create_response_channel(&topic);
                 let mut to_requeue = Vec::new();
 
@@ -533,10 +604,8 @@ impl MessageConsumer for MemoryQueueConsumer {
                         }
                         MessageDisposition::Nack => {
                             // Re-queue the message if Nacked
-                            if let Some(msgs) = &messages_for_retry {
-                                if let Some(msg) = msgs.get(i) {
-                                    to_requeue.push(msg.clone());
-                                }
+                            if let Some(msg) = messages_for_retry.get(i) {
+                                to_requeue.push(msg.clone());
                             }
                         }
                         MessageDisposition::Ack => {}
