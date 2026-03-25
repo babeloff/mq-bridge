@@ -26,8 +26,8 @@ use mqi::{
     },
     MqStr, Object, Subscription, Syncpoint,
 };
-use std::{thread, time::Duration};
-use tokio::sync::{mpsc, oneshot};
+use std::{sync::Arc, thread, time::Duration};
+use tokio::sync::{mpsc, oneshot, Semaphore};
 use tracing::{info, trace, warn};
 
 macro_rules! connect_mq {
@@ -237,6 +237,11 @@ impl IbmMqPublisher {
                     }
                 }
                 if !connection_error {
+                    // This means the loop exited because the rx channel was closed.
+                    // This happens when the IbmMqPublisher struct is dropped.
+                    // We should backout any transaction that might be open.
+                    info!("IBM MQ publisher channel closed, backing out any active transaction before exiting thread.");
+                    let _ = Syncpoint::new(&qm).backout();
                     break;
                 }
             }
@@ -578,6 +583,7 @@ async fn spawn_consumer_thread(
 
 pub struct IbmMqConsumer {
     tx: mpsc::Sender<ConsumerJob>,
+    permit: Arc<tokio::sync::Semaphore>,
 }
 
 #[async_trait]
@@ -586,6 +592,13 @@ impl MessageConsumer for IbmMqConsumer {
         &mut self,
         max_messages: usize,
     ) -> Result<ReceivedBatch, crate::traits::ConsumerError> {
+        let permit = self
+            .permit
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("Semaphore closed unexpectedly");
+
         let (reply_tx, reply_rx) = oneshot::channel();
         self.tx
             .send(ConsumerJob::Receive {
@@ -593,13 +606,32 @@ impl MessageConsumer for IbmMqConsumer {
                 reply_tx,
             })
             .await
-            .map_err(|_| {
-                ConsumerError::Connection(anyhow::anyhow!("MQ consumer thread disconnected"))
-            })?;
+            .map_err(|e| ConsumerError::Connection(anyhow::anyhow!(e)))?;
 
-        reply_rx.await.map_err(|_| {
+        let batch = reply_rx.await.map_err(|_| {
             ConsumerError::Connection(anyhow::anyhow!("MQ consumer thread dropped reply"))
-        })?
+        })??;
+
+        if batch.messages.is_empty() {
+            // If we got an empty batch, there's no commit to wait for.
+            // We can release the permit immediately and return.
+            drop(permit);
+            return Ok(batch);
+        }
+
+        let original_commit = batch.commit;
+        let wrapped_commit = Box::new(move |dispositions| {
+            Box::pin(async move {
+                let result = original_commit(dispositions).await;
+                drop(permit); // Release the permit, allowing the next receive_batch to proceed.
+                result
+            }) as traits::BoxFuture<'static, anyhow::Result<()>>
+        });
+
+        Ok(ReceivedBatch {
+            messages: batch.messages,
+            commit: wrapped_commit,
+        })
     }
 
     async fn status(&self) -> EndpointStatus {
@@ -639,6 +671,9 @@ impl MessageConsumer for IbmMqConsumer {
 impl IbmMqConsumer {
     pub async fn new(config: &IbmMqConfig) -> Result<Self, ConsumerError> {
         let tx = spawn_consumer_thread(config.clone()).await?;
-        Ok(Self { tx })
+        Ok(Self {
+            tx,
+            permit: Arc::new(Semaphore::new(1)),
+        })
     }
 }
