@@ -13,7 +13,7 @@ routes:
     concurrency: 4
     batch_size: 128
     input:
-      memory: { topic: "test-in-mqtt" }
+      memory: { topic: "test-in-mqtt", enable_nack: true }
     output:
       middlewares:
         - retry:

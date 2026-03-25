@@ -28,7 +28,7 @@ use mqi::{
 };
 use std::{sync::Arc, thread, time::Duration};
 use tokio::sync::{mpsc, oneshot, Semaphore};
-use tracing::{info, trace, warn};
+use tracing::{debug, info, trace, warn};
 
 macro_rules! connect_mq {
     ($config:expr) => {
@@ -193,7 +193,10 @@ impl IbmMqPublisher {
                                             "MQ commit failed: {}",
                                             e
                                         )));
-                                        let _ = Syncpoint::new(&qm).backout();
+                                        match Syncpoint::new(&qm).backout() {
+                                            Ok(_) => debug!("Backout on reconnect succeeded"),
+                                            Err(e) => warn!("Backout on reconnect FAILED (messages may be lost): {}", e),
+                                        }
                                     }
                                 }
                             } else if let Some(sp) = syncpoint {
@@ -236,12 +239,33 @@ impl IbmMqPublisher {
                         break;
                     }
                 }
+                while let Ok(job) = rx.try_recv() {
+                    match job {
+                        PublisherJob::SendBatch(_, reply_tx) => {
+                            let _ = reply_tx.send(Err(PublisherError::Retryable(anyhow::anyhow!(
+                                "MQ publisher reconnecting, batch rejected"
+                            ))));
+                        }
+                        PublisherJob::Status(reply_tx) => {
+                            let _ = reply_tx.send(EndpointStatus {
+                                healthy: false,
+                                last_error: Some("Publisher reconnecting".to_string()),
+                                ..Default::default()
+                            });
+                        }
+                    }
+                }
                 if !connection_error {
                     // This means the loop exited because the rx channel was closed.
                     // This happens when the IbmMqPublisher struct is dropped.
                     // We should backout any transaction that might be open.
                     info!("IBM MQ publisher channel closed, backing out any active transaction before exiting thread.");
-                    let _ = Syncpoint::new(&qm).backout();
+                    match Syncpoint::new(&qm).backout() {
+                        Ok(_) => debug!("Backout on reconnect succeeded"),
+                        Err(e) => {
+                            warn!("Backout on reconnect FAILED (messages may be lost): {}", e)
+                        }
+                    }
                     break;
                 }
             }
@@ -312,9 +336,11 @@ enum ConsumerJob {
         reply_tx: oneshot::Sender<Result<ReceivedBatch, ConsumerError>>,
     },
     Commit {
+        epoch: u64,
         reply_tx: oneshot::Sender<Result<(), ConsumerError>>,
     },
     Backout {
+        epoch: u64,
         reply_tx: oneshot::Sender<Result<(), ConsumerError>>,
     },
     Status {
@@ -329,11 +355,13 @@ async fn spawn_consumer_thread(
     let buffer_size = config.internal_buffer_size.unwrap_or(100).max(1);
     let (tx, mut rx) = mpsc::channel::<ConsumerJob>(buffer_size);
     let tx_loop = tx.clone();
+    let mut current_epoch = 0u64;
     let (init_tx, init_rx) = oneshot::channel();
 
     thread::spawn(move || {
         let mut init_tx = Some(init_tx);
         loop {
+            current_epoch += 1;
             let qm = match connect_mq!(&config) {
                 Ok(q) => q,
                 Err(e) => {
@@ -445,12 +473,24 @@ async fn spawn_consumer_thread(
                             }
                         }
 
-                        if !messages.is_empty() {
-                            trace!(count = messages.len(), message_ids = ?LazyMessageIds(&messages), "Received batch of IBM MQ messages");
-                            if error.is_some() {
-                                connection_error = true;
+                        if let Some(e) = error {
+                            // If an error occurred during batch retrieval (e.g. quiescing),
+                            // we must backout any messages already retrieved in this syncpoint
+                            // to ensure atomicity and avoid partial batch processing during shutdown.
+                            warn!("Error during IBM MQ batch retrieval, backing out: {}", e);
+                            match Syncpoint::new(&qm).backout() {
+                                Ok(_) => debug!("Backout on reconnect succeeded"),
+                                Err(e) => warn!(
+                                    "Backout on reconnect FAILED (messages may be lost): {}",
+                                    e
+                                ),
                             }
+                            connection_error = true;
+                            let _ = reply_tx.send(Err(e));
+                        } else if !messages.is_empty() {
+                            trace!(count = messages.len(), message_ids = ?LazyMessageIds(&messages), "Received batch of IBM MQ messages");
                             let tx_commit = tx_loop.clone();
+                            let epoch = current_epoch;
                             let commit_fn: traits::BatchCommitFunc =
                                 Box::new(move |dispositions: Vec<MessageDisposition>| {
                                     let tx = tx_commit.clone();
@@ -461,9 +501,9 @@ async fn spawn_consumer_thread(
                                             .any(|d| matches!(d, MessageDisposition::Nack));
 
                                         let job = if !should_backout {
-                                            ConsumerJob::Commit { reply_tx }
+                                            ConsumerJob::Commit { epoch, reply_tx }
                                         } else {
-                                            ConsumerJob::Backout { reply_tx }
+                                            ConsumerJob::Backout { epoch, reply_tx }
                                         };
                                         tx.send(job)
                                             .await
@@ -484,11 +524,14 @@ async fn spawn_consumer_thread(
                                 .is_err()
                             {
                                 warn!("Consumer dropped reply channel, backing out transaction");
-                                let _ = Syncpoint::new(&qm).backout();
+                                match Syncpoint::new(&qm).backout() {
+                                    Ok(_) => debug!("Backout on reconnect succeeded"),
+                                    Err(e) => warn!(
+                                        "Backout on reconnect FAILED (messages may be lost): {}",
+                                        e
+                                    ),
+                                }
                             }
-                        } else if let Some(e) = error {
-                            connection_error = true;
-                            let _ = reply_tx.send(Err(e));
                         } else {
                             let _ = reply_tx.send(Ok(ReceivedBatch {
                                 messages,
@@ -496,7 +539,14 @@ async fn spawn_consumer_thread(
                             }));
                         }
                     }
-                    ConsumerJob::Commit { reply_tx } => {
+                    ConsumerJob::Commit { epoch, reply_tx } => {
+                        if epoch != current_epoch {
+                            warn!("Stale commit ignored (epoch {}, current {}); messages were backed out on reconnect", epoch, current_epoch);
+                            let _ = reply_tx.send(Err(ConsumerError::Connection(anyhow::anyhow!(
+                                "Commit attempted for a stale connection after restart"
+                            ))));
+                            continue;
+                        }
                         let sp = Syncpoint::new(&qm);
                         let res = sp.commit().map(|_| ()).map_err(|e| {
                             ConsumerError::Connection(anyhow::anyhow!("Commit failed: {}", e))
@@ -506,7 +556,13 @@ async fn spawn_consumer_thread(
                         }
                         let _ = reply_tx.send(res);
                     }
-                    ConsumerJob::Backout { reply_tx } => {
+                    ConsumerJob::Backout { epoch, reply_tx } => {
+                        if epoch != current_epoch {
+                            let _ = reply_tx.send(Err(ConsumerError::Connection(anyhow::anyhow!(
+                                "Backout attempted for a stale connection after restart"
+                            ))));
+                            continue;
+                        }
                         let sp = Syncpoint::new(&qm);
                         let res = sp.backout().map(|_| ()).map_err(|e| {
                             ConsumerError::Connection(anyhow::anyhow!("Backout failed: {}", e))
@@ -561,12 +617,25 @@ async fn spawn_consumer_thread(
 
                 if connection_error {
                     warn!("Connection error detected in consumer thread, backing out any active transaction before reconnecting.");
-                    let _ = Syncpoint::new(&qm).backout();
+                    if let Err(e) = Syncpoint::new(&qm).backout() {
+                        warn!(
+                            "Backout on reconnect failed (broker may have already cleaned up): {}",
+                            e
+                        );
+                    }
                     break;
                 }
             }
 
             if !connection_error {
+                // This means the loop exited because the rx channel was closed.
+                // This happens when the IbmMqConsumer struct is dropped.
+                // We should backout any active transaction before exiting.
+                info!("IBM MQ consumer channel closed, backing out any active transaction before exiting thread.");
+                match Syncpoint::new(&qm).backout() {
+                    Ok(_) => debug!("Backout on reconnect succeeded"),
+                    Err(e) => warn!("Backout on reconnect FAILED (messages may be lost): {}", e),
+                }
                 break;
             }
         }

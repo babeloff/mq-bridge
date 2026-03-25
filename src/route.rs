@@ -454,9 +454,10 @@ impl Route {
                             });
                         }
                         Err(e) => {
-                            // Nack the commit to fill the sequencer slot before breaking.
-                            let _ = commit(vec![MessageDisposition::Nack; batch_len]).await;
-                            break Err(e.into()); // Propagate error to trigger reconnect
+                            warn!("Publisher error, sending {} Nacks to commit", batch_len);
+                            let nack_result = commit(vec![MessageDisposition::Nack; batch_len]).await;
+                            debug!("Nack commit result: {:?}", nack_result);
+                            break Err(e.into());
                         }
                     }
                 }
@@ -601,7 +602,8 @@ impl Route {
                         Err(e) => {
                             error!("Worker failed to send message batch: {}", e);
                             // Nack the commit to fill the sequencer slot and prevent a deadlock.
-                            let _ = commit(vec![MessageDisposition::Nack; batch_len]).await;
+                            let nack_result = commit(vec![MessageDisposition::Nack; batch_len]).await;
+                            debug!("Nack commit result: {:?}", nack_result);
                             // Send the error back to the main task to tear down the route.
                             if err_tx.try_send(e.into()).is_err() {
                                 warn!("Could not send error to main task, it might be down or busy.");

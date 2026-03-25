@@ -119,6 +119,7 @@ routes:
     input:
       memory:
         topic: "chaos_in"
+        enable_nack: true
     output:
       ibmmq:
         queue_manager: "QM1"

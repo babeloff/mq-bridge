@@ -20,7 +20,7 @@ use std::any::Any;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tokio::sync::oneshot;
-use tracing::{info, trace};
+use tracing::{info, trace, warn};
 
 /// A map to hold memory channels for the duration of the bridge setup.
 /// This allows a consumer and publisher in different routes to connect to the same in-memory topic.
@@ -427,7 +427,6 @@ impl Drop for MemoryQueueConsumer {
     fn drop(&mut self) {
         if !self.buffer.is_empty() {
             let mut messages = std::mem::take(&mut self.buffer);
-            // Buffer is reversed, reverse back to original order
             messages.reverse();
 
             let channel = get_or_create_channel(&MemoryConfig {
@@ -436,10 +435,26 @@ impl Drop for MemoryQueueConsumer {
                 ..Default::default()
             });
 
-            if let Err(e) = channel.sender.try_send(messages) {
-                tracing::warn!(topic = %self.topic, "Failed to requeue buffered messages on consumer drop (channel full or closed): {}", e);
-            } else {
-                tracing::info!(topic = %self.topic, "Requeued buffered messages on consumer drop");
+            match channel.sender.try_send(messages) {
+                Ok(_) => {
+                    info!(topic = %self.topic, "Requeued buffered messages on consumer drop");
+                }
+                Err(e) => {
+                    let msgs = match e {
+                        async_channel::TrySendError::Full(m) => m,
+                        async_channel::TrySendError::Closed(m) => m,
+                    };
+                    warn!(topic = %self.topic, "Channel full on drop, spawning async requeue");
+                    let sender = channel.sender.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = sender.send(msgs).await {
+                            tracing::error!(
+                                "Failed to requeue buffered messages in background: {}",
+                                e
+                            );
+                        }
+                    });
+                }
             }
         }
     }
@@ -603,9 +618,11 @@ impl MessageConsumer for MemoryQueueConsumer {
                             handle_memory_reply(resp, i, &correlation_ids, &response_channel).await;
                         }
                         MessageDisposition::Nack => {
-                            // Re-queue the message if Nacked
                             if let Some(msg) = messages_for_retry.get(i) {
+                                warn!("Requeueing nacked message {}", i);
                                 to_requeue.push(msg.clone());
+                            } else {
+                                warn!("Nack for index {} but no message in retry buffer!", i);
                             }
                         }
                         MessageDisposition::Ack => {}
