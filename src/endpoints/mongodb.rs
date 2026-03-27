@@ -1354,7 +1354,6 @@ impl MessageConsumer for MongoDbSubscriber {
             capacity,
             details,
             error,
-            ..Default::default()
         }
     }
 

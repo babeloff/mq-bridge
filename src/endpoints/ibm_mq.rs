@@ -228,7 +228,7 @@ impl IbmMqPublisher {
                                     .or(config.topic.clone())
                                     .unwrap_or_default(),
                                 pending: None,
-                                error: error,
+                                error,
                                 capacity: Some(config.internal_buffer_size.unwrap_or(100).max(1)),
                                 ..Default::default()
                             });
@@ -624,7 +624,7 @@ async fn spawn_consumer_thread(
                                 .unwrap_or_default(),
                             pending,
                             capacity,
-                            error: error,
+                            error,
                             ..Default::default()
                         });
                     }
