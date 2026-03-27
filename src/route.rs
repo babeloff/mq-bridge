@@ -4,6 +4,7 @@
 //  git clone https://github.com/marcomq/mq-bridge
 
 use crate::endpoints::{create_consumer_from_route, create_publisher_from_route};
+use crate::errors::ProcessingError;
 pub use crate::models::Route;
 use crate::models::{Endpoint, EndpointType, RouteOptions};
 use crate::traits::{
@@ -297,7 +298,15 @@ impl Route {
                                 break;
                             }
                             Ok(Err(e)) => {
-                                error!("Route '{}' failed: {}. Reconnecting in 5 seconds...", name, e);
+                                match e.downcast_ref::<ProcessingError>() {
+                                    Some(ProcessingError::Retryable(_)) => {
+                                        warn!("Route '{}' failed with a retryable error: {}. Reconnecting in 5 seconds...", name, e);
+                                        break;
+                                    }
+                                    _ => {
+                                        error!("Route '{}' failed: {}. Reconnecting in 5 seconds...", name, e);
+                                    }
+                                }
                                 tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
                             }
                             Err(e) => {

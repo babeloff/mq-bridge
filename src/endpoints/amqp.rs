@@ -314,7 +314,11 @@ impl MessagePublisher for AmqpPublisher {
         EndpointStatus {
             healthy,
             last_error,
-            target: self.exchange.clone(),
+            target: if self.exchange.is_empty() {
+                self.queue.clone()
+            } else {
+                self.exchange.clone()
+            },
             details: serde_json::json!({ "queue": self.queue, "delayed_ack": self.delayed_ack }),
             ..Default::default()
         }

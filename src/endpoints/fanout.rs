@@ -78,8 +78,8 @@ impl MessagePublisher for FanoutPublisher {
 
         EndpointStatus {
             healthy,
-            pending: if pending > 0 { Some(pending) } else { None },
-            capacity: if capacity > 0 { Some(capacity) } else { None },
+            pending: Some(pending),
+            capacity: Some(capacity),
             last_error,
             details: serde_json::json!({ "destinations": details }),
             ..Default::default()

@@ -609,7 +609,7 @@ impl SqlxConsumer {
 
         Ok(rows)
     }
-    async fn get_pending_count(&self) -> Option<usize> {
+    async fn get_pending_count(&self) -> anyhow::Result<usize> {
         let query = match self.driver_name.as_str() {
             "PostgreSQL" | "MySQL" | "MariaDB" => format!(
                 "SELECT COUNT(*) FROM {} WHERE locked_until IS NULL OR locked_until < NOW()",
@@ -623,14 +623,16 @@ impl SqlxConsumer {
                 "SELECT COUNT(*) FROM {} WHERE locked_until IS NULL OR locked_until < GETUTCDATE()",
                 self.table
             ),
-            _ => return None,
+            _ => anyhow::bail!("Unsupported driver for pending count: {}", self.driver_name),
         };
 
-        let row: sqlx::any::AnyRow = sqlx::query(&query).fetch_one(&self.pool).await.ok()?;
-        row.try_get::<i64, _>(0)
-            .ok()
-            .map(|c| c as usize)
-            .or_else(|| row.try_get::<i32, _>(0).ok().map(|c| c as usize))
+        let row: sqlx::any::AnyRow = sqlx::query(&query).fetch_one(&self.pool).await?;
+        if let Ok(c) = row.try_get::<i64, _>(0) {
+            Ok(c as usize)
+        } else {
+            let c: i32 = row.try_get(0)?;
+            Ok(c as usize)
+        }
     }
 }
 #[async_trait]
@@ -752,15 +754,21 @@ impl MessageConsumer for SqlxConsumer {
     }
 
     async fn status(&self) -> EndpointStatus {
-        let (healthy, last_error) = match self.pool.acquire().await {
+        let (mut healthy, mut last_error) = match self.pool.acquire().await {
             Ok(_) => (true, None),
             Err(e) => (false, Some(e.to_string())),
         };
 
-        let pending = if healthy {
-            self.get_pending_count().await
+        let mut pending = None;
+        if healthy {
+            match self.get_pending_count().await {
+                Ok(c) => pending = Some(c),
+                Err(e) => {
+                    healthy = false;
+                    last_error = Some(e.to_string());
+                }
+            }
         } else {
-            None
         };
 
         EndpointStatus {

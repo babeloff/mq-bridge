@@ -224,8 +224,17 @@ async fn spawn_http_server(
                                 });
                             }
                             Err(e) => {
-                                trace!("Accept error in worker {}: {}", i, e);
-                                break;
+                                match e.kind() {
+                                    std::io::ErrorKind::WouldBlock
+                                    | std::io::ErrorKind::Interrupted
+                                    | std::io::ErrorKind::TimedOut => {
+                                        trace!("Transient accept error in worker {}: {}", i, e);
+                                    }
+                                    _ => {
+                                        debug!("Accept error in worker {}: {}", i, e);
+                                        break;
+                                    }
+                                }
                             }
                         }
                     }
@@ -294,8 +303,17 @@ async fn spawn_tls_server(
                                 });
                             }
                             Err(e) => {
-                                trace!("Accept error in TLS worker {}: {}", i, e);
-                                break;
+                                match e.kind() {
+                                    std::io::ErrorKind::WouldBlock
+                                    | std::io::ErrorKind::Interrupted
+                                    | std::io::ErrorKind::TimedOut => {
+                                        trace!("Transient accept error in TLS worker {}: {}", i, e);
+                                    }
+                                    _ => {
+                                        debug!("Accept error in TLS worker {}: {}", i, e);
+                                        break;
+                                    }
+                                }
                             }
                         }
                     }

@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use std::any::Any;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 use tracing::{info, trace, warn};
 
@@ -1124,6 +1124,11 @@ async fn process_mongodb_batch_commit(
     Ok(())
 }
 
+struct CachedCollStats {
+    timestamp: Instant,
+    stats: Document,
+}
+
 /// A subscriber that reads messages from a MongoDB collection using a monotonic sequence number.
 /// This replaces the old EventStore-based implementation.
 pub struct MongoDbSubscriber {
@@ -1132,6 +1137,7 @@ pub struct MongoDbSubscriber {
     db: Database,
     cursor_id: Option<String>,
     last_seq: Arc<AtomicI64>,
+    cached_coll_stats: Mutex<Option<CachedCollStats>>,
 }
 
 impl MongoDbSubscriber {
@@ -1173,6 +1179,7 @@ impl MongoDbSubscriber {
             db,
             cursor_id: config.cursor_id.clone(),
             last_seq: Arc::new(AtomicI64::new(last_seq)),
+            cached_coll_stats: Mutex::new(None),
         })
     }
 }
@@ -1284,29 +1291,59 @@ impl MessageConsumer for MongoDbSubscriber {
             None
         };
 
-        let (capacity, details) = if healthy {
-            match self
-                .db
-                .run_command(doc! { "collStats": self.collection.name() })
-                .await
-            {
-                Ok(stats) => {
-                    let is_capped = stats.get_bool("capped").unwrap_or(false);
-                    let cap = if is_capped {
-                        stats.get_i64("maxSize").ok().map(|s| s as usize)
-                    } else {
-                        None
-                    };
-                    let mut details = serde_json::json!({ "cursor_id": self.cursor_id });
-                    if is_capped {
-                        details["capped"] = serde_json::Value::Bool(true);
+        let (mut capacity, mut details) =
+            (None, serde_json::json!({ "cursor_id": self.cursor_id }));
+
+        if healthy {
+            let mut stats_doc = {
+                let cached_stats_guard = self.cached_coll_stats.lock().unwrap();
+                cached_stats_guard
+                    .as_ref()
+                    .filter(|cached| cached.timestamp.elapsed() < Duration::from_secs(5))
+                    .map(|cached| cached.stats.clone())
+            };
+
+            if stats_doc.is_none() {
+                // Cache is stale or empty, fetch new stats
+                match self
+                    .db
+                    .run_command(doc! { "collStats": self.collection.name() })
+                    .await
+                {
+                    Ok(stats) => {
+                        stats_doc = Some(stats.clone());
+                        let mut cached_stats_guard = self.cached_coll_stats.lock().unwrap();
+                        *cached_stats_guard = Some(CachedCollStats {
+                            timestamp: Instant::now(),
+                            stats,
+                        });
                     }
-                    (cap, details)
+                    Err(e) => {
+                        warn!(
+                            "Failed to get collStats for {}: {}",
+                            self.collection.name(),
+                            e
+                        );
+                        if last_error.is_none() {
+                            // Only update last_error if no other error is present
+                            last_error = Some(format!("Failed to get collStats: {}", e));
+                        }
+                    }
                 }
-                Err(_) => (None, serde_json::json!({ "cursor_id": self.cursor_id })),
             }
-        } else {
-            (None, serde_json::json!({ "cursor_id": self.cursor_id }))
+
+            if let Some(stats) = stats_doc {
+                let is_capped = stats.get_bool("capped").unwrap_or(false);
+                capacity = if is_capped {
+                    stats.get_i64("maxSize").ok().map(|s| s as usize)
+                } else {
+                    None
+                };
+                details = serde_json::json!({ "cursor_id": self.cursor_id });
+                if is_capped {
+                    details["capped"] = serde_json::Value::Bool(true);
+                }
+            }
         };
 
         EndpointStatus {

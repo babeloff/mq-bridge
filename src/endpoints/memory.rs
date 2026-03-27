@@ -675,16 +675,13 @@ async fn handle_memory_reply(
         }
     }
 
-    let mut handled = false;
     if let Some(cid) = resp.metadata.get("correlation_id") {
         if let Some(tx) = response_channel.remove_waiter(cid).await {
-            let _ = tx.send(resp.clone());
-            handled = true;
+            let _ = tx.send(resp);
+            return;
         }
     }
-    if !handled {
-        let _ = response_channel.sender.send(resp).await;
-    }
+    let _ = response_channel.sender.send(resp).await;
 }
 
 #[async_trait]

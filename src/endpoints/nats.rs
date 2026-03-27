@@ -285,7 +285,7 @@ impl MessageConsumer for NatsConsumer {
     }
 
     async fn status(&self) -> EndpointStatus {
-        let healthy = self.client.connection_state() == State::Connected;
+        let mut healthy = self.client.connection_state() == State::Connected;
         let mut pending = None;
         let mut last_error = None;
 
@@ -299,10 +299,16 @@ impl MessageConsumer for NatsConsumer {
                         pending = Some(info.num_pending.try_into().unwrap_or(usize::MAX));
                     }
                     Err(e) => {
+                        healthy = false;
                         last_error = Some(format!("Failed to get consumer info: {}", e));
                     }
                 },
             }
+        } else {
+            last_error = Some(format!(
+                "Disconnected: {:?}",
+                self.client.connection_state()
+            ));
         }
 
         EndpointStatus {

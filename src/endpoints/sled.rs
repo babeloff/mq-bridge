@@ -272,15 +272,10 @@ impl MessageConsumer for SledConsumer {
                     Box::pin(async move {
                         if delete {
                             match disposition {
-                                MessageDisposition::Ack => { /* delete */ }
-                                MessageDisposition::Reply(_) => {
-                                    tracing::warn!("Sled consumer received a Reply/StreamReply, but replying is not supported. Dropping reply.");
-                                }
-                                _ => {}
-                            }
-
-                            match disposition {
                                 MessageDisposition::Ack | MessageDisposition::Reply(_) => {
+                                    if matches!(disposition, MessageDisposition::Reply(_)) {
+                                        tracing::warn!("Sled consumer received a Reply/StreamReply, but replying is not supported. Dropping reply.");
+                                    }
                                     inflight_tree.remove(key_clone).map_err(|e| anyhow!(e))?;
                                 }
                                 MessageDisposition::Nack => {
@@ -353,6 +348,7 @@ impl MessageConsumer for SledConsumer {
     }
 
     async fn status(&self) -> EndpointStatus {
+        // Note: Tree::len() is O(n) in sled and can be expensive for large trees.
         let pending = self.tree.len();
         EndpointStatus {
             healthy: true,

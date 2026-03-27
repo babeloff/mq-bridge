@@ -373,6 +373,13 @@ impl ZeroMqConsumer {
 #[async_trait]
 impl MessageConsumer for ZeroMqConsumer {
     async fn receive_batch(&mut self, max_messages: usize) -> Result<ReceivedBatch, ConsumerError> {
+        if max_messages == 0 {
+            return Ok(ReceivedBatch {
+                messages: Vec::new(),
+                commit: Box::new(|_| Box::pin(async { Ok(()) })),
+            });
+        }
+
         if self.buffer.is_empty() {
             self.fill_buffer().await?;
         }

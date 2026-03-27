@@ -303,13 +303,30 @@ impl MessagePublisher for IbmMqPublisher {
 
     async fn status(&self) -> EndpointStatus {
         let (reply_tx, reply_rx) = oneshot::channel();
-        if self.tx.send(PublisherJob::Status(reply_tx)).await.is_err() {
-            return EndpointStatus {
-                healthy: false,
-                last_error: Some("Publisher thread disconnected".to_string()),
-                ..Default::default()
-            };
+        let send_result = tokio::time::timeout(
+            Duration::from_secs(1),
+            self.tx.send(PublisherJob::Status(reply_tx)),
+        )
+        .await;
+
+        match send_result {
+            Ok(Ok(_)) => {}
+            Ok(Err(_)) => {
+                return EndpointStatus {
+                    healthy: false,
+                    last_error: Some("Publisher thread disconnected".to_string()),
+                    ..Default::default()
+                };
+            }
+            Err(_) => {
+                return EndpointStatus {
+                    healthy: false,
+                    last_error: Some("Status send timed out".to_string()),
+                    ..Default::default()
+                };
+            }
         }
+
         match tokio::time::timeout(Duration::from_secs(1), reply_rx).await {
             Ok(Ok(status)) => status,
             Ok(Err(_)) => EndpointStatus {
@@ -705,18 +722,30 @@ impl MessageConsumer for IbmMqConsumer {
 
     async fn status(&self) -> EndpointStatus {
         let (reply_tx, reply_rx) = oneshot::channel();
-        if self
-            .tx
-            .send(ConsumerJob::Status { reply_tx })
-            .await
-            .is_err()
-        {
-            return EndpointStatus {
-                healthy: false,
-                last_error: Some("Consumer thread disconnected".to_string()),
-                ..Default::default()
-            };
+        let send_result = tokio::time::timeout(
+            Duration::from_secs(1),
+            self.tx.send(ConsumerJob::Status { reply_tx }),
+        )
+        .await;
+
+        match send_result {
+            Ok(Ok(_)) => {}
+            Ok(Err(_)) => {
+                return EndpointStatus {
+                    healthy: false,
+                    last_error: Some("Consumer thread disconnected".to_string()),
+                    ..Default::default()
+                };
+            }
+            Err(_) => {
+                return EndpointStatus {
+                    healthy: false,
+                    last_error: Some("Status send timed out".to_string()),
+                    ..Default::default()
+                };
+            }
         }
+
         match tokio::time::timeout(Duration::from_secs(1), reply_rx).await {
             Ok(Ok(status)) => status,
             Ok(Err(_)) => EndpointStatus {
