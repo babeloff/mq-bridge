@@ -614,7 +614,7 @@ impl MessageConsumer for AmqpConsumer {
         trace!(count = messages_len, queue = %self.queue, message_ids = ?LazyMessageIds(&messages), "Received batch of AMQP messages");
         let channel = self.channel.clone();
         let is_poisoned = self.is_poisoned.clone();
-        let commit: BatchCommitFunc = Box::new(move |mut dispositions: Vec<MessageDisposition>| {
+        let commit: BatchCommitFunc = Box::new(move |dispositions: Vec<MessageDisposition>| {
             Box::pin(async move {
                 if dispositions.len() != reply_infos.len() {
                     tracing::error!(
