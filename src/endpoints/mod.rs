@@ -437,8 +437,9 @@ fn check_consumer_recursive(
                 }
             }
             Err(anyhow!(
-                "[route:{}] Unsupported consumer endpoint type",
-                route_name
+                "[route:{}] Unsupported consumer endpoint type '{:?}'",
+                route_name,
+                endpoint.endpoint_type
             ))
         }
     }
@@ -597,8 +598,9 @@ async fn create_base_consumer(
         )),
         #[allow(unreachable_patterns)]
         _ => Err(anyhow!(
-            "[route:{}] Unsupported consumer endpoint type",
-            route_name
+            "[route:{}] Unsupported consumer endpoint type '{:?}'",
+            route_name,
+            endpoint.endpoint_type
         )),
     }
 }
@@ -916,8 +918,9 @@ fn check_publisher_recursive(
                 }
             }
             Err(anyhow!(
-                "[route:{}] Unsupported publisher endpoint type",
-                route_name
+                "[route:{}] Unsupported publisher endpoint type '{:?}'",
+                route_name,
+                endpoint.endpoint_type
             ))
         }
     }
@@ -1088,6 +1091,10 @@ async fn create_base_publisher(
         EndpointType::Sled(cfg) => {
             Ok(Box::new(sled::SledPublisher::new(cfg)?) as Box<dyn MessagePublisher>)
         }
+        #[cfg(feature = "ibm-mq")]
+        EndpointType::IbmMq(cfg) => {
+            Ok(Box::new(ibm_mq::IbmMqPublisher::new(cfg).await?) as Box<dyn MessagePublisher>)
+        }
         EndpointType::Null => Ok(Box::new(null::NullPublisher) as Box<dyn MessagePublisher>),
         EndpointType::Fanout(endpoints) => {
             let mut publishers = Vec::with_capacity(endpoints.len());
@@ -1145,8 +1152,9 @@ async fn create_base_publisher(
         }
         #[allow(unreachable_patterns)]
         _ => Err(anyhow!(
-            "[route:{}] Unsupported publisher endpoint type",
-            route_name
+            "[route:{}] Unsupported publisher endpoint type '{:?}'",
+            route_name,
+            endpoint_type
         )),
     }?;
     Ok(publisher)

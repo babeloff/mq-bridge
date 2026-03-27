@@ -68,6 +68,16 @@ pub fn get_publisher(name: &str) -> Option<Publisher> {
     Publisher::get(name)
 }
 
+pub fn list_publishers() -> Vec<String> {
+    let registry = PUBLISHER_REGISTRY.get_or_init(|| RwLock::new(HashMap::new()));
+    registry
+        .read()
+        .expect("Publisher registry lock poisoned")
+        .keys()
+        .cloned()
+        .collect()
+}
+
 pub fn register_publisher(name: &str, publisher: Publisher) -> Option<Publisher> {
     publisher.register(name)
 }

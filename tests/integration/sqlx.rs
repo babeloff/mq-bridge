@@ -112,3 +112,69 @@ pub async fn test_sqlx_performance_direct() {
     })
     .await;
 }
+
+pub async fn test_sqlx_status() {
+    use mq_bridge::traits::{MessageConsumer, MessagePublisher};
+    use tokio::time::{sleep, Duration};
+
+    setup_logging();
+    run_test_with_docker_controller(DOCKER_COMPOSE_FILE, |controller| async move {
+        setup_db().await;
+        let config = mq_bridge::models::SqlxConfig {
+            url: DATABASE_URL.to_string(),
+            table: TABLE_NAME.to_string(),
+            ..Default::default()
+        };
+
+        let publisher = SqlxPublisher::new(&config).await.unwrap();
+        let consumer = SqlxConsumer::new(&config).await.unwrap();
+
+        println!("[SQLx] Checking initial status...");
+        sleep(Duration::from_secs(2)).await;
+        let pub_status = publisher.status().await;
+        let con_status = consumer.status().await;
+        assert!(
+            pub_status.healthy,
+            "Publisher should be healthy initially. Status: {:?}",
+            pub_status
+        );
+        assert!(
+            con_status.healthy,
+            "Consumer should be healthy initially. Status: {:?}",
+            con_status
+        );
+        println!("[SQLx] Initial status check OK.");
+
+        controller.stop_service("postgres");
+        println!("[SQLx] Service 'postgres' stopped. Waiting for disconnect detection...");
+
+        let start = std::time::Instant::now();
+        loop {
+            if !publisher.status().await.healthy && !consumer.status().await.healthy {
+                println!("[SQLx] Disconnect detected.");
+                break;
+            }
+            if start.elapsed() > Duration::from_secs(20) {
+                panic!("[SQLx] Timeout waiting for disconnect.");
+            }
+            sleep(Duration::from_secs(1)).await;
+        }
+
+        controller.start_service("postgres");
+        println!("[SQLx] Service 'postgres' started. Waiting for reconnect...");
+
+        let start = std::time::Instant::now();
+        loop {
+            if publisher.status().await.healthy && consumer.status().await.healthy {
+                println!("[SQLx] Reconnect detected.");
+                break;
+            }
+            if start.elapsed() > Duration::from_secs(20) {
+                panic!("[SQLx] Timeout waiting for reconnect.");
+            }
+            sleep(Duration::from_secs(1)).await;
+        }
+        println!("[SQLx] Status test successful.");
+    })
+    .await;
+}

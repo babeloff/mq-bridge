@@ -16,9 +16,11 @@ use tracing::warn;
 ///
 /// Implements `From<Option<CanonicalMessage>>` for compatibility:
 /// `None` maps to `Ack`, `Some(msg)` maps to `Reply(msg)`.
-#[derive(Debug, Clone)]
+#[derive(Default, Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
 pub enum MessageDisposition {
     /// Acknowledge processing (success).
+    #[default]
     Ack,
     /// Acknowledge processing and send a reply.
     Reply(CanonicalMessage),
@@ -105,6 +107,32 @@ pub type BatchCommitFunc = Box<
     dyn FnOnce(Vec<MessageDisposition>) -> BoxFuture<'static, anyhow::Result<()>> + Send + 'static,
 >;
 
+/// Status information about an endpoint (Consumer or Publisher).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct EndpointStatus {
+    pub healthy: bool,
+    pub target: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pending: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capacity: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    pub details: serde_json::Value,
+}
+impl Default for EndpointStatus {
+    fn default() -> Self {
+        Self {
+            healthy: true,
+            target: String::new(),
+            pending: None,
+            capacity: None,
+            error: None,
+            details: serde_json::Value::Null,
+        }
+    }
+}
+
 #[async_trait]
 pub trait MessageConsumer: Send + Sync {
     /// Receives a batch of messages.
@@ -156,6 +184,13 @@ pub trait MessageConsumer: Send + Sync {
             commit: batch_commit,
         })
     }
+
+    async fn status(&self) -> EndpointStatus {
+        EndpointStatus {
+            healthy: true,
+            ..Default::default()
+        }
+    }
     fn as_any(&self) -> &dyn Any;
 }
 
@@ -192,6 +227,13 @@ pub trait MessagePublisher: Send + Sync + 'static {
     async fn flush(&self) -> anyhow::Result<()> {
         Ok(())
     }
+
+    async fn status(&self) -> EndpointStatus {
+        EndpointStatus {
+            healthy: true,
+            ..Default::default()
+        }
+    }
     fn as_any(&self) -> &dyn Any;
 }
 
@@ -210,6 +252,10 @@ impl<T: MessagePublisher + ?Sized> MessagePublisher for Arc<T> {
 
     async fn flush(&self) -> anyhow::Result<()> {
         (**self).flush().await
+    }
+
+    async fn status(&self) -> EndpointStatus {
+        (**self).status().await
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -232,6 +278,10 @@ impl<T: MessagePublisher + ?Sized> MessagePublisher for Box<T> {
 
     async fn flush(&self) -> anyhow::Result<()> {
         (**self).flush().await
+    }
+
+    async fn status(&self) -> EndpointStatus {
+        (**self).status().await
     }
 
     fn as_any(&self) -> &dyn Any {

@@ -1,12 +1,14 @@
 use crate::canonical_message::tracing_support::LazyMessageIds;
 use crate::models::NatsConfig;
 use crate::traits::{
-    BatchCommitFunc, BoxFuture, ConsumerError, MessageConsumer, MessageDisposition,
+    BatchCommitFunc, BoxFuture, ConsumerError, EndpointStatus, MessageConsumer, MessageDisposition,
     MessagePublisher, PublisherError, ReceivedBatch, Sent, SentBatch,
 };
 use crate::CanonicalMessage;
 use crate::APP_NAME;
 use anyhow::{anyhow, Context};
+use async_nats::connection::State;
+use async_nats::jetstream::consumer::pull;
 use async_nats::{header::HeaderMap, jetstream, jetstream::stream, ConnectOptions};
 use async_trait::async_trait;
 use futures::{FutureExt, StreamExt, TryStreamExt};
@@ -202,11 +204,29 @@ impl MessagePublisher for NatsPublisher {
             .await
             .map_err(|e| anyhow!("NATS flush failed: {}", e))
     }
+
+    async fn status(&self) -> EndpointStatus {
+        EndpointStatus {
+            healthy: self.core_client.connection_state() == State::Connected,
+            target: self.subject.clone(),
+            pending: None,
+            capacity: None,
+            error: if self.core_client.connection_state() == State::Connected {
+                None
+            } else {
+                Some("Disconnected".to_string())
+            },
+            ..Default::default()
+        }
+    }
 }
 
 enum NatsCore {
     Ephemeral(async_nats::Subscriber),
-    JetStream(Box<jetstream::consumer::pull::Stream>),
+    JetStream {
+        consumer: Box<jetstream::consumer::Consumer<pull::Config>>,
+        stream: Box<jetstream::consumer::pull::Stream>,
+    },
 }
 
 pub struct NatsConsumer {
@@ -262,6 +282,42 @@ impl MessageConsumer for NatsConsumer {
         self.core
             .receive_batch(max_messages, &self.subject, &self.client)
             .await
+    }
+
+    async fn status(&self) -> EndpointStatus {
+        let mut healthy = self.client.connection_state() == State::Connected;
+        let mut pending = None;
+        let mut error = None;
+
+        if healthy {
+            match &self.core {
+                NatsCore::Ephemeral(_sub) => {
+                    pending = None;
+                }
+                NatsCore::JetStream { consumer, .. } => match consumer.get_info().await {
+                    Ok(info) => {
+                        pending = Some(info.num_pending.try_into().unwrap_or(usize::MAX));
+                    }
+                    Err(e) => {
+                        healthy = false;
+                        error = Some(format!("Failed to get consumer info: {}", e));
+                    }
+                },
+            }
+        } else {
+            error = Some(format!(
+                "Disconnected: {:?}",
+                self.client.connection_state()
+            ));
+        }
+
+        EndpointStatus {
+            healthy,
+            target: self.subject.clone(),
+            pending,
+            error,
+            ..Default::default()
+        }
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -426,7 +482,13 @@ impl NatsCore {
 
             let stream = consumer.messages().await?;
             info!(stream = %stream_name, subject = %subject, "NATS JetStream subscribed");
-            Ok((NatsCore::JetStream(Box::new(stream)), client_clone))
+            Ok((
+                NatsCore::JetStream {
+                    consumer: Box::new(consumer),
+                    stream: Box::new(stream),
+                },
+                client_clone,
+            ))
         } else {
             info!(subject = %subject, "NATS endpoint is in Core mode.");
             let sub = if let Some(qg) = queue_group {
@@ -454,7 +516,7 @@ impl NatsCore {
         }
 
         match self {
-            NatsCore::JetStream(stream) => {
+            NatsCore::JetStream { stream, .. } => {
                 let mut canonical_messages = Vec::with_capacity(max_messages);
                 let mut jetstream_messages = Vec::with_capacity(max_messages);
 
@@ -664,21 +726,28 @@ async fn handle_jetstream_replies(
 ) {
     for (msg, disposition) in messages.iter().zip(dispositions.iter()) {
         // Only send a reply if the NATS message has a reply subject and the disposition is a Reply.
-        if let (Some(reply), MessageDisposition::Reply(resp)) = (msg.reply.as_ref(), disposition) {
-            let publish_result = tokio::time::timeout(
-                std::time::Duration::from_secs(60),
-                client.publish(reply.clone(), resp.payload.clone()),
-            )
-            .await;
+        if let Some(reply) = msg.reply.as_ref() {
+            let payload = match disposition {
+                MessageDisposition::Reply(resp) => Some(resp.payload.clone()),
+                _ => None,
+            };
 
-            match publish_result {
-                Err(_) => {
-                    tracing::error!(subject = %reply, "Failed to publish NATS reply (timeout)");
+            if let Some(p) = payload {
+                let publish_result = tokio::time::timeout(
+                    std::time::Duration::from_secs(60),
+                    client.publish(reply.clone(), p),
+                )
+                .await;
+
+                match publish_result {
+                    Err(_) => {
+                        tracing::error!(subject = %reply, "Failed to publish NATS reply (timeout)");
+                    }
+                    Ok(Err(e)) => {
+                        tracing::error!(subject = %reply, error = %e, "Failed to publish NATS reply");
+                    }
+                    Ok(Ok(_)) => {}
                 }
-                Ok(Err(e)) => {
-                    tracing::error!(subject = %reply, error = %e, "Failed to publish NATS reply");
-                }
-                Ok(Ok(_)) => {}
             }
         }
     }

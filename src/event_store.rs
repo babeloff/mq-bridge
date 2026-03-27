@@ -4,7 +4,8 @@
 
 use crate::canonical_message::tracing_support::LazyMessageIds;
 use crate::traits::{
-    BatchCommitFunc, ConsumerError, MessageConsumer, MessageDisposition, ReceivedBatch,
+    BatchCommitFunc, ConsumerError, EndpointStatus, MessageConsumer, MessageDisposition,
+    ReceivedBatch,
 };
 use crate::CanonicalMessage;
 use async_trait::async_trait;
@@ -541,6 +542,25 @@ impl MessageConsumer for EventStoreConsumer {
             messages: events,
             commit,
         })
+    }
+
+    async fn status(&self) -> EndpointStatus {
+        let last = self.last_offset.load(Ordering::SeqCst);
+        let next = self.store.next_offset.load(Ordering::SeqCst);
+        // Offsets are 1-based. next_offset is the ID of the *next* event to be written.
+        let pending = next.saturating_sub(last).saturating_sub(1) as usize;
+
+        EndpointStatus {
+            healthy: true,
+            target: self.subscriber_id.clone(),
+            pending: Some(pending),
+            details: serde_json::json!({
+                "mode": "event_store",
+                "current_offset": last,
+                "head_offset": next.saturating_sub(1)
+            }),
+            ..Default::default()
+        }
     }
 
     fn as_any(&self) -> &dyn Any {

@@ -4,6 +4,7 @@
 //  git clone https://github.com/marcomq/mq-bridge
 
 use crate::endpoints::{create_consumer_from_route, create_publisher_from_route};
+use crate::errors::ProcessingError;
 pub use crate::models::Route;
 use crate::models::{Endpoint, EndpointType, RouteOptions};
 use crate::traits::{
@@ -297,7 +298,15 @@ impl Route {
                                 break;
                             }
                             Ok(Err(e)) => {
-                                error!("Route '{}' failed: {}. Reconnecting in 5 seconds...", name, e);
+                                match e.downcast_ref::<ProcessingError>() {
+                                    Some(ProcessingError::Retryable(_)) => {
+                                        warn!("Route '{}' failed with a retryable error: {}. Reconnecting in 5 seconds...", name, e);
+                                        break;
+                                    }
+                                    _ => {
+                                        error!("Route '{}' failed: {}. Reconnecting in 5 seconds...", name, e);
+                                    }
+                                }
                                 tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
                             }
                             Err(e) => {
@@ -454,9 +463,10 @@ impl Route {
                             });
                         }
                         Err(e) => {
-                            // Nack the commit to fill the sequencer slot before breaking.
-                            let _ = commit(vec![MessageDisposition::Nack; batch_len]).await;
-                            break Err(e.into()); // Propagate error to trigger reconnect
+                            warn!("Publisher error, sending {} Nacks to commit", batch_len);
+                            let nack_result = commit(vec![MessageDisposition::Nack; batch_len]).await;
+                            debug!("Nack commit result: {:?}", nack_result);
+                            break Err(e.into());
                         }
                     }
                 }
@@ -601,7 +611,8 @@ impl Route {
                         Err(e) => {
                             error!("Worker failed to send message batch: {}", e);
                             // Nack the commit to fill the sequencer slot and prevent a deadlock.
-                            let _ = commit(vec![MessageDisposition::Nack; batch_len]).await;
+                            let nack_result = commit(vec![MessageDisposition::Nack; batch_len]).await;
+                            debug!("Nack commit result: {:?}", nack_result);
                             // Send the error back to the main task to tear down the route.
                             if err_tx.try_send(e.into()).is_err() {
                                 warn!("Could not send error to main task, it might be down or busy.");

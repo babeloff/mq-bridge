@@ -117,3 +117,83 @@ pub async fn test_kafka_performance_direct() {
     })
     .await;
 }
+
+pub async fn test_kafka_status() {
+    use mq_bridge::traits::{MessageConsumer, MessagePublisher};
+    use tokio::time::{sleep, Duration};
+
+    setup_logging();
+    run_test_with_docker_controller(
+        "tests/integration/docker-compose/kafka.yml",
+        |controller| async move {
+            let topic = "status_test_kafka";
+            let config = mq_bridge::models::KafkaConfig {
+                url: "localhost:9092".to_string(),
+                group_id: Some("status_test_group".to_string()),
+                topic: Some(topic.to_string()),
+                ..Default::default()
+            };
+
+            let publisher = KafkaPublisher::new(&config).await.unwrap();
+            let consumer = KafkaConsumer::new(&config).await.unwrap();
+
+            println!("[Kafka] Checking initial status...");
+            sleep(Duration::from_secs(5)).await; // Give time to connect
+            let pub_status = publisher.status().await;
+            let con_status = consumer.status().await;
+            assert!(
+                pub_status.healthy,
+                "Publisher should be healthy initially. Status: {:?}",
+                pub_status
+            );
+            assert!(
+                con_status.healthy,
+                "Consumer should be healthy initially. Status: {:?}",
+                con_status
+            );
+            println!("[Kafka] Initial status check OK.");
+
+            controller.stop_service("kafka");
+            println!("[Kafka] Service 'kafka' stopped. Waiting for disconnect detection...");
+
+            let start = std::time::Instant::now();
+            loop {
+                let pub_status = publisher.status().await;
+                let con_status = consumer.status().await;
+                if !pub_status.healthy && !con_status.healthy {
+                    println!("[Kafka] Disconnect detected.");
+                    break;
+                }
+                if start.elapsed() > Duration::from_secs(30) {
+                    panic!(
+                        "[Kafka] Timeout waiting for disconnect. Pub: {:?}, Con: {:?}",
+                        pub_status, con_status
+                    );
+                }
+                sleep(Duration::from_secs(1)).await;
+            }
+
+            controller.start_service("kafka");
+            println!("[Kafka] Service 'kafka' started. Waiting for reconnect...");
+
+            let start = std::time::Instant::now();
+            loop {
+                let pub_status = publisher.status().await;
+                let con_status = consumer.status().await;
+                if pub_status.healthy && con_status.healthy {
+                    println!("[Kafka] Reconnect detected.");
+                    break;
+                }
+                if start.elapsed() > Duration::from_secs(30) {
+                    panic!(
+                        "[Kafka] Timeout waiting for reconnect. Pub: {:?}, Con: {:?}",
+                        pub_status, con_status
+                    );
+                }
+                sleep(Duration::from_secs(1)).await;
+            }
+            println!("[Kafka] Status test successful.");
+        },
+    )
+    .await;
+}

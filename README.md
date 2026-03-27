@@ -44,6 +44,12 @@ It may still be possible that there are issues with
 - nats, if jetstream support is disabled
 - TLS integration, as this also hasn't been tested a lot and is usually non-trivial to set up
 
+
+Due to the large code base, it may still be possible that some endpoints may show
+issues in production; therefore, they should be tested locally first. They all worked locally
+for me and didn't show data loss during simple in-flight broker restarts.
+Kafka, MongoDB, IBM-MQ, Files, and Memory are considered production-ready.
+
 ### When to use mq-bridge
 *   **Hybrid Messaging**: Connect systems speaking different protocols (e.g., MQTT to Kafka) without writing custom adapters.
 *   **Infrastructure Abstraction**: Write business logic that consumes `CanonicalMessage`s, allowing you to swap the underlying transport (e.g., switching from RabbitMQ to NATS) via configuration.
@@ -64,34 +70,40 @@ It may still be possible that there are issues with
 *   **Middleware**: Components that intercept and process messages (e.g., for error handling).
 *   **Handler**: A programmatic component for business logic, such as transforming/consuming messages (`CommandHandler`) or subscribe them (`EventHandler`).
 
-## Endpoint Behavior
+## Backend Features & Configuration
 
-`mq-bridge` endpoints generally default to a **Consumer** pattern (Queue), where messages are persisted (if supported by the backend) and distributed among workers.
+`mq-bridge` endpoints generally default to a **Consumer** pattern (Queue), where messages are persisted and distributed among workers. To achieve **Subscriber** (Pub/Sub) behavior, specific configuration is required.
 
-To achieve **Subscriber** (Pub/Sub) behavior—where messages are broadcast to all active instances—you must configure the specific backend accordingly. There is no global "subscriber mode" toggle; it is determined by the configuration of the endpoint.
+The table below summarizes the capabilities and configuration for each backend:
 
-| Backend | Default Behavior (Queue) | Configuration for Subscriber (Pub/Sub) | Response Support |
+| Backend | Subscriber Config (Pub/Sub) | Request-Reply | Nack Support |
 | :--- | :--- | :--- | :--- |
-| **Kafka** | Persistent (Consumer Group) | Omit `group_id` (generates unique ID) | No |
-| **NATS** | Persistent (JetStream Durable) | Set `subscriber_mode: true` | Yes |
-| **AMQP** | Persistent (Durable Queue) | Set `subscribe_mode: true` | No |
-| **MQTT** | Persistent Session | Set `clean_session: true` | No |
-| **IBM MQ** | Persistent Queue | Set `topic` instead of `queue` | No |
-| **MongoDB** | Persistent (Collection) | Set `change_stream: true` | Yes |
-| **SQLx** | Persistent (Table) | Not supported | No |
-| **AWS** | Persistent (SQS) | Not supported directly (Use SNS->SQS) | No |
-| **Memory** | Ephemeral (Channel) | Set `subscribe_mode: true` | Yes |
-| **File** | Queue (Reads from start) | Set `mode: subscribe` (Tails file) or `mode: group_subscribe` (Persistent tail) | No |
-| **HTTP** | Ephemeral (Request) | N/A | Yes (Implicit) |
-| **ZeroMQ** | Ephemeral (PULL) | Set `socket_type: "sub"` | No |
+| **AMQP** | Set `subscribe_mode: true` | Emulated (Property) | **Yes** (Basic.nack) |
+| **AWS** | N/A (Use SNS) | No | **Yes** (Visibility Timeout) |
+| **File** | Set `mode: subscribe` | No | Simulated (In-Memory) |
+| **gRPC** | N/A | No | No |
+| **HTTP** | N/A | **Native** (Implicit) | **Yes** (HTTP 500) |
+| **IBM MQ** | Set `topic` | No | **Yes** (Tx Rollback) |
+| **Kafka** | Omit `group_id` | Emulated (Header) | Eventual (Skip Offset) |
+| **Memory** | Set `subscribe_mode: true` | Emulated (Metadata) | **Yes** (Re-queue), by default **disabled** |
+| **MongoDB** | Set `change_stream: true` | Emulated (Metadata) | **Yes** (Unlock) |
+| **MQTT** | Set `clean_session: true` | Emulated (Property) | Eventual (Skip Ack) |
+| **NATS** | Set `subscriber_mode: true` | **Native** (Inbox) | **Yes** (JetStream Nak) |
+| **Sled** | Set `delete_after_read: false` | No | **Yes** (Tx Rollback) |
+| **SQLx** | Not supported | No | Eventual (Skip Delete) |
+| **ZeroMQ** | Set `socket_type: "sub"` | **Native** (REQ/REP) | No |
 
-### Response Mode
-The `response` output endpoint allows sending a reply back to the requester. This is useful for synchronous request-reply patterns (e.g., HTTP-to-NATS-to-HTTP).
+### Feature Details
+*   **Request-Reply**:
+    *   **Native**: Uses protocol-level correlation (e.g., HTTP connection, NATS reply subject).
+    *   **Emulated**: Publishes a new message to a reply destination (specified by the `reply_to` metadata field) carrying a `correlation_id` metadata field.
+*   **Nack Support**: If "Yes", the backend supports explicit negative acknowledgement triggering redelivery. "Eventual" means redelivery depends on timeout or connection drop. "Simulated" is handled in-memory by the bridge.
 
-*   **Availability**: Only available if the **Input** endpoint supports request-reply (HTTP, NATS, Memory, MongoDB).
-*   **Configuration**: Use `response: {}` as the output endpoint.
+### Response Endpoint
+The `response` output endpoint allows sending a reply back to the requester. This is useful for synchronous request-reply patterns (e.g., HTTP-to-NATS-to-HTTP). Use `response: {}` as the output endpoint configuration.
+
 *   **Caveats**:
-    *   If the input does not support responses (e.g., File, Kafka), the message sent to `response` will be dropped.
+    *   If the input does not support responses (e.g., File, SQLx), the message sent to `response` will be dropped.
     *   Ensure timeouts are configured correctly on the requester side, as the bridge processing time adds latency.
     *   Middleware that drops metadata (like `correlation_id`) may break the response chain.
 
@@ -339,18 +351,30 @@ The times are not stable yet, it is therefore recommended to perform the integra
 
 ## AI Disclaimer
 
-This library has been widely written with AI assistance. I used Gemini for planning and writing,
-CodeRabbit for reviews and Copilot/Claude for bugfixing and other small things.
+This library has been widely written with AI assistance. 
+
+Some of the code - the core for example, was originally written by myself, 
+but most other was generated by AI. I mostly used Gemini for 
+planning and writing, CodeRabbit for reviews and Claude for bugfixing and 
+more complicated tasks that Gemini couldn't solve properly.
 While some of the AI output was great, some other output wasn't.
 I am aware that in year 2026, AI is still not generating perfect code and sometimes
-even breaks simple stuff. I reviewed all the
-output code and re-specified it or changed the code manually whan insuficcient.
+breaks simple stuff or forgets important lines during refactorings that then cause
+severe issues. 
+I reviewed all the output code, cleaned it up manually, 
+re-specified and refactored it when insuficcient.
+**I do trust the current code as much as if it would be completely written by myself.**
+
 I didn't change the AI code appearance, so you will sometimes still see code that just
 looks as it is plain from AI and also most of the readme here was actually written
 by AI. I don't think it is bad practice, to keep the original code and text appearance. 
-I'm not an english native speaker, so the AI output for text is mostly just
-way better what I could write. For AI code, the readability is usually
-sufficient, even if it is sometimes much more verbose what I would write in code.
+I'm not an english native speaker, so the AI output for english text is just
+way better than my text. For AI code, the readability is usually
+good, even if it is more verbose than what I would write.
+However, especially for the different endpoints, there is already a lot of existing
+code and the AI could also just assist a lot there. Thats mostly the reason,
+why there are so many available endpoints in this library, they just could be added
+very easily and showed a sufficient code quality.
 
 ## License
 `mq-bridge` is licensed under the MIT License.

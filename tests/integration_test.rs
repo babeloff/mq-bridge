@@ -152,3 +152,74 @@ async fn test_all_chaos() {
         }
     }
 }
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires docker compose, takes long time to run"]
+async fn test_all_status() {
+    println!("--- Running All Status Tests ---");
+    println!("Tests are run sequentially.");
+
+    #[cfg(feature = "kafka")]
+    {
+        if should_run("kafka") {
+            println!("\n\n>>> Starting Kafka Status Test...");
+            integration::kafka::test_kafka_status().await;
+        }
+    }
+
+    #[cfg(feature = "nats")]
+    {
+        if should_run("nats") {
+            println!("\n\n>>> Starting NATS Status Test...");
+            integration::nats::test_nats_status().await;
+        }
+    }
+
+    #[cfg(feature = "amqp")]
+    {
+        if should_run("amqp") {
+            println!("\n\n>>> Starting AMQP Status Test...");
+            integration::amqp::test_amqp_status().await;
+        }
+    }
+
+    #[cfg(feature = "mqtt")]
+    {
+        if should_run("mqtt") {
+            println!("\n\n>>> Starting MQTT Status Test...");
+            integration::mqtt::test_mqtt_status().await;
+        }
+    }
+
+    #[cfg(feature = "mongodb")]
+    {
+        if should_run("mongodb") {
+            println!("\n\n>>> Starting MongoDB Status Test...");
+            integration::mongodb::test_mongodb_status().await;
+        }
+    }
+
+    #[cfg(feature = "ibm-mq")]
+    {
+        if should_run("ibm-mq") {
+            println!("\n\n>>> Starting IBM MQ Status Test...");
+            integration::ibm_mq::test_ibm_mq_status().await;
+        }
+    }
+
+    #[cfg(feature = "sqlx")]
+    {
+        if should_run("sqlx") {
+            println!("\n\n>>> Starting SQLx Status Test...");
+            integration::sqlx::test_sqlx_status().await;
+        }
+    }
+
+    #[cfg(feature = "aws")]
+    {
+        if should_run("aws") {
+            println!("\n\n>>> Starting AWS Status Test...");
+            integration::aws::test_aws_status().await;
+        }
+    }
+}

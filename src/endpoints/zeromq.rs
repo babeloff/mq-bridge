@@ -1,8 +1,8 @@
 use crate::canonical_message::tracing_support::LazyMessageIds;
 use crate::models::{ZeroMqConfig, ZeroMqSocketType};
 use crate::traits::{
-    BoxFuture, ConsumerError, MessageConsumer, MessageDisposition, MessagePublisher,
-    PublisherError, ReceivedBatch, SentBatch,
+    BoxFuture, ConsumerError, EndpointStatus, MessageConsumer, MessageDisposition,
+    MessagePublisher, PublisherError, ReceivedBatch, SentBatch,
 };
 use crate::CanonicalMessage;
 use anyhow::anyhow;
@@ -154,6 +154,20 @@ impl MessagePublisher for ZeroMqPublisher {
                 })?
                 .map_err(|e| PublisherError::Retryable(anyhow!(e)))?;
             Ok(SentBatch::Ack)
+        }
+    }
+
+    async fn status(&self) -> EndpointStatus {
+        EndpointStatus {
+            healthy: !self.tx.is_closed(),
+            pending: Some(self.tx.len()),
+            capacity: self.tx.capacity(),
+            error: if self.tx.is_closed() {
+                Some("Publisher task terminated".to_string())
+            } else {
+                None
+            },
+            ..Default::default()
         }
     }
 
@@ -356,10 +370,16 @@ impl ZeroMqConsumer {
         Ok(())
     }
 }
-
 #[async_trait]
 impl MessageConsumer for ZeroMqConsumer {
     async fn receive_batch(&mut self, max_messages: usize) -> Result<ReceivedBatch, ConsumerError> {
+        if max_messages == 0 {
+            return Ok(ReceivedBatch {
+                messages: Vec::new(),
+                commit: Box::new(|_| Box::pin(async { Ok(()) })),
+            });
+        }
+
         if self.buffer.is_empty() {
             self.fill_buffer().await?;
         }
@@ -367,10 +387,13 @@ impl MessageConsumer for ZeroMqConsumer {
         let mut messages = Vec::with_capacity(max_messages);
         let mut contexts = Vec::with_capacity(max_messages);
 
-        while messages.len() < max_messages && !self.buffer.is_empty() {
-            let buffered = self.buffer.pop_front().unwrap();
-            messages.push(buffered.msg);
-            contexts.push(buffered.reply_context);
+        while messages.len() < max_messages {
+            if let Some(buffered) = self.buffer.pop_front() {
+                messages.push(buffered.msg);
+                contexts.push(buffered.reply_context);
+            } else {
+                break;
+            }
         }
 
         trace!(count = messages.len(), message_ids = ?LazyMessageIds(&messages), "Received batch of ZeroMQ messages");
@@ -378,13 +401,10 @@ impl MessageConsumer for ZeroMqConsumer {
             Box::pin(async move {
                 for (i, ctx_opt) in contexts.into_iter().enumerate() {
                     if let Some(ctx) = ctx_opt {
-                        let resp = dispositions.get(i).and_then(|d| {
-                            if let MessageDisposition::Reply(r) = d {
-                                Some(r.clone())
-                            } else {
-                                None
-                            }
-                        });
+                        let resp = match dispositions.get(i) {
+                            Some(MessageDisposition::Reply(r)) => Some(r.clone()),
+                            _ => None,
+                        };
 
                         let mut state = ctx.state.lock().unwrap();
                         state.responses[ctx.index] = resp;
@@ -405,6 +425,20 @@ impl MessageConsumer for ZeroMqConsumer {
             }) as BoxFuture<'static, anyhow::Result<()>>
         });
         Ok(ReceivedBatch { messages, commit })
+    }
+
+    async fn status(&self) -> EndpointStatus {
+        EndpointStatus {
+            healthy: !self.rx.is_closed(),
+            pending: Some(self.rx.len() + self.buffer.len()),
+            capacity: self.rx.capacity(),
+            error: if self.rx.is_closed() {
+                Some("Consumer task terminated".to_string())
+            } else {
+                None
+            },
+            ..Default::default()
+        }
     }
 
     fn as_any(&self) -> &dyn Any {

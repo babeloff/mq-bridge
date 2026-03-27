@@ -15,8 +15,11 @@ use async_trait::async_trait;
 use base64::{engine::general_purpose, Engine as _};
 use bytes::Bytes;
 use http_body_util::BodyExt;
-use hyper::service::service_fn;
-use hyper::{body::Incoming, Request, Response, StatusCode};
+use http_body_util::StreamBody;
+use hyper::{
+    body::{Frame, Incoming},
+    Request, Response, StatusCode,
+};
 use hyper_rustls::HttpsConnectorBuilder;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::{TokioExecutor, TokioIo};
@@ -35,10 +38,27 @@ use uuid::Uuid;
 
 type HttpSourceMessage = (CanonicalMessage, CommitFunc);
 
+type BoxBody = http_body_util::combinators::BoxBody<Bytes, anyhow::Error>;
+use hyper::service::Service;
+fn full<T: Into<Bytes>>(chunk: T) -> BoxBody {
+    http_body_util::Full::new(chunk.into())
+        .map_err(|_| anyhow::anyhow!("Infallible"))
+        .boxed()
+}
+
+fn streamed<S>(stream: S) -> BoxBody
+where
+    S: futures::Stream<Item = Result<Frame<Bytes>, anyhow::Error>> + Send + Sync + 'static,
+{
+    StreamBody::new(stream).boxed()
+}
+
 /// A source that listens for incoming HTTP requests using hyper.
 pub struct HttpConsumer {
     request_rx: tokio::sync::mpsc::Receiver<HttpSourceMessage>,
     _shutdown_tx: tokio::sync::watch::Sender<()>,
+    buffer_size: usize,
+    url: String,
 }
 
 #[derive(Clone)]
@@ -53,177 +73,256 @@ struct HttpConsumerState {
     custom_headers: HashMap<String, String>,
 }
 
+/// A `hyper::Service` that can be nested into other services (like Axum).
+/// It forwards requests into the `mq-bridge` ecosystem.
+#[derive(Clone)]
+pub struct HttpBridgeService {
+    state: HttpConsumerState,
+}
+
+impl Service<Request<Incoming>> for HttpBridgeService {
+    type Response = Response<BoxBody>;
+    type Error = anyhow::Error;
+    type Future = BoxFuture<'static, Result<Self::Response, Self::Error>>;
+
+    fn call(&self, req: Request<Incoming>) -> Self::Future {
+        // The service_fn in the original code did this clone, so it's correct.
+        let state = self.state.clone();
+        Box::pin(handle_request(state, req))
+    }
+}
+
+/// Creates a linked `HttpConsumer` and `HttpBridgeService`.
+///
+/// The `HttpBridgeService` can be nested into an existing `hyper` or `axum` server.
+/// It will forward requests to the `HttpConsumer`, which can be used as an input
+/// for an `mq-bridge` route.
+pub fn create_http_consumer_and_service(
+    config: &HttpConfig,
+) -> anyhow::Result<(HttpConsumer, HttpBridgeService)> {
+    let (request_rx, state, buffer_size) = setup_http_state_and_channel(config)?;
+    let service = HttpBridgeService { state };
+    let (shutdown_tx, _) = tokio::sync::watch::channel(()); // Dummy for service-only mode
+
+    let consumer = HttpConsumer {
+        request_rx,
+        _shutdown_tx: shutdown_tx,
+        buffer_size,
+        url: config.url.clone(),
+    };
+
+    Ok((consumer, service))
+}
+
 impl HttpConsumer {
     pub async fn new(config: &HttpConfig) -> anyhow::Result<Self> {
-        let _ = rustls::crypto::ring::default_provider().install_default();
-        let buffer_size = config.internal_buffer_size.unwrap_or(100).max(1);
-        let (request_tx, request_rx) = tokio::sync::mpsc::channel::<HttpSourceMessage>(buffer_size);
+        let (request_rx, state, buffer_size) = setup_http_state_and_channel(config)?;
+        let service = HttpBridgeService { state };
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
 
-        let message_id_header = config
-            .message_id_header
-            .clone()
-            .unwrap_or_else(|| "message-id".to_string());
-        let request_timeout =
-            std::time::Duration::from_millis(config.request_timeout_ms.unwrap_or(30000));
-        let compression_threshold_bytes = config.compression_threshold_bytes.unwrap_or(1024);
-        let state = HttpConsumerState {
-            tx: request_tx,
-            message_id_header,
-            request_timeout,
-            fire_and_forget: config.fire_and_forget,
-            basic_auth: config.basic_auth.clone(),
-            compression_enabled: config.compression_enabled,
-            compression_threshold_bytes,
-            custom_headers: config.custom_headers.clone(),
-        };
-
+        // --- Standalone Server Logic ---
         let listen_address = &config.url;
         let addr: SocketAddr = listen_address
             .parse()
             .with_context(|| format!("Invalid listen address: {}", listen_address))?;
 
         let tls_config = config.tls.clone();
-        let workers = config.workers.unwrap_or(0);
-        let workers = if workers == 0 {
+        let workers = if config.workers.unwrap_or(0) == 0 {
             std::thread::available_parallelism()
                 .map(|n| n.get())
                 .unwrap_or(1)
         } else {
-            workers
+            config.workers.unwrap()
         };
 
         if is_tls_server_configured(&tls_config) {
             info!("Starting HTTPS source on {} with {} workers", addr, workers);
-            spawn_tls_server(addr, state.clone(), shutdown_rx, &tls_config).await?;
+            spawn_tls_server(addr, service, shutdown_rx, &tls_config, workers).await?;
         } else {
             info!("Starting HTTP source on {} with {} workers", addr, workers);
-            spawn_http_server(addr, state.clone(), shutdown_rx).await?;
+            spawn_http_server(addr, service, shutdown_rx, workers).await?;
         }
 
         Ok(Self {
             request_rx,
             _shutdown_tx: shutdown_tx,
+            buffer_size,
+            url: config.url.clone(),
         })
     }
 }
 
+/// Helper to set up the shared state and communication channel for the HTTP consumer.
+fn setup_http_state_and_channel(
+    config: &HttpConfig,
+) -> anyhow::Result<(
+    tokio::sync::mpsc::Receiver<HttpSourceMessage>,
+    HttpConsumerState,
+    usize,
+)> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let buffer_size = config.internal_buffer_size.unwrap_or(100).max(1);
+    let (request_tx, request_rx) = tokio::sync::mpsc::channel::<HttpSourceMessage>(buffer_size);
+
+    let message_id_header = config
+        .message_id_header
+        .clone()
+        .unwrap_or_else(|| "message-id".to_string());
+    let request_timeout =
+        std::time::Duration::from_millis(config.request_timeout_ms.unwrap_or(30000));
+    let compression_threshold_bytes = config.compression_threshold_bytes.unwrap_or(1024);
+    let state = HttpConsumerState {
+        tx: request_tx,
+        message_id_header,
+        request_timeout,
+        fire_and_forget: config.fire_and_forget,
+        basic_auth: config.basic_auth.clone(),
+        compression_enabled: config.compression_enabled,
+        compression_threshold_bytes,
+        custom_headers: config.custom_headers.clone(),
+    };
+    Ok((request_rx, state, buffer_size))
+}
+
 async fn spawn_http_server(
     addr: SocketAddr,
-    state: HttpConsumerState,
-    mut shutdown_rx: tokio::sync::watch::Receiver<()>,
+    service: HttpBridgeService,
+    shutdown_rx: tokio::sync::watch::Receiver<()>,
+    workers: usize,
 ) -> anyhow::Result<()> {
-    let listener = TcpListener::bind(&addr)
-        .await
-        .with_context(|| format!("Failed to bind to {}", addr))?;
+    let listener = Arc::new(
+        TcpListener::bind(&addr)
+            .await
+            .with_context(|| format!("Failed to bind to {}", addr))?,
+    );
 
-    let state = Arc::new(state);
+    for i in 0..workers {
+        let listener = listener.clone();
+        let service = service.clone();
+        let mut shutdown_rx = shutdown_rx.clone();
 
-    tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                _ = shutdown_rx.changed() => {
-                    trace!("HTTP server shutting down");
-                    break;
-                }
-                result = listener.accept() => {
-                    match result {
-                        Ok((socket, _)) => {
-                            let state = state.clone();
-                            tokio::spawn(async move {
-                                let io = TokioIo::new(socket);
-                                let state_clone = (*state).clone();
-                                let service = service_fn(move |request: Request<Incoming>| {
-                                    let state = state_clone.clone();
-                                    async move {
-                                        handle_request(state, request).await
+        tokio::spawn(async move {
+            trace!("HTTP worker {} started", i);
+            loop {
+                tokio::select! {
+                    _ = shutdown_rx.changed() => {
+                        trace!("HTTP worker {} shutting down", i);
+                        break;
+                    }
+                    result = listener.accept() => {
+                        match result {
+                            Ok((socket, _)) => {
+                                let service = service.clone();
+                                tokio::spawn(async move {
+                                    let io = TokioIo::new(socket);
+
+                                    let conn = hyper::server::conn::http1::Builder::new()
+                                        .keep_alive(true)
+                                        .serve_connection(io, service.clone())
+                                        .await;
+                                    if let Err(e) = conn {
+                                        trace!("Connection error: {}", e);
                                     }
                                 });
-
-                                let conn = hyper::server::conn::http1::Builder::new()
-                                    .keep_alive(true)
-                                    .serve_connection(io, service)
-                                    .await;
-                                if let Err(e) = conn {
-                                    trace!("Connection error: {}", e);
+                            }
+                            Err(e) => {
+                                match e.kind() {
+                                    std::io::ErrorKind::WouldBlock
+                                    | std::io::ErrorKind::Interrupted
+                                    | std::io::ErrorKind::TimedOut => {
+                                        trace!("Transient accept error in worker {}: {}", i, e);
+                                    }
+                                    _ => {
+                                        debug!("Accept error in worker {}: {}", i, e);
+                                        break;
+                                    }
                                 }
-                            });
-                        }
-                        Err(e) => {
-                            trace!("Accept error: {}", e);
+                            }
                         }
                     }
                 }
             }
-        }
-    });
+        });
+    }
 
     Ok(())
 }
 
 async fn spawn_tls_server(
     addr: SocketAddr,
-    state: HttpConsumerState,
-    mut shutdown_rx: tokio::sync::watch::Receiver<()>,
+    service: HttpBridgeService,
+    shutdown_rx: tokio::sync::watch::Receiver<()>,
     tls_config: &TlsConfig,
+    workers: usize,
 ) -> anyhow::Result<()> {
-    let listener = TcpListener::bind(&addr)
-        .await
-        .with_context(|| format!("Failed to bind to {} (TLS)", addr))?;
+    let listener = Arc::new(
+        TcpListener::bind(&addr)
+            .await
+            .with_context(|| format!("Failed to bind to {} (TLS)", addr))?,
+    );
 
     let rustls_server_config =
         create_rustls_server_config(tls_config).context("Failed to create rustls server config")?;
     let acceptor = TlsAcceptor::from(rustls_server_config);
 
-    let state = Arc::new(state);
+    for i in 0..workers {
+        let listener = listener.clone();
+        let service = service.clone();
+        let acceptor = acceptor.clone();
+        let mut shutdown_rx = shutdown_rx.clone();
 
-    tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                _ = shutdown_rx.changed() => {
-                    trace!("TLS server shutting down");
-                    break;
-                }
-                result = listener.accept() => {
-                    match result {
-                        Ok((socket, _)) => {
-                            let state = state.clone();
-                            let acceptor = acceptor.clone();
-                            tokio::spawn(async move {
-                                match acceptor.accept(socket).await {
-                                    Ok(stream) => {
-                                        let io = TokioIo::new(stream);
-                                        let state_clone = (*state).clone();
-                                        let service = service_fn(move |request: Request<Incoming>| {
-                                            let state = state_clone.clone();
-                                            async move {
-                                                handle_request(state, request).await
+        tokio::spawn(async move {
+            trace!("TLS worker {} started", i);
+            loop {
+                tokio::select! {
+                    _ = shutdown_rx.changed() => {
+                        trace!("TLS worker {} shutting down", i);
+                        break;
+                    }
+                    result = listener.accept() => {
+                        match result {
+                            Ok((socket, _)) => {
+                                let service = service.clone();
+                                let acceptor = acceptor.clone();
+                                tokio::spawn(async move {
+                                    match acceptor.accept(socket).await {
+                                        Ok(stream) => {
+                                            let io = TokioIo::new(stream);
+
+                                            let conn = AutoBuilder::new(TokioExecutor::new())
+                                                .serve_connection_with_upgrades(io, service.clone())
+                                                .await;
+
+                                            if let Err(e) = conn {
+                                                // Benign errors like "connection closed" are expected
+                                                trace!("TLS Connection error: {}", e);
                                             }
-                                        });
-
-                                        let conn = AutoBuilder::new(TokioExecutor::new())
-                                            .serve_connection_with_upgrades(io, service)
-                                            .await;
-
-                                        if let Err(e) = conn {
-                                            // Benign errors like "connection closed" are expected
-                                            trace!("TLS Connection error: {}", e);
+                                        }
+                                        Err(e) => {
+                                            debug!("TLS handshake error: {}", e);
                                         }
                                     }
-                                    Err(e) => {
-                                        debug!("TLS handshake error: {}", e);
+                                });
+                            }
+                            Err(e) => {
+                                match e.kind() {
+                                    std::io::ErrorKind::WouldBlock
+                                    | std::io::ErrorKind::Interrupted
+                                    | std::io::ErrorKind::TimedOut => {
+                                        trace!("Transient accept error in TLS worker {}: {}", i, e);
+                                    }
+                                    _ => {
+                                        debug!("Accept error in TLS worker {}: {}", i, e);
+                                        break;
                                     }
                                 }
-                            });
-                        }
-                        Err(e) => {
-                            trace!("Accept error: {}", e);
+                            }
                         }
                     }
                 }
             }
-        }
-    });
+        });
+    }
 
     Ok(())
 }
@@ -272,6 +371,16 @@ impl MessageConsumer for HttpConsumer {
         })
     }
 
+    async fn status(&self) -> crate::traits::EndpointStatus {
+        crate::traits::EndpointStatus {
+            healthy: true,
+            target: self.url.clone(),
+            pending: Some(self.request_rx.len()),
+            capacity: Some(self.buffer_size),
+            ..Default::default()
+        }
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -281,56 +390,58 @@ impl MessageConsumer for HttpConsumer {
 async fn handle_request(
     state: HttpConsumerState,
     req: Request<Incoming>,
-) -> anyhow::Result<Response<http_body_util::Full<Bytes>>> {
+) -> anyhow::Result<Response<BoxBody>> {
     // Validate Basic Authentication if configured
     if let Some((expected_user, expected_pass)) = &state.basic_auth {
         if let Some(auth_header) = req.headers().get("authorization") {
-            if let Ok(auth_str) = auth_header.to_str() {
-                if let Some(encoded) = auth_str.strip_prefix("Basic ") {
-                    if let Ok(decoded) = general_purpose::STANDARD.decode(encoded) {
-                        if let Ok(credentials) = String::from_utf8(decoded) {
-                            let (user, pass) = if let Some(colon_pos) = credentials.find(':') {
-                                (&credentials[..colon_pos], &credentials[colon_pos + 1..])
-                            } else {
-                                ("", "")
-                            };
-                            if user == expected_user && pass == expected_pass {
-                                // Auth successful, proceed
+            match auth_header.to_str() {
+                Ok(auth_str) => {
+                    if let Some(encoded) = auth_str.strip_prefix("Basic ") {
+                        if let Ok(decoded) = general_purpose::STANDARD.decode(encoded) {
+                            if let Ok(credentials) = String::from_utf8(decoded) {
+                                let (user, pass) = if let Some(colon_pos) = credentials.find(':') {
+                                    (&credentials[..colon_pos], &credentials[colon_pos + 1..])
+                                } else {
+                                    ("", "")
+                                };
+                                if user == expected_user && pass == expected_pass {
+                                    // Auth successful, proceed
+                                } else {
+                                    return Ok(Response::builder()
+                                        .status(StatusCode::UNAUTHORIZED)
+                                        .body(full("Invalid credentials"))
+                                        .unwrap());
+                                }
                             } else {
                                 return Ok(Response::builder()
-                                    .status(StatusCode::UNAUTHORIZED)
-                                    .body(http_body_util::Full::from("Invalid credentials"))
+                                    .status(StatusCode::BAD_REQUEST)
+                                    .body(full("Invalid authorization header encoding"))
                                     .unwrap());
                             }
                         } else {
                             return Ok(Response::builder()
                                 .status(StatusCode::BAD_REQUEST)
-                                .body(http_body_util::Full::from(
-                                    "Invalid authorization header encoding",
-                                ))
+                                .body(full("Invalid base64 encoding in authorization header"))
                                 .unwrap());
                         }
                     } else {
                         return Ok(Response::builder()
-                            .status(StatusCode::BAD_REQUEST)
-                            .body(http_body_util::Full::from(
-                                "Invalid base64 encoding in authorization header",
-                            ))
+                            .status(StatusCode::UNAUTHORIZED)
+                            .body(full("Missing Basic authentication scheme"))
                             .unwrap());
                     }
-                } else {
+                }
+                Err(_) => {
                     return Ok(Response::builder()
-                        .status(StatusCode::UNAUTHORIZED)
-                        .body(http_body_util::Full::from(
-                            "Missing Basic authentication scheme",
-                        ))
+                        .status(StatusCode::BAD_REQUEST)
+                        .body(full("Invalid authorization header encoding"))
                         .unwrap());
                 }
             }
         } else {
             return Ok(Response::builder()
                 .status(StatusCode::UNAUTHORIZED)
-                .body(http_body_util::Full::from("Missing authorization header"))
+                .body(full("Missing authorization header"))
                 .unwrap());
         }
     }
@@ -410,9 +521,7 @@ async fn handle_request(
             builder = builder.header(header_name.as_str(), header_value.as_str());
         }
         return Ok(builder
-            .body(http_body_util::Full::from(
-                "Failed to send request to bridge",
-            ))
+            .body(full("Failed to send request to bridge"))
             .unwrap());
     }
 
@@ -422,9 +531,7 @@ async fn handle_request(
             builder = builder.header(header_name.as_str(), header_value.as_str());
         }
         return Ok(builder
-            .body(http_body_util::Full::from(
-                "Message accepted for processing",
-            ))
+            .body(full("Message accepted for processing"))
             .unwrap());
     }
 
@@ -442,18 +549,14 @@ async fn handle_request(
             for (header_name, header_value) in &custom_headers {
                 builder = builder.header(header_name.as_str(), header_value.as_str());
             }
-            Ok(builder
-                .body(http_body_util::Full::from("Pipeline closed"))
-                .unwrap())
+            Ok(builder.body(full("Pipeline closed")).unwrap())
         }
         Err(_) => {
             let mut builder = Response::builder().status(StatusCode::GATEWAY_TIMEOUT);
             for (header_name, header_value) in &custom_headers {
                 builder = builder.header(header_name.as_str(), header_value.as_str());
             }
-            Ok(builder
-                .body(http_body_util::Full::from("Request timed out"))
-                .unwrap())
+            Ok(builder.body(full("Request timed out")).unwrap())
         }
     }
 }
@@ -463,7 +566,7 @@ fn make_response(
     compression_enabled: bool,
     compression_threshold_bytes: usize,
     custom_headers: HashMap<String, String>,
-) -> anyhow::Result<Response<http_body_util::Full<Bytes>>> {
+) -> anyhow::Result<Response<BoxBody>> {
     match disposition {
         MessageDisposition::Reply(mut msg) => {
             let status = msg
@@ -475,8 +578,18 @@ fn make_response(
 
             let mut builder = Response::builder().status(status);
 
+            let is_streaming = msg.metadata.iter().any(|(k, v)| {
+                (k.eq_ignore_ascii_case("content-type") && v.contains("text/event-stream"))
+                    || (k.eq_ignore_ascii_case("transfer-encoding") && v.contains("chunked"))
+            });
+
             for (key, value) in &msg.metadata {
-                builder = builder.header(key.as_str(), value.as_str());
+                if !key.eq_ignore_ascii_case("content-encoding")
+                    && !key.eq_ignore_ascii_case("transfer-encoding")
+                    && !key.eq_ignore_ascii_case("content-length")
+                {
+                    builder = builder.header(key.as_str(), value.as_str());
+                }
             }
 
             let has_content_type = msg
@@ -503,25 +616,28 @@ fn make_response(
                 builder = builder.header(header_name.as_str(), header_value.as_str());
             }
 
-            Ok(builder.body(http_body_util::Full::from(payload)).unwrap())
+            if is_streaming {
+                let stream = futures::stream::once(async move {
+                    Ok::<_, anyhow::Error>(Frame::data(Bytes::from(payload)))
+                });
+                Ok(builder.body(streamed(stream)).unwrap())
+            } else {
+                Ok(builder.body(full(payload)).unwrap())
+            }
         }
         MessageDisposition::Ack => {
             let mut builder = Response::builder().status(StatusCode::ACCEPTED);
             for (header_name, header_value) in &custom_headers {
                 builder = builder.header(header_name.as_str(), header_value.as_str());
             }
-            Ok(builder
-                .body(http_body_util::Full::from("Message processed"))
-                .unwrap())
+            Ok(builder.body(full("Message processed")).unwrap())
         }
         MessageDisposition::Nack => {
             let mut builder = Response::builder().status(StatusCode::INTERNAL_SERVER_ERROR);
             for (header_name, header_value) in &custom_headers {
                 builder = builder.header(header_name.as_str(), header_value.as_str());
             }
-            Ok(builder
-                .body(http_body_util::Full::from("Message processing failed"))
-                .unwrap())
+            Ok(builder.body(full("Message processing failed")).unwrap())
         }
     }
 }

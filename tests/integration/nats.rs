@@ -103,3 +103,79 @@ pub async fn test_nats_performance_direct() {
     })
     .await;
 }
+
+pub async fn test_nats_status() {
+    use mq_bridge::traits::{MessageConsumer, MessagePublisher};
+    use tokio::time::{sleep, Duration};
+
+    setup_logging();
+    run_test_with_docker_controller(
+        "tests/integration/docker-compose/nats.yml",
+        |controller| async move {
+            let stream_name = "status_nats_direct";
+            let subject = "status_nats_direct.subject";
+            let config = mq_bridge::models::NatsConfig {
+                url: "nats://localhost:4222".to_string(),
+                ..Default::default()
+            };
+
+            let mut pub_config = config.clone();
+            pub_config.subject = Some(subject.to_string());
+            pub_config.stream = Some(stream_name.to_string());
+            let publisher = NatsPublisher::new(&pub_config).await.unwrap();
+
+            let mut consumer_config = config.clone();
+            consumer_config.subject = Some(subject.to_string());
+            consumer_config.stream = Some(stream_name.to_string());
+            let consumer = NatsConsumer::new(&consumer_config).await.unwrap();
+
+            println!("[NATS] Checking initial status...");
+            sleep(Duration::from_secs(2)).await;
+            let pub_status = publisher.status().await;
+            let con_status = consumer.status().await;
+            assert!(
+                pub_status.healthy,
+                "Publisher should be healthy initially. Status: {:?}",
+                pub_status
+            );
+            assert!(
+                con_status.healthy,
+                "Consumer should be healthy initially. Status: {:?}",
+                con_status
+            );
+            println!("[NATS] Initial status check OK.");
+
+            controller.stop_service("nats");
+            println!("[NATS] Service 'nats' stopped. Waiting for disconnect detection...");
+
+            let start = std::time::Instant::now();
+            loop {
+                if !publisher.status().await.healthy && !consumer.status().await.healthy {
+                    println!("[NATS] Disconnect detected.");
+                    break;
+                }
+                if start.elapsed() > Duration::from_secs(20) {
+                    panic!("[NATS] Timeout waiting for disconnect.");
+                }
+                sleep(Duration::from_secs(1)).await;
+            }
+
+            controller.start_service("nats");
+            println!("[NATS] Service 'nats' started. Waiting for reconnect...");
+
+            let start = std::time::Instant::now();
+            loop {
+                if publisher.status().await.healthy && consumer.status().await.healthy {
+                    println!("[NATS] Reconnect detected.");
+                    break;
+                }
+                if start.elapsed() > Duration::from_secs(20) {
+                    panic!("[NATS] Timeout waiting for reconnect.");
+                }
+                sleep(Duration::from_secs(1)).await;
+            }
+            println!("[NATS] Status test successful.");
+        },
+    )
+    .await;
+}

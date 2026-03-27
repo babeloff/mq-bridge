@@ -8,7 +8,7 @@ use crate::event_store::{
 };
 use crate::models::MemoryConfig;
 use crate::traits::{
-    BatchCommitFunc, BoxFuture, ConsumerError, MessageConsumer, MessageDisposition,
+    BatchCommitFunc, BoxFuture, ConsumerError, EndpointStatus, MessageConsumer, MessageDisposition,
     MessagePublisher, PublisherError, Received, ReceivedBatch, Sent, SentBatch,
 };
 use crate::CanonicalMessage;
@@ -20,7 +20,7 @@ use std::any::Any;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tokio::sync::oneshot;
-use tracing::{info, trace};
+use tracing::{info, trace, warn};
 
 /// A map to hold memory channels for the duration of the bridge setup.
 /// This allows a consumer and publisher in different routes to connect to the same in-memory topic.
@@ -344,6 +344,26 @@ impl MessagePublisher for MemoryPublisher {
         }
     }
 
+    async fn status(&self) -> EndpointStatus {
+        match &self.backend {
+            PublisherBackend::Queue(sender) => EndpointStatus {
+                healthy: !sender.is_closed(),
+                target: self.topic.clone(),
+                pending: Some(sender.len()),
+                capacity: Some(sender.capacity().unwrap_or(0)),
+                ..Default::default()
+            },
+            PublisherBackend::Log(_store) => EndpointStatus {
+                healthy: true,
+                target: self.topic.clone(),
+                details: serde_json::json!({
+                    "mode": "event_store"
+                }),
+                ..Default::default()
+            },
+        }
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -403,6 +423,47 @@ impl MemoryConsumer {
     }
 }
 
+impl Drop for MemoryQueueConsumer {
+    fn drop(&mut self) {
+        if !self.buffer.is_empty() {
+            let mut messages = std::mem::take(&mut self.buffer);
+            messages.reverse();
+
+            let channel = get_or_create_channel(&MemoryConfig {
+                topic: self.topic.clone(),
+                capacity: None,
+                ..Default::default()
+            });
+
+            match channel.sender.try_send(messages) {
+                Ok(_) => {
+                    info!(topic = %self.topic, "Requeued buffered messages on consumer drop");
+                }
+                Err(e) => {
+                    let msgs = match e {
+                        async_channel::TrySendError::Full(m) => m,
+                        async_channel::TrySendError::Closed(m) => m,
+                    };
+                    warn!(topic = %self.topic, "Channel full on drop, spawning async requeue");
+                    let sender = channel.sender.clone();
+                    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                        handle.spawn(async move {
+                            if let Err(e) = sender.send(msgs).await {
+                                tracing::error!(
+                                    "Failed to requeue buffered messages in background: {}",
+                                    e
+                                );
+                            }
+                        });
+                    } else {
+                        tracing::error!(topic = %self.topic, "No active runtime found, could not requeue buffered messages on consumer drop");
+                    }
+                }
+            }
+        }
+    }
+}
+
 impl MemoryQueueConsumer {
     pub fn new(config: &MemoryConfig) -> anyhow::Result<Self> {
         let channel = get_or_create_channel(config);
@@ -446,6 +507,53 @@ impl MemoryQueueConsumer {
     }
 }
 
+struct RequeueGuard {
+    topic: String,
+    messages: Vec<CanonicalMessage>,
+}
+
+impl Drop for RequeueGuard {
+    fn drop(&mut self) {
+        if !self.messages.is_empty() {
+            let topic = self.topic.clone();
+            let count = self.messages.len();
+            let messages = std::mem::take(&mut self.messages);
+
+            let channel = get_or_create_channel(&MemoryConfig {
+                topic: topic.clone(),
+                capacity: None,
+                ..Default::default()
+            });
+
+            match channel.sender.try_send(messages) {
+                Ok(_) => {
+                    tracing::info!(topic = %topic, count, "Requeued dropped batch via RequeueGuard");
+                }
+                Err(e) => {
+                    let msgs = match e {
+                        async_channel::TrySendError::Full(m) => m,
+                        async_channel::TrySendError::Closed(m) => m,
+                    };
+                    tracing::warn!(topic = %topic, count, "Failed to requeue dropped batch (channel full/closed), spawning retry");
+                    let sender = channel.sender.clone();
+                    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                        handle.spawn(async move {
+                            if let Err(e) = sender.send(msgs).await {
+                                tracing::error!(
+                                    "Failed to requeue dropped batch in background: {}",
+                                    e
+                                );
+                            }
+                        });
+                    } else {
+                        tracing::error!(topic = %topic, count, "No active runtime found, could not requeue dropped batch via RequeueGuard");
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[async_trait]
 impl MessageConsumer for MemoryQueueConsumer {
     async fn receive_batch(&mut self, max_messages: usize) -> Result<ReceivedBatch, ConsumerError> {
@@ -485,15 +593,16 @@ impl MessageConsumer for MemoryQueueConsumer {
             .map(|m| m.metadata.get("correlation_id").cloned())
             .collect();
 
-        // This clone is necessary to support NACKs. The commit function needs access
-        // to the messages to re-queue them, but the `ReceivedBatch` must also return
-        // ownership of the messages to the caller. Without changing the core traits,
-        // cloning is the only way to satisfy both owners.
-        let messages_for_retry = if self.enable_nack {
-            Some(messages.clone())
+        // Guard to requeue messages if the batch is dropped without commit/nack.
+        let mut guard = if self.enable_nack {
+            Some(RequeueGuard {
+                topic: self.topic.clone(),
+                messages: messages.clone(),
+            })
         } else {
             None
         };
+
         let commit = Box::new(move |dispositions: Vec<MessageDisposition>| {
             Box::pin(async move {
                 if dispositions.len() != expected_count {
@@ -503,37 +612,28 @@ impl MessageConsumer for MemoryQueueConsumer {
                         dispositions.len()
                     ));
                 }
+
+                // Clone messages from guard to keep it armed during async operations
+                let messages_for_retry = if let Some(g) = &guard {
+                    g.messages.clone()
+                } else {
+                    Vec::new()
+                };
+
                 let response_channel = get_or_create_response_channel(&topic);
                 let mut to_requeue = Vec::new();
 
                 for (i, disposition) in dispositions.into_iter().enumerate() {
                     match disposition {
-                        MessageDisposition::Reply(mut resp) => {
-                            if !resp.metadata.contains_key("correlation_id") {
-                                if let Some(Some(cid)) = correlation_ids.get(i) {
-                                    resp.metadata
-                                        .insert("correlation_id".to_string(), cid.clone());
-                                }
-                            }
-
-                            // If the receiver is dropped, sending will fail. We can ignore it.
-                            let mut handled = false;
-                            if let Some(cid) = resp.metadata.get("correlation_id") {
-                                if let Some(tx) = response_channel.remove_waiter(cid).await {
-                                    let _ = tx.send(resp.clone());
-                                    handled = true;
-                                }
-                            }
-                            if !handled {
-                                let _ = response_channel.sender.send(resp).await;
-                            }
+                        MessageDisposition::Reply(resp) => {
+                            handle_memory_reply(resp, i, &correlation_ids, &response_channel).await;
                         }
                         MessageDisposition::Nack => {
-                            // Re-queue the message if Nacked
-                            if let Some(msgs) = &messages_for_retry {
-                                if let Some(msg) = msgs.get(i) {
-                                    to_requeue.push(msg.clone());
-                                }
+                            if let Some(msg) = messages_for_retry.get(i) {
+                                warn!("Requeueing nacked message {}", i);
+                                to_requeue.push(msg.clone());
+                            } else {
+                                warn!("Nack for index {} but no message in retry buffer!", i);
                             }
                         }
                         MessageDisposition::Ack => {}
@@ -550,15 +650,55 @@ impl MessageConsumer for MemoryQueueConsumer {
                         tracing::error!("Failed to re-queue NACKed messages to memory channel as it was closed.");
                     }
                 }
+
+                // Disarm the guard after all awaits are finished.
+                if let Some(g) = &mut guard {
+                    std::mem::take(&mut g.messages);
+                }
+
                 Ok(())
             }) as BoxFuture<'static, anyhow::Result<()>>
         }) as BatchCommitFunc;
         Ok(ReceivedBatch { messages, commit })
     }
 
+    async fn status(&self) -> EndpointStatus {
+        let pending = self.receiver.len();
+        let capacity = self.receiver.capacity().unwrap_or(0);
+        EndpointStatus {
+            healthy: !self.receiver.is_closed(),
+            target: self.topic.clone(),
+            pending: Some(pending),
+            capacity: Some(capacity),
+            ..Default::default()
+        }
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
+}
+
+async fn handle_memory_reply(
+    mut resp: CanonicalMessage,
+    index: usize,
+    correlation_ids: &[Option<String>],
+    response_channel: &MemoryResponseChannel,
+) {
+    if !resp.metadata.contains_key("correlation_id") {
+        if let Some(Some(cid)) = correlation_ids.get(index) {
+            resp.metadata
+                .insert("correlation_id".to_string(), cid.clone());
+        }
+    }
+
+    if let Some(cid) = resp.metadata.get("correlation_id") {
+        if let Some(tx) = response_channel.remove_waiter(cid).await {
+            let _ = tx.send(resp);
+            return;
+        }
+    }
+    let _ = response_channel.sender.send(resp).await;
 }
 
 #[async_trait]
@@ -567,6 +707,13 @@ impl MessageConsumer for MemoryConsumer {
         match self {
             Self::Queue(q) => q.receive_batch(max_messages).await,
             Self::Log { consumer, .. } => consumer.receive_batch(max_messages).await,
+        }
+    }
+
+    async fn status(&self) -> EndpointStatus {
+        match self {
+            Self::Queue(q) => q.status().await,
+            Self::Log { consumer, .. } => consumer.status().await,
         }
     }
 

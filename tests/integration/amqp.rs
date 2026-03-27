@@ -247,3 +247,83 @@ pub async fn test_amqp_performance_direct() {
     })
     .await;
 }
+
+pub async fn test_amqp_status() {
+    use mq_bridge::traits::{MessageConsumer, MessagePublisher};
+    use tokio::time::{sleep, Duration};
+
+    setup_logging();
+    run_test_with_docker_controller(
+        "tests/integration/docker-compose/amqp.yml",
+        |controller| async move {
+            let queue = "status_test_amqp";
+            let config = mq_bridge::models::AmqpConfig {
+                url: "amqp://guest:guest@localhost:5672/%2f".to_string(),
+                queue: Some(queue.to_string()),
+                ..Default::default()
+            };
+
+            let publisher = AmqpPublisher::new(&config).await.unwrap();
+            let consumer = AmqpConsumer::new(&config).await.unwrap();
+
+            println!("[AMQP] Checking initial status...");
+            sleep(Duration::from_secs(2)).await;
+            let pub_status = publisher.status().await;
+            let con_status = consumer.status().await;
+            assert!(
+                pub_status.healthy,
+                "Publisher should be healthy initially. Status: {:?}",
+                pub_status
+            );
+            assert!(
+                con_status.healthy,
+                "Consumer should be healthy initially. Status: {:?}",
+                con_status
+            );
+            println!("[AMQP] Initial status check OK.");
+
+            controller.stop_service("rabbitmq");
+            println!("[AMQP] Service 'rabbitmq' stopped. Waiting for disconnect detection...");
+
+            let start = std::time::Instant::now();
+            loop {
+                let pub_status = publisher.status().await;
+                let con_status = consumer.status().await;
+                if !pub_status.healthy && !con_status.healthy {
+                    println!("[AMQP] Disconnect detected.");
+                    break;
+                }
+                if start.elapsed() > Duration::from_secs(20) {
+                    panic!(
+                        "[AMQP] Timeout waiting for disconnect. Pub: {:?}, Con: {:?}",
+                        pub_status, con_status
+                    );
+                }
+                sleep(Duration::from_secs(1)).await;
+            }
+
+            controller.start_service("rabbitmq");
+            println!("[AMQP] Service 'rabbitmq' started. Waiting for reconnect...");
+
+            let start = std::time::Instant::now();
+            loop {
+                // Create new instances to force reconnection
+                if let (Ok(p), Ok(c)) = (
+                    AmqpPublisher::new(&config).await,
+                    AmqpConsumer::new(&config).await,
+                ) {
+                    if p.status().await.healthy && c.status().await.healthy {
+                        println!("[AMQP] Reconnect detected.");
+                        break;
+                    }
+                }
+                if start.elapsed() > Duration::from_secs(20) {
+                    panic!("[AMQP] Timeout waiting for reconnect.");
+                }
+                sleep(Duration::from_secs(2)).await;
+            }
+            println!("[AMQP] Status test successful.");
+        },
+    )
+    .await;
+}

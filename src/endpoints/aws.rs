@@ -1,8 +1,8 @@
 use crate::canonical_message::tracing_support::LazyMessageIds;
 use crate::models::AwsConfig;
 use crate::traits::{
-    BatchCommitFunc, ConsumerError, MessageConsumer, MessageDisposition, MessagePublisher,
-    PublisherError, ReceivedBatch, Sent, SentBatch,
+    BatchCommitFunc, ConsumerError, EndpointStatus, MessageConsumer, MessageDisposition,
+    MessagePublisher, PublisherError, ReceivedBatch, Sent, SentBatch,
 };
 use crate::CanonicalMessage;
 use anyhow::{anyhow, Context};
@@ -152,6 +152,55 @@ impl MessageConsumer for AwsConsumer {
         Ok(ReceivedBatch { messages, commit })
     }
 
+    async fn status(&self) -> EndpointStatus {
+        let mut pending = None;
+        let mut details = serde_json::json!({});
+        let mut healthy = true;
+        let mut error = None;
+
+        match self
+            .client
+            .get_queue_attributes()
+            .queue_url(&self.queue_url)
+            .attribute_names(aws_sdk_sqs::types::QueueAttributeName::ApproximateNumberOfMessages)
+            .attribute_names(
+                aws_sdk_sqs::types::QueueAttributeName::ApproximateNumberOfMessagesNotVisible,
+            )
+            .send()
+            .await
+        {
+            Ok(resp) => {
+                if let Some(attrs) = resp.attributes {
+                    if let Some(count_str) = attrs
+                        .get(&aws_sdk_sqs::types::QueueAttributeName::ApproximateNumberOfMessages)
+                    {
+                        if let Ok(val) = count_str.parse::<usize>() {
+                            pending = Some(val);
+                        }
+                    }
+                    let details_map: std::collections::HashMap<String, String> = attrs
+                        .iter()
+                        .map(|(k, v)| (k.as_str().to_string(), v.clone()))
+                        .collect();
+                    details = serde_json::json!(details_map);
+                }
+            }
+            Err(e) => {
+                healthy = false;
+                error = Some(e.to_string());
+            }
+        }
+
+        EndpointStatus {
+            healthy,
+            target: self.queue_url.clone(),
+            pending,
+            details,
+            error,
+            ..Default::default()
+        }
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -189,6 +238,14 @@ fn prepare_aws_entries(
 
     for (i, (handle_opt, disposition)) in handles.iter().zip(dispositions).enumerate() {
         if let Some(handle) = handle_opt {
+            match disposition {
+                MessageDisposition::Ack => { /* proceed to delete */ }
+                MessageDisposition::Reply(_) => {
+                    tracing::warn!("AWS consumer received a Reply/StreamReply, but replying is not supported. The reply is dropped.");
+                }
+                MessageDisposition::Nack => { /* handle below */ }
+            }
+
             match disposition {
                 MessageDisposition::Ack | MessageDisposition::Reply(_) => {
                     delete_entries.push(
@@ -488,6 +545,48 @@ impl MessagePublisher for AwsPublisher {
             }
         } else {
             Ok(SentBatch::Ack)
+        }
+    }
+
+    async fn status(&self) -> EndpointStatus {
+        let mut healthy = true;
+        let mut error = None;
+        let mut details = serde_json::json!({});
+
+        if let (Some(client), Some(url)) = (&self.sqs_client, &self.queue_url) {
+            match client.get_queue_attributes().queue_url(url).send().await {
+                Ok(_) => { /* SQS is healthy */ }
+                Err(e) => {
+                    healthy = false;
+                    error = Some(format!("SQS: {}", e));
+                }
+            }
+        }
+
+        if let (Some(client), Some(arn)) = (&self.sns_client, &self.topic_arn) {
+            if healthy {
+                // Don't overwrite the first error
+                match client.get_topic_attributes().topic_arn(arn).send().await {
+                    Ok(resp) => {
+                        if let Some(attrs) = resp.attributes {
+                            details["sns_attributes"] = serde_json::json!(attrs);
+                        }
+                    }
+                    Err(e) => {
+                        healthy = false;
+                        error = Some(format!("SNS: {}", e));
+                    }
+                }
+            }
+        }
+
+        let target = self.queue_url.clone().or_else(|| self.topic_arn.clone());
+        EndpointStatus {
+            healthy,
+            error,
+            target: target.unwrap_or_default(),
+            details,
+            ..Default::default()
         }
     }
 
