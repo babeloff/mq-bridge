@@ -251,13 +251,13 @@ impl MessagePublisher for KafkaPublisher {
     async fn status(&self) -> EndpointStatus {
         let producer = self.producer.clone();
         let topic = self.topic.clone();
-        let (healthy, pending, last_error) = tokio::task::spawn_blocking(move || {
+        let (healthy, pending, error) = tokio::task::spawn_blocking(move || {
             let meta_topic = if topic.is_empty() {
                 None
             } else {
                 Some(topic.as_str())
             };
-            let (healthy, last_error) = match producer
+            let (healthy, error) = match producer
                 .client()
                 .fetch_metadata(meta_topic, Duration::from_secs(1))
             {
@@ -265,14 +265,14 @@ impl MessagePublisher for KafkaPublisher {
                 Err(e) => (false, Some(e.to_string())),
             };
             let pending = producer.in_flight_count() as usize;
-            (healthy, pending, last_error)
+            (healthy, pending, error)
         })
         .await
         .unwrap_or((false, 0, Some("status task panicked".to_string())));
 
         EndpointStatus {
             healthy,
-            last_error,
+            error,
             target: self.topic.clone(),
             pending: Some(pending),
             ..Default::default()
@@ -453,13 +453,13 @@ impl MessageConsumer for KafkaConsumer {
         let consumer = self.consumer.clone();
         let topic = self.topic.clone();
 
-        let (healthy, pending, last_error) = tokio::task::spawn_blocking(move || {
+        let (healthy, pending, error) = tokio::task::spawn_blocking(move || {
             let meta_topic = if topic.is_empty() {
                 None
             } else {
                 Some(topic.as_str())
             };
-            let (mut healthy, mut last_error) = match consumer
+            let (mut healthy, mut error) = match consumer
                 .client()
                 .fetch_metadata(meta_topic, Duration::from_secs(1))
             {
@@ -491,7 +491,7 @@ impl MessageConsumer for KafkaConsumer {
                                                 }
                                             }
                                             Err(e) => {
-                                                last_error = Some(format!(
+                                                error = Some(format!(
                                                     "Failed to fetch watermarks: {}",
                                                     e
                                                 ));
@@ -504,13 +504,13 @@ impl MessageConsumer for KafkaConsumer {
                             }
                         }
                         Err(e) => {
-                            last_error = Some(format!("Failed to get consumer position: {}", e));
+                            error = Some(format!("Failed to get consumer position: {}", e));
                             healthy = false;
                         }
                     }
                 }
             }
-            (healthy, total_lag, last_error)
+            (healthy, total_lag, error)
         })
         .await
         .unwrap_or((false, 0, Some("status task panicked".to_string())));
@@ -519,7 +519,7 @@ impl MessageConsumer for KafkaConsumer {
             healthy,
             target: self.topic.clone(),
             pending: if healthy { Some(pending) } else { None },
-            last_error,
+            error,
             ..Default::default()
         }
     }

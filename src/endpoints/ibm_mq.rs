@@ -210,14 +210,13 @@ impl IbmMqPublisher {
                         }
                         PublisherJob::Status(reply_tx) => {
                             let mut healthy = true;
-                            let mut last_error = None;
+                            let mut error = None;
                             if let Err(e) = queue.inquire(&[mqi::attribute::MQIA_DEF_PRIORITY]) {
                                 if e.2 != constants::MQRC_NOT_OPEN_FOR_INQUIRE
                                     && e.2 != constants::MQRC_NOT_AUTHORIZED
                                 {
                                     healthy = false;
-                                    last_error =
-                                        Some(format!("Failed to inquire object status: {}", e));
+                                    error = Some(format!("Failed to inquire object status: {}", e));
                                 }
                             }
 
@@ -229,7 +228,7 @@ impl IbmMqPublisher {
                                     .or(config.topic.clone())
                                     .unwrap_or_default(),
                                 pending: None,
-                                last_error,
+                                error: error,
                                 capacity: Some(config.internal_buffer_size.unwrap_or(100).max(1)),
                                 ..Default::default()
                             });
@@ -249,7 +248,7 @@ impl IbmMqPublisher {
                         PublisherJob::Status(reply_tx) => {
                             let _ = reply_tx.send(EndpointStatus {
                                 healthy: false,
-                                last_error: Some("Publisher reconnecting".to_string()),
+                                error: Some("Publisher reconnecting".to_string()),
                                 ..Default::default()
                             });
                         }
@@ -314,14 +313,14 @@ impl MessagePublisher for IbmMqPublisher {
             Ok(Err(_)) => {
                 return EndpointStatus {
                     healthy: false,
-                    last_error: Some("Publisher thread disconnected".to_string()),
+                    error: Some("Publisher thread disconnected".to_string()),
                     ..Default::default()
                 };
             }
             Err(_) => {
                 return EndpointStatus {
                     healthy: false,
-                    last_error: Some("Status send timed out".to_string()),
+                    error: Some("Status send timed out".to_string()),
                     ..Default::default()
                 };
             }
@@ -331,12 +330,12 @@ impl MessagePublisher for IbmMqPublisher {
             Ok(Ok(status)) => status,
             Ok(Err(_)) => EndpointStatus {
                 healthy: false,
-                last_error: Some("Publisher thread dropped status request".to_string()),
+                error: Some("Publisher thread dropped status request".to_string()),
                 ..Default::default()
             },
             Err(_) => EndpointStatus {
                 healthy: false,
-                last_error: Some("Status check timed out".to_string()),
+                error: Some("Status check timed out".to_string()),
                 ..Default::default()
             },
         }
@@ -593,7 +592,7 @@ async fn spawn_consumer_thread(
                         let mut healthy = true;
                         let mut pending = None;
                         let mut capacity = None;
-                        let mut last_error = None;
+                        let mut error = None;
 
                         match obj.inquire(&[MQIA_CURRENT_Q_DEPTH, MQIA_MAX_Q_DEPTH]) {
                             Ok(values) => {
@@ -611,8 +610,7 @@ async fn spawn_consumer_thread(
                                     && e.2 != constants::MQRC_NOT_AUTHORIZED
                                 {
                                     healthy = false;
-                                    last_error =
-                                        Some(format!("Failed to inquire queue status: {}", e));
+                                    error = Some(format!("Failed to inquire queue status: {}", e));
                                 }
                             }
                         }
@@ -626,7 +624,7 @@ async fn spawn_consumer_thread(
                                 .unwrap_or_default(),
                             pending,
                             capacity,
-                            last_error,
+                            error: error,
                             ..Default::default()
                         });
                     }
@@ -730,14 +728,14 @@ impl MessageConsumer for IbmMqConsumer {
             Ok(Err(_)) => {
                 return EndpointStatus {
                     healthy: false,
-                    last_error: Some("Consumer thread disconnected".to_string()),
+                    error: Some("Consumer thread disconnected".to_string()),
                     ..Default::default()
                 };
             }
             Err(_) => {
                 return EndpointStatus {
                     healthy: false,
-                    last_error: Some("Status send timed out".to_string()),
+                    error: Some("Status send timed out".to_string()),
                     ..Default::default()
                 };
             }
@@ -747,12 +745,12 @@ impl MessageConsumer for IbmMqConsumer {
             Ok(Ok(status)) => status,
             Ok(Err(_)) => EndpointStatus {
                 healthy: false,
-                last_error: Some("Consumer thread dropped status request".to_string()),
+                error: Some("Consumer thread dropped status request".to_string()),
                 ..Default::default()
             },
             Err(_) => EndpointStatus {
                 healthy: false,
-                last_error: Some("Status check timed out".to_string()),
+                error: Some("Status check timed out".to_string()),
                 ..Default::default()
             },
         }

@@ -156,7 +156,7 @@ impl MessageConsumer for AwsConsumer {
         let mut pending = None;
         let mut details = serde_json::json!({});
         let mut healthy = true;
-        let mut last_error = None;
+        let mut error = None;
 
         match self
             .client
@@ -187,7 +187,7 @@ impl MessageConsumer for AwsConsumer {
             }
             Err(e) => {
                 healthy = false;
-                last_error = Some(e.to_string());
+                error = Some(e.to_string());
             }
         }
 
@@ -196,7 +196,7 @@ impl MessageConsumer for AwsConsumer {
             target: self.queue_url.clone(),
             pending,
             details,
-            last_error,
+            error,
             ..Default::default()
         }
     }
@@ -550,7 +550,7 @@ impl MessagePublisher for AwsPublisher {
 
     async fn status(&self) -> EndpointStatus {
         let mut healthy = true;
-        let mut last_error = None;
+        let mut error = None;
         let mut details = serde_json::json!({});
 
         if let (Some(client), Some(url)) = (&self.sqs_client, &self.queue_url) {
@@ -558,7 +558,7 @@ impl MessagePublisher for AwsPublisher {
                 Ok(_) => { /* SQS is healthy */ }
                 Err(e) => {
                     healthy = false;
-                    last_error = Some(format!("SQS: {}", e));
+                    error = Some(format!("SQS: {}", e));
                 }
             }
         }
@@ -574,7 +574,7 @@ impl MessagePublisher for AwsPublisher {
                     }
                     Err(e) => {
                         healthy = false;
-                        last_error = Some(format!("SNS: {}", e));
+                        error = Some(format!("SNS: {}", e));
                     }
                 }
             }
@@ -583,7 +583,7 @@ impl MessagePublisher for AwsPublisher {
         let target = self.queue_url.clone().or_else(|| self.topic_arn.clone());
         EndpointStatus {
             healthy,
-            last_error,
+            error,
             target: target.unwrap_or_default(),
             details,
             ..Default::default()

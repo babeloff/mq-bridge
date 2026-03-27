@@ -117,9 +117,7 @@ pub struct EndpointStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub capacity: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub last_error: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub connected_since_ms: Option<u64>,
+    pub error: Option<String>,
     pub details: serde_json::Value,
 }
 impl Default for EndpointStatus {
@@ -129,8 +127,7 @@ impl Default for EndpointStatus {
             target: String::new(),
             pending: None,
             capacity: None,
-            last_error: None,
-            connected_since_ms: None,
+            error: None,
             details: serde_json::Value::Null,
         }
     }

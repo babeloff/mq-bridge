@@ -323,7 +323,7 @@ impl MessagePublisher for SqlxPublisher {
     }
 
     async fn status(&self) -> EndpointStatus {
-        let (healthy, last_error) = match self.pool.acquire().await {
+        let (healthy, error) = match self.pool.acquire().await {
             Ok(_) => (true, None),
             Err(e) => (false, Some(e.to_string())),
         };
@@ -331,7 +331,7 @@ impl MessagePublisher for SqlxPublisher {
         EndpointStatus {
             healthy,
             target: self.table.clone(),
-            last_error,
+            error,
             details: serde_json::json!({ "driver": self.driver_name, "pool_size": self.pool.size(), "pool_idle": self.pool.num_idle() }),
             ..Default::default()
         }
@@ -754,7 +754,7 @@ impl MessageConsumer for SqlxConsumer {
     }
 
     async fn status(&self) -> EndpointStatus {
-        let (mut healthy, mut last_error) = match self.pool.acquire().await {
+        let (mut healthy, mut error) = match self.pool.acquire().await {
             Ok(_) => (true, None),
             Err(e) => (false, Some(e.to_string())),
         };
@@ -765,7 +765,7 @@ impl MessageConsumer for SqlxConsumer {
                 Ok(c) => pending = Some(c),
                 Err(e) => {
                     healthy = false;
-                    last_error = Some(e.to_string());
+                    error = Some(e.to_string());
                 }
             }
         };
@@ -774,7 +774,7 @@ impl MessageConsumer for SqlxConsumer {
             healthy,
             target: self.table.clone(),
             pending,
-            last_error,
+            error,
             details: serde_json::json!({ "driver": self.driver_name, "pool_size": self.pool.size(), "pool_idle": self.pool.num_idle() }),
             ..Default::default()
         }

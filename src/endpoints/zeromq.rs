@@ -162,7 +162,7 @@ impl MessagePublisher for ZeroMqPublisher {
             healthy: !self.tx.is_closed(),
             pending: Some(self.tx.len()),
             capacity: self.tx.capacity(),
-            last_error: if self.tx.is_closed() {
+            error: if self.tx.is_closed() {
                 Some("Publisher task terminated".to_string())
             } else {
                 None
@@ -432,7 +432,7 @@ impl MessageConsumer for ZeroMqConsumer {
             healthy: !self.rx.is_closed(),
             pending: Some(self.rx.len() + self.buffer.len()),
             capacity: self.rx.capacity(),
-            last_error: if self.rx.is_closed() {
+            error: if self.rx.is_closed() {
                 Some("Consumer task terminated".to_string())
             } else {
                 None

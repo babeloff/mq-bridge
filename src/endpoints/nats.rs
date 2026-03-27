@@ -211,7 +211,7 @@ impl MessagePublisher for NatsPublisher {
             target: self.subject.clone(),
             pending: None,
             capacity: None,
-            last_error: if self.core_client.connection_state() == State::Connected {
+            error: if self.core_client.connection_state() == State::Connected {
                 None
             } else {
                 Some("Disconnected".to_string())
@@ -287,7 +287,7 @@ impl MessageConsumer for NatsConsumer {
     async fn status(&self) -> EndpointStatus {
         let mut healthy = self.client.connection_state() == State::Connected;
         let mut pending = None;
-        let mut last_error = None;
+        let mut error = None;
 
         if healthy {
             match &self.core {
@@ -300,12 +300,12 @@ impl MessageConsumer for NatsConsumer {
                     }
                     Err(e) => {
                         healthy = false;
-                        last_error = Some(format!("Failed to get consumer info: {}", e));
+                        error = Some(format!("Failed to get consumer info: {}", e));
                     }
                 },
             }
         } else {
-            last_error = Some(format!(
+            error = Some(format!(
                 "Disconnected: {:?}",
                 self.client.connection_state()
             ));
@@ -315,7 +315,7 @@ impl MessageConsumer for NatsConsumer {
             healthy,
             target: self.subject.clone(),
             pending,
-            last_error,
+            error,
             ..Default::default()
         }
     }

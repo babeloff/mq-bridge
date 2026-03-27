@@ -243,7 +243,7 @@ impl MessagePublisher for MqttPublisher {
         EndpointStatus {
             healthy,
             target: self.topic.clone(),
-            last_error: if healthy {
+            error: if healthy {
                 None
             } else {
                 Some("Disconnected".to_string())
@@ -470,7 +470,7 @@ impl MessageConsumer for MqttListener {
             target: self.topic.clone(),
             pending: Some(self.message_rx.len()),
             capacity: Some(self.capacity),
-            last_error: if healthy {
+            error: if healthy {
                 None
             } else {
                 Some("Disconnected".to_string())

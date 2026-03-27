@@ -61,14 +61,14 @@ impl MessagePublisher for FanoutPublisher {
         let mut healthy = true;
         let mut pending = 0;
         let mut capacity = 0;
-        let mut last_error: Option<String> = None;
+        let mut error: Option<String> = None;
         let mut details = Vec::new();
 
         for status in results {
             if !status.healthy {
                 healthy = false;
-                if last_error.is_none() {
-                    last_error = status.last_error.clone();
+                if error.is_none() {
+                    error = status.error.clone();
                 }
             }
             pending += status.pending.unwrap_or(0);
@@ -80,7 +80,7 @@ impl MessagePublisher for FanoutPublisher {
             healthy,
             pending: Some(pending),
             capacity: Some(capacity),
-            last_error,
+            error,
             details: serde_json::json!({ "destinations": details }),
             ..Default::default()
         }

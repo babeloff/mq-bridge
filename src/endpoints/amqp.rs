@@ -302,7 +302,7 @@ impl MessagePublisher for AmqpPublisher {
         let conn_status = state.connection.status();
         let chan_status = state.channel.status();
         let healthy = conn_status.connected() && chan_status.connected();
-        let last_error = if !healthy {
+        let error = if !healthy {
             Some(format!(
                 "Connection: '{:?}', Channel: '{:?}'",
                 conn_status.state(),
@@ -313,7 +313,7 @@ impl MessagePublisher for AmqpPublisher {
         };
         EndpointStatus {
             healthy,
-            last_error,
+            error,
             target: if self.exchange.is_empty() {
                 self.queue.clone()
             } else {
@@ -654,7 +654,7 @@ impl MessageConsumer for AmqpConsumer {
         let chan_status = self.channel.status();
         let mut healthy = conn_status.connected() && chan_status.connected();
         let mut pending: Option<usize> = None;
-        let mut last_error: Option<String> = None;
+        let mut error: Option<String> = None;
 
         if healthy {
             let passive_declare = self.channel.queue_declare(
@@ -669,15 +669,15 @@ impl MessageConsumer for AmqpConsumer {
                 Ok(Ok(q)) => pending = Some(q.message_count() as usize),
                 Ok(Err(e)) => {
                     healthy = false;
-                    last_error = Some(e.to_string());
+                    error = Some(e.to_string());
                 }
                 Err(e) => {
                     healthy = false;
-                    last_error = Some(e.to_string());
+                    error = Some(e.to_string());
                 }
             }
         } else {
-            last_error = Some(format!(
+            error = Some(format!(
                 "Connection: '{:?}', Channel: '{:?}'",
                 conn_status.state(),
                 chan_status.state()
@@ -688,7 +688,7 @@ impl MessageConsumer for AmqpConsumer {
             healthy,
             target: self.queue.clone(),
             pending,
-            last_error,
+            error,
             capacity: Some(self.prefetch as usize),
             ..Default::default()
         }

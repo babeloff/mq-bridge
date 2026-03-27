@@ -620,14 +620,14 @@ impl MessagePublisher for MongoDbPublisher {
     }
 
     async fn status(&self) -> EndpointStatus {
-        let (healthy, last_error) = match self.db.run_command(doc! { "ping": 1 }).await {
+        let (healthy, error) = match self.db.run_command(doc! { "ping": 1 }).await {
             Ok(_) => (true, None),
             Err(e) => (false, Some(e.to_string())),
         };
         EndpointStatus {
             healthy,
             target: self.collection_name.clone(),
-            last_error,
+            error,
             details: serde_json::json!({ "database": self.db.name(), "request_reply": self.request_reply }),
             ..Default::default()
         }
@@ -767,11 +767,11 @@ impl MessageConsumer for MongoDbConsumer {
     }
 
     async fn status(&self) -> EndpointStatus {
-        let mut last_error = None;
+        let mut error = None;
         let healthy = match self.db.run_command(doc! { "ping": 1 }).await {
             Ok(_) => true,
             Err(e) => {
-                last_error = Some(e.to_string());
+                error = Some(e.to_string());
                 false
             }
         };
@@ -785,7 +785,7 @@ impl MessageConsumer for MongoDbConsumer {
             match self.collection.count_documents(filter).await {
                 Ok(c) => Some(c as usize),
                 Err(e) => {
-                    last_error = Some(format!("Failed to count pending documents: {}", e));
+                    error = Some(format!("Failed to count pending documents: {}", e));
                     None
                 }
             }
@@ -797,7 +797,7 @@ impl MessageConsumer for MongoDbConsumer {
             healthy,
             target: self.collection_name.clone(),
             pending,
-            last_error,
+            error,
             details: serde_json::json!({ "database": self.db.name(), "mode": if self.change_stream.is_some() { "change_stream" } else { "polling" } }),
             ..Default::default()
         }
@@ -1268,11 +1268,11 @@ impl MessageConsumer for MongoDbSubscriber {
     }
 
     async fn status(&self) -> EndpointStatus {
-        let mut last_error = None;
+        let mut error = None;
         let healthy = match self.db.run_command(doc! { "ping": 1 }).await {
             Ok(_) => true,
             Err(e) => {
-                last_error = Some(e.to_string());
+                error = Some(e.to_string());
                 false
             }
         };
@@ -1283,7 +1283,7 @@ impl MessageConsumer for MongoDbSubscriber {
             match self.collection.count_documents(filter).await {
                 Ok(c) => Some(c as usize),
                 Err(e) => {
-                    last_error = Some(format!("Failed to count pending: {}", e));
+                    error = Some(format!("Failed to count pending: {}", e));
                     None
                 }
             }
@@ -1324,9 +1324,9 @@ impl MessageConsumer for MongoDbSubscriber {
                             self.collection.name(),
                             e
                         );
-                        if last_error.is_none() {
-                            // Only update last_error if no other error is present
-                            last_error = Some(format!("Failed to get collStats: {}", e));
+                        if error.is_none() {
+                            // Only update error if no other error is present
+                            error = Some(format!("Failed to get collStats: {}", e));
                         }
                     }
                 }
@@ -1353,7 +1353,7 @@ impl MessageConsumer for MongoDbSubscriber {
             pending,
             capacity,
             details,
-            last_error,
+            error,
             ..Default::default()
         }
     }
