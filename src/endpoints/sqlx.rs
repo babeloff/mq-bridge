@@ -628,10 +628,10 @@ impl SqlxConsumer {
 
         let row: sqlx::any::AnyRow = sqlx::query(&query).fetch_one(&self.pool).await?;
         if let Ok(c) = row.try_get::<i64, _>(0) {
-            Ok(c as usize)
+            usize::try_from(c).map_err(|e| anyhow!("i64 to usize conversion failed: {}", e))
         } else {
             let c: i32 = row.try_get(0)?;
-            Ok(c as usize)
+            usize::try_from(c).map_err(|e| anyhow!("i32 to usize conversion failed: {}", e))
         }
     }
 }
@@ -768,7 +768,6 @@ impl MessageConsumer for SqlxConsumer {
                     last_error = Some(e.to_string());
                 }
             }
-        } else {
         };
 
         EndpointStatus {

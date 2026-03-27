@@ -446,14 +446,18 @@ impl Drop for MemoryQueueConsumer {
                     };
                     warn!(topic = %self.topic, "Channel full on drop, spawning async requeue");
                     let sender = channel.sender.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = sender.send(msgs).await {
-                            tracing::error!(
-                                "Failed to requeue buffered messages in background: {}",
-                                e
-                            );
-                        }
-                    });
+                    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                        handle.spawn(async move {
+                            if let Err(e) = sender.send(msgs).await {
+                                tracing::error!(
+                                    "Failed to requeue buffered messages in background: {}",
+                                    e
+                                );
+                            }
+                        });
+                    } else {
+                        tracing::error!(topic = %self.topic, "No active runtime found, could not requeue buffered messages on consumer drop");
+                    }
                 }
             }
         }
@@ -532,11 +536,18 @@ impl Drop for RequeueGuard {
                     };
                     tracing::warn!(topic = %topic, count, "Failed to requeue dropped batch (channel full/closed), spawning retry");
                     let sender = channel.sender.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = sender.send(msgs).await {
-                            tracing::error!("Failed to requeue dropped batch in background: {}", e);
-                        }
-                    });
+                    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                        handle.spawn(async move {
+                            if let Err(e) = sender.send(msgs).await {
+                                tracing::error!(
+                                    "Failed to requeue dropped batch in background: {}",
+                                    e
+                                );
+                            }
+                        });
+                    } else {
+                        tracing::error!(topic = %topic, count, "No active runtime found, could not requeue dropped batch via RequeueGuard");
+                    }
                 }
             }
         }
@@ -602,9 +613,9 @@ impl MessageConsumer for MemoryQueueConsumer {
                     ));
                 }
 
-                // Take messages from guard to disable auto-requeue and use for Nack retry
-                let messages_for_retry = if let Some(g) = &mut guard {
-                    std::mem::take(&mut g.messages)
+                // Clone messages from guard to keep it armed during async operations
+                let messages_for_retry = if let Some(g) = &guard {
+                    g.messages.clone()
                 } else {
                     Vec::new()
                 };
@@ -639,6 +650,12 @@ impl MessageConsumer for MemoryQueueConsumer {
                         tracing::error!("Failed to re-queue NACKed messages to memory channel as it was closed.");
                     }
                 }
+
+                // Disarm the guard after all awaits are finished.
+                if let Some(g) = &mut guard {
+                    std::mem::take(&mut g.messages);
+                }
+
                 Ok(())
             }) as BoxFuture<'static, anyhow::Result<()>>
         }) as BatchCommitFunc;

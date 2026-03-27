@@ -46,10 +46,9 @@ It may still be possible that there are issues with
 
 
 Due to the large code base, it may still be possible that some endpoints may show
-issues in production and therefore should be tested locally first. They all worked locally
-for me and didn't show data loss for simple in flight broker restarts, 
-but I haven't really used them in a real application yet.
-I would trust Kafka, MongoDB, IBM-MQ, Files and Memory to be production ready.
+issues in production; therefore, they should be tested locally first. They all worked locally
+for me and didn't show data loss during simple in-flight broker restarts.
+Kafka, MongoDB, IBM-MQ, Files, and Memory are considered production-ready.
 
 ### When to use mq-bridge
 *   **Hybrid Messaging**: Connect systems speaking different protocols (e.g., MQTT to Kafka) without writing custom adapters.
@@ -360,10 +359,10 @@ planning and writing, CodeRabbit for reviews and Claude for bugfixing and
 more complicated tasks that Gemini couldn't solve properly.
 While some of the AI output was great, some other output wasn't.
 I am aware that in year 2026, AI is still not generating perfect code and sometimes
-breaks simple stuff or forgets important lines during refacorings that then cause
+breaks simple stuff or forgets important lines during refactorings that then cause
 severe issues. 
 I reviewed all the output code, cleaned it up manually, 
-re-specified and refactored it whan insuficcient.
+re-specified and refactored it when insuficcient.
 **I do trust the current code as much as if it would be completely written by myself.**
 
 I didn't change the AI code appearance, so you will sometimes still see code that just
@@ -374,7 +373,7 @@ way better than my text. For AI code, the readability is usually
 good, even if it is more verbose than what I would write.
 However, especially for the different endpoints, there is already a lot of existing
 code and the AI could also just assist a lot there. Thats mostly the reason,
-why there are so many available endoints in this library, they just could be added
+why there are so many available endpoints in this library, they just could be added
 very easily and showed a sufficient code quality.
 
 ## License

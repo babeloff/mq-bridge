@@ -678,12 +678,9 @@ impl MessageConsumer for IbmMqConsumer {
         &mut self,
         max_messages: usize,
     ) -> Result<ReceivedBatch, crate::traits::ConsumerError> {
-        let permit = self
-            .permit
-            .clone()
-            .acquire_owned()
-            .await
-            .expect("Semaphore closed unexpectedly");
+        let permit = self.permit.clone().acquire_owned().await.map_err(|_| {
+            ConsumerError::Connection(anyhow::anyhow!("MQ consumer semaphore closed"))
+        })?;
 
         let (reply_tx, reply_rx) = oneshot::channel();
         self.tx

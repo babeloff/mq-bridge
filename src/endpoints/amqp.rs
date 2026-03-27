@@ -630,7 +630,7 @@ impl MessageConsumer for AmqpConsumer {
                 }
 
                 let commit_op = async {
-                    handle_replies(&channel, &reply_infos, &mut dispositions).await;
+                    handle_replies(&channel, &reply_infos, &dispositions).await;
                     handle_dispositions(ackers, dispositions).await
                 };
 
@@ -702,18 +702,14 @@ impl MessageConsumer for AmqpConsumer {
 async fn handle_replies(
     channel: &Channel,
     reply_infos: &[(Option<String>, Option<String>)],
-    dispositions: &mut [MessageDisposition],
+    dispositions: &[MessageDisposition],
 ) {
-    for ((reply_to, correlation_id), disposition) in reply_infos.iter().zip(dispositions.iter_mut())
-    {
-        let payload = match disposition {
-            MessageDisposition::Reply(resp) => {
-                if reply_to.is_none() {
-                    tracing::warn!("MessageDisposition::Reply received but no reply_to address found in original message");
-                    None
-                } else {
-                    Some(resp.payload.clone())
-                }
+    for ((reply_to, correlation_id), disposition) in reply_infos.iter().zip(dispositions.iter()) {
+        let payload = match (disposition, reply_to) {
+            (MessageDisposition::Reply(resp), Some(_)) => Some(resp.payload.clone()),
+            (MessageDisposition::Reply(_), None) => {
+                tracing::warn!("MessageDisposition::Reply received but no reply_to address found in original message");
+                None
             }
             _ => None,
         };

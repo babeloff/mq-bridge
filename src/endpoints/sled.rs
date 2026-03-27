@@ -112,9 +112,14 @@ impl MessagePublisher for SledPublisher {
     }
 
     async fn status(&self) -> EndpointStatus {
+        let (healthy, last_error) = match self.tree.first() {
+            Ok(_) => (true, None),
+            Err(e) => (false, Some(format!("Sled error: {}", e))),
+        };
         EndpointStatus {
-            healthy: true,
+            healthy,
             target: String::from_utf8_lossy(&self.tree.name()).to_string(),
+            last_error,
             ..Default::default()
         }
     }
@@ -349,13 +354,23 @@ impl MessageConsumer for SledConsumer {
 
     async fn status(&self) -> EndpointStatus {
         // Note: Tree::len() is O(n) in sled and can be expensive for large trees.
-        let pending = self.tree.len();
+        let (healthy, last_error, pending, inflight) = match self.tree.flush() {
+            Ok(_) => (
+                true,
+                None,
+                Some(self.tree.len()),
+                Some(self.inflight_tree.len()),
+            ),
+            Err(e) => (false, Some(format!("Sled flush failed: {}", e)), None, None),
+        };
+
         EndpointStatus {
-            healthy: true,
+            healthy,
             target: String::from_utf8_lossy(&self.tree.name()).to_string(),
-            pending: Some(pending),
+            pending,
+            last_error,
             details: serde_json::json!({
-                "inflight": self.inflight_tree.len()
+                "inflight": inflight
             }),
             ..Default::default()
         }

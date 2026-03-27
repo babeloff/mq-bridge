@@ -46,10 +46,11 @@ fn full<T: Into<Bytes>>(chunk: T) -> BoxBody {
         .boxed()
 }
 
-fn streamed<T: Into<Bytes>>(chunk: T) -> BoxBody {
-    let chunk = chunk.into();
-    let s = futures::stream::once(async move { Ok::<_, anyhow::Error>(Frame::data(chunk)) });
-    StreamBody::new(s).boxed()
+fn streamed<S>(stream: S) -> BoxBody
+where
+    S: futures::Stream<Item = Result<Frame<Bytes>, anyhow::Error>> + Send + Sync + 'static,
+{
+    StreamBody::new(stream).boxed()
 }
 
 /// A source that listens for incoming HTTP requests using hyper.
@@ -99,14 +100,14 @@ impl Service<Request<Incoming>> for HttpBridgeService {
 pub fn create_http_consumer_and_service(
     config: &HttpConfig,
 ) -> anyhow::Result<(HttpConsumer, HttpBridgeService)> {
-    let (request_rx, state) = setup_http_state_and_channel(config)?;
+    let (request_rx, state, buffer_size) = setup_http_state_and_channel(config)?;
     let service = HttpBridgeService { state };
     let (shutdown_tx, _) = tokio::sync::watch::channel(()); // Dummy for service-only mode
 
     let consumer = HttpConsumer {
         request_rx,
         _shutdown_tx: shutdown_tx,
-        buffer_size: config.internal_buffer_size.unwrap_or(100),
+        buffer_size,
         url: config.url.clone(),
     };
 
@@ -115,7 +116,7 @@ pub fn create_http_consumer_and_service(
 
 impl HttpConsumer {
     pub async fn new(config: &HttpConfig) -> anyhow::Result<Self> {
-        let (request_rx, state) = setup_http_state_and_channel(config)?;
+        let (request_rx, state, buffer_size) = setup_http_state_and_channel(config)?;
         let service = HttpBridgeService { state };
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
 
@@ -145,7 +146,7 @@ impl HttpConsumer {
         Ok(Self {
             request_rx,
             _shutdown_tx: shutdown_tx,
-            buffer_size: config.internal_buffer_size.unwrap_or(100),
+            buffer_size,
             url: config.url.clone(),
         })
     }
@@ -157,6 +158,7 @@ fn setup_http_state_and_channel(
 ) -> anyhow::Result<(
     tokio::sync::mpsc::Receiver<HttpSourceMessage>,
     HttpConsumerState,
+    usize,
 )> {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let buffer_size = config.internal_buffer_size.unwrap_or(100).max(1);
@@ -179,7 +181,7 @@ fn setup_http_state_and_channel(
         compression_threshold_bytes,
         custom_headers: config.custom_headers.clone(),
     };
-    Ok((request_rx, state))
+    Ok((request_rx, state, buffer_size))
 }
 
 async fn spawn_http_server(
@@ -392,39 +394,47 @@ async fn handle_request(
     // Validate Basic Authentication if configured
     if let Some((expected_user, expected_pass)) = &state.basic_auth {
         if let Some(auth_header) = req.headers().get("authorization") {
-            if let Ok(auth_str) = auth_header.to_str() {
-                if let Some(encoded) = auth_str.strip_prefix("Basic ") {
-                    if let Ok(decoded) = general_purpose::STANDARD.decode(encoded) {
-                        if let Ok(credentials) = String::from_utf8(decoded) {
-                            let (user, pass) = if let Some(colon_pos) = credentials.find(':') {
-                                (&credentials[..colon_pos], &credentials[colon_pos + 1..])
-                            } else {
-                                ("", "")
-                            };
-                            if user == expected_user && pass == expected_pass {
-                                // Auth successful, proceed
+            match auth_header.to_str() {
+                Ok(auth_str) => {
+                    if let Some(encoded) = auth_str.strip_prefix("Basic ") {
+                        if let Ok(decoded) = general_purpose::STANDARD.decode(encoded) {
+                            if let Ok(credentials) = String::from_utf8(decoded) {
+                                let (user, pass) = if let Some(colon_pos) = credentials.find(':') {
+                                    (&credentials[..colon_pos], &credentials[colon_pos + 1..])
+                                } else {
+                                    ("", "")
+                                };
+                                if user == expected_user && pass == expected_pass {
+                                    // Auth successful, proceed
+                                } else {
+                                    return Ok(Response::builder()
+                                        .status(StatusCode::UNAUTHORIZED)
+                                        .body(full("Invalid credentials"))
+                                        .unwrap());
+                                }
                             } else {
                                 return Ok(Response::builder()
-                                    .status(StatusCode::UNAUTHORIZED)
-                                    .body(full("Invalid credentials"))
+                                    .status(StatusCode::BAD_REQUEST)
+                                    .body(full("Invalid authorization header encoding"))
                                     .unwrap());
                             }
                         } else {
                             return Ok(Response::builder()
                                 .status(StatusCode::BAD_REQUEST)
-                                .body(full("Invalid authorization header encoding"))
+                                .body(full("Invalid base64 encoding in authorization header"))
                                 .unwrap());
                         }
                     } else {
                         return Ok(Response::builder()
-                            .status(StatusCode::BAD_REQUEST)
-                            .body(full("Invalid base64 encoding in authorization header"))
+                            .status(StatusCode::UNAUTHORIZED)
+                            .body(full("Missing Basic authentication scheme"))
                             .unwrap());
                     }
-                } else {
+                }
+                Err(_) => {
                     return Ok(Response::builder()
-                        .status(StatusCode::UNAUTHORIZED)
-                        .body(full("Missing Basic authentication scheme"))
+                        .status(StatusCode::BAD_REQUEST)
+                        .body(full("Invalid authorization header encoding"))
                         .unwrap());
                 }
             }
@@ -574,7 +584,8 @@ fn make_response(
             });
 
             for (key, value) in &msg.metadata {
-                if !key.eq_ignore_ascii_case("transfer-encoding")
+                if !key.eq_ignore_ascii_case("content-encoding")
+                    && !key.eq_ignore_ascii_case("transfer-encoding")
                     && !key.eq_ignore_ascii_case("content-length")
                 {
                     builder = builder.header(key.as_str(), value.as_str());
@@ -606,7 +617,10 @@ fn make_response(
             }
 
             if is_streaming {
-                Ok(builder.body(streamed(payload)).unwrap())
+                let stream = futures::stream::once(async move {
+                    Ok::<_, anyhow::Error>(Frame::data(Bytes::from(payload)))
+                });
+                Ok(builder.body(streamed(stream)).unwrap())
             } else {
                 Ok(builder.body(full(payload)).unwrap())
             }

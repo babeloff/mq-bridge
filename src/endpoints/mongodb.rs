@@ -1334,11 +1334,12 @@ impl MessageConsumer for MongoDbSubscriber {
 
             if let Some(stats) = stats_doc {
                 let is_capped = stats.get_bool("capped").unwrap_or(false);
-                capacity = if is_capped {
-                    stats.get_i64("maxSize").ok().map(|s| s as usize)
-                } else {
-                    None
-                };
+                if is_capped {
+                    if let Ok(max_size) = stats.get_i64("maxSize") {
+                        details["capacity_bytes"] = serde_json::json!(max_size);
+                    }
+                    capacity = stats.get_i64("max").ok().map(|s| s as usize);
+                }
                 details = serde_json::json!({ "cursor_id": self.cursor_id });
                 if is_capped {
                     details["capped"] = serde_json::Value::Bool(true);
