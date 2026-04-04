@@ -17,5 +17,7 @@ pub mod sqlx;
 #[cfg(feature = "zeromq")]
 pub mod zeromq;
 
+pub mod file;
+pub mod logic_test;
 pub mod memory;
 pub mod route;

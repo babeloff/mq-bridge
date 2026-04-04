@@ -1,5 +1,4 @@
 #![allow(unused_imports, dead_code)]
-mod integration;
 
 use mq_bridge::test_utils::{run_test_with_docker, setup_logging};
 use mq_bridge::traits::{MessageConsumer, MessagePublisher};

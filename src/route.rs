@@ -299,12 +299,12 @@ impl Route {
                             }
                             Ok(Err(e)) => {
                                 match e.downcast_ref::<ProcessingError>() {
-                                    Some(ProcessingError::Retryable(_)) => {
-                                        warn!("Route '{}' failed with a retryable error: {}. Reconnecting in 5 seconds...", name, e);
-                                        break;
+                                Some(ProcessingError::NonRetryable(_)) => {
+                                    error!("Route '{}' failed with a permanent error: {}. Shutting down.", name, e);
+                                    break; // Stop the route for permanent failures
                                     }
                                     _ => {
-                                        error!("Route '{}' failed: {}. Reconnecting in 5 seconds...", name, e);
+                                    warn!("Route '{}' failed: {}. Reconnecting in 5 seconds...", name, e);
                                     }
                                 }
                                 tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;

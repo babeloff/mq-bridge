@@ -140,7 +140,7 @@ impl RandomPanicPublisher {
                     self.config.mode
                 );
             }
-            FaultMode::Disconnect => Err(PublisherError::NonRetryable(anyhow::anyhow!(
+            FaultMode::Disconnect => Err(PublisherError::Retryable(anyhow::anyhow!(
                 "__CONNECTION_ERROR__: RandomPanicPublisher: Simulated connection loss"
             ))),
             FaultMode::Timeout => Err(PublisherError::Retryable(anyhow::anyhow!(

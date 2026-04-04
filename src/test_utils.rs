@@ -590,6 +590,35 @@ pub fn generate_message(id: u128) -> CanonicalMessage {
     CanonicalMessage::new(STATIC_PAYLOAD.clone(), Some(id))
 }
 
+/// Verifies that multiple subscribers receive the same message (Broadcast/Pub-Sub logic).
+pub async fn verify_subscriber_logic(
+    publisher: Arc<dyn MessagePublisher>,
+    sub1: Arc<AsyncMutex<dyn MessageConsumer>>,
+    sub2: Arc<AsyncMutex<dyn MessageConsumer>>,
+) {
+    let payload = format!("broadcast-{}", fast_uuid_v7::gen_id());
+    publisher.send(payload.as_str().into()).await.unwrap();
+
+    let res1 = tokio::time::timeout(Duration::from_secs(10), async {
+        let mut guard = sub1.lock().await;
+        guard.receive().await
+    })
+    .await
+    .expect("sub1 timeout")
+    .unwrap();
+
+    let res2 = tokio::time::timeout(Duration::from_secs(10), async {
+        let mut guard = sub2.lock().await;
+        guard.receive().await
+    })
+    .await
+    .expect("sub2 timeout")
+    .unwrap();
+
+    assert_eq!(res1.message.get_payload_str(), payload);
+    assert_eq!(res2.message.get_payload_str(), payload);
+}
+
 /// Measure the performance of writing messages to a publisher.
 ///
 /// This test creates a publisher and consumer with a bounded channel.

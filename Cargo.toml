@@ -146,6 +146,7 @@ chrono = "0.4"
 metrics-util = "0.20"
 criterion = { version = "0.8", features = ["async", "async_tokio"] }
 mq-bridge = { path = ".", features = ["test-utils"] }
+reqwest = { version = "0.12", features = ["stream"] }
 
 [[bench]]
 name = "performance_bench"
