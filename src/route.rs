@@ -428,63 +428,56 @@ impl Route {
                             });
                         }
                         Ok(SentBatch::Partial { responses, failed }) => {
-                            let has_retryable = failed.iter().any(|(_, e)| matches!(e, PublisherError::Retryable(_)));
-                            if has_retryable {
-                                let failed_count = failed.len();
-                                let (_, first_error) = failed
+                            // Connection and Retryable are both "transient" errors - treat them the same.
+                            // Connection errors from handlers or publishers both indicate a temporary
+                            // failure that should either be retried (with middleware) or crash the route.
+                            let has_transient = failed.iter().any(|(_, e)| {
+                                matches!(e, PublisherError::Retryable(_) | PublisherError::Connection(_))
+                            });
+                            if has_transient {
+                                let (_, first_err) = failed
                                     .iter()
-                                    .find(|(_, e)| matches!(e, PublisherError::Retryable(_)))
-                                    .expect("has_retryable is true");
+                                    .find(|(_, e)| matches!(e, PublisherError::Retryable(_) | PublisherError::Connection(_)))
+                                    .expect("has_transient is true");
                                 let err = anyhow::anyhow!(
-                                    "Failed to send {} messages in batch. First retryable error: {}",
-                                    failed_count,
-                                    first_error
+                                    "Transient error in batch send ({} messages failed). First error: {}",
+                                    failed.len(),
+                                    first_err
                                 );
-                                // Partially ack/nack the batch to fill the sequencer slot.
+                                // Ack/nack the batch to fill the sequencer slot.
                                 let commit = commit_opt.take().expect("Commit already used");
                                 let dispositions =
                                     map_responses_to_dispositions(&message_ids, responses, &failed);
                                 if let Err(commit_err) = commit(dispositions).await {
-                                    warn!("Commit after partial send failure also failed (this is expected during a disconnect): {}", commit_err);
-                                }
-
-                                // Scan failed vector for any connection error
-                                let has_connection_error = failed.iter().any(|(_, e)| {
-                                    matches!(e, ProcessingError::Connection(_))
-                                });
-                                if has_connection_error {
-                                    break Err(err);
+                                    warn!("Commit after transient failure also failed: {}", commit_err);
                                 }
                                 if !has_retry_middleware {
-                                    // No retry middleware: treat retryable error as fatal
                                     break Err(err);
                                 }
-                                warn!("Retryable error detected in batch, message(s) Nack'ed for re-delivery: {}", err);
+                                warn!("Transient error in batch, message(s) Nack'ed for re-delivery: {}", err);
                                 continue;
                             }
-                            // If we reach here, there were no retryable errors, only non-retryable ones.
-                            // Or, there were no errors at all (but not SentBatch::Ack).
-                            {
-                                for (msg, e) in &failed {
-                                    error!("Dropping message (ID: {:032x}) due to non-retryable error: {}", msg.message_id, e);
-                                }
-                                let commit = commit_opt.take().expect("Commit already used");
-                                let permit = commit_semaphore.clone().acquire_owned().await.map_err(|e| anyhow::anyhow!("Semaphore error: {}", e))?;
-                                let err_tx = err_tx.clone();
-                                let ids = std::mem::take(&mut message_ids);
-                                commit_tasks.spawn(async move {
-                                    let dispositions = map_responses_to_dispositions(&ids, responses, &failed);
-                                    if let Err(e) = commit(dispositions).await {
-                                        error!("Commit failed: {}", e);
-                                        if err_tx.try_send(e).is_err() {
-                                            warn!("Could not send commit error to main task, it might be down or busy.");
-                                        }
-                                    }
-                                    drop(permit);
-                                });
+                            // Only non-retryable errors remain - drop them with a log.
+                            for (msg, e) in &failed {
+                                error!("Dropping message (ID: {:032x}) due to non-retryable error: {}", msg.message_id, e);
                             }
+                            let commit = commit_opt.take().expect("Commit already used");
+                            let permit = commit_semaphore.clone().acquire_owned().await.map_err(|e| anyhow::anyhow!("Semaphore error: {}", e))?;
+                            let err_tx = err_tx.clone();
+                            let ids = std::mem::take(&mut message_ids);
+                            commit_tasks.spawn(async move {
+                                let dispositions = map_responses_to_dispositions(&ids, responses, &failed);
+                                if let Err(e) = commit(dispositions).await {
+                                    error!("Commit failed: {}", e);
+                                    if err_tx.try_send(e).is_err() {
+                                        warn!("Could not send commit error to main task, it might be down or busy.");
+                                    }
+                                }
+                                drop(permit);
+                            });
                         }
                         Err(e) => {
+                            // Any direct error from send_batch crashes the route.
                             warn!("Publisher error, sending {} Nacks to commit", batch_len);
                             let commit = commit_opt.take().expect("Commit already used");
                             let nack_result = commit(vec![MessageDisposition::Nack; batch_len]).await;
@@ -584,48 +577,37 @@ impl Route {
                             });
                         }
                         Ok(SentBatch::Partial { responses, failed }) => {
-                            let has_retryable = failed.iter().any(|(_, e)| matches!(e, PublisherError::Retryable(_)));
-                            if has_retryable {
-                                let commit = commit_opt.take().expect("Commit already used");
-                                let failed_count = failed.len();
-                                let (_, first_error) = failed
+                            // Connection and Retryable are both "transient" errors.
+                            let has_transient = failed.iter().any(|(_, e)| {
+                                matches!(e, PublisherError::Retryable(_) | PublisherError::Connection(_))
+                            });
+                            if has_transient {
+                                let (_, first_err) = failed
                                     .iter()
-                                    .find(|(_, e)| matches!(e, PublisherError::Retryable(_)))
-                                    .expect("has_retryable is true");
+                                    .find(|(_, e)| matches!(e, PublisherError::Retryable(_) | PublisherError::Connection(_)))
+                                    .expect("has_transient is true");
                                 let e = anyhow::anyhow!(
-                                    "Failed to send {} messages in batch. First retryable error: {}",
-                                    failed_count,
-                                    first_error
+                                    "Transient error in batch send ({} messages failed). First error: {}",
+                                    failed.len(),
+                                    first_err
                                 );
-                                error!("Worker failed to send message batch: {}", e);
-                                // Partially ack/nack the batch to fill the sequencer slot.
-                                // This is crucial to prevent deadlocks. Even if this commit fails
-                                // due to a broken connection, it's important to attempt it.
+                                let commit = commit_opt.take().expect("Commit already used");
+                                // Ack/nack the batch to fill the sequencer slot.
                                 let dispositions =
                                     map_responses_to_dispositions(&message_ids, responses, &failed);
                                 if let Err(commit_err) = commit(dispositions).await {
-                                    warn!("Commit after partial send failure also failed (this is expected during a disconnect): {}", commit_err);
-                                }
-
-                                // Scan failed vector for any connection error
-                                let has_connection_error = failed.iter().any(|(_, err)| {
-                                    matches!(err, ProcessingError::Connection(_))
-                                });
-                                if has_connection_error {
-                                    if err_tx.try_send(e).is_err() {
-                                        warn!("Could not send error to main task, it might be down or busy.");
-                                    }
-                                    break;
+                                    warn!("Commit after transient failure also failed: {}", commit_err);
                                 }
                                 if !has_retry_middleware {
-                                    // No retry middleware: treat retryable error as fatal
                                     if err_tx.try_send(e).is_err() {
                                         warn!("Could not send error to main task, it might be down or busy.");
                                     }
                                     break;
                                 }
-                                continue; // Continue to next batch, broker will re-deliver Nack'ed messages
+                                warn!("Transient error in batch, message(s) Nack'ed for re-delivery: {}", e);
+                                continue;
                             }
+                            // Only non-retryable errors remain - drop them with a log.
                             for (msg, e) in &failed {
                                 error!("Worker dropping message (ID: {:032x}) due to non-retryable error: {}", msg.message_id, e);
                             }
@@ -1766,16 +1748,14 @@ mod tests {
         let in_topic = format!("dlq_in_{}", unique_id);
         let out_topic = format!("dlq_out_{}", unique_id);
         let dlq_topic = format!("dlq_target_{}", unique_id);
-
         let input = Endpoint::new_memory(&in_topic, 10);
-
         let dlq_endpoint = Endpoint::new_memory(&dlq_topic, 10);
 
         let mut output = Endpoint::new_memory(&out_topic, 10);
         output.middlewares = vec![
             // Inner-most: Fail always
             Middleware::RandomPanic(RandomPanicMiddleware {
-                mode: FaultMode::Disconnect, // Returns Retryable error
+                mode: FaultMode::Timeout, // Returns Retryable error, does NOT cause route restart
                 trigger_on_message: None,    // Fail always
                 enabled: true,
                 ..Default::default()
