@@ -62,11 +62,12 @@ pub async fn test_nats_chaos() {
 pub async fn test_nats_subscriber_logic() {
     setup_logging();
     run_test_with_docker("tests/integration/docker-compose/nats.yml", || async {
-        let subject = format!("sub_logic_{}", fast_uuid_v7::gen_id());
+        let stream_name = format!("sub_logic_stream_{}", fast_uuid_v7::gen_id());
+        let subject = format!("{}.sub_logic_{}", stream_name, fast_uuid_v7::gen_id());
         let config = mq_bridge::models::NatsConfig {
             url: "nats://localhost:4222".to_string(),
             subject: Some(subject),
-            stream: Some("test-stream".to_string()),
+            stream: Some(stream_name),
             subscriber_mode: true,
             ..Default::default()
         };
@@ -78,6 +79,8 @@ pub async fn test_nats_subscriber_logic() {
         let sub2 = Arc::new(tokio::sync::Mutex::new(
             NatsConsumer::new(&config).await.unwrap(),
         ));
+        // Give subscribers time to connect and finish the subscription
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         verify_subscriber_logic(publisher, sub1, sub2).await;
     })

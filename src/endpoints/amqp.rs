@@ -43,16 +43,30 @@ pub struct AmqpPublisher {
 impl AmqpPublisher {
     pub async fn new(config: &AmqpConfig) -> anyhow::Result<Self> {
         let state = Self::connect(config).await?;
-        let queue = config
+        let queue_or_exchange = config
             .queue
             .as_deref()
-            .ok_or_else(|| anyhow!("Queue name is required for AMQP publisher"))?
-            .to_string();
+            .ok_or_else(|| anyhow!("Queue name is required for AMQP publisher"))?;
+
+        let (exchange, queue) = if config.subscribe_mode {
+            (
+                config
+                    .exchange
+                    .clone()
+                    .unwrap_or_else(|| queue_or_exchange.to_string()),
+                "".to_string(),
+            )
+        } else {
+            (
+                config.exchange.clone().unwrap_or_default(),
+                queue_or_exchange.to_string(),
+            )
+        };
 
         Ok(Self {
             state: Arc::new(RwLock::new(state)),
             config: config.clone(),
-            exchange: config.exchange.clone().unwrap_or_default(),
+            exchange,
             queue,
             no_persistence: config.no_persistence,
             delayed_ack: config.delayed_ack,
@@ -60,7 +74,7 @@ impl AmqpPublisher {
     }
 
     async fn connect(config: &AmqpConfig) -> anyhow::Result<AmqpState> {
-        let queue = config
+        let queue_or_exchange = config
             .queue
             .as_deref()
             .ok_or_else(|| anyhow!("Queue name is required for AMQP publisher"))?;
@@ -72,18 +86,34 @@ impl AmqpPublisher {
             .await?;
 
         if !config.no_declare_queue {
-            // Ensure the queue exists before we try to publish to it. This is idempotent.
-            info!(queue = %queue, "Declaring AMQP queue in sink");
-            channel
-                .queue_declare(
-                    queue,
-                    QueueDeclareOptions {
-                        durable: !config.no_persistence,
-                        ..Default::default()
-                    },
-                    FieldTable::default(),
-                )
-                .await?;
+            if config.subscribe_mode {
+                let exchange_name = config.exchange.as_deref().unwrap_or(queue_or_exchange);
+                info!(exchange = %exchange_name, "Declaring AMQP Fanout exchange in sink");
+                channel
+                    .exchange_declare(
+                        exchange_name,
+                        ExchangeKind::Fanout,
+                        ExchangeDeclareOptions {
+                            durable: true,
+                            ..Default::default()
+                        },
+                        FieldTable::default(),
+                    )
+                    .await?;
+            } else {
+                // Ensure the queue exists before we try to publish to it. This is idempotent.
+                info!(queue = %queue_or_exchange, "Declaring AMQP queue in sink");
+                channel
+                    .queue_declare(
+                        queue_or_exchange,
+                        QueueDeclareOptions {
+                            durable: !config.no_persistence,
+                            ..Default::default()
+                        },
+                        FieldTable::default(),
+                    )
+                    .await?;
+            }
         }
 
         Ok(AmqpState {

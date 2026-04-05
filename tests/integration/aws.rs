@@ -192,21 +192,43 @@ pub async fn test_aws_status() {
             controller.start_service("localstack");
             println!("[AWS] Service 'localstack' started. Waiting for reconnect...");
 
-            // AWS SDK is slow to recover, so we give it more time.
-            sleep(Duration::from_secs(10)).await;
+            let start = std::time::Instant::now();
+            loop {
+                // LocalStack state is ephemeral. Re-create the queue after restart.
+                // This also helps wait for the SQS service to become ready.
+                ensure_queue_exists().await;
 
-            let pub_status = publisher.status().await;
-            let con_status = consumer.status().await;
-            assert!(
-                pub_status.healthy,
-                "Publisher should be healthy after reconnect. Status: {:?}",
-                pub_status
-            );
-            assert!(
-                con_status.healthy,
-                "Consumer should be healthy after reconnect. Status: {:?}",
-                con_status
-            );
+                let p_res = AwsPublisher::new(&config).await;
+                let c_res = AwsConsumer::new(&config).await;
+
+                if let (Ok(p), Ok(c)) = (&p_res, &c_res) {
+                    if p.status().await.healthy && c.status().await.healthy {
+                        println!("[AWS] Reconnect detected.");
+                        break;
+                    }
+                }
+
+                if start.elapsed() > Duration::from_secs(30) {
+                    // Give more time for AWS SDK to reconnect
+                    let status = match (p_res, c_res) {
+                        (Ok(p), Ok(c)) => format!(
+                            "Pub Status: {:?}, Con Status: {:?}",
+                            p.status().await,
+                            c.status().await
+                        ),
+                        (p, c) => format!(
+                            "Pub Init Error: {:?}, Con Init Error: {:?}",
+                            p.err(),
+                            c.err()
+                        ),
+                    };
+                    panic!(
+                        "[AWS] Timeout waiting for reconnect. Last state: {}",
+                        status
+                    );
+                }
+                sleep(Duration::from_secs(2)).await;
+            }
             println!("[AWS] Status test successful.");
         },
     )

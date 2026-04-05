@@ -8,16 +8,31 @@
 ![macOS](https://img.shields.io/badge/macOS-supported-green?logo=apple)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
+
 ```text
       ┌────── mq-bridge-lib ──────┐
 ──────┴───────────────────────────┴──────
+            crossing streams
 ```
 
 `mq-bridge` is an asynchronous message library for Rust. It connects different messaging systems, data stores, and protocols. Unlike a classic bridge that simply forwards messages, `mq-bridge` acts as a **programmable integration layer**, allowing for transformation, filtering, routing and event/command handling. It is built on Tokio and supports patterns like retries, dead-letter queues, and message deduplication.
 
+
+## Architecture
+
+See [ARCHITECTURE.md](ARCHITECTURE.md) for a detailed overview of the internal design, extensibility, and usage patterns.
+
+**Usage Types:**
+
+1. **Event Handler (TypedHandler):** Communicate between applications using strongly-typed message handlers, optionally with response support.
+2. **Compute Handler:** Generally receive and process messages with a custom handler
+3. **Direct Endpoint Usage:** Use `publish` / `publish_batch` and `receive` / `receive_batch` directly on endpoints. This mode requires manual commit, batch sequencing, and concurrency handling.
+
+For implementation details and quick start examples for each usage type, see the [Architecture Guide](ARCHITECTURE.md).
+
 ## Features
 
-*   **Supported Backends**: Kafka, NATS, AMQP (RabbitMQ), MQTT, MongoDB, SQL Databases (PostgreSQL, MySQL, SQLite via `sqlx`), HTTP, ZeroMQ, Files, AWS (SQS/SNS), IBM MQ, and in-memory channels.
+*   **Supported Backends**: Kafka, NATS, AMQP (RabbitMQ), MQTT, MongoDB, SQL Databases (PostgreSQL, MySQL, SQLite via sqlx), HTTP, ZeroMQ, Files, AWS (SQS/SNS), IBM MQ, and in-memory channels.
     > **Note**: IBM MQ is not included in the `full` feature set. It requires the `ibm-mq` feature and the IBM MQ Client library. See [mqi crate](https://crates.io/crates/mqi/) for installation details.
 *   **Configuration**: Routes can be defined via YAML, JSON or environment variables.
 *   **Programmable Logic**: Inject custom Rust handlers to transform or filter messages in-flight.
@@ -44,11 +59,29 @@ It may still be possible that there are issues with
 - nats, if jetstream support is disabled
 - TLS integration, as this also hasn't been tested a lot and is usually non-trivial to set up
 
+Automated integration and performance tests cover all supported endpoints, including queue and subscriber modes, request-reply (where supported), and protocol-specific behaviors. See the backend feature table below for details on configuration and protocol support.
 
-Due to the large code base, it may still be possible that some endpoints may show
-issues in production; therefore, they should be tested locally first. They all worked locally
-for me and didn't show data loss during simple in-flight broker restarts.
-Kafka, MongoDB, IBM-MQ, Files, and Memory are considered production-ready.
+The following table tracks, which endpoints are already used in other projects actively for events. Send me a message or create an issue if you use an endpoint actively:
+
+| Endpoint  | Manual Test |
+|-----------|:-----------:|
+| Kafka     |     ✅      |
+| MongoDB   |     ✅      |
+| HTTP      |     ✅      |
+| IBM MQ    |     ✅      |
+| Retry Middleware    |     ✅      |
+| DLQ Middleware    |     ✅      |
+
+All endpoints are have automated integration tests and did not show data loss during simple in-flight broker restarts.
+
+## Test Notes
+
+- **NATS**: Automated tests are only run with JetStream enabled. Other NATS modes are not covered by integration tests.
+- **MongoDB**: The reply pattern was just tested in an automated test. It is not actively used in projects yet. Due to kind of emulation, it may be possible to have major issues with lost replys, if timeouts are not configured correctly.
+- **Performance Tests**: These are generally executed in non-subscriber (queue) mode for all endpoints.
+- **Request-Reply**: Only tested for endpoints that natively support or emulate it (see backend table below for details). Endpoints like SQLx, Files, AWS, IBM MQ, and Sled do not support request-reply and are not tested for this pattern.
+- **Subscriber Mode**: You may also completely emulate a subscriber mode, if the subscribers are static, by performing a fanout and manually create an endpoint for each target.
+
 
 ### When to use mq-bridge
 *   **Hybrid Messaging**: Connect systems speaking different protocols (e.g., MQTT to Kafka) without writing custom adapters.
@@ -349,20 +382,26 @@ cargo bench --features "full"
 ```
 The times are not stable yet, it is therefore recommended to perform the integration performance test if you want to measure throughput.
 
+## Contributing
+
+We welcome contributions! See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines on how to get started, code style, and submitting pull requests.
+
 ## AI Disclaimer
 
 This library has been widely written with AI assistance. 
 
 Some of the code - the core for example, was originally written by myself, 
 but most other was generated by AI. I mostly used Gemini for 
-planning and writing, CodeRabbit for reviews and Claude for bugfixing and 
-more complicated tasks that Gemini couldn't solve properly.
+planning, analysis and writing, CodeRabbit for reviews and Claude for bugfixing, 
+additional planning and more complicated tasks when Gemini failed.
 While some of the AI output was great, some other output wasn't.
 I am aware that in year 2026, AI is still not generating perfect code and sometimes
-breaks simple stuff or forgets important lines during refactorings that then cause
-severe issues. 
+breaks simple stuff or forgets important lines during refactorings that 
+later result in severe bugs. 
+I didn't use any agent mode as this usually causes early architectural issues that
+can later not be resolved easily.
 I reviewed all the output code, cleaned it up manually, 
-re-specified and refactored it when insuficcient.
+re-specified and refactored it when necessary.
 **I do trust the current code as much as if it would be completely written by myself.**
 
 I didn't change the AI code appearance, so you will sometimes still see code that just

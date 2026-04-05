@@ -60,7 +60,7 @@ impl NatsPublisher {
             jetstream
                 .get_or_create_stream(stream::Config {
                     name: stream_name.to_string(),
-                    subjects: vec![format!("{}.>", stream_name)],
+                    subjects: vec![subject.to_string()],
                     max_messages: config.stream_max_messages.unwrap_or(1_000_000),
                     max_bytes: config.stream_max_bytes.unwrap_or(1024 * 1024 * 1024), // 1GB
                     ..Default::default()
@@ -247,16 +247,25 @@ impl NatsConsumer {
             .as_deref()
             .ok_or_else(|| anyhow!("Stream name is required for NATS consumer"))?;
 
-        let (durable_name, queue_group, deliver_policy) = if config.subscriber_mode {
-            (None, None, jetstream::consumer::DeliverPolicy::New)
+        let deliver_policy = match config.deliver_policy {
+            Some(crate::models::NatsDeliverPolicy::All) | None => {
+                jetstream::consumer::DeliverPolicy::All
+            }
+            Some(crate::models::NatsDeliverPolicy::Last) => {
+                jetstream::consumer::DeliverPolicy::Last
+            }
+            Some(crate::models::NatsDeliverPolicy::New) => jetstream::consumer::DeliverPolicy::New,
+            Some(crate::models::NatsDeliverPolicy::LastPerSubject) => {
+                jetstream::consumer::DeliverPolicy::LastPerSubject
+            }
+        };
+
+        let (durable_name, queue_group) = if config.subscriber_mode {
+            (None, None)
         } else {
             let durable = format!("{}-{}-{}", APP_NAME, stream_name, subject.replace('.', "-"));
             let queue = format!("{}-{}", APP_NAME, stream_name.replace('.', "-"));
-            (
-                Some(durable),
-                Some(queue),
-                jetstream::consumer::DeliverPolicy::All,
-            )
+            (Some(durable), Some(queue))
         };
 
         let (core, client) = NatsCore::connect(
@@ -460,7 +469,7 @@ impl NatsCore {
             jetstream
                 .get_or_create_stream(stream::Config {
                     name: stream_name.to_string(),
-                    subjects: vec![format!("{}.>", stream_name)],
+                    subjects: vec![subject.to_string()],
                     max_messages: config.stream_max_messages.unwrap_or(1_000_000),
                     max_bytes: config.stream_max_bytes.unwrap_or(1024 * 1024 * 1024), // 1GB
                     ..Default::default()

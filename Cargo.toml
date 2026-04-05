@@ -154,6 +154,10 @@ harness = false
 required-features = ["test-utils"]
 
 [[test]]
+name = "performance_test"
+required-features = ["test-utils"]
+
+[[test]]
 name = "integration_test"
 required-features = ["test-utils"]
 

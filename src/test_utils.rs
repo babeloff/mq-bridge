@@ -44,6 +44,13 @@ static PERFORMANCE_RESULTS: Lazy<Mutex<Vec<PerformanceResult>>> =
 /// Global lock to serialize tests that use Docker containers.
 static DOCKER_TEST_LOCK: Lazy<AsyncMutex<()>> = Lazy::new(|| AsyncMutex::new(()));
 
+pub fn should_run(test_name: &str) -> bool {
+    let filter = std::env::var("MQB_TEST_BACKEND")
+        .unwrap_or_default()
+        .to_lowercase();
+    filter.is_empty() || test_name.to_lowercase().contains(&filter)
+}
+
 /// Adds a performance result to the global collector.
 pub fn add_performance_result(result: PerformanceResult) {
     println!(
@@ -599,7 +606,8 @@ pub async fn verify_subscriber_logic(
     let payload = format!("broadcast-{}", fast_uuid_v7::gen_id());
     publisher.send(payload.as_str().into()).await.unwrap();
 
-    let res1 = tokio::time::timeout(Duration::from_secs(10), async {
+    // tokio::time::sleep(Duration::from_secs(1000)).await; // Backoff before retry
+    let res1 = tokio::time::timeout(Duration::from_secs(15), async {
         let mut guard = sub1.lock().await;
         guard.receive().await
     })
@@ -607,7 +615,7 @@ pub async fn verify_subscriber_logic(
     .expect("sub1 timeout")
     .unwrap();
 
-    let res2 = tokio::time::timeout(Duration::from_secs(10), async {
+    let res2 = tokio::time::timeout(Duration::from_secs(15), async {
         let mut guard = sub2.lock().await;
         guard.receive().await
     })

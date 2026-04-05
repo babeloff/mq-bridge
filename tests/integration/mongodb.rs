@@ -7,7 +7,7 @@ use mq_bridge::endpoints::mongodb::{MongoDbConsumer, MongoDbPublisher, MongoDbSu
 use mq_bridge::test_utils::{
     add_performance_result, run_chaos_pipeline_test, run_direct_perf_test,
     run_performance_pipeline_test, run_pipeline_test, run_test_with_docker,
-    run_test_with_docker_controller, setup_logging, verify_subscriber_logic,
+    run_test_with_docker_controller, setup_logging, should_run, verify_subscriber_logic,
 };
 const CONFIG_YAML: &str = r#"
 routes:
@@ -88,6 +88,9 @@ pub async fn test_mongodb_subscriber_logic() {
 #[tokio::test]
 #[ignore = "requires docker compose"]
 async fn test_mongodb_subscriber_no_duplicates() {
+    if !should_run("mongodb") {
+        return;
+    }
     use mq_bridge::models::{Endpoint, Route};
     use mq_bridge::traits::MessagePublisher;
     use mq_bridge::type_handler::TypeHandler;

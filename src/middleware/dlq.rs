@@ -45,6 +45,7 @@ impl MessagePublisher for DlqPublisher {
                     PublisherError::NonRetryable(_) => true,
                     // If retries are exhausted, we treat it as a non-retryable error for DLQ purposes.
                     PublisherError::Retryable(err) => err.to_string().contains("Retries exhausted"),
+                    PublisherError::Connection(_) => false, // Connection errors are always retryable
                 };
 
                 if !is_non_retryable {
@@ -162,6 +163,7 @@ impl MessagePublisher for DlqPublisher {
                     PublisherError::NonRetryable(_) => true,
                     // If retries are exhausted, we treat it as a non-retryable error for DLQ purposes.
                     PublisherError::Retryable(err) => err.to_string().contains("Retries exhausted"),
+                    PublisherError::Connection(_) => false, // Connection errors are always retryable
                 };
 
                 if !is_non_retryable {

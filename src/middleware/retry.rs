@@ -30,6 +30,7 @@ impl RetryPublisher {
             match operation().await {
                 Ok(val) => return Ok(val),
                 Err(e @ PublisherError::NonRetryable(_)) => return Err(e), // Don't retry non-retryable errors
+                Err(e @ PublisherError::Connection(_)) => return Err(e), // Propagate connection errors
                 Err(e @ PublisherError::Retryable(_)) => {
                     if attempt >= self.config.max_attempts {
                         return Err(PublisherError::Retryable(anyhow!(

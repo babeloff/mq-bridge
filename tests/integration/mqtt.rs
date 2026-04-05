@@ -18,16 +18,16 @@ routes:
     output:
       middlewares:
         - retry:
-            max_attempts: 20
+            max_attempts: 10
             initial_interval_ms: 500
             max_interval_ms: 2000
-      mqtt: { url: "mqtt://localhost:1883", topic: "test_topic_mqtt", client_id: "test-publisher-chaos", clean_session: false, qos: 1, max_inflight: 500, queue_capacity: 1000, delayed_ack: false }
+      mqtt: { url: "mqtt://localhost:1883", topic: "test_topic_mqtt", client_id: "test-publisher-chaos", clean_session: false, qos: 1, max_inflight: 1000, queue_capacity: 10000, delayed_ack: false }
 
   mqtt_to_memory:
     concurrency: 4
     batch_size: 128
     input:
-      mqtt: { url: "mqtt://localhost:1883", topic: "test_topic_mqtt", client_id: "test-consumer-chaos", clean_session: false, qos: 1, max_inflight: 500, queue_capacity: 1000 }
+      mqtt: { url: "mqtt://localhost:1883", topic: "test_topic_mqtt", client_id: "test-consumer-chaos", clean_session: false, qos: 1, max_inflight: 1000, queue_capacity: 10000 }
     output:
       memory: { topic: "test-out-mqtt", capacity: {out_capacity} }
 "#;
@@ -74,9 +74,14 @@ pub async fn test_mqtt_subscriber_logic() {
         let sub1 = Arc::new(tokio::sync::Mutex::new(
             MqttConsumer::new(&config).await.unwrap(),
         ));
+        // Give sub1 a moment to subscribe before sub2 connects, to reduce race conditions
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         let sub2 = Arc::new(tokio::sync::Mutex::new(
             MqttConsumer::new(&config).await.unwrap(),
         ));
+        // Give subscribers time to connect and finish the MQTT handshake/subscription
+        // especially when using clean_session: true (ephemeral subscriptions).
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         verify_subscriber_logic(publisher, sub1, sub2).await;
     })
@@ -102,7 +107,9 @@ pub async fn test_mqtt_performance_direct() {
         let config = mq_bridge::models::MqttConfig {
             url: "mqtt://localhost:1883".to_string(),
             // Increase the client's incoming message buffer to hold all messages from the test run.
-            queue_capacity: Some(PERF_TEST_BATCH_MESSAGE_COUNT * 2), // For batch and single
+            queue_capacity: Some(PERF_TEST_BATCH_MESSAGE_COUNT * 4), // Extra margin
+            max_inflight: Some(60000), // Maximize sink capacity to avoid broker queue overflows
+            qos: Some(1),
             topic: Some(topic.to_string()),
             ..Default::default()
         };

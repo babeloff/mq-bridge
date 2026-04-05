@@ -93,10 +93,22 @@ pub async fn test_kafka_subscriber_logic() {
 
         let publisher = Arc::new(KafkaPublisher::new(&config).await.unwrap());
         let sub1 = Arc::new(tokio::sync::Mutex::new(
-            KafkaConsumer::new(&config).await.unwrap(),
+            KafkaConsumer::new(
+                &config
+                    .clone()
+                    .with_consumer_option("auto.offset.reset", "earliest"),
+            )
+            .await
+            .unwrap(),
         ));
         let sub2 = Arc::new(tokio::sync::Mutex::new(
-            KafkaConsumer::new(&config).await.unwrap(),
+            KafkaConsumer::new(
+                &config
+                    .clone()
+                    .with_consumer_option("auto.offset.reset", "earliest"),
+            )
+            .await
+            .unwrap(),
         ));
 
         verify_subscriber_logic(publisher, sub1, sub2).await;
