@@ -190,39 +190,49 @@ impl MessagePublisher for MqttPublisher {
         let client = self.state.read().await.client.clone();
 
         let mut first_error: Option<anyhow::Error> = None;
+        let mut failed_indices = Vec::new();
 
-        for message in &messages {
-            // If an error has already occurred, we can stop trying to publish.
+        for (i, message) in messages.iter().enumerate() {
             if first_error.is_some() {
-                break;
+                failed_indices.push(i);
+                continue;
             }
-
             let publish_future = client.publish(&self.topic, self.qos, message.clone());
-
             match tokio::time::timeout(Duration::from_secs(10), publish_future).await {
                 Ok(Ok(_)) => {
                     // Successfully enqueued
                 }
                 Ok(Err(e)) => {
-                    // Enqueueing failed.
                     first_error = Some(anyhow!("Failed to publish MQTT message in batch: {}", e));
+                    failed_indices.push(i);
                 }
                 Err(_) => {
-                    // Timeout.
                     first_error = Some(anyhow!("MQTT publish timed out in batch"));
+                    failed_indices.push(i);
                 }
             }
         }
 
         if let Some(e) = first_error {
             warn!(
-                "MQTT batch send failed, connection error for all {} messages. First error: {}",
+                "MQTT batch send failed, marking all {} messages for retry. First error: {}",
                 messages.len(),
                 e
             );
-            return Err(PublisherError::Connection(anyhow!(
-                "MQTT batch send failed: {e}"
-            )));
+            let failed_messages = messages
+                .into_iter()
+                .map(|m| {
+                    (
+                        m,
+                        PublisherError::Retryable(anyhow!("Batch failed due to connection issue")),
+                    )
+                })
+                .collect();
+
+            Ok(SentBatch::Partial {
+                responses: None,
+                failed: failed_messages,
+            })
         } else {
             Ok(SentBatch::Ack)
         }

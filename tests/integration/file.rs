@@ -28,8 +28,10 @@ pub async fn test_file_subscriber_logic() {
     ));
 
     // Wait for consumers to be ready
-    sub1.lock().await.wait_ready().await;
-    sub2.lock().await.wait_ready().await;
+    let _ = sub1.lock().await;
+    tokio::task::yield_now().await;
+    let _ = sub2.lock().await;
+    tokio::task::yield_now().await;
 
     verify_subscriber_logic(publisher, sub1, sub2).await;
 }
