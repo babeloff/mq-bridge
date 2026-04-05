@@ -1756,7 +1756,7 @@ mod tests {
             // Inner-most: Fail always
             Middleware::RandomPanic(RandomPanicMiddleware {
                 mode: FaultMode::Timeout, // Returns Retryable error, does NOT cause route restart
-                trigger_on_message: None,    // Fail always
+                trigger_on_message: None, // Fail always
                 enabled: true,
                 ..Default::default()
             }),
