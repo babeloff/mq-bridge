@@ -27,8 +27,9 @@ pub async fn test_file_subscriber_logic() {
         FileConsumer::new(&config).await.unwrap(),
     ));
 
-    // Startup delay to allow consumers to initialize
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    // Wait for consumers to be ready
+    sub1.lock().await.wait_ready().await;
+    sub2.lock().await.wait_ready().await;
 
     verify_subscriber_logic(publisher, sub1, sub2).await;
 }

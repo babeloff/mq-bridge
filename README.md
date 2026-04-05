@@ -77,7 +77,7 @@ All endpoints have automated integration tests and did not show data loss during
 ## Test Notes
 
 - **NATS**: Automated tests are only run with JetStream enabled. Other NATS modes are not covered by integration tests.
-- **MongoDB**: The reply pattern was just tested in an automated test. It is not actively used in projects yet. Due to kind of emulation, it may be possible to have major issues with lost replys, if timeouts are not configured correctly.
+- **MongoDB**: The reply pattern was only tested in an automated test and is not yet used in projects; because it uses emulation that wait for messages, it may cause severe issues if timeouts are not configured correctly.
 - **Performance Tests**: These are generally executed in non-subscriber (queue) mode for all endpoints.
 - **Request-Reply**: Only tested for endpoints that natively support or emulate it (see backend table below for details). Endpoints like SQLx, Files, AWS, IBM MQ, and Sled do not support request-reply and are not tested for this pattern.
 - **Subscriber Mode**: You may also completely emulate a subscriber mode, if the subscribers are static, by performing a fanout and manually create an endpoint for each target.

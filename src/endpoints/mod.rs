@@ -68,6 +68,11 @@ impl Endpoint {
     pub fn new_response() -> Self {
         Self::new(EndpointType::Response(ResponseConfig::default()))
     }
+    pub fn has_retry_middleware(&self) -> bool {
+        self.middlewares
+            .iter()
+            .any(|m| matches!(m, Middleware::Retry(_)))
+    }
     pub fn add_middleware(mut self, middleware: Middleware) -> Self {
         self.middlewares.push(middleware);
         self

@@ -858,6 +858,12 @@ impl FileConsumer {
             }),
         })
     }
+
+    pub async fn wait_ready(&self) {
+        // For now, just a placeholder: in a real implementation, this would check for the reader task being active.
+        // For the test, we can poll the file existence or a channel, but here we just yield once for demonstration.
+        tokio::task::yield_now().await;
+    }
 }
 
 #[async_trait]

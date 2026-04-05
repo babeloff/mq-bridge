@@ -216,24 +216,13 @@ impl MessagePublisher for MqttPublisher {
 
         if let Some(e) = first_error {
             warn!(
-                "MQTT batch send failed, marking all {} messages for retry. First error: {}",
+                "MQTT batch send failed, connection error for all {} messages. First error: {}",
                 messages.len(),
                 e
             );
-            let failed_messages = messages
-                .into_iter()
-                .map(|m| {
-                    (
-                        m,
-                        PublisherError::Connection(anyhow!("Batch failed due to connection issue")),
-                    )
-                })
-                .collect();
-
-            Ok(SentBatch::Partial {
-                responses: None,
-                failed: failed_messages,
-            })
+            return Err(PublisherError::Connection(anyhow!(
+                "MQTT batch send failed: {e}"
+            )));
         } else {
             Ok(SentBatch::Ack)
         }
@@ -437,6 +426,13 @@ impl MessageConsumer for MqttListener {
         let client = self.client.clone();
         let commit = Box::new(move |dispositions: Vec<MessageDisposition>| {
             Box::pin(async move {
+                // Length check to avoid silent truncation
+                if dispositions.len() != reply_infos.len() || dispositions.len() != acks.len() {
+                    return Err(anyhow!(
+                        "MQTT batch commit: mismatched lengths: dispositions={}, reply_infos={}, acks={}",
+                        dispositions.len(), reply_infos.len(), acks.len()
+                    ));
+                }
                 let mut ack_futures = Vec::with_capacity(dispositions.len());
 
                 for (((reply_topic, correlation_data), ack), disposition) in reply_infos
@@ -538,12 +534,12 @@ async fn create_client_and_eventloop(
             mqttoptions
                 .set_keep_alive(Duration::from_secs(config.keep_alive_seconds.unwrap_or(20)));
             mqttoptions.set_manual_acks(!config.delayed_ack);
-            if let Some(max_qos_messages) = config.max_inflight.or(Some(1000)) {
-                mqttoptions.set_outgoing_inflight_upper_limit(max_qos_messages);
-                // Set incoming maximum to allow the broker to push more messages into our internal queue before waiting for ACKs.
-                mqttoptions.set_receive_maximum(Some(max_qos_messages));
-                mqttoptions.set_max_packet_size(Some(10 * 1024 * 1024)); // Set max packet size to 10MB
-            }
+            let default_window = config
+                .max_inflight
+                .unwrap_or(queue_capacity.try_into().unwrap());
+            mqttoptions.set_outgoing_inflight_upper_limit(default_window);
+            mqttoptions.set_receive_maximum(Some(default_window));
+            mqttoptions.set_max_packet_size(Some(10 * 1024 * 1024)); // Set max packet size to 10MB
             mqttoptions.set_clean_start(config.clean_session);
 
             if let Some(expiry) = config.session_expiry_interval {
@@ -570,9 +566,10 @@ async fn create_client_and_eventloop(
             mqttoptions
                 .set_keep_alive(Duration::from_secs(config.keep_alive_seconds.unwrap_or(20)));
             mqttoptions.set_manual_acks(!config.delayed_ack);
-            if let Some(inflight) = config.max_inflight.or(Some(1000)) {
-                mqttoptions.set_inflight(inflight);
-            }
+            let default_window = config
+                .max_inflight
+                .unwrap_or(queue_capacity.try_into().unwrap());
+            mqttoptions.set_inflight(default_window);
             mqttoptions.set_clean_session(config.clean_session);
 
             if let (Some(username), Some(password)) = (&config.username, &config.password) {

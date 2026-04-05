@@ -298,9 +298,8 @@ impl Route {
                                 break;
                             }
                             Ok(Err(e)) => {
-                                let is_permanent = e.downcast_ref::<ProcessingError>().is_some_and(|pe| matches!(pe, ProcessingError::NonRetryable(_)))
-                                    || e.downcast_ref::<PublisherError>().is_some_and(|pe| matches!(pe, PublisherError::NonRetryable(_)))
-                                    || e.downcast_ref::<HandlerError>().is_some_and(|he| matches!(he, HandlerError::NonRetryable(_)))
+                                let is_permanent =
+                                    e.downcast_ref::<ProcessingError>().is_some_and(|pe| matches!(pe, ProcessingError::NonRetryable(_)))
                                     || e.downcast_ref::<ConsumerError>().is_some_and(|ce| matches!(ce, ConsumerError::EndOfStream));
 
                                 if is_permanent {
@@ -372,11 +371,7 @@ impl Route {
         }
         let mut message_ids = Vec::with_capacity(self.options.batch_size);
         // Check if retry middleware is present on output
-        let has_retry_middleware = self
-            .output
-            .middlewares
-            .iter()
-            .any(|m| matches!(m, crate::models::Middleware::Retry(_)));
+        let has_retry_middleware = self.output.has_retry_middleware();
         let run_result = loop {
             select! {
                 Ok(err) = err_rx.recv() => break Err(err),
@@ -453,8 +448,11 @@ impl Route {
                                     warn!("Commit after partial send failure also failed (this is expected during a disconnect): {}", commit_err);
                                 }
 
-                                // Use typed connection error check
-                                if first_error.is_connection_error() {
+                                // Scan failed vector for any connection error
+                                let has_connection_error = failed.iter().any(|(_, e)| {
+                                    matches!(e, ProcessingError::Connection(_))
+                                });
+                                if has_connection_error {
                                     break Err(err);
                                 }
                                 if !has_retry_middleware {
@@ -555,11 +553,7 @@ impl Route {
             let err_tx = err_tx.clone();
             let commit_semaphore = commit_semaphore.clone();
             let mut commit_tasks = JoinSet::new();
-            let has_retry_middleware = self
-                .output
-                .middlewares
-                .iter()
-                .any(|m| matches!(m, crate::models::Middleware::Retry(_)));
+            let has_retry_middleware = self.output.has_retry_middleware();
             join_set.spawn(async move {
                 debug!("Starting worker {}", i);
                 let mut message_ids = Vec::with_capacity(batch_size);
@@ -613,8 +607,11 @@ impl Route {
                                     warn!("Commit after partial send failure also failed (this is expected during a disconnect): {}", commit_err);
                                 }
 
-                                // Use typed connection error check
-                                if first_error.is_connection_error() {
+                                // Scan failed vector for any connection error
+                                let has_connection_error = failed.iter().any(|(_, err)| {
+                                    matches!(err, ProcessingError::Connection(_))
+                                });
+                                if has_connection_error {
                                     if err_tx.try_send(e).is_err() {
                                         warn!("Could not send error to main task, it might be down or busy.");
                                     }

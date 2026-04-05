@@ -144,6 +144,8 @@ impl MessagePublisher for RetryPublisher {
                     if matches!(e, PublisherError::NonRetryable(_)) {
                         return Err(e);
                     }
+                    // Connection errors are treated as non-retryable and may be reported as part of a Partial result (failed_messages),
+                    // not always as Err. The retry logic will not retry them whether they arrive via Err or Partial.
                     if matches!(e, PublisherError::Connection(_)) {
                         return Err(e);
                     }

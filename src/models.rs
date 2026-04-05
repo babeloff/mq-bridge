@@ -34,11 +34,34 @@ use tracing::trace;
 ///           sled_path: "/tmp/mq-bridge/dedup_db"
 ///           ttl_seconds: 3600
 ///       - metrics: {}
+///       - retry:
+///           max_attempts: 5
+///           initial_interval_ms: 200
+///       - random_panic:
+///           mode: nack
+///       - dlq:
+///           endpoint:
+///             nats:
+///               subject: "dlq-subject"
+///               url: "nats://localhost:4222"
 ///     kafka:
 ///       topic: "input-topic"
 ///       url: "localhost:9092"
 ///       group_id: "my-consumer-group"
+///       tls:
+///         required: true
+///         ca_file: "/path_to_ca"
+///         cert_file: "/path_to_cert"
+///         key_file: "/path_to_key"
+///         cert_password: "password"
+///         accept_invalid_certs: true
 ///   output:
+///     middlewares:
+///       - metrics: {}
+///       - dlq:
+///           endpoint:
+///             file:
+///               path: "error.out"
 ///     nats:
 ///       subject: "output-subject"
 ///       url: "nats://localhost:4222"
