@@ -94,7 +94,7 @@ impl AmqpPublisher {
                         exchange_name,
                         ExchangeKind::Fanout,
                         ExchangeDeclareOptions {
-                            durable: true,
+                            durable: !config.no_persistence,
                             ..Default::default()
                         },
                         FieldTable::default(),
