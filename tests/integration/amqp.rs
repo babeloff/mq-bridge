@@ -1,4 +1,4 @@
-#![allow(dead_code)]
+#![allow(unused_imports, dead_code)]
 
 use mq_bridge::endpoints::amqp::{AmqpConsumer, AmqpPublisher};
 use mq_bridge::test_utils::{

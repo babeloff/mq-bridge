@@ -33,7 +33,7 @@ fn test_env_secs(key: &str, default_s: u64) -> std::time::Duration {
     env::var(key)
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
-        .map(|s| std::time::Duration::from_secs(s))
+        .map(std::time::Duration::from_secs)
         .unwrap_or(std::time::Duration::from_secs(default_s))
 }
 

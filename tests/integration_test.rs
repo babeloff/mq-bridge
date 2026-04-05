@@ -203,3 +203,69 @@ async fn test_all_status() {
         }
     }
 }
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires docker compose, takes long time to run"]
+async fn test_all_performance_pipeline() {
+    println!("--- Running All Performance Pipeline Tests ---");
+    #[cfg(feature = "kafka")]
+    {
+        if should_run("kafka") {
+            println!("\n\n>>> Starting Kafka Performance Pipeline Test...");
+            integration::kafka::test_kafka_performance_pipeline().await;
+        }
+    }
+    #[cfg(feature = "aws")]
+    {
+        if should_run("aws") {
+            println!("\n\n>>> Starting AWS Performance Pipeline Test...");
+            integration::aws::test_aws_performance_pipeline().await;
+        }
+    }
+    #[cfg(feature = "amqp")]
+    {
+        if should_run("amqp") {
+            println!("\n\n>>> Starting AMQP Performance Pipeline Test...");
+            integration::amqp::test_amqp_performance_pipeline().await;
+        }
+    }
+    #[cfg(feature = "mqtt")]
+    {
+        if should_run("mqtt") {
+            println!("\n\n>>> Starting MQTT Performance Pipeline Test...");
+            integration::mqtt::test_mqtt_performance_pipeline().await;
+        }
+    }
+    #[cfg(feature = "nats")]
+    {
+        if should_run("nats") {
+            println!("\n\n>>> Starting NATS Performance Pipeline Test...");
+            integration::nats::test_nats_performance_pipeline().await;
+        }
+    }
+    #[cfg(feature = "mongodb")]
+    {
+        if should_run("mongodb") {
+            println!("\n\n>>> Starting MongoDB Performance Pipeline Test...");
+            integration::mongodb::test_mongodb_performance_pipeline().await;
+        }
+        if should_run("mongodb_replica_set") {
+            println!("\n\n>>> Starting MongoDB Replica Set Performance Pipeline Test...");
+            integration::mongodb::test_mongodb_replica_set_pipeline().await;
+        }
+    }
+    #[cfg(feature = "ibm-mq")]
+    {
+        if should_run("ibm-mq") {
+            println!("\n\n>>> Starting IBM MQ Performance Pipeline Test...");
+            integration::ibm_mq::test_ibm_mq_performance_pipeline().await;
+        }
+    }
+    #[cfg(feature = "zeromq")]
+    {
+        if should_run("zeromq") {
+            println!("\n\n>>> Starting ZeroMQ Performance Pipeline Test...");
+            integration::zeromq::test_zeromq_performance_pipeline().await;
+        }
+    }
+}

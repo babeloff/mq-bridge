@@ -45,17 +45,6 @@ fn get_config() -> IbmMqConfig {
     }
 }
 
-fn get_config() -> IbmMqConfig {
-    IbmMqConfig {
-        username: Some("app".to_string()),
-        password: Some("admin".to_string()),
-        queue_manager: "QM1".to_string(),
-        url: "localhost(1414)".to_string(),
-        channel: "DEV.APP.SVRCONN".to_string(),
-        ..Default::default()
-    }
-}
-
 pub async fn test_ibm_mq_subscriber_logic() {
     setup_logging();
     run_test_with_docker("tests/integration/docker-compose/ibm_mq.yml", || async {

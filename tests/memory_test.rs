@@ -1,7 +1,5 @@
-#[path = "integration/mod.rs"]
-mod integration;
-
-use integration::memory;
+const IN_TOPIC: &str = "mem-in";
+const OUT_TOPIC: &str = "mem-out";
 use mq_bridge::models::{Endpoint, Route};
 use mq_bridge::test_utils::format_pretty;
 use std::time::Instant;
@@ -23,8 +21,8 @@ pub async fn test_memory_to_memory_pipeline() {
 
     let messages_to_send = mq_bridge::test_utils::generate_test_messages(num_messages);
 
-    let input = Endpoint::new_memory(&memory::IN_TOPIC, 200);
-    let output = Endpoint::new_memory(&memory::OUT_TOPIC, num_messages);
+    let input = Endpoint::new_memory(IN_TOPIC, 200);
+    let output = Endpoint::new_memory(OUT_TOPIC, num_messages);
     let route = Route::new(input, output).with_batch_size(100);
     let in_channel = route.input.channel().unwrap();
     let out_channel = route.output.channel().unwrap();

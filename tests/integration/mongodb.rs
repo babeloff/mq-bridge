@@ -1,4 +1,4 @@
-#![allow(dead_code)]
+#![allow(unused_imports, dead_code)]
 use std::sync::Arc;
 
 use mq_bridge::test_utils::PERF_TEST_MESSAGE_COUNT;
