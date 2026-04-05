@@ -606,7 +606,7 @@ pub async fn verify_subscriber_logic(
     let payload = format!("broadcast-{}", fast_uuid_v7::gen_id());
     publisher.send(payload.as_str().into()).await.unwrap();
 
-    // tokio::time::sleep(Duration::from_secs(1000)).await; // Backoff before retry
+    // Backoff before retry
     let res1 = tokio::time::timeout(Duration::from_secs(15), async {
         let mut guard = sub1.lock().await;
         guard.receive().await

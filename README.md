@@ -72,7 +72,7 @@ The following table tracks, which endpoints are already used in other projects a
 | Retry Middleware    |     ✅      |
 | DLQ Middleware    |     ✅      |
 
-All endpoints are have automated integration tests and did not show data loss during simple in-flight broker restarts.
+All endpoints have automated integration tests and did not show data loss during simple in-flight broker restarts.
 
 ## Test Notes
 
@@ -399,7 +399,7 @@ I am aware that in year 2026, AI is still not generating perfect code and someti
 breaks simple stuff or forgets important lines during refactorings that 
 later result in severe bugs. 
 I didn't use any agent mode as this usually causes early architectural issues that
-can later not be resolved easily.
+cannot later be resolved easily.
 I reviewed all the output code, cleaned it up manually, 
 re-specified and refactored it when necessary.
 **I do trust the current code as much as if it would be completely written by myself.**

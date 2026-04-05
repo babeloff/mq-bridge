@@ -144,6 +144,9 @@ impl MessagePublisher for RetryPublisher {
                     if matches!(e, PublisherError::NonRetryable(_)) {
                         return Err(e);
                     }
+                    if matches!(e, PublisherError::Connection(_)) {
+                        return Err(e);
+                    }
                     if attempt >= self.config.max_attempts {
                         return Err(PublisherError::Retryable(anyhow!(
                             "Retries exhausted after {} attempts: {}",

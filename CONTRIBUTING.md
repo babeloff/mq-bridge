@@ -61,7 +61,7 @@ Some integration tests require Docker services. See `tests/integration/docker-co
 
 ## Reporting Issues
 
-- Use [GitHub Issues](https://github.com/your-org/mq-bridge/issues) for bugs, enhancements, or questions.
+- Use [GitHub Issues](https://github.com/marcomq/mq-bridge/issues) for bugs, enhancements, or questions.
 - Provide as much detail as possible (logs, configs, steps to reproduce).
 
 ## Code of Conduct

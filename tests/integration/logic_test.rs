@@ -52,7 +52,11 @@ async fn test_memory_request_reply_logic() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_http_request_reply_pattern() {
     // Verifies Request-Reply over a real HTTP boundary.
-    let port = 12345;
+    use std::net::TcpListener;
+    // Bind to an ephemeral port
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener); // Release the port for the HTTP server
     let addr = format!("127.0.0.1:{}", port);
 
     let http_in = Endpoint {
@@ -71,8 +75,26 @@ async fn test_http_request_reply_pattern() {
     let route = Route::new(http_in, Endpoint::new_response()).with_handler(handler);
     route.deploy("http_logic").await.unwrap();
 
-    // Use reqwest to simulate an external client.
+    // Wait for HTTP server readiness (retry loop)
     let client = reqwest::Client::new();
+    let mut ready = false;
+    for _ in 0..20 {
+        let resp = client
+            .post(format!("http://{}", addr))
+            .body("ping")
+            .send()
+            .await;
+        if let Ok(res) = &resp {
+            if res.status() == reqwest::StatusCode::OK {
+                ready = true;
+                break;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(ready, "HTTP server did not become ready in time");
+
+    // Final request for assertion
     let res = client
         .post(format!("http://{}", addr))
         .body("ping")

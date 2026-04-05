@@ -186,8 +186,8 @@ Use `send` / `send_batch` and `receive` / `receive_batch` directly on endpoints.
 use mq_bridge::endpoints::memory::{MemoryConsumer, MemoryPublisher};
 use mq_bridge::{CanonicalMessage, traits::MessageDisposition};
 
-let publisher = MemoryPublisher::new("my_topic", 100).await.unwrap();
-let mut consumer = MemoryConsumer::new("my_topic", 100).await.unwrap();
+let publisher = MemoryPublisher::new_local("my_topic", 100);
+let mut consumer = MemoryConsumer::new_local("my_topic", 100);
 let msg = CanonicalMessage::new(b"hello world".to_vec(), None);
 publisher.send(msg).await.unwrap();
 let received = consumer.receive().await.unwrap();

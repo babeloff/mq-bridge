@@ -454,10 +454,8 @@ impl Route {
                                 }
 
                                 // Use typed connection error check
-                                if let Some(pe) = err.downcast_ref::<PublisherError>() {
-                                    if pe.is_connection_error() {
-                                        break Err(err);
-                                    }
+                                if first_error.is_connection_error() {
+                                    break Err(err);
                                 }
                                 if !has_retry_middleware {
                                     // No retry middleware: treat retryable error as fatal
@@ -616,13 +614,11 @@ impl Route {
                                 }
 
                                 // Use typed connection error check
-                                if let Some(pe) = e.downcast_ref::<PublisherError>() {
-                                    if pe.is_connection_error() {
-                                        if err_tx.try_send(e).is_err() {
-                                            warn!("Could not send error to main task, it might be down or busy.");
-                                        }
-                                        break;
+                                if first_error.is_connection_error() {
+                                    if err_tx.try_send(e).is_err() {
+                                        warn!("Could not send error to main task, it might be down or busy.");
                                     }
+                                    break;
                                 }
                                 if !has_retry_middleware {
                                     // No retry middleware: treat retryable error as fatal

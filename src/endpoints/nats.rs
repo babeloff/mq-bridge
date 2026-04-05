@@ -57,10 +57,15 @@ impl NatsPublisher {
         let client = if !config.no_jetstream {
             let jetstream = jetstream::new(nats_client);
             info!(stream = %stream_name, "Ensuring NATS JetStream stream exists");
+            let subjects = if subject.contains('>') || subject.contains('*') {
+                vec![subject.to_string()]
+            } else {
+                vec![format!("{}.>", stream_name)]
+            };
             jetstream
                 .get_or_create_stream(stream::Config {
                     name: stream_name.to_string(),
-                    subjects: vec![subject.to_string()],
+                    subjects,
                     max_messages: config.stream_max_messages.unwrap_or(1_000_000),
                     max_bytes: config.stream_max_bytes.unwrap_or(1024 * 1024 * 1024), // 1GB
                     ..Default::default()
