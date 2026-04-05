@@ -172,11 +172,13 @@ impl MessagePublisher for MqttPublisher {
         // without immediately failing the batch, while still preventing indefinite hangs.
         match tokio::time::timeout(Duration::from_secs(10), publish_future).await {
             Ok(Ok(_)) => Ok(Sent::Ack),
-            Ok(Err(e)) => Err(PublisherError::Retryable(anyhow!(
-                "__CONNECTION_ERROR__: Failed to publish MQTT message: {}",
+            Ok(Err(e)) => Err(PublisherError::Connection(anyhow!(
+                "Failed to publish MQTT message: {}",
                 e
             ))),
-            Err(_) => Err(PublisherError::Retryable(anyhow!("MQTT publish timed out"))),
+            Err(_) => Err(PublisherError::Connection(anyhow!(
+                "MQTT publish timed out"
+            ))),
         }
     }
 
@@ -223,7 +225,7 @@ impl MessagePublisher for MqttPublisher {
                 .map(|m| {
                     (
                         m,
-                        PublisherError::Retryable(anyhow!("Batch failed due to connection issue")),
+                        PublisherError::Connection(anyhow!("Batch failed due to connection issue")),
                     )
                 })
                 .collect();

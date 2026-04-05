@@ -141,7 +141,7 @@ impl RandomPanicPublisher {
                 );
             }
             FaultMode::Disconnect => Err(PublisherError::Connection(anyhow::anyhow!(
-                "__CONNECTION_ERROR__: RandomPanicPublisher: Simulated connection loss"
+                "RandomPanicPublisher: Simulated connection loss"
             ))),
             FaultMode::Timeout => Err(PublisherError::Retryable(anyhow::anyhow!(
                 "RandomPanicPublisher: Simulated timeout"

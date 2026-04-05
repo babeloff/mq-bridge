@@ -65,10 +65,8 @@ impl MessagePublisher for DlqPublisher {
                     Err(dlq_error) => {
                         // If the DLQ itself has a connection error, we must propagate it to trigger a route restart.
                         // Otherwise, the message would be lost.
-                        if let PublisherError::NonRetryable(err) = &dlq_error {
-                            if err.to_string().contains("__CONNECTION_ERROR__") {
-                                return Err(dlq_error);
-                            }
+                        if let PublisherError::Connection(_) = &dlq_error {
+                            return Err(dlq_error);
                         }
                         Err(PublisherError::NonRetryable(anyhow::anyhow!(
                             "Primary send failed: '{}'. DLQ send also failed: {}",
@@ -141,10 +139,8 @@ impl MessagePublisher for DlqPublisher {
                     }
                     Err(dlq_error) => {
                         // If the DLQ itself has a connection error, propagate it to restart the route.
-                        if let PublisherError::NonRetryable(err) = &dlq_error {
-                            if err.to_string().contains("__CONNECTION_ERROR__") {
-                                return Err(dlq_error);
-                            }
+                        if let PublisherError::Connection(_) = &dlq_error {
+                            return Err(dlq_error);
                         }
                         error!(
                             "DLQ send failed: {}. Propagating original errors.",
@@ -200,10 +196,8 @@ impl MessagePublisher for DlqPublisher {
                     }
                     Err(dlq_error) => {
                         // If the DLQ itself has a connection error, propagate it to restart the route.
-                        if let PublisherError::NonRetryable(err) = &dlq_error {
-                            if err.to_string().contains("__CONNECTION_ERROR__") {
-                                return Err(dlq_error);
-                            }
+                        if let PublisherError::Connection(_) = &dlq_error {
+                            return Err(dlq_error);
                         }
                         error!(
                             "DLQ send failed: {}. Propagating original error.",

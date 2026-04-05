@@ -157,14 +157,6 @@ required-features = ["test-utils"]
 name = "integration_test"
 required-features = ["test-utils"]
 
-[[test]]
-name = "memory_test"
-required-features = ["test-utils"]
-
-[[test]]
-name = "request_reply_test"
-required-features = ["test-utils"]
-
 [target.'cfg(windows)'.dependencies.rdkafka]
 version = "0.38"
 features = ["cmake-build", "tokio"]
