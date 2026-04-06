@@ -346,12 +346,20 @@ async fn run_pipeline_test_internal(
         }
 
         if last_log_time.elapsed() > Duration::from_secs(5) {
-            println!(
-                "Progress: {}/{} messages received (Unique: {})",
-                received.len(),
-                num_messages,
-                unique_received_ids.len()
-            );
+            if is_performance_test {
+                println!(
+                    "Progress: {}/{} messages received",
+                    received.len(),
+                    num_messages
+                );
+            } else {
+                println!(
+                    "Progress: {}/{} messages received (Unique: {})",
+                    received.len(),
+                    num_messages,
+                    unique_received_ids.len()
+                );
+            }
             last_log_time = Instant::now();
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
