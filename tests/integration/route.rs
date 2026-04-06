@@ -14,28 +14,43 @@ use mq_bridge::{
 use serde::{Deserialize, Serialize};
 use std::env;
 
-/// Helper to run a simple service loop that receives one message and replies.
+/// Helper to run a simple service loop that receives messages and replies.
 async fn run_service_reply(mut consumer: Box<dyn MessageConsumer>, response_payload: &[u8]) {
     // Run continuously: receive and reply to messages until the consumer errors or test ends.
     loop {
         match consumer.receive().await {
             Ok(received) => {
                 let response = CanonicalMessage::new(response_payload.to_vec(), None);
-                let _ =
-                    (received.commit)(mq_bridge::traits::MessageDisposition::Reply(response)).await;
+                if let Err(e) = (received.commit)(
+                    mq_bridge::traits::MessageDisposition::Reply(response),
+                )
+                .await
+                {
+                    tracing::error!("Failed to commit reply: {:?}", e);
+                }
             }
-            Err(e) => panic!("Service consumer failed to receive: {:?}", e),
+            Err(e) => {
+                tracing::warn!("Service consumer receive failed, exiting service loop: {:?}", e);
+                break;
+            }
         }
     }
 }
 
-/// Helper to run a simple service loop that receives one message and ACKs it (no reply).
+/// Helper to run a simple service loop that receives messages and ACKs them (no reply).
 async fn run_service_ack(mut consumer: Box<dyn MessageConsumer>) {
-    match consumer.receive().await {
-        Ok(received) => {
-            let _ = (received.commit)(mq_bridge::traits::MessageDisposition::Ack).await;
+    loop {
+        match consumer.receive().await {
+            Ok(received) => {
+                if let Err(e) = (received.commit)(mq_bridge::traits::MessageDisposition::Ack).await {
+                    tracing::error!("Failed to commit ack: {:?}", e);
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Service consumer receive failed, exiting service loop: {:?}", e);
+                break;
+            }
         }
-        Err(e) => panic!("Service consumer failed to receive: {:?}", e),
     }
 }
 

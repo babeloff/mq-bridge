@@ -13,6 +13,41 @@ pub fn should_run(test_name: &str) -> bool {
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires docker compose"]
+async fn test_all_request_reply() {
+    println!("--- Running All Request-Reply Tests ---");
+    #[cfg(feature = "kafka")]
+    if should_run("kafka") {
+        integration::route::test_kafka_request_reply().await;
+        integration::route::test_kafka_request_reply_multiple_sequential().await;
+        integration::route::test_kafka_request_reply_lost_response().await;
+    }
+    #[cfg(feature = "nats")]
+    if should_run("nats") {
+        integration::route::test_nats_request_reply().await;
+        integration::route::test_nats_core_request_reply().await;
+    }
+    #[cfg(feature = "mongodb")]
+    if should_run("mongodb") {
+        integration::route::test_mongodb_request_reply_pattern().await;
+        integration::route::test_mongodb_request_reply_multiple_sequential().await;
+        integration::route::test_mongodb_request_reply_lost_response().await;
+    }
+    #[cfg(feature = "amqp")]
+    if should_run("amqp") {
+        integration::route::test_amqp_request_reply().await;
+    }
+    #[cfg(feature = "mqtt")]
+    if should_run("mqtt") {
+        integration::route::test_mqtt_request_reply().await;
+    }
+    integration::route::test_memory_request_reply().await;
+    // Additional memory request-reply tests for multi-message scenarios
+    integration::route::test_memory_request_reply_multiple_sequential().await;
+    integration::route::test_memory_request_reply_multiple_concurrent().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires docker compose"]
 async fn test_all_subscriber_logic() {
     println!("--- Running All Subscriber and Request-Reply Logic Tests ---");
 
@@ -339,39 +374,4 @@ async fn test_all_performance_direct() {
         }
     }
     // The summary table will be printed here when `_summary_printer` is dropped.
-}
-
-#[tokio::test(flavor = "multi_thread")]
-#[ignore = "requires docker compose"]
-async fn test_all_request_reply() {
-    println!("--- Running All Request-Reply Tests ---");
-    #[cfg(feature = "kafka")]
-    if should_run("kafka") {
-        integration::route::test_kafka_request_reply().await;
-        integration::route::test_kafka_request_reply_multiple_sequential().await;
-        integration::route::test_kafka_request_reply_lost_response().await;
-    }
-    #[cfg(feature = "nats")]
-    if should_run("nats") {
-        integration::route::test_nats_request_reply().await;
-        integration::route::test_nats_core_request_reply().await;
-    }
-    #[cfg(feature = "mongodb")]
-    if should_run("mongodb") {
-        integration::route::test_mongodb_request_reply_pattern().await;
-        integration::route::test_mongodb_request_reply_multiple_sequential().await;
-        integration::route::test_mongodb_request_reply_lost_response().await;
-    }
-    #[cfg(feature = "amqp")]
-    if should_run("amqp") {
-        integration::route::test_amqp_request_reply().await;
-    }
-    #[cfg(feature = "mqtt")]
-    if should_run("mqtt") {
-        integration::route::test_mqtt_request_reply().await;
-    }
-    integration::route::test_memory_request_reply().await;
-    // Additional memory request-reply tests for multi-message scenarios
-    integration::route::test_memory_request_reply_multiple_sequential().await;
-    integration::route::test_memory_request_reply_multiple_concurrent().await;
 }
