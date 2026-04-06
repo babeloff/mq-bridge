@@ -16,14 +16,16 @@ use std::env;
 
 /// Helper to run a simple service loop that receives one message and replies.
 async fn run_service_reply(mut consumer: Box<dyn MessageConsumer>, response_payload: &[u8]) {
-    let receive_future = consumer.receive();
-    match tokio::time::timeout(std::time::Duration::from_secs(5), receive_future).await {
-        Ok(Ok(received)) => {
-            let response = CanonicalMessage::new(response_payload.to_vec(), None);
-            let _ = (received.commit)(mq_bridge::traits::MessageDisposition::Reply(response)).await;
+    // Run continuously: receive and reply to messages until the consumer errors or test ends.
+    loop {
+        match consumer.receive().await {
+            Ok(received) => {
+                let response = CanonicalMessage::new(response_payload.to_vec(), None);
+                let _ =
+                    (received.commit)(mq_bridge::traits::MessageDisposition::Reply(response)).await;
+            }
+            Err(e) => panic!("Service consumer failed to receive: {:?}", e),
         }
-        Ok(Err(e)) => panic!("Service consumer failed to receive: {:?}", e),
-        Err(_) => panic!("Service consumer receive timed out"),
     }
 }
 
@@ -130,6 +132,8 @@ pub async fn test_kafka_request_reply_multiple_sequential() {
 
         let mut service_endpoint = config.clone();
         service_endpoint.topic = Some(request_topic.clone());
+        // Run the service as a proper consumer (so it has a producer for replies)
+        service_endpoint.group_id = Some(format!("service_group_{}", fast_uuid_v7::gen_id_str()));
         let service_consumer = KafkaConsumer::new(&service_endpoint).await.unwrap();
 
         // Wait for the consumer to report healthy/ready (retry for up to ~5s)
@@ -635,8 +639,7 @@ pub async fn test_mqtt_request_reply() {
         client_endpoint.topic = Some(reply_topic.to_string());
         let mut client_consumer = MqttConsumer::new(&client_endpoint).await.unwrap();
 
-        let mut service_config = config.clone();
-        service_config.client_id = Some("service_sub".to_string());
+        let service_config = config.clone();
         let mut service_endpoint = service_config;
         service_endpoint.topic = Some(req_topic.to_string());
         let service_consumer = MqttConsumer::new(&service_endpoint).await.unwrap();
