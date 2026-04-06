@@ -21,16 +21,17 @@ async fn run_service_reply(mut consumer: Box<dyn MessageConsumer>, response_payl
         match consumer.receive().await {
             Ok(received) => {
                 let response = CanonicalMessage::new(response_payload.to_vec(), None);
-                if let Err(e) = (received.commit)(
-                    mq_bridge::traits::MessageDisposition::Reply(response),
-                )
-                .await
+                if let Err(e) =
+                    (received.commit)(mq_bridge::traits::MessageDisposition::Reply(response)).await
                 {
                     tracing::error!("Failed to commit reply: {:?}", e);
                 }
             }
             Err(e) => {
-                tracing::warn!("Service consumer receive failed, exiting service loop: {:?}", e);
+                tracing::warn!(
+                    "Service consumer receive failed, exiting service loop: {:?}",
+                    e
+                );
                 break;
             }
         }
@@ -42,15 +43,48 @@ async fn run_service_ack(mut consumer: Box<dyn MessageConsumer>) {
     loop {
         match consumer.receive().await {
             Ok(received) => {
-                if let Err(e) = (received.commit)(mq_bridge::traits::MessageDisposition::Ack).await {
+                if let Err(e) = (received.commit)(mq_bridge::traits::MessageDisposition::Ack).await
+                {
                     tracing::error!("Failed to commit ack: {:?}", e);
                 }
             }
             Err(e) => {
-                tracing::warn!("Service consumer receive failed, exiting service loop: {:?}", e);
+                tracing::warn!(
+                    "Service consumer receive failed, exiting service loop: {:?}",
+                    e
+                );
                 break;
             }
         }
+    }
+}
+
+/// Helper to run a single receive-and-reply (with timeout).
+async fn run_service_reply_once(mut consumer: Box<dyn MessageConsumer>, response_payload: &[u8]) {
+    match tokio::time::timeout(std::time::Duration::from_secs(5), consumer.receive()).await {
+        Ok(Ok(received)) => {
+            let response = CanonicalMessage::new(response_payload.to_vec(), None);
+            if let Err(e) =
+                (received.commit)(mq_bridge::traits::MessageDisposition::Reply(response)).await
+            {
+                tracing::error!("Failed to commit reply once: {:?}", e);
+            }
+        }
+        Ok(Err(e)) => tracing::warn!("Service consumer failed to receive once: {:?}", e),
+        Err(_) => tracing::warn!("Service consumer receive timed out (once)"),
+    }
+}
+
+/// Helper to run a single receive-and-ack (with timeout).
+async fn run_service_ack_once(mut consumer: Box<dyn MessageConsumer>) {
+    match tokio::time::timeout(std::time::Duration::from_secs(5), consumer.receive()).await {
+        Ok(Ok(received)) => {
+            if let Err(e) = (received.commit)(mq_bridge::traits::MessageDisposition::Ack).await {
+                tracing::error!("Failed to commit ack once: {:?}", e);
+            }
+        }
+        Ok(Err(e)) => tracing::warn!("Service consumer failed to receive once: {:?}", e),
+        Err(_) => tracing::warn!("Service consumer receive timed out (once)"),
     }
 }
 
@@ -104,7 +138,11 @@ pub async fn test_kafka_request_reply() {
 
         client_publisher.send(req_msg).await.unwrap();
 
-        let received_resp = client_consumer.receive().await.unwrap();
+        let received_resp =
+            tokio::time::timeout(std::time::Duration::from_secs(5), client_consumer.receive())
+                .await
+                .expect("Timed out waiting for Kafka response")
+                .unwrap();
         assert_eq!(received_resp.message.payload, b"response".as_slice());
         assert_eq!(
             received_resp
@@ -183,7 +221,11 @@ pub async fn test_kafka_request_reply_multiple_sequential() {
 
         let mut received = HashSet::new();
         for _ in 0..8 {
-            let rec = client_consumer.receive().await.unwrap();
+            let rec =
+                tokio::time::timeout(std::time::Duration::from_secs(5), client_consumer.receive())
+                    .await
+                    .expect("Timed out waiting for Kafka sequential response")
+                    .unwrap();
             let cid = rec.message.metadata.get("correlation_id").cloned();
             if let Some(c) = cid {
                 received.insert(c);
@@ -354,13 +396,16 @@ pub async fn test_nats_request_reply() {
         let (service_ready_tx, service_ready_rx) = tokio::sync::oneshot::channel();
         let service_task = tokio::spawn(async move {
             let _ = service_ready_tx.send(());
-            run_service_reply(Box::new(service_consumer), b"pong").await;
+            run_service_reply_once(Box::new(service_consumer), b"pong").await;
         });
         service_ready_rx.await.unwrap();
 
         // 4. Send the request and check the response
         let msg = CanonicalMessage::new(b"ping".to_vec(), None);
-        let result = publisher.send(msg).await.unwrap();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), publisher.send(msg))
+            .await
+            .expect("Timed out waiting for NATS request response")
+            .unwrap();
 
         match result {
             Sent::Response(resp) => {
@@ -407,12 +452,15 @@ pub async fn test_nats_core_request_reply() {
         let (service_ready_tx, service_ready_rx) = tokio::sync::oneshot::channel();
         let service_task = tokio::spawn(async move {
             let _ = service_ready_tx.send(());
-            run_service_reply(Box::new(service_consumer), b"pong").await;
+            run_service_reply_once(Box::new(service_consumer), b"pong").await;
         });
         service_ready_rx.await.unwrap();
 
         let msg = CanonicalMessage::new(b"ping".to_vec(), None);
-        let result = publisher.send(msg).await.unwrap();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), publisher.send(msg))
+            .await
+            .expect("Timed out waiting for NATS Core request response")
+            .unwrap();
 
         match result {
             Sent::Response(resp) => {
@@ -462,7 +510,13 @@ pub async fn test_mongodb_request_reply_pattern() {
 
         // 3. Send request and wait for response
         let request_msg = CanonicalMessage::new(b"mongo_request".to_vec(), None);
-        let result = client_publisher.send(request_msg).await.unwrap();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client_publisher.send(request_msg),
+        )
+        .await
+        .expect("Timed out waiting for MongoDB response")
+        .unwrap();
 
         // 4. Assert the response
         match result {
@@ -484,7 +538,9 @@ pub async fn test_mongodb_request_reply_multiple_sequential() {
     setup_logging();
     run_test_with_docker("tests/integration/docker-compose/mongodb.yml", || async {
         let req_collection = format!("req_rep_collection_{}", fast_uuid_v7::gen_id_str());
-        let db_name = format!("mq_bridge_test_req_rep_{}", fast_uuid_v7::gen_id_str());
+        let db_suffix = fast_uuid_v7::gen_id_str();
+        let db_suffix_short: String = db_suffix.chars().take(35).collect();
+        let db_name = format!("mq_bridge_test_req_rep_{}", db_suffix_short);
 
         // Service side
         let service_config = mq_bridge::models::MongoDbConfig {
@@ -513,7 +569,13 @@ pub async fn test_mongodb_request_reply_multiple_sequential() {
 
         for i in 0..8 {
             let req = CanonicalMessage::new(format!("mongo_req_{}", i).into_bytes(), None);
-            let res = client_publisher.send(req).await.unwrap();
+            let res = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                client_publisher.send(req),
+            )
+            .await
+            .expect("Timed out waiting for MongoDB sequential response")
+            .unwrap();
             match res {
                 Sent::Response(r) => assert_eq!(r.get_payload_str(), "mongo_multi_resp"),
                 _ => panic!("Expected response for MongoDB request"),
@@ -532,7 +594,9 @@ pub async fn test_mongodb_request_reply_lost_response() {
     setup_logging();
     run_test_with_docker("tests/integration/docker-compose/mongodb.yml", || async {
         let req_collection = format!("req_rep_lost_{}", fast_uuid_v7::gen_id_str());
-        let db_name = format!("mq_bridge_test_req_rep_lost_{}", fast_uuid_v7::gen_id_str());
+        let db_suffix = fast_uuid_v7::gen_id_str();
+        let db_suffix_short: String = db_suffix.chars().take(35).collect();
+        let db_name = format!("mq_bridge_test_req_rep_lost_{}", db_suffix_short);
 
         let service_config = mq_bridge::models::MongoDbConfig {
             url: "mongodb://localhost:27017".to_string(),
@@ -612,9 +676,19 @@ pub async fn test_amqp_request_reply() {
             .metadata
             .insert("correlation_id".to_string(), correlation_id.to_string());
 
-        client_publisher.send(req_msg).await.unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client_publisher.send(req_msg),
+        )
+        .await
+        .expect("Timed out sending AMQP request")
+        .unwrap();
 
-        let received_resp = client_consumer.receive().await.unwrap();
+        let received_resp =
+            tokio::time::timeout(std::time::Duration::from_secs(5), client_consumer.receive())
+                .await
+                .expect("Timed out waiting for AMQP response")
+                .unwrap();
 
         assert_eq!(received_resp.message.payload, b"response".as_slice());
         assert_eq!(
@@ -674,9 +748,19 @@ pub async fn test_mqtt_request_reply() {
             .metadata
             .insert("correlation_id".to_string(), correlation_data.to_string());
 
-        client_publisher.send(req_msg).await.unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client_publisher.send(req_msg),
+        )
+        .await
+        .expect("Timed out sending MQTT request")
+        .unwrap();
 
-        let received_resp = client_consumer.receive().await.unwrap();
+        let received_resp =
+            tokio::time::timeout(std::time::Duration::from_secs(5), client_consumer.receive())
+                .await
+                .expect("Timed out waiting for MQTT response")
+                .unwrap();
 
         assert_eq!(received_resp.message.payload, b"response".as_slice());
         assert_eq!(
@@ -1331,7 +1415,13 @@ pub async fn test_memory_request_reply() {
     })
     .unwrap();
 
-    let result = publisher.send("direct request".into()).await.unwrap();
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        publisher.send("direct request".into()),
+    )
+    .await
+    .expect("Timed out waiting for memory response")
+    .unwrap();
 
     if let Sent::Response(response_msg) = result {
         assert_eq!(response_msg.get_payload_str(), "reply to direct request");
@@ -1377,7 +1467,13 @@ pub async fn test_memory_request_reply_multiple_sequential() {
 
     for i in 0..8 {
         let payload = format!("seq-{}", i);
-        let result = publisher.send(payload.clone().into()).await.unwrap();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            publisher.send(payload.clone().into()),
+        )
+        .await
+        .expect("Timed out waiting for memory sequential response")
+        .unwrap();
         if let Sent::Response(response_msg) = result {
             assert_eq!(
                 response_msg.get_payload_str(),
@@ -1438,7 +1534,13 @@ pub async fn test_memory_request_reply_multiple_concurrent() {
         let p = publisher.clone();
         let payload = format!("con-{}", i);
         handles.push(tokio::spawn(async move {
-            let res = p.send(payload.clone().into()).await.unwrap();
+            let res = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                p.send(payload.clone().into()),
+            )
+            .await
+            .expect("Timed out waiting for memory concurrent response")
+            .unwrap();
             match res {
                 Sent::Response(resp) => Ok((i, resp.get_payload_str().to_string())),
                 _ => Err(format!("Expected response for payload {}", payload)),
