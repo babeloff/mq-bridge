@@ -124,6 +124,7 @@ pub async fn test_kafka_request_reply_multiple_sequential() {
 
         let mut reply_config = config.clone();
         reply_config.topic = Some(reply_topic.clone());
+        let _ = KafkaPublisher::new(&reply_config).await.unwrap();
         reply_config.group_id = Some(format!("reply_group_{}", fast_uuid_v7::gen_id_str()));
         let mut client_consumer = KafkaConsumer::new(&reply_config).await.unwrap();
 
@@ -188,6 +189,7 @@ pub async fn test_kafka_request_reply_lost_response() {
 
         let mut reply_config = config.clone();
         reply_config.topic = Some(reply_topic.clone());
+        let _ = KafkaPublisher::new(&reply_config).await.unwrap();
         reply_config.group_id = Some(format!("reply_group_lost_{}", fast_uuid_v7::gen_id_str()));
         let mut client_consumer = KafkaConsumer::new(&reply_config).await.unwrap();
 
