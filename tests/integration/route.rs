@@ -132,12 +132,23 @@ pub async fn test_kafka_request_reply_multiple_sequential() {
         service_endpoint.topic = Some(request_topic.clone());
         let service_consumer = KafkaConsumer::new(&service_endpoint).await.unwrap();
 
+        // Wait for the consumer to report healthy/ready (retry for up to ~5s)
+        let mut attempts = 0;
+        loop {
+            let status = service_consumer.status().await;
+            if status.healthy {
+                break;
+            }
+            if attempts >= 10 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            attempts += 1;
+        }
+
         tokio::spawn(async move {
             run_service_reply(Box::new(service_consumer), b"kafka_multi_resp").await;
         });
-
-        // Give it a moment to initialize
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
         let mut expected: HashSet<String> = HashSet::new();
         for i in 0..8 {
