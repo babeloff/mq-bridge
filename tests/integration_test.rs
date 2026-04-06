@@ -273,14 +273,25 @@ async fn test_all_performance_pipeline() {
 async fn test_all_request_reply() {
     println!("--- Running All Request-Reply Tests ---");
     #[cfg(feature = "kafka")]
-    integration::route::test_kafka_request_reply().await;
+    if should_run("kafka") {
+        integration::route::test_kafka_request_reply().await;
+    }
     #[cfg(feature = "nats")]
-    integration::route::test_nats_request_reply().await;
+    if should_run("nats") {
+        integration::route::test_nats_request_reply().await;
+        integration::route::test_nats_core_request_reply().await;
+    }
     #[cfg(feature = "mongodb")]
-    integration::route::test_mongodb_request_reply_pattern().await;
+    if should_run("mongodb") {
+        integration::route::test_mongodb_request_reply_pattern().await;
+    }
     #[cfg(feature = "amqp")]
-    integration::route::test_amqp_request_reply().await;
+    if should_run("amqp") {
+        integration::route::test_amqp_request_reply().await;
+    }
     #[cfg(feature = "mqtt")]
-    integration::route::test_mqtt_request_reply().await;
+    if should_run("mqtt") {
+        integration::route::test_mqtt_request_reply().await;
+    }
     integration::route::test_memory_request_reply().await;
 }

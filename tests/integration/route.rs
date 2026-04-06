@@ -101,31 +101,88 @@ pub async fn test_nats_request_reply() {
         let subject = "req_rep_subject";
         let stream_name = "req_rep_stream";
 
-        let service_config = mq_bridge::models::NatsConfig {
-            url: "nats://localhost:4222".to_string(),
-            no_jetstream: true,
-            ..Default::default()
-        };
-
-        let client_config = mq_bridge::models::NatsConfig {
+        // 1. Create publisher first (ensures JetStream stream exists)
+        let mut pub_config = mq_bridge::models::NatsConfig {
             url: "nats://localhost:4222".to_string(),
             request_reply: true,
             ..Default::default()
         };
+        pub_config.subject = Some(subject.to_string());
+        pub_config.stream = Some(stream_name.to_string());
+        // JetStream enabled (default)
+        let publisher = NatsPublisher::new(&pub_config).await.unwrap();
 
-        let mut service_endpoint = service_config;
+        // 2. Now create the JetStream consumer (service side)
+        let mut service_endpoint = mq_bridge::models::NatsConfig {
+            url: "nats://localhost:4222".to_string(),
+            no_jetstream: true,
+            ..Default::default()
+        };
+        service_endpoint.subject = Some(subject.to_string());
+        service_endpoint.stream = Some(stream_name.to_string());
+        // Native NATS request-reply needs a live Core subscription as the responder.
+        let service_consumer = NatsConsumer::new(&service_endpoint).await.unwrap();
+
+        // 3. Spawn the reply service after both publisher and consumer are ready
+        let (service_ready_tx, service_ready_rx) = tokio::sync::oneshot::channel();
+        let service_task = tokio::spawn(async move {
+            let _ = service_ready_tx.send(());
+            run_service_reply(Box::new(service_consumer), b"pong").await;
+        });
+        service_ready_rx.await.unwrap();
+
+        // 4. Send the request and check the response
+        let msg = CanonicalMessage::new(b"ping".to_vec(), None);
+        let result = publisher.send(msg).await.unwrap();
+
+        match result {
+            Sent::Response(resp) => {
+                assert_eq!(resp.payload.to_vec(), b"pong");
+            }
+            _ => panic!("Expected response"),
+        }
+        service_task.await.unwrap();
+        println!("NATS Request-Reply test passed!");
+    })
+    .await;
+}
+
+/// Test NATS request-reply with Core (no JetStream) mode for both publisher and consumer.
+#[cfg(feature = "nats")]
+pub async fn test_nats_core_request_reply() {
+    use mq_bridge::endpoints::nats::{NatsConsumer, NatsPublisher};
+    use mq_bridge::traits::Sent;
+    setup_logging();
+    run_test_with_docker("tests/integration/docker-compose/nats.yml", || async {
+        let subject = "core_req_rep_subject";
+
+        // Publisher in Core mode
+        let mut pub_config = mq_bridge::models::NatsConfig {
+            url: "nats://localhost:4222".to_string(),
+            request_reply: true,
+            no_jetstream: true,
+            ..Default::default()
+        };
+        pub_config.subject = Some(subject.to_string());
+        pub_config.stream = Some("ignored".to_string());
+        let publisher = NatsPublisher::new(&pub_config).await.unwrap();
+
+        // Consumer in Core mode
+        let mut service_endpoint = mq_bridge::models::NatsConfig {
+            url: "nats://localhost:4222".to_string(),
+            no_jetstream: true,
+            ..Default::default()
+        };
         service_endpoint.subject = Some(subject.to_string());
         service_endpoint.stream = Some("ignored".to_string());
         let service_consumer = NatsConsumer::new(&service_endpoint).await.unwrap();
 
-        let mut pub_config = client_config.clone();
-        pub_config.subject = Some(subject.to_string());
-        pub_config.stream = Some(stream_name.to_string());
-        let publisher = NatsPublisher::new(&pub_config).await.unwrap();
-
-        tokio::spawn(async move {
+        let (service_ready_tx, service_ready_rx) = tokio::sync::oneshot::channel();
+        let service_task = tokio::spawn(async move {
+            let _ = service_ready_tx.send(());
             run_service_reply(Box::new(service_consumer), b"pong").await;
         });
+        service_ready_rx.await.unwrap();
 
         let msg = CanonicalMessage::new(b"ping".to_vec(), None);
         let result = publisher.send(msg).await.unwrap();
@@ -136,7 +193,8 @@ pub async fn test_nats_request_reply() {
             }
             _ => panic!("Expected response"),
         }
-        println!("NATS Request-Reply test passed!");
+        service_task.await.unwrap();
+        println!("NATS Core Request-Reply test passed!");
     })
     .await;
 }

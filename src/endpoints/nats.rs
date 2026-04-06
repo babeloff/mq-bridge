@@ -511,6 +511,7 @@ impl NatsCore {
             } else {
                 client.subscribe(subject.to_string()).await?
             };
+            client.flush().await?;
             info!(subject = %subject, "NATS Core subscribed");
             Ok((NatsCore::Ephemeral(sub), client_clone))
         }
@@ -621,6 +622,7 @@ impl NatsCore {
                 let client = client.clone();
                 let commit_closure: BatchCommitFunc = Box::new(move |dispositions| {
                     Box::pin(async move {
+                        let mut sent_reply = false;
                         if dispositions.len() != reply_subjects.len() {
                             tracing::warn!(
                                     "NATS Core batch reply count mismatch: received {} messages but got {} responses. Pairing up to the shorter length.",
@@ -653,9 +655,16 @@ impl NatsCore {
                                             "Failed to publish NATS reply"
                                         );
                                     }
-                                    Ok(Ok(_)) => {}
+                                    Ok(Ok(_)) => {
+                                        sent_reply = true;
+                                    }
                                 }
                             }
+                        }
+                        if sent_reply {
+                            client.flush().await.map_err(|e| {
+                                anyhow::anyhow!("Failed to flush NATS replies: {}", e)
+                            })?;
                         }
                         Ok(())
                     }) as BoxFuture<'static, anyhow::Result<()>>
@@ -738,6 +747,7 @@ async fn handle_jetstream_replies(
     messages: &[async_nats::jetstream::Message],
     dispositions: &[MessageDisposition],
 ) {
+    let mut sent_reply = false;
     for (msg, disposition) in messages.iter().zip(dispositions.iter()) {
         // Only send a reply if the NATS message has a reply subject and the disposition is a Reply.
         if let Some(reply) = msg.reply.as_ref() {
@@ -760,9 +770,17 @@ async fn handle_jetstream_replies(
                     Ok(Err(e)) => {
                         tracing::error!(subject = %reply, error = %e, "Failed to publish NATS reply");
                     }
-                    Ok(Ok(_)) => {}
+                    Ok(Ok(_)) => {
+                        sent_reply = true;
+                    }
                 }
             }
+        }
+    }
+
+    if sent_reply {
+        if let Err(error) = client.flush().await {
+            tracing::error!(error = %error, "Failed to flush NATS JetStream replies");
         }
     }
 }
