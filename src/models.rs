@@ -34,11 +34,34 @@ use tracing::trace;
 ///           sled_path: "/tmp/mq-bridge/dedup_db"
 ///           ttl_seconds: 3600
 ///       - metrics: {}
+///       - retry:
+///           max_attempts: 5
+///           initial_interval_ms: 200
+///       - random_panic:
+///           mode: nack
+///       - dlq:
+///           endpoint:
+///             nats:
+///               subject: "dlq-subject"
+///               url: "nats://localhost:4222"
 ///     kafka:
 ///       topic: "input-topic"
 ///       url: "localhost:9092"
 ///       group_id: "my-consumer-group"
+///       tls:
+///         required: true
+///         ca_file: "/path_to_ca"
+///         cert_file: "/path_to_cert"
+///         key_file: "/path_to_key"
+///         cert_password: "password"
+///         accept_invalid_certs: true
 ///   output:
+///     middlewares:
+///       - metrics: {}
+///       - dlq:
+///           endpoint:
+///             file:
+///               path: "error.out"
 ///     nats:
 ///       subject: "output-subject"
 ///       url: "nats://localhost:4222"
@@ -998,10 +1021,23 @@ pub struct NatsConfig {
     pub subscriber_mode: bool,
     /// (Publisher only) Maximum number of messages in the stream (if created by the bridge). Defaults to 1,000,000.
     pub stream_max_messages: Option<i64>,
+    /// (Consumer only) The delivery policy for the consumer. Defaults to "all".
+    pub deliver_policy: Option<NatsDeliverPolicy>,
     /// (Publisher only) Maximum total bytes in the stream (if created by the bridge). Defaults to 1GB.
     pub stream_max_bytes: Option<i64>,
     /// (Consumer only) Number of messages to prefetch from the consumer. Defaults to 10000.
     pub prefetch_count: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum NatsDeliverPolicy {
+    #[default]
+    All,
+    Last,
+    New,
+    LastPerSubject,
 }
 
 impl NatsConfig {
@@ -1020,6 +1056,11 @@ impl NatsConfig {
 
     pub fn with_stream(mut self, stream: impl Into<String>) -> Self {
         self.stream = Some(stream.into());
+        self
+    }
+
+    pub fn with_deliver_policy(mut self, policy: NatsDeliverPolicy) -> Self {
+        self.deliver_policy = Some(policy);
         self
     }
 

@@ -44,6 +44,13 @@ static PERFORMANCE_RESULTS: Lazy<Mutex<Vec<PerformanceResult>>> =
 /// Global lock to serialize tests that use Docker containers.
 static DOCKER_TEST_LOCK: Lazy<AsyncMutex<()>> = Lazy::new(|| AsyncMutex::new(()));
 
+pub fn should_run(test_name: &str) -> bool {
+    let filter = std::env::var("MQB_TEST_BACKEND")
+        .unwrap_or_default()
+        .to_lowercase();
+    filter.is_empty() || test_name.to_lowercase().contains(&filter)
+}
+
 /// Adds a performance result to the global collector.
 pub fn add_performance_result(result: PerformanceResult) {
     println!(
@@ -339,12 +346,20 @@ async fn run_pipeline_test_internal(
         }
 
         if last_log_time.elapsed() > Duration::from_secs(5) {
-            println!(
-                "Progress: {}/{} messages received (Unique: {})",
-                received.len(),
-                num_messages,
-                unique_received_ids.len()
-            );
+            if is_performance_test {
+                println!(
+                    "Progress: {}/{} messages received",
+                    received.len(),
+                    num_messages
+                );
+            } else {
+                println!(
+                    "Progress: {}/{} messages received (Unique: {})",
+                    received.len(),
+                    num_messages,
+                    unique_received_ids.len()
+                );
+            }
             last_log_time = Instant::now();
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -588,6 +603,36 @@ static STATIC_PAYLOAD: Lazy<Vec<u8>> =
 
 pub fn generate_message(id: u128) -> CanonicalMessage {
     CanonicalMessage::new(STATIC_PAYLOAD.clone(), Some(id))
+}
+
+/// Verifies that multiple subscribers receive the same message (Broadcast/Pub-Sub logic).
+pub async fn verify_subscriber_logic(
+    publisher: Arc<dyn MessagePublisher>,
+    sub1: Arc<AsyncMutex<dyn MessageConsumer>>,
+    sub2: Arc<AsyncMutex<dyn MessageConsumer>>,
+) {
+    let payload = format!("broadcast-{}", fast_uuid_v7::gen_id());
+    publisher.send(payload.as_str().into()).await.unwrap();
+
+    // Backoff before retry
+    let res1 = tokio::time::timeout(Duration::from_secs(15), async {
+        let mut guard = sub1.lock().await;
+        guard.receive().await
+    })
+    .await
+    .expect("sub1 timeout")
+    .unwrap();
+
+    let res2 = tokio::time::timeout(Duration::from_secs(15), async {
+        let mut guard = sub2.lock().await;
+        guard.receive().await
+    })
+    .await
+    .expect("sub2 timeout")
+    .unwrap();
+
+    assert_eq!(res1.message.get_payload_str(), payload);
+    assert_eq!(res2.message.get_payload_str(), payload);
 }
 
 /// Measure the performance of writing messages to a publisher.

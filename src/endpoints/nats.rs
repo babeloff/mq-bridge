@@ -57,10 +57,15 @@ impl NatsPublisher {
         let client = if !config.no_jetstream {
             let jetstream = jetstream::new(nats_client);
             info!(stream = %stream_name, "Ensuring NATS JetStream stream exists");
+            let subjects = if subject.contains('>') || subject.contains('*') {
+                vec![subject.to_string()]
+            } else {
+                vec![format!("{}.>", stream_name)]
+            };
             jetstream
                 .get_or_create_stream(stream::Config {
                     name: stream_name.to_string(),
-                    subjects: vec![format!("{}.>", stream_name)],
+                    subjects,
                     max_messages: config.stream_max_messages.unwrap_or(1_000_000),
                     max_bytes: config.stream_max_bytes.unwrap_or(1024 * 1024 * 1024), // 1GB
                     ..Default::default()
@@ -247,16 +252,25 @@ impl NatsConsumer {
             .as_deref()
             .ok_or_else(|| anyhow!("Stream name is required for NATS consumer"))?;
 
-        let (durable_name, queue_group, deliver_policy) = if config.subscriber_mode {
-            (None, None, jetstream::consumer::DeliverPolicy::New)
+        let deliver_policy = match config.deliver_policy {
+            Some(crate::models::NatsDeliverPolicy::All) | None => {
+                jetstream::consumer::DeliverPolicy::All
+            }
+            Some(crate::models::NatsDeliverPolicy::Last) => {
+                jetstream::consumer::DeliverPolicy::Last
+            }
+            Some(crate::models::NatsDeliverPolicy::New) => jetstream::consumer::DeliverPolicy::New,
+            Some(crate::models::NatsDeliverPolicy::LastPerSubject) => {
+                jetstream::consumer::DeliverPolicy::LastPerSubject
+            }
+        };
+
+        let (durable_name, queue_group) = if config.subscriber_mode {
+            (None, None)
         } else {
             let durable = format!("{}-{}-{}", APP_NAME, stream_name, subject.replace('.', "-"));
             let queue = format!("{}-{}", APP_NAME, stream_name.replace('.', "-"));
-            (
-                Some(durable),
-                Some(queue),
-                jetstream::consumer::DeliverPolicy::All,
-            )
+            (Some(durable), Some(queue))
         };
 
         let (core, client) = NatsCore::connect(
@@ -460,7 +474,7 @@ impl NatsCore {
             jetstream
                 .get_or_create_stream(stream::Config {
                     name: stream_name.to_string(),
-                    subjects: vec![format!("{}.>", stream_name)],
+                    subjects: vec![subject.to_string()],
                     max_messages: config.stream_max_messages.unwrap_or(1_000_000),
                     max_bytes: config.stream_max_bytes.unwrap_or(1024 * 1024 * 1024), // 1GB
                     ..Default::default()
@@ -497,6 +511,7 @@ impl NatsCore {
             } else {
                 client.subscribe(subject.to_string()).await?
             };
+            client.flush().await?;
             info!(subject = %subject, "NATS Core subscribed");
             Ok((NatsCore::Ephemeral(sub), client_clone))
         }
@@ -607,6 +622,7 @@ impl NatsCore {
                 let client = client.clone();
                 let commit_closure: BatchCommitFunc = Box::new(move |dispositions| {
                     Box::pin(async move {
+                        let mut sent_reply = false;
                         if dispositions.len() != reply_subjects.len() {
                             tracing::warn!(
                                     "NATS Core batch reply count mismatch: received {} messages but got {} responses. Pairing up to the shorter length.",
@@ -639,9 +655,16 @@ impl NatsCore {
                                             "Failed to publish NATS reply"
                                         );
                                     }
-                                    Ok(Ok(_)) => {}
+                                    Ok(Ok(_)) => {
+                                        sent_reply = true;
+                                    }
                                 }
                             }
+                        }
+                        if sent_reply {
+                            client.flush().await.map_err(|e| {
+                                anyhow::anyhow!("Failed to flush NATS replies: {}", e)
+                            })?;
                         }
                         Ok(())
                     }) as BoxFuture<'static, anyhow::Result<()>>
@@ -724,6 +747,7 @@ async fn handle_jetstream_replies(
     messages: &[async_nats::jetstream::Message],
     dispositions: &[MessageDisposition],
 ) {
+    let mut sent_reply = false;
     for (msg, disposition) in messages.iter().zip(dispositions.iter()) {
         // Only send a reply if the NATS message has a reply subject and the disposition is a Reply.
         if let Some(reply) = msg.reply.as_ref() {
@@ -746,9 +770,17 @@ async fn handle_jetstream_replies(
                     Ok(Err(e)) => {
                         tracing::error!(subject = %reply, error = %e, "Failed to publish NATS reply");
                     }
-                    Ok(Ok(_)) => {}
+                    Ok(Ok(_)) => {
+                        sent_reply = true;
+                    }
                 }
             }
+        }
+    }
+
+    if sent_reply {
+        if let Err(error) = client.flush().await {
+            tracing::error!(error = %error, "Failed to flush NATS JetStream replies");
         }
     }
 }

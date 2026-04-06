@@ -30,6 +30,7 @@ impl RetryPublisher {
             match operation().await {
                 Ok(val) => return Ok(val),
                 Err(e @ PublisherError::NonRetryable(_)) => return Err(e), // Don't retry non-retryable errors
+                Err(e @ PublisherError::Connection(_)) => return Err(e), // Propagate connection errors
                 Err(e @ PublisherError::Retryable(_)) => {
                     if attempt >= self.config.max_attempts {
                         return Err(PublisherError::Retryable(anyhow!(
@@ -141,6 +142,11 @@ impl MessagePublisher for RetryPublisher {
                 }
                 Err(e) => {
                     if matches!(e, PublisherError::NonRetryable(_)) {
+                        return Err(e);
+                    }
+                    // Connection errors are treated as non-retryable and may be reported as part of a Partial result (failed_messages),
+                    // not always as Err. The retry logic will not retry them whether they arrive via Err or Partial.
+                    if matches!(e, PublisherError::Connection(_)) {
                         return Err(e);
                     }
                     if attempt >= self.config.max_attempts {

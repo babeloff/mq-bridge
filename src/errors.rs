@@ -9,6 +9,14 @@ pub enum ProcessingError {
     /// A permanent error occurred. The operation should not be retried.
     #[error("non-retryable error: {0}")]
     NonRetryable(#[source] anyhow::Error),
+    /// A connection-level error occurred. Used to signal broker disconnects, etc.
+    #[error("connection error: {0}")]
+    Connection(#[source] anyhow::Error),
+}
+impl ProcessingError {
+    pub fn is_connection_error(&self) -> bool {
+        matches!(self, ProcessingError::Connection(_))
+    }
 }
 
 pub type HandlerError = ProcessingError;

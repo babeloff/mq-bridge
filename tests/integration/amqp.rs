@@ -1,10 +1,11 @@
-#![allow(dead_code)]
+#![allow(unused_imports, dead_code)]
 
 use mq_bridge::endpoints::amqp::{AmqpConsumer, AmqpPublisher};
 use mq_bridge::test_utils::{
     add_performance_result, run_chaos_pipeline_test, run_direct_perf_test,
     run_performance_pipeline_test, run_pipeline_test, run_test_with_docker,
-    run_test_with_docker_controller, setup_logging, PERF_TEST_MESSAGE_COUNT,
+    run_test_with_docker_controller, setup_logging, should_run, verify_subscriber_logic,
+    PERF_TEST_MESSAGE_COUNT,
 };
 use std::sync::Arc;
 
@@ -47,6 +48,9 @@ pub async fn test_amqp_pipeline() {
 #[tokio::test]
 #[ignore = "requires docker compose"]
 async fn test_amqp_publisher_handles_nack() {
+    if !should_run("amqp") {
+        return;
+    }
     use mq_bridge::traits::MessagePublisher;
     setup_logging();
     run_test_with_docker("tests/integration/docker-compose/amqp.yml", || async {
@@ -103,9 +107,38 @@ async fn test_amqp_publisher_handles_nack() {
     .await;
 }
 
+pub async fn test_amqp_subscriber_logic() {
+    setup_logging();
+    run_test_with_docker("tests/integration/docker-compose/amqp.yml", || async {
+        let queue = format!("sub_logic_{}", fast_uuid_v7::gen_id());
+        let config = mq_bridge::models::AmqpConfig {
+            url: "amqp://guest:guest@localhost:5672/%2f".to_string(),
+            queue: Some(queue.clone()),
+            subscribe_mode: true,
+            ..Default::default()
+        };
+
+        let publisher = Arc::new(AmqpPublisher::new(&config).await.unwrap());
+        let sub1 = Arc::new(tokio::sync::Mutex::new(
+            AmqpConsumer::new(&config).await.unwrap(),
+        ));
+        let sub2 = Arc::new(tokio::sync::Mutex::new(
+            AmqpConsumer::new(&config).await.unwrap(),
+        ));
+        // Give subscribers time to connect and finish the subscription
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        verify_subscriber_logic(publisher, sub1, sub2).await;
+    })
+    .await;
+}
+
 #[tokio::test]
 #[ignore = "requires docker compose"]
 async fn test_amqp_publisher_handles_disconnect() {
+    if !should_run("amqp") {
+        return;
+    }
     use mq_bridge::models::{
         Endpoint, EndpointType, FaultMode, Middleware, RandomPanicMiddleware, RetryMiddleware,
     };

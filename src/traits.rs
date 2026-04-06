@@ -367,6 +367,19 @@ pub async fn send_batch_helper<P: MessagePublisher + ?Sized>(
                 }
                 break;
             }
+            Err(PublisherError::Connection(e)) => {
+                // Treat connection errors as affecting the whole batch, propagate immediately.
+                failed_messages.push((msg, PublisherError::Connection(e)));
+                for m in iter {
+                    failed_messages.push((
+                        m,
+                        PublisherError::Connection(anyhow::anyhow!(
+                            "Batch aborted due to previous connection error"
+                        )),
+                    ));
+                }
+                break;
+            }
             Err(PublisherError::NonRetryable(e)) => {
                 // A non-retryable error is specific to this message.
                 // Collect it and continue with the rest of the batch.

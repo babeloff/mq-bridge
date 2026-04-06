@@ -17,5 +17,8 @@ pub mod sqlx;
 #[cfg(feature = "zeromq")]
 pub mod zeromq;
 
+pub mod file;
+pub mod logic_test;
 pub mod memory;
+// request_reply_test.rs merged into route.rs
 pub mod route;

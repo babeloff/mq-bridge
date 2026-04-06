@@ -15,5 +15,5 @@ Run with full tracing:
 `RUST_LOG=info,mq_bridge=trace cargo test...`
 
 ###
-Run only one test, for example aws:
-`MQB_TEST_BACKEND=aws cargo test --test integration_test --features full --release  -- --ignored --test-threads=1 --nocapture`
+Run performance test for a single backend, for example aws:
+`MQB_TEST_BACKEND=aws cargo test --test performance_test --features full --release  -- --ignored --test-threads=1 --nocapture`

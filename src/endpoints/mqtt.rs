@@ -172,11 +172,13 @@ impl MessagePublisher for MqttPublisher {
         // without immediately failing the batch, while still preventing indefinite hangs.
         match tokio::time::timeout(Duration::from_secs(10), publish_future).await {
             Ok(Ok(_)) => Ok(Sent::Ack),
-            Ok(Err(e)) => Err(PublisherError::Retryable(anyhow!(
+            Ok(Err(e)) => Err(PublisherError::Connection(anyhow!(
                 "Failed to publish MQTT message: {}",
                 e
             ))),
-            Err(_) => Err(PublisherError::Retryable(anyhow!("MQTT publish timed out"))),
+            Err(_) => Err(PublisherError::Connection(anyhow!(
+                "MQTT publish timed out"
+            ))),
         }
     }
 
@@ -188,26 +190,25 @@ impl MessagePublisher for MqttPublisher {
         let client = self.state.read().await.client.clone();
 
         let mut first_error: Option<anyhow::Error> = None;
+        let mut failed_indices = Vec::new();
 
-        for message in &messages {
-            // If an error has already occurred, we can stop trying to publish.
+        for (i, message) in messages.iter().enumerate() {
             if first_error.is_some() {
-                break;
+                failed_indices.push(i);
+                continue;
             }
-
             let publish_future = client.publish(&self.topic, self.qos, message.clone());
-
             match tokio::time::timeout(Duration::from_secs(10), publish_future).await {
                 Ok(Ok(_)) => {
                     // Successfully enqueued
                 }
                 Ok(Err(e)) => {
-                    // Enqueueing failed.
                     first_error = Some(anyhow!("Failed to publish MQTT message in batch: {}", e));
+                    failed_indices.push(i);
                 }
                 Err(_) => {
-                    // Timeout.
                     first_error = Some(anyhow!("MQTT publish timed out in batch"));
+                    failed_indices.push(i);
                 }
             }
         }
@@ -435,28 +436,41 @@ impl MessageConsumer for MqttListener {
         let client = self.client.clone();
         let commit = Box::new(move |dispositions: Vec<MessageDisposition>| {
             Box::pin(async move {
+                // Length check to avoid silent truncation
+                if dispositions.len() != reply_infos.len() || dispositions.len() != acks.len() {
+                    return Err(anyhow!(
+                        "MQTT batch commit: mismatched lengths: dispositions={}, reply_infos={}, acks={}",
+                        dispositions.len(), reply_infos.len(), acks.len()
+                    ));
+                }
+                let mut ack_futures = Vec::with_capacity(dispositions.len());
+
                 for (((reply_topic, correlation_data), ack), disposition) in reply_infos
                     .into_iter()
                     .zip(acks.into_iter())
                     .zip(dispositions.into_iter())
                 {
-                    match disposition {
-                        MessageDisposition::Reply(resp) => {
-                            handle_mqtt_reply(&client, reply_topic, correlation_data, resp).await?;
-                            if let Err(e) = client.ack(&ack).await {
-                                error!("Failed to ack MQTT message in batch: {}", e);
-                                return Err(anyhow!("Failed to ack MQTT message batch: {}", e));
+                    let client = client.clone();
+                    ack_futures.push(async move {
+                        match disposition {
+                            MessageDisposition::Reply(resp) => {
+                                handle_mqtt_reply(&client, reply_topic, correlation_data, resp)
+                                    .await?;
+                                client.ack(&ack).await.map_err(|e| {
+                                    error!("Failed to ack MQTT message in batch: {}", e);
+                                    anyhow!("Failed to ack MQTT message batch: {}", e)
+                                })
                             }
-                        }
-                        MessageDisposition::Ack => {
-                            if let Err(e) = client.ack(&ack).await {
+                            MessageDisposition::Ack => client.ack(&ack).await.map_err(|e| {
                                 error!("Failed to ack MQTT message in batch: {}", e);
-                                return Err(e);
-                            }
+                                e
+                            }),
+                            MessageDisposition::Nack => Ok(()),
                         }
-                        MessageDisposition::Nack => {}
-                    }
+                    });
                 }
+
+                futures::future::try_join_all(ack_futures).await?;
                 Ok(())
             }) as BoxFuture<'static, anyhow::Result<()>>
         });
@@ -530,9 +544,16 @@ async fn create_client_and_eventloop(
             mqttoptions
                 .set_keep_alive(Duration::from_secs(config.keep_alive_seconds.unwrap_or(20)));
             mqttoptions.set_manual_acks(!config.delayed_ack);
-            if let Some(inflight) = config.max_inflight {
-                mqttoptions.set_outgoing_inflight_upper_limit(inflight);
-            }
+            let default_window: u16 = match config.max_inflight {
+                Some(v) => v,
+                None => {
+                    let capped = std::cmp::min(queue_capacity, u16::MAX as usize);
+                    capped as u16
+                }
+            };
+            mqttoptions.set_outgoing_inflight_upper_limit(default_window);
+            mqttoptions.set_receive_maximum(Some(default_window));
+            mqttoptions.set_max_packet_size(Some(10 * 1024 * 1024)); // Set max packet size to 10MB
             mqttoptions.set_clean_start(config.clean_session);
 
             if let Some(expiry) = config.session_expiry_interval {
@@ -559,9 +580,14 @@ async fn create_client_and_eventloop(
             mqttoptions
                 .set_keep_alive(Duration::from_secs(config.keep_alive_seconds.unwrap_or(20)));
             mqttoptions.set_manual_acks(!config.delayed_ack);
-            if let Some(inflight) = config.max_inflight {
-                mqttoptions.set_inflight(inflight);
-            }
+            let default_window: u16 = match config.max_inflight {
+                Some(v) => v,
+                None => {
+                    let capped = std::cmp::min(queue_capacity, u16::MAX as usize);
+                    capped as u16
+                }
+            };
+            mqttoptions.set_inflight(default_window);
             mqttoptions.set_clean_session(config.clean_session);
 
             if let (Some(username), Some(password)) = (&config.username, &config.password) {
