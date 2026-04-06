@@ -348,6 +348,8 @@ async fn test_all_request_reply() {
     #[cfg(feature = "kafka")]
     if should_run("kafka") {
         integration::route::test_kafka_request_reply().await;
+        integration::route::test_kafka_request_reply_multiple_sequential().await;
+        integration::route::test_kafka_request_reply_lost_response().await;
     }
     #[cfg(feature = "nats")]
     if should_run("nats") {
@@ -357,6 +359,8 @@ async fn test_all_request_reply() {
     #[cfg(feature = "mongodb")]
     if should_run("mongodb") {
         integration::route::test_mongodb_request_reply_pattern().await;
+        integration::route::test_mongodb_request_reply_multiple_sequential().await;
+        integration::route::test_mongodb_request_reply_lost_response().await;
     }
     #[cfg(feature = "amqp")]
     if should_run("amqp") {
@@ -367,4 +371,7 @@ async fn test_all_request_reply() {
         integration::route::test_mqtt_request_reply().await;
     }
     integration::route::test_memory_request_reply().await;
+    // Additional memory request-reply tests for multi-message scenarios
+    integration::route::test_memory_request_reply_multiple_sequential().await;
+    integration::route::test_memory_request_reply_multiple_concurrent().await;
 }

@@ -544,9 +544,13 @@ async fn create_client_and_eventloop(
             mqttoptions
                 .set_keep_alive(Duration::from_secs(config.keep_alive_seconds.unwrap_or(20)));
             mqttoptions.set_manual_acks(!config.delayed_ack);
-            let default_window = config
-                .max_inflight
-                .unwrap_or(queue_capacity.try_into().unwrap());
+            let default_window: u16 = match config.max_inflight {
+                Some(v) => v,
+                None => {
+                    let capped = std::cmp::min(queue_capacity, u16::MAX as usize);
+                    capped as u16
+                }
+            };
             mqttoptions.set_outgoing_inflight_upper_limit(default_window);
             mqttoptions.set_receive_maximum(Some(default_window));
             mqttoptions.set_max_packet_size(Some(10 * 1024 * 1024)); // Set max packet size to 10MB
@@ -576,9 +580,13 @@ async fn create_client_and_eventloop(
             mqttoptions
                 .set_keep_alive(Duration::from_secs(config.keep_alive_seconds.unwrap_or(20)));
             mqttoptions.set_manual_acks(!config.delayed_ack);
-            let default_window = config
-                .max_inflight
-                .unwrap_or(queue_capacity.try_into().unwrap());
+            let default_window: u16 = match config.max_inflight {
+                Some(v) => v,
+                None => {
+                    let capped = std::cmp::min(queue_capacity, u16::MAX as usize);
+                    capped as u16
+                }
+            };
             mqttoptions.set_inflight(default_window);
             mqttoptions.set_clean_session(config.clean_session);
 

@@ -27,6 +27,16 @@ async fn run_service_reply(mut consumer: Box<dyn MessageConsumer>, response_payl
     }
 }
 
+/// Helper to run a simple service loop that receives one message and ACKs it (no reply).
+async fn run_service_ack(mut consumer: Box<dyn MessageConsumer>) {
+    match consumer.receive().await {
+        Ok(received) => {
+            let _ = (received.commit)(mq_bridge::traits::MessageDisposition::Ack).await;
+        }
+        Err(e) => panic!("Service consumer failed to receive: {:?}", e),
+    }
+}
+
 #[cfg(feature = "kafka")]
 pub async fn test_kafka_request_reply() {
     use mq_bridge::endpoints::kafka::{KafkaConsumer, KafkaPublisher};
@@ -118,6 +128,71 @@ pub async fn test_nats_request_reply() {
             no_jetstream: true,
             ..Default::default()
         };
+        #[cfg(feature = "kafka")]
+        pub async fn test_kafka_request_reply_multiple_sequential() {
+            use mq_bridge::endpoints::kafka::{KafkaConsumer, KafkaPublisher};
+            use mq_bridge::models::KafkaConfig;
+            use mq_bridge::CanonicalMessage;
+            use std::collections::HashSet;
+            setup_logging();
+            run_test_with_docker("tests/integration/docker-compose/kafka.yml", || async {
+                let request_topic = format!("test_req_rep_topic_{}", fast_uuid_v7::gen_id_str());
+                let reply_topic = format!("test_req_rep_reply_{}", fast_uuid_v7::gen_id_str());
+
+                let config = mq_bridge::models::KafkaConfig {
+                    url: "localhost:9092".to_string(),
+                    ..Default::default()
+                };
+
+                let mut req_config = config.clone();
+                req_config.topic = Some(request_topic.clone());
+                let client_publisher = KafkaPublisher::new(&req_config).await.unwrap();
+
+                let mut reply_config = config.clone();
+                reply_config.topic = Some(reply_topic.clone());
+                reply_config.group_id = Some(format!("reply_group_{}", fast_uuid_v7::gen_id_str()));
+                let mut client_consumer = KafkaConsumer::new(&reply_config).await.unwrap();
+
+                let mut service_endpoint = config.clone();
+                service_endpoint.topic = Some(request_topic.clone());
+                let service_consumer = KafkaConsumer::new(&service_endpoint).await.unwrap();
+
+                tokio::spawn(async move {
+                    run_service_reply(Box::new(service_consumer), b"kafka_multi_resp").await;
+                });
+
+                // Give it a moment to initialize
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+                let mut expected: HashSet<String> = HashSet::new();
+                for i in 0..8 {
+                    let cid = format!("cid-{}", i);
+                    let mut msg = CanonicalMessage::new(format!("req-{}", i).into_bytes(), None);
+                    msg.metadata
+                        .insert("reply_to".to_string(), reply_topic.clone());
+                    msg.metadata
+                        .insert("correlation_id".to_string(), cid.clone());
+                    expected.insert(cid.clone());
+                    client_publisher.send(msg).await.unwrap();
+                }
+
+                let mut received = HashSet::new();
+                for _ in 0..8 {
+                    let rec = client_consumer.receive().await.unwrap();
+                    let cid = rec.message.metadata.get("correlation_id").cloned();
+                    if let Some(c) = cid {
+                        received.insert(c);
+                    }
+                    let _ = (rec.commit)(mq_bridge::traits::MessageDisposition::Ack).await;
+                    assert_eq!(rec.message.get_payload_str(), "kafka_multi_resp");
+                }
+
+                assert_eq!(expected, received);
+                println!("Kafka sequential multi-request request-reply test passed!");
+            })
+            .await;
+        }
+
         service_endpoint.subject = Some(subject.to_string());
         service_endpoint.stream = Some(stream_name.to_string());
         // Native NATS request-reply needs a live Core subscription as the responder.
@@ -245,6 +320,104 @@ pub async fn test_mongodb_request_reply_pattern() {
             _ => panic!("Expected Sent::Response, got {:?}", result),
         }
         println!("MongoDB Request-Reply test passed!");
+    })
+    .await;
+}
+
+#[cfg(feature = "mongodb")]
+pub async fn test_mongodb_request_reply_multiple_sequential() {
+    use mq_bridge::endpoints::mongodb::{MongoDbConsumer, MongoDbPublisher};
+    use mq_bridge::traits::Sent;
+    use mq_bridge::CanonicalMessage;
+    setup_logging();
+    run_test_with_docker("tests/integration/docker-compose/mongodb.yml", || async {
+        let req_collection = format!("req_rep_collection_{}", fast_uuid_v7::gen_id_str());
+        let db_name = format!("mq_bridge_test_req_rep_{}", fast_uuid_v7::gen_id_str());
+
+        // Service side
+        let service_config = mq_bridge::models::MongoDbConfig {
+            url: "mongodb://localhost:27017".to_string(),
+            database: db_name.clone(),
+            ..Default::default()
+        };
+        let mut service_endpoint = service_config;
+        service_endpoint.collection = Some(req_collection.clone());
+        let service_consumer = MongoDbConsumer::new(&service_endpoint).await.unwrap();
+
+        tokio::spawn(async move {
+            run_service_reply(Box::new(service_consumer), b"mongo_multi_resp").await;
+        });
+
+        // Client side
+        let client_config = mq_bridge::models::MongoDbConfig {
+            url: "mongodb://localhost:27017".to_string(),
+            database: db_name.clone(),
+            request_reply: true,
+            ..Default::default()
+        };
+        let mut pub_conf = client_config.clone();
+        pub_conf.collection = Some(req_collection.clone());
+        let client_publisher = MongoDbPublisher::new(&pub_conf).await.unwrap();
+
+        for i in 0..8 {
+            let req = CanonicalMessage::new(format!("mongo_req_{}", i).into_bytes(), None);
+            let res = client_publisher.send(req).await.unwrap();
+            match res {
+                Sent::Response(r) => assert_eq!(r.get_payload_str(), "mongo_multi_resp"),
+                _ => panic!("Expected response for MongoDB request"),
+            }
+        }
+
+        println!("MongoDB sequential multi-request request-reply test passed!");
+    })
+    .await;
+}
+
+#[cfg(feature = "mongodb")]
+pub async fn test_mongodb_request_reply_lost_response() {
+    use mq_bridge::endpoints::mongodb::{MongoDbConsumer, MongoDbPublisher};
+    use mq_bridge::traits::PublisherError;
+    setup_logging();
+    run_test_with_docker("tests/integration/docker-compose/mongodb.yml", || async {
+        let req_collection = format!("req_rep_lost_{}", fast_uuid_v7::gen_id_str());
+        let db_name = format!("mq_bridge_test_req_rep_lost_{}", fast_uuid_v7::gen_id_str());
+
+        let service_config = mq_bridge::models::MongoDbConfig {
+            url: "mongodb://localhost:27017".to_string(),
+            database: db_name.clone(),
+            ..Default::default()
+        };
+        let mut service_endpoint = service_config;
+        service_endpoint.collection = Some(req_collection.clone());
+        let service_consumer = MongoDbConsumer::new(&service_endpoint).await.unwrap();
+
+        // Service ACKs without replying
+        tokio::spawn(async move {
+            run_service_ack(Box::new(service_consumer)).await;
+        });
+
+        let client_config = mq_bridge::models::MongoDbConfig {
+            url: "mongodb://localhost:27017".to_string(),
+            database: db_name.clone(),
+            request_reply: true,
+            request_timeout_ms: Some(2000),
+            ..Default::default()
+        };
+        let mut pub_conf = client_config.clone();
+        pub_conf.collection = Some(req_collection.clone());
+        let client_publisher = MongoDbPublisher::new(&pub_conf).await.unwrap();
+
+        let req = mq_bridge::CanonicalMessage::new(b"lost_mongo_req".to_vec(), None);
+        let res = client_publisher.send(req).await;
+        match res {
+            Err(PublisherError::NonRetryable(_)) => {
+                // Expected: timed out waiting for reply
+            }
+            Ok(_) => panic!("Expected timeout/error due to missing reply"),
+            Err(e) => panic!("Unexpected error: {:?}", e),
+        }
+
+        println!("MongoDB lost-response simulation passed (timeout detected)");
     })
     .await;
 }
@@ -1018,4 +1191,120 @@ pub async fn test_memory_request_reply() {
     // Clean up
     Route::stop("mem_rr_test").await;
     println!("Memory Request-Reply test passed!");
+}
+
+pub async fn test_memory_request_reply_multiple_sequential() {
+    use fast_uuid_v7::gen_id_str;
+    use mq_bridge::endpoints::memory::MemoryPublisher;
+    use mq_bridge::models::{Endpoint, MemoryConfig};
+    use mq_bridge::traits::Sent;
+    use mq_bridge::CanonicalMessage;
+    use mq_bridge::Handled;
+    use mq_bridge::Route;
+
+    let topic = format!("mem_rr_multi_seq_{}", gen_id_str());
+    let input_endpoint = Endpoint::new_memory(&topic, 100);
+    let output_endpoint = Endpoint::new_response();
+    let handler = |mut msg: CanonicalMessage| async move {
+        let request_payload = msg.get_payload_str();
+        let response_payload = format!("reply to {}", request_payload);
+        msg.set_payload_str(response_payload);
+        Ok(Handled::Publish(msg))
+    };
+
+    let route = Route::new(input_endpoint, output_endpoint).with_handler(handler);
+    route.deploy("mem_rr_multi_seq_test").await.unwrap();
+
+    let publisher = MemoryPublisher::new(&MemoryConfig {
+        topic: topic.clone(),
+        capacity: Some(100),
+        request_reply: true,
+        request_timeout_ms: Some(5000),
+        ..Default::default()
+    })
+    .unwrap();
+
+    for i in 0..8 {
+        let payload = format!("seq-{}", i);
+        let result = publisher.send(payload.clone().into()).await.unwrap();
+        if let Sent::Response(response_msg) = result {
+            assert_eq!(
+                response_msg.get_payload_str(),
+                format!("reply to {}", payload)
+            );
+        } else {
+            panic!("Expected Sent::Response, got {:?}", result);
+        }
+    }
+
+    Route::stop("mem_rr_multi_seq_test").await;
+    println!("Memory sequential multi-request request-reply test passed!");
+}
+
+pub async fn test_memory_request_reply_multiple_concurrent() {
+    use fast_uuid_v7::gen_id_str;
+    use mq_bridge::endpoints::memory::MemoryPublisher;
+    use mq_bridge::models::{Endpoint, MemoryConfig};
+    use mq_bridge::traits::Sent;
+    use mq_bridge::CanonicalMessage;
+    use mq_bridge::Handled;
+    use mq_bridge::Route;
+
+    let topic = format!("mem_rr_multi_con_{}", gen_id_str());
+    let input_endpoint = Endpoint::new_memory(&topic, 100);
+    let output_endpoint = Endpoint::new_response();
+    let handler = |mut msg: CanonicalMessage| async move {
+        let request_payload = msg.get_payload_str();
+        // Small, deterministic jitter to increase out-of-order likelihood
+        let mut sleep_ms = 0u64;
+        if let Some(pos) = request_payload.rfind('-') {
+            if let Ok(n) = request_payload[pos + 1..].parse::<u64>() {
+                sleep_ms = (n % 5) * 10;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(sleep_ms)).await;
+
+        let response_payload = format!("reply to {}", request_payload);
+        msg.set_payload_str(response_payload);
+        Ok(Handled::Publish(msg))
+    };
+
+    let route = Route::new(input_endpoint, output_endpoint).with_handler(handler);
+    route.deploy("mem_rr_multi_con_test").await.unwrap();
+
+    let publisher = MemoryPublisher::new(&MemoryConfig {
+        topic: topic.clone(),
+        capacity: Some(100),
+        request_reply: true,
+        request_timeout_ms: Some(5000),
+        ..Default::default()
+    })
+    .unwrap();
+
+    let mut handles = Vec::new();
+    let n = 16usize;
+    for i in 0..n {
+        let p = publisher.clone();
+        let payload = format!("con-{}", i);
+        handles.push(tokio::spawn(async move {
+            let res = p.send(payload.clone().into()).await.unwrap();
+            match res {
+                Sent::Response(resp) => Ok((i, resp.get_payload_str().to_string())),
+                _ => Err(format!("Expected response for payload {}", payload)),
+            }
+        }));
+    }
+
+    for h in handles {
+        let out = h.await.unwrap();
+        match out {
+            Ok((i, resp_payload)) => {
+                assert_eq!(resp_payload, format!("reply to con-{}", i));
+            }
+            Err(e) => panic!("{}", e),
+        }
+    }
+
+    Route::stop("mem_rr_multi_con_test").await;
+    println!("Memory concurrent multi-request request-reply test passed!");
 }
