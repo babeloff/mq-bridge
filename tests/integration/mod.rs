@@ -6,10 +6,15 @@ pub mod aws;
 pub mod grpc;
 #[cfg(feature = "http")]
 pub mod http;
+#[cfg(feature = "http")]
+pub mod http_tls;
 #[cfg(feature = "ibm-mq")]
 pub mod ibm_mq;
+#[cfg(feature = "ibm-mq")]
+pub mod ibm_mq_tls;
 #[cfg(feature = "kafka")]
 pub mod kafka;
+pub mod tls_helpers;
 #[cfg(feature = "mongodb")]
 pub mod mongodb;
 #[cfg(feature = "mqtt")]
@@ -26,3 +31,5 @@ pub mod logic_test;
 pub mod memory;
 // request_reply_test.rs merged into route.rs
 pub mod route;
+#[cfg(feature = "grpc")]
+pub mod grpc_tls;

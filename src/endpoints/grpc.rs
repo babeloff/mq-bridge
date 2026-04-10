@@ -615,7 +615,7 @@ mod tests {
             request: Request<proto::Ack>,
         ) -> Result<Response<proto::AckResponse>, Status> {
             let _ = request.into_inner();
-            Ok(Response::new(proto::AckResponse { success: true }))
+            Ok(Response::new(proto::AckResponse { success: true, error: String::new() }))
         }
 
         type PublishBatchStream = ReceiverStream<Result<PublishResponse, Status>>;

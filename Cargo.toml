@@ -148,6 +148,12 @@ criterion = { version = "0.8", features = ["async", "async_tokio"] }
 mq-bridge = { path = ".", features = ["test-utils"] }
 reqwest = { version = "0.12", features = ["stream"] }
 
+# TLS test helpers
+rcgen = "0.9"
+tokio-rustls = "0.26"
+rustls = "0.23"
+rustls-pemfile = "2.2"
+
 [[bench]]
 name = "performance_bench"
 harness = false
