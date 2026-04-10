@@ -276,6 +276,10 @@ impl Route {
     /// # }
     /// ```
     pub async fn run(&self, name_str: &str) -> anyhow::Result<RouteHandle> {
+        // Ensure a deterministic rustls CryptoProvider is installed early in process
+        // This avoids panics when rustls cannot auto-select a provider based on features.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
         let warnings = self.check(name_str, None)?;
         for warning in warnings {
             tracing::warn!(route = name_str, "Configuration warning: {}", warning);

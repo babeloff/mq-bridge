@@ -711,8 +711,8 @@ mod tests {
         let mut rx_for_pub_test = tx.subscribe();
         let bridge = MockBridge { tx: tx.clone() };
 
-        let incoming = TcpListenerStream::new(listener);
-        let _server_handle = tokio::spawn(async move {
+        let incoming: TcpListenerStream = TcpListenerStream::new(listener);
+        let server_handle = tokio::spawn(async move {
             TonicServer::builder()
                 .serve_with_incoming(BridgeServer::new(bridge), incoming)
                 .await

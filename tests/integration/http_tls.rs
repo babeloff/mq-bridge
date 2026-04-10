@@ -1,9 +1,9 @@
-#![allow(dead_code)]
+#![allow(dead_code, unused)]
 
 use crate::integration::tls_helpers;
 use mq_bridge::models::Route;
 use mq_bridge::test_utils::setup_logging;
-use mq_bridge::test_utils::PERF_TEST_MESSAGE_COUNT;
+use mq_bridge::test_utils::{PERF_TEST_MESSAGE_COUNT, PERF_TEST_SINGLE_MESSAGE_COUNT};
 use serde_yaml_ng;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -78,7 +78,7 @@ async fn test_http_tls_pipeline() {
         let cert_dir = tls_helpers::generate_service_certs("mongodb").expect("generate certs");
         if let Some(out_route) = routes.get_mut(out_route_name.as_str()) {
             if let mq_bridge::models::EndpointType::Http(ref mut http_cfg) =
-                out_route.output.endpoint_type
+                out_route.input.endpoint_type
             {
                 *http_cfg = tls_helpers::http_consumer_config_with_tls(
                     &cert_dir,

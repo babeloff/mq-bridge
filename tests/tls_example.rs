@@ -14,7 +14,6 @@ async fn tls_handshake_example() -> Result<()> {
     let mut ca_params = CertificateParams::new(vec!["localhost".into()]);
     ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
     let ca = Certificate::from_params(ca_params)?;
-    let ca_der = ca.serialize_der()?;
     let ca_pem = ca.serialize_pem()?;
 
     let mut server_params = CertificateParams::new(vec!["localhost".into()]);
