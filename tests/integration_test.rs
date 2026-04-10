@@ -302,6 +302,20 @@ async fn test_all_performance_pipeline() {
             integration::zeromq::test_zeromq_performance_pipeline().await;
         }
     }
+    #[cfg(feature = "grpc")]
+    {
+        if should_run("grpc") {
+            println!("\n\n>>> Starting gRPC Performance Pipeline Test...");
+            integration::grpc::test_grpc_performance_pipeline().await;
+        }
+    }
+    #[cfg(feature = "http")]
+    {
+        if should_run("http") {
+            println!("\n\n>>> Starting HTTP Performance Pipeline Test...");
+            integration::http::test_http_performance_pipeline().await;
+        }
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]

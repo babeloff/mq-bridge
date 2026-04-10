@@ -20,7 +20,7 @@ use tokio::{
     sync::Semaphore,
     task::{JoinHandle, JoinSet},
 };
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 
 // Re-export extensions for backward compatibility and internal usage
 pub use crate::extensions::{
@@ -160,6 +160,7 @@ impl Route {
     }
 
     /// Stops a running route by name and removes it from the registry.
+    /// Tries to join the handles for 5s and then returns without join.
     pub async fn stop(name: &str) -> bool {
         let registry = ROUTE_REGISTRY.get_or_init(|| RwLock::new(HashMap::new()));
         let active_opt = {
@@ -169,7 +170,9 @@ impl Route {
 
         if let Some(active) = active_opt {
             active.handle.stop().await;
-            let _ = active.handle.join().await;
+            // Give the route up to 5 seconds to shut down gracefully.
+            let _ =
+                tokio::time::timeout(std::time::Duration::from_secs(5), active.handle.join()).await;
             true
         } else {
             false
@@ -419,8 +422,9 @@ impl Route {
                             commit_tasks.spawn(async move {
                                 if let Err(e) = commit(vec![MessageDisposition::Ack; batch_len]).await {
                                     error!("Commit failed: {}", e);
-                                    if err_tx.try_send(e).is_err() {
-                                        warn!("Could not send commit error to main task, it might be down or busy.");
+                                    match err_tx.try_send(e) {
+                                        Ok(_) => trace!("Reported commit error to main task"),
+                                        Err(err_send) => warn!(error=?err_send, "Could not send commit error to main task, it might be down or busy."),
                                     }
                                 }
                                 // Permit is dropped here, releasing the slot
@@ -469,8 +473,9 @@ impl Route {
                                 let dispositions = map_responses_to_dispositions(&ids, responses, &failed);
                                 if let Err(e) = commit(dispositions).await {
                                     error!("Commit failed: {}", e);
-                                    if err_tx.try_send(e).is_err() {
-                                        warn!("Could not send commit error to main task, it might be down or busy.");
+                                    match err_tx.try_send(e) {
+                                        Ok(_) => trace!("Reported commit error to main task"),
+                                        Err(err_send) => warn!(error=?err_send, "Could not send commit error to main task, it might be down or busy."),
                                     }
                                 }
                                 drop(permit);
@@ -569,8 +574,9 @@ impl Route {
                             commit_tasks.spawn(async move {
                                 if let Err(e) = commit(vec![MessageDisposition::Ack; batch_len]).await {
                                     error!("Commit failed: {}", e);
-                                    if err_tx.try_send(e).is_err() {
-                                        warn!("Could not send commit error to main task, it might be down or busy.");
+                                    match err_tx.try_send(e) {
+                                        Ok(_) => trace!("Reported commit error to main task"),
+                                        Err(err_send) => warn!(error=?err_send, "Could not send commit error to main task, it might be down or busy."),
                                     }
                                 }
                                 drop(permit);
@@ -599,8 +605,9 @@ impl Route {
                                     warn!("Commit after transient failure also failed: {}", commit_err);
                                 }
                                 if !has_retry_middleware {
-                                    if err_tx.try_send(e).is_err() {
-                                        warn!("Could not send error to main task, it might be down or busy.");
+                                    match err_tx.try_send(e) {
+                                        Ok(_) => trace!("Reported error to main task"),
+                                        Err(err_send) => warn!(error=?err_send, "Could not send error to main task, it might be down or busy."),
                                     }
                                     break;
                                 }
@@ -625,8 +632,9 @@ impl Route {
                                 let dispositions = map_responses_to_dispositions(&ids, responses, &failed);
                                 if let Err(e) = commit(dispositions).await {
                                     error!("Commit failed: {}", e);
-                                    if err_tx.try_send(e).is_err() {
-                                        warn!("Could not send commit error to main task, it might be down or busy.");
+                                    match err_tx.try_send(e) {
+                                        Ok(_) => trace!("Reported commit error to main task"),
+                                        Err(err_send) => warn!(error=?err_send, "Could not send commit error to main task, it might be down or busy."),
                                     }
                                 }
                                 drop(permit);
@@ -639,8 +647,9 @@ impl Route {
                             let nack_result = commit(vec![MessageDisposition::Nack; batch_len]).await;
                             debug!("Nack commit result: {:?}", nack_result);
                             // Send the error back to the main task to tear down the route.
-                            if err_tx.try_send(e.into()).is_err() {
-                                warn!("Could not send error to main task, it might be down or busy.");
+                            match err_tx.try_send(e.into()) {
+                                Ok(_) => trace!("Reported error to main task"),
+                                Err(err_send) => warn!(error=?err_send, "Could not send error to main task, it might be down or busy."),
                             }
                             break;
                         }
@@ -708,14 +717,18 @@ impl Route {
                     };
                     debug!("Received a batch of {} messages concurrently", messages.len());
 
-                    // Wrap the commit function to route it through the sequencer
+                    // Wrap the commit function to route it through the sequencer.
+                    // Only advance the sequence counter after we've successfully enqueued
+                    // the work item to avoid creating sequence gaps if the work channel
+                    // is closed while producing batches.
                     let seq = seq_counter;
-                    seq_counter += 1;
                     let wrapped_commit = wrap_commit(commit, seq, seq_tx.clone());
 
                     if work_tx.send((messages, wrapped_commit)).await.is_err() {
                         warn!("Work channel closed, cannot process more messages concurrently. Shutting down.");
                         break;
+                    } else {
+                        seq_counter += 1;
                     }
                 }
             }
@@ -750,7 +763,6 @@ impl Route {
         self.options = options;
         self
     }
-
     pub fn with_concurrency(mut self, concurrency: usize) -> Self {
         self.options.concurrency = concurrency.max(1);
         self
@@ -760,7 +772,6 @@ impl Route {
         self.options.batch_size = batch_size.max(1);
         self
     }
-
     pub fn with_commit_concurrency_limit(mut self, limit: usize) -> Self {
         self.options.commit_concurrency_limit = limit.max(1);
         self
@@ -856,67 +867,48 @@ type SequencerItem = (
 
 fn spawn_sequencer(buffer_size: usize) -> (Sender<(u64, SequencerItem)>, JoinHandle<()>) {
     let (seq_tx, seq_rx) = bounded::<(u64, SequencerItem)>(buffer_size);
-
     let sequencer_handle = tokio::spawn(async move {
         let mut buffer: BTreeMap<u64, SequencerItem> = BTreeMap::new();
         let mut next_seq = 0u64;
-        let mut deadline: Option<tokio::time::Instant> = None;
-        const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
         loop {
-            while let Some((dispositions, commit_func, notify)) = buffer.remove(&next_seq) {
-                let res = commit_func(dispositions).await;
-                let _ = notify.send(res);
+            // If we have the next item in sequence, execute its commit directly.
+            // Using a plain await (no select!) here is essential: if we raced a recv
+            // against the commit future, a recv win would drop the commit future and
+            // the notify sender, leaving the caller permanently blocked while next_seq
+            // stays unadvanced — a deadlock.
+            if let Some((dispositions, commit_func, notify)) = buffer.remove(&next_seq) {
+                let result = commit_func(dispositions).await;
+                let _ = notify.send(result);
                 next_seq += 1;
+                continue;
             }
 
-            if !buffer.is_empty() {
-                if deadline.is_none() {
-                    deadline = Some(tokio::time::Instant::now() + TIMEOUT);
-                }
-            } else {
-                deadline = None;
-            }
-
-            let timeout_fut = async {
-                if let Some(d) = deadline {
-                    tokio::time::sleep_until(d).await
-                } else {
-                    std::future::pending().await
-                }
-            };
-
-            select! {
-                res = seq_rx.recv() => {
-                    match res {
-                        Ok((seq, item)) => {
-                            if seq < next_seq {
-                                let (_, _, notify) = item;
-                                // This should not happen with the new timeout logic, but we'll keep the check.
-                                let _ = notify.send(Err(anyhow::anyhow!("Sequencer received late item (seq {} < next_seq {}), which is unexpected", seq, next_seq)));
-                            } else {
-                                buffer.insert(seq, item);
-                            }
-                        }
-                        Err(_) => {
-                            for (_, (_, _, notify)) in std::mem::take(&mut buffer) {
-                                let _ = notify.send(Err(anyhow::anyhow!("Sequencer is shutting down")));
-                            }
-                            break;
-                        }
-                    }
-                }
-                _ = timeout_fut => {
-                    if let Some(first_seq) = buffer.keys().next() {
-                        // With the Nack-on-failure fix, all sequence slots are always filled before
-                        // a worker exits. A timeout here indicates a bug: a commit was lost without
-                        // being called. The sequencer will keep waiting to avoid skipping messages.
-                        error!("Sequencer timed out waiting for seq {}. Next in buffer is {}. This is a bug - a commit slot was never filled.", next_seq, *first_seq);
+            // Wait for the next item from any worker.
+            match seq_rx.recv().await {
+                Ok((seq, item)) => {
+                    if seq < next_seq {
+                        let (_, _, notify) = item;
+                        trace!(
+                            seq,
+                            next_seq,
+                            "Sequencer received late item (seq < next_seq)"
+                        );
+                        let _ = notify.send(Err(anyhow::anyhow!(
+                            "Sequencer received late item (seq {} < next_seq {})",
+                            seq,
+                            next_seq
+                        )));
                     } else {
-                        // This should be unreachable as a timeout can't occur on an empty buffer.
-                        error!("Sequencer timed out on an empty buffer, which is unexpected.");
+                        buffer.insert(seq, item);
                     }
-                    deadline = None;
+                }
+                Err(_) => {
+                    // seq_tx was dropped — drain and notify any remaining buffered commits.
+                    for (_, (_, _, notify)) in buffer {
+                        let _ = notify.send(Err(anyhow::anyhow!("Sequencer is shutting down")));
+                    }
+                    break;
                 }
             }
         }
@@ -932,13 +924,11 @@ fn wrap_commit(
     Box::new(move |dispositions| {
         Box::pin(async move {
             let (notify_tx, notify_rx) = tokio::sync::oneshot::channel();
-            // Send to sequencer
             if seq_tx
                 .send((seq, (dispositions, commit, notify_tx)))
                 .await
                 .is_ok()
             {
-                // Wait for sequencer to execute the commit
                 match notify_rx.await {
                     Ok(res) => res,
                     Err(_) => Err(anyhow::anyhow!(
@@ -1322,6 +1312,120 @@ mod tests {
                 panic!("Route deadlocked! The sequencer likely didn't receive the Nack for the failed batch.");
             }
         }
+    }
+
+    #[tokio::test]
+    async fn test_sequencer_ordered_commits() {
+        use std::time::Duration;
+        use tokio::time::timeout;
+
+        let (seq_tx, sequencer_handle) = spawn_sequencer(16);
+        let processed: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
+
+        // Send sequences out of order to ensure the sequencer enforces ordering.
+        let seqs = vec![2u64, 0u64, 1u64, 3u64];
+        let mut receivers = Vec::new();
+
+        for seq in seqs.iter().cloned() {
+            let (notify_tx, notify_rx) = tokio::sync::oneshot::channel();
+            let processed_clone = processed.clone();
+            let commit: BatchCommitFunc = Box::new(move |_dispositions| {
+                let processed = processed_clone.clone();
+                Box::pin(async move {
+                    // Simulate variable work durations
+                    tokio::time::sleep(Duration::from_millis(10 * (seq as u64))).await;
+                    processed.lock().unwrap().push(seq);
+                    Ok(())
+                })
+            });
+            seq_tx
+                .send((seq, (Vec::new(), commit, notify_tx)))
+                .await
+                .unwrap();
+            receivers.push(notify_rx);
+        }
+
+        // Wait for all commits to complete (with timeout to catch deadlocks)
+        for rx in receivers {
+            let res = timeout(Duration::from_secs(2), rx)
+                .await
+                .expect("Sequencer notify timed out");
+            assert!(res.is_ok(), "Sequencer reported an error on commit");
+            assert!(res.unwrap().is_ok(), "Commit returned an error");
+        }
+
+        // Close sender to allow sequencer task to exit and await it.
+        drop(seq_tx);
+        let _ = sequencer_handle.await;
+
+        let result = processed.lock().unwrap().clone();
+        assert_eq!(
+            result,
+            vec![0u64, 1u64, 2u64, 3u64],
+            "Sequencer must process commits in order"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sequencer_shutdown_notifies_pending() {
+        use std::time::Duration;
+        use tokio::time::timeout;
+
+        let (seq_tx, sequencer_handle) = spawn_sequencer(8);
+
+        // Prepare two pending items for sequences 1 and 2 while sequence 0 is missing.
+        let (notify_tx1, notify_rx1) = tokio::sync::oneshot::channel();
+        let (notify_tx2, notify_rx2) = tokio::sync::oneshot::channel();
+
+        let commit1: BatchCommitFunc = Box::new(|_dispositions| {
+            Box::pin(async move {
+                // Should not be executed because next_seq is missing (0)
+                panic!("Commit should not be executed during shutdown drain");
+                #[allow(unreachable_code)]
+                Ok(())
+            })
+        });
+
+        let commit2: BatchCommitFunc = Box::new(|_dispositions| {
+            Box::pin(async move {
+                panic!("Commit should not be executed during shutdown drain");
+                #[allow(unreachable_code)]
+                Ok(())
+            })
+        });
+
+        seq_tx
+            .send((1u64, (Vec::new(), commit1, notify_tx1)))
+            .await
+            .unwrap();
+        seq_tx
+            .send((2u64, (Vec::new(), commit2, notify_tx2)))
+            .await
+            .unwrap();
+
+        // Trigger shutdown of the sequencer by dropping the sender.
+        drop(seq_tx);
+
+        // Sequencer should drain buffered items and reply with an error to the notifiers.
+        let r1 = timeout(Duration::from_secs(1), notify_rx1)
+            .await
+            .expect("Timeout waiting for notify_rx1")
+            .expect("Sequencer closed notify channel");
+        assert!(
+            r1.is_err(),
+            "Pending commit should receive Err on sequencer shutdown"
+        );
+
+        let r2 = timeout(Duration::from_secs(1), notify_rx2)
+            .await
+            .expect("Timeout waiting for notify_rx2")
+            .expect("Sequencer closed notify channel");
+        assert!(
+            r2.is_err(),
+            "Pending commit should receive Err on sequencer shutdown"
+        );
+
+        let _ = sequencer_handle.await;
     }
 
     use crate::traits::{CustomEndpointFactory, Sent};

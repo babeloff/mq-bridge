@@ -642,6 +642,119 @@ pub mod http_helper {
     }
 }
 
+#[cfg(feature = "grpc")]
+pub mod grpc_helper {
+    use super::PERF_TEST_MESSAGE_COUNT;
+    use mq_bridge::endpoints::grpc::{GrpcConsumer, GrpcPublisher};
+    use mq_bridge::models::GrpcConfig;
+    use mq_bridge::traits::{MessageConsumer, MessagePublisher};
+    use once_cell::sync::Lazy;
+    use std::net::TcpListener;
+    use std::sync::{Arc, Mutex as StdMutex};
+    use tokio::sync::Mutex;
+
+    static CURRENT_URL: Lazy<StdMutex<String>> = Lazy::new(|| StdMutex::new(String::new()));
+
+    fn get_free_port() -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap().port()
+    }
+
+    pub async fn create_consumer() -> Arc<Mutex<dyn MessageConsumer>> {
+        // Start consumer in server_mode, which will spawn the embedded tonic server.
+        let port = get_free_port();
+        let addr = format!("127.0.0.1:{}", port);
+        let url = format!("http://{}", addr);
+
+        {
+            let mut lock = CURRENT_URL.lock().unwrap();
+            *lock = url.clone();
+        }
+
+        let config = GrpcConfig {
+            url: url.clone(),
+            server_mode: true,
+            ..Default::default()
+        };
+
+        // Construct consumer which will spawn the server task.
+        let cons = GrpcConsumer::new(&config).await.unwrap();
+
+        // Allow server to start listening before clients connect.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        Arc::new(Mutex::new(cons))
+    }
+
+    pub async fn create_publisher() -> Arc<dyn MessagePublisher> {
+        let url = {
+            let lock = CURRENT_URL.lock().unwrap();
+            lock.clone()
+        };
+        let config = GrpcConfig {
+            url,
+            ..Default::default()
+        };
+        Arc::new(GrpcPublisher::new(&config).await.unwrap())
+    }
+}
+
+#[cfg(feature = "grpc")]
+pub mod grpc_server_helper {
+    use super::PERF_TEST_MESSAGE_COUNT;
+    use mq_bridge::endpoints::grpc::{GrpcConsumer, GrpcPublisher};
+    use mq_bridge::models::GrpcConfig;
+    use mq_bridge::traits::{MessageConsumer, MessagePublisher};
+    use once_cell::sync::Lazy;
+    use std::net::TcpListener;
+    use std::sync::{Arc, Mutex as StdMutex};
+    use tokio::sync::Mutex;
+
+    static CURRENT_URL: Lazy<StdMutex<String>> = Lazy::new(|| StdMutex::new(String::new()));
+
+    fn get_free_port() -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap().port()
+    }
+
+    pub async fn create_consumer() -> Arc<Mutex<dyn MessageConsumer>> {
+        // Start consumer in server_mode, which will spawn the embedded tonic server.
+        let port = get_free_port();
+        let addr = format!("127.0.0.1:{}", port);
+        let url = format!("http://{}", addr);
+        {
+            let mut lock = CURRENT_URL.lock().unwrap();
+            *lock = url.clone();
+        }
+
+        let config = GrpcConfig {
+            url: url.clone(),
+            server_mode: true,
+            ..Default::default()
+        };
+
+        // Construct consumer which will spawn the server task.
+        let cons = GrpcConsumer::new(&config).await.unwrap();
+
+        // Allow server to start listening before clients connect.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        Arc::new(Mutex::new(cons))
+    }
+
+    pub async fn create_publisher() -> Arc<dyn MessagePublisher> {
+        let url = {
+            let lock = CURRENT_URL.lock().unwrap();
+            lock.clone()
+        };
+        let config = GrpcConfig {
+            url,
+            ..Default::default()
+        };
+        Arc::new(GrpcPublisher::new(&config).await.unwrap())
+    }
+}
+
 fn performance_benchmarks(c: &mut Criterion) {
     let rt = Runtime::new().unwrap();
 
@@ -800,6 +913,28 @@ fn performance_benchmarks(c: &mut Criterion) {
         PERF_TEST_MESSAGE_COUNT,
         PERF_TEST_CONCURRENCY,
         std::time::Duration::from_millis(1000)
+    );
+    bench_backend!(
+        "grpc",
+        "grpc",
+        grpc_helper,
+        group,
+        &rt,
+        &BENCH_RESULTS,
+        PERF_TEST_MESSAGE_COUNT,
+        PERF_TEST_CONCURRENCY,
+        std::time::Duration::from_millis(10)
+    );
+    bench_backend!(
+        "grpc",
+        "grpc_server",
+        grpc_server_helper,
+        group,
+        &rt,
+        &BENCH_RESULTS,
+        PERF_TEST_MESSAGE_COUNT,
+        PERF_TEST_CONCURRENCY,
+        std::time::Duration::from_millis(10)
     );
     bench_backend!(
         "http",

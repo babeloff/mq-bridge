@@ -11,6 +11,7 @@ use async_trait::async_trait;
 use std::any::Any;
 use std::time::Duration;
 use tonic::transport::Channel;
+use tracing::{debug, error, info, trace, warn};
 use uuid::Uuid;
 
 pub mod proto {
@@ -22,47 +23,33 @@ use proto::bridge_client::BridgeClient;
 use proto::{BridgeMessage, SubscribeRequest};
 use tonic::Request;
 
-const GRPC_BATCH_POLL_MS: u64 = 10;
+use tokio::sync::{broadcast, mpsc};
+use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
+use tonic::transport::Server as TonicServer;
+use tonic::transport::{Certificate, ClientTlsConfig, Identity, ServerTlsConfig};
+use tonic::{Response, Status};
+
+const GRPC_BATCH_POLL_MS: u64 = 15; // Increased for better batching in performance tests, and to reduce "poll timed out" warnings
+
+// ── Consumer ──────────────────────────────────────────────────────────────────
 
 pub struct GrpcConsumer {
-    _client: BridgeClient<Channel>,
-    stream: Option<tonic::Streaming<BridgeMessage>>,
+    inner: GrpcConsumerInner,
+}
+
+enum GrpcConsumerInner {
+    Client(Box<ClientModeConsumer>),
+    Server(ServerModeConsumer),
 }
 
 impl GrpcConsumer {
     pub async fn new(config: &GrpcConfig) -> Result<Self> {
-        let mut endpoint = tonic::transport::Endpoint::from_shared(config.url.clone())?;
-        if config.tls.required {
-            return Err(anyhow::anyhow!(
-                "gRPC TLS support is not compiled in. Please enable tonic TLS features."
-            ));
-        }
-        if let Some(timeout) = config.timeout_ms {
-            endpoint = endpoint.connect_timeout(Duration::from_millis(timeout));
-        }
-        let channel = endpoint.connect().await?;
-        let mut client = BridgeClient::new(channel);
-
-        let topic = config
-            .topic
-            .clone()
-            .unwrap_or_else(|| "default".to_string());
-
-        // Eagerly subscribe to ensure the consumer is ready upon creation.
-        let request = Request::new(SubscribeRequest { topic });
-        let stream = if let Some(timeout) = config.timeout_ms {
-            tokio::time::timeout(Duration::from_millis(timeout), client.subscribe(request))
-                .await
-                .map_err(|_| anyhow::anyhow!("gRPC subscribe timed out"))??
+        let inner = if config.server_mode {
+            GrpcConsumerInner::Server(ServerModeConsumer::new(config).await?)
         } else {
-            client.subscribe(request).await?
-        }
-        .into_inner();
-
-        Ok(Self {
-            _client: client,
-            stream: Some(stream),
-        })
+            GrpcConsumerInner::Client(Box::new(ClientModeConsumer::new(config).await?))
+        };
+        Ok(Self { inner })
     }
 }
 
@@ -72,60 +59,336 @@ impl MessageConsumer for GrpcConsumer {
         &mut self,
         max_messages: usize,
     ) -> Result<crate::outcomes::ReceivedBatch, ConsumerError> {
-        let mut messages = Vec::with_capacity(max_messages);
-        if let Some(stream) = self.stream.as_mut() {
-            // The first message will block until it arrives. Subsequent messages will be
-            // fetched with a short timeout to fill the batch without blocking indefinitely.
-            loop {
-                let msg_future = stream.message();
-                let msg_result = if messages.is_empty() {
-                    // Block for the first message
-                    Ok(msg_future.await)
-                } else {
-                    // Poll for subsequent messages
-                    tokio::time::timeout(Duration::from_millis(GRPC_BATCH_POLL_MS), msg_future)
-                        .await
+        match &mut self.inner {
+            GrpcConsumerInner::Client(c) => c.receive_batch(max_messages).await,
+            GrpcConsumerInner::Server(s) => s.receive_batch(max_messages).await,
+        }
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+struct ClientModeConsumer {
+    _client: BridgeClient<Channel>,
+    stream: tonic::Streaming<BridgeMessage>,
+}
+
+impl ClientModeConsumer {
+    async fn new(config: &GrpcConfig) -> Result<Self> {
+        debug!(grpc_url = %config.url, "Creating gRPC client consumer (client mode)");
+        let endpoint = make_endpoint(config).await?;
+        let mut client = BridgeClient::new(endpoint.connect().await?);
+        let topic = config
+            .topic
+            .clone()
+            .unwrap_or_else(|| "default".to_string());
+        let request = Request::new(SubscribeRequest { topic });
+        let stream = if let Some(ms) = config.timeout_ms {
+            tokio::time::timeout(Duration::from_millis(ms), client.subscribe(request))
+                .await
+                .map_err(|_| anyhow::anyhow!("gRPC subscribe timed out"))??
+        } else {
+            client.subscribe(request).await?
+        }
+        .into_inner();
+        info!(grpc_url = %config.url, "gRPC client consumer connected and subscription started");
+        Ok(Self {
+            _client: client,
+            stream,
+        })
+    }
+}
+
+#[async_trait]
+impl MessageConsumer for ClientModeConsumer {
+    async fn receive_batch(
+        &mut self,
+        max_messages: usize,
+    ) -> Result<crate::outcomes::ReceivedBatch, ConsumerError> {
+        receive_from_stream(&mut self.stream, max_messages).await
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+/// Reads a batch from a tonic server-streaming response.
+/// Blocks on the first message; polls briefly for subsequent ones to fill the batch.
+async fn receive_from_stream(
+    stream: &mut tonic::Streaming<BridgeMessage>,
+    max_messages: usize,
+) -> Result<crate::outcomes::ReceivedBatch, ConsumerError> {
+    let mut messages = Vec::with_capacity(max_messages);
+    loop {
+        let result = if messages.is_empty() {
+            Ok(stream.message().await)
+        } else {
+            tokio::time::timeout(Duration::from_millis(GRPC_BATCH_POLL_MS), stream.message()).await
+        };
+        match result {
+            Ok(Ok(Some(msg))) => {
+                messages.push(bridge_to_canonical(msg));
+                if messages.len() >= max_messages {
+                    break;
+                }
+            }
+            Ok(Ok(None)) => {
+                trace!("gRPC stream closed by server (None)");
+                break;
+            }
+            Err(_) => {
+                trace!("gRPC stream poll timed out while filling batch (normal exit)");
+                break;
+            }
+            Ok(Err(e)) => {
+                error!("gRPC stream returned error while receiving: {:?}", e);
+                return Err(ConsumerError::Connection(e.into()));
+            }
+        }
+    }
+    if messages.is_empty() {
+        Err(ConsumerError::EndOfStream)
+    } else {
+        Ok(crate::outcomes::ReceivedBatch {
+            messages,
+            commit: Box::new(|_| Box::pin(async { Ok(()) })),
+        })
+    }
+}
+
+// ── Embedded gRPC server (server_mode) ────────────────────────────────────────
+
+struct ServerModeConsumer {
+    _handle: tokio::task::JoinHandle<()>,
+    rx: mpsc::Receiver<BridgeMessage>,
+}
+
+/// Tonic service implementation that fans incoming messages into a subscriber
+/// broadcast stream and a reliable internal queue for the server-mode consumer.
+struct BridgeService {
+    tx: broadcast::Sender<BridgeMessage>,
+    queue_tx: mpsc::Sender<BridgeMessage>,
+}
+
+#[tonic::async_trait]
+impl proto::bridge_server::Bridge for BridgeService {
+    async fn publish(
+        &self,
+        request: Request<BridgeMessage>,
+    ) -> Result<Response<proto::PublishResponse>, Status> {
+        let msg = request.into_inner();
+        let msg_id = msg.id.clone();
+        trace!(msg_id = %msg_id, "BridgeService::publish received message");
+        let _ = self.tx.send(msg.clone());
+        if self.queue_tx.send(msg).await.is_err() {
+            warn!(msg_id = %msg_id, "BridgeService::publish failed: internal server queue is closed");
+            return Ok(Response::new(proto::PublishResponse {
+                result: Some(proto::publish_response::Result::Ack(proto::Ack {
+                    id: msg_id,
+                    status: 1, // NACK
+                    reason: "Internal queue closed".to_string(),
+                    metadata: Default::default(),
+                })),
+            }));
+        }
+        Ok(Response::new(proto::PublishResponse {
+            result: Some(proto::publish_response::Result::Ack(proto::Ack {
+                id: msg_id,
+                status: 0,
+                reason: String::new(),
+                metadata: Default::default(),
+            })),
+        }))
+    }
+
+    async fn acknowledge(
+        &self,
+        request: Request<proto::Ack>,
+    ) -> Result<Response<proto::AckResponse>, Status> {
+        // Minimal implementation: accept the ack and return success.
+        let ack = request.into_inner();
+        trace!(ack_id = %ack.id, "BridgeService::acknowledge received ack");
+        Ok(Response::new(proto::AckResponse {
+            success: true,
+            error: String::new(),
+        }))
+    }
+
+    type PublishBatchStream = ReceiverStream<Result<proto::PublishResponse, Status>>;
+
+    async fn publish_batch(
+        &self,
+        request: Request<tonic::Streaming<BridgeMessage>>,
+    ) -> Result<Response<Self::PublishBatchStream>, Status> {
+        let mut stream = request.into_inner();
+        let (tx, rx) = mpsc::channel(32);
+        let sender = self.tx.clone();
+        let queue_tx = self.queue_tx.clone();
+
+        tokio::spawn(async move {
+            while let Ok(Some(msg)) = stream.message().await {
+                let msg_id = msg.id.clone();
+                trace!(msg_id = %msg_id, "BridgeService::publish_batch received message");
+                let _ = sender.send(msg.clone());
+                if queue_tx.send(msg).await.is_err() {
+                    warn!("publish_batch: internal server queue closed, stopping responder task");
+                    break;
+                }
+                let resp = proto::PublishResponse {
+                    result: Some(proto::publish_response::Result::Ack(proto::Ack {
+                        id: msg_id,
+                        status: 0,
+                        reason: String::new(),
+                        metadata: Default::default(),
+                    })),
                 };
+                if tx.send(Ok(resp)).await.is_err() {
+                    warn!("publish_batch: client stream closed, stopping responder task");
+                    break;
+                }
+            }
+            trace!("publish_batch responder task exiting");
+        });
 
-                match msg_result {
-                    Ok(Ok(Some(msg))) => {
-                        let message_id = if msg.id.is_empty() {
-                            None
-                        } else if let Ok(uuid) = Uuid::parse_str(&msg.id) {
-                            Some(uuid.as_u128())
-                        } else if let Ok(n) =
-                            u128::from_str_radix(msg.id.trim_start_matches("0x"), 16)
-                        {
-                            Some(n)
-                        } else {
-                            msg.id.parse::<u128>().ok()
-                        };
+        Ok(Response::new(ReceiverStream::new(rx)))
+    }
 
-                        let canonical = CanonicalMessage::new(msg.payload, message_id)
-                            .with_metadata(msg.metadata);
-                        messages.push(canonical);
-                        if messages.len() >= max_messages {
+    type SubscribeStream = ReceiverStream<Result<BridgeMessage, Status>>;
+
+    async fn subscribe(
+        &self,
+        _request: Request<SubscribeRequest>,
+    ) -> Result<Response<Self::SubscribeStream>, Status> {
+        let mut rx = self.tx.subscribe();
+        let (tx_stream, rx_stream) = mpsc::channel(32);
+        tokio::spawn(async move {
+            loop {
+                match rx.recv().await {
+                    Ok(msg) => {
+                        if tx_stream.send(Ok(msg)).await.is_err() {
+                            warn!("subscribe: downstream consumer disconnected");
                             break;
                         }
                     }
-                    Ok(Ok(None)) => break, // Stream ended
-                    Ok(Err(e)) => return Err(ConsumerError::Connection(e.into())),
-                    Err(_) => break, // Timeout on subsequent message
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => break,
                 }
             }
-        } else {
-            // This case should now be impossible if `new` always initializes the stream.
-            return Err(ConsumerError::Connection(anyhow::anyhow!(
-                "gRPC stream not initialized. This is a bug."
-            )));
+        });
+        Ok(Response::new(ReceiverStream::new(rx_stream)))
+    }
+}
+
+impl ServerModeConsumer {
+    async fn new(config: &GrpcConfig) -> Result<Self> {
+        let addr = parse_addr(&config.url)?;
+        let (tx, _) = broadcast::channel(1024);
+        let (queue_tx, rx) = mpsc::channel(16 * 1024);
+
+        let mut builder = TonicServer::builder();
+        if let Some(v) = config.initial_stream_window_size {
+            builder = builder.initial_stream_window_size(v);
+        }
+        if let Some(v) = config.initial_connection_window_size {
+            builder = builder.initial_connection_window_size(v);
+        }
+        if let Some(v) = config.concurrency_limit_per_connection {
+            builder = builder.concurrency_limit_per_connection(v);
+        }
+        if let Some(ms) = config.http2_keepalive_interval_ms {
+            builder = builder.http2_keepalive_interval(Some(Duration::from_millis(ms)));
+        }
+        if let Some(ms) = config.http2_keepalive_timeout_ms {
+            builder = builder.http2_keepalive_timeout(Some(Duration::from_millis(ms)));
+        }
+        if let Some(ms) = config.timeout_ms {
+            builder = builder.timeout(Duration::from_millis(ms));
         }
 
+        if config.tls.required {
+            if !config.tls.is_tls_server_configured() {
+                return Err(anyhow::anyhow!(
+                    "gRPC server TLS enabled but no cert/key provided in GrpcConfig"
+                ));
+            }
+            let cert_path = config.tls.cert_file.as_ref().unwrap();
+            let key_path = config.tls.key_file.as_ref().unwrap();
+            let cert = tokio::fs::read(cert_path).await?;
+            let key = tokio::fs::read(key_path).await?;
+            let identity = Identity::from_pem(cert, key);
+
+            let mut tls_config = ServerTlsConfig::new().identity(identity);
+            if let Some(ca_path) = &config.tls.ca_file {
+                let ca_pem = tokio::fs::read(ca_path).await?;
+                let ca_cert = Certificate::from_pem(ca_pem);
+                tls_config = tls_config.client_ca_root(ca_cert);
+            }
+
+            builder = builder.tls_config(tls_config)?;
+        }
+
+        let mut service = proto::bridge_server::BridgeServer::new(BridgeService { tx, queue_tx });
+        if let Some(max) = config.max_decoding_message_size {
+            service = service.max_decoding_message_size(max);
+        }
+
+        // Bind the TCP listener first so we know the server port is bound and
+        // listening before returning. This avoids races where the consumer
+        // tries to connect before the server is ready.
+        info!(addr = %addr, "Binding gRPC embedded server listener");
+        let listener = tokio::net::TcpListener::bind(addr).await?;
+        let local = listener.local_addr()?;
+        info!(server_addr = %local, "gRPC embedded server listener bound");
+        let incoming = TcpListenerStream::new(listener);
+
+        let handle = tokio::spawn(async move {
+            info!(server_addr = %local, "gRPC embedded server starting to serve");
+            if let Err(e) = builder.serve_with_incoming(service, incoming).await {
+                error!(server_addr = %local, "gRPC server error: {:?}", e);
+            }
+            info!(server_addr = %local, "gRPC embedded server stopped");
+        });
+
+        Ok(Self {
+            _handle: handle,
+            rx,
+        })
+    }
+}
+
+#[async_trait]
+impl MessageConsumer for ServerModeConsumer {
+    async fn receive_batch(
+        &mut self,
+        max_messages: usize,
+    ) -> Result<crate::outcomes::ReceivedBatch, ConsumerError> {
+        let mut messages = Vec::with_capacity(max_messages);
+        loop {
+            let result = if messages.is_empty() {
+                Ok(self.rx.recv().await)
+            } else {
+                tokio::time::timeout(Duration::from_millis(GRPC_BATCH_POLL_MS), self.rx.recv())
+                    .await
+            };
+            match result {
+                Ok(Some(msg)) => {
+                    messages.push(bridge_to_canonical(msg));
+                    if messages.len() >= max_messages {
+                        break;
+                    }
+                }
+                Ok(None) | Err(_) => break,
+            }
+        }
         if messages.is_empty() {
             Err(ConsumerError::EndOfStream)
         } else {
             Ok(crate::outcomes::ReceivedBatch {
                 messages,
-                commit: Box::new(|_| Box::pin(async { Ok(()) })), // Auto-ack for now
+                commit: Box::new(|_| Box::pin(async { Ok(()) })),
             })
         }
     }
@@ -135,6 +398,8 @@ impl MessageConsumer for GrpcConsumer {
     }
 }
 
+// ── Publisher ─────────────────────────────────────────────────────────────────
+
 pub struct GrpcPublisher {
     client: BridgeClient<Channel>,
     timeout: Option<Duration>,
@@ -142,16 +407,10 @@ pub struct GrpcPublisher {
 
 impl GrpcPublisher {
     pub async fn new(config: &GrpcConfig) -> Result<Self> {
-        let mut endpoint = tonic::transport::Endpoint::from_shared(config.url.clone())?;
-        if config.tls.required {
-            return Err(anyhow::anyhow!(
-                "gRPC TLS support is not compiled in. Please enable tonic TLS features."
-            ));
-        }
-        if let Some(timeout) = config.timeout_ms {
-            endpoint = endpoint.connect_timeout(Duration::from_millis(timeout));
-        }
-        let client = BridgeClient::new(endpoint.connect().await?);
+        // Use a lazy channel so the publisher route can start before a server-mode
+        // gRPC consumer has finished binding its embedded listener.
+        let endpoint = make_endpoint(config).await?;
+        let client = BridgeClient::new(endpoint.connect_lazy());
         Ok(Self {
             client,
             timeout: config.timeout_ms.map(Duration::from_millis),
@@ -166,15 +425,20 @@ impl MessagePublisher for GrpcPublisher {
         messages: Vec<CanonicalMessage>,
     ) -> Result<SentBatch, PublisherError> {
         let mut client = self.client.clone();
-        let bridge_messages = messages.into_iter().map(|msg| BridgeMessage {
-            payload: msg.payload.to_vec(),
-            id: fast_uuid_v7::format_uuid(msg.message_id).to_string(),
-            metadata: msg.metadata.into_iter().collect(),
-        });
 
-        let request_stream = tokio_stream::iter(bridge_messages);
+        // Preserve the original messages so we can map response ids back to originals.
+        let original_messages = messages;
+        let bridge_messages_vec: Vec<BridgeMessage> = original_messages
+            .iter()
+            .cloned()
+            .map(|msg| BridgeMessage {
+                payload: msg.payload.to_vec(),
+                id: fast_uuid_v7::format_uuid(msg.message_id).to_string(),
+                metadata: msg.metadata.into_iter().collect(),
+            })
+            .collect();
 
-        let response_fut = client.publish_batch(request_stream);
+        let response_fut = client.publish_batch(tokio_stream::iter(bridge_messages_vec));
         let response = if let Some(timeout) = self.timeout {
             tokio::time::timeout(timeout, response_fut)
                 .await
@@ -186,19 +450,130 @@ impl MessagePublisher for GrpcPublisher {
             response_fut.await.map_err(anyhow::Error::from)?
         };
 
-        let inner_response = response.into_inner();
-        if inner_response.success {
+        let mut stream = response.into_inner();
+        let mut responses = Vec::new();
+        let mut failed: Vec<(CanonicalMessage, PublisherError)> = Vec::new();
+
+        // We need to map response IDs back to the original messages. Recreate
+        // a lookup map from id string -> CanonicalMessage for the messages we sent.
+        let mut id_map: std::collections::HashMap<String, CanonicalMessage> =
+            std::collections::HashMap::new();
+        // Note: we constructed bridge_messages from `messages_iter`; rebuild mapping from
+        // the original messages we prepared earlier.
+        for msg in &original_messages {
+            let id_str = fast_uuid_v7::format_uuid(msg.message_id).to_string();
+            id_map.insert(id_str, msg.clone());
+        }
+
+        loop {
+            match stream.message().await {
+                Ok(Some(r)) => match r.result {
+                    Some(proto::publish_response::Result::Ack(ack)) => {
+                        // Non-zero status indicates failure for that message id.
+                        if ack.status != 0 {
+                            if let Some(orig) = id_map.get(&ack.id) {
+                                failed.push((
+                                    orig.clone(),
+                                    PublisherError::Retryable(anyhow::anyhow!(ack.reason)),
+                                ));
+                            } else {
+                                // Unknown id; treat as retryable transport-level failure
+                                return Err(PublisherError::Retryable(anyhow::anyhow!(ack.reason)));
+                            }
+                        }
+                    }
+                    Some(proto::publish_response::Result::Reply(reply)) => {
+                        responses.push(bridge_to_canonical(reply));
+                    }
+                    Some(proto::publish_response::Result::Error(err)) => {
+                        // Treat explicit error responses as a retryable batch-level failure.
+                        return Err(PublisherError::Retryable(anyhow::anyhow!(err)));
+                    }
+                    None => {}
+                },
+                Ok(None) => break,
+                Err(e) => {
+                    error!("Error reading publish batch response stream: {:?}", e);
+                    return Err(PublisherError::Retryable(e.into()));
+                }
+            }
+        }
+
+        let total = id_map.len();
+        if failed.is_empty() && responses.is_empty() {
+            // No failures and no response messages: treat as full Ack
             Ok(SentBatch::Ack)
-        } else {
+        } else if failed.len() == total {
+            // All messages failed -> treat as retryable
             Err(PublisherError::Retryable(anyhow::anyhow!(
-                inner_response.error
+                "All messages in batch failed"
             )))
+        } else {
+            Ok(SentBatch::Partial {
+                responses: if responses.is_empty() {
+                    None
+                } else {
+                    Some(responses)
+                },
+                failed,
+            })
         }
     }
 
     fn as_any(&self) -> &dyn Any {
         self
     }
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+fn bridge_to_canonical(msg: BridgeMessage) -> CanonicalMessage {
+    let message_id = if msg.id.is_empty() {
+        None
+    } else if let Ok(uuid) = Uuid::parse_str(&msg.id) {
+        Some(uuid.as_u128())
+    } else if let Ok(n) = u128::from_str_radix(msg.id.trim_start_matches("0x"), 16) {
+        Some(n)
+    } else {
+        msg.id.parse::<u128>().ok()
+    };
+    CanonicalMessage::new(msg.payload, message_id).with_metadata(msg.metadata)
+}
+
+async fn make_endpoint(config: &GrpcConfig) -> Result<tonic::transport::Endpoint> {
+    let mut endpoint = tonic::transport::Endpoint::from_shared(config.url.clone())?;
+
+    if config.tls.required {
+        let mut tls_config = ClientTlsConfig::new();
+        if let Some(ca_path) = &config.tls.ca_file {
+            let ca_pem = tokio::fs::read(ca_path).await?;
+            let ca_cert = Certificate::from_pem(ca_pem);
+            tls_config = tls_config.ca_certificate(ca_cert);
+        }
+        if let (Some(cert_path), Some(key_path)) = (&config.tls.cert_file, &config.tls.key_file) {
+            let cert_pem = tokio::fs::read(cert_path).await?;
+            let key_pem = tokio::fs::read(key_path).await?;
+            let identity = Identity::from_pem(cert_pem, key_pem);
+            tls_config = tls_config.identity(identity);
+        }
+        endpoint = endpoint.tls_config(tls_config)?;
+    }
+
+    if let Some(ms) = config.timeout_ms {
+        endpoint = endpoint.connect_timeout(Duration::from_millis(ms));
+    }
+
+    Ok(endpoint)
+}
+
+fn parse_addr(url: &str) -> Result<std::net::SocketAddr> {
+    let stripped = url.find("://").map(|p| &url[p + 3..]).unwrap_or(url);
+    let host = stripped
+        .find('/')
+        .map(|p| &stripped[..p])
+        .unwrap_or(stripped);
+    host.parse()
+        .map_err(|e| anyhow::anyhow!("Invalid gRPC server address '{}': {}", host, e))
 }
 
 #[cfg(test)]
@@ -222,26 +597,56 @@ mod tests {
             request: Request<BridgeMessage>,
         ) -> Result<Response<PublishResponse>, Status> {
             // The receiver can be dropped if no subscriber is active. We can ignore the error.
-            let _ = self.tx.send(request.into_inner());
+            let msg = request.into_inner();
+            let msg_id = msg.id.clone();
+            let _ = self.tx.send(msg);
             Ok(Response::new(PublishResponse {
-                success: true,
-                error: "".to_string(),
+                result: Some(proto::publish_response::Result::Ack(proto::Ack {
+                    id: msg_id,
+                    status: 0,
+                    reason: String::new(),
+                    metadata: Default::default(),
+                })),
             }))
         }
+
+        async fn acknowledge(
+            &self,
+            request: Request<proto::Ack>,
+        ) -> Result<Response<proto::AckResponse>, Status> {
+            let _ = request.into_inner();
+            Ok(Response::new(proto::AckResponse { success: true }))
+        }
+
+        type PublishBatchStream = ReceiverStream<Result<PublishResponse, Status>>;
 
         async fn publish_batch(
             &self,
             request: Request<tonic::Streaming<BridgeMessage>>,
-        ) -> Result<Response<PublishResponse>, Status> {
+        ) -> Result<Response<Self::PublishBatchStream>, Status> {
             let mut stream = request.into_inner();
-            while let Some(msg_result) = stream.message().await? {
-                // The receiver can be dropped if no subscriber is active. We can ignore the error.
-                let _ = self.tx.send(msg_result);
-            }
-            Ok(Response::new(PublishResponse {
-                success: true,
-                error: "".to_string(),
-            }))
+            let (tx, rx) = mpsc::channel(32);
+            let sender = self.tx.clone();
+
+            tokio::spawn(async move {
+                while let Ok(Some(msg_result)) = stream.message().await {
+                    let msg_id = msg_result.id.clone();
+                    let _ = sender.send(msg_result);
+                    let resp = PublishResponse {
+                        result: Some(proto::publish_response::Result::Ack(proto::Ack {
+                            id: msg_id,
+                            status: 0,
+                            reason: String::new(),
+                            metadata: Default::default(),
+                        })),
+                    };
+                    if tx.send(Ok(resp)).await.is_err() {
+                        break;
+                    }
+                }
+            });
+
+            Ok(Response::new(ReceiverStream::new(rx)))
         }
 
         type SubscribeStream = ReceiverStream<Result<BridgeMessage, Status>>;
@@ -441,6 +846,63 @@ mod tests {
         );
 
         // 6. Teardown
+        server_handle.abort();
+    }
+    #[tokio::test]
+    async fn test_grpc_acknowledge_and_batch_streaming() {
+        let addr = "[::1]:50055".parse().unwrap();
+        let (tx, _) = broadcast::channel(16);
+        let bridge = MockBridge { tx: tx.clone() };
+
+        let server_handle = tokio::spawn(async move {
+            Server::builder()
+                .serve(addr, BridgeServer::new(bridge))
+                .await
+                .unwrap();
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let config = GrpcConfig {
+            url: format!("http://{}", addr),
+            timeout_ms: None,
+            topic: Some("batch_test_topic".to_string()),
+            ..Default::default()
+        };
+
+        // Test sending a batch using GrpcPublisher
+        let publisher = GrpcPublisher::new(&config)
+            .await
+            .expect("Failed to create GrpcPublisher");
+
+        let msgs = vec![
+            CanonicalMessage::new("batch_1".into(), None),
+            CanonicalMessage::new("batch_2".into(), None),
+        ];
+
+        let sent_result = publisher.send_batch(msgs).await;
+        // The mock server returns Ack variant with status 0, so it should map to SentBatch::Ack
+        assert!(matches!(sent_result, Ok(SentBatch::Ack)));
+
+        // Test explicit acknowledge
+        let mut client = BridgeClient::new(
+            tonic::transport::Endpoint::from_shared(config.url.clone())
+                .unwrap()
+                .connect()
+                .await
+                .unwrap(),
+        );
+        let ack_req = tonic::Request::new(proto::Ack {
+            id: fast_uuid_v7::gen_id_str().to_string(),
+            status: 0,
+            reason: String::new(),
+            metadata: Default::default(),
+        });
+
+        let ack_resp = client.acknowledge(ack_req).await;
+        assert!(ack_resp.is_ok());
+        assert!(ack_resp.unwrap().into_inner().success);
+
         server_handle.abort();
     }
 }

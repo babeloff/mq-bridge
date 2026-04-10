@@ -568,7 +568,13 @@ async fn create_base_consumer(
         EndpointType::ZeroMq(cfg) => Ok(boxed(zeromq::ZeroMqConsumer::new(cfg).await?)),
         EndpointType::File(cfg) => Ok(boxed(file::FileConsumer::new(cfg).await?)),
         #[cfg(feature = "grpc")]
-        EndpointType::Grpc(cfg) => Ok(boxed(grpc::GrpcConsumer::new(cfg).await?)),
+        EndpointType::Grpc(cfg) => {
+            let mut config = cfg.clone();
+            if config.topic.is_none() {
+                config.topic = Some(route_name.to_string());
+            }
+            Ok(boxed(grpc::GrpcConsumer::new(&config).await?))
+        }
         #[cfg(feature = "sqlx")]
         EndpointType::Sqlx(cfg) => Ok(boxed(sqlx::SqlxConsumer::new(cfg).await?)),
         #[cfg(feature = "http")]

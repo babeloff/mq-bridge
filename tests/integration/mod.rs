@@ -2,6 +2,10 @@
 pub mod amqp;
 #[cfg(feature = "aws")]
 pub mod aws;
+#[cfg(feature = "grpc")]
+pub mod grpc;
+#[cfg(feature = "http")]
+pub mod http;
 #[cfg(feature = "ibm-mq")]
 pub mod ibm_mq;
 #[cfg(feature = "kafka")]

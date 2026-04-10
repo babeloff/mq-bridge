@@ -1424,15 +1424,39 @@ pub enum ZeroMqSocketType {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct GrpcConfig {
-    /// The gRPC server URL (e.g., "http://localhost:50051").
+    /// The gRPC server URL (e.g., "http://localhost:50051" for client or "0.0.0.0:50051" for server mode).
     pub url: String,
-    /// The topic to subscribe to.
+    /// Topic / subject to subscribe to. **Client-mode only.**
     pub topic: Option<String>,
     /// Timeout in milliseconds.
+    /// - Client mode: used as the connection timeout and per-request deadline.
+    /// - Server mode: applied as the per-request deadline on the embedded server.
     pub timeout_ms: Option<u64>,
     /// TLS configuration.
     #[serde(default)]
     pub tls: TlsConfig,
+    /// If `true`, start an embedded tonic gRPC server that accepts incoming `Publish` /
+    /// `PublishBatch` RPCs. If `false` (the default), connect to a remote server as a client.
+    #[serde(default)]
+    pub server_mode: bool,
+    /// HTTP/2 stream-level initial window size in bytes. **Server-mode only.**
+    #[serde(default)]
+    pub initial_stream_window_size: Option<u32>,
+    /// HTTP/2 connection-level initial window size in bytes. **Server-mode only.**
+    #[serde(default)]
+    pub initial_connection_window_size: Option<u32>,
+    /// Maximum number of concurrent requests handled per connection. **Server-mode only.**
+    #[serde(default)]
+    pub concurrency_limit_per_connection: Option<usize>,
+    /// HTTP/2 keepalive ping interval in milliseconds. **Server-mode only.** Default disabled
+    #[serde(default)]
+    pub http2_keepalive_interval_ms: Option<u64>,
+    /// Timeout for a keepalive ping acknowledgement in milliseconds. **Server-mode only.**
+    #[serde(default)]
+    pub http2_keepalive_timeout_ms: Option<u64>,
+    /// Maximum size of a decoded incoming message in bytes. **Server-mode only.** Default 4 MiB.
+    #[serde(default)]
+    pub max_decoding_message_size: Option<usize>,
 }
 
 impl GrpcConfig {
@@ -1446,6 +1470,12 @@ impl GrpcConfig {
 
     pub fn with_topic(mut self, topic: impl Into<String>) -> Self {
         self.topic = Some(topic.into());
+        self
+    }
+
+    /// Enable or disable server mode for this gRPC endpoint.
+    pub fn with_server_mode(mut self, server_mode: bool) -> Self {
+        self.server_mode = server_mode;
         self
     }
 }
