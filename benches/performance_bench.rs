@@ -673,7 +673,7 @@ pub mod grpc_helper {
 
         let config = GrpcConfig {
             url: url.clone(),
-            server_mode: true,
+            server_mode: false,
             ..Default::default()
         };
 

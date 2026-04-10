@@ -14,7 +14,6 @@ pub mod ibm_mq;
 pub mod ibm_mq_tls;
 #[cfg(feature = "kafka")]
 pub mod kafka;
-pub mod tls_helpers;
 #[cfg(feature = "mongodb")]
 pub mod mongodb;
 #[cfg(feature = "mqtt")]
@@ -23,6 +22,7 @@ pub mod mqtt;
 pub mod nats;
 #[cfg(feature = "sqlx")]
 pub mod sqlx;
+pub mod tls_helpers;
 #[cfg(feature = "zeromq")]
 pub mod zeromq;
 
@@ -30,6 +30,6 @@ pub mod file;
 pub mod logic_test;
 pub mod memory;
 // request_reply_test.rs merged into route.rs
-pub mod route;
 #[cfg(feature = "grpc")]
 pub mod grpc_tls;
+pub mod route;

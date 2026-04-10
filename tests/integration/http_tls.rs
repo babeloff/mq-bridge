@@ -1,12 +1,12 @@
 #![allow(dead_code)]
 
-use mq_bridge::test_utils::PERF_TEST_MESSAGE_COUNT;
+use crate::integration::tls_helpers;
 use mq_bridge::models::Route;
+use mq_bridge::test_utils::setup_logging;
+use mq_bridge::test_utils::PERF_TEST_MESSAGE_COUNT;
 use serde_yaml_ng;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
-use mq_bridge::test_utils::setup_logging;
-use crate::integration::tls_helpers;
 
 const CONFIG_YAML: &str = r#"
 routes:
@@ -59,12 +59,17 @@ async fn test_http_tls_pipeline() {
         let port = get_free_port();
         let config_yaml = CONFIG_YAML
             .replace("{out_port}", &port.to_string())
-            .replace("{out_capacity}", &(PERF_TEST_MESSAGE_COUNT + 100).to_string())
+            .replace(
+                "{out_capacity}",
+                &(PERF_TEST_MESSAGE_COUNT + 100).to_string(),
+            )
             .replace("{buffer_size}", &(PERF_TEST_MESSAGE_COUNT * 2).to_string());
 
-        let yaml_val: serde_yaml_ng::Value = serde_yaml_ng::from_str(&config_yaml).expect("Failed to parse YAML config");
+        let yaml_val: serde_yaml_ng::Value =
+            serde_yaml_ng::from_str(&config_yaml).expect("Failed to parse YAML config");
         let routes_val = yaml_val.get("routes").expect("YAML must have 'routes' key");
-        let mut routes: HashMap<String, Route> = serde_yaml_ng::from_value(routes_val.clone()).expect("Failed to parse routes");
+        let mut routes: HashMap<String, Route> =
+            serde_yaml_ng::from_value(routes_val.clone()).expect("Failed to parse routes");
 
         let in_route_name = "memory_to_http".to_string();
         let out_route_name = "http_to_memory".to_string();
@@ -72,13 +77,23 @@ async fn test_http_tls_pipeline() {
         // Inject TLS settings using generated certs
         let cert_dir = tls_helpers::generate_service_certs("mongodb").expect("generate certs");
         if let Some(out_route) = routes.get_mut(out_route_name.as_str()) {
-            if let mq_bridge::models::EndpointType::Http(ref mut http_cfg) = out_route.output.endpoint_type {
-                *http_cfg = tls_helpers::http_consumer_config_with_tls(&cert_dir, format!("127.0.0.1:{}", port));
+            if let mq_bridge::models::EndpointType::Http(ref mut http_cfg) =
+                out_route.output.endpoint_type
+            {
+                *http_cfg = tls_helpers::http_consumer_config_with_tls(
+                    &cert_dir,
+                    format!("127.0.0.1:{}", port),
+                );
             }
         }
         if let Some(in_route) = routes.get_mut(in_route_name.as_str()) {
-            if let mq_bridge::models::EndpointType::Http(ref mut http_cfg) = in_route.output.endpoint_type {
-                *http_cfg = tls_helpers::http_publisher_config_with_tls(&cert_dir, format!("https://127.0.0.1:{}", port));
+            if let mq_bridge::models::EndpointType::Http(ref mut http_cfg) =
+                in_route.output.endpoint_type
+            {
+                *http_cfg = tls_helpers::http_publisher_config_with_tls(
+                    &cert_dir,
+                    format!("https://127.0.0.1:{}", port),
+                );
             }
         }
 
@@ -91,11 +106,15 @@ async fn test_http_tls_pipeline() {
                 let addr = format!("127.0.0.1:{}", port);
                 if wait_for_server_ready(&addr, Duration::from_secs(5)).await {
                     // Deploy publisher and run pipeline
-                    in_route.deploy(&in_route_name).await.expect("Failed to deploy memory_to_http route");
+                    in_route
+                        .deploy(&in_route_name)
+                        .await
+                        .expect("Failed to deploy memory_to_http route");
 
                     // Fill input and wait for messages
                     let in_channel = in_route.input.channel().unwrap();
-                    let messages = mq_bridge::test_utils::generate_test_messages(PERF_TEST_MESSAGE_COUNT);
+                    let messages =
+                        mq_bridge::test_utils::generate_test_messages(PERF_TEST_MESSAGE_COUNT);
                     in_channel.fill_messages(messages).await.unwrap();
 
                     let memory_channel = out_route.output.channel().unwrap();
@@ -107,7 +126,9 @@ async fn test_http_tls_pipeline() {
                         if !batch.is_empty() {
                             received += batch.len();
                         }
-                        if received >= PERF_TEST_MESSAGE_COUNT { break; }
+                        if received >= PERF_TEST_MESSAGE_COUNT {
+                            break;
+                        }
                         tokio::time::sleep(Duration::from_millis(50)).await;
                     }
 

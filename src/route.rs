@@ -169,10 +169,28 @@ impl Route {
         };
 
         if let Some(active) = active_opt {
-            active.handle.stop().await;
-            // Give the route up to 5 seconds to shut down gracefully.
-            let _ =
-                tokio::time::timeout(std::time::Duration::from_secs(5), active.handle.join()).await;
+            // Move the handle out so we can operate on its internals.
+            let handle = active.handle;
+
+            // Signal the route to stop and close the shutdown channel.
+            let _ = handle.0 .1.send(()).await;
+            handle.0 .1.close();
+
+            // Extract the JoinHandle so we can monitor and, if needed, abort it.
+            let mut join_handle = handle.0 .0;
+            tokio::select! {
+                res = &mut join_handle => {
+                    // The task finished naturally within the 5s window
+                    let _ = res;
+                }
+                _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+                    // The 5s timer finished first - abort the task to ensure it doesn't linger.
+                    join_handle.abort();
+                    // Await the handle one last time to ensure the task has fully shut down.
+                    let _ = join_handle.await;
+                }
+            }
+
             true
         } else {
             false
@@ -1027,6 +1045,7 @@ mod tests {
     use std::any::Any;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+    use std::time::Duration;
 
     // Helper function to run a fault injection test on the consumer side.
     async fn run_consumer_fault_test(
@@ -1569,7 +1588,7 @@ mod tests {
                     } else {
                         // Subsequent connections work
                         // Sleep a bit to prevent busy loop in test
-                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        tokio::time::sleep(Duration::from_millis(100)).await;
                         Ok(ReceivedBatch {
                             messages: vec![crate::CanonicalMessage::from("msg2")],
                             commit: Box::new(|_| Box::pin(async { Ok(()) })),

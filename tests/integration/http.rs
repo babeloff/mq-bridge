@@ -118,6 +118,7 @@ pub async fn test_http_performance_pipeline() {
         // Keep this below the outer 60s timeout to allow cleanup to complete.
         let deadline = Duration::from_secs(45);
         let start = Instant::now();
+        let mut last_log = Instant::now();
         let mut received = 0usize;
 
         while start.elapsed() < deadline {
@@ -128,11 +129,12 @@ pub async fn test_http_performance_pipeline() {
             if received >= PERF_TEST_MESSAGE_COUNT {
                 break;
             }
-            if start.elapsed().as_secs() % 5 == 0 && start.elapsed().subsec_millis() < 200 {
+            if last_log.elapsed() >= Duration::from_secs(5) {
                 println!(
                     "Progress: {}/{} messages received",
                     received, PERF_TEST_MESSAGE_COUNT
                 );
+                last_log = Instant::now();
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }

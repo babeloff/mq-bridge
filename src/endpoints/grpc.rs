@@ -314,6 +314,7 @@ impl ServerModeConsumer {
                     "gRPC server TLS enabled but no cert/key provided in GrpcConfig"
                 ));
             }
+            let _ = rustls::crypto::ring::default_provider().install_default();
             let cert_path = config.tls.cert_file.as_ref().unwrap();
             let key_path = config.tls.key_file.as_ref().unwrap();
             let cert = tokio::fs::read(cert_path).await?;
@@ -454,16 +455,19 @@ impl MessagePublisher for GrpcPublisher {
         let mut responses = Vec::new();
         let mut failed: Vec<(CanonicalMessage, PublisherError)> = Vec::new();
 
-        // We need to map response IDs back to the original messages. Recreate
-        // a lookup map from id string -> CanonicalMessage for the messages we sent.
-        let mut id_map: std::collections::HashMap<String, CanonicalMessage> =
+        // We need to map response IDs back to the original messages. Use a map
+        // from id string -> Vec<CanonicalMessage> to preserve duplicates (multiple
+        // messages may share the same message_id). Also compute the total number
+        // of original messages for later checks.
+        let mut id_map: std::collections::HashMap<String, Vec<CanonicalMessage>> =
             std::collections::HashMap::new();
         // Note: we constructed bridge_messages from `messages_iter`; rebuild mapping from
         // the original messages we prepared earlier.
         for msg in &original_messages {
             let id_str = fast_uuid_v7::format_uuid(msg.message_id).to_string();
-            id_map.insert(id_str, msg.clone());
+            id_map.entry(id_str).or_default().push(msg.clone());
         }
+        let total_messages = original_messages.len();
 
         loop {
             match stream.message().await {
@@ -471,14 +475,22 @@ impl MessagePublisher for GrpcPublisher {
                     Some(proto::publish_response::Result::Ack(ack)) => {
                         // Non-zero status indicates failure for that message id.
                         if ack.status != 0 {
-                            if let Some(orig) = id_map.get(&ack.id) {
-                                failed.push((
-                                    orig.clone(),
-                                    PublisherError::Retryable(anyhow::anyhow!(ack.reason)),
-                                ));
+                            if let Some(origs) = id_map.get(&ack.id) {
+                                // Associate the failure with all original messages that
+                                // share this id.
+                                for orig in origs {
+                                    failed.push((
+                                        orig.clone(),
+                                        PublisherError::Retryable(anyhow::anyhow!(ack
+                                            .reason
+                                            .clone())),
+                                    ));
+                                }
                             } else {
                                 // Unknown id; treat as retryable transport-level failure
-                                return Err(PublisherError::Retryable(anyhow::anyhow!(ack.reason)));
+                                return Err(PublisherError::Retryable(anyhow::anyhow!(ack
+                                    .reason
+                                    .clone())));
                             }
                         }
                     }
@@ -499,7 +511,7 @@ impl MessagePublisher for GrpcPublisher {
             }
         }
 
-        let total = id_map.len();
+        let total = total_messages;
         if failed.is_empty() && responses.is_empty() {
             // No failures and no response messages: treat as full Ack
             Ok(SentBatch::Ack)
@@ -544,6 +556,7 @@ async fn make_endpoint(config: &GrpcConfig) -> Result<tonic::transport::Endpoint
     let mut endpoint = tonic::transport::Endpoint::from_shared(config.url.clone())?;
 
     if config.tls.required {
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let mut tls_config = ClientTlsConfig::new();
         if let Some(ca_path) = &config.tls.ca_file {
             let ca_pem = tokio::fs::read(ca_path).await?;
@@ -615,7 +628,10 @@ mod tests {
             request: Request<proto::Ack>,
         ) -> Result<Response<proto::AckResponse>, Status> {
             let _ = request.into_inner();
-            Ok(Response::new(proto::AckResponse { success: true, error: String::new() }))
+            Ok(Response::new(proto::AckResponse {
+                success: true,
+                error: String::new(),
+            }))
         }
 
         type PublishBatchStream = ReceiverStream<Result<PublishResponse, Status>>;
@@ -687,15 +703,18 @@ mod tests {
 
     #[tokio::test]
     async fn test_grpc_publisher_and_consumer() {
-        let addr = "[::1]:50051".parse().unwrap();
+        // Bind an ephemeral port and start the server using that listener so tests
+        // don't rely on a hardcoded port.
+        let listener = tokio::net::TcpListener::bind("[::1]:0").await.unwrap();
+        let local = listener.local_addr().unwrap();
         let (tx, _) = broadcast::channel(16);
         let mut rx_for_pub_test = tx.subscribe();
         let bridge = MockBridge { tx: tx.clone() };
 
-        // Start Server
-        let server_handle = tokio::spawn(async move {
-            Server::builder()
-                .serve(addr, BridgeServer::new(bridge))
+        let incoming = TcpListenerStream::new(listener);
+        let _server_handle = tokio::spawn(async move {
+            TonicServer::builder()
+                .serve_with_incoming(BridgeServer::new(bridge), incoming)
                 .await
                 .unwrap();
         });
@@ -704,7 +723,7 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         let config = GrpcConfig {
-            url: format!("http://{}", addr),
+            url: format!("http://{}", local),
             timeout_ms: None,
             topic: Some("test_topic".to_string()),
             ..Default::default()

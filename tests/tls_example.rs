@@ -1,13 +1,15 @@
 use std::io::BufReader;
 
+use anyhow::Result;
 use rcgen::{BasicConstraints, Certificate, CertificateParams, IsCa, PKCS_ECDSA_P256_SHA256};
 use rustls::RootCertStore;
-use anyhow::Result;
 
 #[tokio::test]
 async fn tls_handshake_example() -> Result<()> {
     // Ensure rustls has a process-level crypto provider installed for tests.
-    rustls::crypto::ring::default_provider().install_default();
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .ok();
     // Generate a test CA and a server certificate signed by it.
     let mut ca_params = CertificateParams::new(vec!["localhost".into()]);
     ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);

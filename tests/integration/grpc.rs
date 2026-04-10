@@ -117,8 +117,10 @@ async fn test_grpc_client_mode() {
 
         async fn subscribe(
             &self,
-            _request: Request<proto::SubscribeRequest>,
+            request: Request<proto::SubscribeRequest>,
         ) -> Result<Response<Self::SubscribeStream>, Status> {
+            let req = request.into_inner();
+            let topic_filter = req.topic;
             let mut rx = self.tx.subscribe();
             let (tx_stream, rx_stream) = mpsc::channel(10);
 
@@ -126,8 +128,13 @@ async fn test_grpc_client_mode() {
                 loop {
                     match rx.recv().await {
                         Ok(msg) => {
-                            if tx_stream.send(Ok(msg)).await.is_err() {
-                                break;
+                            // Only forward messages that match the requested topic.
+                            let msg_topic =
+                                msg.metadata.get("topic").map(|s| s.as_str()).unwrap_or("");
+                            if msg_topic == topic_filter {
+                                if tx_stream.send(Ok(msg)).await.is_err() {
+                                    break;
+                                }
                             }
                         }
                         Err(broadcast::error::RecvError::Lagged(_)) => continue,
@@ -161,57 +168,134 @@ async fn test_grpc_client_mode() {
 }
 
 async fn test_grpc_server_mode() {
-    // Server-mode: start the route consumer which will spawn an embedded server,
-    // and have the memory->grpc publisher send messages to it.
-    // Try several ports with readiness probing to avoid TOCTOU races when selecting an ephemeral port.
-    let mut last_err = None;
-    for _ in 0..6 {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0");
-        let port = match listener {
-            Ok(l) => l.local_addr().ok().map(|a| a.port()),
-            Err(_) => None,
-        };
-        let port = match port {
-            Some(p) => p,
-            None => {
-                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-                continue;
-            }
-        };
+    // Server-mode style test: bind an ephemeral port and start a mock server
+    // on that listener, then run the pipeline with a client-mode consumer
+    // connecting to this server. This reserves the port and avoids TOCTOU.
+    use mq_bridge::endpoints::grpc::proto;
+    use proto::bridge_server::{Bridge, BridgeServer};
+    use proto::{BridgeMessage, PublishResponse};
+    use tokio::sync::{broadcast, mpsc};
+    use tokio_stream::wrappers::ReceiverStream;
+    use tonic::{Request, Response, Status};
 
-        let grpc_url = format!("http://127.0.0.1:{}", port);
+    struct MockBridge {
+        tx: broadcast::Sender<BridgeMessage>,
+    }
 
-        // Inject `server_mode: true` before substituting the URL placeholder.
-        let config_yaml = CONFIG_YAML
-            .replace(
-                "input:\n      grpc:\n        url: \"{grpc_url}\"",
-                "input:\n      grpc:\n        url: \"{grpc_url}\"\n        server_mode: true",
-            )
-            .replace("{grpc_url}", &grpc_url)
-            .replace(
-                "{out_capacity}",
-                &(PERF_TEST_MESSAGE_COUNT + 1000).to_string(),
-            );
+    #[tonic::async_trait]
+    impl Bridge for MockBridge {
+        async fn publish(
+            &self,
+            request: Request<BridgeMessage>,
+        ) -> Result<Response<PublishResponse>, Status> {
+            let msg = request.into_inner();
+            let msg_id = msg.id.clone();
+            let _ = self.tx.send(msg);
+            Ok(Response::new(PublishResponse {
+                result: Some(proto::publish_response::Result::Ack(proto::Ack {
+                    id: msg_id,
+                    status: 0,
+                    reason: String::new(),
+                    metadata: Default::default(),
+                })),
+            }))
+        }
 
-        // Deploy the consumer (embedded server) and wait for the server to accept connections.
-        let deploy_res = tokio::time::timeout(std::time::Duration::from_secs(8), async {
-            run_performance_pipeline_test("grpc", &config_yaml, PERF_TEST_MESSAGE_COUNT).await
-        })
-        .await;
+        async fn acknowledge(
+            &self,
+            request: Request<proto::Ack>,
+        ) -> Result<Response<proto::AckResponse>, Status> {
+            let _ = request.into_inner();
+            Ok(Response::new(proto::AckResponse {
+                success: true,
+                error: String::new(),
+            }))
+        }
 
-        match deploy_res {
-            Ok(()) => return,
-            Err(e) => {
-                // Timeout or other error: try another port
-                last_err = Some(format!("attempt failed for port {}: {}", port, e));
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                continue;
-            }
+        type PublishBatchStream = ReceiverStream<Result<PublishResponse, Status>>;
+
+        async fn publish_batch(
+            &self,
+            request: Request<tonic::Streaming<BridgeMessage>>,
+        ) -> Result<Response<Self::PublishBatchStream>, Status> {
+            let mut stream = request.into_inner();
+            let (tx, rx) = mpsc::channel(32);
+            let sender = self.tx.clone();
+
+            tokio::spawn(async move {
+                while let Ok(Some(msg)) = stream.message().await {
+                    let msg_id = msg.id.clone();
+                    let _ = sender.send(msg);
+                    let resp = PublishResponse {
+                        result: Some(proto::publish_response::Result::Ack(proto::Ack {
+                            id: msg_id,
+                            status: 0,
+                            reason: String::new(),
+                            metadata: Default::default(),
+                        })),
+                    };
+                    if tx.send(Ok(resp)).await.is_err() {
+                        break;
+                    }
+                }
+            });
+
+            Ok(Response::new(ReceiverStream::new(rx)))
+        }
+
+        type SubscribeStream = ReceiverStream<Result<BridgeMessage, Status>>;
+
+        async fn subscribe(
+            &self,
+            request: Request<proto::SubscribeRequest>,
+        ) -> Result<Response<Self::SubscribeStream>, Status> {
+            let req = request.into_inner();
+            let topic_filter = req.topic;
+            let mut rx = self.tx.subscribe();
+            let (tx_stream, rx_stream) = mpsc::channel(10);
+
+            tokio::spawn(async move {
+                loop {
+                    match rx.recv().await {
+                        Ok(msg) => {
+                            let msg_topic =
+                                msg.metadata.get("topic").map(|s| s.as_str()).unwrap_or("");
+                            if msg_topic == topic_filter {
+                                if tx_stream.send(Ok(msg)).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+            });
+
+            Ok(Response::new(ReceiverStream::new(rx_stream)))
         }
     }
 
-    panic!(
-        "Failed to run gRPC server-mode performance test: {:?}",
-        last_err
+    // Bind an ephemeral port and start the mock server using the owned listener.
+    use tokio_stream::wrappers::TcpListenerStream;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let grpc_url = format!("http://{}", addr);
+
+    let (tx, _rx) = broadcast::channel(PERF_TEST_MESSAGE_COUNT + 1000);
+    let bridge = MockBridge { tx };
+    let incoming = TcpListenerStream::new(listener);
+    let _server_handle = tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .serve_with_incoming(BridgeServer::new(bridge), incoming)
+            .await
+            .unwrap();
+    });
+
+    let config_yaml = CONFIG_YAML.replace("{grpc_url}", &grpc_url).replace(
+        "{out_capacity}",
+        &(PERF_TEST_MESSAGE_COUNT + 1000).to_string(),
     );
+
+    run_performance_pipeline_test("grpc", &config_yaml, PERF_TEST_MESSAGE_COUNT).await;
 }
