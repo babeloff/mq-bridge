@@ -32,6 +32,8 @@ pub fn generate_service_certs(service: &str) -> Result<PathBuf> {
         "mongodb" => PathBuf::from("tests/integration/docker-compose/certs"),
         "kafka" => PathBuf::from("tests/integration/docker-compose/kafka-certs"),
         "ibm-mq" => PathBuf::from("tests/integration/docker-compose/ibm-mq-certs"),
+        "http" => PathBuf::from("tests/integration/docker-compose/http-certs"),
+        "grpc" => PathBuf::from("tests/integration/docker-compose/grpc-certs"),
         _ => unreachable!(),
     };
     Ok(out)

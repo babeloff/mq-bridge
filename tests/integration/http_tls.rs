@@ -19,7 +19,7 @@ routes:
       http:
         url: "https://127.0.0.1:{out_port}"
         request_timeout_ms: 5000
-        batch_concurrency: 4
+        batch_concurrency: 2
 
   http_to_memory:
     concurrency: 2
@@ -75,7 +75,7 @@ async fn test_http_tls_pipeline() {
         let out_route_name = "http_to_memory".to_string();
 
         // Inject TLS settings using generated certs
-        let cert_dir = tls_helpers::generate_service_certs("mongodb").expect("generate certs");
+        let cert_dir = tls_helpers::generate_service_certs("http").expect("generate certs");
         if let Some(out_route) = routes.get_mut(out_route_name.as_str()) {
             if let mq_bridge::models::EndpointType::Http(ref mut http_cfg) =
                 out_route.input.endpoint_type

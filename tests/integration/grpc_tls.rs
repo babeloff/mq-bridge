@@ -48,7 +48,7 @@ async fn test_grpc_tls_roundtrip() {
     drop(listener);
 
     // Generate certs and set up TLS configs
-    let cert_dir = tls_helpers::generate_service_certs("mongodb").expect("generate certs");
+    let cert_dir = tls_helpers::generate_service_certs("grpc").expect("generate certs");
     if let Some(out_route) = routes.get_mut("grpc_to_memory") {
         if let mq_bridge::models::EndpointType::Grpc(ref mut cfg) = out_route.input.endpoint_type {
             *cfg =

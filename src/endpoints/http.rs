@@ -289,6 +289,8 @@ async fn spawn_tls_server(
                                             let io = TokioIo::new(stream);
 
                                             let conn = AutoBuilder::new(TokioExecutor::new())
+                                                .http1().keep_alive(true)
+                                                .http2().max_concurrent_streams(200)
                                                 .serve_connection_with_upgrades(io, service.clone())
                                                 .await;
 
