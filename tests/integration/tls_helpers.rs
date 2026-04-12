@@ -90,8 +90,7 @@ pub fn http_consumer_config_with_tls(
     cert_dir: &Path,
     addr: impl Into<String>,
 ) -> mq_bridge::models::HttpConfig {
-    let cert = cert_dir.join("mongo.crt");
-    let key = cert_dir.join("mongo.key");
+    let (cert, key) = choose_cert_and_key(cert_dir);
     let mut cfg = mq_bridge::models::HttpConfig::new(addr.into());
     cfg.tls = mq_bridge::models::TlsConfig::new()
         .with_client_cert(cert.to_string_lossy(), key.to_string_lossy())
@@ -115,14 +114,19 @@ pub fn grpc_server_config_with_tls(
     cert_dir: &Path,
     url: impl Into<String>,
 ) -> mq_bridge::models::GrpcConfig {
-    let cert = cert_dir.join("mongo.crt");
-    let key = cert_dir.join("mongo.key");
+    let (cert, key) = choose_cert_and_key(cert_dir);
     let mut cfg = mq_bridge::models::GrpcConfig::new(url.into());
     cfg.server_mode = true;
     cfg.tls = mq_bridge::models::TlsConfig::new()
         .with_client_cert(cert.to_string_lossy(), key.to_string_lossy())
         .with_insecure(false);
     cfg
+}
+
+fn choose_cert_and_key(cert_dir: &Path) -> (PathBuf, PathBuf) {
+    let server_crt = cert_dir.join("server.crt");
+    let server_key = cert_dir.join("server.key");
+    (server_crt, server_key)
 }
 
 pub fn grpc_client_config_with_tls(

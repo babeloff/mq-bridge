@@ -6,7 +6,7 @@ services:
       - "27017:27017"
     volumes:
       - ./certs:/etc/ssl/mongo:ro
-    command: mongod --bind_ip_all --tlsMode requireTLS --tlsCertificateKeyFile /etc/ssl/mongo/mongo.pem --tlsCAFile /etc/ssl/mongo/ca.pem
+    command: mongod --bind_ip_all --tlsMode requireTLS --tlsCertificateKeyFile /etc/ssl/mongo/server.pem --tlsCAFile /etc/ssl/mongo/ca.pem
     healthcheck:
       test: "bash -c 'echo \"db.runCommand(\"ping\").ok\" | mongosh --tls --tlsCAFile /etc/ssl/mongo/ca.pem --host localhost:27017 --quiet'"
       interval: 5s

@@ -822,6 +822,9 @@ pub mod grpc_helper {
             });
             // give server a small moment to bind
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        } else {
+            // Release the reserved port so ServerModeConsumer::new can bind to it.
+            drop(std_listener);
         }
 
         let cons = GrpcConsumer::new(&config).await.unwrap();
