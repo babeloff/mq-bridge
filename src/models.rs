@@ -1821,18 +1821,6 @@ impl TlsConfig {
     pub fn is_tls_server_configured(&self) -> bool {
         self.cert_file.is_some() && self.key_file.is_some()
     }
-
-    /// Initialize global rustls provider state required by rustls config builders.
-    ///
-    /// Under the `rustls` feature, some code paths build rustls client/server configs
-    /// even when endpoint URLs are plain HTTP (for connectors that support both HTTP and HTTPS).
-    /// Installing the provider here keeps those paths safe and avoids runtime panics.
-    pub fn init_provider(&self) {
-        #[cfg(feature = "rustls")]
-        {
-            let _ = rustls::crypto::ring::default_provider().install_default();
-        }
-    }
 }
 
 /// Trait for extracting secrets from configuration structures.

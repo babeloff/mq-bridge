@@ -13,7 +13,7 @@ use async_nats::{header::HeaderMap, jetstream, jetstream::stream, ConnectOptions
 use async_trait::async_trait;
 use futures::{FutureExt, StreamExt, TryStreamExt};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
-use rustls::crypto::ring as rustls_ring;
+
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, UnixTime};
 use rustls::{ClientConfig, DigitallySignedStruct, Error as RustlsError, SignatureScheme};
 use std::io::BufReader;
@@ -380,10 +380,10 @@ async fn build_nats_options(config: &NatsConfig) -> anyhow::Result<ConnectOption
             }
         }
 
-        let provider = rustls_ring::default_provider(); // Corrected line
-        let tls_config_builder = ClientConfig::builder_with_provider(Arc::new(provider))
-            .with_protocol_versions(&[&rustls::version::TLS13])?
-            .with_root_certificates(root_store);
+        let tls_config_builder =
+            ClientConfig::builder_with_provider(crate::endpoints::get_crypto_provider()?)
+                .with_protocol_versions(&[&rustls::version::TLS13])?
+                .with_root_certificates(root_store);
 
         let tls_config_builder = tls_config_builder.with_client_auth_cert(
             client_auth_certs,
@@ -392,7 +392,8 @@ async fn build_nats_options(config: &NatsConfig) -> anyhow::Result<ConnectOption
         )?;
         tls_config_builder
     } else {
-        ClientConfig::builder()
+        ClientConfig::builder_with_provider(crate::endpoints::get_crypto_provider()?)
+            .with_safe_default_protocol_versions()?
             .with_root_certificates(root_store)
             .with_no_client_auth()
     };
@@ -436,7 +437,7 @@ async fn build_nats_options(config: &NatsConfig) -> anyhow::Result<ConnectOption
                 self.supported_schemes.clone()
             }
         }
-        let schemes = rustls_ring::default_provider()
+        let schemes = crate::endpoints::get_crypto_provider()?
             .signature_verification_algorithms
             .supported_schemes();
         let verifier = NoopServerCertVerifier {

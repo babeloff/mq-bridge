@@ -160,8 +160,6 @@ fn setup_http_state_and_channel(
     HttpConsumerState,
     usize,
 )> {
-    // Initialize TLS provider if TLS is configured for this endpoint.
-    config.tls.init_provider();
     let buffer_size = config.internal_buffer_size.unwrap_or(100).max(1);
     let (request_tx, request_rx) = tokio::sync::mpsc::channel::<HttpSourceMessage>(buffer_size);
 
@@ -672,7 +670,6 @@ pub struct HttpPublisher {
 impl HttpPublisher {
     pub async fn new(config: &HttpConfig) -> anyhow::Result<Self> {
         // Initialize TLS provider if TLS is configured for this endpoint.
-        config.tls.init_provider();
         let batch_concurrency = config.batch_concurrency.unwrap_or(20).max(1);
 
         let tls_client_config = create_rustls_client_config(&config.tls)
@@ -990,7 +987,6 @@ fn create_rustls_server_config(
 ) -> anyhow::Result<Arc<rustls::ServerConfig>> {
     // Ensure a process-level rustls CryptoProvider is installed when building server config.
     // This avoids a runtime panic if the provider wasn't set elsewhere.
-    tls_config.init_provider();
 
     let cert_file = tls_config
         .cert_file
@@ -1004,7 +1000,9 @@ fn create_rustls_server_config(
     let certs = load_certs(cert_file)?;
     let key = load_private_key(key_file)?;
 
-    let config_builder = rustls::ServerConfig::builder();
+    let config_builder =
+        rustls::ServerConfig::builder_with_provider(crate::endpoints::get_crypto_provider()?)
+            .with_safe_default_protocol_versions()?;
 
     let config = if let Some(ca_file) = &tls_config.ca_file {
         // mTLS: verify client certificates using the provided CA
@@ -1039,9 +1037,6 @@ fn create_rustls_server_config(
 
 /// Creates a `rustls::ClientConfig` for the HTTPS client.
 fn create_rustls_client_config(tls_config: &TlsConfig) -> anyhow::Result<rustls::ClientConfig> {
-    // Ensure a process-level rustls CryptoProvider is installed when building client config.
-    tls_config.init_provider();
-
     let mut root_cert_store = rustls::RootCertStore::empty();
 
     if let Some(ca_file) = &tls_config.ca_file {
@@ -1055,7 +1050,10 @@ fn create_rustls_client_config(tls_config: &TlsConfig) -> anyhow::Result<rustls:
         root_cert_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     }
 
-    let config_builder = rustls::ClientConfig::builder().with_root_certificates(root_cert_store);
+    let config_builder =
+        rustls::ClientConfig::builder_with_provider(crate::endpoints::get_crypto_provider()?)
+            .with_safe_default_protocol_versions()?
+            .with_root_certificates(root_cert_store);
 
     if let (Some(cert_file), Some(key_file)) = (&tls_config.cert_file, &tls_config.key_file) {
         let certs = load_certs(cert_file)?;
@@ -1175,14 +1173,6 @@ http_route:
 
     #[tokio::test]
     async fn test_http_consumer_publisher_integration() {
-        // Ensure rustls crypto provider is installed when the `rustls` feature is enabled.
-        // Some downstream TLS crates may require a process-level provider to be set
-        // before creating client/server configs. Installing here keeps the change
-        // minimal and local to tests.
-        #[cfg(feature = "rustls")]
-        {
-            let _ = rustls::crypto::ring::default_provider().install_default();
-        }
         let port = get_free_port();
         let addr = format!("127.0.0.1:{}", port);
         let url = format!("http://{}", addr);

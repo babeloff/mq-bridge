@@ -1171,6 +1171,28 @@ async fn create_base_publisher(
     Ok(publisher)
 }
 
+
+/// Returns the active process-level rustls `CryptoProvider`, or a descriptive error if none
+/// has been installed yet.
+///
+/// This is called by every endpoint that creates a rustls `ClientConfig` / `ServerConfig`.
+/// As a library, mq-bridge never installs a provider itself; the choice belongs to the
+/// application binary.  To resolve the error, either:
+///
+/// * Enable the **`rustls-ring`** or **`rustls-aws-lc`** feature of `mq-bridge`, or
+/// * Call `rustls::crypto::CryptoProvider::install_default()` early in your `main()`.
+#[cfg(feature = "rustls")]
+#[allow(unused)]
+pub(crate) fn get_crypto_provider() -> anyhow::Result<std::sync::Arc<rustls::crypto::CryptoProvider>>
+{
+    rustls::crypto::CryptoProvider::get_default()
+        .cloned()
+        .ok_or_else(|| {
+            anyhow!("No rustls CryptoProvider is installed.\n\
+Fix: enable the `rustls-ring` or `rustls-aws-lc` feature of mq-bridge, or call `rustls::crypto::CryptoProvider::install_default()` in your application binary before creating any TLS endpoint.")
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

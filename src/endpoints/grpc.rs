@@ -315,7 +315,6 @@ impl ServerModeConsumer {
                     "gRPC server TLS enabled but no cert/key provided in GrpcConfig"
                 ));
             }
-            config.tls.init_provider();
             let cert_path = config.tls.cert_file.as_ref().unwrap();
             let key_path = config.tls.key_file.as_ref().unwrap();
             let cert = tokio::fs::read(cert_path).await?;
@@ -572,7 +571,6 @@ async fn make_endpoint(config: &GrpcConfig) -> Result<tonic::transport::Endpoint
     let mut endpoint = tonic::transport::Endpoint::from_shared(config.url.clone())?;
 
     if config.tls.required {
-        config.tls.init_provider();
         let mut tls_config = ClientTlsConfig::new();
         if let Some(ca_path) = &config.tls.ca_file {
             let ca_pem = tokio::fs::read(ca_path).await?;

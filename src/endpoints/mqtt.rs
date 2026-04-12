@@ -787,9 +787,6 @@ fn sanitize_for_client_id(input: &str) -> String {
 }
 
 async fn build_tls_config(config: &MqttConfig) -> anyhow::Result<rustls::ClientConfig> {
-    // Ensure rustls provider is installed if TLS is enabled for this endpoint.
-    config.tls.init_provider();
-
     let mut root_cert_store = rustls::RootCertStore::empty();
     if let Some(ca_file) = &config.tls.ca_file {
         let mut ca_buf = std::io::BufReader::new(std::fs::File::open(ca_file)?);
@@ -800,7 +797,9 @@ async fn build_tls_config(config: &MqttConfig) -> anyhow::Result<rustls::ClientC
     }
 
     let client_config_builder =
-        rustls::ClientConfig::builder().with_root_certificates(root_cert_store);
+        rustls::ClientConfig::builder_with_provider(crate::endpoints::get_crypto_provider()?)
+            .with_safe_default_protocol_versions()?
+            .with_root_certificates(root_cert_store);
 
     let mut client_config = if config.tls.is_mtls_client_configured() {
         let cert_file = config.tls.cert_file.as_ref().unwrap();

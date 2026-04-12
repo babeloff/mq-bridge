@@ -432,9 +432,13 @@ pub fn setup_logging() {
     // Using a std::sync::Once ensures this is only run once per test binary.
     static START: std::sync::Once = std::sync::Once::new();
     START.call_once(|| {
-        // NOTE: TLS provider initialization should be performed by the endpoint
-        // when building client/server configs. Avoid installing a global default
-        // here to surface missing `init_provider()` calls in production code.
+        // Install the rustls CryptoProvider selected by feature flag, if none is installed yet.
+        // This keeps library code provider-agnostic while keeping tests self-contained.
+        #[cfg(feature = "rustls-aws-lc")]
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        #[cfg(all(feature = "rustls-ring", not(feature = "rustls-aws-lc")))]
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
         let file_appender = tracing_appender::rolling::never("logs", "integration_test.log");
         let (non_blocking_writer, guard) = tracing_appender::non_blocking(file_appender);
 
