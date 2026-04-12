@@ -1,46 +1,45 @@
 #![allow(unused_imports)]
-#[cfg(feature = "ibm-mq")]
-mod ibm_mq_tls {
-    use std::sync::Arc;
+#![cfg(feature = "ibm-mq")]
 
-    use crate::integration::tls_helpers;
-    use mq_bridge::endpoints::ibm_mq::{IbmMqConsumer, IbmMqPublisher};
-    use mq_bridge::test_utils::run_test_with_docker;
-    use mq_bridge::test_utils::setup_logging;
-    use mq_bridge::traits::{MessageConsumer, MessagePublisher};
+use std::sync::Arc;
 
-    #[tokio::test]
-    #[ignore = "requires docker compose and openssl/keytool"]
-    async fn test_ibm_mq_tls_roundtrip() {
-        setup_logging();
+use crate::integration::tls_helpers;
+use mq_bridge::endpoints::ibm_mq::{IbmMqConsumer, IbmMqPublisher};
+use mq_bridge::test_utils::run_test_with_docker;
+use mq_bridge::test_utils::setup_logging;
+use mq_bridge::traits::{MessageConsumer, MessagePublisher};
 
-        // Generate certs and build TLS-enabled IBM MQ config
-        let cert_dir = tls_helpers::generate_service_certs("ibm-mq").expect("generate certs");
+#[tokio::test]
+#[ignore = "requires docker compose and openssl/keytool"]
+async fn test_ibm_mq_tls_roundtrip() {
+    setup_logging();
 
-        run_test_with_docker(
-            "tests/integration/docker-compose/ibm_mq_tls.yml",
-            || async {
-                let mut cfg =
-                    tls_helpers::ibm_mq_config_with_tls(&cert_dir, "QM1", "DEV.APP.SVRCONN");
-                cfg.username = Some("app".to_string());
-                cfg.password = Some("admin".to_string());
+    // Generate certs and build TLS-enabled IBM MQ config
+    let cert_dir = tls_helpers::generate_service_certs("ibm-mq").expect("generate certs");
 
-                let publisher = Arc::new(
-                    IbmMqPublisher::new(&cfg)
-                        .await
-                        .expect("Failed to create publisher"),
-                );
-                let mut consumer = IbmMqConsumer::new(&cfg)
+    run_test_with_docker(
+        "tests/integration/docker-compose/ibm_mq_tls.yml",
+        || async {
+            let mut cfg =
+                tls_helpers::ibm_mq_config_with_tls(&cert_dir, "QM1", "DEV.APP.SVRCONN");
+            cfg.username = Some("app".to_string());
+            cfg.password = Some("admin".to_string());
+
+            let publisher = Arc::new(
+                IbmMqPublisher::new(&cfg)
                     .await
-                    .expect("Failed to create consumer");
+                    .expect("Failed to create publisher"),
+            );
+            let mut consumer = IbmMqConsumer::new(&cfg)
+                .await
+                .expect("Failed to create consumer");
 
-                // Publish and receive
-                let msg = mq_bridge::CanonicalMessage::from_vec("hello");
-                publisher.send(msg).await.expect("publish failed");
-                let received = consumer.receive().await.expect("receive failed");
-                assert_eq!(received.message.payload, b"hello".to_vec());
-            },
-        )
-        .await;
-    }
+            // Publish and receive
+            let msg = mq_bridge::CanonicalMessage::from_vec("hello");
+            publisher.send(msg).await.expect("publish failed");
+            let received = consumer.receive().await.expect("receive failed");
+            assert_eq!(received.message.payload, b"hello".to_vec());
+        },
+    )
+    .await;
 }

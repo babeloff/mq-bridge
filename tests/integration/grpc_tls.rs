@@ -1,4 +1,5 @@
 #![allow(dead_code)]
+#![allow(unused_imports)]
 
 use crate::integration::tls_helpers;
 use mq_bridge::models::Route;

@@ -1342,7 +1342,7 @@ mod tests {
         let processed: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
 
         // Send sequences out of order to ensure the sequencer enforces ordering.
-        let seqs = vec![2u64, 0u64, 1u64, 3u64];
+        let seqs = [2u64, 0u64, 1u64, 3u64];
         let mut receivers = Vec::new();
 
         for seq in seqs.iter().cloned() {
@@ -1352,7 +1352,7 @@ mod tests {
                 let processed = processed_clone.clone();
                 Box::pin(async move {
                     // Simulate variable work durations
-                    tokio::time::sleep(Duration::from_millis(10 * (seq as u64))).await;
+                    tokio::time::sleep(Duration::from_millis(10 * seq)).await;
                     processed.lock().unwrap().push(seq);
                     Ok(())
                 })

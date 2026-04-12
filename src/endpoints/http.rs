@@ -1168,6 +1168,14 @@ http_route:
 
     #[tokio::test]
     async fn test_http_consumer_publisher_integration() {
+        // Ensure rustls crypto provider is installed when the `rustls` feature is enabled.
+        // Some downstream TLS crates may require a process-level provider to be set
+        // before creating client/server configs. Installing here keeps the change
+        // minimal and local to tests.
+        #[cfg(feature = "rustls")]
+        {
+            let _ = rustls::crypto::ring::default_provider().install_default();
+        }
         let port = get_free_port();
         let addr = format!("127.0.0.1:{}", port);
         let url = format!("http://{}", addr);

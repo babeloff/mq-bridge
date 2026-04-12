@@ -163,10 +163,8 @@ async fn test_grpc_client_mode() {
                                 .get("mq_bridge.topic")
                                 .map(|s| s.as_str())
                                 .unwrap_or("");
-                            if msg_topic == topic_filter {
-                                if tx_stream.send(Ok(msg)).await.is_err() {
-                                    break;
-                                }
+                            if msg_topic == topic_filter && tx_stream.send(Ok(msg)).await.is_err() {
+                                break;
                             }
                         }
                         Err(broadcast::error::RecvError::Lagged(_)) => continue,
@@ -303,10 +301,8 @@ async fn test_grpc_server_mode() {
                                 .get("mq_bridge.topic")
                                 .map(|s| s.as_str())
                                 .unwrap_or("");
-                            if msg_topic == topic_filter {
-                                if tx_stream.send(Ok(msg)).await.is_err() {
-                                    break;
-                                }
+                            if msg_topic == topic_filter && tx_stream.send(Ok(msg)).await.is_err() {
+                                break;
                             }
                         }
                         Err(broadcast::error::RecvError::Lagged(_)) => continue,
