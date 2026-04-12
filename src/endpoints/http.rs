@@ -988,6 +988,10 @@ fn is_tls_client_configured(tls_config: &TlsConfig) -> bool {
 fn create_rustls_server_config(
     tls_config: &TlsConfig,
 ) -> anyhow::Result<Arc<rustls::ServerConfig>> {
+    // Ensure a process-level rustls CryptoProvider is installed when building server config.
+    // This avoids a runtime panic if the provider wasn't set elsewhere.
+    tls_config.init_provider();
+
     let cert_file = tls_config
         .cert_file
         .as_ref()
@@ -1035,6 +1039,9 @@ fn create_rustls_server_config(
 
 /// Creates a `rustls::ClientConfig` for the HTTPS client.
 fn create_rustls_client_config(tls_config: &TlsConfig) -> anyhow::Result<rustls::ClientConfig> {
+    // Ensure a process-level rustls CryptoProvider is installed when building client config.
+    tls_config.init_provider();
+
     let mut root_cert_store = rustls::RootCertStore::empty();
 
     if let Some(ca_file) = &tls_config.ca_file {

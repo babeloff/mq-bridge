@@ -432,6 +432,9 @@ pub fn setup_logging() {
     // Using a std::sync::Once ensures this is only run once per test binary.
     static START: std::sync::Once = std::sync::Once::new();
     START.call_once(|| {
+        // NOTE: TLS provider initialization should be performed by the endpoint
+        // when building client/server configs. Avoid installing a global default
+        // here to surface missing `init_provider()` calls in production code.
         let file_appender = tracing_appender::rolling::never("logs", "integration_test.log");
         let (non_blocking_writer, guard) = tracing_appender::non_blocking(file_appender);
 

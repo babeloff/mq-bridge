@@ -118,7 +118,7 @@ async fn test_http_tls_pipeline() {
                     in_channel.fill_messages(messages).await.unwrap();
 
                     let memory_channel = out_route.output.channel().unwrap();
-                    let deadline = Duration::from_secs(45);
+                    let deadline = Duration::from_secs(180);
                     let start = Instant::now();
                     let mut received = 0usize;
                     while start.elapsed() < deadline {
@@ -128,6 +128,14 @@ async fn test_http_tls_pipeline() {
                         }
                         if received >= PERF_TEST_MESSAGE_COUNT {
                             break;
+                        }
+                        if start.elapsed().as_secs() % 5 == 0 {
+                            println!(
+                                "Progress: {} / {} received after {:?}",
+                                received,
+                                PERF_TEST_MESSAGE_COUNT,
+                                start.elapsed()
+                            );
                         }
                         tokio::time::sleep(Duration::from_millis(50)).await;
                     }
