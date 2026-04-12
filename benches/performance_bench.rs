@@ -644,7 +644,6 @@ pub mod http_helper {
 
 #[cfg(feature = "grpc")]
 pub mod grpc_helper {
-    use super::PERF_TEST_MESSAGE_COUNT;
     use mq_bridge::endpoints::grpc::{GrpcConsumer, GrpcPublisher};
     use mq_bridge::models::GrpcConfig;
     use mq_bridge::traits::{MessageConsumer, MessagePublisher};
@@ -660,8 +659,7 @@ pub mod grpc_helper {
         listener.local_addr().unwrap().port()
     }
 
-    pub async fn create_consumer() -> Arc<Mutex<dyn MessageConsumer>> {
-        // Start consumer in server_mode, which will spawn the embedded tonic server.
+    pub async fn create_consumer_with_mode(server_mode: bool) -> Arc<Mutex<dyn MessageConsumer>> {
         let port = get_free_port();
         let addr = format!("127.0.0.1:{}", port);
         let url = format!("http://{}", addr);
@@ -673,17 +671,153 @@ pub mod grpc_helper {
 
         let config = GrpcConfig {
             url: url.clone(),
-            server_mode: false,
+            server_mode,
             ..Default::default()
         };
 
-        // Construct consumer which will spawn the server task.
+        // If running client-mode (server_mode == false), spawn a lightweight in-process
+        // Bridge server so the client can connect. This mirrors the embedded server used
+        // in production endpoints but is self-contained for benches.
+        if !server_mode {
+            // spawn a simple bridge server that fans published messages to subscribers
+            let listen_addr = addr.clone();
+            tokio::spawn(async move {
+                use mq_bridge::endpoints::grpc::proto;
+                use proto::{BridgeMessage, PublishResponse};
+                use tokio::sync::{broadcast, mpsc};
+                use tokio_stream::wrappers::ReceiverStream;
+                use tonic::{Request, Response, Status};
+
+                struct BenchBridge {
+                    tx: broadcast::Sender<BridgeMessage>,
+                    queue_tx: mpsc::Sender<BridgeMessage>,
+                }
+
+                #[tonic::async_trait]
+                impl proto::bridge_server::Bridge for BenchBridge {
+                    async fn publish(
+                        &self,
+                        request: Request<BridgeMessage>,
+                    ) -> Result<Response<PublishResponse>, Status> {
+                        let msg = request.into_inner();
+                        let _ = self.tx.send(msg.clone());
+                        Ok(Response::new(PublishResponse {
+                            result: Some(proto::publish_response::Result::Ack(proto::Ack {
+                                id: msg.id,
+                                status: 0,
+                                reason: String::new(),
+                                metadata: Default::default(),
+                            })),
+                        }))
+                    }
+
+                    type PublishBatchStream = ReceiverStream<Result<PublishResponse, Status>>;
+
+                    async fn publish_batch(
+                        &self,
+                        request: Request<tonic::Streaming<BridgeMessage>>,
+                    ) -> Result<Response<Self::PublishBatchStream>, Status> {
+                        let mut stream = request.into_inner();
+                        let (tx, rx) = mpsc::channel(32);
+                        let sender = self.tx.clone();
+                        let queue_tx = self.queue_tx.clone();
+
+                        tokio::spawn(async move {
+                            while let Ok(Some(msg)) = stream.message().await {
+                                let id = msg.id.clone();
+                                let _ = sender.send(msg.clone());
+                                let _ = queue_tx.send(msg).await;
+                                let resp = PublishResponse {
+                                    result: Some(proto::publish_response::Result::Ack(
+                                        proto::Ack {
+                                            id,
+                                            status: 0,
+                                            reason: String::new(),
+                                            metadata: Default::default(),
+                                        },
+                                    )),
+                                };
+                                if tx.send(Ok(resp)).await.is_err() {
+                                    break;
+                                }
+                            }
+                        });
+
+                        Ok(Response::new(ReceiverStream::new(rx)))
+                    }
+
+                    type SubscribeStream = ReceiverStream<Result<BridgeMessage, Status>>;
+
+                    async fn subscribe(
+                        &self,
+                        _request: Request<proto::SubscribeRequest>,
+                    ) -> Result<Response<Self::SubscribeStream>, Status> {
+                        let mut rx = self.tx.subscribe();
+                        let (tx_stream, rx_stream) = mpsc::channel(32);
+                        tokio::spawn(async move {
+                            loop {
+                                match rx.recv().await {
+                                    Ok(msg) => {
+                                        if tx_stream.send(Ok(msg)).await.is_err() {
+                                            break;
+                                        }
+                                    }
+                                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                                    Err(broadcast::error::RecvError::Closed) => break,
+                                }
+                            }
+                        });
+                        Ok(Response::new(ReceiverStream::new(rx_stream)))
+                    }
+
+                    async fn acknowledge(
+                        &self,
+                        _request: Request<proto::Ack>,
+                    ) -> Result<Response<proto::AckResponse>, Status> {
+                        Ok(Response::new(proto::AckResponse {
+                            success: true,
+                            error: String::new(),
+                        }))
+                    }
+                }
+
+                let (tx, _) = broadcast::channel(1024);
+                let (queue_tx, _rx) = mpsc::channel(16 * 1024);
+                // Drain queue receiver so the send side never blocks and causes
+                // backpressure that stalls publish_batch handlers during benches.
+                let mut queue_rx = _rx;
+                tokio::spawn(async move {
+                    while let Some(_msg) = queue_rx.recv().await {
+                        // intentionally drop messages
+                    }
+                });
+                let service = BenchBridge { tx, queue_tx };
+                // Bind and serve using an incoming TCP listener to avoid method resolution
+                // differences across tonic versions.
+                let listener = tokio::net::TcpListener::bind(listen_addr)
+                    .await
+                    .expect("Failed to bind bench bridge listener");
+                let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+                let svc = proto::bridge_server::BridgeServer::new(service);
+                if let Err(e) = tonic::transport::Server::builder()
+                    .serve_with_incoming(svc, incoming)
+                    .await
+                {
+                    eprintln!("bench bridge server error: {:?}", e);
+                }
+            });
+            // give server a small moment to bind
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+
         let cons = GrpcConsumer::new(&config).await.unwrap();
-
-        // Allow server to start listening before clients connect.
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
+        // Allow server (if started) to stabilize before clients connect.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         Arc::new(Mutex::new(cons))
+    }
+
+    pub async fn create_consumer() -> Arc<Mutex<dyn MessageConsumer>> {
+        create_consumer_with_mode(false).await
     }
 
     pub async fn create_publisher() -> Arc<dyn MessagePublisher> {
@@ -701,57 +835,18 @@ pub mod grpc_helper {
 
 #[cfg(feature = "grpc")]
 pub mod grpc_server_helper {
-    use super::PERF_TEST_MESSAGE_COUNT;
-    use mq_bridge::endpoints::grpc::{GrpcConsumer, GrpcPublisher};
-    use mq_bridge::models::GrpcConfig;
+    use super::grpc_helper;
     use mq_bridge::traits::{MessageConsumer, MessagePublisher};
-    use once_cell::sync::Lazy;
-    use std::net::TcpListener;
-    use std::sync::{Arc, Mutex as StdMutex};
+    use std::sync::Arc;
     use tokio::sync::Mutex;
 
-    static CURRENT_URL: Lazy<StdMutex<String>> = Lazy::new(|| StdMutex::new(String::new()));
-
-    fn get_free_port() -> u16 {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.local_addr().unwrap().port()
-    }
-
     pub async fn create_consumer() -> Arc<Mutex<dyn MessageConsumer>> {
-        // Start consumer in server_mode, which will spawn the embedded tonic server.
-        let port = get_free_port();
-        let addr = format!("127.0.0.1:{}", port);
-        let url = format!("http://{}", addr);
-        {
-            let mut lock = CURRENT_URL.lock().unwrap();
-            *lock = url.clone();
-        }
-
-        let config = GrpcConfig {
-            url: url.clone(),
-            server_mode: true,
-            ..Default::default()
-        };
-
-        // Construct consumer which will spawn the server task.
-        let cons = GrpcConsumer::new(&config).await.unwrap();
-
-        // Allow server to start listening before clients connect.
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-        Arc::new(Mutex::new(cons))
+        // Server-mode consumer
+        grpc_helper::create_consumer_with_mode(true).await
     }
 
     pub async fn create_publisher() -> Arc<dyn MessagePublisher> {
-        let url = {
-            let lock = CURRENT_URL.lock().unwrap();
-            lock.clone()
-        };
-        let config = GrpcConfig {
-            url,
-            ..Default::default()
-        };
-        Arc::new(GrpcPublisher::new(&config).await.unwrap())
+        grpc_helper::create_publisher().await
     }
 }
 
@@ -848,7 +943,7 @@ fn performance_benchmarks(c: &mut Criterion) {
         &BENCH_RESULTS,
         PERF_TEST_MESSAGE_COUNT,
         PERF_TEST_CONCURRENCY,
-        std::time::Duration::from_millis(100)
+        std::time::Duration::from_millis(150)
     );
 
     bench_backend!(

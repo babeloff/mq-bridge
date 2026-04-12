@@ -1,36 +1,45 @@
-#![allow(dead_code)]
+#![allow(dead_code, unused)]
 
 use mq_bridge::test_utils::{
     run_performance_pipeline_test, setup_logging, PERF_TEST_MESSAGE_COUNT,
 };
+use std::env;
+use std::time::Duration;
 
 const CONFIG_YAML: &str = r#"
 routes:
-  memory_to_grpc:
-    concurrency: 4
-    batch_size: 128
-    input:
-      memory: { topic: "test-in-grpc" }
-    output:
-      grpc:
-        url: "{grpc_url}"
+    memory_to_grpc:
+        concurrency: 4
+        batch_size: 128
+        input:
+            memory: { topic: "test-in-grpc" }
+        output:
+            grpc:
+                url: "{grpc_url}"
+                topic: "grpc_to_memory"
 
-  grpc_to_memory:
-    concurrency: 4
-    batch_size: 128
-    input:
-      grpc:
-        url: "{grpc_url}"
-    output:
-      memory: { topic: "test-out-grpc", capacity: {out_capacity} }
+    grpc_to_memory:
+        concurrency: 4
+        batch_size: 128
+        input:
+            grpc:
+                url: "{grpc_url}"
+                topic: "grpc_to_memory"
+        output:
+            memory: { topic: "test-out-grpc", capacity: {out_capacity} }
 "#;
 
 pub async fn test_grpc_performance_pipeline() {
     setup_logging();
 
-    // Run client-mode (external mock server) first, then server-mode (embedded server).
-    test_grpc_client_mode().await;
-    test_grpc_server_mode().await;
+    // Run client-mode and server-mode with a guarded timeout to avoid hangs.
+    let timeout = Duration::from_secs(60);
+
+    let res = tokio::time::timeout(timeout, test_grpc_client_mode()).await;
+    assert!(res.is_ok(), "test_grpc_client_mode timed out after 60s");
+
+    let res = tokio::time::timeout(timeout, test_grpc_server_mode()).await;
+    assert!(res.is_ok(), "test_grpc_server_mode timed out after 60s");
 }
 
 async fn test_grpc_client_mode() {
@@ -60,7 +69,17 @@ async fn test_grpc_client_mode() {
         ) -> Result<Response<PublishResponse>, Status> {
             let msg = request.into_inner();
             let msg_id = msg.id.clone();
-            let _ = self.tx.send(msg);
+            let msg_topic = msg.metadata.get("mq_bridge.topic").cloned();
+            tracing::debug!(mock = "publish", msg_id = %msg_id, metadata = ?msg.metadata);
+            let res = self.tx.send(msg);
+            match res {
+                Ok(_) => {
+                    tracing::trace!(mock = "publish", msg_id = %msg_id, topic = ?msg_topic, "enqueued to broadcast channel")
+                }
+                Err(e) => {
+                    tracing::debug!(mock = "publish", msg_id = %msg_id, error = %format!("{:?}", e), "broadcast send failed")
+                }
+            }
             Ok(Response::new(PublishResponse {
                 result: Some(proto::publish_response::Result::Ack(proto::Ack {
                     id: msg_id,
@@ -95,7 +114,17 @@ async fn test_grpc_client_mode() {
             tokio::spawn(async move {
                 while let Ok(Some(msg)) = stream.message().await {
                     let msg_id = msg.id.clone();
-                    let _ = sender.send(msg);
+                    let msg_topic = msg.metadata.get("mq_bridge.topic").cloned();
+                    tracing::trace!(mock = "publish_batch", msg_id = %msg_id, metadata = ?msg.metadata);
+                    let res = sender.send(msg);
+                    match res {
+                        Ok(_) => {
+                            tracing::trace!(mock = "publish_batch", msg_id = %msg_id, topic = ?msg_topic, "enqueued to broadcast channel")
+                        }
+                        Err(e) => {
+                            tracing::debug!(mock = "publish_batch", msg_id = %msg_id, error = %format!("{:?}", e), "broadcast send failed")
+                        }
+                    }
                     let resp = PublishResponse {
                         result: Some(proto::publish_response::Result::Ack(proto::Ack {
                             id: msg_id,
@@ -129,8 +158,11 @@ async fn test_grpc_client_mode() {
                     match rx.recv().await {
                         Ok(msg) => {
                             // Only forward messages that match the requested topic.
-                            let msg_topic =
-                                msg.metadata.get("topic").map(|s| s.as_str()).unwrap_or("");
+                            let msg_topic = msg
+                                .metadata
+                                .get("mq_bridge.topic")
+                                .map(|s| s.as_str())
+                                .unwrap_or("");
                             if msg_topic == topic_filter {
                                 if tx_stream.send(Ok(msg)).await.is_err() {
                                     break;
@@ -152,11 +184,15 @@ async fn test_grpc_client_mode() {
     let (tx, _rx) = broadcast::channel(PERF_TEST_MESSAGE_COUNT + 1000);
     let bridge = MockBridge { tx };
     let incoming = TcpListenerStream::new(listener);
+    tracing::info!(mock = "server", grpc_url = %grpc_url, "starting mock gRPC server");
+    let grpc_url_clone = grpc_url.clone();
     let _server_handle = tokio::spawn(async move {
-        tonic::transport::Server::builder()
+        if let Err(e) = tonic::transport::Server::builder()
             .serve_with_incoming(BridgeServer::new(bridge), incoming)
             .await
-            .unwrap();
+        {
+            tracing::error!(mock = "server", grpc_url = %grpc_url_clone, error = %format!("{:?}", e), "mock gRPC server error");
+        }
     });
 
     let config_yaml = CONFIG_YAML.replace("{grpc_url}", &grpc_url).replace(
@@ -164,7 +200,11 @@ async fn test_grpc_client_mode() {
         &(PERF_TEST_MESSAGE_COUNT + 1000).to_string(),
     );
 
-    run_performance_pipeline_test("grpc", &config_yaml, PERF_TEST_MESSAGE_COUNT).await;
+    let msg_count = env::var("MQB_FOCUSED_COUNT")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(PERF_TEST_MESSAGE_COUNT);
+    run_performance_pipeline_test("grpc", &config_yaml, msg_count).await;
 }
 
 async fn test_grpc_server_mode() {
@@ -258,8 +298,11 @@ async fn test_grpc_server_mode() {
                 loop {
                     match rx.recv().await {
                         Ok(msg) => {
-                            let msg_topic =
-                                msg.metadata.get("topic").map(|s| s.as_str()).unwrap_or("");
+                            let msg_topic = msg
+                                .metadata
+                                .get("mq_bridge.topic")
+                                .map(|s| s.as_str())
+                                .unwrap_or("");
                             if msg_topic == topic_filter {
                                 if tx_stream.send(Ok(msg)).await.is_err() {
                                     break;
@@ -285,11 +328,15 @@ async fn test_grpc_server_mode() {
     let (tx, _rx) = broadcast::channel(PERF_TEST_MESSAGE_COUNT + 1000);
     let bridge = MockBridge { tx };
     let incoming = TcpListenerStream::new(listener);
+    tracing::info!(mock = "server", grpc_url = %grpc_url, "starting mock gRPC server (server mode)");
+    let grpc_url_clone = grpc_url.clone();
     let _server_handle = tokio::spawn(async move {
-        tonic::transport::Server::builder()
+        if let Err(e) = tonic::transport::Server::builder()
             .serve_with_incoming(BridgeServer::new(bridge), incoming)
             .await
-            .unwrap();
+        {
+            tracing::error!(mock = "server", grpc_url = %grpc_url_clone, error = %format!("{:?}", e), "mock gRPC server error (server mode)");
+        }
     });
 
     let config_yaml = CONFIG_YAML.replace("{grpc_url}", &grpc_url).replace(
@@ -297,5 +344,9 @@ async fn test_grpc_server_mode() {
         &(PERF_TEST_MESSAGE_COUNT + 1000).to_string(),
     );
 
-    run_performance_pipeline_test("grpc", &config_yaml, PERF_TEST_MESSAGE_COUNT).await;
+    let msg_count = env::var("MQB_FOCUSED_COUNT")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(PERF_TEST_MESSAGE_COUNT);
+    run_performance_pipeline_test("grpc", &config_yaml, msg_count).await;
 }

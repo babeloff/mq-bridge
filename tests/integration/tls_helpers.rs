@@ -11,13 +11,18 @@ pub fn generate_service_certs(service: &str) -> Result<PathBuf> {
         anyhow::bail!("Cert script not found: {}", script.display());
     }
 
-    // Invoke the script via the shell to avoid requiring the execute bit on the
-    // script file (some environments may not have it set).
-    let status = Command::new("sh")
-        .arg(&script)
-        .arg(service)
-        .status()
-        .with_context(|| format!("Failed to run cert script: {}", script.display()))?;
+    // Prefer to run the script with `bash` since it uses bash-specific features.
+    // Fall back to `sh` if `bash` is not available.
+    let bash_status = Command::new("bash").arg(&script).arg(service).status();
+
+    let status = match bash_status {
+        Ok(s) => s,
+        Err(_) => Command::new("sh")
+            .arg(&script)
+            .arg(service)
+            .status()
+            .with_context(|| format!("Failed to run cert script: {}", script.display()))?,
+    };
 
     if !status.success() {
         anyhow::bail!("Cert script failed for {}", service);

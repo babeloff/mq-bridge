@@ -932,17 +932,24 @@ pub struct FileConfig {
 #[serde(tag = "mode", rename_all = "snake_case")]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub enum FileConsumerMode {
-    /// **Queue Mode**: Reads from the beginning of the file.
+    /// **Queue Mode**: Standard point-to-point consumption. Reads from the start
+    /// of the file. If `delete` is true, processed lines are physically removed
+    /// from the file once they are successfully acknowledged.
     Consume {
         #[serde(default)]
         delete: bool,
     },
-    /// **Broadcast Mode**: Tails the file (starts at the end).
+    /// **Broadcast Mode**: Pub-sub style consumption. Tails the file by starting
+    /// at the current end. If `delete` is true, lines are removed only after
+    /// all local application subscribers for this specific file have acknowledged them.
     Subscribe {
         #[serde(default)]
         delete: bool,
     },
-    /// **Persistent Mode**: Reads the file with offset tracking.
+    /// **Persistent Mode**: Consumption with external offset tracking.
+    /// Saves the last read byte position to a `.offset` file identified by the `group_id`.
+    /// This allows the consumer to resume exactly where it left off after a restart
+    /// without deleting data or requiring the bridge to stay running.
     GroupSubscribe {
         /// The consumer group ID that is used for offset tracking. Should be unique.
         group_id: String,
@@ -1813,6 +1820,22 @@ impl TlsConfig {
     /// Checks if TLS server certificate authentication is configured.
     pub fn is_tls_server_configured(&self) -> bool {
         self.cert_file.is_some() && self.key_file.is_some()
+    }
+
+    /// Initialize any global TLS provider state required by the underlying TLS implementation.
+    ///
+    /// On platforms where `rustls` needs an explicit crypto provider installed (feature `rustls`),
+    /// this will call the provider installation. The call is a no-op when the `rustls` feature
+    /// is not enabled. Only performed when TLS appears to be enabled/configured to avoid
+    /// unnecessary global state changes for non-TLS endpoints.
+    pub fn init_provider(&self) {
+        #[cfg(feature = "rustls")]
+        {
+            if self.required || self.is_tls_server_configured() || self.is_mtls_client_configured()
+            {
+                let _ = rustls::crypto::ring::default_provider().install_default();
+            }
+        }
     }
 }
 

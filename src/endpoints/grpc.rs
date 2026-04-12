@@ -84,6 +84,7 @@ impl ClientModeConsumer {
             .topic
             .clone()
             .unwrap_or_else(|| "default".to_string());
+        debug!(grpc_url = %config.url, subscribe_topic = %topic, "gRPC client consumer subscribing to topic");
         let request = Request::new(SubscribeRequest { topic });
         let stream = if let Some(ms) = config.timeout_ms {
             tokio::time::timeout(Duration::from_millis(ms), client.subscribe(request))
@@ -314,7 +315,7 @@ impl ServerModeConsumer {
                     "gRPC server TLS enabled but no cert/key provided in GrpcConfig"
                 ));
             }
-            let _ = rustls::crypto::ring::default_provider().install_default();
+            config.tls.init_provider();
             let cert_path = config.tls.cert_file.as_ref().unwrap();
             let key_path = config.tls.key_file.as_ref().unwrap();
             let cert = tokio::fs::read(cert_path).await?;
@@ -404,6 +405,7 @@ impl MessageConsumer for ServerModeConsumer {
 pub struct GrpcPublisher {
     client: BridgeClient<Channel>,
     timeout: Option<Duration>,
+    topic: Option<String>,
 }
 
 impl GrpcPublisher {
@@ -415,6 +417,12 @@ impl GrpcPublisher {
         Ok(Self {
             client,
             timeout: config.timeout_ms.map(Duration::from_millis),
+            topic: Some(
+                config
+                    .topic
+                    .clone()
+                    .unwrap_or_else(|| "default".to_string()),
+            ),
         })
     }
 }
@@ -432,10 +440,18 @@ impl MessagePublisher for GrpcPublisher {
         let bridge_messages_vec: Vec<BridgeMessage> = original_messages
             .iter()
             .cloned()
-            .map(|msg| BridgeMessage {
-                payload: msg.payload.to_vec(),
-                id: fast_uuid_v7::format_uuid(msg.message_id).to_string(),
-                metadata: msg.metadata.into_iter().collect(),
+            .map(|msg| {
+                let mut md: std::collections::HashMap<String, String> =
+                    msg.metadata.into_iter().collect();
+                if let Some(topic) = &self.topic {
+                    md.entry("mq_bridge.topic".to_string())
+                        .or_insert_with(|| topic.clone());
+                }
+                BridgeMessage {
+                    payload: msg.payload.to_vec(),
+                    id: fast_uuid_v7::format_uuid(msg.message_id).to_string(),
+                    metadata: md.into_iter().collect(),
+                }
             })
             .collect();
 
@@ -556,7 +572,7 @@ async fn make_endpoint(config: &GrpcConfig) -> Result<tonic::transport::Endpoint
     let mut endpoint = tonic::transport::Endpoint::from_shared(config.url.clone())?;
 
     if config.tls.required {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        config.tls.init_provider();
         let mut tls_config = ClientTlsConfig::new();
         if let Some(ca_path) = &config.tls.ca_file {
             let ca_pem = tokio::fs::read(ca_path).await?;

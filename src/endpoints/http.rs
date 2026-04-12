@@ -160,7 +160,8 @@ fn setup_http_state_and_channel(
     HttpConsumerState,
     usize,
 )> {
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    // Initialize TLS provider if TLS is configured for this endpoint.
+    config.tls.init_provider();
     let buffer_size = config.internal_buffer_size.unwrap_or(100).max(1);
     let (request_tx, request_rx) = tokio::sync::mpsc::channel::<HttpSourceMessage>(buffer_size);
 
@@ -670,7 +671,8 @@ pub struct HttpPublisher {
 
 impl HttpPublisher {
     pub async fn new(config: &HttpConfig) -> anyhow::Result<Self> {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        // Initialize TLS provider if TLS is configured for this endpoint.
+        config.tls.init_provider();
         let batch_concurrency = config.batch_concurrency.unwrap_or(20).max(1);
 
         let tls_client_config = create_rustls_client_config(&config.tls)
