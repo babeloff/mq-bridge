@@ -20,8 +20,7 @@ async fn test_ibm_mq_tls_roundtrip() {
     run_test_with_docker(
         "tests/integration/docker-compose/ibm_mq_tls.yml",
         || async {
-            let mut cfg =
-                tls_helpers::ibm_mq_config_with_tls(&cert_dir, "QM1", "DEV.APP.SVRCONN");
+            let mut cfg = tls_helpers::ibm_mq_config_with_tls(&cert_dir, "QM1", "DEV.APP.SVRCONN");
             cfg.username = Some("app".to_string());
             cfg.password = Some("admin".to_string());
 
