@@ -236,6 +236,16 @@ impl proto::bridge_server::Bridge for BridgeService {
                 let _ = sender.send(msg.clone());
                 if queue_tx.send(msg).await.is_err() {
                     warn!("publish_batch: internal server queue closed, stopping responder task");
+                    // Send an explicit NACK for this message so clients receive a terminal response
+                    let nack = proto::PublishResponse {
+                        result: Some(proto::publish_response::Result::Ack(proto::Ack {
+                            id: msg_id.clone(),
+                            status: 1,
+                            reason: "Internal queue closed".to_string(),
+                            metadata: Default::default(),
+                        })),
+                    };
+                    let _ = tx.send(Ok(nack)).await;
                     break;
                 }
                 let resp = proto::PublishResponse {
@@ -360,6 +370,13 @@ impl ServerModeConsumer {
     }
 }
 
+impl Drop for ServerModeConsumer {
+    fn drop(&mut self) {
+        // Ensure the background server task is stopped when the consumer is dropped.
+        self._handle.abort();
+    }
+}
+
 #[async_trait]
 impl MessageConsumer for ServerModeConsumer {
     async fn receive_batch(
@@ -454,84 +471,107 @@ impl MessagePublisher for GrpcPublisher {
             })
             .collect();
 
-        let response_fut = client.publish_batch(tokio_stream::iter(bridge_messages_vec));
-        let response = if let Some(timeout) = self.timeout {
-            tokio::time::timeout(timeout, response_fut)
-                .await
-                .map_err(|_| {
-                    PublisherError::Retryable(anyhow::anyhow!("gRPC publish batch timed out"))
-                })?
-                .map_err(anyhow::Error::from)?
-        } else {
-            response_fut.await.map_err(anyhow::Error::from)?
-        };
-
-        let mut stream = response.into_inner();
-        let mut responses = Vec::new();
-        let mut failed: Vec<(CanonicalMessage, PublisherError)> = Vec::new();
-
-        // We need to map response IDs back to the original messages. Use a map
-        // from id string -> Vec<CanonicalMessage> to preserve duplicates (multiple
-        // messages may share the same message_id). Also compute the total number
-        // of original messages for later checks.
+        // Process responses and enforce an overall timeout if configured.
         let mut id_map: std::collections::HashMap<String, Vec<CanonicalMessage>> =
             std::collections::HashMap::new();
-        // Note: we constructed bridge_messages from `messages_iter`; rebuild mapping from
-        // the original messages we prepared earlier.
         for msg in &original_messages {
             let id_str = fast_uuid_v7::format_uuid(msg.message_id).to_string();
             id_map.entry(id_str).or_default().push(msg.clone());
         }
         let total_messages = original_messages.len();
 
-        loop {
-            match stream.message().await {
-                Ok(Some(r)) => match r.result {
-                    Some(proto::publish_response::Result::Ack(ack)) => {
-                        // Non-zero status indicates failure for that message id.
-                        if ack.status != 0 {
-                            if let Some(origs) = id_map.get(&ack.id) {
-                                // Associate the failure with all original messages that
-                                // share this id.
-                                for orig in origs {
-                                    failed.push((
-                                        orig.clone(),
-                                        PublisherError::Retryable(anyhow::anyhow!(ack
-                                            .reason
-                                            .clone())),
-                                    ));
+        // Start the publish_batch call but don't await it yet; the future is
+        // driven inside the processing future so we can apply a timeout that
+        // bounds the entire response-handling phase.
+        let response_fut = client.publish_batch(tokio_stream::iter(bridge_messages_vec));
+
+        let process_fut = async {
+            let response = response_fut.await.map_err(|e| {
+                PublisherError::Retryable(anyhow::anyhow!(format!(
+                    "gRPC publish_batch error: {:?}",
+                    e
+                )))
+            })?;
+            let mut stream = response.into_inner();
+            let mut responses = Vec::new();
+            let mut failed: Vec<(CanonicalMessage, PublisherError)> = Vec::new();
+            let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+            loop {
+                match stream.message().await {
+                    Ok(Some(r)) => match r.result {
+                        Some(proto::publish_response::Result::Ack(ack)) => {
+                            seen_ids.insert(ack.id.clone());
+                            if ack.status != 0 {
+                                if let Some(origs) = id_map.get(&ack.id) {
+                                    for orig in origs {
+                                        failed.push((
+                                            orig.clone(),
+                                            PublisherError::Retryable(anyhow::anyhow!(ack
+                                                .reason
+                                                .clone())),
+                                        ));
+                                    }
+                                } else {
+                                    return Err(PublisherError::Retryable(anyhow::anyhow!(ack
+                                        .reason
+                                        .clone())));
                                 }
-                            } else {
-                                // Unknown id; treat as retryable transport-level failure
-                                return Err(PublisherError::Retryable(anyhow::anyhow!(ack
-                                    .reason
-                                    .clone())));
                             }
                         }
+                        Some(proto::publish_response::Result::Reply(reply)) => {
+                            seen_ids.insert(reply.id.clone());
+                            responses.push(bridge_to_canonical(reply));
+                        }
+                        Some(proto::publish_response::Result::Error(err)) => {
+                            // Treat explicit error responses as a retryable batch-level failure.
+                            return Err(PublisherError::Retryable(anyhow::anyhow!(err)));
+                        }
+                        None => {}
+                    },
+                    Ok(None) => break,
+                    Err(e) => {
+                        error!("Error reading publish batch response stream: {:?}", e);
+                        return Err(PublisherError::Retryable(anyhow::anyhow!(format!(
+                            "gRPC stream error: {:?}",
+                            e
+                        ))));
                     }
-                    Some(proto::publish_response::Result::Reply(reply)) => {
-                        responses.push(bridge_to_canonical(reply));
-                    }
-                    Some(proto::publish_response::Result::Error(err)) => {
-                        // Treat explicit error responses as a retryable batch-level failure.
-                        return Err(PublisherError::Retryable(anyhow::anyhow!(err)));
-                    }
-                    None => {}
-                },
-                Ok(None) => break,
-                Err(e) => {
-                    error!("Error reading publish batch response stream: {:?}", e);
-                    return Err(PublisherError::Retryable(e.into()));
                 }
             }
-        }
+
+            // Any ids that were not seen are treated as missing responses -> retryable.
+            for (id, origs) in &id_map {
+                if !seen_ids.contains(id) {
+                    for orig in origs {
+                        failed.push((
+                            orig.clone(),
+                            PublisherError::Retryable(anyhow::anyhow!("missing response for id")),
+                        ));
+                    }
+                }
+            }
+
+            Ok((responses, failed)) as Result<_, PublisherError>
+        };
+
+        let (responses, failed): (
+            Vec<crate::CanonicalMessage>,
+            Vec<(crate::CanonicalMessage, PublisherError)>,
+        ) = if let Some(timeout) = self.timeout {
+            tokio::time::timeout(timeout, process_fut)
+                .await
+                .map_err(|_| {
+                    PublisherError::Retryable(anyhow::anyhow!("gRPC publish batch timed out"))
+                })??
+        } else {
+            process_fut.await?
+        };
 
         let total = total_messages;
         if failed.is_empty() && responses.is_empty() {
-            // No failures and no response messages: treat as full Ack
             Ok(SentBatch::Ack)
         } else if failed.len() == total {
-            // All messages failed -> treat as retryable
             Err(PublisherError::Retryable(anyhow::anyhow!(
                 "All messages in batch failed"
             )))

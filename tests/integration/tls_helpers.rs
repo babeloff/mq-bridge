@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// Generate certs for a named service ("mongodb" or "kafka") using the shared script.
+/// Generate certs for a named service ("mongodb", "kafka", or "ibm-mq") using the shared script.
 pub fn generate_service_certs(service: &str) -> Result<PathBuf> {
     let script = PathBuf::from("tests/integration/scripts/gen_certs.sh");
     if !script.exists() {
@@ -32,7 +32,7 @@ pub fn generate_service_certs(service: &str) -> Result<PathBuf> {
         "mongodb" => PathBuf::from("tests/integration/docker-compose/certs"),
         "kafka" => PathBuf::from("tests/integration/docker-compose/kafka-certs"),
         "ibm-mq" => PathBuf::from("tests/integration/docker-compose/ibm-mq-certs"),
-        _ => anyhow::bail!("Unknown service: {}", service),
+        _ => unreachable!(),
     };
     Ok(out)
 }

@@ -1433,7 +1433,7 @@ pub enum ZeroMqSocketType {
 pub struct GrpcConfig {
     /// The gRPC server URL (e.g., "http://localhost:50051" for client or "0.0.0.0:50051" for server mode).
     pub url: String,
-    /// Topic / subject to subscribe to. **Client-mode only.**
+    /// Topic / subject used for both subscribe and publish paths.
     pub topic: Option<String>,
     /// Timeout in milliseconds.
     /// - Client mode: used as the connection timeout and per-request deadline.

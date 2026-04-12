@@ -553,9 +553,8 @@ pub mod http_helper {
 
     static CURRENT_URL: Lazy<StdMutex<String>> = Lazy::new(|| StdMutex::new(String::new()));
 
-    fn get_free_port() -> u16 {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.local_addr().unwrap().port()
+    fn get_free_listener() -> std::net::TcpListener {
+        TcpListener::bind("127.0.0.1:0").unwrap()
     }
 
     struct HttpBenchConsumer {
@@ -585,7 +584,9 @@ pub mod http_helper {
     }
 
     pub async fn create_consumer() -> Arc<Mutex<dyn MessageConsumer>> {
-        let port = get_free_port();
+        // Reserve the port by holding the std listener until the server binds it.
+        let std_listener = get_free_listener();
+        let port = std_listener.local_addr().unwrap().port();
         let addr = format!("127.0.0.1:{}", port);
         let url = format!("http://{}", addr);
 
@@ -654,13 +655,13 @@ pub mod grpc_helper {
 
     static CURRENT_URL: Lazy<StdMutex<String>> = Lazy::new(|| StdMutex::new(String::new()));
 
-    fn get_free_port() -> u16 {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.local_addr().unwrap().port()
+    fn get_free_listener() -> std::net::TcpListener {
+        TcpListener::bind("127.0.0.1:0").unwrap()
     }
 
     pub async fn create_consumer_with_mode(server_mode: bool) -> Arc<Mutex<dyn MessageConsumer>> {
-        let port = get_free_port();
+        let std_listener = get_free_listener();
+        let port = std_listener.local_addr().unwrap().port();
         let addr = format!("127.0.0.1:{}", port);
         let url = format!("http://{}", addr);
 
@@ -680,7 +681,9 @@ pub mod grpc_helper {
         // in production endpoints but is self-contained for benches.
         if !server_mode {
             // spawn a simple bridge server that fans published messages to subscribers
-            let listen_addr = addr.clone();
+            // Move the reserved std listener into the spawn so the socket stays reserved
+            // until the server takes ownership.
+            let std_listener = std_listener;
             tokio::spawn(async move {
                 use mq_bridge::endpoints::grpc::proto;
                 use proto::{BridgeMessage, PublishResponse};
@@ -701,6 +704,7 @@ pub mod grpc_helper {
                     ) -> Result<Response<PublishResponse>, Status> {
                         let msg = request.into_inner();
                         let _ = self.tx.send(msg.clone());
+                        let _ = self.queue_tx.send(msg.clone()).await;
                         Ok(Response::new(PublishResponse {
                             result: Some(proto::publish_response::Result::Ack(proto::Ack {
                                 id: msg.id,
@@ -750,14 +754,25 @@ pub mod grpc_helper {
 
                     async fn subscribe(
                         &self,
-                        _request: Request<proto::SubscribeRequest>,
+                        request: Request<proto::SubscribeRequest>,
                     ) -> Result<Response<Self::SubscribeStream>, Status> {
+                        let topic = request.get_ref().topic.clone();
                         let mut rx = self.tx.subscribe();
                         let (tx_stream, rx_stream) = mpsc::channel(32);
                         tokio::spawn(async move {
                             loop {
                                 match rx.recv().await {
                                     Ok(msg) => {
+                                        let msg_topic = msg
+                                            .metadata
+                                            .iter()
+                                            .find(|(k, _)| k.as_str() == "mq_bridge.topic")
+                                            .map(|(_, v)| v.clone());
+                                        if !topic.is_empty()
+                                            && msg_topic.as_deref() != Some(topic.as_str())
+                                        {
+                                            continue;
+                                        }
                                         if tx_stream.send(Ok(msg)).await.is_err() {
                                             break;
                                         }
@@ -792,11 +807,10 @@ pub mod grpc_helper {
                     }
                 });
                 let service = BenchBridge { tx, queue_tx };
-                // Bind and serve using an incoming TCP listener to avoid method resolution
-                // differences across tonic versions.
-                let listener = tokio::net::TcpListener::bind(listen_addr)
-                    .await
-                    .expect("Failed to bind bench bridge listener");
+                // Convert the reserved std listener to a non-blocking tokio listener
+                std_listener.set_nonblocking(true).ok();
+                let listener = tokio::net::TcpListener::from_std(std_listener)
+                    .expect("Failed to convert std listener to tokio listener");
                 let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
                 let svc = proto::bridge_server::BridgeServer::new(service);
                 if let Err(e) = tonic::transport::Server::builder()

@@ -1141,6 +1141,12 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.local_addr().unwrap().port()
     }
+    fn init_crypto() {
+        #[cfg(feature = "rustls-aws-lc")]
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        #[cfg(all(feature = "rustls-ring", not(feature = "rustls-aws-lc")))]
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
 
     #[test]
     fn test_http_config_yaml() {
@@ -1173,6 +1179,8 @@ http_route:
 
     #[tokio::test]
     async fn test_http_consumer_publisher_integration() {
+        init_crypto();
+
         let port = get_free_port();
         let addr = format!("127.0.0.1:{}", port);
         let url = format!("http://{}", addr);
@@ -1217,6 +1225,7 @@ http_route:
 
     #[tokio::test]
     async fn test_http_server_shutdown_on_drop() {
+        init_crypto();
         let port = get_free_port();
         let addr = format!("127.0.0.1:{}", port);
         let config = HttpConfig {
@@ -1237,6 +1246,7 @@ http_route:
 
     #[tokio::test]
     async fn test_http_to_static_response() {
+        init_crypto();
         let port = get_free_port();
         let addr = format!("127.0.0.1:{}", port);
         let http_config = HttpConfig {
@@ -1267,6 +1277,7 @@ http_route:
 
     #[tokio::test]
     async fn test_http_to_response_endpoint() {
+        init_crypto();
         let port = get_free_port();
         let addr = format!("127.0.0.1:{}", port);
         let http_config = HttpConfig {
@@ -1298,6 +1309,7 @@ http_route:
     #[tokio::test]
     async fn test_http_reply_with_custom_status_code() {
         use crate::traits::Handled;
+        init_crypto();
 
         let port = get_free_port();
         let addr = format!("127.0.0.1:{}", port);

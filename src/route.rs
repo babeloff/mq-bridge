@@ -160,7 +160,9 @@ impl Route {
     }
 
     /// Stops a running route by name and removes it from the registry.
-    /// Tries to join the handles for 5s and then returns without join.
+    /// Waits up to 5 seconds for the route task to join; if the timeout elapses
+    /// the task is aborted and the implementation awaits the aborted handle to
+    /// ensure the background task has fully terminated before returning.
     pub async fn stop(name: &str) -> bool {
         let registry = ROUTE_REGISTRY.get_or_init(|| RwLock::new(HashMap::new()));
         let active_opt = {
@@ -742,11 +744,18 @@ impl Route {
                     let seq = seq_counter;
                     let wrapped_commit = wrap_commit(commit, seq, seq_tx.clone());
 
-                    if work_tx.send((messages, wrapped_commit)).await.is_err() {
-                        warn!("Work channel closed, cannot process more messages concurrently. Shutting down.");
-                        break;
-                    } else {
-                        seq_counter += 1;
+                    match work_tx.send((messages, wrapped_commit)).await {
+                        Ok(()) => {
+                            seq_counter += 1;
+                        }
+                        Err(e) => {
+                            warn!("Work channel closed, cannot process more messages concurrently. Shutting down.");
+                            // Recover the moved tuple so we can invoke the wrapped commit
+                            // and resolve the batch with a NACK.
+                            let (msgs_back, wrapped_commit_back) = e.into_inner();
+                            let _ = (wrapped_commit_back)(vec![crate::traits::MessageDisposition::Nack; msgs_back.len()]).await;
+                            break;
+                        }
                     }
                 }
             }
