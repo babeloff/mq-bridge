@@ -1171,7 +1171,6 @@ async fn create_base_publisher(
     Ok(publisher)
 }
 
-
 /// Returns the active process-level rustls `CryptoProvider`, or a descriptive error if none
 /// has been installed yet.
 ///
