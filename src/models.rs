@@ -1822,19 +1822,15 @@ impl TlsConfig {
         self.cert_file.is_some() && self.key_file.is_some()
     }
 
-    /// Initialize any global TLS provider state required by the underlying TLS implementation.
+    /// Initialize global rustls provider state required by rustls config builders.
     ///
-    /// On platforms where `rustls` needs an explicit crypto provider installed (feature `rustls`),
-    /// this will call the provider installation. The call is a no-op when the `rustls` feature
-    /// is not enabled. Only performed when TLS appears to be enabled/configured to avoid
-    /// unnecessary global state changes for non-TLS endpoints.
+    /// Under the `rustls` feature, some code paths build rustls client/server configs
+    /// even when endpoint URLs are plain HTTP (for connectors that support both HTTP and HTTPS).
+    /// Installing the provider here keeps those paths safe and avoids runtime panics.
     pub fn init_provider(&self) {
         #[cfg(feature = "rustls")]
         {
-            if self.required || self.is_tls_server_configured() || self.is_mtls_client_configured()
-            {
-                let _ = rustls::crypto::ring::default_provider().install_default();
-            }
+            let _ = rustls::crypto::ring::default_provider().install_default();
         }
     }
 }
