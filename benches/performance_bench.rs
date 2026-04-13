@@ -14,6 +14,16 @@ use mq_bridge::test_utils::{print_benchmark_results, PerformanceResult, PERF_TES
 
 const PERF_TEST_MESSAGE_COUNT: usize = 1000;
 
+#[allow(unused)]
+#[cfg(feature = "rustls")]
+fn ensure_rustls_installed() {
+    // Install the process-level provider selected by feature flags (tests/benches do this).
+    #[cfg(feature = "rustls-aws-lc")]
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    #[cfg(all(feature = "rustls-ring", not(feature = "rustls-aws-lc")))]
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
 static BENCH_RESULTS: Lazy<Mutex<HashMap<String, PerformanceResult>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
@@ -541,8 +551,10 @@ pub mod file_delete_helper {
 
 #[cfg(feature = "http")]
 pub mod http_helper {
-    use mq_bridge::endpoints::http::{HttpConsumer, HttpPublisher};
+    use hyper::server::conn::http1::Builder as Http1Builder;
+    use hyper_util::rt::TokioIo;
     use mq_bridge::endpoints::http::create_http_consumer_and_service;
+    use mq_bridge::endpoints::http::{HttpConsumer, HttpPublisher};
     use mq_bridge::endpoints::memory::MemoryConsumer;
     use mq_bridge::models::HttpConfig;
     use mq_bridge::traits::{ConsumerError, MessageConsumer, MessageDisposition, MessagePublisher};
@@ -551,8 +563,6 @@ pub mod http_helper {
     use std::sync::Arc;
     use std::sync::Mutex as StdMutex;
     use tokio::sync::Mutex;
-    use hyper_util::rt::TokioIo;
-    use hyper::server::conn::http1::Builder as Http1Builder;
 
     static CURRENT_URL: Lazy<StdMutex<String>> = Lazy::new(|| StdMutex::new(String::new()));
 
@@ -587,6 +597,8 @@ pub mod http_helper {
     }
 
     pub async fn create_consumer() -> Arc<Mutex<dyn MessageConsumer>> {
+        #[cfg(feature = "rustls")]
+        crate::ensure_rustls_installed();
         // Reserve the port by holding the std listener until the server binds it.
         let std_listener = get_free_listener();
         let port = std_listener.local_addr().unwrap().port();
@@ -605,8 +617,7 @@ pub mod http_helper {
             ..Default::default()
         };
         // Create the consumer and the bridge service without starting a server yet.
-        let (mut http_consumer, service) =
-            create_http_consumer_and_service(&config).unwrap();
+        let (mut http_consumer, service) = create_http_consumer_and_service(&config).unwrap();
 
         // Move the reserved std listener into a tokio listener and spawn a simple
         // accept loop that serves connections with the created service.
@@ -667,6 +678,8 @@ pub mod http_helper {
     }
 
     pub async fn create_publisher() -> Arc<dyn MessagePublisher> {
+        #[cfg(feature = "rustls")]
+        crate::ensure_rustls_installed();
         let url = {
             let lock = CURRENT_URL.lock().unwrap();
             lock.clone()
@@ -696,6 +709,8 @@ pub mod grpc_helper {
     }
 
     pub async fn create_consumer_with_mode(server_mode: bool) -> Arc<Mutex<dyn MessageConsumer>> {
+        #[cfg(feature = "rustls")]
+        crate::ensure_rustls_installed();
         let std_listener = get_free_listener();
         let port = std_listener.local_addr().unwrap().port();
         let addr = format!("127.0.0.1:{}", port);
