@@ -138,7 +138,9 @@ pub struct RouteOptions {
     #[serde(default = "default_batch_size")]
     #[cfg_attr(feature = "schema", schemars(range(min = 1)))]
     pub batch_size: usize,
-    /// (Optional) The maximum number of concurrent commit tasks allowed. Defaults to 4096.
+    /// (Optional) The maximum number of in-flight commit requests queued for ordered sequencing.
+    /// Lower values apply backpressure earlier; higher values allow larger commit backlogs.
+    /// Defaults to 4096.
     #[serde(default = "default_commit_concurrency_limit")]
     pub commit_concurrency_limit: usize,
 }

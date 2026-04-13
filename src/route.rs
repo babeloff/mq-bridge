@@ -17,7 +17,6 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, OnceLock, RwLock};
 use tokio::{
     select,
-    sync::Semaphore,
     task::{JoinHandle, JoinSet},
 };
 use tracing::{debug, error, info, trace, warn};
@@ -382,7 +381,6 @@ impl Route {
         let publisher = create_publisher_from_route(name, &self.output).await?;
         let mut consumer = create_consumer_from_route(name, &self.input).await?;
         let (err_tx, err_rx) = bounded(1);
-        let commit_semaphore = Arc::new(Semaphore::new(self.options.commit_concurrency_limit));
         let mut commit_tasks = JoinSet::new();
 
         // Sequencer setup to ensure ordered commits even with parallel commit tasks
@@ -437,7 +435,6 @@ impl Route {
                     match publisher.send_batch(received_batch.messages).await {
                         Ok(SentBatch::Ack) => {
                             let commit = commit_opt.take().expect("Commit already used");
-                            let permit = commit_semaphore.clone().acquire_owned().await.map_err(|e| anyhow::anyhow!("Semaphore error: {}", e))?;
                             let err_tx = err_tx.clone();
                             commit_tasks.spawn(async move {
                                 if let Err(e) = commit(vec![MessageDisposition::Ack; batch_len]).await {
@@ -447,8 +444,6 @@ impl Route {
                                         Err(err_send) => warn!(error=?err_send, "Could not send commit error to main task, it might be down or busy."),
                                     }
                                 }
-                                // Permit is dropped here, releasing the slot
-                                drop(permit);
                             });
                         }
                         Ok(SentBatch::Partial { responses, failed }) => {
@@ -479,6 +474,7 @@ impl Route {
                                     break Err(err);
                                 }
                                 warn!("Transient error in batch, message(s) Nack'ed for re-delivery: {}", err);
+                                tokio::task::yield_now().await;
                                 continue;
                             }
                             // Only non-retryable errors remain - drop them with a log.
@@ -486,7 +482,6 @@ impl Route {
                                 error!("Dropping message (ID: {:032x}) due to non-retryable error: {}", msg.message_id, e);
                             }
                             let commit = commit_opt.take().expect("Commit already used");
-                            let permit = commit_semaphore.clone().acquire_owned().await.map_err(|e| anyhow::anyhow!("Semaphore error: {}", e))?;
                             let err_tx = err_tx.clone();
                             let ids = std::mem::take(&mut message_ids);
                             commit_tasks.spawn(async move {
@@ -498,7 +493,6 @@ impl Route {
                                         Err(err_send) => warn!(error=?err_send, "Could not send commit error to main task, it might be down or busy."),
                                     }
                                 }
-                                drop(permit);
                             });
                         }
                         Err(e) => {
@@ -510,6 +504,8 @@ impl Route {
                             break Err(e.into());
                         }
                     }
+
+                    tokio::task::yield_now().await;
                 }
             }
         };
@@ -555,8 +551,6 @@ impl Route {
             .saturating_mul(self.options.batch_size);
         let (work_tx, work_rx) =
             bounded::<(Vec<crate::CanonicalMessage>, BatchCommitFunc)>(work_capacity);
-        let commit_semaphore = Arc::new(Semaphore::new(self.options.commit_concurrency_limit));
-
         // --- Ordered Commit Sequencer ---
         // To prevent data loss with cumulative-ack brokers (Kafka/AMQP), commits must happen in order.
         // We assign a sequence number to each batch and use a sequencer task to enforce order.
@@ -569,7 +563,6 @@ impl Route {
             let work_rx_clone = work_rx.clone();
             let publisher = Arc::clone(&publisher);
             let err_tx = err_tx.clone();
-            let commit_semaphore = commit_semaphore.clone();
             let mut commit_tasks = JoinSet::new();
             let has_retry_middleware = self.output.has_retry_middleware();
             join_set.spawn(async move {
@@ -583,13 +576,6 @@ impl Route {
                     match publisher.send_batch(messages).await {
                         Ok(SentBatch::Ack) => {
                             let commit = commit_opt.take().expect("Commit already used");
-                            let permit = match commit_semaphore.clone().acquire_owned().await {
-                                Ok(p) => p,
-                                Err(_) => {
-                                    warn!("Semaphore closed, worker exiting");
-                                    break;
-                                }
-                            };
                             let err_tx = err_tx.clone();
                             commit_tasks.spawn(async move {
                                 if let Err(e) = commit(vec![MessageDisposition::Ack; batch_len]).await {
@@ -599,7 +585,6 @@ impl Route {
                                         Err(err_send) => warn!(error=?err_send, "Could not send commit error to main task, it might be down or busy."),
                                     }
                                 }
-                                drop(permit);
                             });
                         }
                         Ok(SentBatch::Partial { responses, failed }) => {
@@ -632,6 +617,7 @@ impl Route {
                                     break;
                                 }
                                 warn!("Transient error in batch, message(s) Nack'ed for re-delivery: {}", e);
+                                tokio::task::yield_now().await;
                                 continue;
                             }
                             // Only non-retryable errors remain - drop them with a log.
@@ -639,13 +625,6 @@ impl Route {
                                 error!("Worker dropping message (ID: {:032x}) due to non-retryable error: {}", msg.message_id, e);
                             }
                             let commit = commit_opt.take().expect("Commit already used");
-                            let permit = match commit_semaphore.clone().acquire_owned().await {
-                                Ok(p) => p,
-                                Err(_) => {
-                                    warn!("Semaphore closed, worker exiting");
-                                    break;
-                                }
-                            };
                             let err_tx = err_tx.clone();
                             let ids = std::mem::take(&mut message_ids);
                             commit_tasks.spawn(async move {
@@ -657,7 +636,6 @@ impl Route {
                                         Err(err_send) => warn!(error=?err_send, "Could not send commit error to main task, it might be down or busy."),
                                     }
                                 }
-                                drop(permit);
                             });
                         }
                         Err(e) => {
@@ -757,6 +735,8 @@ impl Route {
                             break;
                         }
                     }
+
+                    tokio::task::yield_now().await;
                 }
             }
         }
@@ -908,6 +888,8 @@ fn spawn_sequencer(buffer_size: usize) -> (Sender<(u64, SequencerItem)>, JoinHan
                 let result = commit_func(dispositions).await;
                 let _ = notify.send(result);
                 next_seq += 1;
+                // Yield to allow other tasks to run, preventing busy-loop when buffer has many messages
+                tokio::task::yield_now().await;
                 continue;
             }
 
@@ -1055,6 +1037,192 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
+
+    #[derive(Debug, Default)]
+    struct CommitObservation {
+        completed: Mutex<Vec<u64>>,
+        active: std::sync::atomic::AtomicUsize,
+        max_active: std::sync::atomic::AtomicUsize,
+    }
+
+    #[derive(Debug)]
+    struct CommitTrackingMiddlewareFactory {
+        observation: Arc<CommitObservation>,
+    }
+
+    #[derive(Debug)]
+    struct ReorderingPublisherMiddlewareFactory;
+
+    struct CommitTrackingConsumer {
+        inner: Box<dyn MessageConsumer>,
+        observation: Arc<CommitObservation>,
+    }
+
+    struct ReorderingPublisher {
+        inner: Box<dyn MessagePublisher>,
+    }
+
+    #[async_trait::async_trait]
+    impl CustomMiddlewareFactory for CommitTrackingMiddlewareFactory {
+        async fn apply_consumer(
+            &self,
+            consumer: Box<dyn MessageConsumer>,
+            _route_name: &str,
+            _config: &serde_json::Value,
+        ) -> anyhow::Result<Box<dyn MessageConsumer>> {
+            Ok(Box::new(CommitTrackingConsumer {
+                inner: consumer,
+                observation: Arc::clone(&self.observation),
+            }))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl CustomMiddlewareFactory for ReorderingPublisherMiddlewareFactory {
+        async fn apply_publisher(
+            &self,
+            publisher: Box<dyn MessagePublisher>,
+            _route_name: &str,
+            _config: &serde_json::Value,
+        ) -> anyhow::Result<Box<dyn MessagePublisher>> {
+            Ok(Box::new(ReorderingPublisher { inner: publisher }))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl MessageConsumer for CommitTrackingConsumer {
+        async fn receive_batch(
+            &mut self,
+            max_messages: usize,
+        ) -> Result<ReceivedBatch, ConsumerError> {
+            let mut batch = self.inner.receive_batch(max_messages).await?;
+            let seq = batch
+                .messages
+                .first()
+                .and_then(|message| message.get_payload_str().parse::<u64>().ok())
+                .expect("tracking test expects numeric payloads");
+            let original_commit = batch.commit;
+            let observation = Arc::clone(&self.observation);
+            batch.commit = Box::new(move |dispositions| {
+                let observation = Arc::clone(&observation);
+                Box::pin(async move {
+                    let active_now = observation.active.fetch_add(1, Ordering::SeqCst) + 1;
+                    let _ = observation.max_active.fetch_update(
+                        Ordering::SeqCst,
+                        Ordering::SeqCst,
+                        |current| (active_now > current).then_some(active_now),
+                    );
+
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    let result = original_commit(dispositions).await;
+                    observation.completed.lock().unwrap().push(seq);
+                    observation.active.fetch_sub(1, Ordering::SeqCst);
+                    result
+                })
+            });
+            Ok(batch)
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl MessagePublisher for ReorderingPublisher {
+        async fn send_batch(
+            &self,
+            messages: Vec<crate::CanonicalMessage>,
+        ) -> Result<SentBatch, PublisherError> {
+            let seq = messages
+                .first()
+                .and_then(|message| message.get_payload_str().parse::<u64>().ok())
+                .expect("tracking test expects numeric payloads");
+            let delay_ms = 10 * (6u64.saturating_sub(seq.min(6)));
+            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            self.inner.send_batch(messages).await
+        }
+
+        async fn send(&self, msg: crate::CanonicalMessage) -> Result<Sent, PublisherError> {
+            self.inner.send(msg).await
+        }
+
+        async fn flush(&self) -> anyhow::Result<()> {
+            self.inner.flush().await
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    async fn assert_route_commits_are_ordered_and_non_overlapping(concurrency: usize) {
+        let unique_id = fast_uuid_v7::gen_id().to_string();
+        let tracking_name = format!("track_commit_{}", unique_id);
+        let reorder_name = format!("reorder_publish_{}", unique_id);
+        let in_topic = format!("ordered_commit_in_{}", unique_id);
+        let observation = Arc::new(CommitObservation::default());
+
+        register_middleware_factory(
+            &tracking_name,
+            Arc::new(CommitTrackingMiddlewareFactory {
+                observation: Arc::clone(&observation),
+            }),
+        );
+        register_middleware_factory(
+            &reorder_name,
+            Arc::new(ReorderingPublisherMiddlewareFactory),
+        );
+
+        let input = Endpoint::new_memory(&in_topic, 32).add_middleware(Middleware::Custom {
+            name: tracking_name,
+            config: serde_json::Value::Null,
+        });
+        let output = Endpoint::new(EndpointType::Null).add_middleware(Middleware::Custom {
+            name: reorder_name,
+            config: serde_json::Value::Null,
+        });
+
+        let route = Route::new(input.clone(), output)
+            .with_concurrency(concurrency)
+            .with_batch_size(1)
+            .with_commit_concurrency_limit(1);
+
+        let input_channel = input.channel().unwrap();
+        let messages = (0..6)
+            .map(|seq| crate::CanonicalMessage::from(seq.to_string()))
+            .collect();
+        input_channel.fill_messages(messages).await.unwrap();
+        input_channel.close();
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            route.run_until_err("ordered_commit_regression", None, None),
+        )
+        .await
+        .expect("Route should not hang while draining finite input")
+        .expect("Route should complete without commit errors");
+        assert_eq!(
+            *observation.completed.lock().unwrap(),
+            vec![0, 1, 2, 3, 4, 5],
+            "Commit execution must follow receive order",
+        );
+        assert_eq!(
+            observation.max_active.load(Ordering::SeqCst),
+            1,
+            "Broker-facing commit functions must never overlap",
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_sequential_route_commits_are_ordered_and_non_overlapping() {
+        assert_route_commits_are_ordered_and_non_overlapping(1).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_concurrent_route_commits_are_ordered_and_non_overlapping() {
+        assert_route_commits_are_ordered_and_non_overlapping(4).await;
+    }
 
     // Helper function to run a fault injection test on the consumer side.
     async fn run_consumer_fault_test(
