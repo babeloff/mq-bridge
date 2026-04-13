@@ -1,5 +1,6 @@
 // Runs the mariadb integration helpers (requires Docker)
 #![allow(unused_imports, dead_code)]
+#![cfg(feature = "sqlx")]
 
 #[path = "integration/mariadb.rs"]
 mod mariadb;

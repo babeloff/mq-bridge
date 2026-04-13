@@ -1,4 +1,5 @@
 #![allow(dead_code)]
+#![cfg(feature = "sqlx")]
 
 use mq_bridge::endpoints::sqlx::{SqlxConsumer, SqlxPublisher};
 use mq_bridge::test_utils::{

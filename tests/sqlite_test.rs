@@ -1,5 +1,6 @@
 // Runs the sqlite integration helpers (file-backed, no Docker)
 #![allow(unused_imports, dead_code)]
+#![cfg(feature = "sqlx")]
 
 #[path = "integration/sqlite.rs"]
 mod sqlite;
