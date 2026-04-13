@@ -1,0 +1,17 @@
+services:
+  mariadb:
+    image: mariadb:11
+    container_name: mariadb-itest-mq-bridge
+    ports:
+      - "3307:3306"
+    environment:
+      - MYSQL_ROOT_PASSWORD=rootpass
+      - MYSQL_DATABASE=testdb
+      - MYSQL_USER=testuser
+      - MYSQL_PASSWORD=testpass
+    healthcheck:
+      # Check for the UNIX socket to avoid requiring mysqladmin/mysql client in the image
+      test: ["CMD-SHELL", "test -S /run/mysqld/mysqld.sock"]
+      interval: 5s
+      timeout: 10s
+      retries: 20

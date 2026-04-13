@@ -1,0 +1,16 @@
+services:
+  mysql:
+    image: mysql:8.1
+    container_name: mysql-itest-mq-bridge
+    ports:
+      - "3306:3306"
+    environment:
+      - MYSQL_ROOT_PASSWORD=rootpass
+      - MYSQL_DATABASE=testdb
+      - MYSQL_USER=testuser
+      - MYSQL_PASSWORD=testpass
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -u testuser -ptestpass"]
+      interval: 5s
+      timeout: 5s
+      retries: 10

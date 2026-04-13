@@ -14,7 +14,6 @@ use anyhow::{anyhow, Context};
 use async_trait::async_trait;
 use sqlx::any::AnyPoolOptions;
 use sqlx::{AnyPool, Row};
-use std::borrow::Cow;
 use std::time::Duration;
 use tracing::{info, trace, warn};
 
@@ -197,13 +196,13 @@ impl SqlxPublisher {
                     let index_name = format!("idx_{}_locked_until", table_name_for_index);
 
                     let create_index_query = match driver_name.as_str() {
-                        "PostgreSQL" | "SQLite" => {
+                        "PostgreSQL" | "SQLite" | "MariaDB" => {
                             format!(
                                 "CREATE INDEX IF NOT EXISTS {} ON {} (locked_until)",
                                 index_name, config.table
                             )
                         }
-                        "MySQL" | "MariaDB" => {
+                        "MySQL" => {
                             format!(
                                 "CREATE INDEX {} ON {} (locked_until)",
                                 index_name, config.table
@@ -221,10 +220,10 @@ impl SqlxPublisher {
 
                     if !create_index_query.is_empty() {
                         if let Err(e) = sqlx::query(&create_index_query).execute(&pool).await {
-                            if (driver_name.as_str() == "MySQL"
-                                || driver_name.as_str() == "MariaDB")
+                            let driver_lc = driver_name.to_lowercase();
+                            if (driver_lc.contains("mysql") || driver_lc.contains("mariadb"))
                                 && e.as_database_error()
-                                    .is_some_and(|db_err| db_err.code() == Some(Cow::from("1061")))
+                                    .is_some_and(|db_err| db_err.code().as_deref() == Some("1061"))
                             {
                                 trace!("Index {} on {} already exists.", index_name, config.table);
                             } else {
