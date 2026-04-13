@@ -542,6 +542,7 @@ pub mod file_delete_helper {
 #[cfg(feature = "http")]
 pub mod http_helper {
     use mq_bridge::endpoints::http::{HttpConsumer, HttpPublisher};
+    use mq_bridge::endpoints::http::create_http_consumer_and_service;
     use mq_bridge::endpoints::memory::MemoryConsumer;
     use mq_bridge::models::HttpConfig;
     use mq_bridge::traits::{ConsumerError, MessageConsumer, MessageDisposition, MessagePublisher};
@@ -550,6 +551,8 @@ pub mod http_helper {
     use std::sync::Arc;
     use std::sync::Mutex as StdMutex;
     use tokio::sync::Mutex;
+    use hyper_util::rt::TokioIo;
+    use hyper::server::conn::http1::Builder as Http1Builder;
 
     static CURRENT_URL: Lazy<StdMutex<String>> = Lazy::new(|| StdMutex::new(String::new()));
 
@@ -601,7 +604,40 @@ pub mod http_helper {
             fire_and_forget: false,
             ..Default::default()
         };
-        let mut http_consumer = HttpConsumer::new(&config).await.unwrap();
+        // Create the consumer and the bridge service without starting a server yet.
+        let (mut http_consumer, service) =
+            create_http_consumer_and_service(&config).unwrap();
+
+        // Move the reserved std listener into a tokio listener and spawn a simple
+        // accept loop that serves connections with the created service.
+        let std_listener = std_listener;
+        let tokio_listener = tokio::net::TcpListener::from_std(std_listener).unwrap();
+        let listener = std::sync::Arc::new(tokio_listener);
+
+        tokio::spawn(async move {
+            loop {
+                match listener.accept().await {
+                    Ok((socket, _)) => {
+                        let service = service.clone();
+                        tokio::spawn(async move {
+                            let io = TokioIo::new(socket);
+
+                            let conn = Http1Builder::new()
+                                .keep_alive(true)
+                                .serve_connection(io, service.clone())
+                                .await;
+                            if let Err(e) = conn {
+                                tracing::trace!("Connection error: {}", e);
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        tracing::debug!("Accept error: {}", e);
+                        break;
+                    }
+                }
+            }
+        });
 
         // Create a memory consumer to act as the buffer
         let buffer_topic = format!("http_bench_buffer_{}", fast_uuid_v7::gen_id());
