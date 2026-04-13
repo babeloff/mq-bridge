@@ -554,7 +554,7 @@ pub mod http_helper {
     use hyper::server::conn::http1::Builder as Http1Builder;
     use hyper_util::rt::TokioIo;
     use mq_bridge::endpoints::http::create_http_consumer_and_service;
-    use mq_bridge::endpoints::http::{HttpConsumer, HttpPublisher};
+    use mq_bridge::endpoints::http::HttpPublisher;
     use mq_bridge::endpoints::memory::MemoryConsumer;
     use mq_bridge::models::HttpConfig;
     use mq_bridge::traits::{ConsumerError, MessageConsumer, MessageDisposition, MessagePublisher};

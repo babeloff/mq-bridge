@@ -42,6 +42,12 @@ impl Publisher {
         self.publisher.clone()
     }
 
+    /// Attempt to borrow the underlying concrete publisher as `T`.
+    /// Returns `Some(&T)` if the underlying publisher is of type `T`.
+    pub fn downcast_ref<T: 'static>(&self) -> Option<&T> {
+        self.publisher.as_ref().as_any().downcast_ref::<T>()
+    }
+
     /// Registers this publisher globally with a given name.
     pub fn register(&self, name: &str) -> Option<Self> {
         let registry = PUBLISHER_REGISTRY.get_or_init(|| RwLock::new(HashMap::new()));
@@ -61,6 +67,18 @@ impl Publisher {
         let registry = PUBLISHER_REGISTRY.get_or_init(|| RwLock::new(HashMap::new()));
         let mut map = registry.write().expect("Publisher registry lock poisoned");
         map.remove(name)
+    }
+}
+
+// Generic conversion from any concrete publisher into the generic `Publisher` wrapper.
+impl<T> From<T> for Publisher
+where
+    T: traits::MessagePublisher + 'static,
+{
+    fn from(p: T) -> Self {
+        Self {
+            publisher: std::sync::Arc::new(p),
+        }
     }
 }
 
