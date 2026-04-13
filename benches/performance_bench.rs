@@ -925,6 +925,38 @@ pub mod grpc_helper {
         let cons = GrpcConsumer::new(&config).await.unwrap();
         // Allow server (if started) to stabilize before clients connect.
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Spawn diagnostics for gRPC helper so CI logs include FD counts and URL.
+        let diag_url = url.clone();
+        tokio::spawn(async move {
+            let pid = std::process::id();
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                let fd_count: Option<usize> = tokio::task::spawn_blocking(move || {
+                    if let Ok(rd) = std::fs::read_dir("/proc/self/fd") {
+                        return Some(rd.count());
+                    }
+                    if let Ok(out) = std::process::Command::new("lsof")
+                        .arg("-p")
+                        .arg(pid.to_string())
+                        .output()
+                    {
+                        if out.status.success() {
+                            let s = String::from_utf8_lossy(&out.stdout);
+                            return Some(s.lines().count());
+                        }
+                    }
+                    None
+                })
+                .await
+                .unwrap_or_default();
+
+                println!(
+                    "BENCH-DIAG-GRPC pid={} url={} fd_count={:?}",
+                    pid, diag_url, fd_count
+                );
+            }
+        });
         Arc::new(Mutex::new(cons))
     }
 
