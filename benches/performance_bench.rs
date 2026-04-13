@@ -614,6 +614,7 @@ pub mod http_helper {
             url: addr,
             internal_buffer_size: Some(super::PERF_TEST_MESSAGE_COUNT * 2),
             fire_and_forget: false,
+            request_timeout_ms: Some(1000),
             ..Default::default()
         };
         // Create the consumer and the bridge service without starting a server yet.
@@ -657,17 +658,60 @@ pub mod http_helper {
         let memory_channel = memory_consumer.channel();
 
         // Spawn background task to drain HTTP consumer into memory consumer
+        // Clone the sender ahead of time so we don't partially move `memory_channel`
+        let forward_sender = memory_channel.sender.clone();
         let task = tokio::spawn(async move {
             while let Ok(batch) = http_consumer.receive_batch(100).await {
                 let count = batch.messages.len();
                 if count > 0 {
-                    // Forward to memory channel
-                    if memory_channel.sender.send(batch.messages).await.is_err() {
-                        break; // Memory consumer closed
-                    }
+                    // Forward to memory channel in background so a full buffer doesn't
+                    // block the HTTP request/response path (prevents bench hangs).
+                    let msgs = batch.messages;
+                    let sender = forward_sender.clone();
+                    tokio::spawn(async move {
+                        let _ = sender.send(msgs).await;
+                    });
                     // Ack immediately to unblock HTTP response
                     let _ = (batch.commit)(vec![MessageDisposition::Ack; count]).await;
                 }
+            }
+        });
+
+        // Spawn a lightweight diagnostics task to print memory-channel depth and
+        // process FD count periodically. This helps CI artifacts show whether
+        // the bench is experiencing socket/FD growth or backpressure.
+        let diag_channel = memory_channel.clone();
+        tokio::spawn(async move {
+            let pid = std::process::id();
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                let pending = diag_channel.len();
+                let capacity = diag_channel.sender.capacity().unwrap_or(0);
+                // compute fd count in a blocking task (may not be available on all platforms)
+                let fd_count: Option<usize> = tokio::task::spawn_blocking(move || {
+                    // Try /proc/self/fd first (Linux), fall back to `lsof -p PID` if available
+                    if let Ok(rd) = std::fs::read_dir("/proc/self/fd") {
+                        return Some(rd.count());
+                    }
+                    if let Ok(out) = std::process::Command::new("lsof")
+                        .arg("-p")
+                        .arg(pid.to_string())
+                        .output()
+                    {
+                        if out.status.success() {
+                            let s = String::from_utf8_lossy(&out.stdout);
+                            return Some(s.lines().count());
+                        }
+                    }
+                    None
+                })
+                .await
+                .unwrap_or_default();
+
+                println!(
+                    "BENCH-DIAG pid={} mem_pending={} mem_capacity={} fd_count={:?}",
+                    pid, pending, capacity, fd_count
+                );
             }
         });
 
@@ -1078,6 +1122,17 @@ fn performance_benchmarks(c: &mut Criterion) {
         std::time::Duration::from_millis(1000)
     );
     bench_backend!(
+        "http",
+        "http",
+        http_helper,
+        group,
+        &rt,
+        &BENCH_RESULTS,
+        PERF_TEST_MESSAGE_COUNT,
+        PERF_TEST_CONCURRENCY,
+        std::time::Duration::from_millis(20)
+    );
+    bench_backend!(
         "grpc",
         "grpc",
         grpc_helper,
@@ -1086,7 +1141,7 @@ fn performance_benchmarks(c: &mut Criterion) {
         &BENCH_RESULTS,
         PERF_TEST_MESSAGE_COUNT,
         PERF_TEST_CONCURRENCY,
-        std::time::Duration::from_millis(10)
+        std::time::Duration::from_millis(20)
     );
     bench_backend!(
         "grpc",
@@ -1097,20 +1152,8 @@ fn performance_benchmarks(c: &mut Criterion) {
         &BENCH_RESULTS,
         PERF_TEST_MESSAGE_COUNT,
         PERF_TEST_CONCURRENCY,
-        std::time::Duration::from_millis(10)
+        std::time::Duration::from_millis(20)
     );
-    bench_backend!(
-        "http",
-        "http",
-        http_helper,
-        group,
-        &rt,
-        &BENCH_RESULTS,
-        PERF_TEST_MESSAGE_COUNT,
-        PERF_TEST_CONCURRENCY,
-        std::time::Duration::from_millis(10)
-    );
-
     // Print consolidated results
     let results = BENCH_RESULTS.blocking_lock();
     print_benchmark_results(&results, PERF_TEST_MESSAGE_COUNT);
