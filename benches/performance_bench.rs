@@ -14,6 +14,16 @@ use mq_bridge::test_utils::{print_benchmark_results, PerformanceResult, PERF_TES
 
 const PERF_TEST_MESSAGE_COUNT: usize = 1000;
 
+#[allow(unused)]
+#[cfg(feature = "rustls")]
+fn ensure_rustls_installed() {
+    // Install the process-level provider selected by feature flags (tests/benches do this).
+    #[cfg(feature = "rustls-aws-lc")]
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    #[cfg(all(feature = "rustls-ring", not(feature = "rustls-aws-lc")))]
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
 static BENCH_RESULTS: Lazy<Mutex<HashMap<String, PerformanceResult>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
@@ -542,50 +552,107 @@ pub mod file_delete_helper {
 #[cfg(feature = "http")]
 pub mod http_helper {
     use mq_bridge::endpoints::http::{HttpConsumer, HttpPublisher};
-    use mq_bridge::endpoints::memory::MemoryConsumer;
+    use mq_bridge::endpoints::memory::{MemoryConsumer, MemoryPublisher};
     use mq_bridge::models::HttpConfig;
-    use mq_bridge::traits::{ConsumerError, MessageConsumer, MessageDisposition, MessagePublisher};
+    use mq_bridge::traits::{MessageConsumer, MessageDisposition, MessagePublisher};
     use once_cell::sync::Lazy;
-    use std::net::TcpListener;
     use std::sync::Arc;
     use std::sync::Mutex as StdMutex;
     use tokio::sync::Mutex;
 
     static CURRENT_URL: Lazy<StdMutex<String>> = Lazy::new(|| StdMutex::new(String::new()));
 
-    fn get_free_port() -> u16 {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.local_addr().unwrap().port()
-    }
-
-    struct HttpBenchConsumer {
-        inner: MemoryConsumer,
-        task: Option<tokio::task::JoinHandle<()>>,
-    }
-
-    #[async_trait::async_trait]
-    impl MessageConsumer for HttpBenchConsumer {
-        async fn receive_batch(
-            &mut self,
-            max_messages: usize,
-        ) -> Result<mq_bridge::ReceivedBatch, ConsumerError> {
-            self.inner.receive_batch(max_messages).await
-        }
-        fn as_any(&self) -> &dyn std::any::Any {
-            self
-        }
-    }
-
-    impl Drop for HttpBenchConsumer {
-        fn drop(&mut self) {
-            if let Some(task) = self.task.take() {
-                task.abort();
-            }
-        }
-    }
-
     pub async fn create_consumer() -> Arc<Mutex<dyn MessageConsumer>> {
-        let port = get_free_port();
+        #[cfg(feature = "rustls")]
+        crate::ensure_rustls_installed();
+
+        let http_config = HttpConfig {
+            url: "127.0.0.1:0".to_string(),
+            // Sufficient internal buffer to prevent backpressure during bursts
+            internal_buffer_size: Some(super::PERF_TEST_MESSAGE_COUNT * 2),
+            concurrency_limit: Some(super::PERF_TEST_CONCURRENCY * 2),
+            request_timeout_ms: Some(10000),
+            fire_and_forget: false, // Reliable mode: wait for ack before HTTP response
+            ..Default::default()
+        };
+
+        let mut http_consumer = HttpConsumer::new(&http_config)
+            .await
+            .expect("Failed to create HttpConsumer");
+        let addr = http_consumer
+            .bound_addr()
+            .expect("HttpConsumer should have bound addr");
+        let url = format!("http://{}", addr);
+
+        {
+            let mut lock = CURRENT_URL.lock().unwrap();
+            *lock = url;
+        }
+
+        // Setup an internal memory buffer to decouple the "Write" and "Read" phases of the benchmark.
+        // This allows the benchmark to finish writing all messages without deadlocking on the reader.
+        let topic = format!("http_perf_buffer_{}", fast_uuid_v7::gen_id());
+        let mem_config = mq_bridge::models::MemoryConfig {
+            topic,
+            capacity: Some(super::PERF_TEST_MESSAGE_COUNT * 10),
+            ..Default::default()
+        };
+        let mem_publisher = MemoryPublisher::new(&mem_config).unwrap();
+        let mem_consumer = MemoryConsumer::new(&mem_config).unwrap();
+
+        // Background task to bridge Http -> Memory.
+        // We only ACK the HTTP request once the message is safely accepted by the memory queue.
+        tokio::spawn(async move {
+            while let Ok(batch) = http_consumer.receive_batch(100).await {
+                let count = batch.messages.len();
+                if count > 0 && mem_publisher.send_batch(batch.messages).await.is_ok() {
+                    let _ = (batch.commit)(vec![MessageDisposition::Ack; count]).await;
+                }
+            }
+        });
+
+        Arc::new(Mutex::new(mem_consumer))
+    }
+
+    pub async fn create_publisher() -> Arc<dyn MessagePublisher> {
+        #[cfg(feature = "rustls")]
+        crate::ensure_rustls_installed();
+        let url = {
+            let lock = CURRENT_URL.lock().unwrap();
+            lock.clone()
+        };
+        let config = HttpConfig {
+            url,
+            request_timeout_ms: Some(10000),
+            pool_idle_timeout_ms: Some(1000),
+            tcp_keepalive_ms: Some(1000),
+            ..Default::default()
+        };
+        Arc::new(HttpPublisher::new(&config).await.unwrap())
+    }
+}
+
+#[cfg(feature = "grpc")]
+pub mod grpc_helper {
+    use mq_bridge::endpoints::grpc::{GrpcConsumer, GrpcPublisher};
+    use mq_bridge::models::GrpcConfig;
+    use mq_bridge::traits::{MessageConsumer, MessagePublisher};
+    use once_cell::sync::Lazy;
+    use std::net::TcpListener;
+    use std::sync::{Arc, Mutex as StdMutex};
+    use tokio::sync::Mutex;
+
+    static CURRENT_URL: Lazy<StdMutex<String>> = Lazy::new(|| StdMutex::new(String::new()));
+
+    fn get_free_listener() -> std::net::TcpListener {
+        TcpListener::bind("127.0.0.1:0").unwrap()
+    }
+
+    pub async fn create_consumer_with_mode(server_mode: bool) -> Arc<Mutex<dyn MessageConsumer>> {
+        #[cfg(feature = "rustls")]
+        crate::ensure_rustls_installed();
+        let std_listener = get_free_listener();
+        let port = std_listener.local_addr().unwrap().port();
         let addr = format!("127.0.0.1:{}", port);
         let url = format!("http://{}", addr);
 
@@ -594,39 +661,191 @@ pub mod http_helper {
             *lock = url.clone();
         }
 
-        let config = HttpConfig {
-            url: addr,
-            internal_buffer_size: Some(super::PERF_TEST_MESSAGE_COUNT * 2),
-            fire_and_forget: false,
+        let config = GrpcConfig {
+            url: url.clone(),
+            server_mode,
             ..Default::default()
         };
-        let mut http_consumer = HttpConsumer::new(&config).await.unwrap();
 
-        // Create a memory consumer to act as the buffer
-        let buffer_topic = format!("http_bench_buffer_{}", fast_uuid_v7::gen_id());
-        let memory_consumer =
-            MemoryConsumer::new_local(&buffer_topic, super::PERF_TEST_MESSAGE_COUNT * 2);
-        let memory_channel = memory_consumer.channel();
+        // If running client-mode (server_mode == false), spawn a lightweight in-process
+        // Bridge server so the client can connect. This mirrors the embedded server used
+        // in production endpoints but is self-contained for benches.
+        if !server_mode {
+            // spawn a simple bridge server that fans published messages to subscribers
+            // Move the reserved std listener into the spawn so the socket stays reserved
+            // until the server takes ownership.
+            let std_listener = std_listener;
+            tokio::spawn(async move {
+                use mq_bridge::endpoints::grpc::proto;
+                use proto::{BridgeMessage, PublishResponse};
+                use tokio::sync::{broadcast, mpsc};
+                use tokio_stream::wrappers::ReceiverStream;
+                use tonic::{Request, Response, Status};
 
-        // Spawn background task to drain HTTP consumer into memory consumer
-        let task = tokio::spawn(async move {
-            while let Ok(batch) = http_consumer.receive_batch(100).await {
-                let count = batch.messages.len();
-                if count > 0 {
-                    // Forward to memory channel
-                    if memory_channel.sender.send(batch.messages).await.is_err() {
-                        break; // Memory consumer closed
-                    }
-                    // Ack immediately to unblock HTTP response
-                    let _ = (batch.commit)(vec![MessageDisposition::Ack; count]).await;
+                struct BenchBridge {
+                    tx: broadcast::Sender<BridgeMessage>,
+                    queue_tx: mpsc::Sender<BridgeMessage>,
                 }
+
+                #[tonic::async_trait]
+                impl proto::bridge_server::Bridge for BenchBridge {
+                    async fn publish(
+                        &self,
+                        request: Request<BridgeMessage>,
+                    ) -> Result<Response<PublishResponse>, Status> {
+                        let msg = request.into_inner();
+                        let _ = self.tx.send(msg.clone());
+                        let _ = self.queue_tx.send(msg.clone()).await;
+                        Ok(Response::new(PublishResponse {
+                            result: Some(proto::publish_response::Result::Ack(proto::Ack {
+                                id: msg.id,
+                                status: 0,
+                                reason: String::new(),
+                                metadata: Default::default(),
+                            })),
+                        }))
+                    }
+
+                    type PublishBatchStream = ReceiverStream<Result<PublishResponse, Status>>;
+
+                    async fn publish_batch(
+                        &self,
+                        request: Request<tonic::Streaming<BridgeMessage>>,
+                    ) -> Result<Response<Self::PublishBatchStream>, Status> {
+                        let mut stream = request.into_inner();
+                        let (tx, rx) = mpsc::channel(32);
+                        let sender = self.tx.clone();
+                        let queue_tx = self.queue_tx.clone();
+
+                        tokio::spawn(async move {
+                            while let Ok(Some(msg)) = stream.message().await {
+                                let id = msg.id.clone();
+                                let _ = sender.send(msg.clone());
+                                let _ = queue_tx.send(msg).await;
+                                let resp = PublishResponse {
+                                    result: Some(proto::publish_response::Result::Ack(
+                                        proto::Ack {
+                                            id,
+                                            status: 0,
+                                            reason: String::new(),
+                                            metadata: Default::default(),
+                                        },
+                                    )),
+                                };
+                                if tx.send(Ok(resp)).await.is_err() {
+                                    break;
+                                }
+                            }
+                        });
+
+                        Ok(Response::new(ReceiverStream::new(rx)))
+                    }
+
+                    type SubscribeStream = ReceiverStream<Result<BridgeMessage, Status>>;
+
+                    async fn subscribe(
+                        &self,
+                        request: Request<proto::SubscribeRequest>,
+                    ) -> Result<Response<Self::SubscribeStream>, Status> {
+                        let topic = request.get_ref().topic.clone();
+                        let mut rx = self.tx.subscribe();
+                        let (tx_stream, rx_stream) = mpsc::channel(32);
+                        tokio::spawn(async move {
+                            loop {
+                                match rx.recv().await {
+                                    Ok(msg) => {
+                                        let msg_topic = msg
+                                            .metadata
+                                            .iter()
+                                            .find(|(k, _)| k.as_str() == "mq_bridge.topic")
+                                            .map(|(_, v)| v.clone());
+                                        if !topic.is_empty()
+                                            && msg_topic.as_deref() != Some(topic.as_str())
+                                        {
+                                            continue;
+                                        }
+                                        if tx_stream.send(Ok(msg)).await.is_err() {
+                                            break;
+                                        }
+                                    }
+                                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                                    Err(broadcast::error::RecvError::Closed) => break,
+                                }
+                            }
+                        });
+                        Ok(Response::new(ReceiverStream::new(rx_stream)))
+                    }
+
+                    async fn acknowledge(
+                        &self,
+                        _request: Request<proto::Ack>,
+                    ) -> Result<Response<proto::AckResponse>, Status> {
+                        Ok(Response::new(proto::AckResponse {
+                            success: true,
+                            error: String::new(),
+                        }))
+                    }
+                }
+
+                let (tx, _) = broadcast::channel(1024);
+                let (queue_tx, _rx) = mpsc::channel(16 * 1024);
+                // Drain queue receiver so the send side never blocks and causes
+                // backpressure that stalls publish_batch handlers during benches.
+                let mut queue_rx = _rx;
+                tokio::spawn(async move {
+                    while let Some(_msg) = queue_rx.recv().await {
+                        // intentionally drop messages
+                    }
+                });
+                let service = BenchBridge { tx, queue_tx };
+                // Convert the reserved std listener to a non-blocking tokio listener
+                std_listener.set_nonblocking(true).ok();
+                let listener = tokio::net::TcpListener::from_std(std_listener)
+                    .expect("Failed to convert std listener to tokio listener");
+                let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+                let svc = proto::bridge_server::BridgeServer::new(service);
+                if let Err(e) = tonic::transport::Server::builder()
+                    .serve_with_incoming(svc, incoming)
+                    .await
+                {
+                    eprintln!("bench bridge server error: {:?}", e);
+                }
+            });
+            // give server a small moment to bind
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        } else {
+            // Release the reserved port so ServerModeConsumer::new can bind to it.
+            drop(std_listener);
+        }
+
+        let cons = GrpcConsumer::new(&config).await.unwrap();
+        // Allow server (if started) to stabilize before clients connect.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Spawn diagnostics for gRPC helper so CI logs include FD counts and URL.
+        let diag_url = url.clone();
+        tokio::spawn(async move {
+            let pid = std::process::id();
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                // compute fd count efficiently if possible
+                let fd_count: Option<usize> = if let Ok(rd) = std::fs::read_dir("/proc/self/fd") {
+                    Some(rd.count())
+                } else {
+                    None
+                };
+
+                println!(
+                    "BENCH-DIAG-GRPC pid={} url={} fd_count={:?}",
+                    pid, diag_url, fd_count
+                );
             }
         });
+        Arc::new(Mutex::new(cons))
+    }
 
-        Arc::new(Mutex::new(HttpBenchConsumer {
-            inner: memory_consumer,
-            task: Some(task),
-        }))
+    pub async fn create_consumer() -> Arc<Mutex<dyn MessageConsumer>> {
+        create_consumer_with_mode(false).await
     }
 
     pub async fn create_publisher() -> Arc<dyn MessagePublisher> {
@@ -634,11 +853,28 @@ pub mod http_helper {
             let lock = CURRENT_URL.lock().unwrap();
             lock.clone()
         };
-        let config = HttpConfig {
+        let config = GrpcConfig {
             url,
             ..Default::default()
         };
-        Arc::new(HttpPublisher::new(&config).await.unwrap())
+        Arc::new(GrpcPublisher::new(&config).await.unwrap())
+    }
+}
+
+#[cfg(feature = "grpc")]
+pub mod grpc_server_helper {
+    use super::grpc_helper;
+    use mq_bridge::traits::{MessageConsumer, MessagePublisher};
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
+    pub async fn create_consumer() -> Arc<Mutex<dyn MessageConsumer>> {
+        // Server-mode consumer
+        grpc_helper::create_consumer_with_mode(true).await
+    }
+
+    pub async fn create_publisher() -> Arc<dyn MessagePublisher> {
+        grpc_helper::create_publisher().await
     }
 }
 
@@ -735,7 +971,7 @@ fn performance_benchmarks(c: &mut Criterion) {
         &BENCH_RESULTS,
         PERF_TEST_MESSAGE_COUNT,
         PERF_TEST_CONCURRENCY,
-        std::time::Duration::from_millis(100)
+        std::time::Duration::from_millis(150)
     );
 
     bench_backend!(
@@ -810,9 +1046,30 @@ fn performance_benchmarks(c: &mut Criterion) {
         &BENCH_RESULTS,
         PERF_TEST_MESSAGE_COUNT,
         PERF_TEST_CONCURRENCY,
-        std::time::Duration::from_millis(10)
+        std::time::Duration::from_millis(20)
     );
-
+    bench_backend!(
+        "grpc",
+        "grpc",
+        grpc_helper,
+        group,
+        &rt,
+        &BENCH_RESULTS,
+        PERF_TEST_MESSAGE_COUNT,
+        PERF_TEST_CONCURRENCY,
+        std::time::Duration::from_millis(20)
+    );
+    bench_backend!(
+        "grpc",
+        "grpc_server",
+        grpc_server_helper,
+        group,
+        &rt,
+        &BENCH_RESULTS,
+        PERF_TEST_MESSAGE_COUNT,
+        PERF_TEST_CONCURRENCY,
+        std::time::Duration::from_millis(20)
+    );
     // Print consolidated results
     let results = BENCH_RESULTS.blocking_lock();
     print_benchmark_results(&results, PERF_TEST_MESSAGE_COUNT);

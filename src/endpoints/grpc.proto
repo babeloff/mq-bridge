@@ -5,9 +5,11 @@ service Bridge {
     // Publishes a message to the bridge
     rpc Publish (BridgeMessage) returns (PublishResponse);
     // Publishes a batch of messages using a client stream
-    rpc PublishBatch (stream BridgeMessage) returns (PublishResponse);
+    rpc PublishBatch (stream BridgeMessage) returns (stream PublishResponse);
     // Subscribes to a stream of messages from the bridge
     rpc Subscribe (SubscribeRequest) returns (stream BridgeMessage);
+    // Consumer -> Broker: explicit ack/nack for received messages
+    rpc Acknowledge (Ack) returns (AckResponse);
 }
 
 message BridgeMessage {
@@ -17,6 +19,31 @@ message BridgeMessage {
 }
 
 message PublishResponse {
+    // Reserve low field numbers that were used previously to avoid
+    // accidental wire-compatibility breakage if older clients/servers
+    // used those numbers for different semantics.
+    reserved 1, 2, 3;
+
+    oneof result {
+        BridgeMessage reply = 10;
+        Ack ack = 11;
+        string error = 12;
+    }
+}
+
+message Ack {
+    string id = 1;
+    enum Status {
+        // Ack by default - this is already the name of the message
+        ACK = 0;
+        NACK = 1;
+        REQUEUE = 2;
+    }
+    Status status = 2;
+    string reason = 3;
+    map<string, string> metadata = 4;
+}
+message AckResponse {
     bool success = 1;
     string error = 2;
 }

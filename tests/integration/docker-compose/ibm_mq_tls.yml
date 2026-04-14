@@ -1,0 +1,23 @@
+version: "3.8"
+services:
+  mq:
+    image: icr.io/ibm-messaging/mq:9.4.2.0-r1
+    platform: linux/amd64
+    container_name: mq
+    ports:
+      - "1414:1414"
+      - "9443:9443"
+    environment:
+      - LICENSE=accept
+      - MQ_QMGR_NAME=QM1
+      - MQ_APP_PASSWORD=admin
+      - MQ_ADMIN_PASSWORD=admin
+    healthcheck:
+      test: ["CMD-SHELL", "echo \"DISPLAY QLOCAL('DEV.QUEUE.1')\" | /opt/mqm/bin/runmqsc QM1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    volumes:
+      - ./mq_init.mqsc:/etc/mqm/mq_init.mqsc
+      - ./mq_init_tls.mqsc:/etc/mqm/mq_init_tls.mqsc
+      - ./ibm-mq-certs:/etc/mqm/pki

@@ -138,7 +138,9 @@ pub struct RouteOptions {
     #[serde(default = "default_batch_size")]
     #[cfg_attr(feature = "schema", schemars(range(min = 1)))]
     pub batch_size: usize,
-    /// (Optional) The maximum number of concurrent commit tasks allowed. Defaults to 4096.
+    /// (Optional) The maximum number of in-flight commit requests queued for ordered sequencing.
+    /// Lower values apply backpressure earlier; higher values allow larger commit backlogs.
+    /// Defaults to 4096.
     #[serde(default = "default_commit_concurrency_limit")]
     pub commit_concurrency_limit: usize,
 }
@@ -932,17 +934,24 @@ pub struct FileConfig {
 #[serde(tag = "mode", rename_all = "snake_case")]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub enum FileConsumerMode {
-    /// **Queue Mode**: Reads from the beginning of the file.
+    /// **Queue Mode**: Standard point-to-point consumption. Reads from the start
+    /// of the file. If `delete` is true, processed lines are physically removed
+    /// from the file once they are successfully acknowledged.
     Consume {
         #[serde(default)]
         delete: bool,
     },
-    /// **Broadcast Mode**: Tails the file (starts at the end).
+    /// **Broadcast Mode**: Pub-sub style consumption. Tails the file by starting
+    /// at the current end. If `delete` is true, lines are removed only after
+    /// all local application subscribers for this specific file have acknowledged them.
     Subscribe {
         #[serde(default)]
         delete: bool,
     },
-    /// **Persistent Mode**: Reads the file with offset tracking.
+    /// **Persistent Mode**: Consumption with external offset tracking.
+    /// Saves the last read byte position to a `.offset` file identified by the `group_id`.
+    /// This allows the consumer to resume exactly where it left off after a restart
+    /// without deleting data or requiring the bridge to stay running.
     GroupSubscribe {
         /// The consumer group ID that is used for offset tracking. Should be unique.
         group_id: String,
@@ -1424,15 +1433,39 @@ pub enum ZeroMqSocketType {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct GrpcConfig {
-    /// The gRPC server URL (e.g., "http://localhost:50051").
+    /// The gRPC server URL (e.g., "http://localhost:50051" for client or "0.0.0.0:50051" for server mode).
     pub url: String,
-    /// The topic to subscribe to.
+    /// Topic / subject used for both subscribe and publish paths.
     pub topic: Option<String>,
     /// Timeout in milliseconds.
+    /// - Client mode: used as the connection timeout and per-request deadline.
+    /// - Server mode: applied as the per-request deadline on the embedded server.
     pub timeout_ms: Option<u64>,
     /// TLS configuration.
     #[serde(default)]
     pub tls: TlsConfig,
+    /// If `true`, start an embedded tonic gRPC server that accepts incoming `Publish` /
+    /// `PublishBatch` RPCs. If `false` (the default), connect to a remote server as a client.
+    #[serde(default)]
+    pub server_mode: bool,
+    /// HTTP/2 stream-level initial window size in bytes. **Server-mode only.**
+    #[serde(default)]
+    pub initial_stream_window_size: Option<u32>,
+    /// HTTP/2 connection-level initial window size in bytes. **Server-mode only.**
+    #[serde(default)]
+    pub initial_connection_window_size: Option<u32>,
+    /// Maximum number of concurrent requests handled per connection. **Server-mode only.**
+    #[serde(default)]
+    pub concurrency_limit_per_connection: Option<usize>,
+    /// HTTP/2 keepalive ping interval in milliseconds. **Server-mode only.** Default disabled
+    #[serde(default)]
+    pub http2_keepalive_interval_ms: Option<u64>,
+    /// Timeout for a keepalive ping acknowledgement in milliseconds. **Server-mode only.**
+    #[serde(default)]
+    pub http2_keepalive_timeout_ms: Option<u64>,
+    /// Maximum size of a decoded incoming message in bytes. **Server-mode only.** Default 4 MiB.
+    #[serde(default)]
+    pub max_decoding_message_size: Option<usize>,
 }
 
 impl GrpcConfig {
@@ -1446,6 +1479,12 @@ impl GrpcConfig {
 
     pub fn with_topic(mut self, topic: impl Into<String>) -> Self {
         self.topic = Some(topic.into());
+        self
+    }
+
+    /// Enable or disable server mode for this gRPC endpoint.
+    pub fn with_server_mode(mut self, server_mode: bool) -> Self {
+        self.server_mode = server_mode;
         self
     }
 }
@@ -1489,6 +1528,8 @@ pub struct HttpConfig {
     #[serde(default)]
     pub compression_threshold_bytes: Option<usize>,
     /// HTTP Basic Authentication credentials (username, password). For consumers: validates incoming requests. For publishers: adds Authorization header.
+    /// (Consumer only) Maximum number of concurrent requests to handle. Defaults to 100.
+    pub concurrency_limit: Option<usize>,
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",

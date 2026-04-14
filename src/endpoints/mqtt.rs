@@ -797,7 +797,9 @@ async fn build_tls_config(config: &MqttConfig) -> anyhow::Result<rustls::ClientC
     }
 
     let client_config_builder =
-        rustls::ClientConfig::builder().with_root_certificates(root_cert_store);
+        rustls::ClientConfig::builder_with_provider(crate::endpoints::get_crypto_provider()?)
+            .with_safe_default_protocol_versions()?
+            .with_root_certificates(root_cert_store);
 
     let mut client_config = if config.tls.is_mtls_client_configured() {
         let cert_file = config.tls.cert_file.as_ref().unwrap();
@@ -812,7 +814,13 @@ async fn build_tls_config(config: &MqttConfig) -> anyhow::Result<rustls::ClientC
     if config.tls.accept_invalid_certs {
         warn!("MQTT TLS is configured to accept invalid certificates. This is insecure and should not be used in production.");
         let mut dangerous_config = client_config.dangerous();
-        dangerous_config.set_certificate_verifier(Arc::new(NoopServerCertVerifier {}));
+        let schemes = crate::endpoints::get_crypto_provider()?
+            .signature_verification_algorithms
+            .supported_schemes();
+        let verifier = NoopServerCertVerifier {
+            supported_schemes: schemes,
+        };
+        dangerous_config.set_certificate_verifier(Arc::new(verifier));
     }
     Ok(client_config)
 }
@@ -831,7 +839,9 @@ fn load_private_key(path: &str) -> anyhow::Result<rustls::pki_types::PrivateKeyD
 
 /// A rustls certificate verifier that does not perform any validation.
 #[derive(Debug)]
-struct NoopServerCertVerifier;
+struct NoopServerCertVerifier {
+    supported_schemes: Vec<rustls::SignatureScheme>,
+}
 
 impl rustls::client::danger::ServerCertVerifier for NoopServerCertVerifier {
     fn verify_server_cert(
@@ -864,9 +874,7 @@ impl rustls::client::danger::ServerCertVerifier for NoopServerCertVerifier {
     }
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        rustls::crypto::ring::default_provider()
-            .signature_verification_algorithms
-            .supported_schemes()
+        self.supported_schemes.clone()
     }
 }
 

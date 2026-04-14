@@ -33,7 +33,7 @@ uuid = { version = "1.19" }
 fast-uuid-v7 = "0.1.3"
 
 # Common TLS dependencies
-rustls = { version = "0.23", features = ["ring"], optional = true }
+rustls = { version = "0.23", optional = true }
 tokio-rustls = { version = "0.26", optional = true }
 rustls-pemfile = { version = "2.2", optional = true }
 webpki-roots = { version = "0.26", optional = true }
@@ -93,7 +93,7 @@ sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "mysql
 zeromq = { version = "0.4", optional = true }
 
 # gRPC
-tonic = { version = "0.14", optional = true, default-features = false, features = ["codegen", "transport"] }
+tonic = { version = "0.14", optional = true, default-features = false, features = ["codegen", "transport", "tls-webpki-roots"] }
 tonic-prost = { version = "0.14", optional = true }
 prost = { version = "0.14", optional = true, default-features = false, features = ["std", "derive"] }
 tokio-stream = { version = "0.1", optional = true, features = ["net"] }
@@ -114,12 +114,19 @@ protoc-bin-vendored = { version = "3.0", optional = true }
 [features]
 default = []
 middleware = ["metrics", "dedup"]
-full = ["middleware", "mongodb", "kafka", "amqp", "nats", "mqtt", "http", "aws", "zeromq", "sled", "grpc", "sqlx"]
+full = ["middleware", "mongodb", "kafka", "amqp", "nats", "mqtt", "http", "aws", "zeromq", "sled", "grpc", "sqlx", "rustls-ring"]
 
 # Functionality features
 dedup = ["sled"]
 metrics = ["dep:metrics"]
 test-utils = ["dep:tracing-appender", "dep:tracing-subscriber", "dep:serde_yaml_ng"]
+
+# TLS crypto provider selection — pick exactly one when using any TLS endpoint
+# (http, grpc, mqtt, nats, amqp, …).  If neither is enabled the application binary
+# must call `rustls::crypto::CryptoProvider::install_default()` before building
+# any TLS endpoint.  This follows the same pattern as reqwest / hyper-rustls.
+rustls-ring    = ["rustls/ring",       "tokio-rustls?/ring",       "hyper-rustls?/ring"]
+rustls-aws-lc  = ["rustls/aws_lc_rs",  "tokio-rustls?/aws_lc_rs",  "hyper-rustls?/aws-lc-rs"]
 
 # Generate Schema file
 schema = ["dep:schemars"]
@@ -135,7 +142,7 @@ aws = ["aws-config", "aws-sdk-sqs", "aws-sdk-sns"]
 ibm-mq = ["mqi"]
 zeromq = ["dep:zeromq"]
 # Note: The grpc feature requires protobuf-src which can significantly increase build times.
-grpc = ["tonic", "prost", "tokio-stream", "tonic-prost", "tonic-prost-build", "protoc-bin-vendored"]
+grpc = ["tonic", "prost", "tokio-stream", "tonic-prost", "tonic-prost-build", "protoc-bin-vendored", "rustls"]
 sqlx = ["dep:sqlx", "url"]
 
 [dev-dependencies]
@@ -145,8 +152,14 @@ tempfile = "3.10"
 chrono = "0.4"
 metrics-util = "0.20"
 criterion = { version = "0.8", features = ["async", "async_tokio"] }
-mq-bridge = { path = ".", features = ["test-utils"] }
+mq-bridge = { path = ".", features = ["test-utils", "rustls-ring"] }
 reqwest = { version = "0.12", features = ["stream"] }
+
+# TLS test helpers
+rcgen = "0.9"
+tokio-rustls = { version = "0.26", features = ["ring"] }
+rustls = { version = "0.23", features = ["ring"] }
+rustls-pemfile = "2.2"
 
 [[bench]]
 name = "performance_bench"

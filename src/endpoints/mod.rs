@@ -568,7 +568,13 @@ async fn create_base_consumer(
         EndpointType::ZeroMq(cfg) => Ok(boxed(zeromq::ZeroMqConsumer::new(cfg).await?)),
         EndpointType::File(cfg) => Ok(boxed(file::FileConsumer::new(cfg).await?)),
         #[cfg(feature = "grpc")]
-        EndpointType::Grpc(cfg) => Ok(boxed(grpc::GrpcConsumer::new(cfg).await?)),
+        EndpointType::Grpc(cfg) => {
+            let mut config = cfg.clone();
+            if config.topic.is_none() {
+                config.topic = Some(route_name.to_string());
+            }
+            Ok(boxed(grpc::GrpcConsumer::new(&config).await?))
+        }
         #[cfg(feature = "sqlx")]
         EndpointType::Sqlx(cfg) => Ok(boxed(sqlx::SqlxConsumer::new(cfg).await?)),
         #[cfg(feature = "http")]
@@ -1163,6 +1169,27 @@ async fn create_base_publisher(
         )),
     }?;
     Ok(publisher)
+}
+
+/// Returns the active process-level rustls `CryptoProvider`, or a descriptive error if none
+/// has been installed yet.
+///
+/// This is called by every endpoint that creates a rustls `ClientConfig` / `ServerConfig`.
+/// As a library, mq-bridge never installs a provider itself; the choice belongs to the
+/// application binary.  To resolve the error, either:
+///
+/// * Enable the **`rustls-ring`** or **`rustls-aws-lc`** feature of `mq-bridge`, or
+/// * Call `rustls::crypto::CryptoProvider::install_default()` early in your `main()`.
+#[cfg(feature = "rustls")]
+#[allow(unused)]
+pub(crate) fn get_crypto_provider() -> anyhow::Result<std::sync::Arc<rustls::crypto::CryptoProvider>>
+{
+    rustls::crypto::CryptoProvider::get_default()
+        .cloned()
+        .ok_or_else(|| {
+            anyhow!("No rustls CryptoProvider is installed.\n\
+Fix: enable the `rustls-ring` or `rustls-aws-lc` feature of mq-bridge, or call `rustls::crypto::CryptoProvider::install_default()` in your application binary before creating any TLS endpoint.")
+        })
 }
 
 #[cfg(test)]

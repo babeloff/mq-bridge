@@ -8,8 +8,8 @@ use mq_bridge::test_utils::{
 };
 use std::sync::Arc;
 
-const DOCKER_COMPOSE_FILE: &str = "tests/integration/docker-compose/postgres.yml";
-const DATABASE_URL: &str = "postgres://testuser:testpass@localhost:5432/testdb";
+const DOCKER_COMPOSE_FILE: &str = "tests/integration/docker-compose/mariadb.yml";
+const DATABASE_URL: &str = "mysql://testuser:testpass@localhost:3307/testdb";
 const TABLE_NAME: &str = "messages";
 
 async fn setup_db() {
@@ -19,7 +19,6 @@ async fn setup_db() {
         auto_create_table: true,
         ..Default::default()
     };
-    // This will trigger table creation
     let _publisher = SqlxPublisher::new(&config).await.unwrap();
 }
 
@@ -29,33 +28,26 @@ routes:
     concurrency: 4
     batch_size: 128
     input:
-      memory: { topic: "sqlx-test-in" }
+      memory: { topic: "sqlx-mariadb-in" }
     output:
-      middlewares:
-        - retry:
-            max_attempts: 20
-            initial_interval_ms: 500
-            max_interval_ms: 2000
       sqlx:
-        url: "postgres://testuser:testpass@localhost:5432/testdb"
+        url: "mysql://testuser:testpass@localhost:3307/testdb"
         table: "messages"
-        min_connections: 2
 
   sqlx_to_memory:
     concurrency: 4
     batch_size: 128
     input:
-      sqlx:
-        url: "postgres://testuser:testpass@localhost:5432/testdb"
-        table: "messages"
-        delete_after_read: true
-        polling_interval_ms: 20
-        min_connections: 2
+            sqlx:
+                url: "mysql://testuser:testpass@localhost:3307/testdb"
+                table: "messages"
+                delete_after_read: true
+                polling_interval_ms: 20
     output:
-      memory: { topic: "sqlx-test-out", capacity: {out_capacity} }
+      memory: { topic: "sqlx-mariadb-out", capacity: {out_capacity} }
 "#;
 
-pub async fn test_sqlx_pipeline() {
+pub async fn test_mariadb_pipeline() {
     setup_logging();
     run_test_with_docker(DOCKER_COMPOSE_FILE, || async {
         setup_db().await;
@@ -68,20 +60,17 @@ pub async fn test_sqlx_pipeline() {
     .await;
 }
 
-pub async fn test_sqlx_chaos() {
+pub async fn test_mariadb_chaos() {
     setup_logging();
     run_test_with_docker_controller(DOCKER_COMPOSE_FILE, |controller| async move {
         setup_db().await;
-        let config_yaml = CONFIG_YAML.replace(
-            "{out_capacity}",
-            &(10000 + 1000).to_string(), // Using a smaller number for chaos tests
-        );
-        run_chaos_pipeline_test("sqlx", &config_yaml, controller, "postgres").await;
+        let config_yaml = CONFIG_YAML.replace("{out_capacity}", &(10000 + 1000).to_string());
+        run_chaos_pipeline_test("sqlx", &config_yaml, controller, "mariadb").await;
     })
     .await;
 }
 
-pub async fn test_sqlx_performance_direct() {
+pub async fn test_mariadb_performance_direct() {
     setup_logging();
     run_test_with_docker(DOCKER_COMPOSE_FILE, || async {
         setup_db().await;
@@ -95,7 +84,7 @@ pub async fn test_sqlx_performance_direct() {
         };
 
         let result = run_direct_perf_test(
-            "SQLx (Postgres)",
+            "SQLx (MariaDB)",
             || async {
                 let pub_config = config.clone();
                 Arc::new(SqlxPublisher::new(&pub_config).await.unwrap())
@@ -114,7 +103,7 @@ pub async fn test_sqlx_performance_direct() {
     .await;
 }
 
-pub async fn test_sqlx_status() {
+pub async fn test_mariadb_status() {
     use mq_bridge::traits::{MessageConsumer, MessagePublisher};
     use tokio::time::{sleep, Duration};
 
@@ -130,7 +119,7 @@ pub async fn test_sqlx_status() {
         let publisher = SqlxPublisher::new(&config).await.unwrap();
         let consumer = SqlxConsumer::new(&config).await.unwrap();
 
-        println!("[SQLx] Checking initial status...");
+        println!("[MariaDB] Checking initial status...");
         sleep(Duration::from_secs(2)).await;
         let pub_status = publisher.status().await;
         let con_status = consumer.status().await;
@@ -144,38 +133,38 @@ pub async fn test_sqlx_status() {
             "Consumer should be healthy initially. Status: {:?}",
             con_status
         );
-        println!("[SQLx] Initial status check OK.");
+        println!("[MariaDB] Initial status check OK.");
 
-        controller.stop_service("postgres");
-        println!("[SQLx] Service 'postgres' stopped. Waiting for disconnect detection...");
+        controller.stop_service("mariadb");
+        println!("[MariaDB] Service 'mariadb' stopped. Waiting for disconnect detection...");
 
         let start = std::time::Instant::now();
         loop {
             if !publisher.status().await.healthy && !consumer.status().await.healthy {
-                println!("[SQLx] Disconnect detected.");
+                println!("[MariaDB] Disconnect detected.");
                 break;
             }
             if start.elapsed() > Duration::from_secs(20) {
-                panic!("[SQLx] Timeout waiting for disconnect.");
+                panic!("[MariaDB] Timeout waiting for disconnect.");
             }
             sleep(Duration::from_secs(1)).await;
         }
 
-        controller.start_service("postgres");
-        println!("[SQLx] Service 'postgres' started. Waiting for reconnect...");
+        controller.start_service("mariadb");
+        println!("[MariaDB] Service 'mariadb' started. Waiting for reconnect...");
 
         let start = std::time::Instant::now();
         loop {
             if publisher.status().await.healthy && consumer.status().await.healthy {
-                println!("[SQLx] Reconnect detected.");
+                println!("[MariaDB] Reconnect detected.");
                 break;
             }
             if start.elapsed() > Duration::from_secs(20) {
-                panic!("[SQLx] Timeout waiting for reconnect.");
+                panic!("[MariaDB] Timeout waiting for reconnect.");
             }
             sleep(Duration::from_secs(1)).await;
         }
-        println!("[SQLx] Status test successful.");
+        println!("[MariaDB] Status test successful.");
     })
     .await;
 }

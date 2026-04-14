@@ -542,7 +542,7 @@
         {
           "oneOf": [
             {
-              "description": "**Queue Mode**: Reads from the beginning of the file.",
+              "description": "**Queue Mode**: Standard point-to-point consumption. Reads from the start\nof the file. If `delete` is true, processed lines are physically removed\nfrom the file once they are successfully acknowledged.",
               "type": "object",
               "properties": {
                 "delete": {
@@ -559,7 +559,7 @@
               ]
             },
             {
-              "description": "**Broadcast Mode**: Tails the file (starts at the end).",
+              "description": "**Broadcast Mode**: Pub-sub style consumption. Tails the file by starting\nat the current end. If `delete` is true, lines are removed only after\nall local application subscribers for this specific file have acknowledged them.",
               "type": "object",
               "properties": {
                 "delete": {
@@ -576,7 +576,7 @@
               ]
             },
             {
-              "description": "**Persistent Mode**: Reads the file with offset tracking.",
+              "description": "**Persistent Mode**: Consumption with external offset tracking.\nSaves the last read byte position to a `.offset` file identified by the `group_id`.\nThis allows the consumer to resume exactly where it left off after a restart\nwithout deleting data or requiring the bridge to stay running.",
               "type": "object",
               "properties": {
                 "group_id": {
@@ -634,8 +634,73 @@
     "GrpcConfig": {
       "type": "object",
       "properties": {
+        "concurrency_limit_per_connection": {
+          "description": "Maximum number of concurrent requests handled per connection. **Server-mode only.**",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "default": null,
+          "minimum": 0
+        },
+        "http2_keepalive_interval_ms": {
+          "description": "HTTP/2 keepalive ping interval in milliseconds. **Server-mode only.** Default disabled",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "default": null,
+          "minimum": 0
+        },
+        "http2_keepalive_timeout_ms": {
+          "description": "Timeout for a keepalive ping acknowledgement in milliseconds. **Server-mode only.**",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "default": null,
+          "minimum": 0
+        },
+        "initial_connection_window_size": {
+          "description": "HTTP/2 connection-level initial window size in bytes. **Server-mode only.**",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "default": null,
+          "minimum": 0
+        },
+        "initial_stream_window_size": {
+          "description": "HTTP/2 stream-level initial window size in bytes. **Server-mode only.**",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "default": null,
+          "minimum": 0
+        },
+        "max_decoding_message_size": {
+          "description": "Maximum size of a decoded incoming message in bytes. **Server-mode only.** Default 4 MiB.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "default": null,
+          "minimum": 0
+        },
+        "server_mode": {
+          "description": "If `true`, start an embedded tonic gRPC server that accepts incoming `Publish` /\n`PublishBatch` RPCs. If `false` (the default), connect to a remote server as a client.",
+          "type": "boolean",
+          "default": false
+        },
         "timeout_ms": {
-          "description": "Timeout in milliseconds.",
+          "description": "Timeout in milliseconds.\n- Client mode: used as the connection timeout and per-request deadline.\n- Server mode: applied as the per-request deadline on the embedded server.",
           "type": [
             "integer",
             "null"
@@ -656,14 +721,14 @@
           }
         },
         "topic": {
-          "description": "The topic to subscribe to.",
+          "description": "Topic / subject used for both subscribe and publish paths.",
           "type": [
             "string",
             "null"
           ]
         },
         "url": {
-          "description": "The gRPC server URL (e.g., \"http://localhost:50051\").",
+          "description": "The gRPC server URL (e.g., \"http://localhost:50051\" for client or \"0.0.0.0:50051\" for server mode).",
           "type": "string"
         }
       },
@@ -817,6 +882,11 @@
             "string",
             "null"
           ]
+        },
+        "disable_status_inq": {
+          "description": "If false, attempt to open the queue with INQUIRE permissions to fetch queue depth for status checks. Defaults to false.",
+          "type": "boolean",
+          "default": false
         },
         "internal_buffer_size": {
           "description": "Internal buffer size for the channel. Defaults to 100.",
@@ -1305,7 +1375,7 @@
           ]
         },
         "delayed_ack": {
-          "description": "(Publisher only) If true, messages are acknowledged immediately upon receipt (auto-ack).\nIf false (default), messages are acknowledged after processing (manual-ack).",
+          "description": "(Consumer only) If true, messages are acknowledged immediately upon receipt (auto-ack).\nIf false (default), messages are acknowledged after processing (manual-ack).\nNote: This setting does not currently enable synchronous publishing (waiting for PubAck) for the MQTT publisher.",
           "type": "boolean",
           "default": false
         },
@@ -1421,6 +1491,17 @@
           "type": "boolean",
           "default": false
         },
+        "deliver_policy": {
+          "description": "(Consumer only) The delivery policy for the consumer. Defaults to \"all\".",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/NatsDeliverPolicy"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "no_jetstream": {
           "description": "If no_jetstream: true, use Core NATS (fire-and-forget) instead of JetStream. Defaults to false.",
           "type": "boolean",
@@ -1527,6 +1608,15 @@
         "url"
       ]
     },
+    "NatsDeliverPolicy": {
+      "type": "string",
+      "enum": [
+        "all",
+        "last",
+        "new",
+        "last_per_subject"
+      ]
+    },
     "RandomPanicMiddleware": {
       "description": "Middleware for fault injection testing.\n\nAllows testing error handling and recovery mechanisms by injecting faults\nat specific points in the message processing pipeline.\n\n# Examples\n\n```yaml\nrandom_panic:\n  mode: panic\n  trigger_on_message: 3  # Trigger on the 3rd message\n```",
       "type": "object",
@@ -1604,7 +1694,7 @@
           "minimum": 1
         },
         "commit_concurrency_limit": {
-          "description": "(Optional) The maximum number of concurrent commit tasks allowed. Defaults to 4096.",
+          "description": "(Optional) The maximum number of in-flight commit requests queued for ordered sequencing.\nLower values apply backpressure earlier; higher values allow larger commit backlogs.\nDefaults to 4096.",
           "type": "integer",
           "format": "uint",
           "default": 4096,

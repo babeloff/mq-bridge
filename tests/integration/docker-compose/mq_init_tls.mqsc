@@ -1,0 +1,14 @@
+/* mq_init_tls.mqsc
+   Scaffold: users may need to adjust commands to create key repository and set channel SSL attributes.
+*/
+
+/* Example: set channel to use TLS and point to certificate label. Actual key repository creation
+   is typically done using runmqakm/runmqckm inside the container. This file is a scaffold that
+   shows expected operations; you may need to run additional commands in container startup. */
+
+ALTER CHANNEL('DEV.APP.SVRCONN') CHLTYPE(SVRCONN) SSLCIPH('ANY_TLS12');
+/* To create keystore and certify the queue manager's cert, run inside container:
+   runmqakm -keydb -create -db /var/mqm/qmgrs/QM1/ssl/key.kdb -pw password -type cms -stash
+   runmqakm -cert -add -db /var/mqm/qmgrs/QM1/ssl/key.kdb -label ibmmqkey -file /etc/mqm/pki/mq.pem -format ascii -stashed -pw password
+   ALTER QMGR SSLKEYR('/var/mqm/qmgrs/QM1/ssl/key')
+*/

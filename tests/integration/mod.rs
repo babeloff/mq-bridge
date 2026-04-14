@@ -2,18 +2,33 @@
 pub mod amqp;
 #[cfg(feature = "aws")]
 pub mod aws;
+#[cfg(feature = "grpc")]
+pub mod grpc;
+#[cfg(feature = "http")]
+pub mod http;
+#[cfg(feature = "http")]
+pub mod http_tls;
 #[cfg(feature = "ibm-mq")]
 pub mod ibm_mq;
+#[cfg(feature = "ibm-mq")]
+pub mod ibm_mq_tls;
 #[cfg(feature = "kafka")]
 pub mod kafka;
+#[cfg(feature = "sqlx")]
+pub mod mariadb;
 #[cfg(feature = "mongodb")]
 pub mod mongodb;
 #[cfg(feature = "mqtt")]
 pub mod mqtt;
+#[cfg(feature = "sqlx")]
+pub mod mysql;
 #[cfg(feature = "nats")]
 pub mod nats;
 #[cfg(feature = "sqlx")]
+pub mod sqlite;
+#[cfg(feature = "sqlx")]
 pub mod sqlx;
+pub mod tls_helpers;
 #[cfg(feature = "zeromq")]
 pub mod zeromq;
 
@@ -21,4 +36,6 @@ pub mod file;
 pub mod logic_test;
 pub mod memory;
 // request_reply_test.rs merged into route.rs
+#[cfg(feature = "grpc")]
+pub mod grpc_tls;
 pub mod route;

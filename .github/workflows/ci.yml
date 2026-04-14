@@ -142,6 +142,17 @@ jobs:
       - name: Pre-pull docker images
         run: |
           find tests/integration/docker-compose -name "*.yml" | xargs -P 5 -I {} docker compose -f {} pull -q
+      - name: Install JDK (for keytool)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y default-jdk
+
+      - name: Generate TLS certs for integration services
+        run: |
+          chmod +x tests/integration/scripts/gen_certs.sh
+          ./tests/integration/scripts/gen_certs.sh mongodb
+          ./tests/integration/scripts/gen_certs.sh kafka
+          ./tests/integration/scripts/gen_certs.sh ibm-mq
 
       - name: Run chaos/stability tests
         run: |
@@ -179,6 +190,17 @@ jobs:
       - name: Pre-pull docker images
         run: |
           find tests/integration/docker-compose -name "*.yml" | xargs -P 5 -I {} docker compose -f {} pull -q
+      - name: Install JDK (for keytool)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y default-jdk
+
+      - name: Generate TLS certs for integration services
+        run: |
+          chmod +x tests/integration/scripts/gen_certs.sh
+          ./tests/integration/scripts/gen_certs.sh mongodb
+          ./tests/integration/scripts/gen_certs.sh kafka
+          ./tests/integration/scripts/gen_certs.sh ibm-mq
 
       - name: Run pipeline performance tests
         run: |
@@ -216,6 +238,17 @@ jobs:
       - name: Pre-pull docker images
         run: |
           find tests/integration/docker-compose -name "*.yml" | xargs -P 5 -I {} docker compose -f {} pull -q
+      - name: Install JDK (for keytool)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y default-jdk
+
+      - name: Generate TLS certs for integration services
+        run: |
+          chmod +x tests/integration/scripts/gen_certs.sh
+          ./tests/integration/scripts/gen_certs.sh mongodb
+          ./tests/integration/scripts/gen_certs.sh kafka
+          ./tests/integration/scripts/gen_certs.sh ibm-mq
 
       - name: Run armature integration tests
         run: |

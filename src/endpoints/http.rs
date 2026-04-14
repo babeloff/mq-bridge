@@ -33,7 +33,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
-use tracing::{debug, info, trace};
+use tracing::{debug, info, trace, warn};
 use uuid::Uuid;
 
 type HttpSourceMessage = (CanonicalMessage, CommitFunc);
@@ -59,6 +59,13 @@ pub struct HttpConsumer {
     _shutdown_tx: tokio::sync::watch::Sender<()>,
     buffer_size: usize,
     url: String,
+    bound_addr: Option<SocketAddr>,
+}
+
+impl HttpConsumer {
+    pub fn bound_addr(&self) -> Option<SocketAddr> {
+        self.bound_addr
+    }
 }
 
 #[derive(Clone)]
@@ -71,6 +78,7 @@ struct HttpConsumerState {
     compression_enabled: bool,
     compression_threshold_bytes: usize,
     custom_headers: HashMap<String, String>,
+    concurrency_limit: Arc<tokio::sync::Semaphore>,
 }
 
 /// A `hyper::Service` that can be nested into other services (like Axum).
@@ -90,28 +98,6 @@ impl Service<Request<Incoming>> for HttpBridgeService {
         let state = self.state.clone();
         Box::pin(handle_request(state, req))
     }
-}
-
-/// Creates a linked `HttpConsumer` and `HttpBridgeService`.
-///
-/// The `HttpBridgeService` can be nested into an existing `hyper` or `axum` server.
-/// It will forward requests to the `HttpConsumer`, which can be used as an input
-/// for an `mq-bridge` route.
-pub fn create_http_consumer_and_service(
-    config: &HttpConfig,
-) -> anyhow::Result<(HttpConsumer, HttpBridgeService)> {
-    let (request_rx, state, buffer_size) = setup_http_state_and_channel(config)?;
-    let service = HttpBridgeService { state };
-    let (shutdown_tx, _) = tokio::sync::watch::channel(()); // Dummy for service-only mode
-
-    let consumer = HttpConsumer {
-        request_rx,
-        _shutdown_tx: shutdown_tx,
-        buffer_size,
-        url: config.url.clone(),
-    };
-
-    Ok((consumer, service))
 }
 
 impl HttpConsumer {
@@ -135,12 +121,18 @@ impl HttpConsumer {
             config.workers.unwrap()
         };
 
+        let listener = TcpListener::bind(&addr)
+            .await
+            .with_context(|| format!("Failed to bind to {}", addr))?;
+        let bound_addr = listener.local_addr().ok();
+        let listener = Arc::new(listener);
+
         if is_tls_server_configured(&tls_config) {
             info!("Starting HTTPS source on {} with {} workers", addr, workers);
-            spawn_tls_server(addr, service, shutdown_rx, &tls_config, workers).await?;
+            spawn_tls_server(listener, service, shutdown_rx, &tls_config, workers).await?;
         } else {
             info!("Starting HTTP source on {} with {} workers", addr, workers);
-            spawn_http_server(addr, service, shutdown_rx, workers).await?;
+            spawn_http_server(listener, service, shutdown_rx, workers).await?;
         }
 
         Ok(Self {
@@ -148,6 +140,7 @@ impl HttpConsumer {
             _shutdown_tx: shutdown_tx,
             buffer_size,
             url: config.url.clone(),
+            bound_addr,
         })
     }
 }
@@ -160,7 +153,6 @@ fn setup_http_state_and_channel(
     HttpConsumerState,
     usize,
 )> {
-    let _ = rustls::crypto::ring::default_provider().install_default();
     let buffer_size = config.internal_buffer_size.unwrap_or(100).max(1);
     let (request_tx, request_rx) = tokio::sync::mpsc::channel::<HttpSourceMessage>(buffer_size);
 
@@ -180,22 +172,19 @@ fn setup_http_state_and_channel(
         compression_enabled: config.compression_enabled,
         compression_threshold_bytes,
         custom_headers: config.custom_headers.clone(),
+        concurrency_limit: Arc::new(tokio::sync::Semaphore::new(
+            config.concurrency_limit.unwrap_or(100).max(1),
+        )),
     };
     Ok((request_rx, state, buffer_size))
 }
 
 async fn spawn_http_server(
-    addr: SocketAddr,
+    listener: Arc<TcpListener>,
     service: HttpBridgeService,
     shutdown_rx: tokio::sync::watch::Receiver<()>,
     workers: usize,
 ) -> anyhow::Result<()> {
-    let listener = Arc::new(
-        TcpListener::bind(&addr)
-            .await
-            .with_context(|| format!("Failed to bind to {}", addr))?,
-    );
-
     for i in 0..workers {
         let listener = listener.clone();
         let service = service.clone();
@@ -212,14 +201,14 @@ async fn spawn_http_server(
                     result = listener.accept() => {
                         match result {
                             Ok((socket, _)) => {
+                                let _ = socket.set_nodelay(true);
                                 let service = service.clone();
                                 tokio::spawn(async move {
                                     let io = TokioIo::new(socket);
-
-                                    let conn = hyper::server::conn::http1::Builder::new()
-                                        .keep_alive(true)
-                                        .serve_connection(io, service.clone())
-                                        .await;
+                                    let mut builder = AutoBuilder::new(TokioExecutor::new());
+                                    builder.http1().keep_alive(true);
+                                    builder.http2().max_concurrent_streams(200);
+                                    let conn = builder.serve_connection_with_upgrades(io, service).await;
                                     if let Err(e) = conn {
                                         trace!("Connection error: {}", e);
                                     }
@@ -231,10 +220,15 @@ async fn spawn_http_server(
                                     | std::io::ErrorKind::Interrupted
                                     | std::io::ErrorKind::TimedOut => {
                                         trace!("Transient accept error in worker {}: {}", i, e);
+                                        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                                    }
+                                    _ if e.raw_os_error() == Some(24) => { // EMFILE (Too many open files)
+                                        warn!("HTTP worker {}: FD limit reached, cooling down...", i);
+                                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                                     }
                                     _ => {
-                                        debug!("Accept error in worker {}: {}", i, e);
-                                        break;
+                                        warn!("Accept error in worker {}: {}. Retrying...", i, e);
+                                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                                     }
                                 }
                             }
@@ -249,18 +243,12 @@ async fn spawn_http_server(
 }
 
 async fn spawn_tls_server(
-    addr: SocketAddr,
+    listener: Arc<TcpListener>,
     service: HttpBridgeService,
     shutdown_rx: tokio::sync::watch::Receiver<()>,
     tls_config: &TlsConfig,
     workers: usize,
 ) -> anyhow::Result<()> {
-    let listener = Arc::new(
-        TcpListener::bind(&addr)
-            .await
-            .with_context(|| format!("Failed to bind to {} (TLS)", addr))?,
-    );
-
     let rustls_server_config =
         create_rustls_server_config(tls_config).context("Failed to create rustls server config")?;
     let acceptor = TlsAcceptor::from(rustls_server_config);
@@ -288,10 +276,10 @@ async fn spawn_tls_server(
                                     match acceptor.accept(socket).await {
                                         Ok(stream) => {
                                             let io = TokioIo::new(stream);
-
-                                            let conn = AutoBuilder::new(TokioExecutor::new())
-                                                .serve_connection_with_upgrades(io, service.clone())
-                                                .await;
+                                            let mut builder = AutoBuilder::new(TokioExecutor::new());
+                                            builder.http1().keep_alive(true);
+                                            builder.http2().max_concurrent_streams(200);
+                                            let conn = builder.serve_connection_with_upgrades(io, service.clone()).await;
 
                                             if let Err(e) = conn {
                                                 // Benign errors like "connection closed" are expected
@@ -310,10 +298,15 @@ async fn spawn_tls_server(
                                     | std::io::ErrorKind::Interrupted
                                     | std::io::ErrorKind::TimedOut => {
                                         trace!("Transient accept error in TLS worker {}: {}", i, e);
+                                        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                                    }
+                                    _ if e.raw_os_error() == Some(24) => { // EMFILE
+                                        warn!("TLS worker {}: FD limit reached, cooling down...", i);
+                                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                                     }
                                     _ => {
-                                        debug!("Accept error in TLS worker {}: {}", i, e);
-                                        break;
+                                        warn!("Accept error in TLS worker {}: {}. Retrying...", i, e);
+                                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                                     }
                                 }
                             }
@@ -357,11 +350,16 @@ impl MessageConsumer for HttpConsumer {
         let batch_commit: crate::traits::BatchCommitFunc =
             Box::new(move |dispositions: Vec<MessageDisposition>| {
                 Box::pin(async move {
+                    tracing::trace!(
+                        count = dispositions.len(),
+                        "Committing batch of HTTP messages"
+                    );
                     // Commit each message with its corresponding disposition
+                    let mut results = Vec::with_capacity(commits.len());
                     for (commit, disposition) in commits.into_iter().zip(dispositions.into_iter()) {
-                        commit(disposition).await?;
+                        results.push(commit(disposition).await);
                     }
-                    Ok(())
+                    results.into_iter().collect::<anyhow::Result<()>>()
                 }) as crate::traits::BoxFuture<'static, anyhow::Result<()>>
             });
 
@@ -391,7 +389,30 @@ async fn handle_request(
     state: HttpConsumerState,
     req: Request<Incoming>,
 ) -> anyhow::Result<Response<BoxBody>> {
-    // Validate Basic Authentication if configured
+    match handle_request_internal(state, req).await {
+        Ok(res) => Ok(res),
+        Err(e) => {
+            tracing::error!("Internal error handling HTTP request: {}", e);
+            Ok(Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .body(full(format!("Internal error: {}", e)))
+                .unwrap())
+        }
+    }
+}
+
+async fn handle_request_internal(
+    state: HttpConsumerState,
+    req: Request<Incoming>,
+) -> anyhow::Result<Response<BoxBody>> {
+    // Acquire a permit to limit concurrent requests and prevent resource exhaustion.
+    // This applies backpressure to Hyper and prevents task explosion during retry storms.
+    let _permit = state
+        .concurrency_limit
+        .acquire()
+        .await
+        .map_err(|e| anyhow!(e))?;
+
     if let Some((expected_user, expected_pass)) = &state.basic_auth {
         if let Some(auth_header) = req.headers().get("authorization") {
             match auth_header.to_str() {
@@ -490,8 +511,24 @@ async fn handle_request(
         }
     }
 
-    // Read body after extracting metadata
-    let body_bytes = req.collect().await?.to_bytes();
+    // Read body with a timeout to prevent hanging on abandoned client connections.
+    // This prevents "zombie" tasks from saturating the runtime during retry storms.
+    let body_collect_timeout = std::time::Duration::from_secs(10).min(state.request_timeout);
+    let body_bytes = match tokio::time::timeout(body_collect_timeout, req.collect()).await {
+        Ok(Ok(b)) => b.to_bytes(),
+        Ok(Err(e)) => {
+            return Ok(Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .body(full(format!("Failed to read body: {}", e)))
+                .unwrap());
+        }
+        Err(_) => {
+            return Ok(Response::builder()
+                .status(StatusCode::REQUEST_TIMEOUT)
+                .body(full("Timed out reading request body"))
+                .unwrap());
+        }
+    };
     let body_bytes_raw = body_bytes.to_vec();
 
     // Decompress if needed
@@ -499,7 +536,10 @@ async fn handle_request(
         .map_err(|e| anyhow!("Failed to decompress request body: {}", e))?;
 
     let mut message = CanonicalMessage::new(payload, message_id);
-    trace!(message_id = %format!("{:032x}", message.message_id), "Received HTTP request");
+    trace!(
+        message_id = format!("{:032x}", message.message_id),
+        "Received HTTP request"
+    );
 
     message.metadata = metadata;
 
@@ -514,16 +554,35 @@ async fn handle_request(
         }) as BoxFuture<'static, anyhow::Result<()>>
     });
 
-    if let Err(e) = state.tx.send((message, commit)).await {
-        tracing::error!("Failed to send request to bridge: {}", e);
-        let mut builder = Response::builder().status(StatusCode::INTERNAL_SERVER_ERROR);
-        for (header_name, header_value) in &state.custom_headers {
-            builder = builder.header(header_name.as_str(), header_value.as_str());
+    // Use a timeout for the internal channel send to prevent connection task hang
+    // if the bridge pipeline is overloaded. 503 Service Unavailable is returned
+    // to allow the client to retry later without holding onto server resources.
+    let send_timeout = std::time::Duration::from_millis(2000).min(state.request_timeout / 2);
+    match tokio::time::timeout(send_timeout, state.tx.send((message, commit))).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => {
+            tracing::error!("Failed to send request to bridge (channel closed): {}", e);
+            return Ok(Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .body(full("Internal pipeline closed"))
+                .unwrap());
         }
-        return Ok(builder
-            .body(full("Failed to send request to bridge"))
-            .unwrap());
+        Err(_) => {
+            tracing::warn!("HTTP handler: internal channel full, request rejected");
+            let mut builder = Response::builder().status(StatusCode::SERVICE_UNAVAILABLE);
+            for (header_name, header_value) in &state.custom_headers {
+                builder = builder.header(header_name.as_str(), header_value.as_str());
+            }
+            return Ok(builder.body(full("Server overloaded")).unwrap());
+        }
     }
+
+    // Release the concurrency permit here, after the message has been handed off to the
+    // pipeline. The permit protects against connection/body-read explosion, not against
+    // slow downstream processing. Holding it while waiting on ack_rx would cause a
+    // deadlock: all permits occupied by requests waiting on downstream, no capacity
+    // left for new requests, retry storm fills the channel → everything stalls.
+    drop(_permit);
 
     if state.fire_and_forget {
         let mut builder = Response::builder().status(StatusCode::ACCEPTED);
@@ -537,6 +596,10 @@ async fn handle_request(
 
     let timeout_duration = state.request_timeout;
     let custom_headers = state.custom_headers.clone();
+    tracing::trace!(
+        timeout_ms = timeout_duration.as_millis(),
+        "HTTP handler waiting for disposition"
+    );
     match tokio::time::timeout(timeout_duration, ack_rx).await {
         Ok(Ok(disposition)) => make_response(
             disposition,
@@ -549,6 +612,7 @@ async fn handle_request(
             for (header_name, header_value) in &custom_headers {
                 builder = builder.header(header_name.as_str(), header_value.as_str());
             }
+            tracing::error!("HTTP handler: pipeline closed before disposition arrived");
             Ok(builder.body(full("Pipeline closed")).unwrap())
         }
         Err(_) => {
@@ -556,6 +620,10 @@ async fn handle_request(
             for (header_name, header_value) in &custom_headers {
                 builder = builder.header(header_name.as_str(), header_value.as_str());
             }
+            tracing::warn!(
+                "HTTP handler: request timed out after {} ms",
+                timeout_duration.as_millis()
+            );
             Ok(builder.body(full("Request timed out")).unwrap())
         }
     }
@@ -670,7 +738,7 @@ pub struct HttpPublisher {
 
 impl HttpPublisher {
     pub async fn new(config: &HttpConfig) -> anyhow::Result<Self> {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        // Initialize TLS provider if TLS is configured for this endpoint.
         let batch_concurrency = config.batch_concurrency.unwrap_or(20).max(1);
 
         let tls_client_config = create_rustls_client_config(&config.tls)
@@ -678,6 +746,7 @@ impl HttpPublisher {
 
         let mut http_connector = HttpConnector::new();
         http_connector.enforce_http(false);
+        http_connector.set_nodelay(true);
         if let Some(keepalive) = config.tcp_keepalive_ms {
             http_connector.set_keepalive(Some(std::time::Duration::from_millis(keepalive)));
         }
@@ -857,13 +926,30 @@ impl MessagePublisher for HttpPublisher {
             }
         }
 
-        let response_bytes_raw = match response.into_body().collect().await {
-            Ok(collected) => collected.to_bytes().to_vec(),
-            Err(e) => {
+        // Use a shorter cap for body collection — the full request timeout was already
+        // spent on getting the response headers. Reusing it here could double the total
+        // wall time a single send() call blocks the caller.
+        let body_collect_timeout = self
+            .request_timeout
+            .unwrap_or(std::time::Duration::from_secs(30))
+            .min(std::time::Duration::from_secs(10));
+        let response_bytes_raw = match tokio::time::timeout(
+            body_collect_timeout,
+            response.into_body().collect(),
+        )
+        .await
+        {
+            Ok(Ok(collected)) => collected.to_bytes().to_vec(),
+            Ok(Err(e)) => {
                 return Err(PublisherError::Retryable(anyhow::anyhow!(
                     "Failed to read HTTP response body: {}",
                     e
-                )));
+                )))
+            }
+            Err(_) => {
+                return Err(PublisherError::Retryable(anyhow::anyhow!(
+                    "HTTP response body collection timeout"
+                )))
             }
         };
 
@@ -986,6 +1072,9 @@ fn is_tls_client_configured(tls_config: &TlsConfig) -> bool {
 fn create_rustls_server_config(
     tls_config: &TlsConfig,
 ) -> anyhow::Result<Arc<rustls::ServerConfig>> {
+    // Ensure a process-level rustls CryptoProvider is installed when building server config.
+    // This avoids a runtime panic if the provider wasn't set elsewhere.
+
     let cert_file = tls_config
         .cert_file
         .as_ref()
@@ -998,7 +1087,9 @@ fn create_rustls_server_config(
     let certs = load_certs(cert_file)?;
     let key = load_private_key(key_file)?;
 
-    let config_builder = rustls::ServerConfig::builder();
+    let config_builder =
+        rustls::ServerConfig::builder_with_provider(crate::endpoints::get_crypto_provider()?)
+            .with_safe_default_protocol_versions()?;
 
     let config = if let Some(ca_file) = &tls_config.ca_file {
         // mTLS: verify client certificates using the provided CA
@@ -1046,7 +1137,10 @@ fn create_rustls_client_config(tls_config: &TlsConfig) -> anyhow::Result<rustls:
         root_cert_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     }
 
-    let config_builder = rustls::ClientConfig::builder().with_root_certificates(root_cert_store);
+    let config_builder =
+        rustls::ClientConfig::builder_with_provider(crate::endpoints::get_crypto_provider()?)
+            .with_safe_default_protocol_versions()?
+            .with_root_certificates(root_cert_store);
 
     if let (Some(cert_file), Some(key_file)) = (&tls_config.cert_file, &tls_config.key_file) {
         let certs = load_certs(cert_file)?;
@@ -1134,6 +1228,12 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.local_addr().unwrap().port()
     }
+    fn init_crypto() {
+        #[cfg(feature = "rustls-aws-lc")]
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        #[cfg(all(feature = "rustls-ring", not(feature = "rustls-aws-lc")))]
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
 
     #[test]
     fn test_http_config_yaml() {
@@ -1166,6 +1266,8 @@ http_route:
 
     #[tokio::test]
     async fn test_http_consumer_publisher_integration() {
+        init_crypto();
+
         let port = get_free_port();
         let addr = format!("127.0.0.1:{}", port);
         let url = format!("http://{}", addr);
@@ -1210,6 +1312,7 @@ http_route:
 
     #[tokio::test]
     async fn test_http_server_shutdown_on_drop() {
+        init_crypto();
         let port = get_free_port();
         let addr = format!("127.0.0.1:{}", port);
         let config = HttpConfig {
@@ -1230,6 +1333,7 @@ http_route:
 
     #[tokio::test]
     async fn test_http_to_static_response() {
+        init_crypto();
         let port = get_free_port();
         let addr = format!("127.0.0.1:{}", port);
         let http_config = HttpConfig {
@@ -1260,6 +1364,7 @@ http_route:
 
     #[tokio::test]
     async fn test_http_to_response_endpoint() {
+        init_crypto();
         let port = get_free_port();
         let addr = format!("127.0.0.1:{}", port);
         let http_config = HttpConfig {
@@ -1291,6 +1396,7 @@ http_route:
     #[tokio::test]
     async fn test_http_reply_with_custom_status_code() {
         use crate::traits::Handled;
+        init_crypto();
 
         let port = get_free_port();
         let addr = format!("127.0.0.1:{}", port);
