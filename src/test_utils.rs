@@ -44,6 +44,42 @@ static PERFORMANCE_RESULTS: Lazy<Mutex<Vec<PerformanceResult>>> =
 /// Global lock to serialize tests that use Docker containers.
 static DOCKER_TEST_LOCK: Lazy<AsyncMutex<()>> = Lazy::new(|| AsyncMutex::new(()));
 
+/// Per-feature elapsed time tracker to enforce time budgets across sub-benchmarks.
+static BENCH_FEATURE_ELAPSED: Lazy<AsyncMutex<std::collections::HashMap<String, u64>>> =
+    Lazy::new(|| AsyncMutex::new(std::collections::HashMap::new()));
+
+/// Run a sub-benchmark future with a per-subbench timeout (60s) and accumulate
+/// elapsed time per feature. If the per-feature total exceeds 180s, a warning
+/// is printed. Returns the measured duration (or the timeout duration on timeout).
+pub async fn with_subbench_timeout<F>(feature: &str, subbench: &str, fut: F) -> std::time::Duration
+where
+    F: std::future::Future<Output = std::time::Duration> + Send,
+{
+    let per_sub_timeout = std::time::Duration::from_secs(60);
+    let max_feature_total_secs: u64 = 180;
+
+    let measured = match tokio::time::timeout(per_sub_timeout, fut).await {
+        Ok(d) => d,
+        Err(_) => {
+            eprintln!("BENCH-TIMEOUT feature={} subbench={}", feature, subbench);
+            per_sub_timeout
+        }
+    };
+
+    // Update accumulated time for the feature
+    let mut map = BENCH_FEATURE_ELAPSED.lock().await;
+    let entry = map.entry(feature.to_string()).or_insert(0);
+    *entry += measured.as_secs();
+    if *entry > max_feature_total_secs {
+        eprintln!(
+            "BENCH-WARNING feature={} exceeded total time budget: {}s",
+            feature, *entry
+        );
+    }
+
+    measured
+}
+
 pub fn should_run(test_name: &str) -> bool {
     let filter = std::env::var("MQB_TEST_BACKEND")
         .unwrap_or_default()
@@ -1050,6 +1086,20 @@ pub async fn measure_single_read_performance(
 }
 
 pub fn should_run_benchmark(backend_name: &str) -> bool {
+    // If the MQB_TEST_BACKEND env var is set, prefer it as a filter source.
+    if let Ok(env_filters) = std::env::var("MQB_TEST_BACKEND") {
+        let env_filters: Vec<&str> = env_filters
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if !env_filters.is_empty() {
+            return env_filters
+                .iter()
+                .any(|f| backend_name.contains(f) || f.contains(backend_name));
+        }
+    }
+
     let mut filters = Vec::new();
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -1125,161 +1175,177 @@ macro_rules! run_benchmarks {
     ($name:literal, $group:expr, $rt:expr, $results:expr, $msg_count:expr, $concurrency:expr, $sleep_duration:expr) => {
         $group.bench_function(concat!($name, "_single_write"), |b| {
             b.to_async($rt).iter_custom(|iters| async move {
-                let mut total = std::time::Duration::ZERO;
-                // Create consumer first to support brokerless protocols like ZeroMQ
-                let consumer = backend::create_consumer().await;
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                let publisher = backend::create_publisher().await;
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                for _ in 0..iters {
-                    let duration = $crate::test_utils::measure_single_write_performance(
-                        concat!($name, "_single_write"),
-                        std::sync::Arc::clone(&publisher),
-                        $msg_count,
-                        $concurrency,
-                    )
-                    .await;
-                    total += duration;
-                    tokio::time::sleep($sleep_duration).await;
-                    $crate::test_utils::measure_read_performance(
-                        "cleanup",
-                        std::sync::Arc::clone(&consumer),
-                        $msg_count,
-                    )
-                    .await;
-                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-                }
-                let msgs_per_sec = (iters as f64 * $msg_count as f64) / total.as_secs_f64();
-                {
-                    let mut results = $results.lock().await;
-                    let stats = results.entry($name.to_string()).or_default();
-                    stats.single_write_performance = msgs_per_sec;
-                }
-                println!(
-                    "\n{} single_write: {} iters, total time {:?}, {:.2} msgs/sec",
-                    $name, iters, total, msgs_per_sec
-                );
-                total
+                let sub = concat!($name, "_single_write");
+                let inner = async move {
+                    let mut total = std::time::Duration::ZERO;
+                    // Create consumer first to support brokerless protocols like ZeroMQ
+                    let consumer = backend::create_consumer().await;
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    let publisher = backend::create_publisher().await;
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    for _ in 0..iters {
+                        let duration = $crate::test_utils::measure_single_write_performance(
+                            concat!($name, "_single_write"),
+                            std::sync::Arc::clone(&publisher),
+                            $msg_count,
+                            $concurrency,
+                        )
+                        .await;
+                        total += duration;
+                        tokio::time::sleep($sleep_duration).await;
+                        $crate::test_utils::measure_read_performance(
+                            "cleanup",
+                            std::sync::Arc::clone(&consumer),
+                            $msg_count,
+                        )
+                        .await;
+                        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                    }
+                    let msgs_per_sec = (iters as f64 * $msg_count as f64) / total.as_secs_f64();
+                    {
+                        let mut results = $results.lock().await;
+                        let stats = results.entry($name.to_string()).or_default();
+                        stats.single_write_performance = msgs_per_sec;
+                    }
+                    println!(
+                        "\n{} single_write: {} iters, total time {:?}, {:.2} msgs/sec",
+                        $name, iters, total, msgs_per_sec
+                    );
+                    total
+                };
+                $crate::test_utils::with_subbench_timeout($name, sub, inner).await
             })
         });
 
         $group.bench_function(concat!($name, "_single_read"), |b| {
             b.to_async($rt).iter_custom(|iters| async move {
-                let mut total = std::time::Duration::ZERO;
-                let consumer = backend::create_consumer().await;
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                let publisher = backend::create_publisher().await;
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                for _ in 0..iters {
-                    $crate::test_utils::measure_write_performance(
-                        "setup_fill",
-                        std::sync::Arc::clone(&publisher),
-                        $msg_count,
-                        $concurrency,
-                    )
-                    .await;
-                    tokio::time::sleep($sleep_duration).await;
+                let sub = concat!($name, "_single_read");
+                let inner = async move {
+                    let mut total = std::time::Duration::ZERO;
+                    let consumer = backend::create_consumer().await;
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    let publisher = backend::create_publisher().await;
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    for _ in 0..iters {
+                        $crate::test_utils::measure_write_performance(
+                            "setup_fill",
+                            std::sync::Arc::clone(&publisher),
+                            $msg_count,
+                            $concurrency,
+                        )
+                        .await;
+                        tokio::time::sleep($sleep_duration).await;
 
-                    let duration = $crate::test_utils::measure_single_read_performance(
-                        concat!($name, "_single_read"),
-                        std::sync::Arc::clone(&consumer),
-                        $msg_count,
-                    )
-                    .await;
-                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-                    total += duration;
-                }
-                let msgs_per_sec = (iters as f64 * $msg_count as f64) / total.as_secs_f64();
-                {
-                    let mut results = $results.lock().await;
-                    let stats = results.entry($name.to_string()).or_default();
-                    stats.single_read_performance = msgs_per_sec;
-                }
-                println!(
-                    "\n{} single_read: {} iters, total time {:?}, {:.2} msgs/sec",
-                    $name, iters, total, msgs_per_sec
-                );
-                total
+                        let duration = $crate::test_utils::measure_single_read_performance(
+                            concat!($name, "_single_read"),
+                            std::sync::Arc::clone(&consumer),
+                            $msg_count,
+                        )
+                        .await;
+                        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                        total += duration;
+                    }
+                    let msgs_per_sec = (iters as f64 * $msg_count as f64) / total.as_secs_f64();
+                    {
+                        let mut results = $results.lock().await;
+                        let stats = results.entry($name.to_string()).or_default();
+                        stats.single_read_performance = msgs_per_sec;
+                    }
+                    println!(
+                        "\n{} single_read: {} iters, total time {:?}, {:.2} msgs/sec",
+                        $name, iters, total, msgs_per_sec
+                    );
+                    total
+                };
+                $crate::test_utils::with_subbench_timeout($name, sub, inner).await
             })
         });
 
         $group.bench_function(concat!($name, "_batch_write"), |b| {
             b.to_async($rt).iter_custom(|iters| async move {
-                let mut total = std::time::Duration::ZERO;
-                let consumer = backend::create_consumer().await;
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                let publisher = backend::create_publisher().await;
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                for _ in 0..iters {
-                    let duration = $crate::test_utils::measure_write_performance(
-                        concat!($name, "_batch_write"),
-                        std::sync::Arc::clone(&publisher),
-                        $msg_count,
-                        $concurrency,
-                    )
-                    .await;
-                    tokio::time::sleep($sleep_duration).await;
-                    total += duration;
+                let sub = concat!($name, "_batch_write");
+                let inner = async move {
+                    let mut total = std::time::Duration::ZERO;
+                    let consumer = backend::create_consumer().await;
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    let publisher = backend::create_publisher().await;
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    for _ in 0..iters {
+                        let duration = $crate::test_utils::measure_write_performance(
+                            concat!($name, "_batch_write"),
+                            std::sync::Arc::clone(&publisher),
+                            $msg_count,
+                            $concurrency,
+                        )
+                        .await;
+                        tokio::time::sleep($sleep_duration).await;
+                        total += duration;
 
-                    $crate::test_utils::measure_read_performance(
-                        "cleanup",
-                        std::sync::Arc::clone(&consumer),
-                        $msg_count,
-                    )
-                    .await;
-                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-                }
-                let msgs_per_sec = (iters as f64 * $msg_count as f64) / total.as_secs_f64();
-                {
-                    let mut results = $results.lock().await;
-                    let stats = results.entry($name.to_string()).or_default();
-                    stats.write_performance = msgs_per_sec;
-                }
-                println!(
-                    "\n{} batch_write: {} iters, total time {:?}, {:.2} msgs/sec",
-                    $name, iters, total, msgs_per_sec
-                );
-                total
+                        $crate::test_utils::measure_read_performance(
+                            "cleanup",
+                            std::sync::Arc::clone(&consumer),
+                            $msg_count,
+                        )
+                        .await;
+                        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                    }
+                    let msgs_per_sec = (iters as f64 * $msg_count as f64) / total.as_secs_f64();
+                    {
+                        let mut results = $results.lock().await;
+                        let stats = results.entry($name.to_string()).or_default();
+                        stats.write_performance = msgs_per_sec;
+                    }
+                    println!(
+                        "\n{} batch_write: {} iters, total time {:?}, {:.2} msgs/sec",
+                        $name, iters, total, msgs_per_sec
+                    );
+                    total
+                };
+                $crate::test_utils::with_subbench_timeout($name, sub, inner).await
             })
         });
 
         $group.bench_function(concat!($name, "_batch_read"), |b| {
             b.to_async($rt).iter_custom(|iters| async move {
-                let mut total = std::time::Duration::ZERO;
-                let consumer = backend::create_consumer().await;
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                let publisher = backend::create_publisher().await;
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                for _ in 0..iters {
-                    $crate::test_utils::measure_write_performance(
-                        "setup_fill",
-                        std::sync::Arc::clone(&publisher),
-                        $msg_count,
-                        $concurrency,
-                    )
-                    .await;
-                    tokio::time::sleep($sleep_duration).await;
+                let sub = concat!($name, "_batch_read");
+                let inner = async move {
+                    let mut total = std::time::Duration::ZERO;
+                    let consumer = backend::create_consumer().await;
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    let publisher = backend::create_publisher().await;
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    for _ in 0..iters {
+                        $crate::test_utils::measure_write_performance(
+                            "setup_fill",
+                            std::sync::Arc::clone(&publisher),
+                            $msg_count,
+                            $concurrency,
+                        )
+                        .await;
+                        tokio::time::sleep($sleep_duration).await;
 
-                    let duration = $crate::test_utils::measure_read_performance(
-                        concat!($name, "_batch_read"),
-                        std::sync::Arc::clone(&consumer),
-                        $msg_count,
-                    )
-                    .await;
-                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-                    total += duration;
-                }
-                let msgs_per_sec = (iters as f64 * $msg_count as f64) / total.as_secs_f64();
-                {
-                    let mut results = $results.lock().await;
-                    let stats = results.entry($name.to_string()).or_default();
-                    stats.read_performance = msgs_per_sec;
-                }
-                println!(
-                    "\n{} batch_read: {} iters, total time {:?}, {:.2} msgs/sec",
-                    $name, iters, total, msgs_per_sec
-                );
-                total
+                        let duration = $crate::test_utils::measure_read_performance(
+                            concat!($name, "_batch_read"),
+                            std::sync::Arc::clone(&consumer),
+                            $msg_count,
+                        )
+                        .await;
+                        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                        total += duration;
+                    }
+                    let msgs_per_sec = (iters as f64 * $msg_count as f64) / total.as_secs_f64();
+                    {
+                        let mut results = $results.lock().await;
+                        let stats = results.entry($name.to_string()).or_default();
+                        stats.read_performance = msgs_per_sec;
+                    }
+                    println!(
+                        "\n{} batch_read: {} iters, total time {:?}, {:.2} msgs/sec",
+                        $name, iters, total, msgs_per_sec
+                    );
+                    total
+                };
+                $crate::test_utils::with_subbench_timeout($name, sub, inner).await
             })
         });
     };

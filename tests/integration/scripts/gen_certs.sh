@@ -58,7 +58,7 @@ EOF
   # Do NOT create legacy mongo.* names; use server.* exclusively
 
   chmod 644 "$BASE_CERT_DIR"/* || true
-  ls -l "$BASE_CERT_DIR"
+  # ls -l "$BASE_CERT_DIR"
 }
 
 generate_pem_dir() {
@@ -71,7 +71,7 @@ generate_pem_dir() {
   cp -a "$BASE_CERT_DIR/server.key" "$outdir/" 2>/dev/null || true
   cp -a "$BASE_CERT_DIR/server.pem" "$outdir/" 2>/dev/null || true
   chmod 644 "$outdir"/* || true
-  ls -l "$outdir"
+  # ls -l "$outdir"
 }
 
 generate_keystore_dir() {
@@ -114,7 +114,7 @@ EOF
     echo "keytool not found; pkcs12 created but JKS keystore/truststore not created"
   fi
   chmod 644 "$outdir"/* || true
-  ls -l "$outdir"
+  # ls -l "$outdir"
 }
 
 case "$CMD" in

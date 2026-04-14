@@ -551,174 +551,67 @@ pub mod file_delete_helper {
 
 #[cfg(feature = "http")]
 pub mod http_helper {
-    use hyper::server::conn::http1::Builder as Http1Builder;
-    use hyper_util::rt::TokioIo;
-    use mq_bridge::endpoints::http::create_http_consumer_and_service;
-    use mq_bridge::endpoints::http::HttpPublisher;
-    use mq_bridge::endpoints::memory::MemoryConsumer;
+    use mq_bridge::endpoints::http::{HttpConsumer, HttpPublisher};
+    use mq_bridge::endpoints::memory::{MemoryConsumer, MemoryPublisher};
     use mq_bridge::models::HttpConfig;
-    use mq_bridge::traits::{ConsumerError, MessageConsumer, MessageDisposition, MessagePublisher};
+    use mq_bridge::traits::{MessageConsumer, MessageDisposition, MessagePublisher};
     use once_cell::sync::Lazy;
-    use std::net::TcpListener;
     use std::sync::Arc;
     use std::sync::Mutex as StdMutex;
     use tokio::sync::Mutex;
 
     static CURRENT_URL: Lazy<StdMutex<String>> = Lazy::new(|| StdMutex::new(String::new()));
 
-    fn get_free_listener() -> std::net::TcpListener {
-        TcpListener::bind("127.0.0.1:0").unwrap()
-    }
-
-    struct HttpBenchConsumer {
-        inner: MemoryConsumer,
-        task: Option<tokio::task::JoinHandle<()>>,
-    }
-
-    #[async_trait::async_trait]
-    impl MessageConsumer for HttpBenchConsumer {
-        async fn receive_batch(
-            &mut self,
-            max_messages: usize,
-        ) -> Result<mq_bridge::ReceivedBatch, ConsumerError> {
-            self.inner.receive_batch(max_messages).await
-        }
-        fn as_any(&self) -> &dyn std::any::Any {
-            self
-        }
-    }
-
-    impl Drop for HttpBenchConsumer {
-        fn drop(&mut self) {
-            if let Some(task) = self.task.take() {
-                task.abort();
-            }
-        }
-    }
-
     pub async fn create_consumer() -> Arc<Mutex<dyn MessageConsumer>> {
         #[cfg(feature = "rustls")]
         crate::ensure_rustls_installed();
-        // Reserve the port by holding the std listener until the server binds it.
-        let std_listener = get_free_listener();
-        let port = std_listener.local_addr().unwrap().port();
-        let addr = format!("127.0.0.1:{}", port);
+
+        let http_config = HttpConfig {
+            url: "127.0.0.1:0".to_string(),
+            // Sufficient internal buffer to prevent backpressure during bursts
+            internal_buffer_size: Some(super::PERF_TEST_MESSAGE_COUNT * 2),
+            concurrency_limit: Some(super::PERF_TEST_CONCURRENCY * 2),
+            request_timeout_ms: Some(10000),
+            fire_and_forget: false, // Reliable mode: wait for ack before HTTP response
+            ..Default::default()
+        };
+
+        let mut http_consumer = HttpConsumer::new(&http_config)
+            .await
+            .expect("Failed to create HttpConsumer");
+        let addr = http_consumer
+            .bound_addr()
+            .expect("HttpConsumer should have bound addr");
         let url = format!("http://{}", addr);
 
         {
             let mut lock = CURRENT_URL.lock().unwrap();
-            *lock = url.clone();
+            *lock = url;
         }
 
-        let config = HttpConfig {
-            url: addr,
-            internal_buffer_size: Some(super::PERF_TEST_MESSAGE_COUNT * 2),
-            fire_and_forget: false,
-            request_timeout_ms: Some(1000),
+        // Setup an internal memory buffer to decouple the "Write" and "Read" phases of the benchmark.
+        // This allows the benchmark to finish writing all messages without deadlocking on the reader.
+        let topic = format!("http_perf_buffer_{}", fast_uuid_v7::gen_id());
+        let mem_config = mq_bridge::models::MemoryConfig {
+            topic,
+            capacity: Some(super::PERF_TEST_MESSAGE_COUNT * 10),
             ..Default::default()
         };
-        // Create the consumer and the bridge service without starting a server yet.
-        let (mut http_consumer, service) = create_http_consumer_and_service(&config).unwrap();
+        let mem_publisher = MemoryPublisher::new(&mem_config).unwrap();
+        let mem_consumer = MemoryConsumer::new(&mem_config).unwrap();
 
-        // Move the reserved std listener into a tokio listener and spawn a simple
-        // accept loop that serves connections with the created service.
-        let std_listener = std_listener;
-        let tokio_listener = tokio::net::TcpListener::from_std(std_listener).unwrap();
-        let listener = std::sync::Arc::new(tokio_listener);
-
+        // Background task to bridge Http -> Memory.
+        // We only ACK the HTTP request once the message is safely accepted by the memory queue.
         tokio::spawn(async move {
-            loop {
-                match listener.accept().await {
-                    Ok((socket, _)) => {
-                        let service = service.clone();
-                        tokio::spawn(async move {
-                            let io = TokioIo::new(socket);
-
-                            let conn = Http1Builder::new()
-                                .keep_alive(true)
-                                .serve_connection(io, service.clone())
-                                .await;
-                            if let Err(e) = conn {
-                                tracing::trace!("Connection error: {}", e);
-                            }
-                        });
-                    }
-                    Err(e) => {
-                        tracing::debug!("Accept error: {}", e);
-                        break;
-                    }
-                }
-            }
-        });
-
-        // Create a memory consumer to act as the buffer
-        let buffer_topic = format!("http_bench_buffer_{}", fast_uuid_v7::gen_id());
-        let memory_consumer =
-            MemoryConsumer::new_local(&buffer_topic, super::PERF_TEST_MESSAGE_COUNT * 2);
-        let memory_channel = memory_consumer.channel();
-
-        // Spawn background task to drain HTTP consumer into memory consumer
-        // Clone the sender ahead of time so we don't partially move `memory_channel`
-        let forward_sender = memory_channel.sender.clone();
-        let task = tokio::spawn(async move {
             while let Ok(batch) = http_consumer.receive_batch(100).await {
                 let count = batch.messages.len();
-                if count > 0 {
-                    // Forward to memory channel in background so a full buffer doesn't
-                    // block the HTTP request/response path (prevents bench hangs).
-                    let msgs = batch.messages;
-                    let sender = forward_sender.clone();
-                    tokio::spawn(async move {
-                        let _ = sender.send(msgs).await;
-                    });
-                    // Ack immediately to unblock HTTP response
+                if count > 0 && mem_publisher.send_batch(batch.messages).await.is_ok() {
                     let _ = (batch.commit)(vec![MessageDisposition::Ack; count]).await;
                 }
             }
         });
 
-        // Spawn a lightweight diagnostics task to print memory-channel depth and
-        // process FD count periodically. This helps CI artifacts show whether
-        // the bench is experiencing socket/FD growth or backpressure.
-        let diag_channel = memory_channel.clone();
-        tokio::spawn(async move {
-            let pid = std::process::id();
-            loop {
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                let pending = diag_channel.len();
-                let capacity = diag_channel.sender.capacity().unwrap_or(0);
-                // compute fd count in a blocking task (may not be available on all platforms)
-                let fd_count: Option<usize> = tokio::task::spawn_blocking(move || {
-                    // Try /proc/self/fd first (Linux), fall back to `lsof -p PID` if available
-                    if let Ok(rd) = std::fs::read_dir("/proc/self/fd") {
-                        return Some(rd.count());
-                    }
-                    if let Ok(out) = std::process::Command::new("lsof")
-                        .arg("-p")
-                        .arg(pid.to_string())
-                        .output()
-                    {
-                        if out.status.success() {
-                            let s = String::from_utf8_lossy(&out.stdout);
-                            return Some(s.lines().count());
-                        }
-                    }
-                    None
-                })
-                .await
-                .unwrap_or_default();
-
-                println!(
-                    "BENCH-DIAG pid={} mem_pending={} mem_capacity={} fd_count={:?}",
-                    pid, pending, capacity, fd_count
-                );
-            }
-        });
-
-        Arc::new(Mutex::new(HttpBenchConsumer {
-            inner: memory_consumer,
-            task: Some(task),
-        }))
+        Arc::new(Mutex::new(mem_consumer))
     }
 
     pub async fn create_publisher() -> Arc<dyn MessagePublisher> {
@@ -730,6 +623,9 @@ pub mod http_helper {
         };
         let config = HttpConfig {
             url,
+            request_timeout_ms: Some(10000),
+            pool_idle_timeout_ms: Some(1000),
+            tcp_keepalive_ms: Some(1000),
             ..Default::default()
         };
         Arc::new(HttpPublisher::new(&config).await.unwrap())
@@ -932,24 +828,12 @@ pub mod grpc_helper {
             let pid = std::process::id();
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                let fd_count: Option<usize> = tokio::task::spawn_blocking(move || {
-                    if let Ok(rd) = std::fs::read_dir("/proc/self/fd") {
-                        return Some(rd.count());
-                    }
-                    if let Ok(out) = std::process::Command::new("lsof")
-                        .arg("-p")
-                        .arg(pid.to_string())
-                        .output()
-                    {
-                        if out.status.success() {
-                            let s = String::from_utf8_lossy(&out.stdout);
-                            return Some(s.lines().count());
-                        }
-                    }
+                // compute fd count efficiently if possible
+                let fd_count: Option<usize> = if let Ok(rd) = std::fs::read_dir("/proc/self/fd") {
+                    Some(rd.count())
+                } else {
                     None
-                })
-                .await
-                .unwrap_or_default();
+                };
 
                 println!(
                     "BENCH-DIAG-GRPC pid={} url={} fd_count={:?}",

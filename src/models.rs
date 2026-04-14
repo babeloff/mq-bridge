@@ -1528,6 +1528,8 @@ pub struct HttpConfig {
     #[serde(default)]
     pub compression_threshold_bytes: Option<usize>,
     /// HTTP Basic Authentication credentials (username, password). For consumers: validates incoming requests. For publishers: adds Authorization header.
+    /// (Consumer only) Maximum number of concurrent requests to handle. Defaults to 100.
+    pub concurrency_limit: Option<usize>,
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
