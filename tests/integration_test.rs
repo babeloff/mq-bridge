@@ -161,7 +161,9 @@ async fn test_all_chaos() {
     {
         if should_run("sqlx") {
             println!("\n\n>>> Starting SQLx Chaos Test...");
-            integration::sqlx::test_sqlx_chaos().await;
+            integration::postgres::test_postgres_chaos().await;
+            integration::mariadb::test_mariadb_chaos().await;
+            integration::mysql::test_mysql_chaos().await;
         }
     }
 }
@@ -224,7 +226,10 @@ async fn test_all_status() {
     {
         if should_run("sqlx") {
             println!("\n\n>>> Starting SQLx Status Test...");
-            integration::sqlx::test_sqlx_status().await;
+            integration::postgres::test_postgres_status().await;
+            integration::mariadb::test_mariadb_status().await;
+            integration::sqlite::test_sqlite_status().await;
+            integration::mysql::test_mysql_status().await;
         }
     }
 
@@ -316,6 +321,16 @@ async fn test_all_performance_pipeline() {
             integration::http::test_http_performance_pipeline().await;
         }
     }
+    #[cfg(feature = "sqlx")]
+    {
+        if should_run("sqlx") {
+            println!("\n\n>>> Starting Sqlx Performance Pipeline Test...");
+            integration::postgres::test_postgres_pipeline().await;
+            integration::mysql::test_mysql_pipeline().await;
+            integration::mariadb::test_mariadb_pipeline().await;
+            integration::sqlite::test_sqlite_pipeline().await;
+        }
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -384,7 +399,10 @@ async fn test_all_performance_direct() {
     {
         if should_run("sqlx") {
             println!("\n\n>>> Starting SQLx Direct Performance Test...");
-            integration::sqlx::test_sqlx_performance_direct().await;
+            integration::postgres::test_postgres_performance_direct().await;
+            integration::mariadb::test_mariadb_performance_direct().await;
+            integration::sqlite::test_sqlite_performance_direct().await;
+            integration::mysql::test_mysql_performance_direct().await;
         }
     }
     // The summary table will be printed here when `_summary_printer` is dropped.

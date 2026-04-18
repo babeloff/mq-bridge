@@ -3,32 +3,42 @@
 
 use mq_bridge::endpoints::sqlx::{SqlxConsumer, SqlxPublisher};
 use mq_bridge::test_utils::{
-    add_performance_result, run_direct_perf_test, run_pipeline_test, setup_logging,
-    PERF_TEST_MESSAGE_COUNT,
+    add_performance_result, run_direct_perf_test, run_performance_pipeline_test,
+    run_pipeline_test, setup_logging, PERF_TEST_MESSAGE_COUNT,
 };
 use std::sync::Arc;
 
 const TABLE_NAME: &str = "messages";
 
-fn db_file_path() -> std::path::PathBuf {
+fn db_file_path(id: &str) -> std::path::PathBuf {
     let mut p = std::env::temp_dir();
-    p.push("mq_bridge_test_sqlite.db");
+    // Using unique file names per test prevents lock contention and race conditions
+    // when tests are run in parallel.
+    p.push(format!("mq_bridge_test_sqlite_{}.db", id));
     p
 }
 
-fn db_url() -> String {
-    format!("sqlite://{}", db_file_path().display())
+fn db_url(id: &str) -> String {
+    format!("sqlite://{}?mode=rwc", db_file_path(id).display())
 }
 
-async fn setup_db() {
-    let db_path = db_file_path();
+async fn setup_db(id: &str) {
+    let db_path = db_file_path(id);
     let _ = std::fs::remove_file(&db_path);
     if let Some(parent) = db_path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
     let _ = std::fs::File::create(&db_path);
+
+    // Manually enable WAL mode to ensure high performance during tests.
+    // journal_mode=WAL is persistent in the database file header.
+    let url = db_url(id);
+    if let Ok(mut conn) = <sqlx::SqliteConnection as sqlx::Connection>::connect(&url).await {
+        let _ = sqlx::query("PRAGMA journal_mode=WAL;").execute(&mut conn).await;
+    }
+
     let config = mq_bridge::models::SqlxConfig {
-        url: db_url(),
+        url: db_url(id),
         table: TABLE_NAME.to_string(),
         auto_create_table: true,
         ..Default::default()
@@ -38,7 +48,7 @@ async fn setup_db() {
 
 const CONFIG_YAML: &str = r#"
 routes:
-    memory_to_sqlx:
+    memory_to_sqlite:
         concurrency: 4
         batch_size: 128
         input:
@@ -48,7 +58,7 @@ routes:
                 url: "{db_url}"
                 table: "messages"
 
-    sqlx_to_memory:
+    sqlite_to_memory:
         concurrency: 4
         batch_size: 128
         input:
@@ -63,21 +73,33 @@ routes:
 
 pub async fn test_sqlite_pipeline() {
     setup_logging();
-    setup_db().await;
+    setup_db("pipeline").await;
     let config_yaml = CONFIG_YAML
         .replace(
             "{out_capacity}",
             &(PERF_TEST_MESSAGE_COUNT + 1000).to_string(),
         )
-        .replace("{db_url}", &db_url());
-    run_pipeline_test("sqlx", &config_yaml).await;
+        .replace("{db_url}", &db_url("pipeline"));
+    run_pipeline_test("sqlite", &config_yaml).await;
+}
+
+pub async fn test_sqlite_performance_pipeline() {
+    setup_logging();
+    setup_db("perf_pipeline").await;
+    let config_yaml = CONFIG_YAML
+        .replace(
+            "{out_capacity}",
+            &(PERF_TEST_MESSAGE_COUNT + 1000).to_string(),
+        )
+        .replace("{db_url}", &db_url("perf_pipeline"));
+    run_performance_pipeline_test("sqlite", &config_yaml, PERF_TEST_MESSAGE_COUNT).await;
 }
 
 pub async fn test_sqlite_performance_direct() {
     setup_logging();
-    setup_db().await;
+    setup_db("direct").await;
     let config = mq_bridge::models::SqlxConfig {
-        url: db_url(),
+        url: db_url("direct"),
         table: TABLE_NAME.to_string(),
         delete_after_read: true,
         polling_interval_ms: Some(1),
@@ -101,4 +123,24 @@ pub async fn test_sqlite_performance_direct() {
     .await;
 
     add_performance_result(result);
+}
+
+pub async fn test_sqlite_status() {
+    use mq_bridge::traits::{MessageConsumer, MessagePublisher};
+
+    setup_logging();
+    setup_db("status").await;
+    let config = mq_bridge::models::SqlxConfig {
+        url: db_url("status"),
+        table: TABLE_NAME.to_string(),
+        ..Default::default()
+    };
+
+    let publisher = SqlxPublisher::new(&config).await.unwrap();
+    let consumer = SqlxConsumer::new(&config).await.unwrap();
+
+    let pub_status = publisher.status().await;
+    let con_status = consumer.status().await;
+    assert!(pub_status.healthy);
+    assert!(con_status.healthy);
 }
