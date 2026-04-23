@@ -38,6 +38,12 @@ use uuid::Uuid;
 
 type HttpSourceMessage = (CanonicalMessage, CommitFunc);
 
+#[derive(Clone, Default)]
+struct HttpConnInfo {
+    cipher_suite: Option<String>,
+    protocol_version: Option<String>,
+}
+
 type BoxBody = http_body_util::combinators::BoxBody<Bytes, anyhow::Error>;
 use hyper::service::Service;
 fn full<T: Into<Bytes>>(chunk: T) -> BoxBody {
@@ -79,6 +85,7 @@ struct HttpConsumerState {
     compression_threshold_bytes: usize,
     custom_headers: HashMap<String, String>,
     concurrency_limit: Arc<tokio::sync::Semaphore>,
+    method: Option<hyper::Method>,
 }
 
 /// A `hyper::Service` that can be nested into other services (like Axum).
@@ -86,6 +93,7 @@ struct HttpConsumerState {
 #[derive(Clone)]
 pub struct HttpBridgeService {
     state: HttpConsumerState,
+    conn_info: HttpConnInfo,
 }
 
 impl Service<Request<Incoming>> for HttpBridgeService {
@@ -96,14 +104,18 @@ impl Service<Request<Incoming>> for HttpBridgeService {
     fn call(&self, req: Request<Incoming>) -> Self::Future {
         // The service_fn in the original code did this clone, so it's correct.
         let state = self.state.clone();
-        Box::pin(handle_request(state, req))
+        let conn_info = self.conn_info.clone();
+        Box::pin(handle_request(state, conn_info, req))
     }
 }
 
 impl HttpConsumer {
     pub async fn new(config: &HttpConfig) -> anyhow::Result<Self> {
         let (request_rx, state, buffer_size) = setup_http_state_and_channel(config)?;
-        let service = HttpBridgeService { state };
+        let service = HttpBridgeService {
+            state,
+            conn_info: HttpConnInfo::default(),
+        };
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
 
         // --- Standalone Server Logic ---
@@ -127,7 +139,7 @@ impl HttpConsumer {
         let bound_addr = listener.local_addr().ok();
         let listener = Arc::new(listener);
 
-        if is_tls_server_configured(&tls_config) {
+        if tls_config.is_tls_server_configured() {
             info!("Starting HTTPS source on {} with {} workers", addr, workers);
             spawn_tls_server(listener, service, shutdown_rx, &tls_config, workers).await?;
         } else {
@@ -139,7 +151,7 @@ impl HttpConsumer {
             request_rx,
             _shutdown_tx: shutdown_tx,
             buffer_size,
-            url: config.url.clone(),
+            url: config.tls.normalize_url(&config.url, true),
             bound_addr,
         })
     }
@@ -163,6 +175,12 @@ fn setup_http_state_and_channel(
     let request_timeout =
         std::time::Duration::from_millis(config.request_timeout_ms.unwrap_or(30000));
     let compression_threshold_bytes = config.compression_threshold_bytes.unwrap_or(1024);
+
+    let method = config
+        .method
+        .as_deref()
+        .and_then(|m| hyper::Method::from_bytes(m.as_bytes()).ok());
+
     let state = HttpConsumerState {
         tx: request_tx,
         message_id_header,
@@ -175,6 +193,7 @@ fn setup_http_state_and_channel(
         concurrency_limit: Arc::new(tokio::sync::Semaphore::new(
             config.concurrency_limit.unwrap_or(100).max(1),
         )),
+        method,
     };
     Ok((request_rx, state, buffer_size))
 }
@@ -202,13 +221,14 @@ async fn spawn_http_server(
                         match result {
                             Ok((socket, _)) => {
                                 let _ = socket.set_nodelay(true);
-                                let service = service.clone();
+                                let mut conn_service = service.clone();
+                                conn_service.conn_info = HttpConnInfo::default();
                                 tokio::spawn(async move {
                                     let io = TokioIo::new(socket);
                                     let mut builder = AutoBuilder::new(TokioExecutor::new());
                                     builder.http1().keep_alive(true);
                                     builder.http2().max_concurrent_streams(200);
-                                    let conn = builder.serve_connection_with_upgrades(io, service).await;
+                                    let conn = builder.serve_connection_with_upgrades(io, conn_service).await;
                                     if let Err(e) = conn {
                                         trace!("Connection error: {}", e);
                                     }
@@ -270,16 +290,22 @@ async fn spawn_tls_server(
                     result = listener.accept() => {
                         match result {
                             Ok((socket, _)) => {
-                                let service = service.clone();
                                 let acceptor = acceptor.clone();
+                                let mut conn_service = service.clone();
                                 tokio::spawn(async move {
                                     match acceptor.accept(socket).await {
                                         Ok(stream) => {
+                                            let mut conn_info = HttpConnInfo::default();
+                                            let (_, session) = stream.get_ref();
+                                            conn_info.cipher_suite = session.negotiated_cipher_suite().map(|c| format!("{:?}", c.suite()));
+                                            conn_info.protocol_version = session.protocol_version().map(|v| format!("{:?}", v));
+                                            conn_service.conn_info = conn_info;
+
                                             let io = TokioIo::new(stream);
                                             let mut builder = AutoBuilder::new(TokioExecutor::new());
                                             builder.http1().keep_alive(true);
                                             builder.http2().max_concurrent_streams(200);
-                                            let conn = builder.serve_connection_with_upgrades(io, service.clone()).await;
+                                            let conn = builder.serve_connection_with_upgrades(io, conn_service).await;
 
                                             if let Err(e) = conn {
                                                 // Benign errors like "connection closed" are expected
@@ -375,6 +401,7 @@ impl MessageConsumer for HttpConsumer {
             target: self.url.clone(),
             pending: Some(self.request_rx.len()),
             capacity: Some(self.buffer_size),
+            details: serde_json::json!({ "bound_addr": self.bound_addr }),
             ..Default::default()
         }
     }
@@ -387,9 +414,10 @@ impl MessageConsumer for HttpConsumer {
 #[tracing::instrument(level = "trace", skip_all)]
 async fn handle_request(
     state: HttpConsumerState,
+    conn_info: HttpConnInfo,
     req: Request<Incoming>,
 ) -> anyhow::Result<Response<BoxBody>> {
-    match handle_request_internal(state, req).await {
+    match handle_request_internal(state, conn_info, req).await {
         Ok(res) => Ok(res),
         Err(e) => {
             tracing::error!("Internal error handling HTTP request: {}", e);
@@ -403,6 +431,7 @@ async fn handle_request(
 
 async fn handle_request_internal(
     state: HttpConsumerState,
+    conn_info: HttpConnInfo,
     req: Request<Incoming>,
 ) -> anyhow::Result<Response<BoxBody>> {
     // Acquire a permit to limit concurrent requests and prevent resource exhaustion.
@@ -412,6 +441,16 @@ async fn handle_request_internal(
         .acquire()
         .await
         .map_err(|e| anyhow!(e))?;
+
+    // Validate HTTP method if restricted in configuration
+    if let Some(ref allowed_method) = state.method {
+        if req.method() != allowed_method {
+            return Ok(Response::builder()
+                .status(StatusCode::METHOD_NOT_ALLOWED)
+                .body(full(format!("Method {} not allowed", req.method())))
+                .unwrap());
+        }
+    }
 
     if let Some((expected_user, expected_pass)) = &state.basic_auth {
         if let Some(auth_header) = req.headers().get("authorization") {
@@ -491,8 +530,15 @@ async fn handle_request_internal(
             "http_query".to_string(),
             req.uri().query().unwrap_or("").to_string(),
         ),
-        ("http_uri".to_string(), req.uri().to_string()),
+        ("http_version".to_string(), format!("{:?}", req.version())),
     ]);
+
+    if let Some(cs) = conn_info.cipher_suite {
+        metadata.insert("tls_cipher_suite".to_string(), cs);
+    }
+    if let Some(pv) = conn_info.protocol_version {
+        metadata.insert("tls_protocol_version".to_string(), pv);
+    }
 
     for (key, value) in req.headers() {
         if let Ok(v_str) = value.to_str() {
@@ -500,11 +546,7 @@ async fn handle_request_internal(
                 content_encoding = Some(v_str.to_string());
             }
             let k_str = key.as_str();
-            if k_str == "http_method"
-                || k_str == "http_path"
-                || k_str == "http_query"
-                || k_str == "http_uri"
-            {
+            if k_str == "http_method" || k_str == "http_path" || k_str == "http_query" {
                 continue;
             }
             metadata.insert(k_str.to_string(), v_str.to_string());
@@ -728,6 +770,8 @@ pub struct HttpPublisher {
         >,
     >,
     url: String,
+    /// Default HTTP method to use if not overridden by message metadata
+    method: hyper::Method,
     request_timeout: Option<std::time::Duration>,
     batch_concurrency: usize,
     compression_enabled: bool,
@@ -766,18 +810,13 @@ impl HttpPublisher {
         }
         let client = client_builder.build(https_connector);
 
-        let url = if config.url.to_lowercase().starts_with("http://")
-            || config.url.to_lowercase().starts_with("https://")
-        {
-            config.url.clone()
-        } else {
-            let scheme = if is_tls_client_configured(&config.tls) {
-                "https"
-            } else {
-                "http"
-            };
-            format!("{}://{}", scheme, config.url)
-        };
+        let url = config.tls.normalize_url(&config.url, false);
+
+        let method = config
+            .method
+            .as_deref()
+            .and_then(|m| hyper::Method::from_bytes(m.as_bytes()).ok())
+            .unwrap_or(hyper::Method::POST);
 
         let request_timeout = config
             .request_timeout_ms
@@ -788,6 +827,7 @@ impl HttpPublisher {
         Ok(Self {
             client: std::sync::Arc::new(client),
             url,
+            method,
             request_timeout,
             batch_concurrency,
             compression_enabled: config.compression_enabled,
@@ -811,7 +851,7 @@ impl MessagePublisher for HttpPublisher {
             .metadata
             .get("http_method")
             .and_then(|m| hyper::Method::from_bytes(m.as_bytes()).ok())
-            .unwrap_or(hyper::Method::POST);
+            .unwrap_or_else(|| self.method.clone());
 
         let uri = if let Some(path) = message.metadata.get("http_path") {
             let base_uri = self.url.parse::<hyper::Uri>().map_err(|e| {
@@ -855,11 +895,7 @@ impl MessagePublisher for HttpPublisher {
         let mut request_builder = Request::builder().method(method).uri(uri);
 
         for (key, value) in &message.metadata {
-            if key == "http_method"
-                || key == "http_path"
-                || key == "http_query"
-                || key == "http_uri"
-            {
+            if key == "http_method" || key == "http_path" || key == "http_query" {
                 continue;
             }
             request_builder = request_builder.header(key, value);
@@ -916,6 +952,10 @@ impl MessagePublisher for HttpPublisher {
 
         let response_status = response.status();
         let mut response_metadata = HashMap::new();
+        response_metadata.insert(
+            "http_version".to_string(),
+            format!("{:?}", response.version()),
+        );
         let mut content_encoding = None;
         for (key, value) in response.headers() {
             if let Ok(value_str) = value.to_str() {
@@ -1044,6 +1084,14 @@ impl MessagePublisher for HttpPublisher {
         }
     }
 
+    async fn status(&self) -> crate::traits::EndpointStatus {
+        crate::traits::EndpointStatus {
+            healthy: true,
+            target: self.url.clone(),
+            ..Default::default()
+        }
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -1054,19 +1102,6 @@ impl MessagePublisher for HttpPublisher {
 // NOTE: These helpers assume `TlsConfig` has fields like `cert_file`, `key_file`, `ca_file`,
 // `client_cert_file`, and `client_key_file`. You may need to adjust field names if your
 // `TlsConfig` struct in `src/models.rs` is different.
-
-/// Checks if the TLS configuration is sufficient to start a TLS server.
-fn is_tls_server_configured(tls_config: &TlsConfig) -> bool {
-    tls_config.cert_file.is_some() && tls_config.key_file.is_some()
-}
-
-/// Checks if the TLS configuration is sufficient to make a TLS client connection.
-fn is_tls_client_configured(tls_config: &TlsConfig) -> bool {
-    // A client is configured for TLS if it has a CA to trust or a client cert to present.
-    tls_config.required
-        || tls_config.ca_file.is_some()
-        || (tls_config.cert_file.is_some() && tls_config.key_file.is_some())
-}
 
 /// Creates a `rustls::ServerConfig` for the HTTPS server.
 fn create_rustls_server_config(

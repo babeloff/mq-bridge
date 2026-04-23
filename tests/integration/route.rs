@@ -864,6 +864,9 @@ async fn test_route_with_typed_handler_failure_deserialization() {
         move |msg: MyTypedMessage| async move {
             // This should not be called
             let _ = msg;
+            if false {
+                return;
+            }
             unreachable!("Handler should not be called on deserialization failure");
         },
     );
@@ -898,9 +901,10 @@ async fn test_retryable_error_without_middleware_crashes_route() {
         "my_message",
         move |_msg: MyTypedMessage| async move {
             // Use a connection error to trigger an intentional route crash/restart
-            Err(mq_bridge::HandlerError::Connection(anyhow::anyhow!(
-                "Temporary failure"
-            )))
+            let res: Result<Handled, mq_bridge::HandlerError> = Err(
+                mq_bridge::HandlerError::Connection(anyhow::anyhow!("Temporary failure")),
+            );
+            res
         },
     );
 
@@ -994,9 +998,9 @@ async fn test_route_with_typed_handler_failure_handler() {
         "my_message",
         move |msg: MyTypedMessage| async move {
             assert_eq!(msg.id, 456);
-            Err(mq_bridge::HandlerError::NonRetryable(anyhow::anyhow!(
-                "Handler failed as expected"
-            )))
+            Result::<(), mq_bridge::HandlerError>::Err(mq_bridge::HandlerError::NonRetryable(
+                anyhow::anyhow!("Handler failed as expected"),
+            ))
         },
     );
 

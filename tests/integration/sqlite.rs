@@ -3,8 +3,8 @@
 
 use mq_bridge::endpoints::sqlx::{SqlxConsumer, SqlxPublisher};
 use mq_bridge::test_utils::{
-    add_performance_result, run_direct_perf_test, run_performance_pipeline_test,
-    run_pipeline_test, setup_logging, PERF_TEST_MESSAGE_COUNT,
+    add_performance_result, run_direct_perf_test, run_performance_pipeline_test, run_pipeline_test,
+    setup_logging, PERF_TEST_MESSAGE_COUNT,
 };
 use std::sync::Arc;
 
@@ -34,7 +34,9 @@ async fn setup_db(id: &str) {
     // journal_mode=WAL is persistent in the database file header.
     let url = db_url(id);
     if let Ok(mut conn) = <sqlx::SqliteConnection as sqlx::Connection>::connect(&url).await {
-        let _ = sqlx::query("PRAGMA journal_mode=WAL;").execute(&mut conn).await;
+        let _ = sqlx::query("PRAGMA journal_mode=WAL;")
+            .execute(&mut conn)
+            .await;
     }
 
     let config = mq_bridge::models::SqlxConfig {

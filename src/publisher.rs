@@ -22,6 +22,32 @@ impl Publisher {
         Ok(Self { publisher })
     }
 
+    /// Sends a message and expects a response message from the endpoint.
+    /// Returns an error if the endpoint does not support responses (e.g. returns a simple Ack).
+    pub async fn request(&self, message: CanonicalMessage) -> anyhow::Result<CanonicalMessage> {
+        match self.publisher.send(message).await? {
+            Sent::Response(resp) => Ok(resp),
+            Sent::Ack => Err(anyhow::anyhow!("Expected a response from the endpoint, but received only an acknowledgment (Ack). Ensure the endpoint and route are correctly configured for request-reply.")),
+        }
+    }
+
+    /// Sends a batch of messages and expects a response message for each from the endpoint.
+    /// Returns an error if any message fails or if the endpoint does not support responses (e.g. returns a simple Ack).
+    pub async fn request_batch(
+        &self,
+        messages: Vec<CanonicalMessage>,
+    ) -> anyhow::Result<Vec<CanonicalMessage>> {
+        let count = messages.len();
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+        match self.publisher.send_batch(messages).await? {
+            SentBatch::Partial { responses: Some(resps), failed } if failed.is_empty() && resps.len() == count => Ok(resps),
+            SentBatch::Ack => Err(anyhow::anyhow!("Expected responses from the endpoint, but received only acknowledgments (Ack). Ensure the endpoint and route are correctly configured for request-reply.")),
+            _ => Err(anyhow::anyhow!("Request batch failed to return the expected responses. Ensure the endpoint and route are correctly configured for request-reply.")),
+        }
+    }
+
     /// Sends a message to the configured endpoint.
     pub async fn send(&self, message: CanonicalMessage) -> anyhow::Result<Sent> {
         self.publisher
@@ -154,5 +180,35 @@ mod tests {
 
         let retrieved = Publisher::get("static_pub").expect("Failed to get publisher");
         assert!(Arc::ptr_eq(&publisher.publisher, &retrieved.publisher));
+    }
+
+    #[tokio::test]
+    async fn test_publisher_request_batch() {
+        use crate::traits::{MessagePublisher, PublisherError, SentBatch};
+        use async_trait::async_trait;
+        use std::any::Any;
+
+        struct MockRR;
+        #[async_trait]
+        impl MessagePublisher for MockRR {
+            async fn send_batch(
+                &self,
+                messages: Vec<CanonicalMessage>,
+            ) -> Result<SentBatch, PublisherError> {
+                Ok(SentBatch::Partial {
+                    responses: Some(messages),
+                    failed: vec![],
+                })
+            }
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        let publisher: Publisher = MockRR.into();
+        let msgs = vec![CanonicalMessage::from("1"), CanonicalMessage::from("2")];
+        let res = publisher.request_batch(msgs).await.unwrap();
+        assert_eq!(res.len(), 2);
+        assert_eq!(res[0].get_payload_str(), "1");
     }
 }

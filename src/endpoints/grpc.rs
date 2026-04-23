@@ -35,6 +35,8 @@ const GRPC_BATCH_POLL_MS: u64 = 15; // Increased for better batching in performa
 
 pub struct GrpcConsumer {
     inner: GrpcConsumerInner,
+    url: String,
+    bound_addr: Option<std::net::SocketAddr>,
 }
 
 enum GrpcConsumerInner {
@@ -44,12 +46,22 @@ enum GrpcConsumerInner {
 
 impl GrpcConsumer {
     pub async fn new(config: &GrpcConfig) -> Result<Self> {
-        let inner = if config.server_mode {
-            GrpcConsumerInner::Server(ServerModeConsumer::new(config).await?)
+        let url = config.tls.normalize_url(&config.url, config.server_mode);
+        let (inner, bound_addr) = if config.server_mode {
+            let s = ServerModeConsumer::new(config, &url).await?;
+            let addr = s.bound_addr();
+            (GrpcConsumerInner::Server(s), Some(addr))
         } else {
-            GrpcConsumerInner::Client(Box::new(ClientModeConsumer::new(config).await?))
+            (
+                GrpcConsumerInner::Client(Box::new(ClientModeConsumer::new(config, &url).await?)),
+                None,
+            )
         };
-        Ok(Self { inner })
+        Ok(Self {
+            inner,
+            url,
+            bound_addr,
+        })
     }
 }
 
@@ -65,6 +77,15 @@ impl MessageConsumer for GrpcConsumer {
         }
     }
 
+    async fn status(&self) -> crate::traits::EndpointStatus {
+        crate::traits::EndpointStatus {
+            healthy: true,
+            target: self.url.clone(),
+            details: serde_json::json!({ "bound_addr": self.bound_addr }),
+            ..Default::default()
+        }
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -76,9 +97,9 @@ struct ClientModeConsumer {
 }
 
 impl ClientModeConsumer {
-    async fn new(config: &GrpcConfig) -> Result<Self> {
-        debug!(grpc_url = %config.url, "Creating gRPC client consumer (client mode)");
-        let endpoint = make_endpoint(config).await?;
+    async fn new(config: &GrpcConfig, url: &str) -> Result<Self> {
+        debug!(grpc_url = %url, "Creating gRPC client consumer (client mode)");
+        let endpoint = make_endpoint(config, url).await?;
         let mut client = BridgeClient::new(endpoint.connect().await?);
         let topic = config
             .topic
@@ -94,7 +115,7 @@ impl ClientModeConsumer {
             client.subscribe(request).await?
         }
         .into_inner();
-        info!(grpc_url = %config.url, "gRPC client consumer connected and subscription started");
+        info!(grpc_url = %url, "gRPC client consumer connected and subscription started");
         Ok(Self {
             _client: client,
             stream,
@@ -164,6 +185,7 @@ async fn receive_from_stream(
 
 struct ServerModeConsumer {
     _handle: tokio::task::JoinHandle<()>,
+    bound_addr: std::net::SocketAddr,
     rx: mpsc::Receiver<BridgeMessage>,
 }
 
@@ -294,8 +316,8 @@ impl proto::bridge_server::Bridge for BridgeService {
 }
 
 impl ServerModeConsumer {
-    async fn new(config: &GrpcConfig) -> Result<Self> {
-        let addr = parse_addr(&config.url)?;
+    async fn new(config: &GrpcConfig, url: &str) -> Result<Self> {
+        let addr = parse_addr(url)?;
         let (tx, _) = broadcast::channel(1024);
         let (queue_tx, rx) = mpsc::channel(16 * 1024);
 
@@ -365,8 +387,13 @@ impl ServerModeConsumer {
 
         Ok(Self {
             _handle: handle,
+            bound_addr: local,
             rx,
         })
+    }
+
+    fn bound_addr(&self) -> std::net::SocketAddr {
+        self.bound_addr
     }
 }
 
@@ -420,6 +447,7 @@ impl MessageConsumer for ServerModeConsumer {
 
 pub struct GrpcPublisher {
     client: BridgeClient<Channel>,
+    url: String,
     timeout: Option<Duration>,
     topic: Option<String>,
 }
@@ -428,10 +456,12 @@ impl GrpcPublisher {
     pub async fn new(config: &GrpcConfig) -> Result<Self> {
         // Use a lazy channel so the publisher route can start before a server-mode
         // gRPC consumer has finished binding its embedded listener.
-        let endpoint = make_endpoint(config).await?;
+        let url = config.tls.normalize_url(&config.url, false);
+        let endpoint = make_endpoint(config, &url).await?;
         let client = BridgeClient::new(endpoint.connect_lazy());
         Ok(Self {
             client,
+            url,
             timeout: config.timeout_ms.map(Duration::from_millis),
             topic: Some(
                 config
@@ -587,6 +617,14 @@ impl MessagePublisher for GrpcPublisher {
         }
     }
 
+    async fn status(&self) -> crate::traits::EndpointStatus {
+        crate::traits::EndpointStatus {
+            healthy: true,
+            target: self.url.clone(),
+            ..Default::default()
+        }
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -607,8 +645,8 @@ fn bridge_to_canonical(msg: BridgeMessage) -> CanonicalMessage {
     CanonicalMessage::new(msg.payload, message_id).with_metadata(msg.metadata)
 }
 
-async fn make_endpoint(config: &GrpcConfig) -> Result<tonic::transport::Endpoint> {
-    let mut endpoint = tonic::transport::Endpoint::from_shared(config.url.clone())?;
+async fn make_endpoint(config: &GrpcConfig, url: &str) -> Result<tonic::transport::Endpoint> {
+    let mut endpoint = tonic::transport::Endpoint::from_shared(url.to_string())?;
 
     if config.tls.required {
         let mut tls_config = ClientTlsConfig::new();

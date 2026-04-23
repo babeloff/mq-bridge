@@ -1498,6 +1498,8 @@ impl GrpcConfig {
 pub struct HttpConfig {
     /// For consumers, the listen address (e.g., "0.0.0.0:8080"). For publishers, the target URL.
     pub url: String,
+    /// (Optional) HTTP method. For publishers: the method to use (defaults to POST). For consumers: restrict to this method (others return 405).
+    pub method: Option<String>,
     /// TLS configuration.
     #[serde(default)]
     pub tls: TlsConfig,
@@ -1590,6 +1592,11 @@ impl HttpConfig {
 
     pub fn with_workers(mut self, workers: usize) -> Self {
         self.workers = Some(workers);
+        self
+    }
+
+    pub fn with_method(mut self, method: impl Into<String>) -> Self {
+        self.method = Some(method.into());
         self
     }
 }
@@ -1824,6 +1831,28 @@ impl TlsConfig {
     /// Checks if TLS server certificate authentication is configured.
     pub fn is_tls_server_configured(&self) -> bool {
         self.cert_file.is_some() && self.key_file.is_some()
+    }
+
+    /// Checks if the TLS configuration is sufficient to make a TLS client connection.
+    pub fn is_tls_client_configured(&self) -> bool {
+        self.required
+            || self.ca_file.is_some()
+            || (self.cert_file.is_some() && self.key_file.is_some())
+    }
+
+    /// Helper to normalize a URL by adding the appropriate scheme prefix (http:// or https://) if missing.
+    pub fn normalize_url(&self, url: &str, is_consumer: bool) -> String {
+        if url.to_lowercase().starts_with("http://") || url.to_lowercase().starts_with("https://") {
+            url.to_string()
+        } else {
+            let is_tls = if is_consumer {
+                self.is_tls_server_configured()
+            } else {
+                self.is_tls_client_configured()
+            };
+            let scheme = if is_tls { "https" } else { "http" };
+            format!("{}://{}", scheme, url)
+        }
     }
 }
 

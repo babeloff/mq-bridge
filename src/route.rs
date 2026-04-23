@@ -431,9 +431,20 @@ impl Route {
                     let batch_len = received_batch.messages.len();
                     message_ids.clear();
                     message_ids.extend(received_batch.messages.iter().map(|m| m.message_id));
+                    let request_ids: std::collections::HashSet<u128> = received_batch
+                        .messages
+                        .iter()
+                        .filter(|m| m.metadata.contains_key("reply_to"))
+                        .map(|m| m.message_id)
+                        .collect();
 
                     match publisher.send_batch(received_batch.messages).await {
                         Ok(SentBatch::Ack) => {
+                            for id in &message_ids {
+                                if request_ids.contains(id) {
+                                    warn!("Message {:032x} expected a reply (reply_to set), but publisher returned Ack. Response loop broken.", id);
+                                }
+                            }
                             let commit = commit_opt.take().expect("Commit already used");
                             let err_tx = err_tx.clone();
                             commit_tasks.spawn(async move {
@@ -466,7 +477,7 @@ impl Route {
                                 // Ack/nack the batch to fill the sequencer slot.
                                 let commit = commit_opt.take().expect("Commit already used");
                                 let dispositions =
-                                    map_responses_to_dispositions(&message_ids, responses, &failed);
+                                    map_responses_to_dispositions(&message_ids, responses, &failed, &request_ids);
                                 if let Err(commit_err) = commit(dispositions).await {
                                     warn!("Commit after transient failure also failed: {}", commit_err);
                                 }
@@ -484,8 +495,9 @@ impl Route {
                             let commit = commit_opt.take().expect("Commit already used");
                             let err_tx = err_tx.clone();
                             let ids = std::mem::take(&mut message_ids);
+                            let req_ids = request_ids;
                             commit_tasks.spawn(async move {
-                                let dispositions = map_responses_to_dispositions(&ids, responses, &failed);
+                                let dispositions = map_responses_to_dispositions(&ids, responses, &failed, &req_ids);
                                 if let Err(e) = commit(dispositions).await {
                                     error!("Commit failed: {}", e);
                                     match err_tx.try_send(e) {
@@ -573,8 +585,19 @@ impl Route {
                     let batch_len = messages.len();
                     message_ids.clear();
                     message_ids.extend(messages.iter().map(|m| m.message_id));
+                    let request_ids: std::collections::HashSet<u128> = messages
+                        .iter()
+                        .filter(|m| m.metadata.contains_key("reply_to"))
+                        .map(|m| m.message_id)
+                        .collect();
+
                     match publisher.send_batch(messages).await {
                         Ok(SentBatch::Ack) => {
+                            for id in &message_ids {
+                                if request_ids.contains(id) {
+                                    warn!("Message {:032x} expected a reply (reply_to set), but publisher returned Ack. Response loop broken.", id);
+                                }
+                            }
                             let commit = commit_opt.take().expect("Commit already used");
                             let err_tx = err_tx.clone();
                             commit_tasks.spawn(async move {
@@ -605,7 +628,7 @@ impl Route {
                                 let commit = commit_opt.take().expect("Commit already used");
                                 // Ack/nack the batch to fill the sequencer slot.
                                 let dispositions =
-                                    map_responses_to_dispositions(&message_ids, responses, &failed);
+                                    map_responses_to_dispositions(&message_ids, responses, &failed, &request_ids);
                                 if let Err(commit_err) = commit(dispositions).await {
                                     warn!("Commit after transient failure also failed: {}", commit_err);
                                 }
@@ -627,8 +650,9 @@ impl Route {
                             let commit = commit_opt.take().expect("Commit already used");
                             let err_tx = err_tx.clone();
                             let ids = std::mem::take(&mut message_ids);
+                            let req_ids = request_ids;
                             commit_tasks.spawn(async move {
-                                let dispositions = map_responses_to_dispositions(&ids, responses, &failed);
+                                let dispositions = map_responses_to_dispositions(&ids, responses, &failed, &req_ids);
                                 if let Err(e) = commit(dispositions).await {
                                     error!("Commit failed: {}", e);
                                     match err_tx.try_send(e) {
@@ -798,17 +822,14 @@ impl Route {
     /// # Examples
     ///
     /// ```
-    /// # use mq_bridge::{Route, models::Endpoint, Handled, HandlerError};
+    /// # use mq_bridge::{Route, models::Endpoint};
     /// # use serde::Deserialize;
-    /// # use std::sync::Arc;
     ///
     /// #[derive(Deserialize)]
-    /// struct MyData {
-    ///     id: u32,
-    /// }
+    /// struct MyData { id: u32 }
     ///
-    /// async fn my_handler(data: MyData) -> Result<Handled, HandlerError> {
-    ///     Ok(Handled::Ack)
+    /// async fn my_handler(data: MyData) -> anyhow::Result<()> {
+    ///     Ok(())
     /// }
     ///
     /// let route = Route::new(Endpoint::new_memory("in", 10), Endpoint::new_memory("out", 10))
@@ -957,6 +978,7 @@ fn map_responses_to_dispositions(
     message_ids: &[u128],
     responses: Option<Vec<crate::CanonicalMessage>>,
     failed: &[(crate::CanonicalMessage, PublisherError)],
+    request_ids: &std::collections::HashSet<u128>,
 ) -> Vec<MessageDisposition> {
     let mut dispositions = Vec::with_capacity(message_ids.len());
     let failed_ids: std::collections::HashSet<u128> =
@@ -976,6 +998,9 @@ fn map_responses_to_dispositions(
             // If a response exists for this specific ID, use it.
             dispositions.push(MessageDisposition::Reply(resp));
         } else {
+            if request_ids.contains(id) {
+                warn!("Message {:032x} expected a reply (reply_to set), but publisher returned Ack. Response loop might be broken.", id);
+            }
             // Otherwise, it was a successful send that did not produce a response.
             dispositions.push(MessageDisposition::Ack);
         }
@@ -1004,7 +1029,9 @@ fn test_map_responses_to_dispositions_logic() {
     msg2.message_id = 2;
     let failed = vec![(msg2, PublisherError::NonRetryable(anyhow!("failed")))];
 
-    let dispositions = map_responses_to_dispositions(&ids, responses, &failed);
+    let mut request_ids = std::collections::HashSet::new();
+    request_ids.insert(3); // id 3 expects a reply but won't get one
+    let dispositions = map_responses_to_dispositions(&ids, responses, &failed, &request_ids);
 
     assert_eq!(dispositions.len(), 4);
     assert!(matches!(dispositions[0], MessageDisposition::Reply(_))); // from responses
@@ -1034,7 +1061,7 @@ mod tests {
     };
     use crate::CanonicalMessage;
     use std::any::Any;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -1625,7 +1652,6 @@ mod tests {
     }
 
     use crate::traits::{CustomEndpointFactory, Sent};
-    use std::sync::atomic::AtomicUsize;
     use std::sync::Mutex;
 
     type ConsumerBehavior =

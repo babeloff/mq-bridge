@@ -206,8 +206,15 @@ pub trait MessagePublisher: Send + Sync + 'static {
     ) -> Result<SentBatch, PublisherError>;
 
     async fn send(&self, message: CanonicalMessage) -> Result<Sent, PublisherError> {
+        let message_id = message.message_id;
+        let expects_reply = message.metadata.contains_key("reply_to");
         match self.send_batch(vec![message]).await {
-            Ok(SentBatch::Ack) => Ok(Sent::Ack),
+            Ok(SentBatch::Ack) => {
+                if expects_reply {
+                    warn!("Message {:032x} expected a reply (reply_to set), but publisher returned Ack. Response loop might be broken.", message_id);
+                }
+                Ok(Sent::Ack)
+            }
             Ok(SentBatch::Partial {
                 mut responses,
                 mut failed,
@@ -217,6 +224,9 @@ pub trait MessagePublisher: Send + Sync + 'static {
                 } else if let Some(res) = responses.as_mut().and_then(|r| r.pop()) {
                     Ok(Sent::Response(res))
                 } else {
+                    if expects_reply {
+                        warn!("Message {:032x} expected a reply (reply_to set), but publisher returned Ack. Response loop might be broken.", message_id);
+                    }
                     Ok(Sent::Ack)
                 }
             }
