@@ -331,7 +331,9 @@ fn request_accepts_text(headers: &hyper::HeaderMap) -> bool {
 }
 
 fn has_content_type_header(headers: &HashMap<String, String>) -> bool {
-    headers.keys().any(|key| key.eq_ignore_ascii_case("content-type"))
+    headers
+        .keys()
+        .any(|key| key.eq_ignore_ascii_case("content-type"))
 }
 
 fn text_error_response(
@@ -1120,14 +1122,12 @@ fn make_response(
             }
             Ok(builder.body(full("Message processed")).unwrap())
         }
-        MessageDisposition::Nack => {
-            Ok(text_error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Message processing failed",
-                accepts_text,
-                Some(&custom_headers),
-            ))
-        }
+        MessageDisposition::Nack => Ok(text_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Message processing failed",
+            accepts_text,
+            Some(&custom_headers),
+        )),
     }
 }
 
@@ -1707,13 +1707,19 @@ http_route:
     fn test_guess_content_type_from_extension() {
         assert_eq!(guess_content_type("html"), "text/html; charset=utf-8");
         assert_eq!(guess_content_type(".woff2"), "font/woff2");
-        assert_eq!(guess_content_type("JSON"), "application/json; charset=utf-8");
+        assert_eq!(
+            guess_content_type("JSON"),
+            "application/json; charset=utf-8"
+        );
     }
 
     #[test]
     fn test_guess_content_type_unknown_defaults_to_octet_stream() {
         assert_eq!(guess_content_type(""), "application/octet-stream");
-        assert_eq!(guess_content_type("unknown-ext"), "application/octet-stream");
+        assert_eq!(
+            guess_content_type("unknown-ext"),
+            "application/octet-stream"
+        );
         assert_eq!(
             guess_content_type("archive.custombin"),
             "application/octet-stream"
@@ -1745,12 +1751,7 @@ http_route:
 
     #[test]
     fn test_text_error_response_sets_text_content_type_when_accepted() {
-        let response = text_error_response(
-            StatusCode::BAD_REQUEST,
-            "bad request",
-            true,
-            None,
-        );
+        let response = text_error_response(StatusCode::BAD_REQUEST, "bad request", true, None);
 
         assert_eq!(
             response.headers().get(CONTENT_TYPE).unwrap(),
@@ -1760,12 +1761,7 @@ http_route:
 
     #[test]
     fn test_text_error_response_skips_text_content_type_when_not_accepted() {
-        let response = text_error_response(
-            StatusCode::BAD_REQUEST,
-            "bad request",
-            false,
-            None,
-        );
+        let response = text_error_response(StatusCode::BAD_REQUEST, "bad request", false, None);
 
         assert!(response.headers().get(CONTENT_TYPE).is_none());
     }
@@ -1773,14 +1769,13 @@ http_route:
     #[test]
     fn test_text_error_response_preserves_custom_content_type() {
         let mut headers = HashMap::new();
-        headers.insert("content-type".to_string(), "application/problem+json".to_string());
-
-        let response = text_error_response(
-            StatusCode::BAD_REQUEST,
-            "bad request",
-            true,
-            Some(&headers),
+        headers.insert(
+            "content-type".to_string(),
+            "application/problem+json".to_string(),
         );
+
+        let response =
+            text_error_response(StatusCode::BAD_REQUEST, "bad request", true, Some(&headers));
 
         assert_eq!(
             response.headers().get(CONTENT_TYPE).unwrap(),

@@ -112,7 +112,7 @@ tonic-prost-build = { version = "0.14", optional = true, default-features = fals
 protoc-bin-vendored = { version = "3.0", optional = true }
 
 [features]
-default = ["full"]
+default = []
 middleware = ["metrics", "dedup"]
 full = ["middleware", "mongodb", "kafka", "amqp", "nats", "mqtt", "http", "aws", "zeromq", "sled", "grpc", "sqlx", "rustls-aws-lc"]
 
