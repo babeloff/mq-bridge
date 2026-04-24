@@ -771,6 +771,12 @@ fn check_publisher_recursive(
 
         #[cfg(feature = "http")]
         EndpointType::Http(_cfg) => {
+            if _cfg.path.is_some() {
+                warnings.push(
+                    "Endpoint 'http' is used as a publisher, but 'path' is a consumer-only option and will be ignored."
+                    .to_string()
+                );
+            }
             if _cfg.workers.is_some() {
                 warnings.push(
                     "Endpoint 'http' is used as a publisher, but 'workers' is a consumer-only option and will be ignored."

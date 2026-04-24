@@ -1498,6 +1498,8 @@ impl GrpcConfig {
 pub struct HttpConfig {
     /// For consumers, the listen address (e.g., "0.0.0.0:8080"). For publishers, the target URL.
     pub url: String,
+    /// (Consumer only) Optional request path filter. If set, only requests whose URI path matches exactly are delivered to this consumer.
+    pub path: Option<String>,
     /// (Optional) HTTP method. For publishers: the method to use (defaults to POST). For consumers: restrict to this method (others return 405).
     pub method: Option<String>,
     /// TLS configuration.
@@ -1775,7 +1777,7 @@ pub struct SqlxConfig {
 ///     ..Default::default()
 /// };
 /// ```
-#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+#[derive(Debug, Deserialize, Serialize, Clone, Default, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct TlsConfig {

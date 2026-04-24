@@ -9,6 +9,9 @@ use crate::CanonicalMessage;
 use anyhow::Result;
 use async_trait::async_trait;
 use std::any::Any;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use tonic::transport::Channel;
 use tracing::{debug, error, info, trace, warn};
@@ -184,7 +187,8 @@ async fn receive_from_stream(
 // ── Embedded gRPC server (server_mode) ────────────────────────────────────────
 
 struct ServerModeConsumer {
-    _handle: tokio::task::JoinHandle<()>,
+    route_id: u64,
+    shared_server: Arc<SharedGrpcServer>,
     bound_addr: std::net::SocketAddr,
     rx: mpsc::Receiver<BridgeMessage>,
 }
@@ -192,8 +196,119 @@ struct ServerModeConsumer {
 /// Tonic service implementation that fans incoming messages into a subscriber
 /// broadcast stream and a reliable internal queue for the server-mode consumer.
 struct BridgeService {
+    router: Arc<SharedGrpcRouter>,
+}
+
+struct SharedGrpcRouter {
+    routes: Mutex<HashMap<u64, SharedGrpcRoute>>,
     tx: broadcast::Sender<BridgeMessage>,
-    queue_tx: mpsc::Sender<BridgeMessage>,
+}
+
+#[derive(Clone)]
+struct SharedGrpcRoute {
+    topic: String,
+    tx: mpsc::Sender<BridgeMessage>,
+}
+
+struct SharedGrpcServer {
+    router: Arc<SharedGrpcRouter>,
+    handle: tokio::task::JoinHandle<()>,
+    bound_addr: std::net::SocketAddr,
+}
+
+#[derive(Clone, Hash, PartialEq, Eq)]
+struct GrpcServerKey {
+    listen_addr: String,
+    tls: crate::models::TlsConfig,
+    timeout_ms: Option<u64>,
+    initial_stream_window_size: Option<u32>,
+    initial_connection_window_size: Option<u32>,
+    concurrency_limit_per_connection: Option<usize>,
+    http2_keepalive_interval_ms: Option<u64>,
+    http2_keepalive_timeout_ms: Option<u64>,
+    max_decoding_message_size: Option<usize>,
+}
+
+static GRPC_SERVER_REGISTRY: OnceLock<Mutex<HashMap<GrpcServerKey, Arc<SharedGrpcServer>>>> =
+    OnceLock::new();
+static GRPC_ROUTE_ID: AtomicU64 = AtomicU64::new(1);
+
+fn grpc_server_registry() -> &'static Mutex<HashMap<GrpcServerKey, Arc<SharedGrpcServer>>> {
+    GRPC_SERVER_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn normalize_grpc_topic(topic: Option<&str>) -> String {
+    topic
+        .map(str::trim)
+        .filter(|topic| !topic.is_empty())
+        .unwrap_or("default")
+        .to_string()
+}
+
+impl SharedGrpcRouter {
+    fn new() -> Self {
+        let (tx, _) = broadcast::channel(1024);
+        Self {
+            routes: Mutex::new(HashMap::new()),
+            tx,
+        }
+    }
+}
+
+fn bridge_message_topic(msg: &BridgeMessage) -> String {
+    normalize_grpc_topic(msg.metadata.get("mq_bridge.topic").map(String::as_str))
+}
+
+impl SharedGrpcRouter {
+    fn register_route(
+        &self,
+        route_id: u64,
+        topic: String,
+        tx: mpsc::Sender<BridgeMessage>,
+    ) -> Result<()> {
+        let mut routes = self
+            .routes
+            .lock()
+            .map_err(|_| anyhow::anyhow!("gRPC route registry lock poisoned"))?;
+        if routes.values().any(|route| route.topic == topic) {
+            return Err(anyhow::anyhow!(
+                "Conflicting gRPC consumer registration for topic '{}'",
+                topic
+            ));
+        }
+        routes.insert(route_id, SharedGrpcRoute { topic, tx });
+        Ok(())
+    }
+
+    fn unregister_route(&self, route_id: u64) -> bool {
+        let Ok(mut routes) = self.routes.lock() else {
+            return false;
+        };
+        routes.remove(&route_id);
+        routes.is_empty()
+    }
+
+    fn route_for_topic(&self, topic: &str) -> Option<mpsc::Sender<BridgeMessage>> {
+        let Ok(routes) = self.routes.lock() else {
+            return None;
+        };
+        routes
+            .values()
+            .find(|route| route.topic == topic)
+            .map(|route| route.tx.clone())
+    }
+
+    async fn dispatch(&self, msg: BridgeMessage) -> Result<()> {
+        let topic = bridge_message_topic(&msg);
+        let _ = self.tx.send(msg.clone());
+        if let Some(route_tx) = self.route_for_topic(&topic) {
+            route_tx
+                .send(msg)
+                .await
+                .map_err(|_| anyhow::anyhow!("No active gRPC consumer for topic '{}'", topic))?;
+        }
+        Ok(())
+    }
 }
 
 #[tonic::async_trait]
@@ -204,10 +319,10 @@ impl proto::bridge_server::Bridge for BridgeService {
     ) -> Result<Response<proto::PublishResponse>, Status> {
         let msg = request.into_inner();
         let msg_id = msg.id.clone();
-        trace!(msg_id = %msg_id, "BridgeService::publish received message");
-        let _ = self.tx.send(msg.clone());
-        if self.queue_tx.send(msg).await.is_err() {
-            warn!(msg_id = %msg_id, "BridgeService::publish failed: internal server queue is closed");
+        let topic = bridge_message_topic(&msg);
+        trace!(msg_id = %msg_id, topic = %topic, "BridgeService::publish received message");
+        if self.router.dispatch(msg).await.is_err() {
+            warn!(msg_id = %msg_id, topic = %topic, "BridgeService::publish failed: internal server queue is closed");
             return Ok(Response::new(proto::PublishResponse {
                 result: Some(proto::publish_response::Result::Ack(proto::Ack {
                     id: msg_id,
@@ -248,15 +363,14 @@ impl proto::bridge_server::Bridge for BridgeService {
     ) -> Result<Response<Self::PublishBatchStream>, Status> {
         let mut stream = request.into_inner();
         let (tx, rx) = mpsc::channel(32);
-        let sender = self.tx.clone();
-        let queue_tx = self.queue_tx.clone();
+        let router = self.router.clone();
 
         tokio::spawn(async move {
             while let Ok(Some(msg)) = stream.message().await {
                 let msg_id = msg.id.clone();
-                trace!(msg_id = %msg_id, "BridgeService::publish_batch received message");
-                let _ = sender.send(msg.clone());
-                if queue_tx.send(msg).await.is_err() {
+                let topic = bridge_message_topic(&msg);
+                trace!(msg_id = %msg_id, topic = %topic, "BridgeService::publish_batch received message");
+                if router.dispatch(msg).await.is_err() {
                     warn!("publish_batch: internal server queue closed, stopping responder task");
                     // Send an explicit NACK for this message so clients receive a terminal response
                     let nack = proto::PublishResponse {
@@ -293,14 +407,18 @@ impl proto::bridge_server::Bridge for BridgeService {
 
     async fn subscribe(
         &self,
-        _request: Request<SubscribeRequest>,
+        request: Request<SubscribeRequest>,
     ) -> Result<Response<Self::SubscribeStream>, Status> {
-        let mut rx = self.tx.subscribe();
+        let topic = normalize_grpc_topic(Some(request.into_inner().topic.as_str()));
+        let mut rx = self.router.tx.subscribe();
         let (tx_stream, rx_stream) = mpsc::channel(32);
         tokio::spawn(async move {
             loop {
                 match rx.recv().await {
                     Ok(msg) => {
+                        if bridge_message_topic(&msg) != topic {
+                            continue;
+                        }
                         if tx_stream.send(Ok(msg)).await.is_err() {
                             warn!("subscribe: downstream consumer disconnected");
                             break;
@@ -317,77 +435,27 @@ impl proto::bridge_server::Bridge for BridgeService {
 
 impl ServerModeConsumer {
     async fn new(config: &GrpcConfig, url: &str) -> Result<Self> {
-        let addr = parse_addr(url)?;
-        let (tx, _) = broadcast::channel(1024);
-        let (queue_tx, rx) = mpsc::channel(16 * 1024);
-
-        let mut builder = TonicServer::builder();
-        if let Some(v) = config.initial_stream_window_size {
-            builder = builder.initial_stream_window_size(v);
-        }
-        if let Some(v) = config.initial_connection_window_size {
-            builder = builder.initial_connection_window_size(v);
-        }
-        if let Some(v) = config.concurrency_limit_per_connection {
-            builder = builder.concurrency_limit_per_connection(v);
-        }
-        if let Some(ms) = config.http2_keepalive_interval_ms {
-            builder = builder.http2_keepalive_interval(Some(Duration::from_millis(ms)));
-        }
-        if let Some(ms) = config.http2_keepalive_timeout_ms {
-            builder = builder.http2_keepalive_timeout(Some(Duration::from_millis(ms)));
-        }
-        if let Some(ms) = config.timeout_ms {
-            builder = builder.timeout(Duration::from_millis(ms));
-        }
-
-        if config.tls.required {
-            if !config.tls.is_tls_server_configured() {
-                return Err(anyhow::anyhow!(
-                    "gRPC server TLS enabled but no cert/key provided in GrpcConfig"
-                ));
-            }
-            let cert_path = config.tls.cert_file.as_ref().unwrap();
-            let key_path = config.tls.key_file.as_ref().unwrap();
-            let cert = tokio::fs::read(cert_path).await?;
-            let key = tokio::fs::read(key_path).await?;
-            let identity = Identity::from_pem(cert, key);
-
-            let mut tls_config = ServerTlsConfig::new().identity(identity);
-            if let Some(ca_path) = &config.tls.ca_file {
-                let ca_pem = tokio::fs::read(ca_path).await?;
-                let ca_cert = Certificate::from_pem(ca_pem);
-                tls_config = tls_config.client_ca_root(ca_cert);
-            }
-
-            builder = builder.tls_config(tls_config)?;
-        }
-
-        let mut service = proto::bridge_server::BridgeServer::new(BridgeService { tx, queue_tx });
-        if let Some(max) = config.max_decoding_message_size {
-            service = service.max_decoding_message_size(max);
-        }
-
-        // Bind the TCP listener first so we know the server port is bound and
-        // listening before returning. This avoids races where the consumer
-        // tries to connect before the server is ready.
-        info!(addr = %addr, "Binding gRPC embedded server listener");
-        let listener = tokio::net::TcpListener::bind(addr).await?;
-        let local = listener.local_addr()?;
-        info!(server_addr = %local, "gRPC embedded server listener bound");
-        let incoming = TcpListenerStream::new(listener);
-
-        let handle = tokio::spawn(async move {
-            info!(server_addr = %local, "gRPC embedded server starting to serve");
-            if let Err(e) = builder.serve_with_incoming(service, incoming).await {
-                error!(server_addr = %local, "gRPC server error: {:?}", e);
-            }
-            info!(server_addr = %local, "gRPC embedded server stopped");
-        });
+        let key = GrpcServerKey {
+            listen_addr: parse_addr(url)?.to_string(),
+            tls: config.tls.clone(),
+            timeout_ms: config.timeout_ms,
+            initial_stream_window_size: config.initial_stream_window_size,
+            initial_connection_window_size: config.initial_connection_window_size,
+            concurrency_limit_per_connection: config.concurrency_limit_per_connection,
+            http2_keepalive_interval_ms: config.http2_keepalive_interval_ms,
+            http2_keepalive_timeout_ms: config.http2_keepalive_timeout_ms,
+            max_decoding_message_size: config.max_decoding_message_size,
+        };
+        let topic = normalize_grpc_topic(config.topic.as_deref());
+        let (tx, rx) = mpsc::channel(16 * 1024);
+        let route_id = GRPC_ROUTE_ID.fetch_add(1, Ordering::Relaxed);
+        let shared_server = get_or_create_shared_grpc_server(config, &key).await?;
+        shared_server.router.register_route(route_id, topic, tx)?;
 
         Ok(Self {
-            _handle: handle,
-            bound_addr: local,
+            route_id,
+            bound_addr: shared_server.bound_addr,
+            shared_server,
             rx,
         })
     }
@@ -397,10 +465,132 @@ impl ServerModeConsumer {
     }
 }
 
+async fn get_or_create_shared_grpc_server(
+    config: &GrpcConfig,
+    key: &GrpcServerKey,
+) -> Result<Arc<SharedGrpcServer>> {
+    if let Ok(registry) = grpc_server_registry().lock() {
+        for (existing_key, server) in registry.iter() {
+            if existing_key.listen_addr != key.listen_addr {
+                continue;
+            }
+            if existing_key == key {
+                return Ok(server.clone());
+            }
+            return Err(anyhow::anyhow!(
+                "gRPC consumer {} is already registered with different server settings",
+                key.listen_addr
+            ));
+        }
+    }
+
+    let addr = parse_addr(&key.listen_addr)?;
+    let router = Arc::new(SharedGrpcRouter::new());
+    let mut builder = TonicServer::builder();
+    if let Some(v) = config.initial_stream_window_size {
+        builder = builder.initial_stream_window_size(v);
+    }
+    if let Some(v) = config.initial_connection_window_size {
+        builder = builder.initial_connection_window_size(v);
+    }
+    if let Some(v) = config.concurrency_limit_per_connection {
+        builder = builder.concurrency_limit_per_connection(v);
+    }
+    if let Some(ms) = config.http2_keepalive_interval_ms {
+        builder = builder.http2_keepalive_interval(Some(Duration::from_millis(ms)));
+    }
+    if let Some(ms) = config.http2_keepalive_timeout_ms {
+        builder = builder.http2_keepalive_timeout(Some(Duration::from_millis(ms)));
+    }
+    if let Some(ms) = config.timeout_ms {
+        builder = builder.timeout(Duration::from_millis(ms));
+    }
+
+    if config.tls.required {
+        if !config.tls.is_tls_server_configured() {
+            return Err(anyhow::anyhow!(
+                "gRPC server TLS enabled but no cert/key provided in GrpcConfig"
+            ));
+        }
+        let cert_path = config.tls.cert_file.as_ref().unwrap();
+        let key_path = config.tls.key_file.as_ref().unwrap();
+        let cert = tokio::fs::read(cert_path).await?;
+        let key = tokio::fs::read(key_path).await?;
+        let identity = Identity::from_pem(cert, key);
+
+        let mut tls_config = ServerTlsConfig::new().identity(identity);
+        if let Some(ca_path) = &config.tls.ca_file {
+            let ca_pem = tokio::fs::read(ca_path).await?;
+            let ca_cert = Certificate::from_pem(ca_pem);
+            tls_config = tls_config.client_ca_root(ca_cert);
+        }
+
+        builder = builder.tls_config(tls_config)?;
+    }
+
+    let mut service = proto::bridge_server::BridgeServer::new(BridgeService {
+        router: router.clone(),
+    });
+    if let Some(max) = config.max_decoding_message_size {
+        service = service.max_decoding_message_size(max);
+    }
+
+    // Bind the TCP listener first so we know the server port is bound and
+    // listening before returning. This avoids races where the consumer
+    // tries to connect before the server is ready.
+    info!(addr = %addr, "Binding gRPC embedded server listener");
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let local = listener.local_addr()?;
+    info!(server_addr = %local, "gRPC embedded server listener bound");
+    let incoming = TcpListenerStream::new(listener);
+
+    let handle = tokio::spawn(async move {
+        info!(server_addr = %local, "gRPC embedded server starting to serve");
+        if let Err(e) = builder.serve_with_incoming(service, incoming).await {
+            error!(server_addr = %local, "gRPC server error: {:?}", e);
+        }
+        info!(server_addr = %local, "gRPC embedded server stopped");
+    });
+
+    let server = Arc::new(SharedGrpcServer {
+        router,
+        handle,
+        bound_addr: local,
+    });
+
+    let mut registry = grpc_server_registry()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("gRPC server registry lock poisoned"))?;
+    for (existing_key, existing) in registry.iter() {
+        if existing_key.listen_addr != key.listen_addr {
+            continue;
+        }
+        if existing_key == key {
+            server.handle.abort();
+            return Ok(existing.clone());
+        }
+        server.handle.abort();
+        return Err(anyhow::anyhow!(
+            "gRPC consumer {} is already registered with different server settings",
+            key.listen_addr
+        ));
+    }
+    registry.insert(key.clone(), server.clone());
+    Ok(server)
+}
+
 impl Drop for ServerModeConsumer {
     fn drop(&mut self) {
-        // Ensure the background server task is stopped when the consumer is dropped.
-        self._handle.abort();
+        let should_shutdown = self.shared_server.router.unregister_route(self.route_id);
+        if !should_shutdown {
+            return;
+        }
+
+        let Ok(mut registry) = grpc_server_registry().lock() else {
+            return;
+        };
+        registry.retain(|_, server| !Arc::ptr_eq(server, &self.shared_server));
+        self.shared_server.handle.abort();
     }
 }
 

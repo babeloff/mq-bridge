@@ -30,7 +30,9 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::BufReader;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, info, trace, warn};
@@ -62,7 +64,8 @@ where
 /// A source that listens for incoming HTTP requests using hyper.
 pub struct HttpConsumer {
     request_rx: tokio::sync::mpsc::Receiver<HttpSourceMessage>,
-    _shutdown_tx: tokio::sync::watch::Sender<()>,
+    route_id: u64,
+    shared_server: Arc<SharedHttpServer>,
     buffer_size: usize,
     url: String,
     bound_addr: Option<SocketAddr>,
@@ -74,8 +77,24 @@ impl HttpConsumer {
     }
 }
 
+impl Drop for HttpConsumer {
+    fn drop(&mut self) {
+        let should_shutdown = self.shared_server.router.unregister_route(self.route_id);
+        if !should_shutdown {
+            return;
+        }
+
+        let Ok(mut registry) = http_server_registry().lock() else {
+            return;
+        };
+        registry.retain(|_, server| !Arc::ptr_eq(server, &self.shared_server));
+        let _ = self.shared_server.shutdown_tx.send(());
+    }
+}
+
 #[derive(Clone)]
 struct HttpConsumerState {
+    path: Option<String>,
     tx: tokio::sync::mpsc::Sender<HttpSourceMessage>,
     message_id_header: String,
     request_timeout: std::time::Duration,
@@ -88,11 +107,261 @@ struct HttpConsumerState {
     method: Option<hyper::Method>,
 }
 
+#[derive(Clone)]
+struct HttpRouteSnapshot {
+    path: Option<String>,
+    method: Option<hyper::Method>,
+    state: HttpConsumerState,
+}
+
+#[derive(Default)]
+struct SharedHttpRouter {
+    routes: Mutex<HashMap<u64, HttpConsumerState>>,
+}
+
+impl SharedHttpRouter {
+    fn register_route(&self, route_id: u64, state: HttpConsumerState) -> anyhow::Result<()> {
+        let mut routes = self
+            .routes
+            .lock()
+            .map_err(|_| anyhow!("HTTP route registry lock poisoned"))?;
+
+        for existing in routes.values() {
+            if routes_conflict(existing, &state) {
+                return Err(anyhow!(
+                    "Conflicting HTTP consumer registration for path {:?} and method {:?}",
+                    state.path,
+                    state.method
+                ));
+            }
+        }
+
+        routes.insert(route_id, state);
+        Ok(())
+    }
+
+    fn unregister_route(&self, route_id: u64) -> bool {
+        let Ok(mut routes) = self.routes.lock() else {
+            return false;
+        };
+        routes.remove(&route_id);
+        routes.is_empty()
+    }
+
+    fn match_route(&self, path: &str, method: &hyper::Method) -> anyhow::Result<RouteMatchResult> {
+        let routes = self
+            .routes
+            .lock()
+            .map_err(|_| anyhow!("HTTP route registry lock poisoned"))?;
+        let snapshots = routes
+            .values()
+            .cloned()
+            .map(|state| HttpRouteSnapshot {
+                path: state.path.clone(),
+                method: state.method.clone(),
+                state,
+            })
+            .collect::<Vec<_>>();
+        drop(routes);
+
+        let matched_path = snapshots
+            .iter()
+            .any(|route| route_matches_path(route, path));
+        let best = snapshots
+            .into_iter()
+            .filter(|route| route_matches_path(route, path) && route_matches_method(route, method))
+            .max_by_key(route_specificity);
+
+        Ok(match best {
+            Some(route) => RouteMatchResult::Matched(route.state),
+            None if matched_path => RouteMatchResult::MethodNotAllowed,
+            None => RouteMatchResult::NotFound,
+        })
+    }
+}
+
+enum RouteMatchResult {
+    Matched(HttpConsumerState),
+    MethodNotAllowed,
+    NotFound,
+}
+
+struct SharedHttpServer {
+    router: Arc<SharedHttpRouter>,
+    shutdown_tx: tokio::sync::watch::Sender<()>,
+    bound_addr: Option<SocketAddr>,
+}
+
+#[derive(Clone, Hash, PartialEq, Eq)]
+struct HttpServerKey {
+    listen_addr: String,
+    tls: TlsConfig,
+    workers: usize,
+}
+
+static HTTP_SERVER_REGISTRY: OnceLock<Mutex<HashMap<HttpServerKey, Arc<SharedHttpServer>>>> =
+    OnceLock::new();
+static HTTP_ROUTE_ID: AtomicU64 = AtomicU64::new(1);
+
+fn http_server_registry() -> &'static Mutex<HashMap<HttpServerKey, Arc<SharedHttpServer>>> {
+    HTTP_SERVER_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn normalize_http_path(path: Option<&str>) -> Option<String> {
+    path.map(str::trim)
+        .filter(|path| !path.is_empty())
+        .map(|path| {
+            if path.starts_with('/') {
+                path.to_string()
+            } else {
+                format!("/{}", path)
+            }
+        })
+}
+
+/// Guesses an HTTP `Content-Type` from a file path or bare file extension.
+///
+/// This accepts values like `"index.html"`, `"/assets/app.js"`, `".svg"`, or `"png"`.
+/// Unknown extensions default to `application/octet-stream`.
+pub fn guess_content_type(path_or_extension: &str) -> &'static str {
+    let input = path_or_extension.trim();
+    let extension = Path::new(input)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .filter(|ext| !ext.is_empty())
+        .or_else(|| input.strip_prefix('.'))
+        .unwrap_or(input)
+        .trim()
+        .trim_start_matches('.')
+        .to_ascii_lowercase();
+
+    match extension.as_str() {
+        "html" | "htm" => "text/html; charset=utf-8",
+        "css" => "text/css; charset=utf-8",
+        "js" | "mjs" | "cjs" => "text/javascript; charset=utf-8",
+        "json" | "map" | "jsonld" => "application/json; charset=utf-8",
+        "xml" => "application/xml; charset=utf-8",
+        "yaml" | "yml" => "application/yaml; charset=utf-8",
+        "pdf" => "application/pdf",
+        "wasm" => "application/wasm",
+        "zip" => "application/zip",
+        "gz" => "application/gzip",
+        "tar" => "application/x-tar",
+        "7z" => "application/x-7z-compressed",
+        "rar" => "application/vnd.rar",
+        "svg" => "image/svg+xml",
+        "ico" => "image/x-icon",
+        "png" => "image/png",
+        "apng" => "image/apng",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "avif" => "image/avif",
+        "bmp" => "image/bmp",
+        "tif" | "tiff" => "image/tiff",
+        "woff" => "font/woff",
+        "woff2" => "font/woff2",
+        "ttf" => "font/ttf",
+        "otf" => "font/otf",
+        "eot" => "application/vnd.ms-fontobject",
+        "txt" | "text" => "text/plain; charset=utf-8",
+        "md" => "text/markdown; charset=utf-8",
+        "csv" => "text/csv; charset=utf-8",
+        "tsv" => "text/tab-separated-values; charset=utf-8",
+        "ics" => "text/calendar; charset=utf-8",
+        "mp3" => "audio/mpeg",
+        "wav" => "audio/wav",
+        "ogg" | "oga" => "audio/ogg",
+        "m4a" => "audio/mp4",
+        "mp4" | "m4v" => "video/mp4",
+        "webm" => "video/webm",
+        "mov" => "video/quicktime",
+        "avi" => "video/x-msvideo",
+        "mpeg" | "mpg" => "video/mpeg",
+        "ogv" => "video/ogg",
+        _ => "application/octet-stream",
+    }
+}
+
+fn routes_conflict(left: &HttpConsumerState, right: &HttpConsumerState) -> bool {
+    left.path == right.path
+        && (left.method == right.method || left.method.is_none() || right.method.is_none())
+}
+
+fn route_matches_path(route: &HttpRouteSnapshot, path: &str) -> bool {
+    match &route.path {
+        Some(route_path) => route_path == path,
+        None => true,
+    }
+}
+
+fn route_matches_method(route: &HttpRouteSnapshot, method: &hyper::Method) -> bool {
+    match &route.method {
+        Some(route_method) => route_method == method,
+        None => true,
+    }
+}
+
+fn route_specificity(route: &HttpRouteSnapshot) -> (u8, u8) {
+    (
+        u8::from(route.path.is_some()),
+        u8::from(route.method.is_some()),
+    )
+}
+
+fn request_accepts_text(headers: &hyper::HeaderMap) -> bool {
+    let accept_values = headers.get_all("accept");
+    if accept_values.iter().next().is_none() {
+        return true;
+    }
+
+    accept_values.iter().any(|value| {
+        value.to_str().ok().is_some_and(|raw| {
+            raw.split(',').any(|item| {
+                let media_type = item
+                    .split(';')
+                    .next()
+                    .unwrap_or_default()
+                    .trim()
+                    .to_ascii_lowercase();
+                matches!(media_type.as_str(), "*/*" | "text/*" | "text/plain")
+            })
+        })
+    })
+}
+
+fn has_content_type_header(headers: &HashMap<String, String>) -> bool {
+    headers.keys().any(|key| key.eq_ignore_ascii_case("content-type"))
+}
+
+fn text_error_response(
+    status: StatusCode,
+    body: impl Into<Bytes>,
+    accepts_text: bool,
+    custom_headers: Option<&HashMap<String, String>>,
+) -> Response<BoxBody> {
+    let mut builder = Response::builder().status(status);
+
+    if let Some(custom_headers) = custom_headers {
+        for (header_name, header_value) in custom_headers {
+            builder = builder.header(header_name.as_str(), header_value.as_str());
+        }
+
+        if accepts_text && !has_content_type_header(custom_headers) {
+            builder = builder.header("content-type", "text/plain; charset=utf-8");
+        }
+    } else if accepts_text {
+        builder = builder.header("content-type", "text/plain; charset=utf-8");
+    }
+
+    builder.body(full(body)).unwrap()
+}
+
 /// A `hyper::Service` that can be nested into other services (like Axum).
 /// It forwards requests into the `mq-bridge` ecosystem.
 #[derive(Clone)]
 pub struct HttpBridgeService {
-    state: HttpConsumerState,
+    router: Arc<SharedHttpRouter>,
     conn_info: HttpConnInfo,
 }
 
@@ -102,23 +371,15 @@ impl Service<Request<Incoming>> for HttpBridgeService {
     type Future = BoxFuture<'static, Result<Self::Response, Self::Error>>;
 
     fn call(&self, req: Request<Incoming>) -> Self::Future {
-        // The service_fn in the original code did this clone, so it's correct.
-        let state = self.state.clone();
+        let router = self.router.clone();
         let conn_info = self.conn_info.clone();
-        Box::pin(handle_request(state, conn_info, req))
+        Box::pin(handle_request(router, conn_info, req))
     }
 }
 
 impl HttpConsumer {
     pub async fn new(config: &HttpConfig) -> anyhow::Result<Self> {
         let (request_rx, state, buffer_size) = setup_http_state_and_channel(config)?;
-        let service = HttpBridgeService {
-            state,
-            conn_info: HttpConnInfo::default(),
-        };
-        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
-
-        // --- Standalone Server Logic ---
         let listen_address = &config.url;
         let addr: SocketAddr = listen_address
             .parse()
@@ -132,27 +393,22 @@ impl HttpConsumer {
         } else {
             config.workers.unwrap()
         };
-
-        let listener = TcpListener::bind(&addr)
-            .await
-            .with_context(|| format!("Failed to bind to {}", addr))?;
-        let bound_addr = listener.local_addr().ok();
-        let listener = Arc::new(listener);
-
-        if tls_config.is_tls_server_configured() {
-            info!("Starting HTTPS source on {} with {} workers", addr, workers);
-            spawn_tls_server(listener, service, shutdown_rx, &tls_config, workers).await?;
-        } else {
-            info!("Starting HTTP source on {} with {} workers", addr, workers);
-            spawn_http_server(listener, service, shutdown_rx, workers).await?;
-        }
+        let route_id = HTTP_ROUTE_ID.fetch_add(1, Ordering::Relaxed);
+        let server_key = HttpServerKey {
+            listen_addr: addr.to_string(),
+            tls: tls_config.clone(),
+            workers,
+        };
+        let shared_server = get_or_create_shared_http_server(&server_key, &tls_config).await?;
+        shared_server.router.register_route(route_id, state)?;
 
         Ok(Self {
             request_rx,
-            _shutdown_tx: shutdown_tx,
+            route_id,
+            shared_server: shared_server.clone(),
             buffer_size,
-            url: config.tls.normalize_url(&config.url, true),
-            bound_addr,
+            url: build_consumer_target_url(config),
+            bound_addr: shared_server.bound_addr,
         })
     }
 }
@@ -182,6 +438,7 @@ fn setup_http_state_and_channel(
         .and_then(|m| hyper::Method::from_bytes(m.as_bytes()).ok());
 
     let state = HttpConsumerState {
+        path: normalize_http_path(config.path.as_deref()),
         tx: request_tx,
         message_id_header,
         request_timeout,
@@ -196,6 +453,90 @@ fn setup_http_state_and_channel(
         method,
     };
     Ok((request_rx, state, buffer_size))
+}
+
+fn build_consumer_target_url(config: &HttpConfig) -> String {
+    let mut url = config.tls.normalize_url(&config.url, true);
+    if let Some(path) = normalize_http_path(config.path.as_deref()) {
+        url.push_str(&path);
+    }
+    url
+}
+
+async fn get_or_create_shared_http_server(
+    key: &HttpServerKey,
+    tls_config: &TlsConfig,
+) -> anyhow::Result<Arc<SharedHttpServer>> {
+    if let Ok(registry) = http_server_registry().lock() {
+        for (existing_key, server) in registry.iter() {
+            if existing_key.listen_addr != key.listen_addr {
+                continue;
+            }
+            if existing_key == key {
+                return Ok(server.clone());
+            }
+            return Err(anyhow!(
+                "HTTP consumer {} is already registered with different TLS or worker settings",
+                key.listen_addr
+            ));
+        }
+    }
+
+    let addr: SocketAddr = key
+        .listen_addr
+        .parse()
+        .with_context(|| format!("Invalid listen address: {}", key.listen_addr))?;
+    let listener = TcpListener::bind(&addr)
+        .await
+        .with_context(|| format!("Failed to bind to {}", addr))?;
+    let bound_addr = listener.local_addr().ok();
+    let listener = Arc::new(listener);
+    let router = Arc::new(SharedHttpRouter::default());
+    let service = HttpBridgeService {
+        router: router.clone(),
+        conn_info: HttpConnInfo::default(),
+    };
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
+
+    if tls_config.is_tls_server_configured() {
+        info!(
+            "Starting shared HTTPS source on {} with {} workers",
+            addr, key.workers
+        );
+        spawn_tls_server(listener, service, shutdown_rx, tls_config, key.workers).await?;
+    } else {
+        info!(
+            "Starting shared HTTP source on {} with {} workers",
+            addr, key.workers
+        );
+        spawn_http_server(listener, service, shutdown_rx, key.workers).await?;
+    }
+
+    let server = Arc::new(SharedHttpServer {
+        router,
+        shutdown_tx,
+        bound_addr,
+    });
+
+    let mut registry = http_server_registry()
+        .lock()
+        .map_err(|_| anyhow!("HTTP server registry lock poisoned"))?;
+    for (existing_key, existing) in registry.iter() {
+        if existing_key.listen_addr != key.listen_addr {
+            continue;
+        }
+        if existing_key == key {
+            let _ = server.shutdown_tx.send(());
+            return Ok(existing.clone());
+        }
+        let _ = server.shutdown_tx.send(());
+        return Err(anyhow!(
+            "HTTP consumer {} is already registered with different TLS or worker settings",
+            key.listen_addr
+        ));
+    }
+    registry.insert(key.clone(), server.clone());
+    Ok(server)
 }
 
 async fn spawn_http_server(
@@ -413,27 +754,51 @@ impl MessageConsumer for HttpConsumer {
 
 #[tracing::instrument(level = "trace", skip_all)]
 async fn handle_request(
-    state: HttpConsumerState,
+    router: Arc<SharedHttpRouter>,
     conn_info: HttpConnInfo,
     req: Request<Incoming>,
 ) -> anyhow::Result<Response<BoxBody>> {
-    match handle_request_internal(state, conn_info, req).await {
+    let accepts_text = request_accepts_text(req.headers());
+    match handle_request_internal(router, conn_info, req, accepts_text).await {
         Ok(res) => Ok(res),
         Err(e) => {
             tracing::error!("Internal error handling HTTP request: {}", e);
-            Ok(Response::builder()
-                .status(StatusCode::INTERNAL_SERVER_ERROR)
-                .body(full(format!("Internal error: {}", e)))
-                .unwrap())
+            Ok(text_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Internal error: {}", e),
+                accepts_text,
+                None,
+            ))
         }
     }
 }
 
 async fn handle_request_internal(
-    state: HttpConsumerState,
+    router: Arc<SharedHttpRouter>,
     conn_info: HttpConnInfo,
     req: Request<Incoming>,
+    accepts_text: bool,
 ) -> anyhow::Result<Response<BoxBody>> {
+    let state = match router.match_route(req.uri().path(), req.method())? {
+        RouteMatchResult::Matched(state) => state,
+        RouteMatchResult::MethodNotAllowed => {
+            return Ok(text_error_response(
+                StatusCode::METHOD_NOT_ALLOWED,
+                format!("Method {} not allowed", req.method()),
+                accepts_text,
+                None,
+            ));
+        }
+        RouteMatchResult::NotFound => {
+            return Ok(text_error_response(
+                StatusCode::NOT_FOUND,
+                "No HTTP consumer registered for this path",
+                accepts_text,
+                None,
+            ));
+        }
+    };
+
     // Acquire a permit to limit concurrent requests and prevent resource exhaustion.
     // This applies backpressure to Hyper and prevents task explosion during retry storms.
     let _permit = state
@@ -442,17 +807,7 @@ async fn handle_request_internal(
         .await
         .map_err(|e| anyhow!(e))?;
 
-    // Validate HTTP method if restricted in configuration
-    if let Some(ref allowed_method) = state.method {
-        if req.method() != allowed_method {
-            return Ok(Response::builder()
-                .status(StatusCode::METHOD_NOT_ALLOWED)
-                .body(full(format!("Method {} not allowed", req.method())))
-                .unwrap());
-        }
-    }
-
-    if let Some((expected_user, expected_pass)) = &state.basic_auth {
+    if let Some((expected_user, expected_pass)) = configured_basic_auth(state.basic_auth.as_ref()) {
         if let Some(auth_header) = req.headers().get("authorization") {
             match auth_header.to_str() {
                 Ok(auth_str) => {
@@ -467,42 +822,54 @@ async fn handle_request_internal(
                                 if user == expected_user && pass == expected_pass {
                                     // Auth successful, proceed
                                 } else {
-                                    return Ok(Response::builder()
-                                        .status(StatusCode::UNAUTHORIZED)
-                                        .body(full("Invalid credentials"))
-                                        .unwrap());
+                                    return Ok(text_error_response(
+                                        StatusCode::UNAUTHORIZED,
+                                        "Invalid credentials",
+                                        accepts_text,
+                                        None,
+                                    ));
                                 }
                             } else {
-                                return Ok(Response::builder()
-                                    .status(StatusCode::BAD_REQUEST)
-                                    .body(full("Invalid authorization header encoding"))
-                                    .unwrap());
+                                return Ok(text_error_response(
+                                    StatusCode::BAD_REQUEST,
+                                    "Invalid authorization header encoding",
+                                    accepts_text,
+                                    None,
+                                ));
                             }
                         } else {
-                            return Ok(Response::builder()
-                                .status(StatusCode::BAD_REQUEST)
-                                .body(full("Invalid base64 encoding in authorization header"))
-                                .unwrap());
+                            return Ok(text_error_response(
+                                StatusCode::BAD_REQUEST,
+                                "Invalid base64 encoding in authorization header",
+                                accepts_text,
+                                None,
+                            ));
                         }
                     } else {
-                        return Ok(Response::builder()
-                            .status(StatusCode::UNAUTHORIZED)
-                            .body(full("Missing Basic authentication scheme"))
-                            .unwrap());
+                        return Ok(text_error_response(
+                            StatusCode::UNAUTHORIZED,
+                            "Missing Basic authentication scheme",
+                            accepts_text,
+                            None,
+                        ));
                     }
                 }
                 Err(_) => {
-                    return Ok(Response::builder()
-                        .status(StatusCode::BAD_REQUEST)
-                        .body(full("Invalid authorization header encoding"))
-                        .unwrap());
+                    return Ok(text_error_response(
+                        StatusCode::BAD_REQUEST,
+                        "Invalid authorization header encoding",
+                        accepts_text,
+                        None,
+                    ));
                 }
             }
         } else {
-            return Ok(Response::builder()
-                .status(StatusCode::UNAUTHORIZED)
-                .body(full("Missing authorization header"))
-                .unwrap());
+            return Ok(text_error_response(
+                StatusCode::UNAUTHORIZED,
+                "Missing authorization header",
+                accepts_text,
+                None,
+            ));
         }
     }
 
@@ -559,16 +926,20 @@ async fn handle_request_internal(
     let body_bytes = match tokio::time::timeout(body_collect_timeout, req.collect()).await {
         Ok(Ok(b)) => b.to_bytes(),
         Ok(Err(e)) => {
-            return Ok(Response::builder()
-                .status(StatusCode::BAD_REQUEST)
-                .body(full(format!("Failed to read body: {}", e)))
-                .unwrap());
+            return Ok(text_error_response(
+                StatusCode::BAD_REQUEST,
+                format!("Failed to read body: {}", e),
+                accepts_text,
+                None,
+            ));
         }
         Err(_) => {
-            return Ok(Response::builder()
-                .status(StatusCode::REQUEST_TIMEOUT)
-                .body(full("Timed out reading request body"))
-                .unwrap());
+            return Ok(text_error_response(
+                StatusCode::REQUEST_TIMEOUT,
+                "Timed out reading request body",
+                accepts_text,
+                None,
+            ));
         }
     };
     let body_bytes_raw = body_bytes.to_vec();
@@ -604,18 +975,21 @@ async fn handle_request_internal(
         Ok(Ok(_)) => {}
         Ok(Err(e)) => {
             tracing::error!("Failed to send request to bridge (channel closed): {}", e);
-            return Ok(Response::builder()
-                .status(StatusCode::INTERNAL_SERVER_ERROR)
-                .body(full("Internal pipeline closed"))
-                .unwrap());
+            return Ok(text_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Internal pipeline closed",
+                accepts_text,
+                None,
+            ));
         }
         Err(_) => {
             tracing::warn!("HTTP handler: internal channel full, request rejected");
-            let mut builder = Response::builder().status(StatusCode::SERVICE_UNAVAILABLE);
-            for (header_name, header_value) in &state.custom_headers {
-                builder = builder.header(header_name.as_str(), header_value.as_str());
-            }
-            return Ok(builder.body(full("Server overloaded")).unwrap());
+            return Ok(text_error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Server overloaded",
+                accepts_text,
+                Some(&state.custom_headers),
+            ));
         }
     }
 
@@ -648,25 +1022,28 @@ async fn handle_request_internal(
             state.compression_enabled,
             state.compression_threshold_bytes,
             custom_headers,
+            accepts_text,
         ),
         Ok(Err(_)) => {
-            let mut builder = Response::builder().status(StatusCode::INTERNAL_SERVER_ERROR);
-            for (header_name, header_value) in &custom_headers {
-                builder = builder.header(header_name.as_str(), header_value.as_str());
-            }
             tracing::error!("HTTP handler: pipeline closed before disposition arrived");
-            Ok(builder.body(full("Pipeline closed")).unwrap())
+            Ok(text_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Pipeline closed",
+                accepts_text,
+                Some(&custom_headers),
+            ))
         }
         Err(_) => {
-            let mut builder = Response::builder().status(StatusCode::GATEWAY_TIMEOUT);
-            for (header_name, header_value) in &custom_headers {
-                builder = builder.header(header_name.as_str(), header_value.as_str());
-            }
             tracing::warn!(
                 "HTTP handler: request timed out after {} ms",
                 timeout_duration.as_millis()
             );
-            Ok(builder.body(full("Request timed out")).unwrap())
+            Ok(text_error_response(
+                StatusCode::GATEWAY_TIMEOUT,
+                "Request timed out",
+                accepts_text,
+                Some(&custom_headers),
+            ))
         }
     }
 }
@@ -676,6 +1053,7 @@ fn make_response(
     compression_enabled: bool,
     compression_threshold_bytes: usize,
     custom_headers: HashMap<String, String>,
+    accepts_text: bool,
 ) -> anyhow::Result<Response<BoxBody>> {
     match disposition {
         MessageDisposition::Reply(mut msg) => {
@@ -743,11 +1121,12 @@ fn make_response(
             Ok(builder.body(full("Message processed")).unwrap())
         }
         MessageDisposition::Nack => {
-            let mut builder = Response::builder().status(StatusCode::INTERNAL_SERVER_ERROR);
-            for (header_name, header_value) in &custom_headers {
-                builder = builder.header(header_name.as_str(), header_value.as_str());
-            }
-            Ok(builder.body(full("Message processing failed")).unwrap())
+            Ok(text_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Message processing failed",
+                accepts_text,
+                Some(&custom_headers),
+            ))
         }
     }
 }
@@ -901,11 +1280,9 @@ impl MessagePublisher for HttpPublisher {
             request_builder = request_builder.header(key, value);
         }
 
-        // Add HTTP Basic Authentication header
-        if let Some((username, password)) = &self.basic_auth {
-            let credentials = format!("{}:{}", username, password);
-            let encoded = base64_encode(credentials.as_bytes());
-            request_builder = request_builder.header("Authorization", format!("Basic {}", encoded));
+        // Only attach Basic auth when credentials are actually configured.
+        if let Some(header_value) = basic_auth_header_value(self.basic_auth.as_ref()) {
+            request_builder = request_builder.header("Authorization", header_value);
         }
 
         // Add custom authentication headers
@@ -1252,11 +1629,29 @@ fn base64_encode(data: &[u8]) -> String {
     general_purpose::STANDARD.encode(data)
 }
 
+fn configured_basic_auth(basic_auth: Option<&(String, String)>) -> Option<(&str, &str)> {
+    basic_auth.and_then(|(username, password)| {
+        if username.is_empty() && password.is_empty() {
+            None
+        } else {
+            Some((username.as_str(), password.as_str()))
+        }
+    })
+}
+
+fn basic_auth_header_value(basic_auth: Option<&(String, String)>) -> Option<String> {
+    configured_basic_auth(basic_auth).map(|(username, password)| {
+        let credentials = format!("{}:{}", username, password);
+        format!("Basic {}", base64_encode(credentials.as_bytes()))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::endpoints::create_publisher_from_route;
     use crate::models::{Config, EndpointType};
+    use hyper::header::{ACCEPT, CONTENT_TYPE};
     use std::time::Duration;
 
     fn get_free_port() -> u16 {
@@ -1297,6 +1692,129 @@ http_route:
             }
             _ => panic!("Expected HTTP output"),
         }
+    }
+
+    #[test]
+    fn test_guess_content_type_from_path() {
+        assert_eq!(
+            guess_content_type("/assets/app.bundle.js"),
+            "text/javascript; charset=utf-8"
+        );
+        assert_eq!(guess_content_type("images/logo.SVG"), "image/svg+xml");
+    }
+
+    #[test]
+    fn test_guess_content_type_from_extension() {
+        assert_eq!(guess_content_type("html"), "text/html; charset=utf-8");
+        assert_eq!(guess_content_type(".woff2"), "font/woff2");
+        assert_eq!(guess_content_type("JSON"), "application/json; charset=utf-8");
+    }
+
+    #[test]
+    fn test_guess_content_type_unknown_defaults_to_octet_stream() {
+        assert_eq!(guess_content_type(""), "application/octet-stream");
+        assert_eq!(guess_content_type("unknown-ext"), "application/octet-stream");
+        assert_eq!(
+            guess_content_type("archive.custombin"),
+            "application/octet-stream"
+        );
+    }
+
+    #[test]
+    fn test_request_accepts_text_defaults_true_without_accept_header() {
+        let headers = hyper::HeaderMap::new();
+        assert!(request_accepts_text(&headers));
+    }
+
+    #[test]
+    fn test_request_accepts_text_matches_text_and_wildcards() {
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(ACCEPT, "application/json, text/plain".parse().unwrap());
+        assert!(request_accepts_text(&headers));
+
+        headers.insert(ACCEPT, "*/*".parse().unwrap());
+        assert!(request_accepts_text(&headers));
+    }
+
+    #[test]
+    fn test_request_accepts_text_rejects_binary_only_accept_header() {
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(ACCEPT, "application/octet-stream".parse().unwrap());
+        assert!(!request_accepts_text(&headers));
+    }
+
+    #[test]
+    fn test_text_error_response_sets_text_content_type_when_accepted() {
+        let response = text_error_response(
+            StatusCode::BAD_REQUEST,
+            "bad request",
+            true,
+            None,
+        );
+
+        assert_eq!(
+            response.headers().get(CONTENT_TYPE).unwrap(),
+            "text/plain; charset=utf-8"
+        );
+    }
+
+    #[test]
+    fn test_text_error_response_skips_text_content_type_when_not_accepted() {
+        let response = text_error_response(
+            StatusCode::BAD_REQUEST,
+            "bad request",
+            false,
+            None,
+        );
+
+        assert!(response.headers().get(CONTENT_TYPE).is_none());
+    }
+
+    #[test]
+    fn test_text_error_response_preserves_custom_content_type() {
+        let mut headers = HashMap::new();
+        headers.insert("content-type".to_string(), "application/problem+json".to_string());
+
+        let response = text_error_response(
+            StatusCode::BAD_REQUEST,
+            "bad request",
+            true,
+            Some(&headers),
+        );
+
+        assert_eq!(
+            response.headers().get(CONTENT_TYPE).unwrap(),
+            "application/problem+json"
+        );
+    }
+
+    #[test]
+    fn test_basic_auth_header_value_omits_empty_credentials() {
+        let empty = (String::new(), String::new());
+        assert_eq!(basic_auth_header_value(Some(&empty)), None);
+        assert_eq!(basic_auth_header_value(None), None);
+    }
+
+    #[test]
+    fn test_configured_basic_auth_omits_empty_credentials() {
+        let empty = (String::new(), String::new());
+        assert_eq!(configured_basic_auth(Some(&empty)), None);
+        assert_eq!(configured_basic_auth(None), None);
+    }
+
+    #[test]
+    fn test_configured_basic_auth_keeps_non_empty_credentials() {
+        let creds = ("user".to_string(), "pass".to_string());
+        assert_eq!(configured_basic_auth(Some(&creds)), Some(("user", "pass")));
+    }
+
+    #[test]
+    fn test_basic_auth_header_value_encodes_configured_credentials() {
+        let creds = ("user".to_string(), "pass".to_string());
+        assert_eq!(
+            basic_auth_header_value(Some(&creds)).as_deref(),
+            Some("Basic dXNlcjpwYXNz")
+        );
     }
 
     #[tokio::test]
@@ -1468,5 +1986,102 @@ http_route:
         });
 
         tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    #[tokio::test]
+    async fn test_http_consumers_share_listener_by_path() {
+        init_crypto();
+
+        let port = get_free_port();
+        let addr = format!("127.0.0.1:{}", port);
+        let url = format!("http://{}", addr);
+
+        let mut alpha_consumer = HttpConsumer::new(&HttpConfig {
+            url: addr.clone(),
+            path: Some("/alpha".to_string()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+        let mut beta_consumer = HttpConsumer::new(&HttpConfig {
+            url: addr.clone(),
+            path: Some("/beta".to_string()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+        let publisher = HttpPublisher::new(&HttpConfig {
+            url,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+        let alpha_task = tokio::spawn(async move {
+            let received = consumer_receive_ack(&mut alpha_consumer).await;
+            received.payload
+        });
+        let beta_task = tokio::spawn(async move {
+            let received = consumer_receive_ack(&mut beta_consumer).await;
+            received.payload
+        });
+
+        let mut alpha_message = CanonicalMessage::new(b"alpha".to_vec(), None);
+        alpha_message
+            .metadata
+            .insert("http_path".to_string(), "/alpha".to_string());
+        let mut beta_message = CanonicalMessage::new(b"beta".to_vec(), None);
+        beta_message
+            .metadata
+            .insert("http_path".to_string(), "/beta".to_string());
+
+        publisher.send(alpha_message).await.unwrap();
+        publisher.send(beta_message).await.unwrap();
+
+        assert_eq!(alpha_task.await.unwrap(), b"alpha".to_vec());
+        assert_eq!(beta_task.await.unwrap(), b"beta".to_vec());
+    }
+
+    #[tokio::test]
+    async fn test_http_consumer_rejects_duplicate_path_registration() {
+        init_crypto();
+
+        let port = get_free_port();
+        let addr = format!("127.0.0.1:{}", port);
+
+        let _consumer = HttpConsumer::new(&HttpConfig {
+            url: addr.clone(),
+            path: Some("/shared".to_string()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+        let error = HttpConsumer::new(&HttpConfig {
+            url: addr,
+            path: Some("/shared".to_string()),
+            ..Default::default()
+        })
+        .await
+        .err()
+        .expect("duplicate registration should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("Conflicting HTTP consumer registration"),
+            "unexpected error: {error}"
+        );
+    }
+
+    async fn consumer_receive_ack(consumer: &mut HttpConsumer) -> CanonicalMessage {
+        let received = consumer.receive().await.unwrap();
+        let message = received.message.clone();
+        (received.commit)(crate::traits::MessageDisposition::Ack)
+            .await
+            .unwrap();
+        message
     }
 }

@@ -200,13 +200,12 @@ struct DeleteUser {
 let typed_handler = TypeHandler::new()
     .add("create_user", |cmd: CreateUser| async move {
         println!("Handling create_user: {}, {}", cmd.id, cmd.username);
-        // ... your logic here
-        Ok(Handled::Ack)
+        // Logic here...
+        // Automatically maps () to Handled::Ack
     })
     .add("delete_user", |cmd: DeleteUser| async move {
         println!("Handling delete_user: {}", cmd.id);
-        // ... your logic here
-        Ok(Handled::Ack)
+        // Logic here...
     });
 
 // 3. Attach the handler to a route
@@ -360,8 +359,8 @@ let command_bus = TypeHandler::new()
 // 2. Event Handler (Read Side / Projection) 
 let projection_handler = TypeHandler::new()
     .add("order_submitted", |evt: OrderSubmitted| async move {
-        // Update read database / cache
-        Ok(Handled::Ack)
+        // Update read database / cache...
+        Ok(())
 }); 
 ```
 ## Configuration 
