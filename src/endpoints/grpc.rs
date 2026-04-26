@@ -201,13 +201,13 @@ struct BridgeService {
 
 struct SharedGrpcRouter {
     routes: Mutex<HashMap<u64, SharedGrpcRoute>>,
-    tx: broadcast::Sender<BridgeMessage>,
 }
 
 #[derive(Clone)]
 struct SharedGrpcRoute {
     topic: String,
     tx: mpsc::Sender<BridgeMessage>,
+    broadcast_tx: broadcast::Sender<BridgeMessage>,
 }
 
 struct SharedGrpcServer {
@@ -247,10 +247,8 @@ fn normalize_grpc_topic(topic: Option<&str>) -> String {
 
 impl SharedGrpcRouter {
     fn new() -> Self {
-        let (tx, _) = broadcast::channel(1024);
         Self {
             routes: Mutex::new(HashMap::new()),
-            tx,
         }
     }
 }
@@ -276,7 +274,15 @@ impl SharedGrpcRouter {
                 topic
             ));
         }
-        routes.insert(route_id, SharedGrpcRoute { topic, tx });
+        let (broadcast_tx, _) = broadcast::channel(1024);
+        routes.insert(
+            route_id,
+            SharedGrpcRoute {
+                topic,
+                tx,
+                broadcast_tx,
+            },
+        );
         Ok(())
     }
 
@@ -288,21 +294,24 @@ impl SharedGrpcRouter {
         routes.is_empty()
     }
 
-    fn route_for_topic(&self, topic: &str) -> Option<mpsc::Sender<BridgeMessage>> {
+    fn route_for_topic(&self, topic: &str) -> Option<SharedGrpcRoute> {
         let Ok(routes) = self.routes.lock() else {
             return None;
         };
-        routes
-            .values()
-            .find(|route| route.topic == topic)
-            .map(|route| route.tx.clone())
+        routes.values().find(|route| route.topic == topic).cloned()
+    }
+
+    fn subscribe_to_topic(&self, topic: &str) -> Option<broadcast::Receiver<BridgeMessage>> {
+        self.route_for_topic(topic)
+            .map(|route| route.broadcast_tx.subscribe())
     }
 
     async fn dispatch(&self, msg: BridgeMessage) -> Result<()> {
         let topic = bridge_message_topic(&msg);
-        let _ = self.tx.send(msg.clone());
-        if let Some(route_tx) = self.route_for_topic(&topic) {
-            route_tx
+        if let Some(route) = self.route_for_topic(&topic) {
+            let _ = route.broadcast_tx.send(msg.clone());
+            route
+                .tx
                 .send(msg)
                 .await
                 .map_err(|_| anyhow::anyhow!("No active gRPC consumer for topic '{}'", topic))?;
@@ -410,15 +419,15 @@ impl proto::bridge_server::Bridge for BridgeService {
         request: Request<SubscribeRequest>,
     ) -> Result<Response<Self::SubscribeStream>, Status> {
         let topic = normalize_grpc_topic(Some(request.into_inner().topic.as_str()));
-        let mut rx = self.router.tx.subscribe();
+        let mut rx = self
+            .router
+            .subscribe_to_topic(&topic)
+            .ok_or_else(|| Status::not_found(format!("No active gRPC topic '{}'", topic)))?;
         let (tx_stream, rx_stream) = mpsc::channel(32);
         tokio::spawn(async move {
             loop {
                 match rx.recv().await {
                     Ok(msg) => {
-                        if bridge_message_topic(&msg) != topic {
-                            continue;
-                        }
                         if tx_stream.send(Ok(msg)).await.is_err() {
                             warn!("subscribe: downstream consumer disconnected");
                             break;

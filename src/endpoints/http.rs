@@ -111,16 +111,16 @@ struct HttpConsumerState {
 struct HttpRouteSnapshot {
     path: Option<String>,
     method: Option<hyper::Method>,
-    state: HttpConsumerState,
+    state: Arc<HttpConsumerState>,
 }
 
 #[derive(Default)]
 struct SharedHttpRouter {
-    routes: Mutex<HashMap<u64, HttpConsumerState>>,
+    routes: Mutex<HashMap<u64, Arc<HttpConsumerState>>>,
 }
 
 impl SharedHttpRouter {
-    fn register_route(&self, route_id: u64, state: HttpConsumerState) -> anyhow::Result<()> {
+    fn register_route(&self, route_id: u64, state: Arc<HttpConsumerState>) -> anyhow::Result<()> {
         let mut routes = self
             .routes
             .lock()
@@ -168,21 +168,30 @@ impl SharedHttpRouter {
             .iter()
             .any(|route| route_matches_path(route, path));
         let best = snapshots
-            .into_iter()
+            .iter()
             .filter(|route| route_matches_path(route, path) && route_matches_method(route, method))
-            .max_by_key(route_specificity);
+            .max_by_key(|route| route_specificity(route));
 
         Ok(match best {
-            Some(route) => RouteMatchResult::Matched(Box::new(route.state)),
-            None if matched_path => RouteMatchResult::MethodNotAllowed,
+            Some(route) => RouteMatchResult::Matched(route.state.clone()),
+            None if matched_path => {
+                let mut methods = snapshots
+                    .iter()
+                    .filter(|route| route_matches_path(route, path))
+                    .filter_map(|route| route.method.clone())
+                    .collect::<Vec<_>>();
+                methods.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+                methods.dedup();
+                RouteMatchResult::MethodNotAllowed(methods)
+            }
             None => RouteMatchResult::NotFound,
         })
     }
 }
 
 enum RouteMatchResult {
-    Matched(Box<HttpConsumerState>),
-    MethodNotAllowed,
+    Matched(Arc<HttpConsumerState>),
+    MethodNotAllowed(Vec<hyper::Method>),
     NotFound,
 }
 
@@ -402,14 +411,15 @@ impl HttpConsumer {
             workers,
         };
         let shared_server =
-            get_or_create_shared_http_server(&server_key, &tls_config, route_id, state).await?;
+            get_or_create_shared_http_server(&server_key, &tls_config, route_id, Arc::new(state))
+                .await?;
 
         Ok(Self {
             request_rx,
             route_id,
             shared_server: shared_server.clone(),
             buffer_size,
-            url: build_consumer_target_url(config),
+            url: build_consumer_target_url(config, shared_server.bound_addr),
             bound_addr: shared_server.bound_addr,
         })
     }
@@ -457,8 +467,22 @@ fn setup_http_state_and_channel(
     Ok((request_rx, state, buffer_size))
 }
 
-fn build_consumer_target_url(config: &HttpConfig) -> String {
-    let mut url = config.tls.normalize_url(&config.url, true);
+fn build_consumer_target_url(config: &HttpConfig, bound_addr: Option<SocketAddr>) -> String {
+    let base = config
+        .url
+        .parse::<SocketAddr>()
+        .ok()
+        .and_then(|configured_addr| {
+            if configured_addr.port() == 0 {
+                bound_addr.map(|bound_addr| {
+                    SocketAddr::new(configured_addr.ip(), bound_addr.port()).to_string()
+                })
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| config.url.clone());
+    let mut url = config.tls.normalize_url(&base, true);
     if let Some(path) = normalize_http_path(config.path.as_deref()) {
         url.push_str(&path);
     }
@@ -469,7 +493,7 @@ async fn get_or_create_shared_http_server(
     key: &HttpServerKey,
     tls_config: &TlsConfig,
     route_id: u64,
-    state: HttpConsumerState,
+    state: Arc<HttpConsumerState>,
 ) -> anyhow::Result<Arc<SharedHttpServer>> {
     let addr: SocketAddr = key
         .listen_addr
@@ -519,7 +543,12 @@ async fn get_or_create_shared_http_server(
     };
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
 
-    if tls_config.is_tls_server_configured() {
+    if tls_config.required {
+        if !tls_config.is_tls_server_configured() {
+            return Err(anyhow!(
+                "HTTP server TLS enabled but no cert/key provided in HttpConfig"
+            ));
+        }
         info!(
             "Starting shared HTTPS source on {} with {} workers",
             addr, key.workers
@@ -804,12 +833,23 @@ async fn handle_request_internal(
 ) -> anyhow::Result<Response<BoxBody>> {
     let state = match router.match_route(req.uri().path(), req.method())? {
         RouteMatchResult::Matched(state) => state,
-        RouteMatchResult::MethodNotAllowed => {
+        RouteMatchResult::MethodNotAllowed(allowed_methods) => {
+            let mut headers = HashMap::new();
+            if !allowed_methods.is_empty() {
+                headers.insert(
+                    "Allow".to_string(),
+                    allowed_methods
+                        .iter()
+                        .map(hyper::Method::as_str)
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                );
+            }
             return Ok(text_error_response(
                 StatusCode::METHOD_NOT_ALLOWED,
                 format!("Method {} not allowed", req.method()),
                 accepts_text,
-                None,
+                Some(&headers),
             ));
         }
         RouteMatchResult::NotFound => {
@@ -1299,7 +1339,13 @@ impl MessagePublisher for HttpPublisher {
         let mut request_builder = Request::builder().method(method).uri(uri);
 
         for (key, value) in &message.metadata {
-            if key == "http_method" || key == "http_path" || key == "http_query" {
+            if key == "http_method"
+                || key == "http_path"
+                || key == "http_query"
+                || key == "http_version"
+                || key == "tls_cipher_suite"
+                || key == "tls_protocol_version"
+            {
                 continue;
             }
             request_builder = request_builder.header(key, value);

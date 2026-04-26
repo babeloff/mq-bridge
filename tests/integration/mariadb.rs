@@ -7,6 +7,7 @@ use mq_bridge::test_utils::{
     run_performance_pipeline_test, run_pipeline_test, run_test_with_docker,
     run_test_with_docker_controller, setup_logging, PERF_TEST_MESSAGE_COUNT,
 };
+use std::future::Future;
 use std::sync::Arc;
 
 const DOCKER_COMPOSE_FILE: &str = "tests/integration/docker-compose/mariadb.yml";
@@ -44,29 +45,34 @@ routes:
     concurrency: 4
     batch_size: 128
     input:
-            sqlx:
-                url: "mysql://testuser:testpass@localhost:3307/testdb"
-                table: "messages"
-                delete_after_read: true
-                polling_interval_ms: 20
+      sqlx:
+        url: "mysql://testuser:testpass@localhost:3307/testdb"
+        table: "messages"
+        delete_after_read: true
+        polling_interval_ms: 20
     output:
       memory: { topic: "sqlx-mariadb-out", capacity: {out_capacity} }
 "#;
 
 pub async fn test_mariadb_pipeline() {
-    setup_logging();
-    run_test_with_docker(DOCKER_COMPOSE_FILE, || async {
-        setup_db().await;
-        let config_yaml = CONFIG_YAML.replace(
-            "{out_capacity}",
-            &(PERF_TEST_MESSAGE_COUNT + 1000).to_string(),
-        );
+    run_mariadb_test(|config_yaml| async move {
         run_pipeline_test("sqlx", &config_yaml).await;
     })
     .await;
 }
 
 pub async fn test_mariadb_performance_pipeline() {
+    run_mariadb_test(|config_yaml| async move {
+        run_performance_pipeline_test("sqlx", &config_yaml, PERF_TEST_MESSAGE_COUNT).await;
+    })
+    .await;
+}
+
+async fn run_mariadb_test<F, Fut>(runner: F)
+where
+    F: FnOnce(String) -> Fut,
+    Fut: Future<Output = ()>,
+{
     setup_logging();
     run_test_with_docker(DOCKER_COMPOSE_FILE, || async {
         setup_db().await;
@@ -74,7 +80,7 @@ pub async fn test_mariadb_performance_pipeline() {
             "{out_capacity}",
             &(PERF_TEST_MESSAGE_COUNT + 1000).to_string(),
         );
-        run_performance_pipeline_test("sqlx", &config_yaml, PERF_TEST_MESSAGE_COUNT).await;
+        runner(config_yaml).await;
     })
     .await;
 }

@@ -880,4 +880,18 @@ mod tests {
             Some("app.reply.subject")
         );
     }
+
+    #[test]
+    fn core_native_reply_does_not_overwrite_explicit_reply_to_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert("reply_to", "app.reply.subject");
+        let message = nats_message(Some("_INBOX.native"), Some(headers));
+
+        let canonical = create_nats_canonical_message(&message, None, true);
+
+        assert_eq!(
+            canonical.metadata.get("reply_to").map(String::as_str),
+            Some("app.reply.subject")
+        );
+    }
 }

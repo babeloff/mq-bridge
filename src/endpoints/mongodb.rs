@@ -203,9 +203,13 @@ pub struct MongoDbPublisher {
     format: MongoDbFormat,
 }
 
+fn mongodb_uses_sequencer(request_reply: bool, format: &MongoDbFormat) -> bool {
+    !request_reply && !matches!(format, MongoDbFormat::Raw)
+}
+
 impl MongoDbPublisher {
     fn uses_sequencer(&self) -> bool {
-        !self.request_reply && !matches!(self.format, MongoDbFormat::Raw)
+        mongodb_uses_sequencer(self.request_reply, &self.format)
     }
 
     pub async fn new(config: &MongoDbConfig) -> anyhow::Result<Self> {
@@ -231,7 +235,7 @@ impl MongoDbPublisher {
         }
 
         let collection = db.collection(collection_name);
-        if !config.request_reply && !matches!(config.format, MongoDbFormat::Raw) {
+        if mongodb_uses_sequencer(config.request_reply, &config.format) {
             // Ensure unique index on seq. The sequencer doc has 'seq_counter', so it won't conflict.
             let index_options = mongodb::options::IndexOptions::builder()
                 .unique(true)
@@ -1179,6 +1183,19 @@ impl MongoDbSubscriber {
         let db = client.database(&config.database);
         let collection: Collection<Document> = db.collection(collection_name);
 
+        let missing_seq = collection
+            .count_documents(doc! {
+                "payload": { "$exists": true },
+                "seq": { "$exists": false }
+            })
+            .limit(1)
+            .await?;
+        if missing_seq > 0 {
+            return Err(anyhow!(
+                "MongoDB subscriber found documents with payload but no seq field; use wrapped publisher format or disable subscriber/change_stream mode for raw collections"
+            ));
+        }
+
         let mut last_seq = 0;
         if let Some(cid) = &config.cursor_id {
             let cursor_doc_id = format!("cursor:{}", cid);
@@ -1208,21 +1225,6 @@ impl MongoDbSubscriber {
 impl MessageConsumer for MongoDbSubscriber {
     async fn receive_batch(&mut self, max_messages: usize) -> Result<ReceivedBatch, ConsumerError> {
         loop {
-            let missing_seq = self
-                .collection
-                .count_documents(doc! {
-                    "payload": { "$exists": true },
-                    "seq": { "$exists": false }
-                })
-                .limit(1)
-                .await
-                .map_err(|e| ConsumerError::Connection(e.into()))?;
-            if missing_seq > 0 {
-                return Err(ConsumerError::Connection(anyhow!(
-                    "MongoDB subscriber found documents with payload but no seq field; use wrapped publisher format or disable subscriber/change_stream mode for raw collections"
-                )));
-            }
-
             // Filter for events with seq > last_seq.
             // Crucially, we must filter out the sequencer and cursor documents which might be in the same collection.
             // Events have a 'payload' field, while sequencer/cursors do not.

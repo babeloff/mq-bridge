@@ -71,12 +71,27 @@ async fn test_grpc_tls_roundtrip() {
     let in_route = routes["memory_to_grpc"].clone();
     let out_route = routes["grpc_to_memory"].clone();
 
-    // Start server (deploy) and allow some time for it to become ready
+    // Start server (deploy) and wait until the socket accepts connections.
     out_route
         .deploy("grpc_to_memory")
         .await
         .expect("Failed to deploy gRPC server");
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    let server_addr = format!("127.0.0.1:{}", port);
+    let ready_start = Instant::now();
+    loop {
+        match tokio::time::timeout(
+            Duration::from_millis(200),
+            tokio::net::TcpStream::connect(&server_addr),
+        )
+        .await
+        {
+            Ok(Ok(_stream)) => break,
+            _ if ready_start.elapsed() < Duration::from_secs(2) => {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            _ => panic!("gRPC server did not become ready at {}", server_addr),
+        }
+    }
 
     in_route
         .deploy("memory_to_grpc")

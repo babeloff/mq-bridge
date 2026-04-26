@@ -1859,7 +1859,7 @@ impl TlsConfig {
             url.to_string()
         } else {
             let is_tls = if is_consumer {
-                self.is_tls_server_configured()
+                self.required
             } else {
                 self.is_tls_client_configured()
             };
@@ -1905,7 +1905,7 @@ fn url_has_userinfo(url: &str) -> bool {
         return false;
     };
     let authority_end = url[authority_start..]
-        .find('/')
+        .find(['/', '?', '#'])
         .map(|idx| authority_start + idx)
         .unwrap_or(url.len());
     url[authority_start..authority_end].contains('@')
@@ -2016,7 +2016,12 @@ impl SecretExtractor for EndpointType {
             EndpointType::Switch(cfg) => {
                 for (key, ep) in cfg.cases.iter_mut() {
                     ep.extract_secrets(
-                        &format!("{}__{}__{}", prefix, "SWITCH__CASES", key.to_uppercase()),
+                        &format!(
+                            "{}__{}__{}",
+                            prefix,
+                            "SWITCH__CASES",
+                            sanitize_secret_key(key)
+                        ),
                         secrets,
                     );
                 }
@@ -2584,6 +2589,30 @@ kafka_to_nats:
         };
         config.insert("credential_route".to_string(), credential_route);
 
+        let query_at_route = Route {
+            output: Endpoint {
+                endpoint_type: EndpointType::Http(HttpConfig::new(
+                    "https://example.com?next=a@b.test",
+                )),
+                middlewares: vec![],
+                handler: None,
+            },
+            ..Default::default()
+        };
+        config.insert("query_at_route".to_string(), query_at_route);
+
+        let fragment_at_route = Route {
+            output: Endpoint {
+                endpoint_type: EndpointType::Http(HttpConfig::new(
+                    "https://example.com#user@example.com",
+                )),
+                middlewares: vec![],
+                handler: None,
+            },
+            ..Default::default()
+        };
+        config.insert("fragment_at_route".to_string(), fragment_at_route);
+
         let secrets = extract_config_secrets(&mut config);
 
         if let EndpointType::Http(http) = &config.get("path_at_route").unwrap().output.endpoint_type
@@ -2592,6 +2621,19 @@ kafka_to_nats:
                 http.url,
                 "https://example.com/path/user@example.com?email=a@b.test"
             );
+        }
+        if let EndpointType::Http(http) =
+            &config.get("query_at_route").unwrap().output.endpoint_type
+        {
+            assert_eq!(http.url, "https://example.com?next=a@b.test");
+        }
+        if let EndpointType::Http(http) = &config
+            .get("fragment_at_route")
+            .unwrap()
+            .output
+            .endpoint_type
+        {
+            assert_eq!(http.url, "https://example.com#user@example.com");
         }
         if let EndpointType::Http(http) =
             &config.get("credential_route").unwrap().output.endpoint_type
@@ -2605,6 +2647,8 @@ kafka_to_nats:
             Some("https://user:pass@example.com/path")
         );
         assert!(!secrets.contains_key("MQB__PATH_AT_ROUTE__OUTPUT__HTTP__URL"));
+        assert!(!secrets.contains_key("MQB__QUERY_AT_ROUTE__OUTPUT__HTTP__URL"));
+        assert!(!secrets.contains_key("MQB__FRAGMENT_AT_ROUTE__OUTPUT__HTTP__URL"));
     }
 
     #[test]
