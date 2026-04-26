@@ -1,5 +1,5 @@
 use crate::models::RetryMiddleware;
-use crate::traits::{MessagePublisher, PublisherError, Sent, SentBatch};
+use crate::traits::{BoxFuture, MessagePublisher, PublisherError, Sent, SentBatch};
 use crate::CanonicalMessage;
 use anyhow::anyhow;
 use async_trait::async_trait;
@@ -60,6 +60,14 @@ impl RetryPublisher {
 
 #[async_trait]
 impl MessagePublisher for RetryPublisher {
+    fn on_connect_hook(&self) -> Option<BoxFuture<'_, anyhow::Result<()>>> {
+        self.inner.on_connect_hook()
+    }
+
+    fn on_disconnect_hook(&self) -> Option<BoxFuture<'_, anyhow::Result<()>>> {
+        self.inner.on_disconnect_hook()
+    }
+
     async fn send(&self, message: CanonicalMessage) -> Result<Sent, PublisherError> {
         self.retry_op(|| {
             let msg = message.clone();

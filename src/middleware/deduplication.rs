@@ -4,8 +4,8 @@
 //  git clone https://github.com/marcomq/mq-bridge
 use crate::models::DeduplicationMiddleware;
 use crate::traits::{
-    into_batch_commit_func, ConsumerError, MessageConsumer, MessageDisposition, Received,
-    ReceivedBatch,
+    into_batch_commit_func, BoxFuture, ConsumerError, MessageConsumer, MessageDisposition,
+    Received, ReceivedBatch,
 };
 use anyhow::Context;
 use async_trait::async_trait;
@@ -42,6 +42,31 @@ impl DeduplicationConsumer {
 
 #[async_trait]
 impl MessageConsumer for DeduplicationConsumer {
+    fn on_connect_hook(&self) -> Option<BoxFuture<'_, anyhow::Result<()>>> {
+        self.inner.on_connect_hook()
+    }
+
+    fn on_disconnect_hook(&self) -> Option<BoxFuture<'_, anyhow::Result<()>>> {
+        let inner_hook = self.inner.on_disconnect_hook();
+        let db = self.db.clone();
+
+        Some(Box::pin(async move {
+            let mut first_error = None;
+            if let Some(hook) = inner_hook {
+                if let Err(err) = hook.await {
+                    first_error = Some(err);
+                }
+            }
+            if let Err(err) = db.flush_async().await {
+                first_error.get_or_insert_with(|| anyhow::anyhow!(err));
+            }
+            match first_error {
+                Some(err) => Err(err),
+                None => Ok(()),
+            }
+        }))
+    }
+
     #[instrument(skip_all)]
     async fn receive(&mut self) -> Result<Received, ConsumerError> {
         loop {

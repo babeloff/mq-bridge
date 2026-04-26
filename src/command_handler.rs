@@ -3,7 +3,7 @@
 //  Licensed under MIT License, see License file for more details
 //  git clone https://github.com/marcomq/mq-bridge
 
-use crate::traits::{send_batch_helper, Handler, MessagePublisher};
+use crate::traits::{send_batch_helper, BoxFuture, Handler, MessagePublisher};
 use crate::traits::{Handled, HandlerError};
 use crate::CanonicalMessage;
 use async_trait::async_trait;
@@ -41,6 +41,14 @@ impl CommandPublisher {
 
 #[async_trait]
 impl MessagePublisher for CommandPublisher {
+    fn on_connect_hook(&self) -> Option<BoxFuture<'_, anyhow::Result<()>>> {
+        self.inner.on_connect_hook()
+    }
+
+    fn on_disconnect_hook(&self) -> Option<BoxFuture<'_, anyhow::Result<()>>> {
+        self.inner.on_disconnect_hook()
+    }
+
     async fn send(&self, message: CanonicalMessage) -> Result<Sent, PublisherError> {
         let inbound_correlation_id = message.metadata.get("correlation_id").cloned();
         let original_id = message.message_id;

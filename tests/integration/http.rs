@@ -1,6 +1,6 @@
-#![allow(dead_code)]
+#![allow(dead_code, unused)]
 
-use mq_bridge::models::Route;
+use mq_bridge::models::{Endpoint, EndpointType, HttpConfig, Route};
 use mq_bridge::test_utils::{setup_logging, PERF_TEST_MESSAGE_COUNT};
 use serde_yaml_ng;
 use std::collections::HashMap;
@@ -151,4 +151,23 @@ pub async fn test_http_performance_pipeline() {
     })
     .await
     .expect("HTTP pipeline test timed out");
+}
+
+#[cfg(feature = "http")]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_http_concurrency() {
+    setup_logging();
+    let port = get_free_port();
+    let input = Endpoint::new(EndpointType::Http(HttpConfig {
+        url: format!("127.0.0.1:{}", port),
+        ..Default::default()
+    }));
+    // Publisher needs the schema
+    let sender = Endpoint::new(EndpointType::Http(HttpConfig {
+        url: format!("http://127.0.0.1:{}", port),
+        ..Default::default()
+    }));
+    let output = Endpoint::new_memory("con_out_http", 10);
+
+    mq_bridge::test_utils::run_concurrency_test(input, output, sender).await;
 }

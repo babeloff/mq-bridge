@@ -1,6 +1,6 @@
 [package]
 name = "mq-bridge"
-version = "0.2.12"
+version = "0.2.13"
 edition = "2021"
 authors = ["Marco Mengelkoch"]
 rust-version = "1.75"  # 2021 edition was released in 1.56
@@ -114,7 +114,7 @@ protoc-bin-vendored = { version = "3.0", optional = true }
 [features]
 default = []
 middleware = ["metrics", "dedup"]
-full = ["middleware", "mongodb", "kafka", "amqp", "nats", "mqtt", "http", "aws", "zeromq", "sled", "grpc", "sqlx", "rustls-ring"]
+full = ["middleware", "mongodb", "kafka", "amqp", "nats", "mqtt", "http", "aws", "zeromq", "sled", "grpc", "sqlx", "rustls-aws-lc"]
 
 # Functionality features
 dedup = ["sled"]

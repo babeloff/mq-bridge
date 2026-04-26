@@ -8,8 +8,8 @@ use crate::errors::ProcessingError;
 pub use crate::models::Route;
 use crate::models::{Endpoint, EndpointType, RouteOptions};
 use crate::traits::{
-    BatchCommitFunc, ConsumerError, Handler, HandlerError, MessageDisposition, PublisherError,
-    SentBatch,
+    BatchCommitFunc, ConsumerError, Handler, HandlerError, MessageConsumer, MessageDisposition,
+    MessagePublisher, PublisherError, SentBatch,
 };
 use async_channel::{bounded, Sender};
 use serde::de::DeserializeOwned;
@@ -38,6 +38,60 @@ impl RouteHandle {
 
     pub async fn join(self) -> Result<(), tokio::task::JoinError> {
         self.0 .0.await
+    }
+}
+
+async fn run_publisher_connect_hook(
+    route_name: &str,
+    publisher: &Arc<dyn MessagePublisher>,
+) -> anyhow::Result<()> {
+    if let Some(hook) = publisher.on_connect_hook() {
+        hook.await.map_err(|err| {
+            anyhow::anyhow!(
+                "Publisher on_connect hook failed for route '{}': {}",
+                route_name,
+                err
+            )
+        })?;
+    }
+    Ok(())
+}
+
+async fn run_consumer_connect_hook(
+    route_name: &str,
+    consumer: &dyn MessageConsumer,
+) -> anyhow::Result<()> {
+    if let Some(hook) = consumer.on_connect_hook() {
+        hook.await.map_err(|err| {
+            anyhow::anyhow!(
+                "Consumer on_connect hook failed for route '{}': {}",
+                route_name,
+                err
+            )
+        })?;
+    }
+    Ok(())
+}
+
+async fn run_publisher_disconnect_hook(route_name: &str, publisher: &Arc<dyn MessagePublisher>) {
+    if let Some(hook) = publisher.on_disconnect_hook() {
+        if let Err(err) = hook.await {
+            warn!(
+                "Publisher on_disconnect hook failed for route '{}': {}",
+                route_name, err
+            );
+        }
+    }
+}
+
+async fn run_consumer_disconnect_hook(route_name: &str, consumer: &dyn MessageConsumer) {
+    if let Some(hook) = consumer.on_disconnect_hook() {
+        if let Err(err) = hook.await {
+            warn!(
+                "Consumer on_disconnect hook failed for route '{}': {}",
+                route_name, err
+            );
+        }
     }
 }
 
@@ -380,6 +434,15 @@ impl Route {
     ) -> anyhow::Result<bool> {
         let publisher = create_publisher_from_route(name, &self.output).await?;
         let mut consumer = create_consumer_from_route(name, &self.input).await?;
+        if let Err(err) = run_publisher_connect_hook(name, &publisher).await {
+            run_publisher_disconnect_hook(name, &publisher).await;
+            return Err(err);
+        }
+        if let Err(err) = run_consumer_connect_hook(name, consumer.as_ref()).await {
+            run_consumer_disconnect_hook(name, consumer.as_ref()).await;
+            run_publisher_disconnect_hook(name, &publisher).await;
+            return Err(err);
+        }
         let (err_tx, err_rx) = bounded(1);
         let mut commit_tasks = JoinSet::new();
 
@@ -431,9 +494,20 @@ impl Route {
                     let batch_len = received_batch.messages.len();
                     message_ids.clear();
                     message_ids.extend(received_batch.messages.iter().map(|m| m.message_id));
+                    let request_ids: std::collections::HashSet<u128> = received_batch
+                        .messages
+                        .iter()
+                        .filter(|m| m.metadata.contains_key("reply_to"))
+                        .map(|m| m.message_id)
+                        .collect();
 
                     match publisher.send_batch(received_batch.messages).await {
                         Ok(SentBatch::Ack) => {
+                            for id in &message_ids {
+                                if request_ids.contains(id) {
+                                    warn!("Message {:032x} expected a reply (reply_to set), but publisher returned Ack. Response loop broken.", id);
+                                }
+                            }
                             let commit = commit_opt.take().expect("Commit already used");
                             let err_tx = err_tx.clone();
                             commit_tasks.spawn(async move {
@@ -466,7 +540,7 @@ impl Route {
                                 // Ack/nack the batch to fill the sequencer slot.
                                 let commit = commit_opt.take().expect("Commit already used");
                                 let dispositions =
-                                    map_responses_to_dispositions(&message_ids, responses, &failed);
+                                    map_responses_to_dispositions(&message_ids, responses, &failed, &request_ids);
                                 if let Err(commit_err) = commit(dispositions).await {
                                     warn!("Commit after transient failure also failed: {}", commit_err);
                                 }
@@ -484,8 +558,9 @@ impl Route {
                             let commit = commit_opt.take().expect("Commit already used");
                             let err_tx = err_tx.clone();
                             let ids = std::mem::take(&mut message_ids);
+                            let req_ids = request_ids;
                             commit_tasks.spawn(async move {
-                                let dispositions = map_responses_to_dispositions(&ids, responses, &failed);
+                                let dispositions = map_responses_to_dispositions(&ids, responses, &failed, &req_ids);
                                 if let Err(e) = commit(dispositions).await {
                                     error!("Commit failed: {}", e);
                                     match err_tx.try_send(e) {
@@ -528,6 +603,8 @@ impl Route {
         }
         drop(err_rx);
         let _ = sequencer_handle.await;
+        run_consumer_disconnect_hook(name, consumer.as_ref()).await;
+        run_publisher_disconnect_hook(name, &publisher).await;
         run_result
     }
 
@@ -540,6 +617,15 @@ impl Route {
     ) -> anyhow::Result<bool> {
         let publisher = create_publisher_from_route(name, &self.output).await?;
         let mut consumer = create_consumer_from_route(name, &self.input).await?;
+        if let Err(err) = run_publisher_connect_hook(name, &publisher).await {
+            run_publisher_disconnect_hook(name, &publisher).await;
+            return Err(err);
+        }
+        if let Err(err) = run_consumer_connect_hook(name, consumer.as_ref()).await {
+            run_consumer_disconnect_hook(name, consumer.as_ref()).await;
+            run_publisher_disconnect_hook(name, &publisher).await;
+            return Err(err);
+        }
         if let Some(tx) = ready_tx {
             let _ = tx.send(()).await;
         }
@@ -573,8 +659,19 @@ impl Route {
                     let batch_len = messages.len();
                     message_ids.clear();
                     message_ids.extend(messages.iter().map(|m| m.message_id));
+                    let request_ids: std::collections::HashSet<u128> = messages
+                        .iter()
+                        .filter(|m| m.metadata.contains_key("reply_to"))
+                        .map(|m| m.message_id)
+                        .collect();
+
                     match publisher.send_batch(messages).await {
                         Ok(SentBatch::Ack) => {
+                            for id in &message_ids {
+                                if request_ids.contains(id) {
+                                    warn!("Message {:032x} expected a reply (reply_to set), but publisher returned Ack. Response loop broken.", id);
+                                }
+                            }
                             let commit = commit_opt.take().expect("Commit already used");
                             let err_tx = err_tx.clone();
                             commit_tasks.spawn(async move {
@@ -605,7 +702,7 @@ impl Route {
                                 let commit = commit_opt.take().expect("Commit already used");
                                 // Ack/nack the batch to fill the sequencer slot.
                                 let dispositions =
-                                    map_responses_to_dispositions(&message_ids, responses, &failed);
+                                    map_responses_to_dispositions(&message_ids, responses, &failed, &request_ids);
                                 if let Err(commit_err) = commit(dispositions).await {
                                     warn!("Commit after transient failure also failed: {}", commit_err);
                                 }
@@ -627,8 +724,9 @@ impl Route {
                             let commit = commit_opt.take().expect("Commit already used");
                             let err_tx = err_tx.clone();
                             let ids = std::mem::take(&mut message_ids);
+                            let req_ids = request_ids;
                             commit_tasks.spawn(async move {
-                                let dispositions = map_responses_to_dispositions(&ids, responses, &failed);
+                                let dispositions = map_responses_to_dispositions(&ids, responses, &failed, &req_ids);
                                 if let Err(e) = commit(dispositions).await {
                                     error!("Commit failed: {}", e);
                                     match err_tx.try_send(e) {
@@ -752,6 +850,8 @@ impl Route {
         // Close sequencer
         drop(seq_tx);
         let _ = sequencer_handle.await;
+        run_consumer_disconnect_hook(name, consumer.as_ref()).await;
+        run_publisher_disconnect_hook(name, &publisher).await;
 
         if let Some(err) = loop_error {
             return Err(err);
@@ -798,17 +898,14 @@ impl Route {
     /// # Examples
     ///
     /// ```
-    /// # use mq_bridge::{Route, models::Endpoint, Handled, HandlerError};
+    /// # use mq_bridge::{Route, models::Endpoint};
     /// # use serde::Deserialize;
-    /// # use std::sync::Arc;
     ///
     /// #[derive(Deserialize)]
-    /// struct MyData {
-    ///     id: u32,
-    /// }
+    /// struct MyData { id: u32 }
     ///
-    /// async fn my_handler(data: MyData) -> Result<Handled, HandlerError> {
-    ///     Ok(Handled::Ack)
+    /// async fn my_handler(data: MyData) -> anyhow::Result<()> {
+    ///     Ok(())
     /// }
     ///
     /// let route = Route::new(Endpoint::new_memory("in", 10), Endpoint::new_memory("out", 10))
@@ -957,6 +1054,7 @@ fn map_responses_to_dispositions(
     message_ids: &[u128],
     responses: Option<Vec<crate::CanonicalMessage>>,
     failed: &[(crate::CanonicalMessage, PublisherError)],
+    request_ids: &std::collections::HashSet<u128>,
 ) -> Vec<MessageDisposition> {
     let mut dispositions = Vec::with_capacity(message_ids.len());
     let failed_ids: std::collections::HashSet<u128> =
@@ -975,6 +1073,9 @@ fn map_responses_to_dispositions(
         } else if let Some(resp) = response_map.remove(id) {
             // If a response exists for this specific ID, use it.
             dispositions.push(MessageDisposition::Reply(resp));
+        } else if request_ids.contains(id) {
+            error!("Message {:032x} expected a reply (reply_to set), but publisher returned Ack. Nacking to avoid committing a lost response.", id);
+            dispositions.push(MessageDisposition::Nack);
         } else {
             // Otherwise, it was a successful send that did not produce a response.
             dispositions.push(MessageDisposition::Ack);
@@ -1004,12 +1105,14 @@ fn test_map_responses_to_dispositions_logic() {
     msg2.message_id = 2;
     let failed = vec![(msg2, PublisherError::NonRetryable(anyhow!("failed")))];
 
-    let dispositions = map_responses_to_dispositions(&ids, responses, &failed);
+    let mut request_ids = std::collections::HashSet::new();
+    request_ids.insert(3); // id 3 expects a reply but won't get one
+    let dispositions = map_responses_to_dispositions(&ids, responses, &failed, &request_ids);
 
     assert_eq!(dispositions.len(), 4);
     assert!(matches!(dispositions[0], MessageDisposition::Reply(_))); // from responses
     assert!(matches!(dispositions[1], MessageDisposition::Nack)); // from failed
-    assert!(matches!(dispositions[2], MessageDisposition::Ack)); // implicit ack
+    assert!(matches!(dispositions[2], MessageDisposition::Nack)); // missing reply
     assert!(matches!(dispositions[3], MessageDisposition::Reply(_))); // from responses
 }
 
@@ -1034,7 +1137,7 @@ mod tests {
     };
     use crate::CanonicalMessage;
     use std::any::Any;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -1624,8 +1727,7 @@ mod tests {
         let _ = sequencer_handle.await;
     }
 
-    use crate::traits::{CustomEndpointFactory, Sent};
-    use std::sync::atomic::AtomicUsize;
+    use crate::traits::{BoxFuture, CustomEndpointFactory, Sent};
     use std::sync::Mutex;
 
     type ConsumerBehavior =
@@ -1696,6 +1798,203 @@ mod tests {
         ) -> anyhow::Result<Box<dyn MessagePublisher>> {
             (self.publisher_behavior.lock().unwrap())()
         }
+    }
+
+    #[derive(Clone, Default)]
+    struct HookState {
+        consumer_connects: Arc<AtomicUsize>,
+        consumer_disconnects: Arc<AtomicUsize>,
+        publisher_connects: Arc<AtomicUsize>,
+        publisher_disconnects: Arc<AtomicUsize>,
+        shared_mutations: Arc<AtomicUsize>,
+        fail_consumer_connect: Arc<AtomicBool>,
+        fail_consumer_disconnect: Arc<AtomicBool>,
+        fail_publisher_disconnect: Arc<AtomicBool>,
+    }
+
+    struct HookConsumer {
+        state: HookState,
+    }
+
+    struct HookPublisher {
+        state: HookState,
+    }
+
+    #[async_trait::async_trait]
+    impl MessageConsumer for HookConsumer {
+        fn on_connect_hook(&self) -> Option<BoxFuture<'_, anyhow::Result<()>>> {
+            Some(Box::pin(async move {
+                self.state.consumer_connects.fetch_add(1, Ordering::SeqCst);
+                self.state.shared_mutations.fetch_add(1, Ordering::SeqCst);
+                if self.state.fail_consumer_connect.load(Ordering::SeqCst) {
+                    return Err(anyhow::anyhow!("consumer hook failed"));
+                }
+                Ok(())
+            }))
+        }
+
+        fn on_disconnect_hook(&self) -> Option<BoxFuture<'_, anyhow::Result<()>>> {
+            Some(Box::pin(async move {
+                self.state
+                    .consumer_disconnects
+                    .fetch_add(1, Ordering::SeqCst);
+                if self.state.fail_consumer_disconnect.load(Ordering::SeqCst) {
+                    return Err(anyhow::anyhow!("consumer disconnect hook failed"));
+                }
+                Ok(())
+            }))
+        }
+
+        async fn receive_batch(&mut self, _max: usize) -> Result<ReceivedBatch, ConsumerError> {
+            Err(ConsumerError::EndOfStream)
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl MessagePublisher for HookPublisher {
+        fn on_connect_hook(&self) -> Option<BoxFuture<'_, anyhow::Result<()>>> {
+            Some(Box::pin(async move {
+                self.state.publisher_connects.fetch_add(1, Ordering::SeqCst);
+                self.state.shared_mutations.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }))
+        }
+
+        fn on_disconnect_hook(&self) -> Option<BoxFuture<'_, anyhow::Result<()>>> {
+            Some(Box::pin(async move {
+                self.state
+                    .publisher_disconnects
+                    .fetch_add(1, Ordering::SeqCst);
+                if self.state.fail_publisher_disconnect.load(Ordering::SeqCst) {
+                    return Err(anyhow::anyhow!("publisher disconnect hook failed"));
+                }
+                Ok(())
+            }))
+        }
+
+        async fn send_batch(
+            &self,
+            _: Vec<crate::CanonicalMessage>,
+        ) -> Result<SentBatch, PublisherError> {
+            Ok(SentBatch::Ack)
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    fn hook_route(state: HookState, concurrency: usize) -> Route {
+        let unique_id = fast_uuid_v7::gen_id().to_string();
+        let factory_name = format!("hooks_{}", unique_id);
+        let mut factory = MockEndpointFactory::new();
+
+        let consumer_state = state.clone();
+        factory.consumer_behavior = Arc::new(Mutex::new(move || {
+            Ok(Box::new(HookConsumer {
+                state: consumer_state.clone(),
+            }) as Box<dyn MessageConsumer>)
+        }));
+
+        let publisher_state = state;
+        factory.publisher_behavior = Arc::new(Mutex::new(move || {
+            Ok(Box::new(HookPublisher {
+                state: publisher_state.clone(),
+            }) as Box<dyn MessagePublisher>)
+        }));
+
+        register_endpoint_factory(&factory_name, Arc::new(factory));
+
+        let input = Endpoint {
+            endpoint_type: EndpointType::Custom {
+                name: factory_name.clone(),
+                config: serde_json::Value::Null,
+            },
+            middlewares: vec![],
+            handler: None,
+        };
+        let output = Endpoint {
+            endpoint_type: EndpointType::Custom {
+                name: factory_name,
+                config: serde_json::Value::Null,
+            },
+            middlewares: vec![],
+            handler: None,
+        };
+        Route::new(input, output).with_concurrency(concurrency)
+    }
+
+    #[tokio::test]
+    async fn test_lifecycle_hooks_called_once_sequentially() {
+        let state = HookState::default();
+        let route = hook_route(state.clone(), 1);
+
+        let stopped_by_shutdown = route
+            .run_until_err("test_lifecycle_sequential", None, None)
+            .await
+            .unwrap();
+
+        assert!(!stopped_by_shutdown);
+        assert_eq!(state.consumer_connects.load(Ordering::SeqCst), 1);
+        assert_eq!(state.consumer_disconnects.load(Ordering::SeqCst), 1);
+        assert_eq!(state.publisher_connects.load(Ordering::SeqCst), 1);
+        assert_eq!(state.publisher_disconnects.load(Ordering::SeqCst), 1);
+        assert_eq!(state.shared_mutations.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn test_lifecycle_hooks_called_once_concurrently() {
+        let state = HookState::default();
+        let route = hook_route(state.clone(), 4);
+
+        route
+            .run_until_err("test_lifecycle_concurrent", None, None)
+            .await
+            .unwrap();
+
+        assert_eq!(state.consumer_connects.load(Ordering::SeqCst), 1);
+        assert_eq!(state.consumer_disconnects.load(Ordering::SeqCst), 1);
+        assert_eq!(state.publisher_connects.load(Ordering::SeqCst), 1);
+        assert_eq!(state.publisher_disconnects.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_lifecycle_on_connect_failure_stops_route() {
+        let state = HookState::default();
+        state.fail_consumer_connect.store(true, Ordering::SeqCst);
+        let route = hook_route(state.clone(), 1);
+
+        let err = route
+            .run_until_err("test_lifecycle_connect_failure", None, None)
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("on_connect hook failed"));
+        assert_eq!(state.publisher_connects.load(Ordering::SeqCst), 1);
+        assert_eq!(state.consumer_connects.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_lifecycle_on_disconnect_failure_does_not_stop_route() {
+        let state = HookState::default();
+        state.fail_consumer_disconnect.store(true, Ordering::SeqCst);
+        state
+            .fail_publisher_disconnect
+            .store(true, Ordering::SeqCst);
+        let route = hook_route(state.clone(), 1);
+
+        let stopped_by_shutdown = route
+            .run_until_err("test_lifecycle_disconnect_failure", None, None)
+            .await
+            .unwrap();
+
+        assert!(!stopped_by_shutdown);
+        assert_eq!(state.consumer_disconnects.load(Ordering::SeqCst), 1);
+        assert_eq!(state.publisher_disconnects.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

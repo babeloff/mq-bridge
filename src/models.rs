@@ -1498,6 +1498,10 @@ impl GrpcConfig {
 pub struct HttpConfig {
     /// For consumers, the listen address (e.g., "0.0.0.0:8080"). For publishers, the target URL.
     pub url: String,
+    /// (Consumer only) Optional request path filter. If set, only requests whose URI path matches exactly are delivered to this consumer.
+    pub path: Option<String>,
+    /// (Optional) HTTP method. For publishers: the method to use (defaults to POST). For consumers: restrict to this method (others return 405).
+    pub method: Option<String>,
     /// TLS configuration.
     #[serde(default)]
     pub tls: TlsConfig,
@@ -1590,6 +1594,16 @@ impl HttpConfig {
 
     pub fn with_workers(mut self, workers: usize) -> Self {
         self.workers = Some(workers);
+        self
+    }
+
+    pub fn with_method(mut self, method: impl Into<String>) -> Self {
+        self.method = Some(method.into());
+        self
+    }
+
+    pub fn with_path(mut self, path: impl Into<String>) -> Self {
+        self.path = Some(path.into());
         self
     }
 }
@@ -1768,7 +1782,7 @@ pub struct SqlxConfig {
 ///     ..Default::default()
 /// };
 /// ```
-#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+#[derive(Debug, Deserialize, Serialize, Clone, Default, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct TlsConfig {
@@ -1823,7 +1837,31 @@ impl TlsConfig {
 
     /// Checks if TLS server certificate authentication is configured.
     pub fn is_tls_server_configured(&self) -> bool {
-        self.cert_file.is_some() && self.key_file.is_some()
+        self.required && self.cert_file.is_some() && self.key_file.is_some()
+    }
+
+    /// Checks if the TLS configuration is sufficient to make a TLS client connection.
+    pub fn is_tls_client_configured(&self) -> bool {
+        self.required
+            || self.ca_file.is_some()
+            || (self.cert_file.is_some() && self.key_file.is_some())
+    }
+
+    /// Helper to normalize a URL by adding the appropriate scheme prefix (http:// or https://) if missing.
+    pub fn normalize_url(&self, url: &str) -> String {
+        if url
+            .get(..7)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("http://"))
+            || url
+                .get(..8)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("https://"))
+        {
+            url.to_string()
+        } else {
+            let is_tls = self.required;
+            let scheme = if is_tls { "https" } else { "http" };
+            format!("{}://{}", scheme, url)
+        }
     }
 }
 
@@ -1831,6 +1869,85 @@ impl TlsConfig {
 pub trait SecretExtractor {
     /// Extracts secrets into the provided map using the given prefix, and clears them from self.
     fn extract_secrets(&mut self, prefix: &str, secrets: &mut HashMap<String, String>);
+}
+
+fn extract_sensitive_string_map_entries(
+    values: &mut HashMap<String, String>,
+    prefix: &str,
+    field_name: &str,
+    secrets: &mut HashMap<String, String>,
+) {
+    let secret_keys = values
+        .keys()
+        .filter(|key| {
+            let key = key.to_ascii_lowercase();
+            key.contains("key") || key.contains("token") || key.contains("auth")
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+
+    for key in secret_keys {
+        if let Some(value) = values.remove(&key) {
+            secrets.insert(
+                sanitize_secret_key(&format!("{}__{}__{}", prefix, field_name, key)),
+                value,
+            );
+        }
+    }
+}
+
+fn url_has_userinfo(url: &str) -> bool {
+    let Some(authority_start) = url.find("://").map(|idx| idx + 3) else {
+        return false;
+    };
+    let authority_end = url[authority_start..]
+        .find(['/', '?', '#'])
+        .map(|idx| authority_start + idx)
+        .unwrap_or(url.len());
+    url[authority_start..authority_end].contains('@')
+}
+
+fn sanitize_secret_key(key: &str) -> String {
+    key.chars()
+        .map(|ch| {
+            let ch = ch.to_ascii_uppercase();
+            if ch.is_ascii_alphanumeric() || ch == '_' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+fn extract_sensitive_url(
+    url: &mut String,
+    prefix: &str,
+    field_name: &str,
+    secrets: &mut HashMap<String, String>,
+) {
+    if !url.is_empty() && url_has_userinfo(url) {
+        secrets.insert(
+            sanitize_secret_key(&format!("{}__{}", prefix, field_name)),
+            std::mem::take(url),
+        );
+    }
+}
+
+fn extract_sensitive_optional_url(
+    url: &mut Option<String>,
+    prefix: &str,
+    field_name: &str,
+    secrets: &mut HashMap<String, String>,
+) {
+    if url.as_ref().is_some_and(|url| url_has_userinfo(url)) {
+        if let Some(url) = url.take() {
+            secrets.insert(
+                sanitize_secret_key(&format!("{}__{}", prefix, field_name)),
+                url,
+            );
+        }
+    }
 }
 
 impl SecretExtractor for Route {
@@ -1878,6 +1995,9 @@ impl SecretExtractor for EndpointType {
             EndpointType::IbmMq(cfg) => {
                 cfg.extract_secrets(&format!("{}__{}", prefix, "IBMMQ"), secrets)
             }
+            EndpointType::ZeroMq(cfg) => {
+                cfg.extract_secrets(&format!("{}__{}", prefix, "ZEROMQ"), secrets)
+            }
             EndpointType::Sqlx(cfg) => {
                 cfg.extract_secrets(&format!("{}__{}", prefix, "SQLX"), secrets)
             }
@@ -1892,7 +2012,12 @@ impl SecretExtractor for EndpointType {
             EndpointType::Switch(cfg) => {
                 for (key, ep) in cfg.cases.iter_mut() {
                     ep.extract_secrets(
-                        &format!("{}__{}__{}", prefix, "SWITCH__CASES", key.to_uppercase()),
+                        &format!(
+                            "{}__{}__{}",
+                            prefix,
+                            "SWITCH__CASES",
+                            sanitize_secret_key(key)
+                        ),
                         secrets,
                     );
                 }
@@ -1928,11 +2053,14 @@ impl SecretExtractor for AwsConfig {
         if let Some(val) = self.session_token.take() {
             secrets.insert(format!("{}__{}", prefix, "SESSION_TOKEN"), val);
         }
+        extract_sensitive_optional_url(&mut self.queue_url, prefix, "QUEUE_URL", secrets);
+        extract_sensitive_optional_url(&mut self.endpoint_url, prefix, "ENDPOINT_URL", secrets);
     }
 }
 
 impl SecretExtractor for KafkaConfig {
     fn extract_secrets(&mut self, prefix: &str, secrets: &mut HashMap<String, String>) {
+        extract_sensitive_url(&mut self.url, prefix, "URL", secrets);
         if let Some(val) = self.username.take() {
             secrets.insert(format!("{}__{}", prefix, "USERNAME"), val);
         }
@@ -1946,6 +2074,7 @@ impl SecretExtractor for KafkaConfig {
 
 impl SecretExtractor for NatsConfig {
     fn extract_secrets(&mut self, prefix: &str, secrets: &mut HashMap<String, String>) {
+        extract_sensitive_url(&mut self.url, prefix, "URL", secrets);
         if let Some(val) = self.username.take() {
             secrets.insert(format!("{}__{}", prefix, "USERNAME"), val);
         }
@@ -1962,6 +2091,7 @@ impl SecretExtractor for NatsConfig {
 
 impl SecretExtractor for AmqpConfig {
     fn extract_secrets(&mut self, prefix: &str, secrets: &mut HashMap<String, String>) {
+        extract_sensitive_url(&mut self.url, prefix, "URL", secrets);
         if let Some(val) = self.username.take() {
             secrets.insert(format!("{}__{}", prefix, "USERNAME"), val);
         }
@@ -1975,6 +2105,7 @@ impl SecretExtractor for AmqpConfig {
 
 impl SecretExtractor for MongoDbConfig {
     fn extract_secrets(&mut self, prefix: &str, secrets: &mut HashMap<String, String>) {
+        extract_sensitive_url(&mut self.url, prefix, "URL", secrets);
         if let Some(val) = self.username.take() {
             secrets.insert(format!("{}__{}", prefix, "USERNAME"), val);
         }
@@ -1988,6 +2119,7 @@ impl SecretExtractor for MongoDbConfig {
 
 impl SecretExtractor for MqttConfig {
     fn extract_secrets(&mut self, prefix: &str, secrets: &mut HashMap<String, String>) {
+        extract_sensitive_url(&mut self.url, prefix, "URL", secrets);
         if let Some(val) = self.username.take() {
             secrets.insert(format!("{}__{}", prefix, "USERNAME"), val);
         }
@@ -2001,10 +2133,17 @@ impl SecretExtractor for MqttConfig {
 
 impl SecretExtractor for HttpConfig {
     fn extract_secrets(&mut self, prefix: &str, secrets: &mut HashMap<String, String>) {
+        extract_sensitive_url(&mut self.url, prefix, "URL", secrets);
         if let Some((u, p)) = self.basic_auth.take() {
             secrets.insert(format!("{}__{}__{}", prefix, "BASIC_AUTH", 0), u);
             secrets.insert(format!("{}__{}__{}", prefix, "BASIC_AUTH", 1), p);
         }
+        extract_sensitive_string_map_entries(
+            &mut self.custom_headers,
+            prefix,
+            "CUSTOM_HEADERS",
+            secrets,
+        );
         self.tls
             .extract_secrets(&format!("{}__{}", prefix, "TLS"), secrets);
     }
@@ -2012,6 +2151,7 @@ impl SecretExtractor for HttpConfig {
 
 impl SecretExtractor for IbmMqConfig {
     fn extract_secrets(&mut self, prefix: &str, secrets: &mut HashMap<String, String>) {
+        extract_sensitive_url(&mut self.url, prefix, "URL", secrets);
         if let Some(val) = self.username.take() {
             secrets.insert(format!("{}__{}", prefix, "USERNAME"), val);
         }
@@ -2023,8 +2163,15 @@ impl SecretExtractor for IbmMqConfig {
     }
 }
 
+impl SecretExtractor for ZeroMqConfig {
+    fn extract_secrets(&mut self, prefix: &str, secrets: &mut HashMap<String, String>) {
+        extract_sensitive_url(&mut self.url, prefix, "URL", secrets);
+    }
+}
+
 impl SecretExtractor for SqlxConfig {
     fn extract_secrets(&mut self, prefix: &str, secrets: &mut HashMap<String, String>) {
+        extract_sensitive_url(&mut self.url, prefix, "URL", secrets);
         if let Some(val) = self.username.take() {
             secrets.insert(format!("{}__{}", prefix, "USERNAME"), val);
         }
@@ -2038,6 +2185,7 @@ impl SecretExtractor for SqlxConfig {
 
 impl SecretExtractor for GrpcConfig {
     fn extract_secrets(&mut self, prefix: &str, secrets: &mut HashMap<String, String>) {
+        extract_sensitive_url(&mut self.url, prefix, "URL", secrets);
         self.tls
             .extract_secrets(&format!("{}__{}", prefix, "TLS"), secrets);
     }
@@ -2060,7 +2208,7 @@ impl SecretExtractor for TlsConfig {
 pub fn extract_config_secrets(config: &mut Config) -> HashMap<String, String> {
     let mut secrets = HashMap::new();
     for (route_name, route) in config.iter_mut() {
-        let prefix = format!("MQB__{}", route_name.to_uppercase());
+        let prefix = sanitize_secret_key(&format!("MQB__{}", route_name));
         route.extract_secrets(&prefix, &mut secrets);
     }
     secrets
@@ -2277,7 +2425,7 @@ kafka_to_nats:
         let mut route = Route::default();
 
         // Setup Kafka with secrets
-        let mut kafka_config = KafkaConfig::new("localhost:9092");
+        let mut kafka_config = KafkaConfig::new("kafka://user:pass@localhost:9092");
         kafka_config.username = Some("user".to_string());
         kafka_config.password = Some("pass".to_string());
         kafka_config.tls.cert_password = Some("certpass".to_string());
@@ -2289,8 +2437,26 @@ kafka_to_nats:
         };
 
         // Setup HTTP with basic auth
-        let mut http_config = HttpConfig::new("http://localhost");
+        let mut http_config = HttpConfig::new("http://httpuser:httppass@localhost");
         http_config.basic_auth = Some(("httpuser".to_string(), "httppass".to_string()));
+        http_config
+            .custom_headers
+            .insert("X-API-Key".to_string(), "http-api-key".to_string());
+        http_config.custom_headers.insert(
+            "X-Access-Token".to_string(),
+            "http-access-token".to_string(),
+        );
+        http_config.custom_headers.insert(
+            "X-Authentication".to_string(),
+            "http-authentication".to_string(),
+        );
+        http_config.custom_headers.insert(
+            "Authorization".to_string(),
+            "Bearer secret-token".to_string(),
+        );
+        http_config
+            .custom_headers
+            .insert("X-Trace-Id".to_string(), "trace-value".to_string());
 
         route.output = Endpoint {
             endpoint_type: EndpointType::Http(http_config),
@@ -2303,6 +2469,12 @@ kafka_to_nats:
         let secrets = extract_config_secrets(&mut config);
 
         // Verify secrets extracted
+        assert_eq!(
+            secrets
+                .get("MQB__TEST_ROUTE__INPUT__KAFKA__URL")
+                .map(|s| s.as_str()),
+            Some("kafka://user:pass@localhost:9092")
+        );
         assert_eq!(
             secrets
                 .get("MQB__TEST_ROUTE__INPUT__KAFKA__USERNAME")
@@ -2323,6 +2495,12 @@ kafka_to_nats:
         );
         assert_eq!(
             secrets
+                .get("MQB__TEST_ROUTE__OUTPUT__HTTP__URL")
+                .map(|s| s.as_str()),
+            Some("http://httpuser:httppass@localhost")
+        );
+        assert_eq!(
+            secrets
                 .get("MQB__TEST_ROUTE__OUTPUT__HTTP__BASIC_AUTH__0")
                 .map(|s| s.as_str()),
             Some("httpuser")
@@ -2333,17 +2511,140 @@ kafka_to_nats:
                 .map(|s| s.as_str()),
             Some("httppass")
         );
+        assert_eq!(
+            secrets
+                .get("MQB__TEST_ROUTE__OUTPUT__HTTP__CUSTOM_HEADERS__X_API_KEY")
+                .map(|s| s.as_str()),
+            Some("http-api-key")
+        );
+        assert_eq!(
+            secrets
+                .get("MQB__TEST_ROUTE__OUTPUT__HTTP__CUSTOM_HEADERS__X_ACCESS_TOKEN")
+                .map(|s| s.as_str()),
+            Some("http-access-token")
+        );
+        assert_eq!(
+            secrets
+                .get("MQB__TEST_ROUTE__OUTPUT__HTTP__CUSTOM_HEADERS__X_AUTHENTICATION")
+                .map(|s| s.as_str()),
+            Some("http-authentication")
+        );
+        assert_eq!(
+            secrets
+                .get("MQB__TEST_ROUTE__OUTPUT__HTTP__CUSTOM_HEADERS__AUTHORIZATION")
+                .map(|s| s.as_str()),
+            Some("Bearer secret-token")
+        );
 
         // Verify config cleared
         let route = config.get("test_route").unwrap();
         if let EndpointType::Kafka(k) = &route.input.endpoint_type {
+            assert!(k.url.is_empty());
             assert!(k.username.is_none());
             assert!(k.password.is_none());
             assert!(k.tls.cert_password.is_none());
         }
         if let EndpointType::Http(h) = &route.output.endpoint_type {
+            assert!(h.url.is_empty());
             assert!(h.basic_auth.is_none());
+            assert!(!h.custom_headers.contains_key("X-API-Key"));
+            assert!(!h.custom_headers.contains_key("X-Access-Token"));
+            assert!(!h.custom_headers.contains_key("X-Authentication"));
+            assert!(!h.custom_headers.contains_key("Authorization"));
+            assert_eq!(
+                h.custom_headers.get("X-Trace-Id").map(|s| s.as_str()),
+                Some("trace-value")
+            );
         }
+    }
+
+    #[test]
+    fn test_extract_sensitive_url_only_strips_authority_credentials() {
+        let mut config = Config::new();
+        let path_at_route = Route {
+            output: Endpoint {
+                endpoint_type: EndpointType::Http(HttpConfig::new(
+                    "https://example.com/path/user@example.com?email=a@b.test",
+                )),
+                middlewares: vec![],
+                handler: None,
+            },
+            ..Default::default()
+        };
+        config.insert("path_at_route".to_string(), path_at_route);
+
+        let credential_route = Route {
+            output: Endpoint {
+                endpoint_type: EndpointType::Http(HttpConfig::new(
+                    "https://user:pass@example.com/path",
+                )),
+                middlewares: vec![],
+                handler: None,
+            },
+            ..Default::default()
+        };
+        config.insert("credential_route".to_string(), credential_route);
+
+        let query_at_route = Route {
+            output: Endpoint {
+                endpoint_type: EndpointType::Http(HttpConfig::new(
+                    "https://example.com?next=a@b.test",
+                )),
+                middlewares: vec![],
+                handler: None,
+            },
+            ..Default::default()
+        };
+        config.insert("query_at_route".to_string(), query_at_route);
+
+        let fragment_at_route = Route {
+            output: Endpoint {
+                endpoint_type: EndpointType::Http(HttpConfig::new(
+                    "https://example.com#user@example.com",
+                )),
+                middlewares: vec![],
+                handler: None,
+            },
+            ..Default::default()
+        };
+        config.insert("fragment_at_route".to_string(), fragment_at_route);
+
+        let secrets = extract_config_secrets(&mut config);
+
+        if let EndpointType::Http(http) = &config.get("path_at_route").unwrap().output.endpoint_type
+        {
+            assert_eq!(
+                http.url,
+                "https://example.com/path/user@example.com?email=a@b.test"
+            );
+        }
+        if let EndpointType::Http(http) =
+            &config.get("query_at_route").unwrap().output.endpoint_type
+        {
+            assert_eq!(http.url, "https://example.com?next=a@b.test");
+        }
+        if let EndpointType::Http(http) = &config
+            .get("fragment_at_route")
+            .unwrap()
+            .output
+            .endpoint_type
+        {
+            assert_eq!(http.url, "https://example.com#user@example.com");
+        }
+        if let EndpointType::Http(http) =
+            &config.get("credential_route").unwrap().output.endpoint_type
+        {
+            assert!(http.url.is_empty());
+        }
+        assert_eq!(
+            secrets
+                .get("MQB__CREDENTIAL_ROUTE__OUTPUT__HTTP__URL")
+                .map(String::as_str),
+            Some("https://user:pass@example.com/path")
+        );
+        assert!(!secrets.contains_key("MQB__PATH_AT_ROUTE__OUTPUT__HTTP__URL"));
+        assert!(!secrets.contains_key("MQB__QUERY_AT_ROUTE__OUTPUT__HTTP__URL"));
+        assert!(!secrets.contains_key("MQB__FRAGMENT_AT_ROUTE__OUTPUT__HTTP__URL"));
     }
 
     #[test]

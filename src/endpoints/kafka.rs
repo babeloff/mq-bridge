@@ -730,9 +730,7 @@ async fn handle_kafka_replies(
                 "Response count mismatch with received messages"
             );
         }
-        for ((reply_topic, correlation_id), disposition) in
-            reply_infos.iter().zip(dispositions.into_iter())
-        {
+        for ((reply_topic, correlation_id), disposition) in reply_infos.iter().zip(dispositions) {
             if let MessageDisposition::Reply(resp) = disposition {
                 if let Some(rt) = reply_topic {
                     let mut record: FutureRecord<'_, (), _> =

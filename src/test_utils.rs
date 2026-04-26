@@ -1431,3 +1431,75 @@ macro_rules! bench_backend {
         }
     };
 }
+
+/// Helper to verify that a route processes messages concurrently.
+/// It deploys a route with concurrency 2, sends two messages that sleep 500ms each via the `sender` endpoint,
+/// and asserts that the total time is significantly less than 1000ms.
+pub async fn run_concurrency_test(
+    input: crate::models::Endpoint,
+    output: crate::models::Endpoint,
+    sender: crate::models::Endpoint,
+) {
+    use crate::traits::Handled;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let work_duration = Duration::from_millis(500);
+    let unique_id = fast_uuid_v7::gen_id().to_string();
+    let counter = Arc::new(AtomicUsize::new(0));
+    let counter_clone = counter.clone();
+
+    // Handler that simulates enough work for the concurrency timing check to be stable.
+    let handler = move |_msg: crate::CanonicalMessage| {
+        let c = counter_clone.clone();
+        async move {
+            tokio::time::sleep(work_duration).await;
+            c.fetch_add(1, Ordering::SeqCst);
+            Ok(Handled::Ack)
+        }
+    };
+
+    let route = crate::models::Route::new(input, output)
+        .with_handler(handler)
+        .with_concurrency(2)
+        .with_batch_size(1);
+
+    let route_name = format!("con_test_{}", unique_id);
+    route
+        .deploy(&route_name)
+        .await
+        .expect("Failed to deploy route");
+
+    let publisher = sender
+        .create_publisher(&route_name)
+        .await
+        .expect("Failed to create publisher");
+    let start = std::time::Instant::now();
+
+    // Send messages concurrently. For request-reply endpoints like HTTP,
+    // sequential awaits in the test driver would prevent concurrent processing in the route.
+    let (res1, res2) = tokio::join!(publisher.send("msg1".into()), publisher.send("msg2".into()));
+    res1.expect("Send 1 failed");
+    res2.expect("Send 2 failed");
+
+    while counter.load(Ordering::SeqCst) < 2 {
+        if start.elapsed() > Duration::from_secs(10) {
+            panic!("Timeout waiting for concurrent messages");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let elapsed = start.elapsed();
+    crate::models::Route::stop(&route_name).await;
+
+    assert!(
+        elapsed < work_duration + Duration::from_millis(300),
+        "Execution was not concurrent: took {:?}",
+        elapsed
+    );
+    assert!(
+        elapsed >= work_duration,
+        "Execution too fast: {:?}",
+        elapsed
+    );
+}

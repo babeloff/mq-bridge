@@ -1,5 +1,5 @@
 use crate::models::WeakJoinMiddleware;
-use crate::traits::{ConsumerError, MessageConsumer, MessageDisposition, ReceivedBatch};
+use crate::traits::{BoxFuture, ConsumerError, MessageConsumer, MessageDisposition, ReceivedBatch};
 use crate::CanonicalMessage;
 use async_trait::async_trait;
 use serde_json::Value;
@@ -75,6 +75,14 @@ impl WeakJoinConsumer {
 
 #[async_trait]
 impl MessageConsumer for WeakJoinConsumer {
+    fn on_connect_hook(&self) -> Option<BoxFuture<'_, anyhow::Result<()>>> {
+        self.inner.on_connect_hook()
+    }
+
+    fn on_disconnect_hook(&self) -> Option<BoxFuture<'_, anyhow::Result<()>>> {
+        self.inner.on_disconnect_hook()
+    }
+
     async fn receive_batch(&mut self, max_messages: usize) -> Result<ReceivedBatch, ConsumerError> {
         let mut state = self.state.lock().await;
 

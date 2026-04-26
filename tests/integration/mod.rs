@@ -18,6 +18,8 @@ pub mod kafka;
 pub mod mariadb;
 #[cfg(feature = "mongodb")]
 pub mod mongodb;
+#[cfg(feature = "mongodb")]
+pub mod mongodb_raw;
 #[cfg(feature = "mqtt")]
 pub mod mqtt;
 #[cfg(feature = "sqlx")]
@@ -25,9 +27,9 @@ pub mod mysql;
 #[cfg(feature = "nats")]
 pub mod nats;
 #[cfg(feature = "sqlx")]
-pub mod sqlite;
+pub mod postgres;
 #[cfg(feature = "sqlx")]
-pub mod sqlx;
+pub mod sqlite;
 pub mod tls_helpers;
 #[cfg(feature = "zeromq")]
 pub mod zeromq;

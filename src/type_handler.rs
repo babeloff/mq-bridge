@@ -1,6 +1,8 @@
+use crate::response::ErgonomicResponse;
 use crate::traits::{Handled, Handler, HandlerError};
 use crate::{CanonicalMessage, MessageContext};
 use async_trait::async_trait;
+use futures::future::BoxFuture;
 use serde::de::DeserializeOwned;
 use std::collections::HashMap;
 use std::future::Future;
@@ -17,11 +19,12 @@ use std::sync::Arc;
 /// #[derive(Deserialize)]
 /// struct MyCommand { id: String }
 ///
+/// # fn main() {
 /// let handler = TypeHandler::new()
 ///     .add("my_command", |cmd: MyCommand| async move {
 ///         println!("Received command: {}", cmd.id);
-///         Ok(Handled::Ack)
-///     });
+///     }); // No return needed! Implicitly returns (), which maps to Handled::Ack.
+/// # }
 /// ```
 #[derive(Clone)]
 pub struct TypeHandler {
@@ -38,7 +41,9 @@ pub trait IntoTypedHandler<T, Args>: Send + Sync + 'static {
     fn call(&self, msg: T, ctx: MessageContext) -> Self::Future;
 }
 
-impl<F, Fut, T> IntoTypedHandler<T, (T,)> for F
+/// Implementation for standard closures returning Result<Handled, HandlerError>.
+/// This path is unique and allows correct inference for legacy code.
+impl<F, Fut, T> IntoTypedHandler<T, (T, Result<Handled, HandlerError>)> for F
 where
     T: DeserializeOwned + Send + Sync + 'static,
     F: Fn(T) -> Fut + Send + Sync + 'static,
@@ -50,7 +55,7 @@ where
     }
 }
 
-impl<F, Fut, T> IntoTypedHandler<T, (T, MessageContext)> for F
+impl<F, Fut, T> IntoTypedHandler<T, (T, MessageContext, Result<Handled, HandlerError>)> for F
 where
     T: DeserializeOwned + Send + Sync + 'static,
     F: Fn(T, MessageContext) -> Fut + Send + Sync + 'static,
@@ -59,6 +64,35 @@ where
     type Future = Fut;
     fn call(&self, msg: T, ctx: MessageContext) -> Self::Future {
         (self)(msg, ctx)
+    }
+}
+
+/// Ergonomic implementation for closures returning types that implement ErgonomicResponse.
+impl<F, Fut, T, R> IntoTypedHandler<T, (T, R)> for F
+where
+    T: DeserializeOwned + Send + Sync + 'static,
+    R: ErgonomicResponse,
+    F: Fn(T) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = R> + Send + 'static,
+{
+    type Future = BoxFuture<'static, Result<Handled, HandlerError>>;
+    fn call(&self, msg: T, _ctx: MessageContext) -> Self::Future {
+        let fut = (self)(msg);
+        Box::pin(async move { fut.await.into_handler_result() })
+    }
+}
+
+impl<F, Fut, T, R> IntoTypedHandler<T, (T, MessageContext, R)> for F
+where
+    T: DeserializeOwned + Send + Sync + 'static,
+    R: ErgonomicResponse,
+    F: Fn(T, MessageContext) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = R> + Send + 'static,
+{
+    type Future = BoxFuture<'static, Result<Handled, HandlerError>>;
+    fn call(&self, msg: T, ctx: MessageContext) -> Self::Future {
+        let fut = (self)(msg, ctx);
+        Box::pin(async move { fut.await.into_handler_result() })
     }
 }
 
@@ -92,11 +126,11 @@ impl TypeHandler {
     }
 
     #[doc(hidden)]
-    pub fn add_simple<T, F, Fut>(self, type_name: &str, handler: F) -> Self
+    pub fn add_simple<T, H, Args>(self, type_name: &str, handler: H) -> Self
     where
         T: DeserializeOwned + Send + Sync + 'static,
-        F: Fn(T) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<Handled, HandlerError>> + Send + 'static,
+        H: IntoTypedHandler<T, Args>,
+        Args: Send + Sync + 'static,
     {
         self.add(type_name, handler)
     }
@@ -239,7 +273,9 @@ mod tests {
     #[tokio::test]
     async fn test_typed_handler_failure() {
         let handler = TypeHandler::new().add("fail", |_: TestMsg| async {
-            Err(HandlerError::Retryable(anyhow::anyhow!("failure")))
+            Result::<Handled, HandlerError>::Err(HandlerError::Retryable(anyhow::anyhow!(
+                "failure"
+            )))
         });
 
         let msg = CanonicalMessage::from_type(&TestMsg { val: "x".into() })

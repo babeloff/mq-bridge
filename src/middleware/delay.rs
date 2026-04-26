@@ -1,7 +1,7 @@
 use crate::models::DelayMiddleware;
 use crate::traits::{
-    ConsumerError, MessageConsumer, MessagePublisher, PublisherError, Received, ReceivedBatch,
-    Sent, SentBatch,
+    BoxFuture, ConsumerError, MessageConsumer, MessagePublisher, PublisherError, Received,
+    ReceivedBatch, Sent, SentBatch,
 };
 use crate::CanonicalMessage;
 use async_trait::async_trait;
@@ -24,6 +24,14 @@ impl DelayConsumer {
 
 #[async_trait]
 impl MessageConsumer for DelayConsumer {
+    fn on_connect_hook(&self) -> Option<BoxFuture<'_, anyhow::Result<()>>> {
+        self.inner.on_connect_hook()
+    }
+
+    fn on_disconnect_hook(&self) -> Option<BoxFuture<'_, anyhow::Result<()>>> {
+        self.inner.on_disconnect_hook()
+    }
+
     async fn receive(&mut self) -> Result<Received, ConsumerError> {
         tokio::time::sleep(self.delay).await;
         self.inner.receive().await
@@ -55,6 +63,14 @@ impl DelayPublisher {
 
 #[async_trait]
 impl MessagePublisher for DelayPublisher {
+    fn on_connect_hook(&self) -> Option<BoxFuture<'_, anyhow::Result<()>>> {
+        self.inner.on_connect_hook()
+    }
+
+    fn on_disconnect_hook(&self) -> Option<BoxFuture<'_, anyhow::Result<()>>> {
+        self.inner.on_disconnect_hook()
+    }
+
     async fn send(&self, message: CanonicalMessage) -> Result<Sent, PublisherError> {
         tokio::time::sleep(self.delay).await;
         self.inner.send(message).await

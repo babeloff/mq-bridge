@@ -159,9 +159,14 @@ async fn test_all_chaos() {
     // AWS chaos test is excluded by default as it requires LocalStack which can be heavy/flaky in some envs
     #[cfg(feature = "sqlx")]
     {
-        if should_run("sqlx") {
-            println!("\n\n>>> Starting SQLx Chaos Test...");
-            integration::sqlx::test_sqlx_chaos().await;
+        if should_run("sqlx") || should_run("postgres") {
+            integration::postgres::test_postgres_chaos().await;
+        }
+        if should_run("sqlx") || should_run("mariadb") {
+            integration::mariadb::test_mariadb_chaos().await;
+        }
+        if should_run("sqlx") || should_run("mysql") {
+            integration::mysql::test_mysql_chaos().await;
         }
     }
 }
@@ -222,9 +227,17 @@ async fn test_all_status() {
 
     #[cfg(feature = "sqlx")]
     {
-        if should_run("sqlx") {
-            println!("\n\n>>> Starting SQLx Status Test...");
-            integration::sqlx::test_sqlx_status().await;
+        if should_run("sqlx") || should_run("postgres") {
+            integration::postgres::test_postgres_status().await;
+        }
+        if should_run("sqlx") || should_run("mariadb") {
+            integration::mariadb::test_mariadb_status().await;
+        }
+        if should_run("sqlx") || should_run("sqlite") {
+            integration::sqlite::test_sqlite_status().await;
+        }
+        if should_run("sqlx") || should_run("mysql") {
+            integration::mysql::test_mysql_status().await;
         }
     }
 
@@ -316,6 +329,21 @@ async fn test_all_performance_pipeline() {
             integration::http::test_http_performance_pipeline().await;
         }
     }
+    #[cfg(feature = "sqlx")]
+    {
+        if should_run("sqlx") || should_run("postgres") {
+            integration::postgres::test_postgres_performance_pipeline().await;
+        }
+        if should_run("sqlx") || should_run("mysql") {
+            integration::mysql::test_mysql_performance_pipeline().await;
+        }
+        if should_run("sqlx") || should_run("mariadb") {
+            integration::mariadb::test_mariadb_performance_pipeline().await;
+        }
+        if should_run("sqlx") || should_run("sqlite") {
+            integration::sqlite::test_sqlite_performance_pipeline().await;
+        }
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -382,9 +410,17 @@ async fn test_all_performance_direct() {
     }
     #[cfg(feature = "sqlx")]
     {
-        if should_run("sqlx") {
-            println!("\n\n>>> Starting SQLx Direct Performance Test...");
-            integration::sqlx::test_sqlx_performance_direct().await;
+        if should_run("sqlx") || should_run("postgres") {
+            integration::postgres::test_postgres_performance_direct().await;
+        }
+        if should_run("sqlx") || should_run("mariadb") {
+            integration::mariadb::test_mariadb_performance_direct().await;
+        }
+        if should_run("sqlx") || should_run("sqlite") {
+            integration::sqlite::test_sqlite_performance_direct().await;
+        }
+        if should_run("sqlx") || should_run("mysql") {
+            integration::mysql::test_mysql_performance_direct().await;
         }
     }
     // The summary table will be printed here when `_summary_printer` is dropped.

@@ -3,8 +3,9 @@
 
 use mq_bridge::endpoints::sqlx::{SqlxConsumer, SqlxPublisher};
 use mq_bridge::test_utils::{
-    add_performance_result, run_chaos_pipeline_test, run_direct_perf_test, run_pipeline_test,
-    run_test_with_docker, run_test_with_docker_controller, setup_logging, PERF_TEST_MESSAGE_COUNT,
+    add_performance_result, run_chaos_pipeline_test, run_direct_perf_test,
+    run_performance_pipeline_test, run_pipeline_test, run_test_with_docker,
+    run_test_with_docker_controller, setup_logging, PERF_TEST_MESSAGE_COUNT,
 };
 use std::sync::Arc;
 
@@ -55,7 +56,7 @@ routes:
       memory: { topic: "sqlx-test-out", capacity: {out_capacity} }
 "#;
 
-pub async fn test_sqlx_pipeline() {
+pub async fn test_postgres_pipeline() {
     setup_logging();
     run_test_with_docker(DOCKER_COMPOSE_FILE, || async {
         setup_db().await;
@@ -68,7 +69,20 @@ pub async fn test_sqlx_pipeline() {
     .await;
 }
 
-pub async fn test_sqlx_chaos() {
+pub async fn test_postgres_performance_pipeline() {
+    setup_logging();
+    run_test_with_docker(DOCKER_COMPOSE_FILE, || async {
+        setup_db().await;
+        let config_yaml = CONFIG_YAML.replace(
+            "{out_capacity}",
+            &(PERF_TEST_MESSAGE_COUNT + 1000).to_string(),
+        );
+        run_performance_pipeline_test("sqlx", &config_yaml, PERF_TEST_MESSAGE_COUNT).await;
+    })
+    .await;
+}
+
+pub async fn test_postgres_chaos() {
     setup_logging();
     run_test_with_docker_controller(DOCKER_COMPOSE_FILE, |controller| async move {
         setup_db().await;
@@ -81,7 +95,7 @@ pub async fn test_sqlx_chaos() {
     .await;
 }
 
-pub async fn test_sqlx_performance_direct() {
+pub async fn test_postgres_performance_direct() {
     setup_logging();
     run_test_with_docker(DOCKER_COMPOSE_FILE, || async {
         setup_db().await;
@@ -114,7 +128,7 @@ pub async fn test_sqlx_performance_direct() {
     .await;
 }
 
-pub async fn test_sqlx_status() {
+pub async fn test_postgres_status() {
     use mq_bridge::traits::{MessageConsumer, MessagePublisher};
     use tokio::time::{sleep, Duration};
 
@@ -130,7 +144,7 @@ pub async fn test_sqlx_status() {
         let publisher = SqlxPublisher::new(&config).await.unwrap();
         let consumer = SqlxConsumer::new(&config).await.unwrap();
 
-        println!("[SQLx] Checking initial status...");
+        println!("[Postgres] Checking initial status...");
         sleep(Duration::from_secs(2)).await;
         let pub_status = publisher.status().await;
         let con_status = consumer.status().await;
@@ -144,38 +158,38 @@ pub async fn test_sqlx_status() {
             "Consumer should be healthy initially. Status: {:?}",
             con_status
         );
-        println!("[SQLx] Initial status check OK.");
+        println!("[Postgres] Initial status check OK.");
 
         controller.stop_service("postgres");
-        println!("[SQLx] Service 'postgres' stopped. Waiting for disconnect detection...");
+        println!("[Postgres] Service 'postgres' stopped. Waiting for disconnect detection...");
 
         let start = std::time::Instant::now();
         loop {
             if !publisher.status().await.healthy && !consumer.status().await.healthy {
-                println!("[SQLx] Disconnect detected.");
+                println!("[Postgres] Disconnect detected.");
                 break;
             }
             if start.elapsed() > Duration::from_secs(20) {
-                panic!("[SQLx] Timeout waiting for disconnect.");
+                panic!("[Postgres] Timeout waiting for disconnect.");
             }
             sleep(Duration::from_secs(1)).await;
         }
 
         controller.start_service("postgres");
-        println!("[SQLx] Service 'postgres' started. Waiting for reconnect...");
+        println!("[Postgres] Service 'postgres' started. Waiting for reconnect...");
 
         let start = std::time::Instant::now();
         loop {
             if publisher.status().await.healthy && consumer.status().await.healthy {
-                println!("[SQLx] Reconnect detected.");
+                println!("[Postgres] Reconnect detected.");
                 break;
             }
             if start.elapsed() > Duration::from_secs(20) {
-                panic!("[SQLx] Timeout waiting for reconnect.");
+                panic!("[Postgres] Timeout waiting for reconnect.");
             }
             sleep(Duration::from_secs(1)).await;
         }
-        println!("[SQLx] Status test successful.");
+        println!("[Postgres] Status test successful.");
     })
     .await;
 }

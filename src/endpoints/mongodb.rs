@@ -203,7 +203,15 @@ pub struct MongoDbPublisher {
     format: MongoDbFormat,
 }
 
+fn mongodb_uses_sequencer(request_reply: bool, format: &MongoDbFormat) -> bool {
+    !request_reply && !matches!(format, MongoDbFormat::Raw)
+}
+
 impl MongoDbPublisher {
+    fn uses_sequencer(&self) -> bool {
+        mongodb_uses_sequencer(self.request_reply, &self.format)
+    }
+
     pub async fn new(config: &MongoDbConfig) -> anyhow::Result<Self> {
         let collection_name = config
             .collection
@@ -227,20 +235,22 @@ impl MongoDbPublisher {
         }
 
         let collection = db.collection(collection_name);
-        // Ensure unique index on seq. The sequencer doc has 'seq_counter', so it won't conflict.
-        let index_options = mongodb::options::IndexOptions::builder()
-            .unique(true)
-            .sparse(true) // Only index documents that have the seq field
-            .build();
-        let index_model = IndexModel::builder()
-            .keys(doc! { "seq": 1 })
-            .options(index_options)
-            .build();
-        if let Err(e) = collection.create_index(index_model).await {
-            warn!(
-                "Failed to create seq index on collection {}: {}",
-                collection_name, e
-            );
+        if mongodb_uses_sequencer(config.request_reply, &config.format) {
+            // Ensure unique index on seq. The sequencer doc has 'seq_counter', so it won't conflict.
+            let index_options = mongodb::options::IndexOptions::builder()
+                .unique(true)
+                .sparse(true) // Only index documents that have the seq field
+                .build();
+            let index_model = IndexModel::builder()
+                .keys(doc! { "seq": 1 })
+                .options(index_options)
+                .build();
+            if let Err(e) = collection.create_index(index_model).await {
+                warn!(
+                    "Failed to create seq index on collection {}: {}",
+                    collection_name, e
+                );
+            }
         }
         info!(database = %config.database, collection = %collection_name, request_reply = %config.request_reply, "MongoDB publisher connected");
 
@@ -340,36 +350,41 @@ impl MongoDbPublisher {
 impl MessagePublisher for MongoDbPublisher {
     async fn send(&self, mut message: CanonicalMessage) -> Result<Sent, PublisherError> {
         if !self.request_reply {
-            trace!(message_id = %format!("{:032x}", message.message_id), collection = %self.collection_name, "Publishing sequenced document to MongoDB");
+            trace!(message_id = %format!("{:032x}", message.message_id), collection = %self.collection_name, uses_sequencer = self.uses_sequencer(), "Publishing document to MongoDB");
             let mut doc = message_to_document(&message, &self.format)
                 .map_err(PublisherError::NonRetryable)?;
 
-            // Atomically increment a sequence counter. This is safe without a transaction for just getting a sequence number.
-            // If the subsequent insert fails, a sequence number might be "lost", creating a gap.
-            let filter = doc! { "_id": "sequencer" };
-            let update = doc! { "$inc": { "seq_counter": 1_i64 } };
-            let options = FindOneAndUpdateOptions::builder()
-                .upsert(true)
-                .return_document(ReturnDocument::After)
-                .build();
+            if self.uses_sequencer() {
+                // Atomically increment a sequence counter. This is safe without a transaction for just getting a sequence number.
+                // If the subsequent insert fails, a sequence number might be "lost", creating a gap.
+                let filter = doc! { "_id": "sequencer" };
+                let update = doc! { "$inc": { "seq_counter": 1_i64 } };
+                let options = FindOneAndUpdateOptions::builder()
+                    .upsert(true)
+                    .return_document(ReturnDocument::After)
+                    .build();
 
-            let counter_doc = self
-                .collection
-                .find_one_and_update(filter, update)
-                .with_options(options)
-                .await
-                .map_err(|e| PublisherError::Retryable(anyhow!(e)))?;
-            let seq = counter_doc
-                .ok_or_else(|| {
-                    PublisherError::Retryable(anyhow!(
-                        "Sequencer document not returned after upsert"
-                    ))
-                })?
-                .get_i64("seq_counter")
-                .map_err(|e| {
-                    PublisherError::Retryable(anyhow!("Invalid seq_counter in sequencer: {}", e))
-                })?;
-            doc.insert("seq", seq);
+                let counter_doc = self
+                    .collection
+                    .find_one_and_update(filter, update)
+                    .with_options(options)
+                    .await
+                    .map_err(|e| PublisherError::Retryable(anyhow!(e)))?;
+                let seq = counter_doc
+                    .ok_or_else(|| {
+                        PublisherError::Retryable(anyhow!(
+                            "Sequencer document not returned after upsert"
+                        ))
+                    })?
+                    .get_i64("seq_counter")
+                    .map_err(|e| {
+                        PublisherError::Retryable(anyhow!(
+                            "Invalid seq_counter in sequencer: {}",
+                            e
+                        ))
+                    })?;
+                doc.insert("seq", seq);
+            }
 
             match self.collection.insert_one(doc).await {
                 Ok(_) => {}
@@ -509,37 +524,41 @@ impl MessagePublisher for MongoDbPublisher {
             }
         }
 
-        // Atomically increment a sequence counter for the batch. This is safe without a transaction.
-        // If the subsequent insert fails, sequence numbers might be "lost", creating gaps.
-        let filter = doc! { "_id": "sequencer" };
-        let update = doc! { "$inc": { "seq_counter": docs.len() as i64 } };
-        let options = FindOneAndUpdateOptions::builder()
-            .upsert(true)
-            .return_document(ReturnDocument::After)
-            .write_concern(
-                mongodb::options::WriteConcern::builder()
-                    .w(mongodb::options::Acknowledgment::Majority)
-                    .build(),
-            )
-            .build();
-        let counter_doc = self
-            .collection
-            .find_one_and_update(filter, update)
-            .with_options(options)
-            .await
-            .map_err(|e| PublisherError::Retryable(anyhow!(e)))?;
-        let end_seq = counter_doc
-            .ok_or_else(|| {
-                PublisherError::Retryable(anyhow!("Sequencer document not returned after upsert"))
-            })?
-            .get_i64("seq_counter")
-            .map_err(|e| {
-                PublisherError::Retryable(anyhow!("Invalid seq_counter in sequencer: {}", e))
-            })?;
-        let start_seq = end_seq - docs.len() as i64 + 1;
+        if self.uses_sequencer() {
+            // Atomically increment a sequence counter for the batch. This is safe without a transaction.
+            // If the subsequent insert fails, sequence numbers might be "lost", creating gaps.
+            let filter = doc! { "_id": "sequencer" };
+            let update = doc! { "$inc": { "seq_counter": docs.len() as i64 } };
+            let options = FindOneAndUpdateOptions::builder()
+                .upsert(true)
+                .return_document(ReturnDocument::After)
+                .write_concern(
+                    mongodb::options::WriteConcern::builder()
+                        .w(mongodb::options::Acknowledgment::Majority)
+                        .build(),
+                )
+                .build();
+            let counter_doc = self
+                .collection
+                .find_one_and_update(filter, update)
+                .with_options(options)
+                .await
+                .map_err(|e| PublisherError::Retryable(anyhow!(e)))?;
+            let end_seq = counter_doc
+                .ok_or_else(|| {
+                    PublisherError::Retryable(anyhow!(
+                        "Sequencer document not returned after upsert"
+                    ))
+                })?
+                .get_i64("seq_counter")
+                .map_err(|e| {
+                    PublisherError::Retryable(anyhow!("Invalid seq_counter in sequencer: {}", e))
+                })?;
+            let start_seq = end_seq - docs.len() as i64 + 1;
 
-        for (i, doc) in docs.iter_mut().enumerate() {
-            doc.insert("seq", start_seq + i as i64);
+            for (i, doc) in docs.iter_mut().enumerate() {
+                doc.insert("seq", start_seq + i as i64);
+            }
         }
 
         match self.collection.insert_many(docs).await {
@@ -1151,6 +1170,11 @@ impl MongoDbSubscriber {
     /// supported. If the collection is empty, it will start consuming from the next inserted document.
     ///
     pub async fn new(config: &MongoDbConfig) -> anyhow::Result<Self> {
+        if matches!(config.format, MongoDbFormat::Raw) {
+            return Err(anyhow!(
+                "MongoDB subscriber/change_stream mode requires wrapped documents with a seq ordering field; raw format is not supported"
+            ));
+        }
         let collection_name = config
             .collection
             .as_deref()
@@ -1158,6 +1182,27 @@ impl MongoDbSubscriber {
         let client = create_client(config).await?;
         let db = client.database(&config.database);
         let collection: Collection<Document> = db.collection(collection_name);
+
+        let missing_seq = collection
+            .count_documents(doc! {
+                "payload": { "$exists": true },
+                "seq": { "$exists": false }
+            })
+            .limit(1)
+            .await
+            .with_context(|| {
+                format!(
+                    "Failed to count documents for collection '{}'",
+                    collection_name
+                )
+            })?;
+
+        if missing_seq > 0 {
+            return Err(anyhow!(
+                "MongoDB subscriber found documents with payload but no seq field in collection '{}'; use wrapped publisher format or disable subscriber/change_stream mode for raw collections",
+                collection_name
+            ));
+        }
 
         let mut last_seq = 0;
         if let Some(cid) = &config.cursor_id {

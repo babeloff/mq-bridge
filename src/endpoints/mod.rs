@@ -345,6 +345,12 @@ fn check_consumer_recursive(
         EndpointType::IbmMq(_) => Ok(warnings),
         #[cfg(feature = "mongodb")]
         EndpointType::MongoDb(cfg) => {
+            if cfg.change_stream && matches!(cfg.format, crate::models::MongoDbFormat::Raw) {
+                return Err(anyhow!(
+                    "[route:{}] MongoDB raw format cannot be used with change_stream/subscriber mode because raw documents do not include the seq ordering field",
+                    route_name
+                ));
+            }
             if cfg.reply_polling_ms.is_some() {
                 warnings.push(
                     "Endpoint 'mongodb' is used as a consumer, but 'reply_polling_ms' is a publisher-only option and will be ignored."
@@ -771,6 +777,12 @@ fn check_publisher_recursive(
 
         #[cfg(feature = "http")]
         EndpointType::Http(_cfg) => {
+            if _cfg.path.is_some() {
+                warnings.push(
+                    "Endpoint 'http' is used as a publisher, but 'path' is a consumer-only option and will be ignored."
+                    .to_string()
+                );
+            }
             if _cfg.workers.is_some() {
                 warnings.push(
                     "Endpoint 'http' is used as a publisher, but 'workers' is a consumer-only option and will be ignored."

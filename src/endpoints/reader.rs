@@ -1,6 +1,6 @@
 use crate::traits::{
-    ConsumerError, MessageConsumer, MessageDisposition, MessagePublisher, PublisherError, Sent,
-    SentBatch,
+    BoxFuture, ConsumerError, MessageConsumer, MessageDisposition, MessagePublisher,
+    PublisherError, Sent, SentBatch,
 };
 use crate::CanonicalMessage;
 use async_trait::async_trait;
@@ -22,6 +22,26 @@ impl ReaderPublisher {
 
 #[async_trait]
 impl MessagePublisher for ReaderPublisher {
+    fn on_connect_hook(&self) -> Option<BoxFuture<'_, anyhow::Result<()>>> {
+        Some(Box::pin(async move {
+            let consumer = self.consumer.lock().await;
+            if let Some(hook) = consumer.on_connect_hook() {
+                hook.await?;
+            }
+            Ok(())
+        }))
+    }
+
+    fn on_disconnect_hook(&self) -> Option<BoxFuture<'_, anyhow::Result<()>>> {
+        Some(Box::pin(async move {
+            let consumer = self.consumer.lock().await;
+            if let Some(hook) = consumer.on_disconnect_hook() {
+                hook.await?;
+            }
+            Ok(())
+        }))
+    }
+
     async fn send(&self, _message: CanonicalMessage) -> Result<Sent, PublisherError> {
         let mut consumer = self.consumer.lock().await;
         // We ignore the incoming message payload and just read from the consumer.

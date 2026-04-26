@@ -103,3 +103,11 @@ pub async fn test_memory_performance_pipeline() {
     );
     run_performance_pipeline_test("internal", &config_yaml, PERF_TEST_MESSAGE_COUNT).await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_memory_concurrency() {
+    setup_logging();
+    let input = Endpoint::new_memory("con_in_mem", 10);
+    let output = Endpoint::new_memory("con_out_mem", 10);
+    mq_bridge::test_utils::run_concurrency_test(input.clone(), output, input).await;
+}
