@@ -129,7 +129,7 @@ impl MessagePublisher for NatsPublisher {
             .map_err(|_| PublisherError::Retryable(anyhow!("NATS request timed out")))?
             .map_err(|e| PublisherError::Retryable(anyhow!("NATS request failed: {}", e)))?;
 
-            let response_msg = create_nats_canonical_message(&response, None);
+            let response_msg = create_nats_canonical_message(&response, None, true);
             return Ok(Sent::Response(response_msg));
         }
 
@@ -544,8 +544,11 @@ impl NatsCore {
                 match message_stream {
                     Some(Ok(first_message)) => {
                         let sequence = first_message.info().ok().map(|meta| meta.stream_sequence);
-                        canonical_messages
-                            .push(create_nats_canonical_message(&first_message, sequence));
+                        canonical_messages.push(create_nats_canonical_message(
+                            &first_message,
+                            sequence,
+                            false,
+                        ));
                         jetstream_messages.push(first_message);
                     }
                     Some(Err(e)) => return Err(ConsumerError::Connection(anyhow::anyhow!(e))),
@@ -562,7 +565,7 @@ impl NatsCore {
                         Some(Ok(Some(message))) => {
                             let sequence = message.info().ok().map(|meta| meta.stream_sequence);
                             canonical_messages
-                                .push(create_nats_canonical_message(&message, sequence));
+                                .push(create_nats_canonical_message(&message, sequence, false));
                             jetstream_messages.push(message);
                         }
                         _ => break, // No more messages in the buffer or stream ended/errored
@@ -603,13 +606,13 @@ impl NatsCore {
 
                 if let Some(message) = sub.next().await {
                     reply_subjects.push(message.reply.clone());
-                    messages.push(create_nats_canonical_message(&message, None));
+                    messages.push(create_nats_canonical_message(&message, None, true));
 
                     while messages.len() < max_messages {
                         match sub.next().now_or_never() {
                             Some(Some(message)) => {
                                 reply_subjects.push(message.reply.clone());
-                                messages.push(create_nats_canonical_message(&message, None))
+                                messages.push(create_nats_canonical_message(&message, None, true))
                             }
                             _ => break,
                         }
@@ -684,6 +687,7 @@ impl NatsCore {
 fn create_nats_canonical_message(
     message: &async_nats::Message,
     sequence: Option<u64>,
+    include_native_reply_to: bool,
 ) -> CanonicalMessage {
     // The most reliable ID is the JetStream sequence number.
     let mut message_id: Option<u128> = None;
@@ -735,10 +739,12 @@ fn create_nats_canonical_message(
             canonical_message.metadata = metadata;
         }
     }
-    if let Some(reply) = &message.reply {
-        canonical_message
-            .metadata
-            .insert("reply_to".to_string(), reply.to_string());
+    if include_native_reply_to {
+        if let Some(reply) = &message.reply {
+            canonical_message
+                .metadata
+                .insert("reply_to".to_string(), reply.to_string());
+        }
     }
     canonical_message
 }
@@ -819,4 +825,58 @@ async fn handle_jetstream_acks(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::Bytes;
+
+    fn nats_message(reply: Option<&str>, headers: Option<HeaderMap>) -> async_nats::Message {
+        let payload = Bytes::from_static(b"payload");
+        async_nats::Message {
+            subject: async_nats::Subject::from_static("test.subject"),
+            reply: reply.map(|reply| async_nats::Subject::from(reply.to_string())),
+            length: payload.len(),
+            payload,
+            headers,
+            status: None,
+            description: None,
+        }
+    }
+
+    #[test]
+    fn core_native_reply_is_mapped_to_reply_to_metadata() {
+        let message = nats_message(Some("_INBOX.reply"), None);
+
+        let canonical = create_nats_canonical_message(&message, None, true);
+
+        assert_eq!(
+            canonical.metadata.get("reply_to").map(String::as_str),
+            Some("_INBOX.reply")
+        );
+    }
+
+    #[test]
+    fn jetstream_ack_reply_is_not_mapped_to_reply_to_metadata() {
+        let message = nats_message(Some("$JS.ACK.test-stream.consumer.1.1"), None);
+
+        let canonical = create_nats_canonical_message(&message, Some(1), false);
+
+        assert!(!canonical.metadata.contains_key("reply_to"));
+    }
+
+    #[test]
+    fn jetstream_preserves_explicit_reply_to_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert("reply_to", "app.reply.subject");
+        let message = nats_message(Some("$JS.ACK.test-stream.consumer.1.1"), Some(headers));
+
+        let canonical = create_nats_canonical_message(&message, Some(1), false);
+
+        assert_eq!(
+            canonical.metadata.get("reply_to").map(String::as_str),
+            Some("app.reply.subject")
+        );
+    }
 }
