@@ -135,6 +135,36 @@ impl Default for EndpointStatus {
 
 #[async_trait]
 pub trait MessageConsumer: Send + Sync {
+    /// Returns an optional lifecycle hook that runs once after the consumer connection is created.
+    ///
+    /// The route awaits this hook before it reports itself as ready. Returning an error fails
+    /// route startup and lets the outer route runner reconnect or surface the startup failure.
+    ///
+    /// Use this for per-connection setup that should be shared by all messages read through this
+    /// consumer, such as warming a connection pool, creating SQLite tables or indexes, setting up
+    /// a Kafka consumer group, or authenticating a RabbitMQ channel.
+    ///
+    /// ```ignore
+    /// fn on_connect_hook(&self) -> Option<BoxFuture<'_, anyhow::Result<()>>> {
+    ///     Some(Box::pin(async move {
+    ///         self.pool.get().await?;
+    ///         self.db.execute("CREATE TABLE IF NOT EXISTS embeddings (...)").await?;
+    ///         Ok(())
+    ///     }))
+    /// }
+    /// ```
+    fn on_connect_hook(&self) -> Option<BoxFuture<'_, anyhow::Result<()>>> {
+        None
+    }
+
+    /// Returns an optional lifecycle hook that runs before the consumer is dropped.
+    ///
+    /// The route awaits this hook during shutdown or reconnect cleanup. Errors are logged as
+    /// warnings and do not replace the route's original result.
+    fn on_disconnect_hook(&self) -> Option<BoxFuture<'_, anyhow::Result<()>>> {
+        None
+    }
+
     /// Receives a batch of messages.
     ///
     /// This method must be implemented by all consumers.
@@ -196,6 +226,49 @@ pub trait MessageConsumer: Send + Sync {
 
 #[async_trait]
 pub trait MessagePublisher: Send + Sync + 'static {
+    /// Returns an optional lifecycle hook that runs once after the publisher connection is created.
+    ///
+    /// The route awaits this hook before it reports itself as ready. Returning an error fails
+    /// route startup and lets the outer route runner reconnect or surface the startup failure.
+    ///
+    /// Use this for per-connection setup that should be shared by all messages published through
+    /// this publisher, such as loading an embedding model, warming a connection pool, creating
+    /// SQLite tables or indexes, setting up a Kafka producer transaction context, or
+    /// authenticating a RabbitMQ channel.
+    ///
+    /// ```ignore
+    /// struct SqliteEmbeddingPublisher {
+    ///     model: Arc<tokio::sync::Mutex<Option<EmbeddingModel>>>,
+    ///     db: sqlx::SqlitePool,
+    /// }
+    ///
+    /// impl MessagePublisher for SqliteEmbeddingPublisher {
+    ///     fn on_connect_hook(&self) -> Option<BoxFuture<'_, anyhow::Result<()>>> {
+    ///         Some(Box::pin(async move {
+    ///             let mut model = self.model.lock().await;
+    ///             if model.is_none() {
+    ///                 *model = Some(EmbeddingModel::load("all-MiniLM-L6-v2").await?);
+    ///             }
+    ///             sqlx::query("CREATE INDEX IF NOT EXISTS idx_embeddings_id ON embeddings(id)")
+    ///                 .execute(&self.db)
+    ///                 .await?;
+    ///             Ok(())
+    ///         }))
+    ///     }
+    /// }
+    /// ```
+    fn on_connect_hook(&self) -> Option<BoxFuture<'_, anyhow::Result<()>>> {
+        None
+    }
+
+    /// Returns an optional lifecycle hook that runs before the publisher is dropped.
+    ///
+    /// The route awaits this hook during shutdown or reconnect cleanup. Errors are logged as
+    /// warnings and do not replace the route's original result.
+    fn on_disconnect_hook(&self) -> Option<BoxFuture<'_, anyhow::Result<()>>> {
+        None
+    }
+
     /// Sends a batch of messages.
     ///
     /// This method must be implemented by all publishers.
@@ -249,6 +322,14 @@ pub trait MessagePublisher: Send + Sync + 'static {
 
 #[async_trait]
 impl<T: MessagePublisher + ?Sized> MessagePublisher for Arc<T> {
+    fn on_connect_hook(&self) -> Option<BoxFuture<'_, anyhow::Result<()>>> {
+        (**self).on_connect_hook()
+    }
+
+    fn on_disconnect_hook(&self) -> Option<BoxFuture<'_, anyhow::Result<()>>> {
+        (**self).on_disconnect_hook()
+    }
+
     async fn send(&self, message: CanonicalMessage) -> Result<Sent, PublisherError> {
         (**self).send(message).await
     }
@@ -275,6 +356,14 @@ impl<T: MessagePublisher + ?Sized> MessagePublisher for Arc<T> {
 
 #[async_trait]
 impl<T: MessagePublisher + ?Sized> MessagePublisher for Box<T> {
+    fn on_connect_hook(&self) -> Option<BoxFuture<'_, anyhow::Result<()>>> {
+        (**self).on_connect_hook()
+    }
+
+    fn on_disconnect_hook(&self) -> Option<BoxFuture<'_, anyhow::Result<()>>> {
+        (**self).on_disconnect_hook()
+    }
+
     async fn send(&self, message: CanonicalMessage) -> Result<Sent, PublisherError> {
         (**self).send(message).await
     }

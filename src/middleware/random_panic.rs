@@ -1,7 +1,7 @@
 use crate::models::{FaultMode, RandomPanicMiddleware};
 use crate::traits::{
-    ConsumerError, MessageConsumer, MessagePublisher, PublisherError, Received, ReceivedBatch,
-    Sent, SentBatch,
+    BoxFuture, ConsumerError, MessageConsumer, MessagePublisher, PublisherError, Received,
+    ReceivedBatch, Sent, SentBatch,
 };
 use crate::CanonicalMessage;
 use async_trait::async_trait;
@@ -70,6 +70,14 @@ impl RandomPanicConsumer {
 
 #[async_trait]
 impl MessageConsumer for RandomPanicConsumer {
+    fn on_connect_hook(&self) -> Option<BoxFuture<'_, anyhow::Result<()>>> {
+        self.inner.on_connect_hook()
+    }
+
+    fn on_disconnect_hook(&self) -> Option<BoxFuture<'_, anyhow::Result<()>>> {
+        self.inner.on_disconnect_hook()
+    }
+
     async fn receive(&mut self) -> Result<Received, ConsumerError> {
         if self.should_trigger_fault() {
             self.inject_fault()
@@ -158,6 +166,14 @@ impl RandomPanicPublisher {
 
 #[async_trait]
 impl MessagePublisher for RandomPanicPublisher {
+    fn on_connect_hook(&self) -> Option<BoxFuture<'_, anyhow::Result<()>>> {
+        self.inner.on_connect_hook()
+    }
+
+    fn on_disconnect_hook(&self) -> Option<BoxFuture<'_, anyhow::Result<()>>> {
+        self.inner.on_disconnect_hook()
+    }
+
     async fn send(&self, message: CanonicalMessage) -> Result<Sent, PublisherError> {
         if self.should_trigger_fault() {
             self.inject_fault()

@@ -4,8 +4,8 @@
 //  git clone https://github.com/marcomq/mq-bridge
 use crate::models::MetricsMiddleware;
 use crate::traits::{
-    ConsumerError, MessageConsumer, MessagePublisher, PublisherError, Received, ReceivedBatch,
-    Sent, SentBatch,
+    BoxFuture, ConsumerError, MessageConsumer, MessagePublisher, PublisherError, Received,
+    ReceivedBatch, Sent, SentBatch,
 };
 use crate::CanonicalMessage;
 use async_trait::async_trait;
@@ -35,6 +35,14 @@ impl MetricsPublisher {
 
 #[async_trait]
 impl MessagePublisher for MetricsPublisher {
+    fn on_connect_hook(&self) -> Option<BoxFuture<'_, anyhow::Result<()>>> {
+        self.inner.on_connect_hook()
+    }
+
+    fn on_disconnect_hook(&self) -> Option<BoxFuture<'_, anyhow::Result<()>>> {
+        self.inner.on_disconnect_hook()
+    }
+
     async fn send(&self, message: CanonicalMessage) -> Result<Sent, PublisherError> {
         let start = Instant::now();
         let result = self.inner.send(message).await?;
@@ -103,6 +111,14 @@ impl MetricsConsumer {
 
 #[async_trait]
 impl MessageConsumer for MetricsConsumer {
+    fn on_connect_hook(&self) -> Option<BoxFuture<'_, anyhow::Result<()>>> {
+        self.inner.on_connect_hook()
+    }
+
+    fn on_disconnect_hook(&self) -> Option<BoxFuture<'_, anyhow::Result<()>>> {
+        self.inner.on_disconnect_hook()
+    }
+
     async fn receive(&mut self) -> Result<Received, ConsumerError> {
         let start = Instant::now();
         let result = self.inner.receive().await?;

@@ -5,7 +5,7 @@
 
 use crate::endpoints::create_publisher_from_route;
 use crate::models::DeadLetterQueueMiddleware;
-use crate::traits::{MessagePublisher, PublisherError, Sent, SentBatch};
+use crate::traits::{BoxFuture, MessagePublisher, PublisherError, Sent, SentBatch};
 use crate::CanonicalMessage;
 use async_trait::async_trait;
 use std::any::Any;
@@ -37,6 +37,50 @@ impl DlqPublisher {
 
 #[async_trait]
 impl MessagePublisher for DlqPublisher {
+    fn on_connect_hook(&self) -> Option<BoxFuture<'_, anyhow::Result<()>>> {
+        let inner_hook = self.inner.on_connect_hook();
+        let dlq_hook = self.dlq_publisher.on_connect_hook();
+        if inner_hook.is_none() && dlq_hook.is_none() {
+            return None;
+        }
+
+        Some(Box::pin(async move {
+            if let Some(hook) = inner_hook {
+                hook.await?;
+            }
+            if let Some(hook) = dlq_hook {
+                hook.await?;
+            }
+            Ok(())
+        }))
+    }
+
+    fn on_disconnect_hook(&self) -> Option<BoxFuture<'_, anyhow::Result<()>>> {
+        let inner_hook = self.inner.on_disconnect_hook();
+        let dlq_hook = self.dlq_publisher.on_disconnect_hook();
+        if inner_hook.is_none() && dlq_hook.is_none() {
+            return None;
+        }
+
+        Some(Box::pin(async move {
+            let mut first_error = None;
+            if let Some(hook) = inner_hook {
+                if let Err(err) = hook.await {
+                    first_error = Some(err);
+                }
+            }
+            if let Some(hook) = dlq_hook {
+                if let Err(err) = hook.await {
+                    first_error.get_or_insert(err);
+                }
+            }
+            match first_error {
+                Some(err) => Err(err),
+                None => Ok(()),
+            }
+        }))
+    }
+
     async fn send(&self, message: CanonicalMessage) -> Result<Sent, PublisherError> {
         match self.inner.send(message.clone()).await {
             Ok(response) => Ok(response),
