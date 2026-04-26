@@ -173,7 +173,7 @@ impl SharedHttpRouter {
             .max_by_key(route_specificity);
 
         Ok(match best {
-            Some(route) => RouteMatchResult::Matched(route.state),
+            Some(route) => RouteMatchResult::Matched(Box::new(route.state)),
             None if matched_path => RouteMatchResult::MethodNotAllowed,
             None => RouteMatchResult::NotFound,
         })
@@ -181,7 +181,7 @@ impl SharedHttpRouter {
 }
 
 enum RouteMatchResult {
-    Matched(HttpConsumerState),
+    Matched(Box<HttpConsumerState>),
     MethodNotAllowed,
     NotFound,
 }
