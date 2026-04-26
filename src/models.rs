@@ -2560,23 +2560,27 @@ kafka_to_nats:
     #[test]
     fn test_extract_sensitive_url_only_strips_authority_credentials() {
         let mut config = Config::new();
-        let mut path_at_route = Route::default();
-        path_at_route.output = Endpoint {
-            endpoint_type: EndpointType::Http(HttpConfig::new(
-                "https://example.com/path/user@example.com?email=a@b.test",
-            )),
-            middlewares: vec![],
-            handler: None,
+        let path_at_route = Route {
+            output: Endpoint {
+                endpoint_type: EndpointType::Http(HttpConfig::new(
+                    "https://example.com/path/user@example.com?email=a@b.test",
+                )),
+                middlewares: vec![],
+                handler: None,
+            },
+            ..Default::default()
         };
         config.insert("path_at_route".to_string(), path_at_route);
 
-        let mut credential_route = Route::default();
-        credential_route.output = Endpoint {
-            endpoint_type: EndpointType::Http(HttpConfig::new(
-                "https://user:pass@example.com/path",
-            )),
-            middlewares: vec![],
-            handler: None,
+        let credential_route = Route {
+            output: Endpoint {
+                endpoint_type: EndpointType::Http(HttpConfig::new(
+                    "https://user:pass@example.com/path",
+                )),
+                middlewares: vec![],
+                handler: None,
+            },
+            ..Default::default()
         };
         config.insert("credential_route".to_string(), credential_route);
 
