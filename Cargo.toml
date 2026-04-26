@@ -1,6 +1,6 @@
 [package]
 name = "mq-bridge"
-version = "0.2.12"
+version = "0.2.13"
 edition = "2021"
 authors = ["Marco Mengelkoch"]
 rust-version = "1.75"  # 2021 edition was released in 1.56
