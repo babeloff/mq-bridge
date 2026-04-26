@@ -51,14 +51,14 @@ routes:
 
 pub async fn test_mysql_pipeline() {
     run_mysql_test(|config_yaml| async move {
-        run_pipeline_test("mysql", &config_yaml).await;
+        run_pipeline_test("sqlx", &config_yaml).await;
     })
     .await;
 }
 
 pub async fn test_mysql_performance_pipeline() {
     run_mysql_test(|config_yaml| async move {
-        run_performance_pipeline_test("mysql", &config_yaml, PERF_TEST_MESSAGE_COUNT).await;
+        run_performance_pipeline_test("sqlx", &config_yaml, PERF_TEST_MESSAGE_COUNT).await;
     })
     .await;
 }
@@ -85,7 +85,7 @@ pub async fn test_mysql_chaos() {
     run_test_with_docker_controller(DOCKER_COMPOSE_FILE, |controller| async move {
         setup_db().await;
         let config_yaml = CONFIG_YAML.replace("{out_capacity}", &(10000 + 1000).to_string());
-        run_chaos_pipeline_test("mysql", &config_yaml, controller, "mysql").await;
+        run_chaos_pipeline_test("sqlx", &config_yaml, controller, "mysql").await;
     })
     .await;
 }

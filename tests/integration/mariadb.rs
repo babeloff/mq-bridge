@@ -56,7 +56,7 @@ pub async fn test_mariadb_pipeline() {
             "{out_capacity}",
             &(PERF_TEST_MESSAGE_COUNT + 1000).to_string(),
         );
-        run_pipeline_test("mariadb", &config_yaml).await;
+        run_pipeline_test("sqlx", &config_yaml).await;
     })
     .await;
 }
@@ -69,7 +69,7 @@ pub async fn test_mariadb_performance_pipeline() {
             "{out_capacity}",
             &(PERF_TEST_MESSAGE_COUNT + 1000).to_string(),
         );
-        run_performance_pipeline_test("mariadb", &config_yaml, PERF_TEST_MESSAGE_COUNT).await;
+        run_performance_pipeline_test("sqlx", &config_yaml, PERF_TEST_MESSAGE_COUNT).await;
     })
     .await;
 }
@@ -79,7 +79,7 @@ pub async fn test_mariadb_chaos() {
     run_test_with_docker_controller(DOCKER_COMPOSE_FILE, |controller| async move {
         setup_db().await;
         let config_yaml = CONFIG_YAML.replace("{out_capacity}", &(10000 + 1000).to_string());
-        run_chaos_pipeline_test("mariadb", &config_yaml, controller, "mariadb").await;
+        run_chaos_pipeline_test("sqlx", &config_yaml, controller, "mariadb").await;
     })
     .await;
 }

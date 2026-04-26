@@ -64,7 +64,7 @@ pub async fn test_postgres_pipeline() {
             "{out_capacity}",
             &(PERF_TEST_MESSAGE_COUNT + 1000).to_string(),
         );
-        run_pipeline_test("postgres", &config_yaml).await;
+        run_pipeline_test("sqlx", &config_yaml).await;
     })
     .await;
 }
@@ -77,7 +77,7 @@ pub async fn test_postgres_performance_pipeline() {
             "{out_capacity}",
             &(PERF_TEST_MESSAGE_COUNT + 1000).to_string(),
         );
-        run_performance_pipeline_test("postgres", &config_yaml, PERF_TEST_MESSAGE_COUNT).await;
+        run_performance_pipeline_test("sqlx", &config_yaml, PERF_TEST_MESSAGE_COUNT).await;
     })
     .await;
 }
@@ -90,7 +90,7 @@ pub async fn test_postgres_chaos() {
             "{out_capacity}",
             &(10000 + 1000).to_string(), // Using a smaller number for chaos tests
         );
-        run_chaos_pipeline_test("postgres", &config_yaml, controller, "postgres").await;
+        run_chaos_pipeline_test("sqlx", &config_yaml, controller, "postgres").await;
     })
     .await;
 }
