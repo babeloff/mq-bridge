@@ -471,30 +471,46 @@ async fn get_or_create_shared_http_server(
     route_id: u64,
     state: HttpConsumerState,
 ) -> anyhow::Result<Arc<SharedHttpServer>> {
-    if let Ok(registry) = http_server_registry().lock() {
-        for (existing_key, server) in registry.iter() {
-            if existing_key.listen_addr != key.listen_addr {
-                continue;
-            }
-            if existing_key == key {
-                server.router.register_route(route_id, state.clone())?;
-                return Ok(server.clone());
-            }
-            return Err(anyhow!(
-                "HTTP consumer {} is already registered with different TLS or worker settings",
-                key.listen_addr
-            ));
-        }
-    }
-
     let addr: SocketAddr = key
         .listen_addr
         .parse()
         .with_context(|| format!("Invalid listen address: {}", key.listen_addr))?;
+    let uses_ephemeral_port = addr.port() == 0;
+
+    if !uses_ephemeral_port {
+        if let Ok(registry) = http_server_registry().lock() {
+            for (existing_key, server) in registry.iter() {
+                if existing_key.listen_addr != key.listen_addr {
+                    continue;
+                }
+                if existing_key == key {
+                    server.router.register_route(route_id, state.clone())?;
+                    return Ok(server.clone());
+                }
+                return Err(anyhow!(
+                    "HTTP consumer {} is already registered with different TLS or worker settings",
+                    key.listen_addr
+                ));
+            }
+        }
+    }
+
     let listener = TcpListener::bind(&addr)
         .await
         .with_context(|| format!("Failed to bind to {}", addr))?;
     let bound_addr = listener.local_addr().ok();
+    let registry_key = if uses_ephemeral_port {
+        let Some(bound_addr) = bound_addr else {
+            return Err(anyhow!("Failed to determine bound HTTP listener address"));
+        };
+        HttpServerKey {
+            listen_addr: bound_addr.to_string(),
+            tls: key.tls.clone(),
+            workers: key.workers,
+        }
+    } else {
+        key.clone()
+    };
     let listener = Arc::new(listener);
     let router = Arc::new(SharedHttpRouter::default());
     let service = HttpBridgeService {
@@ -527,10 +543,10 @@ async fn get_or_create_shared_http_server(
         .lock()
         .map_err(|_| anyhow!("HTTP server registry lock poisoned"))?;
     for (existing_key, existing) in registry.iter() {
-        if existing_key.listen_addr != key.listen_addr {
+        if existing_key.listen_addr != registry_key.listen_addr {
             continue;
         }
-        if existing_key == key {
+        if existing_key == &registry_key {
             let _ = server.shutdown_tx.send(());
             existing.router.register_route(route_id, state.clone())?;
             return Ok(existing.clone());
@@ -542,7 +558,7 @@ async fn get_or_create_shared_http_server(
         ));
     }
     server.router.register_route(route_id, state)?;
-    registry.insert(key.clone(), server.clone());
+    registry.insert(registry_key, server.clone());
     Ok(server)
 }
 
@@ -2078,6 +2094,31 @@ http_route:
                 .contains("Conflicting HTTP consumer registration"),
             "unexpected error: {error}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_http_consumers_on_ephemeral_ports_do_not_share_listener() {
+        init_crypto();
+
+        let first_consumer = HttpConsumer::new(&HttpConfig {
+            url: "127.0.0.1:0".to_string(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let second_consumer = HttpConsumer::new(&HttpConfig {
+            url: "127.0.0.1:0".to_string(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+        let first_addr = first_consumer.bound_addr().unwrap();
+        let second_addr = second_consumer.bound_addr().unwrap();
+
+        assert_ne!(first_addr, second_addr);
+        assert_ne!(first_addr.port(), 0);
+        assert_ne!(second_addr.port(), 0);
     }
 
     async fn consumer_receive_ack(consumer: &mut HttpConsumer) -> CanonicalMessage {
