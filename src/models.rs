@@ -2397,10 +2397,9 @@ kafka_to_nats:
         // Setup HTTP with basic auth
         let mut http_config = HttpConfig::new("http://httpuser:httppass@localhost");
         http_config.basic_auth = Some(("httpuser".to_string(), "httppass".to_string()));
-        http_config.custom_headers.insert(
-            "X-API-Key".to_string(),
-            "http-api-key".to_string(),
-        );
+        http_config
+            .custom_headers
+            .insert("X-API-Key".to_string(), "http-api-key".to_string());
         http_config.custom_headers.insert(
             "X-Access-Token".to_string(),
             "http-access-token".to_string(),
