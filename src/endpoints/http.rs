@@ -447,7 +447,11 @@ fn setup_http_state_and_channel(
     let method = config
         .method
         .as_deref()
-        .and_then(|m| hyper::Method::from_bytes(m.as_bytes()).ok());
+        .map(|m| {
+            hyper::Method::from_bytes(m.as_bytes())
+                .map_err(|_| anyhow::anyhow!("Invalid config.method: '{}'", m))
+        })
+        .transpose()?;
 
     let state = HttpConsumerState {
         path: normalize_http_path(config.path.as_deref()),
@@ -482,7 +486,7 @@ fn build_consumer_target_url(config: &HttpConfig, bound_addr: Option<SocketAddr>
             }
         })
         .unwrap_or_else(|| config.url.clone());
-    let mut url = config.tls.normalize_url(&base, true);
+    let mut url = config.tls.normalize_url(&base);
     if let Some(path) = normalize_http_path(config.path.as_deref()) {
         url.push_str(&path);
     }
@@ -980,6 +984,8 @@ async fn handle_request_internal(
                 || k_str == "http_path"
                 || k_str == "http_query"
                 || k_str == "http_version"
+                || k_str.eq_ignore_ascii_case("tls_cipher_suite")
+                || k_str.eq_ignore_ascii_case("tls_protocol_version")
             {
                 continue;
             }
@@ -1254,12 +1260,16 @@ impl HttpPublisher {
         }
         let client = client_builder.build(https_connector);
 
-        let url = config.tls.normalize_url(&config.url, false);
+        let url = config.tls.normalize_url(&config.url);
 
         let method = config
             .method
             .as_deref()
-            .and_then(|m| hyper::Method::from_bytes(m.as_bytes()).ok())
+            .map(|m| {
+                hyper::Method::from_bytes(m.as_bytes())
+                    .map_err(|_| anyhow::anyhow!("Invalid config.method: '{}'", m))
+            })
+            .transpose()?
             .unwrap_or(hyper::Method::POST);
 
         let request_timeout = config

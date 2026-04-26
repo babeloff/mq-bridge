@@ -332,16 +332,16 @@ async fn test_all_performance_pipeline() {
     #[cfg(feature = "sqlx")]
     {
         if should_run("sqlx") || should_run("postgres") {
-            integration::postgres::test_postgres_pipeline().await;
+            integration::postgres::test_postgres_performance_pipeline().await;
         }
         if should_run("sqlx") || should_run("mysql") {
-            integration::mysql::test_mysql_pipeline().await;
+            integration::mysql::test_mysql_performance_pipeline().await;
         }
         if should_run("sqlx") || should_run("mariadb") {
-            integration::mariadb::test_mariadb_pipeline().await;
+            integration::mariadb::test_mariadb_performance_pipeline().await;
         }
         if should_run("sqlx") || should_run("sqlite") {
-            integration::sqlite::test_sqlite_pipeline().await;
+            integration::sqlite::test_sqlite_performance_pipeline().await;
         }
     }
 }

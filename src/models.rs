@@ -1848,7 +1848,7 @@ impl TlsConfig {
     }
 
     /// Helper to normalize a URL by adding the appropriate scheme prefix (http:// or https://) if missing.
-    pub fn normalize_url(&self, url: &str, is_consumer: bool) -> String {
+    pub fn normalize_url(&self, url: &str) -> String {
         if url
             .get(..7)
             .is_some_and(|prefix| prefix.eq_ignore_ascii_case("http://"))
@@ -1858,11 +1858,7 @@ impl TlsConfig {
         {
             url.to_string()
         } else {
-            let is_tls = if is_consumer {
-                self.required
-            } else {
-                self.is_tls_client_configured()
-            };
+            let is_tls = self.required;
             let scheme = if is_tls { "https" } else { "http" };
             format!("{}://{}", scheme, url)
         }

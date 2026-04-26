@@ -1189,10 +1189,18 @@ impl MongoDbSubscriber {
                 "seq": { "$exists": false }
             })
             .limit(1)
-            .await?;
+            .await
+            .with_context(|| {
+                format!(
+                    "Failed to count documents for collection '{}'",
+                    collection_name
+                )
+            })?;
+
         if missing_seq > 0 {
             return Err(anyhow!(
-                "MongoDB subscriber found documents with payload but no seq field; use wrapped publisher format or disable subscriber/change_stream mode for raw collections"
+                "MongoDB subscriber found documents with payload but no seq field in collection '{}'; use wrapped publisher format or disable subscriber/change_stream mode for raw collections",
+                collection_name
             ));
         }
 

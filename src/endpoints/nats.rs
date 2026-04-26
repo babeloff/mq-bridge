@@ -129,7 +129,7 @@ impl MessagePublisher for NatsPublisher {
             .map_err(|_| PublisherError::Retryable(anyhow!("NATS request timed out")))?
             .map_err(|e| PublisherError::Retryable(anyhow!("NATS request failed: {}", e)))?;
 
-            let response_msg = create_nats_canonical_message(&response, None, true);
+            let response_msg = create_nats_canonical_message(&response, None, false);
             return Ok(Sent::Response(response_msg));
         }
 
@@ -605,6 +605,9 @@ impl NatsCore {
                 let mut reply_subjects = Vec::with_capacity(max_messages);
 
                 if let Some(message) = sub.next().await {
+                    // Note: reply_subjects are recorded from the native Message.reply while metadata["reply_to"]
+                    // may reflect header-provided values (read by route.rs). The batch commit closure always
+                    // publishes to the original Message.reply to preserve native NATS reply semantics.
                     reply_subjects.push(message.reply.clone());
                     messages.push(create_nats_canonical_message(&message, None, true));
 
@@ -893,5 +896,12 @@ mod tests {
             canonical.metadata.get("reply_to").map(String::as_str),
             Some("app.reply.subject")
         );
+    }
+
+    #[test]
+    fn core_native_reply_true_with_no_reply_is_absent() {
+        let message = nats_message(None, None);
+        let canonical = create_nats_canonical_message(&message, None, true);
+        assert!(!canonical.metadata.contains_key("reply_to"));
     }
 }

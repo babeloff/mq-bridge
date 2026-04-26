@@ -49,7 +49,7 @@ enum GrpcConsumerInner {
 
 impl GrpcConsumer {
     pub async fn new(config: &GrpcConfig) -> Result<Self> {
-        let url = config.tls.normalize_url(&config.url, config.server_mode);
+        let url = config.tls.normalize_url(&config.url);
         let (inner, bound_addr) = if config.server_mode {
             let s = ServerModeConsumer::new(config, &url).await?;
             let addr = s.bound_addr();
@@ -308,14 +308,15 @@ impl SharedGrpcRouter {
 
     async fn dispatch(&self, msg: BridgeMessage) -> Result<()> {
         let topic = bridge_message_topic(&msg);
-        if let Some(route) = self.route_for_topic(&topic) {
-            let _ = route.broadcast_tx.send(msg.clone());
-            route
-                .tx
-                .send(msg)
-                .await
-                .map_err(|_| anyhow::anyhow!("No active gRPC consumer for topic '{}'", topic))?;
-        }
+        let route = self
+            .route_for_topic(&topic)
+            .ok_or_else(|| anyhow::anyhow!("No route for topic '{}'", topic))?;
+        let _ = route.broadcast_tx.send(msg.clone());
+        route
+            .tx
+            .send(msg)
+            .await
+            .map_err(|_| anyhow::anyhow!("No active gRPC consumer for topic '{}'", topic))?;
         Ok(())
     }
 }
@@ -665,7 +666,7 @@ impl GrpcPublisher {
     pub async fn new(config: &GrpcConfig) -> Result<Self> {
         // Use a lazy channel so the publisher route can start before a server-mode
         // gRPC consumer has finished binding its embedded listener.
-        let url = config.tls.normalize_url(&config.url, false);
+        let url = config.tls.normalize_url(&config.url);
         let endpoint = make_endpoint(config, &url).await?;
         let client = BridgeClient::new(endpoint.connect_lazy());
         Ok(Self {
