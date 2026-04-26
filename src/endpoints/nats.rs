@@ -743,7 +743,8 @@ fn create_nats_canonical_message(
         if let Some(reply) = &message.reply {
             canonical_message
                 .metadata
-                .insert("reply_to".to_string(), reply.to_string());
+                .entry("reply_to".to_string())
+                .or_insert_with(|| reply.to_string());
         }
     }
     canonical_message

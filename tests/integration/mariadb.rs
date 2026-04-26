@@ -31,6 +31,11 @@ routes:
     input:
       memory: { topic: "sqlx-mariadb-in" }
     output:
+      middlewares:
+        - retry:
+            max_attempts: 20
+            initial_interval_ms: 500
+            max_interval_ms: 2000
       sqlx:
         url: "mysql://testuser:testpass@localhost:3307/testdb"
         table: "messages"
