@@ -730,7 +730,7 @@ impl MessageConsumer for HttpConsumer {
                     );
                     // Commit each message with its corresponding disposition
                     let mut results = Vec::with_capacity(commits.len());
-                    for (commit, disposition) in commits.into_iter().zip(dispositions.into_iter()) {
+                    for (commit, disposition) in commits.into_iter().zip(dispositions) {
                         results.push(commit(disposition).await);
                     }
                     results.into_iter().collect::<anyhow::Result<()>>()
