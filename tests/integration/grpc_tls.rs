@@ -51,8 +51,9 @@ async fn test_grpc_tls_roundtrip() {
     let cert_dir = tls_helpers::generate_service_certs("grpc").expect("generate certs");
     if let Some(out_route) = routes.get_mut("grpc_to_memory") {
         if let mq_bridge::models::EndpointType::Grpc(ref mut cfg) = out_route.input.endpoint_type {
-            *cfg =
-                tls_helpers::grpc_server_config_with_tls(&cert_dir, format!("127.0.0.1:{}", port));
+            *cfg = tls_helpers::grpc_server_config_with_tls(&cert_dir, format!("127.0.0.1:{}", port));
+            cfg.topic = Some("tls_test".to_string());
+            cfg.tls.accept_invalid_certs = true;
         }
     }
     if let Some(in_route) = routes.get_mut("memory_to_grpc") {
@@ -61,6 +62,8 @@ async fn test_grpc_tls_roundtrip() {
                 &cert_dir,
                 format!("https://127.0.0.1:{}", port),
             );
+            cfg.topic = Some("tls_test".to_string());
+            cfg.tls.accept_invalid_certs = true;
         }
     }
 
@@ -72,7 +75,7 @@ async fn test_grpc_tls_roundtrip() {
         .deploy("grpc_to_memory")
         .await
         .expect("Failed to deploy gRPC server");
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
 
     in_route
         .deploy("memory_to_grpc")
