@@ -47,7 +47,24 @@ impl MessageConsumer for DeduplicationConsumer {
     }
 
     fn on_disconnect_hook(&self) -> Option<BoxFuture<'_, anyhow::Result<()>>> {
-        self.inner.on_disconnect_hook()
+        let inner_hook = self.inner.on_disconnect_hook();
+        let db = self.db.clone();
+
+        Some(Box::pin(async move {
+            let mut first_error = None;
+            if let Some(hook) = inner_hook {
+                if let Err(err) = hook.await {
+                    first_error = Some(err);
+                }
+            }
+            if let Err(err) = db.flush_async().await {
+                first_error.get_or_insert_with(|| anyhow::anyhow!(err));
+            }
+            match first_error {
+                Some(err) => Err(err),
+                None => Ok(()),
+            }
+        }))
     }
 
     #[instrument(skip_all)]

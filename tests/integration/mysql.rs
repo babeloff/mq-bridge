@@ -7,6 +7,7 @@ use mq_bridge::test_utils::{
     run_performance_pipeline_test, run_pipeline_test, run_test_with_docker,
     run_test_with_docker_controller, setup_logging, PERF_TEST_MESSAGE_COUNT,
 };
+use std::future::Future;
 use std::sync::Arc;
 
 const DOCKER_COMPOSE_FILE: &str = "tests/integration/docker-compose/mysql.yml";
@@ -49,19 +50,24 @@ routes:
 "#;
 
 pub async fn test_mysql_pipeline() {
-    setup_logging();
-    run_test_with_docker(DOCKER_COMPOSE_FILE, || async {
-        setup_db().await;
-        let config_yaml = CONFIG_YAML.replace(
-            "{out_capacity}",
-            &(PERF_TEST_MESSAGE_COUNT + 1000).to_string(),
-        );
+    run_mysql_test(|config_yaml| async move {
         run_pipeline_test("mysql", &config_yaml).await;
     })
     .await;
 }
 
 pub async fn test_mysql_performance_pipeline() {
+    run_mysql_test(|config_yaml| async move {
+        run_performance_pipeline_test("mysql", &config_yaml, PERF_TEST_MESSAGE_COUNT).await;
+    })
+    .await;
+}
+
+async fn run_mysql_test<F, Fut>(runner: F)
+where
+    F: FnOnce(String) -> Fut,
+    Fut: Future<Output = ()>,
+{
     setup_logging();
     run_test_with_docker(DOCKER_COMPOSE_FILE, || async {
         setup_db().await;
@@ -69,7 +75,7 @@ pub async fn test_mysql_performance_pipeline() {
             "{out_capacity}",
             &(PERF_TEST_MESSAGE_COUNT + 1000).to_string(),
         );
-        run_performance_pipeline_test("mysql", &config_yaml, PERF_TEST_MESSAGE_COUNT).await;
+        runner(config_yaml).await;
     })
     .await;
 }

@@ -13,6 +13,6 @@ async fn sqlite_pipeline_integration() {
 #[tokio::test]
 #[ignore = "Test takes too long"]
 async fn sqlite_performance_direct() {
-    // Keep this small by default; the underlying helper records performance.
+    // Ignored by default; run explicitly with `cargo test sqlite_performance_direct -- --ignored`.
     sqlite::test_sqlite_performance_direct().await;
 }

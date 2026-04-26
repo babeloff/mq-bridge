@@ -1445,15 +1445,16 @@ pub async fn run_concurrency_test(
     use std::sync::Arc;
     use std::time::Duration;
 
+    let work_duration = Duration::from_millis(500);
     let unique_id = fast_uuid_v7::gen_id().to_string();
     let counter = Arc::new(AtomicUsize::new(0));
     let counter_clone = counter.clone();
 
-    // Handler that simulates a 500ms computation
+    // Handler that simulates enough work for the concurrency timing check to be stable.
     let handler = move |_msg: crate::CanonicalMessage| {
         let c = counter_clone.clone();
         async move {
-            tokio::time::sleep(Duration::from_millis(200)).await;
+            tokio::time::sleep(work_duration).await;
             c.fetch_add(1, Ordering::SeqCst);
             Ok(Handled::Ack)
         }
@@ -1492,12 +1493,12 @@ pub async fn run_concurrency_test(
     crate::models::Route::stop(&route_name).await;
 
     assert!(
-        elapsed < Duration::from_millis(300),
+        elapsed < work_duration + Duration::from_millis(300),
         "Execution was not concurrent: took {:?}",
         elapsed
     );
     assert!(
-        elapsed >= Duration::from_millis(200),
+        elapsed >= work_duration,
         "Execution too fast: {:?}",
         elapsed
     );

@@ -79,14 +79,14 @@ impl HttpConsumer {
 
 impl Drop for HttpConsumer {
     fn drop(&mut self) {
+        let Ok(mut registry) = http_server_registry().lock() else {
+            return;
+        };
         let should_shutdown = self.shared_server.router.unregister_route(self.route_id);
         if !should_shutdown {
             return;
         }
 
-        let Ok(mut registry) = http_server_registry().lock() else {
-            return;
-        };
         registry.retain(|_, server| !Arc::ptr_eq(server, &self.shared_server));
         let _ = self.shared_server.shutdown_tx.send(());
     }
@@ -401,8 +401,8 @@ impl HttpConsumer {
             tls: tls_config.clone(),
             workers,
         };
-        let shared_server = get_or_create_shared_http_server(&server_key, &tls_config).await?;
-        shared_server.router.register_route(route_id, state)?;
+        let shared_server =
+            get_or_create_shared_http_server(&server_key, &tls_config, route_id, state).await?;
 
         Ok(Self {
             request_rx,
@@ -468,6 +468,8 @@ fn build_consumer_target_url(config: &HttpConfig) -> String {
 async fn get_or_create_shared_http_server(
     key: &HttpServerKey,
     tls_config: &TlsConfig,
+    route_id: u64,
+    state: HttpConsumerState,
 ) -> anyhow::Result<Arc<SharedHttpServer>> {
     if let Ok(registry) = http_server_registry().lock() {
         for (existing_key, server) in registry.iter() {
@@ -475,6 +477,7 @@ async fn get_or_create_shared_http_server(
                 continue;
             }
             if existing_key == key {
+                server.router.register_route(route_id, state.clone())?;
                 return Ok(server.clone());
             }
             return Err(anyhow!(
@@ -529,6 +532,7 @@ async fn get_or_create_shared_http_server(
         }
         if existing_key == key {
             let _ = server.shutdown_tx.send(());
+            existing.router.register_route(route_id, state.clone())?;
             return Ok(existing.clone());
         }
         let _ = server.shutdown_tx.send(());
@@ -537,6 +541,7 @@ async fn get_or_create_shared_http_server(
             key.listen_addr
         ));
     }
+    server.router.register_route(route_id, state)?;
     registry.insert(key.clone(), server.clone());
     Ok(server)
 }
@@ -915,7 +920,11 @@ async fn handle_request_internal(
                 content_encoding = Some(v_str.to_string());
             }
             let k_str = key.as_str();
-            if k_str == "http_method" || k_str == "http_path" || k_str == "http_query" {
+            if k_str == "http_method"
+                || k_str == "http_path"
+                || k_str == "http_query"
+                || k_str == "http_version"
+            {
                 continue;
             }
             metadata.insert(k_str.to_string(), v_str.to_string());

@@ -1073,10 +1073,10 @@ fn map_responses_to_dispositions(
         } else if let Some(resp) = response_map.remove(id) {
             // If a response exists for this specific ID, use it.
             dispositions.push(MessageDisposition::Reply(resp));
+        } else if request_ids.contains(id) {
+            error!("Message {:032x} expected a reply (reply_to set), but publisher returned Ack. Nacking to avoid committing a lost response.", id);
+            dispositions.push(MessageDisposition::Nack);
         } else {
-            if request_ids.contains(id) {
-                warn!("Message {:032x} expected a reply (reply_to set), but publisher returned Ack. Response loop might be broken.", id);
-            }
             // Otherwise, it was a successful send that did not produce a response.
             dispositions.push(MessageDisposition::Ack);
         }
@@ -1112,7 +1112,7 @@ fn test_map_responses_to_dispositions_logic() {
     assert_eq!(dispositions.len(), 4);
     assert!(matches!(dispositions[0], MessageDisposition::Reply(_))); // from responses
     assert!(matches!(dispositions[1], MessageDisposition::Nack)); // from failed
-    assert!(matches!(dispositions[2], MessageDisposition::Ack)); // implicit ack
+    assert!(matches!(dispositions[2], MessageDisposition::Nack)); // missing reply
     assert!(matches!(dispositions[3], MessageDisposition::Reply(_))); // from responses
 }
 

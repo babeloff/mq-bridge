@@ -1601,6 +1601,11 @@ impl HttpConfig {
         self.method = Some(method.into());
         self
     }
+
+    pub fn with_path(mut self, path: impl Into<String>) -> Self {
+        self.path = Some(path.into());
+        self
+    }
 }
 
 // --- IBM MQ Specific Configuration ---
@@ -1844,7 +1849,13 @@ impl TlsConfig {
 
     /// Helper to normalize a URL by adding the appropriate scheme prefix (http:// or https://) if missing.
     pub fn normalize_url(&self, url: &str, is_consumer: bool) -> String {
-        if url.to_lowercase().starts_with("http://") || url.to_lowercase().starts_with("https://") {
+        if url
+            .get(..7)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("http://"))
+            || url
+                .get(..8)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("https://"))
+        {
             url.to_string()
         } else {
             let is_tls = if is_consumer {
@@ -1874,7 +1885,7 @@ fn extract_sensitive_string_map_entries(
         .keys()
         .filter(|key| {
             let key = key.to_ascii_lowercase();
-            key.contains("key") || key.contains("token") || key.contains("authent")
+            key.contains("key") || key.contains("token") || key.contains("auth")
         })
         .cloned()
         .collect::<Vec<_>>();
@@ -1882,11 +1893,35 @@ fn extract_sensitive_string_map_entries(
     for key in secret_keys {
         if let Some(value) = values.remove(&key) {
             secrets.insert(
-                format!("{}__{}__{}", prefix, field_name, key.to_uppercase()),
+                sanitize_secret_key(&format!("{}__{}__{}", prefix, field_name, key)),
                 value,
             );
         }
     }
+}
+
+fn url_has_userinfo(url: &str) -> bool {
+    let Some(authority_start) = url.find("://").map(|idx| idx + 3) else {
+        return false;
+    };
+    let authority_end = url[authority_start..]
+        .find('/')
+        .map(|idx| authority_start + idx)
+        .unwrap_or(url.len());
+    url[authority_start..authority_end].contains('@')
+}
+
+fn sanitize_secret_key(key: &str) -> String {
+    key.chars()
+        .map(|ch| {
+            let ch = ch.to_ascii_uppercase();
+            if ch.is_ascii_alphanumeric() || ch == '_' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 fn extract_sensitive_url(
@@ -1895,8 +1930,11 @@ fn extract_sensitive_url(
     field_name: &str,
     secrets: &mut HashMap<String, String>,
 ) {
-    if !url.is_empty() && url.contains('@') {
-        secrets.insert(format!("{}__{}", prefix, field_name), std::mem::take(url));
+    if !url.is_empty() && url_has_userinfo(url) {
+        secrets.insert(
+            sanitize_secret_key(&format!("{}__{}", prefix, field_name)),
+            std::mem::take(url),
+        );
     }
 }
 
@@ -1906,9 +1944,12 @@ fn extract_sensitive_optional_url(
     field_name: &str,
     secrets: &mut HashMap<String, String>,
 ) {
-    if url.as_ref().is_some_and(|url| url.contains('@')) {
+    if url.as_ref().is_some_and(|url| url_has_userinfo(url)) {
         if let Some(url) = url.take() {
-            secrets.insert(format!("{}__{}", prefix, field_name), url);
+            secrets.insert(
+                sanitize_secret_key(&format!("{}__{}", prefix, field_name)),
+                url,
+            );
         }
     }
 }
@@ -2166,7 +2207,7 @@ impl SecretExtractor for TlsConfig {
 pub fn extract_config_secrets(config: &mut Config) -> HashMap<String, String> {
     let mut secrets = HashMap::new();
     for (route_name, route) in config.iter_mut() {
-        let prefix = format!("MQB__{}", route_name.to_uppercase());
+        let prefix = sanitize_secret_key(&format!("MQB__{}", route_name));
         route.extract_secrets(&prefix, &mut secrets);
     }
     secrets
@@ -2408,6 +2449,10 @@ kafka_to_nats:
             "X-Authentication".to_string(),
             "http-authentication".to_string(),
         );
+        http_config.custom_headers.insert(
+            "Authorization".to_string(),
+            "Bearer secret-token".to_string(),
+        );
         http_config
             .custom_headers
             .insert("X-Trace-Id".to_string(), "trace-value".to_string());
@@ -2467,21 +2512,27 @@ kafka_to_nats:
         );
         assert_eq!(
             secrets
-                .get("MQB__TEST_ROUTE__OUTPUT__HTTP__CUSTOM_HEADERS__X-API-KEY")
+                .get("MQB__TEST_ROUTE__OUTPUT__HTTP__CUSTOM_HEADERS__X_API_KEY")
                 .map(|s| s.as_str()),
             Some("http-api-key")
         );
         assert_eq!(
             secrets
-                .get("MQB__TEST_ROUTE__OUTPUT__HTTP__CUSTOM_HEADERS__X-ACCESS-TOKEN")
+                .get("MQB__TEST_ROUTE__OUTPUT__HTTP__CUSTOM_HEADERS__X_ACCESS_TOKEN")
                 .map(|s| s.as_str()),
             Some("http-access-token")
         );
         assert_eq!(
             secrets
-                .get("MQB__TEST_ROUTE__OUTPUT__HTTP__CUSTOM_HEADERS__X-AUTHENTICATION")
+                .get("MQB__TEST_ROUTE__OUTPUT__HTTP__CUSTOM_HEADERS__X_AUTHENTICATION")
                 .map(|s| s.as_str()),
             Some("http-authentication")
+        );
+        assert_eq!(
+            secrets
+                .get("MQB__TEST_ROUTE__OUTPUT__HTTP__CUSTOM_HEADERS__AUTHORIZATION")
+                .map(|s| s.as_str()),
+            Some("Bearer secret-token")
         );
 
         // Verify config cleared
@@ -2498,11 +2549,58 @@ kafka_to_nats:
             assert!(!h.custom_headers.contains_key("X-API-Key"));
             assert!(!h.custom_headers.contains_key("X-Access-Token"));
             assert!(!h.custom_headers.contains_key("X-Authentication"));
+            assert!(!h.custom_headers.contains_key("Authorization"));
             assert_eq!(
                 h.custom_headers.get("X-Trace-Id").map(|s| s.as_str()),
                 Some("trace-value")
             );
         }
+    }
+
+    #[test]
+    fn test_extract_sensitive_url_only_strips_authority_credentials() {
+        let mut config = Config::new();
+        let mut path_at_route = Route::default();
+        path_at_route.output = Endpoint {
+            endpoint_type: EndpointType::Http(HttpConfig::new(
+                "https://example.com/path/user@example.com?email=a@b.test",
+            )),
+            middlewares: vec![],
+            handler: None,
+        };
+        config.insert("path_at_route".to_string(), path_at_route);
+
+        let mut credential_route = Route::default();
+        credential_route.output = Endpoint {
+            endpoint_type: EndpointType::Http(HttpConfig::new(
+                "https://user:pass@example.com/path",
+            )),
+            middlewares: vec![],
+            handler: None,
+        };
+        config.insert("credential_route".to_string(), credential_route);
+
+        let secrets = extract_config_secrets(&mut config);
+
+        if let EndpointType::Http(http) = &config.get("path_at_route").unwrap().output.endpoint_type
+        {
+            assert_eq!(
+                http.url,
+                "https://example.com/path/user@example.com?email=a@b.test"
+            );
+        }
+        if let EndpointType::Http(http) =
+            &config.get("credential_route").unwrap().output.endpoint_type
+        {
+            assert!(http.url.is_empty());
+        }
+        assert_eq!(
+            secrets
+                .get("MQB__CREDENTIAL_ROUTE__OUTPUT__HTTP__URL")
+                .map(String::as_str),
+            Some("https://user:pass@example.com/path")
+        );
+        assert!(!secrets.contains_key("MQB__PATH_AT_ROUTE__OUTPUT__HTTP__URL"));
     }
 
     #[test]

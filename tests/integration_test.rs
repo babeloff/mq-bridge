@@ -159,10 +159,13 @@ async fn test_all_chaos() {
     // AWS chaos test is excluded by default as it requires LocalStack which can be heavy/flaky in some envs
     #[cfg(feature = "sqlx")]
     {
-        if should_run("sqlx") {
-            println!("\n\n>>> Starting SQLx Chaos Test...");
+        if should_run("sqlx") || should_run("postgres") {
             integration::postgres::test_postgres_chaos().await;
+        }
+        if should_run("sqlx") || should_run("mariadb") {
             integration::mariadb::test_mariadb_chaos().await;
+        }
+        if should_run("sqlx") || should_run("mysql") {
             integration::mysql::test_mysql_chaos().await;
         }
     }
@@ -224,11 +227,16 @@ async fn test_all_status() {
 
     #[cfg(feature = "sqlx")]
     {
-        if should_run("sqlx") {
-            println!("\n\n>>> Starting SQLx Status Test...");
+        if should_run("sqlx") || should_run("postgres") {
             integration::postgres::test_postgres_status().await;
+        }
+        if should_run("sqlx") || should_run("mariadb") {
             integration::mariadb::test_mariadb_status().await;
+        }
+        if should_run("sqlx") || should_run("sqlite") {
             integration::sqlite::test_sqlite_status().await;
+        }
+        if should_run("sqlx") || should_run("mysql") {
             integration::mysql::test_mysql_status().await;
         }
     }
@@ -323,11 +331,16 @@ async fn test_all_performance_pipeline() {
     }
     #[cfg(feature = "sqlx")]
     {
-        if should_run("sqlx") {
-            println!("\n\n>>> Starting Sqlx Performance Pipeline Test...");
+        if should_run("sqlx") || should_run("postgres") {
             integration::postgres::test_postgres_pipeline().await;
+        }
+        if should_run("sqlx") || should_run("mysql") {
             integration::mysql::test_mysql_pipeline().await;
+        }
+        if should_run("sqlx") || should_run("mariadb") {
             integration::mariadb::test_mariadb_pipeline().await;
+        }
+        if should_run("sqlx") || should_run("sqlite") {
             integration::sqlite::test_sqlite_pipeline().await;
         }
     }
@@ -397,11 +410,16 @@ async fn test_all_performance_direct() {
     }
     #[cfg(feature = "sqlx")]
     {
-        if should_run("sqlx") {
-            println!("\n\n>>> Starting SQLx Direct Performance Test...");
+        if should_run("sqlx") || should_run("postgres") {
             integration::postgres::test_postgres_performance_direct().await;
+        }
+        if should_run("sqlx") || should_run("mariadb") {
             integration::mariadb::test_mariadb_performance_direct().await;
+        }
+        if should_run("sqlx") || should_run("sqlite") {
             integration::sqlite::test_sqlite_performance_direct().await;
+        }
+        if should_run("sqlx") || should_run("mysql") {
             integration::mysql::test_mysql_performance_direct().await;
         }
     }

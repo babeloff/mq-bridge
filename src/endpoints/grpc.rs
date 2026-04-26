@@ -449,8 +449,8 @@ impl ServerModeConsumer {
         let topic = normalize_grpc_topic(config.topic.as_deref());
         let (tx, rx) = mpsc::channel(16 * 1024);
         let route_id = GRPC_ROUTE_ID.fetch_add(1, Ordering::Relaxed);
-        let shared_server = get_or_create_shared_grpc_server(config, &key).await?;
-        shared_server.router.register_route(route_id, topic, tx)?;
+        let shared_server =
+            get_or_create_shared_grpc_server(config, &key, route_id, topic, tx).await?;
 
         Ok(Self {
             route_id,
@@ -468,6 +468,9 @@ impl ServerModeConsumer {
 async fn get_or_create_shared_grpc_server(
     config: &GrpcConfig,
     key: &GrpcServerKey,
+    route_id: u64,
+    topic: String,
+    tx: mpsc::Sender<BridgeMessage>,
 ) -> Result<Arc<SharedGrpcServer>> {
     if let Ok(registry) = grpc_server_registry().lock() {
         for (existing_key, server) in registry.iter() {
@@ -475,6 +478,9 @@ async fn get_or_create_shared_grpc_server(
                 continue;
             }
             if existing_key == key {
+                server
+                    .router
+                    .register_route(route_id, topic.clone(), tx.clone())?;
                 return Ok(server.clone());
             }
             return Err(anyhow::anyhow!(
@@ -567,6 +573,9 @@ async fn get_or_create_shared_grpc_server(
         }
         if existing_key == key {
             server.handle.abort();
+            existing
+                .router
+                .register_route(route_id, topic.clone(), tx.clone())?;
             return Ok(existing.clone());
         }
         server.handle.abort();
@@ -575,20 +584,21 @@ async fn get_or_create_shared_grpc_server(
             key.listen_addr
         ));
     }
+    server.router.register_route(route_id, topic, tx)?;
     registry.insert(key.clone(), server.clone());
     Ok(server)
 }
 
 impl Drop for ServerModeConsumer {
     fn drop(&mut self) {
+        let Ok(mut registry) = grpc_server_registry().lock() else {
+            return;
+        };
         let should_shutdown = self.shared_server.router.unregister_route(self.route_id);
         if !should_shutdown {
             return;
         }
 
-        let Ok(mut registry) = grpc_server_registry().lock() else {
-            return;
-        };
         registry.retain(|_, server| !Arc::ptr_eq(server, &self.shared_server));
         self.shared_server.handle.abort();
     }

@@ -1166,6 +1166,11 @@ impl MongoDbSubscriber {
     /// supported. If the collection is empty, it will start consuming from the next inserted document.
     ///
     pub async fn new(config: &MongoDbConfig) -> anyhow::Result<Self> {
+        if matches!(config.format, MongoDbFormat::Raw) {
+            return Err(anyhow!(
+                "MongoDB subscriber/change_stream mode requires wrapped documents with a seq ordering field; raw format is not supported"
+            ));
+        }
         let collection_name = config
             .collection
             .as_deref()
@@ -1203,6 +1208,21 @@ impl MongoDbSubscriber {
 impl MessageConsumer for MongoDbSubscriber {
     async fn receive_batch(&mut self, max_messages: usize) -> Result<ReceivedBatch, ConsumerError> {
         loop {
+            let missing_seq = self
+                .collection
+                .count_documents(doc! {
+                    "payload": { "$exists": true },
+                    "seq": { "$exists": false }
+                })
+                .limit(1)
+                .await
+                .map_err(|e| ConsumerError::Connection(e.into()))?;
+            if missing_seq > 0 {
+                return Err(ConsumerError::Connection(anyhow!(
+                    "MongoDB subscriber found documents with payload but no seq field; use wrapped publisher format or disable subscriber/change_stream mode for raw collections"
+                )));
+            }
+
             // Filter for events with seq > last_seq.
             // Crucially, we must filter out the sequencer and cursor documents which might be in the same collection.
             // Events have a 'payload' field, while sequencer/cursors do not.

@@ -24,19 +24,35 @@ fn db_url(id: &str) -> String {
 
 async fn setup_db(id: &str) {
     let db_path = db_file_path(id);
-    let _ = std::fs::remove_file(&db_path);
-    if let Some(parent) = db_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+    if let Err(error) = std::fs::remove_file(&db_path) {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!(path = %db_path.display(), error = %error, "failed to remove sqlite db file");
+        }
     }
-    let _ = std::fs::File::create(&db_path);
+    if let Some(parent) = db_path.parent() {
+        if let Err(error) = std::fs::create_dir_all(parent) {
+            tracing::warn!(path = %parent.display(), error = %error, "failed to create sqlite db directory");
+        }
+    }
+    if let Err(error) = std::fs::File::create(&db_path) {
+        tracing::warn!(path = %db_path.display(), error = %error, "failed to create sqlite db file");
+    }
 
     // Manually enable WAL mode to ensure high performance during tests.
     // journal_mode=WAL is persistent in the database file header.
     let url = db_url(id);
-    if let Ok(mut conn) = <sqlx::SqliteConnection as sqlx::Connection>::connect(&url).await {
-        let _ = sqlx::query("PRAGMA journal_mode=WAL;")
-            .execute(&mut conn)
-            .await;
+    match <sqlx::SqliteConnection as sqlx::Connection>::connect(&url).await {
+        Ok(mut conn) => {
+            if let Err(error) = sqlx::query("PRAGMA journal_mode=WAL;")
+                .execute(&mut conn)
+                .await
+            {
+                tracing::warn!(url = %url, error = %error, "failed to set sqlite journal_mode=WAL");
+            }
+        }
+        Err(error) => {
+            tracing::warn!(url = %url, error = %error, "failed to connect to sqlite db");
+        }
     }
 
     let config = mq_bridge::models::SqlxConfig {
