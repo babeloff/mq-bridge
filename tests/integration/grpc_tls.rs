@@ -99,7 +99,10 @@ async fn test_grpc_tls_roundtrip() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
-    assert!(!batch.is_empty(), "Expected at least one message via gRPC within 10s");
+    assert!(
+        !batch.is_empty(),
+        "Expected at least one message via gRPC within 10s"
+    );
 
     mq_bridge::Route::stop("memory_to_grpc").await;
     mq_bridge::Route::stop("grpc_to_memory").await;
