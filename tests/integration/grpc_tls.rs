@@ -6,7 +6,7 @@ use mq_bridge::models::Route;
 use mq_bridge::test_utils::setup_logging;
 use serde_yaml_ng;
 use std::collections::HashMap;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const CONFIG_YAML: &str = r#"
 routes:
@@ -89,9 +89,17 @@ async fn test_grpc_tls_roundtrip() {
         .unwrap();
 
     let memory_channel = out_route.output.channel().unwrap();
-    tokio::time::sleep(Duration::from_secs(2)).await;
-    let batch = memory_channel.drain_messages();
-    assert!(!batch.is_empty(), "Expected at least one message via gRPC");
+    let start = Instant::now();
+    let mut batch = Vec::new();
+    while start.elapsed() < Duration::from_secs(10) {
+        batch = memory_channel.drain_messages();
+        if !batch.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    assert!(!batch.is_empty(), "Expected at least one message via gRPC within 10s");
 
     mq_bridge::Route::stop("memory_to_grpc").await;
     mq_bridge::Route::stop("grpc_to_memory").await;
