@@ -10,8 +10,7 @@ services:
       - MYSQL_USER=testuser
       - MYSQL_PASSWORD=testpass
     healthcheck:
-      # Check for the UNIX socket to avoid requiring mysqladmin/mysql client in the image
-      test: ["CMD-SHELL", "test -S /run/mysqld/mysqld.sock"]
+      test: ["CMD-SHELL", "mariadb-admin ping -h localhost -u root -p$$MYSQL_ROOT_PASSWORD"]
       interval: 5s
       timeout: 10s
       retries: 20
