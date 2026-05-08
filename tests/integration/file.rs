@@ -32,6 +32,7 @@ pub async fn test_file_subscriber_logic() {
     tokio::task::yield_now().await;
     let _ = sub2.lock().await;
     tokio::task::yield_now().await;
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
     verify_subscriber_logic(publisher, sub1, sub2).await;
 }
