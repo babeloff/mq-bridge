@@ -562,13 +562,14 @@ fn process_message<M: Message>(
                         if let Ok(uuid) = Uuid::parse_str(&id_str) {
                             message_id = Some(uuid.as_u128());
                             break;
-                        }
-                        // Try to parse as hex string
-                        else if let Ok(n) =
-                            u128::from_str_radix(id_str.trim_start_matches("0x"), 16)
-                        {
-                            message_id = Some(n);
-                            break;
+                        } else if id_str.starts_with("0x") || id_str.starts_with("0X") {
+                            if let Ok(n) = u128::from_str_radix(
+                                id_str.trim_start_matches("0x").trim_start_matches("0X"),
+                                16,
+                            ) {
+                                message_id = Some(n);
+                                break;
+                            }
                         }
                         // Try to parse as decimal string
                         else if let Ok(n) = id_str.parse::<u128>() {

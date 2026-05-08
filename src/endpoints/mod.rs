@@ -432,6 +432,8 @@ fn check_consumer_recursive(
             Ok(warnings)
         }
         EndpointType::File(_) => Ok(warnings),
+        #[cfg(feature = "websocket")]
+        EndpointType::WebSocket(_) => Ok(warnings),
         EndpointType::Custom { .. } => Ok(warnings),
         EndpointType::Switch(_) => Err(anyhow!(
             "[route:{}] Switch endpoint is only supported as an output",
@@ -870,6 +872,8 @@ fn check_publisher_recursive(
             Ok(warnings)
         }
         EndpointType::File(_) => Ok(warnings),
+        #[cfg(feature = "websocket")]
+        EndpointType::WebSocket(_) => Ok(warnings),
         EndpointType::Static(_) => Ok(warnings),
         EndpointType::Memory(cfg) => {
             if cfg.subscribe_mode {

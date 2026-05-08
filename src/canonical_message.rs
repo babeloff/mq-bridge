@@ -40,8 +40,12 @@ pub(crate) fn u128_from_json(val: &serde_json::Value) -> Result<u128, String> {
     if let Some(s) = val.as_str() {
         if let Ok(uuid) = Uuid::parse_str(s) {
             return Ok(uuid.as_u128());
-        } else if let Ok(n) = u128::from_str_radix(s.trim_start_matches("0x"), 16) {
-            return Ok(n);
+        } else if s.starts_with("0x") || s.starts_with("0X") {
+            if let Ok(n) =
+                u128::from_str_radix(s.trim_start_matches("0x").trim_start_matches("0X"), 16)
+            {
+                return Ok(n);
+            }
         } else if let Ok(n) = s.parse::<u128>() {
             return Ok(n);
         }

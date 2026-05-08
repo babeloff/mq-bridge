@@ -153,7 +153,7 @@ impl DeduplicationConsumer {
                     };
                     if let Ok(ts_bytes) = val[ts_offset..ts_offset + 8].try_into() {
                         if u64::from_be_bytes(ts_bytes) < cutoff {
-                            let _ = db.remove(&key);
+                            let _ = db.compare_and_swap(&key, Some(val), None::<&[u8]>);
                         }
                     }
                 }
@@ -219,23 +219,31 @@ impl MessageConsumer for DeduplicationConsumer {
             // Wrap commit to update DB to "processed" state
             let commit = Box::new(move |disposition: MessageDisposition| {
                 Box::pin(async move {
+                    let is_ack = matches!(
+                        disposition,
+                        MessageDisposition::Ack | MessageDisposition::Reply(_)
+                    );
                     original_commit(disposition).await?;
 
-                    let now_bytes = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs()
-                        .to_be_bytes();
-                    let mut processed_val = [0u8; 9];
-                    processed_val[0] = 1; // STATE_PROCESSED
-                    processed_val[1..9].copy_from_slice(&now_bytes);
+                    if is_ack {
+                        let now_bytes = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs()
+                            .to_be_bytes();
+                        let mut processed_val = [0u8; 9];
+                        processed_val[0] = 1; // STATE_PROCESSED
+                        processed_val[1..9].copy_from_slice(&now_bytes);
 
-                    // Update the pending marker to the final processed value
-                    if let Err(e) = db.insert(message_id.to_be_bytes(), &processed_val[..]) {
-                        error!(
-                            "Failed to update message {:032x} as processed in deduplication DB: {}",
-                            message_id, e
-                        );
+                        // Update the pending marker to the final processed value
+                        if let Err(e) = db.insert(message_id.to_be_bytes(), &processed_val[..]) {
+                            error!(
+                                "Failed to update message {:032x} as processed in deduplication DB: {}",
+                                message_id, e
+                            );
+                        } else {
+                            trace!("Updated message as processed in deduplication DB");
+                        }
                     } else {
                         trace!("Updated message as processed in deduplication DB");
                     }
@@ -293,7 +301,11 @@ impl MessageConsumer for DeduplicationConsumer {
 
                 Box::pin(async move {
                     let mut full_dispositions = vec![MessageDisposition::Ack; total_len];
+                    let mut acks = Vec::new();
                     for (i, disp) in dispositions.into_iter().enumerate() {
+                        if matches!(disp, MessageDisposition::Ack | MessageDisposition::Reply(_)) {
+                            acks.push(kept_ids[i]);
+                        }
                         full_dispositions[kept_indices[i]] = disp;
                     }
 
@@ -308,7 +320,7 @@ impl MessageConsumer for DeduplicationConsumer {
                     processed_val[0] = 1; // STATE_PROCESSED
                     processed_val[1..9].copy_from_slice(&now_bytes);
 
-                    for id in kept_ids {
+                    for id in acks {
                         let _ = db.insert(id.to_be_bytes(), &processed_val[..]);
                     }
                     Ok(())

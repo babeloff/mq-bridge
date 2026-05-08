@@ -1436,7 +1436,7 @@ impl MessagePublisher for HttpPublisher {
         )
         .await
         {
-            Ok(Ok(collected)) => collected.to_bytes().to_vec(),
+            Ok(Ok(collected)) => collected.to_bytes(),
             Ok(Err(e)) => {
                 return Err(PublisherError::Retryable(anyhow::anyhow!(
                     "Failed to read HTTP response body: {}",
@@ -1451,14 +1451,10 @@ impl MessagePublisher for HttpPublisher {
         };
 
         // Decompress response if needed
-        let response_bytes =
-            decompress_if_needed(Bytes::from(response_bytes_raw), content_encoding.as_deref())
-                .map_err(|e| {
-                    PublisherError::Retryable(anyhow::anyhow!(
-                        "Failed to decompress response: {}",
-                        e
-                    ))
-                })?;
+        let response_bytes = decompress_if_needed(response_bytes_raw, content_encoding.as_deref())
+            .map_err(|e| {
+                PublisherError::Retryable(anyhow::anyhow!("Failed to decompress response: {}", e))
+            })?;
 
         if !response_status.is_success() {
             debug!(

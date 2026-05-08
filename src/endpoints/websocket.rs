@@ -188,10 +188,23 @@ async fn handle_connection(
         };
 
         for (name, value) in request.headers() {
+            let name_str = name.as_str();
+            if matches!(
+                name_str,
+                "authorization"
+                    | "cookie"
+                    | "set-cookie"
+                    | "proxy-authorization"
+                    | "x-api-key"
+                    | "session"
+            ) {
+                continue;
+            }
+
             if let Ok(value) = value.to_str() {
                 metadata
                     .headers
-                    .insert(format!("ws_header.{}", name.as_str()), value.to_string());
+                    .insert(format!("ws_header.{}", name_str), value.to_string());
             }
         }
 
@@ -259,8 +272,8 @@ fn normalize_websocket_path(path: &str) -> String {
 fn parse_message_id(raw: &str) -> Option<u128> {
     if let Ok(uuid) = Uuid::parse_str(raw) {
         Some(uuid.as_u128())
-    } else if let Ok(number) = u128::from_str_radix(raw.trim_start_matches("0x"), 16) {
-        Some(number)
+    } else if raw.starts_with("0x") || raw.starts_with("0X") {
+        u128::from_str_radix(raw.trim_start_matches("0x").trim_start_matches("0X"), 16).ok()
     } else {
         raw.parse::<u128>().ok()
     }
