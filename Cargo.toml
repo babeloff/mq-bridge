@@ -1,6 +1,6 @@
 [package]
 name = "mq-bridge"
-version = "0.2.13"
+version = "0.2.14"
 edition = "2021"
 authors = ["Marco Mengelkoch"]
 rust-version = "1.75"  # 2021 edition was released in 1.56
@@ -25,7 +25,7 @@ async-trait = "0.1"
 serde_json = "1.0"
 thiserror = "2.0"
 futures = "0.3"
-tracing = { version = "0.1", features = ["log"] }
+tracing = { version = "0.1" }
 bytes = { version = "1", features = ["serde"] }
 async-channel = { version = "2.5" }
 once_cell = { version = "1.21" }

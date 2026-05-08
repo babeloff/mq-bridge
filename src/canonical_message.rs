@@ -105,11 +105,12 @@ impl CanonicalMessage {
         let mut message_id = None;
         for key in ["message_id", "id", "_id"] {
             if let Some(v) = payload.get(key) {
-                // Use from_value with a helper struct to leverage deserialize_u128 
+                // Use from_value with a helper struct to leverage deserialize_u128
                 // and produce a proper serde_json::Error on failure.
                 let mut map = serde_json::Map::new();
                 map.insert("id".to_string(), v.clone());
-                let extractor: IdExtractor = serde_json::from_value(serde_json::Value::Object(map))?;
+                let extractor: IdExtractor =
+                    serde_json::from_value(serde_json::Value::Object(map))?;
                 message_id = Some(extractor.id);
                 break;
             }

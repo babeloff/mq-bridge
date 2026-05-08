@@ -37,7 +37,9 @@ pub mod zeromq;
 pub mod file;
 pub mod logic_test;
 pub mod memory;
-// request_reply_test.rs merged into route.rs
+// performance_static was just for internal optimiztion - not a real test
+// pub mod performance_static;
+
 #[cfg(feature = "grpc")]
 pub mod grpc_tls;
 pub mod route;
