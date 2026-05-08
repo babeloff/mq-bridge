@@ -4,7 +4,7 @@
 //  git clone https://github.com/marcomq/mq-bridge
 
 use bytes::Bytes;
-use serde::de::{DeserializeOwned, Error};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use uuid::Uuid;
@@ -13,18 +13,56 @@ use crate::type_handler::KIND_KEY;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct CanonicalMessage {
-    #[serde(serialize_with = "print_uuidv7")]
+    #[serde(serialize_with = "print_uuidv7", deserialize_with = "deserialize_u128")]
     pub message_id: u128,
     pub payload: Bytes,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub metadata: HashMap<String, String>,
 }
 
-fn print_uuidv7<S>(value: &u128, serializer: S) -> Result<S::Ok, S::Error>
+pub fn print_uuidv7<S>(value: &u128, serializer: S) -> Result<S::Ok, S::Error>
 where
     S: serde::Serializer,
 {
-    serializer.serialize_str(&fast_uuid_v7::format_uuid(*value).to_string())
+    serializer.serialize_str(fast_uuid_v7::format_uuid(*value).as_ref())
+}
+
+/// Custom deserializer for u128 that handles UUID strings, hex, and numeric formats.
+pub fn deserialize_u128<'de, D>(deserializer: D) -> Result<u128, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let val = serde_json::Value::deserialize(deserializer)?;
+    u128_from_json(&val).map_err(serde::de::Error::custom)
+}
+
+pub(crate) fn u128_from_json(val: &serde_json::Value) -> Result<u128, String> {
+    if let Some(s) = val.as_str() {
+        if let Ok(uuid) = Uuid::parse_str(s) {
+            return Ok(uuid.as_u128());
+        } else if let Ok(n) = u128::from_str_radix(s.trim_start_matches("0x"), 16) {
+            return Ok(n);
+        } else if let Ok(n) = s.parse::<u128>() {
+            return Ok(n);
+        }
+    } else if let Some(n) = val.as_u64() {
+        return Ok(n as u128);
+    } else if let Some(n) = val.as_i64() {
+        if n < 0 {
+            return Err("message_id cannot be negative".to_string());
+        }
+        return Ok(n as u128);
+    } else if val.is_number() {
+        // Fallback for large numeric literals that don't fit in u64/i64
+        if let Ok(n) = serde_json::from_value::<u128>(val.clone()) {
+            return Ok(n);
+        }
+    } else if let Some(oid) = val.get("$oid").and_then(|v| v.as_str()) {
+        if let Ok(n) = u128::from_str_radix(oid, 16) {
+            return Ok(n);
+        }
+    }
+    Err("Invalid u128 format".to_string())
 }
 
 impl CanonicalMessage {
@@ -58,33 +96,25 @@ impl CanonicalMessage {
     }
 
     pub fn from_json(payload: serde_json::Value) -> Result<Self, serde_json::Error> {
+        #[derive(Deserialize)]
+        struct IdExtractor {
+            #[serde(deserialize_with = "deserialize_u128")]
+            id: u128,
+        }
+
         let mut message_id = None;
-        if let Some(val) = payload
-            .get("message_id")
-            .or(payload.get("id"))
-            .or(payload.get("_id"))
-        {
-            if let Some(s) = val.as_str() {
-                if let Ok(uuid) = Uuid::parse_str(s) {
-                    message_id = Some(uuid.as_u128());
-                } else if let Ok(n) = u128::from_str_radix(s.trim_start_matches("0x"), 16) {
-                    message_id = Some(n);
-                } else if let Ok(n) = s.parse::<u128>() {
-                    message_id = Some(n);
-                }
-            } else if let Some(n) = val.as_i64() {
-                if n < 0 {
-                    return Err(Error::custom("message_id cannot be negative"));
-                }
-                message_id = Some(n as u128);
-            } else if let Some(n) = val.as_u64() {
-                message_id = Some(n as u128);
-            } else if let Some(oid) = val.get("$oid").and_then(|v| v.as_str()) {
-                if let Ok(n) = u128::from_str_radix(oid, 16) {
-                    message_id = Some(n);
-                }
+        for key in ["message_id", "id", "_id"] {
+            if let Some(v) = payload.get(key) {
+                // Use from_value with a helper struct to leverage deserialize_u128 
+                // and produce a proper serde_json::Error on failure.
+                let mut map = serde_json::Map::new();
+                map.insert("id".to_string(), v.clone());
+                let extractor: IdExtractor = serde_json::from_value(serde_json::Value::Object(map))?;
+                message_id = Some(extractor.id);
+                break;
             }
         }
+
         let bytes = serde_json::to_vec(&payload)?;
         Ok(Self::new(bytes, message_id))
     }

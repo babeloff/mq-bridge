@@ -156,6 +156,7 @@ fn spawn_accept_loop(
     });
 }
 
+#[allow(clippy::result_large_err)] // TODO: find a good fix for the box issue
 async fn handle_connection(
     stream: tokio::net::TcpStream,
     peer_addr: SocketAddr,

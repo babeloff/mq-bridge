@@ -2,7 +2,7 @@
 //  © Copyright 2025, by Marco Mengelkoch
 //  Licensed under MIT License, see License file for more details
 //  git clone https://github.com/marcomq/mq-bridge
-use crate::canonical_message::tracing_support::LazyMessageIds;
+use crate::canonical_message::{deserialize_u128, tracing_support::LazyMessageIds};
 use crate::event_store::{EventStore, EventStoreConsumer, RetentionPolicy};
 use crate::models::{FileConfig, FileConsumerMode, FileFormat};
 use crate::traits::{
@@ -175,6 +175,7 @@ impl MessagePublisher for FilePublisher {
                     {
                         #[derive(serde::Serialize)]
                         struct JsonWrapper<'a> {
+                            #[serde(serialize_with = "crate::canonical_message::print_uuidv7")]
                             message_id: u128,
                             payload: serde_json::Value,
                             metadata: &'a HashMap<String, String>,
@@ -192,6 +193,7 @@ impl MessagePublisher for FilePublisher {
                     if let Ok(text) = std::str::from_utf8(&msg.payload) {
                         #[derive(serde::Serialize)]
                         struct TextWrapper<'a> {
+                            #[serde(serialize_with = "crate::canonical_message::print_uuidv7")]
                             message_id: u128,
                             payload: &'a str,
                             metadata: &'a HashMap<String, String>,
@@ -1041,6 +1043,7 @@ fn parse_message(buffer: &[u8], format: &FileFormat) -> CanonicalMessage {
         FileFormat::Normal | FileFormat::Json | FileFormat::Text => {
             #[derive(serde::Deserialize)]
             struct AnyPayloadMessage {
+                #[serde(deserialize_with = "deserialize_u128")]
                 message_id: u128,
                 payload: serde_json::Value,
                 #[serde(default)]
@@ -1113,6 +1116,8 @@ mod tests {
 
         let msg1 = msg!(json!({"hello": "world"}));
         let msg2 = msg!(json!({"foo": "bar"}));
+        dbg!(&msg1);
+        dbg!(&msg2);
 
         sink.send_batch(vec![msg1.clone(), msg2.clone()])
             .await
