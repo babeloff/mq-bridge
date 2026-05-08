@@ -1116,8 +1116,6 @@ mod tests {
 
         let msg1 = msg!(json!({"hello": "world"}));
         let msg2 = msg!(json!({"foo": "bar"}));
-        dbg!(&msg1);
-        dbg!(&msg2);
 
         sink.send_batch(vec![msg1.clone(), msg2.clone()])
             .await
