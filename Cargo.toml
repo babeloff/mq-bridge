@@ -80,6 +80,7 @@ http-body = { version = "1.0", optional = true }
 h2 = { version = "0.4", optional = true }
 flate2 = { version = "1.0", optional = true }
 base64 = { version = "0.22", optional = true }
+tokio-tungstenite = { version = "0.28", optional = true }
 
 # AWS
 aws-config = { version = "1.8", optional = true, default-features = false, features = ["behavior-version-latest", "rt-tokio", "rustls"] }
@@ -114,7 +115,7 @@ protoc-bin-vendored = { version = "3.0", optional = true }
 [features]
 default = []
 middleware = ["metrics", "dedup"]
-full = ["middleware", "mongodb", "kafka", "amqp", "nats", "mqtt", "http", "aws", "zeromq", "sled", "grpc", "sqlx", "rustls-aws-lc"]
+full = ["middleware", "mongodb", "kafka", "amqp", "nats", "mqtt", "http", "aws", "zeromq", "sled", "grpc", "sqlx", "websocket", "rustls-aws-lc"]
 
 # Functionality features
 dedup = ["sled"]
@@ -138,6 +139,7 @@ nats = ["async-nats", "rustls", "rustls-pemfile"]
 mongodb = ["dep:mongodb"]
 mqtt = ["rumqttc", "rustls", "tokio-rustls", "rustls-pemfile", "url"]
 http = ["hyper", "hyper-util", "hyper-rustls", "http-body-util", "dep:http-body", "rustls", "tokio-rustls", "rustls-pemfile", "webpki-roots", "h2", "dep:flate2", "dep:base64"]
+websocket = ["dep:tokio-tungstenite"]
 aws = ["aws-config", "aws-sdk-sqs", "aws-sdk-sns"]
 ibm-mq = ["mqi"]
 zeromq = ["dep:zeromq"]

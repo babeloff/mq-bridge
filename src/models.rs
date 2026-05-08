@@ -202,6 +202,7 @@ fn is_known_endpoint_name(name: &str) -> bool {
             | "mongodb"
             | "mqtt"
             | "http"
+            | "websocket"
             | "ibmmq"
             | "zeromq"
             | "grpc"
@@ -461,6 +462,7 @@ pub enum EndpointType {
     MongoDb(MongoDbConfig),
     Mqtt(MqttConfig),
     Http(HttpConfig),
+    WebSocket(WebSocketConfig),
     IbmMq(IbmMqConfig),
     ZeroMq(ZeroMqConfig),
     Grpc(GrpcConfig),
@@ -492,6 +494,7 @@ impl EndpointType {
             EndpointType::MongoDb(_) => "mongodb",
             EndpointType::Mqtt(_) => "mqtt",
             EndpointType::Http(_) => "http",
+            EndpointType::WebSocket(_) => "websocket",
             EndpointType::IbmMq(_) => "ibmmq",
             EndpointType::ZeroMq(_) => "zeromq",
             EndpointType::Grpc(_) => "grpc",
@@ -1545,6 +1548,21 @@ pub struct HttpConfig {
     pub custom_headers: HashMap<String, String>,
 }
 
+/// WebSocket connection configuration.
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct WebSocketConfig {
+    /// For consumers, the listen address (e.g. "0.0.0.0:9000"). For publishers, the target URL.
+    pub url: String,
+    /// (Consumer only) Optional request path filter. If set, only upgrade requests whose URI path matches exactly are delivered to this consumer.
+    pub path: Option<String>,
+    /// (Consumer only) Header key to extract the message ID from the WebSocket handshake. Defaults to "message-id".
+    pub message_id_header: Option<String>,
+    /// (Consumer only) Internal buffer size for the channel. Defaults to 100.
+    pub internal_buffer_size: Option<usize>,
+}
+
 fn deserialize_basic_auth<'de, D>(deserializer: D) -> Result<Option<(String, String)>, D::Error>
 where
     D: Deserializer<'de>,
@@ -1600,6 +1618,21 @@ impl HttpConfig {
     pub fn with_method(mut self, method: impl Into<String>) -> Self {
         self.method = Some(method.into());
         self
+    }
+
+    pub fn with_path(mut self, path: impl Into<String>) -> Self {
+        self.path = Some(path.into());
+        self
+    }
+}
+
+impl WebSocketConfig {
+    /// Creates a new WebSocket configuration with the specified URL.
+    pub fn new(url: impl Into<String>) -> Self {
+        Self {
+            url: url.into(),
+            ..Default::default()
+        }
     }
 
     pub fn with_path(mut self, path: impl Into<String>) -> Self {
@@ -1992,6 +2025,9 @@ impl SecretExtractor for EndpointType {
             EndpointType::Http(cfg) => {
                 cfg.extract_secrets(&format!("{}__{}", prefix, "HTTP"), secrets)
             }
+            EndpointType::WebSocket(cfg) => {
+                cfg.extract_secrets(&format!("{}__{}", prefix, "WEBSOCKET"), secrets)
+            }
             EndpointType::IbmMq(cfg) => {
                 cfg.extract_secrets(&format!("{}__{}", prefix, "IBMMQ"), secrets)
             }
@@ -2146,6 +2182,12 @@ impl SecretExtractor for HttpConfig {
         );
         self.tls
             .extract_secrets(&format!("{}__{}", prefix, "TLS"), secrets);
+    }
+}
+
+impl SecretExtractor for WebSocketConfig {
+    fn extract_secrets(&mut self, prefix: &str, secrets: &mut HashMap<String, String>) {
+        extract_sensitive_url(&mut self.url, prefix, "URL", secrets);
     }
 }
 

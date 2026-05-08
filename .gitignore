@@ -35,3 +35,7 @@ tests/**/*.pkcs12
 # Added by cargo
 
 /target
+
+# Serena + tokensave
+.serena
+.tokensave

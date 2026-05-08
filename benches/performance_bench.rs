@@ -632,6 +632,48 @@ pub mod http_helper {
     }
 }
 
+#[cfg(feature = "websocket")]
+pub mod websocket_helper {
+    use mq_bridge::endpoints::websocket::{WebSocketConsumer, WebSocketPublisher};
+    use mq_bridge::models::WebSocketConfig;
+    use mq_bridge::traits::{MessageConsumer, MessagePublisher};
+    use once_cell::sync::Lazy;
+    use std::sync::Arc;
+    use std::sync::Mutex as StdMutex;
+    use tokio::sync::Mutex;
+
+    static CURRENT_URL: Lazy<StdMutex<String>> = Lazy::new(|| StdMutex::new(String::new()));
+
+    pub async fn create_consumer() -> Arc<Mutex<dyn MessageConsumer>> {
+        let websocket_config = WebSocketConfig {
+            url: "127.0.0.1:0".to_string(),
+            path: Some("/bench".to_string()),
+            internal_buffer_size: Some(super::PERF_TEST_MESSAGE_COUNT * 2),
+            ..Default::default()
+        };
+
+        let websocket_consumer = WebSocketConsumer::new(&websocket_config)
+            .await
+            .expect("Failed to create WebSocketConsumer");
+        let url = websocket_consumer.url().to_string();
+
+        {
+            let mut lock = CURRENT_URL.lock().unwrap();
+            *lock = url;
+        }
+
+        Arc::new(Mutex::new(websocket_consumer))
+    }
+
+    pub async fn create_publisher() -> Arc<dyn MessagePublisher> {
+        let url = {
+            let lock = CURRENT_URL.lock().unwrap();
+            lock.clone()
+        };
+        Arc::new(WebSocketPublisher::new(&WebSocketConfig::new(url)))
+    }
+}
+
 #[cfg(feature = "grpc")]
 pub mod grpc_helper {
     use mq_bridge::endpoints::grpc::{GrpcConsumer, GrpcPublisher};
@@ -1041,6 +1083,17 @@ fn performance_benchmarks(c: &mut Criterion) {
         "http",
         "http",
         http_helper,
+        group,
+        &rt,
+        &BENCH_RESULTS,
+        PERF_TEST_MESSAGE_COUNT,
+        PERF_TEST_CONCURRENCY,
+        std::time::Duration::from_millis(20)
+    );
+    bench_backend!(
+        "websocket",
+        "websocket",
+        websocket_helper,
         group,
         &rt,
         &BENCH_RESULTS,
