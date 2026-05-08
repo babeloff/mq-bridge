@@ -13,10 +13,18 @@ use crate::type_handler::KIND_KEY;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct CanonicalMessage {
+    #[serde(serialize_with = "print_uuidv7")]
     pub message_id: u128,
     pub payload: Bytes,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub metadata: HashMap<String, String>,
+}
+
+fn print_uuidv7<S>(value: &u128, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serializer.serialize_str(&fast_uuid_v7::format_uuid(*value).to_string())
 }
 
 impl CanonicalMessage {
