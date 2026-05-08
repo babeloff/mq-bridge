@@ -320,7 +320,7 @@ pub mod zeromq_helper {
     use mq_bridge::models::{ZeroMqConfig, ZeroMqSocketType};
     use mq_bridge::traits::{MessageConsumer, MessagePublisher};
     use once_cell::sync::Lazy;
-    use rand::Rng;
+    use rand::RngExt;
     use std::sync::atomic::{AtomicU16, Ordering};
     use std::sync::Arc;
     use tokio::sync::Mutex;
