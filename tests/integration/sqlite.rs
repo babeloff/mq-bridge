@@ -19,7 +19,10 @@ fn db_file_path(id: &str) -> std::path::PathBuf {
 }
 
 fn db_url(id: &str) -> String {
-    format!("sqlite://{}?mode=rwc", db_file_path(id).display())
+    format!(
+        "sqlite://{}?mode=rwc&busy_timeout=5000",
+        db_file_path(id).display()
+    )
 }
 
 async fn setup_db(id: &str) {
@@ -70,8 +73,13 @@ routes:
         concurrency: 4
         batch_size: 128
         input:
-            memory: { topic: "sqlx-sqlite-in" }
+            memory: { topic: "sqlx-sqlite-in", enable_nack: true }
         output:
+            middlewares:
+                - retry:
+                    max_attempts: 10
+                    initial_interval_ms: 100
+                    max_interval_ms: 1000
             sqlx:
                 url: "{db_url}"
                 table: "messages"
@@ -80,6 +88,11 @@ routes:
         concurrency: 4
         batch_size: 128
         input:
+            middlewares:
+                - retry:
+                    max_attempts: 10
+                    initial_interval_ms: 100
+                    max_interval_ms: 1000
             sqlx:
                 url: "{db_url}"
                 table: "messages"
