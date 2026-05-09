@@ -860,6 +860,11 @@ impl FileConsumer {
             }),
         })
     }
+
+    /// Returns true if the consumer is ready to receive messages.
+    pub fn is_ready(&self) -> bool {
+        true
+    }
 }
 
 #[async_trait]
