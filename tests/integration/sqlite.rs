@@ -19,10 +19,7 @@ fn db_file_path(id: &str) -> std::path::PathBuf {
 }
 
 fn db_url(id: &str) -> String {
-    format!(
-        "sqlite://{}?mode=rwc&busy_timeout=5000",
-        db_file_path(id).display()
-    )
+    format!("sqlite://{}?mode=rwc", db_file_path(id).display())
 }
 
 async fn setup_db(id: &str) {
@@ -46,11 +43,10 @@ async fn setup_db(id: &str) {
     let url = db_url(id);
     match <sqlx::SqliteConnection as sqlx::Connection>::connect(&url).await {
         Ok(mut conn) => {
-            if let Err(error) = sqlx::query("PRAGMA journal_mode=WAL;")
-                .execute(&mut conn)
-                .await
-            {
-                tracing::warn!(url = %url, error = %error, "failed to set sqlite journal_mode=WAL");
+            for pragma in ["PRAGMA journal_mode=WAL;", "PRAGMA busy_timeout=5000;"] {
+                if let Err(error) = sqlx::query(pragma).execute(&mut conn).await {
+                    tracing::warn!(url = %url, error = %error, pragma, "failed to set sqlite pragma");
+                }
             }
         }
         Err(error) => {
