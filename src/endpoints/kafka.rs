@@ -571,6 +571,15 @@ fn process_message<M: Message>(
                                 break;
                             }
                         }
+                        // Try to parse as legacy 32-char hex string
+                        else if id_str.len() == 32
+                            && id_str.chars().all(|c| c.is_ascii_hexdigit())
+                        {
+                            if let Ok(n) = u128::from_str_radix(&id_str, 16) {
+                                message_id = Some(n);
+                                break;
+                            }
+                        }
                         // Try to parse as decimal string
                         else if let Ok(n) = id_str.parse::<u128>() {
                             message_id = Some(n);

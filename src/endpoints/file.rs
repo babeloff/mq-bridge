@@ -16,7 +16,7 @@ use std::any::Any;
 use std::collections::HashMap;
 use std::io::Seek;
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, Weak};
 use tokio::fs::{self, File, OpenOptions};
 use tokio::io::{self, AsyncBufReadExt, AsyncSeekExt, BufReader};
@@ -480,6 +480,7 @@ struct FileTailConsumer {
     msg_rx: async_channel::Receiver<Vec<CanonicalMessage>>,
     buffer: Vec<CanonicalMessage>,
     offset_file: Option<Arc<Mutex<tokio::fs::File>>>,
+    ready: Arc<AtomicBool>,
 }
 
 fn read_until_bytes_sync<R: std::io::BufRead>(
@@ -511,11 +512,13 @@ fn run_file_tail_task_sync(
     group_id: Option<String>,
     delimiter: Vec<u8>,
     format: FileFormat,
+    ready: Arc<AtomicBool>,
 ) {
     let mut last_position: u64 = initial_offset;
     let mut reader: Option<std::io::BufReader<std::fs::File>> = None;
     let mut current_sleep = std::time::Duration::from_millis(1);
     const MAX_SLEEP: std::time::Duration = std::time::Duration::from_millis(50);
+    let mut initialized = false;
     const BATCH_SIZE: usize = 1024;
     let mut buf = Vec::with_capacity(1024);
 
@@ -548,6 +551,10 @@ fn run_file_tail_task_sync(
             }
 
             reader = Some(std::io::BufReader::with_capacity(128 * BATCH_SIZE, file));
+            if !initialized {
+                ready.store(true, Ordering::SeqCst);
+                initialized = true;
+            }
         }
 
         let mut batch = Vec::with_capacity(BATCH_SIZE);
@@ -607,8 +614,10 @@ struct FileQueueConsumer {
     file_lock: Arc<Mutex<()>>,
     buffer: Arc<Mutex<Vec<CanonicalMessage>>>,
     delimiter: Vec<u8>,
+    ready: Arc<AtomicBool>,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_file_queue_task(
     path: String,
     msg_tx: async_channel::Sender<Vec<CanonicalMessage>>,
@@ -617,9 +626,11 @@ fn run_file_queue_task(
     runtime_handle: tokio::runtime::Handle,
     delimiter: Vec<u8>,
     format: FileFormat,
+    ready: Arc<AtomicBool>,
 ) {
     let mut current_sleep = std::time::Duration::from_millis(1);
     const MAX_SLEEP: std::time::Duration = std::time::Duration::from_millis(100);
+    let mut initialized = false;
     let mut buf = Vec::new();
 
     loop {
@@ -677,6 +688,11 @@ fn run_file_queue_task(
                         Err(_) => break,
                     }
                 }
+
+                if !initialized {
+                    ready.store(true, Ordering::SeqCst);
+                    initialized = true;
+                }
             }
         }
 
@@ -733,6 +749,8 @@ impl FileConsumer {
                 let (msg_tx, msg_rx) = async_channel::bounded(100);
                 let file_lock = get_file_lock(&config.path);
                 let lines_in_memory = Arc::new(AtomicUsize::new(0));
+                let ready = Arc::new(AtomicBool::new(false));
+                let ready_clone = ready.clone();
                 let lines_clone = lines_in_memory.clone();
                 let lock_clone = file_lock.clone();
                 let runtime = tokio::runtime::Handle::current();
@@ -749,6 +767,7 @@ impl FileConsumer {
                         runtime,
                         delimiter_clone,
                         format_clone,
+                        ready_clone,
                     );
                 });
 
@@ -761,6 +780,7 @@ impl FileConsumer {
                         file_lock,
                         buffer: Arc::new(Mutex::new(Vec::new())),
                         delimiter,
+                        ready,
                     }),
                 })
             }
@@ -809,6 +829,8 @@ impl FileConsumer {
     ) -> anyhow::Result<Self> {
         let (msg_tx, msg_rx) = async_channel::bounded(100);
         let mut initial_offset = 0;
+        let ready = Arc::new(AtomicBool::new(false));
+        let ready_clone = ready.clone();
         let mut offset_file = None;
 
         if let Some(gid) = &group_id {
@@ -847,6 +869,7 @@ impl FileConsumer {
                 group_id,
                 delimiter,
                 format_clone,
+                ready_clone,
             );
         });
 
@@ -857,13 +880,18 @@ impl FileConsumer {
                 msg_rx,
                 buffer: Vec::new(),
                 offset_file,
+                ready,
             }),
         })
     }
 
     /// Returns true if the consumer is ready to receive messages.
     pub fn is_ready(&self) -> bool {
-        true
+        match &self.backend {
+            ConsumerBackend::EventStore(_) => true,
+            ConsumerBackend::Tail(c) => c.ready.load(Ordering::SeqCst),
+            ConsumerBackend::Queue(c) => c.ready.load(Ordering::SeqCst),
+        }
     }
 }
 
