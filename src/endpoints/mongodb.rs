@@ -664,6 +664,7 @@ pub struct MongoDbConsumer {
     change_stream: Option<tokio::sync::Mutex<ChangeStream<ChangeStreamEvent<Document>>>>,
     polling_interval: Duration,
     collection_name: String,
+    receive_query: Option<Document>,
 }
 
 impl MongoDbConsumer {
@@ -707,12 +708,21 @@ impl MongoDbConsumer {
 
         info!(database = %config.database, collection = %collection_name, mode = %mode, "MongoDB consumer connected");
 
+        let receive_query = if let Some(q) = &config.receive_query {
+            let doc: Document = serde_json::from_str(q)
+                .context("Failed to parse 'receive_query' from configuration as a JSON document")?;
+            Some(doc)
+        } else {
+            None
+        };
+
         Ok(Self {
             collection,
             db,
             change_stream,
             polling_interval: Duration::from_millis(config.polling_interval_ms.unwrap_or(100)),
             collection_name: collection_name.to_string(),
+            receive_query,
         })
     }
 }
@@ -720,9 +730,10 @@ impl MongoDbConsumer {
 #[async_trait]
 impl MessageConsumer for MongoDbConsumer {
     async fn receive(&mut self) -> Result<Received, ConsumerError> {
+        let extra_filter = self.receive_query.clone().unwrap_or_default();
         loop {
             // Always try to poll for a single document first using the efficient atomic operation.
-            if let Some(claimed) = self.try_claim_document(doc! {}).await? {
+            if let Some(claimed) = self.try_claim_document(extra_filter.clone()).await? {
                 return Ok(claimed);
             }
 
@@ -748,6 +759,7 @@ impl MessageConsumer for MongoDbConsumer {
     }
 
     async fn receive_batch(&mut self, max_messages: usize) -> Result<ReceivedBatch, ConsumerError> {
+        let extra_filter = self.receive_query.clone().unwrap_or_default();
         loop {
             // Always try to poll for a batch first.
             let now = SystemTime::now()
@@ -758,7 +770,7 @@ impl MessageConsumer for MongoDbConsumer {
             let locked_until = now + lock_duration_secs;
 
             let claimed_docs = self
-                .find_and_claim_documents(doc! {}, max_messages, now, locked_until)
+                .find_and_claim_documents(extra_filter.clone(), max_messages, now, locked_until)
                 .await?;
 
             if !claimed_docs.is_empty() {
@@ -800,7 +812,11 @@ impl MessageConsumer for MongoDbConsumer {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs() as i64;
-            let filter = Self::available_message_filter(now);
+            let filter = if let Some(extra) = &self.receive_query {
+                doc! { "$and": [Self::available_message_filter(now), extra.clone()] }
+            } else {
+                Self::available_message_filter(now)
+            };
             match self.collection.count_documents(filter).await {
                 Ok(c) => Some(c as usize),
                 Err(e) => {
@@ -855,8 +871,11 @@ impl MongoDbConsumer {
             return Ok(Vec::new());
         }
 
-        let mut base_filter = Self::available_message_filter(now);
-        base_filter.extend(extra_filter);
+        let base_filter = if extra_filter.is_empty() {
+            Self::available_message_filter(now)
+        } else {
+            doc! { "$and": [Self::available_message_filter(now), extra_filter] }
+        };
 
         // 1. Find a batch of available documents.
         let mut cursor = self
@@ -905,8 +924,11 @@ impl MongoDbConsumer {
         let lock_duration_secs = 60;
         let locked_until = now + lock_duration_secs;
 
-        let mut filter = Self::available_message_filter(now);
-        filter.extend(extra_filter);
+        let filter = if extra_filter.is_empty() {
+            Self::available_message_filter(now)
+        } else {
+            doc! { "$and": [Self::available_message_filter(now), extra_filter] }
+        };
 
         let update = doc! { "$set": { "locked_until": locked_until } };
 
@@ -1157,6 +1179,7 @@ pub struct MongoDbSubscriber {
     cursor_id: Option<String>,
     last_seq: Arc<AtomicI64>,
     cached_coll_stats: Mutex<Option<CachedCollStats>>,
+    receive_query: Option<Document>,
 }
 
 impl MongoDbSubscriber {
@@ -1218,6 +1241,14 @@ impl MongoDbSubscriber {
         }
         info!(collection = %collection_name, cursor_id = ?config.cursor_id, start_seq = %last_seq, "MongoDB sequenced subscriber initialized");
 
+        let receive_query = if let Some(q) = &config.receive_query {
+            let doc: Document = serde_json::from_str(q)
+                .context("Failed to parse 'receive_query' from configuration as a JSON document")?;
+            Some(doc)
+        } else {
+            None
+        };
+
         Ok(Self {
             collection,
             polling_interval: Duration::from_millis(config.polling_interval_ms.unwrap_or(100)),
@@ -1225,6 +1256,7 @@ impl MongoDbSubscriber {
             cursor_id: config.cursor_id.clone(),
             last_seq: Arc::new(AtomicI64::new(last_seq)),
             cached_coll_stats: Mutex::new(None),
+            receive_query,
         })
     }
 }
@@ -1237,10 +1269,14 @@ impl MessageConsumer for MongoDbSubscriber {
             // Crucially, we must filter out the sequencer and cursor documents which might be in the same collection.
             // Events have a 'payload' field, while sequencer/cursors do not.
             let last_seq = self.last_seq.load(Ordering::Relaxed);
-            let filter = doc! {
+            let mut filter = doc! {
                 "seq": { "$gt": last_seq },
                 "payload": { "$exists": true }
             };
+            if let Some(extra) = &self.receive_query {
+                filter = doc! { "$and": [filter, extra.clone()] };
+            }
+
             let find_options = FindOptions::builder()
                 .sort(doc! { "seq": 1 })
                 .limit(max_messages as i64)
@@ -1324,7 +1360,11 @@ impl MessageConsumer for MongoDbSubscriber {
 
         let pending = if healthy {
             let last_seq = self.last_seq.load(Ordering::Relaxed);
-            let filter = doc! { "seq": { "$gt": last_seq }, "payload": { "$exists": true } };
+            let mut filter = doc! { "seq": { "$gt": last_seq }, "payload": { "$exists": true } };
+            if let Some(extra) = &self.receive_query {
+                filter = doc! { "$and": [filter, extra.clone()] };
+            }
+
             match self.collection.count_documents(filter).await {
                 Ok(c) => Some(c as usize),
                 Err(e) => {

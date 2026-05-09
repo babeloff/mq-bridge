@@ -11,8 +11,12 @@ use aws_config::BehaviorVersion;
 use aws_sdk_sns::config::Credentials;
 use aws_sdk_sns::Client as SnsClient;
 use aws_sdk_sqs::Client as SqsClient;
+use base64::{engine::general_purpose, Engine as _};
 use std::any::Any;
+use std::collections::HashMap;
 use tracing::{error, trace};
+
+const AWS_BINARY_ENCODED_METADATA_KEY: &str = "aws_binary_encoded";
 
 pub struct AwsConsumer {
     client: SqsClient,
@@ -335,6 +339,24 @@ pub struct AwsPublisher {
     sns_client: Option<SnsClient>,
     queue_url: Option<String>,
     topic_arn: Option<String>,
+    binary_payload_mode: bool,
+}
+
+fn encode_aws_payload(
+    payload: &[u8],
+    metadata: &mut HashMap<String, String>,
+    is_base64_encoded: bool,
+) -> anyhow::Result<String> {
+    let body = if is_base64_encoded {
+        metadata.insert(
+            AWS_BINARY_ENCODED_METADATA_KEY.to_string(),
+            "true".to_string(),
+        );
+        general_purpose::STANDARD.encode(payload)
+    } else {
+        String::from_utf8(payload.to_vec()).context("AWS payload must be valid UTF-8")?
+    };
+    Ok(body)
 }
 
 impl AwsPublisher {
@@ -364,6 +386,7 @@ impl AwsPublisher {
             sns_client,
             queue_url,
             topic_arn,
+            binary_payload_mode: config.binary_payload_mode,
         })
     }
 }
@@ -378,14 +401,18 @@ impl MessagePublisher for AwsPublisher {
             payload_size = message.payload.len(),
             "Publishing AWS message"
         );
-        let body = String::from_utf8(message.payload.to_vec())
-            .context("AWS payload must be valid UTF-8")?;
 
+        let mut message_attrs = message.metadata.clone();
+        let body = encode_aws_payload(
+            &message.payload,
+            &mut message_attrs,
+            self.binary_payload_mode,
+        )?;
         let mut errors = Vec::new();
 
         if let (Some(client), Some(url)) = (&self.sqs_client, &self.queue_url) {
             let mut req = client.send_message().queue_url(url).message_body(&body);
-            for (k, v) in &message.metadata {
+            for (k, v) in &message_attrs {
                 req = req.message_attributes(
                     k,
                     aws_sdk_sqs::types::MessageAttributeValue::builder()
@@ -402,7 +429,7 @@ impl MessagePublisher for AwsPublisher {
 
         if let (Some(client), Some(arn)) = (&self.sns_client, &self.topic_arn) {
             let mut req = client.publish().topic_arn(arn).message(&body);
-            for (k, v) in &message.metadata {
+            for (k, v) in &message_attrs {
                 req = req.message_attributes(
                     k,
                     aws_sdk_sns::types::MessageAttributeValue::builder()
@@ -458,8 +485,13 @@ impl MessagePublisher for AwsPublisher {
                 let mut entries = Vec::with_capacity(chunk.len());
                 let mut valid_indices = Vec::with_capacity(chunk.len());
                 for (i, msg) in chunk.iter().enumerate() {
-                    let body = match String::from_utf8(msg.payload.to_vec()) {
-                        Ok(s) => s,
+                    let mut message_attrs = msg.metadata.clone();
+                    let body = match encode_aws_payload(
+                        &msg.payload,
+                        &mut message_attrs,
+                        self.binary_payload_mode,
+                    ) {
+                        Ok(body) => body,
                         Err(e) => {
                             failed_messages
                                 .push((msg.clone(), PublisherError::NonRetryable(anyhow!(e))));
@@ -471,7 +503,7 @@ impl MessagePublisher for AwsPublisher {
                         .id(format!("{}", i))
                         .message_body(body);
 
-                    for (k, v) in &msg.metadata {
+                    for (k, v) in &message_attrs {
                         entry = entry.message_attributes(
                             k,
                             aws_sdk_sqs::types::MessageAttributeValue::builder()

@@ -130,11 +130,15 @@ pub struct RouteOptions {
     /// A human-readable description of the route's purpose. Defaults to an empty string.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub description: String,
-    /// (Optional) Number of concurrent processing tasks for this route. Defaults to 1.
+    /// (Optional) Number of concurrent processing tasks for this route. While it improves throughput for high-latency
+    /// handlers, it adds synchronization overhead for ordered commits and may lead to out-of-order processing
+    /// in the handler. Defaults to 1.
     #[serde(default = "default_concurrency")]
     #[cfg_attr(feature = "schema", schemars(range(min = 1)))]
     pub concurrency: usize,
-    /// (Optional) Number of messages to process in a single batch. Defaults to 1.
+    /// (Optional) Maximum number of messages to process in a single batch. The consumer waits for at least one message
+    /// and then attempts to fetch more if available. Increasing this improves throughput but also increases
+    /// the potential impact of a single batch processing failure. Defaults to 1.
     #[serde(default = "default_batch_size")]
     #[cfg_attr(feature = "schema", schemars(range(min = 1)))]
     pub batch_size: usize,
@@ -210,6 +214,8 @@ fn is_known_endpoint_name(name: &str) -> bool {
             | "ref"
             | "switch"
             | "response"
+            | "reader"
+            | "null"
             | "sqlx"
     )
 }
@@ -736,6 +742,9 @@ pub struct AwsConfig {
     /// (Consumer only) Wait time for long polling in seconds (0-20).
     #[cfg_attr(feature = "schema", schemars(range(min = 0, max = 20)))]
     pub wait_time_seconds: Option<i32>,
+    /// Use binary payloads in SQS/SNS messages.
+    #[serde(default)]
+    pub binary_payload_mode: bool,
 }
 
 impl AwsConfig {
@@ -1255,6 +1264,8 @@ pub struct MongoDbConfig {
     pub format: MongoDbFormat,
     /// The ID used for the cursor in sequenced mode. If not provided, consumption starts from the current sequence (ephemeral).
     pub cursor_id: Option<String>,
+    /// (Consumer only) Optional custom MongoDB query to filter messages. Provided as a JSON string (e.g., '{"type": "notification"}').
+    pub receive_query: Option<String>,
 }
 
 impl MongoDbConfig {

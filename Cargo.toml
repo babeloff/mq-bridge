@@ -140,7 +140,7 @@ mongodb = ["dep:mongodb"]
 mqtt = ["rumqttc", "rustls", "tokio-rustls", "rustls-pemfile", "url"]
 http = ["hyper", "hyper-util", "hyper-rustls", "http-body-util", "dep:http-body", "rustls", "tokio-rustls", "rustls-pemfile", "webpki-roots", "h2", "dep:flate2", "dep:base64"]
 websocket = ["dep:tokio-tungstenite"]
-aws = ["aws-config", "aws-sdk-sqs", "aws-sdk-sns"]
+aws = ["aws-config", "aws-sdk-sqs", "aws-sdk-sns", "dep:base64"]
 ibm-mq = ["mqi"]
 zeromq = ["dep:zeromq"]
 # Note: The grpc feature requires protobuf-src which can significantly increase build times.
