@@ -17,6 +17,20 @@ use sqlx::{AnyPool, Row};
 use std::time::Duration;
 use tracing::{info, trace, warn};
 
+fn is_deadlock_error(e: &sqlx::Error) -> bool {
+    if let Some(db_err) = e.as_database_error() {
+        match db_err.code() {
+            Some(code) => {
+                let c = code.as_ref();
+                c == "1213" || c == "40001" || c == "40P01" || c == "1205"
+            }
+            None => false,
+        }
+    } else {
+        false
+    }
+}
+
 fn is_valid_table_name(name: &str) -> bool {
     if name.is_empty() || name.starts_with('.') || name.ends_with('.') || name.contains("..") {
         return false;
@@ -731,15 +745,36 @@ impl MessageConsumer for SqlxConsumer {
                             let sql =
                                 format!("DELETE FROM {} WHERE id IN ({})", table, placeholders);
 
-                            let mut query = sqlx::query(&sql);
-                            for id in ids_to_ack {
-                                query = query.bind(id);
-                            }
+                            let mut attempts = 0;
+                            loop {
+                                let mut query = sqlx::query(&sql);
+                                for id in &ids_to_ack {
+                                    query = query.bind(*id);
+                                }
 
-                            query
-                                .execute(&pool)
-                                .await
-                                .map_err(|e| anyhow!("Failed to delete acked messages: {}", e))?;
+                                match query.execute(&pool).await {
+                                    Ok(_) => break,
+                                    Err(e) => {
+                                        if is_deadlock_error(&e) && attempts < 5 {
+                                            attempts += 1;
+                                            warn!(
+                                                attempts,
+                                                error = %e,
+                                                "Deadlock detected during SQLx commit, retrying..."
+                                            );
+                                            tokio::time::sleep(Duration::from_millis(
+                                                attempts * 50,
+                                            ))
+                                            .await;
+                                            continue;
+                                        }
+                                        return Err(anyhow!(
+                                            "Failed to delete acked messages: {}",
+                                            e
+                                        ));
+                                    }
+                                }
+                            }
                         }
                         Ok(())
                     }) as BoxFuture<'static, anyhow::Result<()>>

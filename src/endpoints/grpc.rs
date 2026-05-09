@@ -847,8 +847,8 @@ fn bridge_to_canonical(msg: BridgeMessage) -> CanonicalMessage {
         None
     } else if let Ok(uuid) = Uuid::parse_str(&msg.id) {
         Some(uuid.as_u128())
-    } else if let Ok(n) = u128::from_str_radix(msg.id.trim_start_matches("0x"), 16) {
-        Some(n)
+    } else if msg.id.starts_with("0x") || msg.id.starts_with("0X") {
+        u128::from_str_radix(msg.id.trim_start_matches("0x").trim_start_matches("0X"), 16).ok()
     } else {
         msg.id.parse::<u128>().ok()
     };

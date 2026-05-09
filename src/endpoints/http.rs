@@ -1015,13 +1015,12 @@ async fn handle_request_internal(
             ));
         }
     };
-    let body_bytes_raw = body_bytes.to_vec();
 
     // Decompress if needed
-    let payload = decompress_if_needed(&body_bytes_raw, content_encoding.as_deref())
+    let payload = decompress_if_needed(body_bytes, content_encoding.as_deref())
         .map_err(|e| anyhow!("Failed to decompress request body: {}", e))?;
 
-    let mut message = CanonicalMessage::new(payload, message_id);
+    let mut message = CanonicalMessage::new_bytes(payload, message_id);
     trace!(
         message_id = format!("{:032x}", message.message_id),
         "Received HTTP request"
@@ -1162,8 +1161,8 @@ fn make_response(
             }
 
             // Compress payload if enabled and beneficial
-            let (payload, was_compressed) = compress_if_needed(
-                &msg.payload,
+            let (payload_out, was_compressed) = compress_if_needed(
+                msg.payload.clone(),
                 compression_enabled,
                 compression_threshold_bytes,
             )?;
@@ -1179,11 +1178,11 @@ fn make_response(
 
             if is_streaming {
                 let stream = futures::stream::once(async move {
-                    Ok::<_, anyhow::Error>(Frame::data(Bytes::from(payload)))
+                    Ok::<_, anyhow::Error>(Frame::data(payload_out))
                 });
                 Ok(builder.body(streamed(stream)).unwrap())
             } else {
-                Ok(builder.body(full(payload)).unwrap())
+                Ok(builder.body(full(payload_out)).unwrap())
             }
         }
         MessageDisposition::Ack => {
@@ -1372,8 +1371,8 @@ impl MessagePublisher for HttpPublisher {
         }
 
         // Compress payload if enabled and beneficial
-        let (payload, was_compressed) = compress_if_needed(
-            &message.payload,
+        let (payload_out, was_compressed) = compress_if_needed(
+            message.payload.clone(),
             self.compression_enabled,
             self.compression_threshold_bytes,
         )
@@ -1385,7 +1384,7 @@ impl MessagePublisher for HttpPublisher {
             request_builder = request_builder.header("Content-Encoding", "gzip");
         }
 
-        let body = http_body_util::Full::from(Bytes::from(payload));
+        let body = http_body_util::Full::from(payload_out);
         let request = request_builder.body(body).map_err(|e| {
             PublisherError::NonRetryable(anyhow::anyhow!("Failed to build request: {}", e))
         })?;
@@ -1437,7 +1436,7 @@ impl MessagePublisher for HttpPublisher {
         )
         .await
         {
-            Ok(Ok(collected)) => collected.to_bytes().to_vec(),
+            Ok(Ok(collected)) => collected.to_bytes(),
             Ok(Err(e)) => {
                 return Err(PublisherError::Retryable(anyhow::anyhow!(
                     "Failed to read HTTP response body: {}",
@@ -1452,7 +1451,7 @@ impl MessagePublisher for HttpPublisher {
         };
 
         // Decompress response if needed
-        let response_bytes = decompress_if_needed(&response_bytes_raw, content_encoding.as_deref())
+        let response_bytes = decompress_if_needed(response_bytes_raw, content_encoding.as_deref())
             .map_err(|e| {
                 PublisherError::Retryable(anyhow::anyhow!("Failed to decompress response: {}", e))
             })?;
@@ -1486,7 +1485,8 @@ impl MessagePublisher for HttpPublisher {
             "HTTP request succeeded"
         );
 
-        let mut response_message = CanonicalMessage::new(response_bytes, Some(message.message_id));
+        let mut response_message =
+            CanonicalMessage::new_bytes(response_bytes, Some(message.message_id));
         response_message.metadata = response_metadata;
         Ok(Sent::Response(response_message))
     }
@@ -1666,42 +1666,42 @@ fn load_private_key(path: &str) -> anyhow::Result<PrivateKeyDer<'static>> {
 /// Returns (compressed_data, was_compressed).
 #[cfg(feature = "http")]
 fn compress_if_needed(
-    data: &[u8],
+    data: Bytes,
     compression_enabled: bool,
     threshold: usize,
-) -> anyhow::Result<(Vec<u8>, bool)> {
+) -> anyhow::Result<(Bytes, bool)> {
     if !compression_enabled || data.len() < threshold {
-        return Ok((data.to_vec(), false));
+        return Ok((data, false));
     }
 
     use flate2::Compression;
     use std::io::Write;
 
     let mut encoder = flate2::write::GzEncoder::new(Vec::new(), Compression::fast());
-    encoder.write_all(data)?;
+    encoder.write_all(&data)?;
     let compressed = encoder.finish()?;
 
     // Only use compression if it actually saves space
     if compressed.len() < data.len() {
-        Ok((compressed, true))
+        Ok((Bytes::from(compressed), true))
     } else {
-        Ok((data.to_vec(), false))
+        Ok((data, false))
     }
 }
 
 /// Decompresses gzip data if the Content-Encoding header indicates it.
 #[cfg(feature = "http")]
-fn decompress_if_needed(data: &[u8], content_encoding: Option<&str>) -> anyhow::Result<Vec<u8>> {
+fn decompress_if_needed(data: Bytes, content_encoding: Option<&str>) -> anyhow::Result<Bytes> {
     if let Some(encoding) = content_encoding {
         if encoding.to_lowercase().contains("gzip") {
             use std::io::Read;
-            let mut decoder = flate2::read::GzDecoder::new(data);
+            let mut decoder = flate2::read::GzDecoder::new(&data[..]);
             let mut decompressed = Vec::new();
             decoder.read_to_end(&mut decompressed)?;
-            return Ok(decompressed);
+            return Ok(Bytes::from(decompressed));
         }
     }
-    Ok(data.to_vec())
+    Ok(data)
 }
 
 /// Encodes data as base64 for HTTP Basic Authentication.

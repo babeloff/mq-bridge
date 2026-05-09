@@ -138,6 +138,7 @@ pub async fn test_mariadb_status() {
         let config = mq_bridge::models::SqlxConfig {
             url: DATABASE_URL.to_string(),
             table: TABLE_NAME.to_string(),
+            acquire_timeout_ms: Some(1000),
             ..Default::default()
         };
 

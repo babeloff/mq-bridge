@@ -33,6 +33,8 @@ pub mod sled;
 pub mod sqlx;
 pub mod static_endpoint;
 pub mod switch;
+#[cfg(feature = "websocket")]
+pub mod websocket;
 #[cfg(feature = "zeromq")]
 pub mod zeromq;
 use crate::endpoints::memory::{get_or_create_channel, MemoryChannel};
@@ -430,6 +432,8 @@ fn check_consumer_recursive(
             Ok(warnings)
         }
         EndpointType::File(_) => Ok(warnings),
+        #[cfg(feature = "websocket")]
+        EndpointType::WebSocket(_) => Ok(warnings),
         EndpointType::Custom { .. } => Ok(warnings),
         EndpointType::Switch(_) => Err(anyhow!(
             "[route:{}] Switch endpoint is only supported as an output",
@@ -585,6 +589,8 @@ async fn create_base_consumer(
         EndpointType::Sqlx(cfg) => Ok(boxed(sqlx::SqlxConsumer::new(cfg).await?)),
         #[cfg(feature = "http")]
         EndpointType::Http(cfg) => Ok(boxed(http::HttpConsumer::new(cfg).await?)),
+        #[cfg(feature = "websocket")]
+        EndpointType::WebSocket(cfg) => Ok(boxed(websocket::WebSocketConsumer::new(cfg).await?)),
         EndpointType::Static(cfg) => Ok(boxed(static_endpoint::StaticRequestConsumer::new(cfg)?)),
         EndpointType::Memory(cfg) => Ok(boxed(memory::MemoryConsumer::new(cfg)?)),
         #[cfg(feature = "sled")]
@@ -866,6 +872,8 @@ fn check_publisher_recursive(
             Ok(warnings)
         }
         EndpointType::File(_) => Ok(warnings),
+        #[cfg(feature = "websocket")]
+        EndpointType::WebSocket(_) => Ok(warnings),
         EndpointType::Static(_) => Ok(warnings),
         EndpointType::Memory(cfg) => {
             if cfg.subscribe_mode {
@@ -1090,6 +1098,11 @@ async fn create_base_publisher(
         #[cfg(feature = "http")]
         EndpointType::Http(cfg) => {
             let sink = http::HttpPublisher::new(cfg).await?;
+            Ok(Box::new(sink) as Box<dyn MessagePublisher>)
+        }
+        #[cfg(feature = "websocket")]
+        EndpointType::WebSocket(cfg) => {
+            let sink = websocket::WebSocketPublisher::new(cfg);
             Ok(Box::new(sink) as Box<dyn MessagePublisher>)
         }
         #[cfg(feature = "mongodb")]
