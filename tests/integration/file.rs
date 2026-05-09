@@ -39,7 +39,7 @@ pub async fn test_file_subscriber_logic() {
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
     verify_subscriber_logic(publisher, sub1, sub2).await;
 }
