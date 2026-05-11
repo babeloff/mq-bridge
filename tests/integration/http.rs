@@ -138,10 +138,19 @@ pub async fn test_http_performance_pipeline() {
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
+        let duration = start.elapsed();
 
         // Stop both routes (Route::stop has a built-in 5 s timeout so this won't hang).
         mq_bridge::Route::stop(&in_route_name).await;
         mq_bridge::Route::stop(&out_route_name).await;
+
+        let messages_per_second = received as f64 / duration.as_secs_f64();
+        mq_bridge::test_utils::add_performance_result(mq_bridge::test_utils::PerformanceResult {
+            test_name: "HTTP Pipeline".to_string(),
+            write_performance: messages_per_second,
+            read_performance: messages_per_second,
+            ..Default::default()
+        });
 
         assert_eq!(
             received, PERF_TEST_MESSAGE_COUNT,
