@@ -195,6 +195,7 @@ async fn handle_reply(
 /// A publisher that inserts messages into a MongoDB collection.
 pub struct MongoDbPublisher {
     collection: Collection<Document>,
+    meta_collection: Collection<Document>,
     db: Database,
     collection_name: String,
     request_reply: bool,
@@ -235,6 +236,12 @@ impl MongoDbPublisher {
         }
 
         let collection = db.collection(collection_name);
+        let meta_collection_name = config
+            .meta_collection
+            .clone()
+            .unwrap_or_else(|| collection_name.to_string());
+        let meta_collection = db.collection(&meta_collection_name);
+
         if mongodb_uses_sequencer(config.request_reply, &config.format) {
             // Ensure unique index on seq. The sequencer doc has 'seq_counter', so it won't conflict.
             let index_options = mongodb::options::IndexOptions::builder()
@@ -301,6 +308,7 @@ impl MongoDbPublisher {
         }
         Ok(Self {
             collection,
+            meta_collection,
             db,
             collection_name: collection_name.to_string(),
             request_reply: config.request_reply,
@@ -365,7 +373,7 @@ impl MessagePublisher for MongoDbPublisher {
                     .build();
 
                 let counter_doc = self
-                    .collection
+                    .meta_collection
                     .find_one_and_update(filter, update)
                     .with_options(options)
                     .await
@@ -539,7 +547,7 @@ impl MessagePublisher for MongoDbPublisher {
                 )
                 .build();
             let counter_doc = self
-                .collection
+                .meta_collection
                 .find_one_and_update(filter, update)
                 .with_options(options)
                 .await
@@ -1174,6 +1182,7 @@ struct CachedCollStats {
 /// This replaces the old EventStore-based implementation.
 pub struct MongoDbSubscriber {
     collection: Collection<Document>,
+    meta_collection: Collection<Document>,
     polling_interval: Duration,
     db: Database,
     cursor_id: Option<String>,
@@ -1206,6 +1215,12 @@ impl MongoDbSubscriber {
         let db = client.database(&config.database);
         let collection: Collection<Document> = db.collection(collection_name);
 
+        let meta_collection_name = config
+            .meta_collection
+            .clone()
+            .unwrap_or_else(|| collection_name.to_string());
+        let meta_collection = db.collection::<Document>(&meta_collection_name);
+
         let missing_seq = collection
             .count_documents(doc! {
                 "payload": { "$exists": true },
@@ -1230,12 +1245,15 @@ impl MongoDbSubscriber {
         let mut last_seq = 0;
         if let Some(cid) = &config.cursor_id {
             let cursor_doc_id = format!("cursor:{}", cid);
-            if let Ok(Some(doc)) = collection.find_one(doc! { "_id": cursor_doc_id }).await {
+            if let Ok(Some(doc)) = meta_collection
+                .find_one(doc! { "_id": cursor_doc_id })
+                .await
+            {
                 last_seq = doc.get_i64("last_seq").unwrap_or(0);
             }
         } else {
             // Ephemeral mode: start from current sequencer value
-            if let Ok(Some(doc)) = collection.find_one(doc! { "_id": "sequencer" }).await {
+            if let Ok(Some(doc)) = meta_collection.find_one(doc! { "_id": "sequencer" }).await {
                 last_seq = doc.get_i64("seq_counter").unwrap_or(0);
             }
         }
@@ -1251,6 +1269,7 @@ impl MongoDbSubscriber {
 
         Ok(Self {
             collection,
+            meta_collection,
             polling_interval: Duration::from_millis(config.polling_interval_ms.unwrap_or(100)),
             db,
             cursor_id: config.cursor_id.clone(),
@@ -1306,7 +1325,7 @@ impl MessageConsumer for MongoDbSubscriber {
             }
 
             if !messages.is_empty() {
-                let collection = self.collection.clone();
+                let meta_collection = self.meta_collection.clone();
                 let cursor_id = self.cursor_id.clone();
 
                 let commit = Box::new(move |dispositions: Vec<MessageDisposition>| {
@@ -1327,7 +1346,7 @@ impl MessageConsumer for MongoDbSubscriber {
                             // Only persist if we have a cursor_id
                             if let Some(cid) = cursor_id {
                                 let cursor_doc_id = format!("cursor:{}", cid);
-                                if let Err(e) = collection
+                                if let Err(e) = meta_collection
                                     .update_one(
                                         doc! { "_id": cursor_doc_id },
                                         doc! { "$set": { "last_seq": highest_acked } },

@@ -37,7 +37,8 @@
           "type": [
             "string",
             "null"
-          ]
+          ],
+          "format": "password"
         },
         "prefetch_count": {
           "description": "(Consumer only) Number of messages to prefetch. Defaults to 100.",
@@ -74,15 +75,17 @@
           }
         },
         "url": {
-          "description": "AMQP connection URI. The `lapin` client connects to a single host specified in the URI.\nFor high availability, provide the address of a load balancer or use DNS resolution\nthat points to multiple brokers. Example: \"amqp://localhost:5672/vhost\".",
-          "type": "string"
+          "description": "AMQP connection URI. The `lapin` client connects to a single host specified in the URI. If it contains userinfo, it will be treated as a secret.\nFor high availability, provide the address of a load balancer or use DNS resolution\nthat points to multiple brokers. Example: \"amqp://localhost:5672/vhost\".",
+          "type": "string",
+          "format": "password"
         },
         "username": {
           "description": "Optional username for authentication.",
           "type": [
             "string",
             "null"
-          ]
+          ],
+          "format": "password"
         }
       },
       "additionalProperties": false,
@@ -98,14 +101,21 @@
           "type": [
             "string",
             "null"
-          ]
+          ],
+          "format": "password"
+        },
+        "binary_payload_mode": {
+          "description": "Use binary payloads in SQS/SNS messages.",
+          "type": "boolean",
+          "default": false
         },
         "endpoint_url": {
           "description": "Custom endpoint URL (e.g., for LocalStack).",
           "type": [
             "string",
             "null"
-          ]
+          ],
+          "format": "password"
         },
         "max_messages": {
           "description": "(Consumer only) Maximum number of messages to receive in a batch (1-10).",
@@ -118,11 +128,12 @@
           "minimum": 1
         },
         "queue_url": {
-          "description": "The SQS queue URL. Required for Consumer. Optional for Publisher if `topic_arn` is set.",
+          "description": "The SQS queue URL. Required for Consumer. Optional for Publisher if `topic_arn` is set. If it contains userinfo, it will be treated as a secret.",
           "type": [
             "string",
             "null"
-          ]
+          ],
+          "format": "password"
         },
         "region": {
           "description": "AWS Region (e.g., \"us-east-1\").",
@@ -136,14 +147,16 @@
           "type": [
             "string",
             "null"
-          ]
+          ],
+          "format": "password"
         },
         "session_token": {
           "description": "AWS Session Token.",
           "type": [
             "string",
             "null"
-          ]
+          ],
+          "format": "password"
         },
         "topic_arn": {
           "description": "(Publisher only) The SNS topic ARN.",
@@ -360,6 +373,17 @@
           },
           "required": [
             "http"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "websocket": {
+              "$ref": "#/$defs/WebSocketConfig"
+            }
+          },
+          "required": [
+            "websocket"
           ]
         },
         {
@@ -729,7 +753,8 @@
         },
         "url": {
           "description": "The gRPC server URL (e.g., \"http://localhost:50051\" for client or \"0.0.0.0:50051\" for server mode).",
-          "type": "string"
+          "type": "string",
+          "format": "password"
         }
       },
       "additionalProperties": false,
@@ -742,11 +767,11 @@
       "type": "object",
       "properties": {
         "basic_auth": {
-          "description": "HTTP Basic Authentication credentials (username, password). For consumers: validates incoming requests. For publishers: adds Authorization header.",
           "type": [
             "array",
             "null"
           ],
+          "format": "password",
           "maxItems": 2,
           "minItems": 2,
           "prefixItems": [
@@ -782,9 +807,19 @@
           "default": null,
           "minimum": 0
         },
+        "concurrency_limit": {
+          "description": "HTTP Basic Authentication credentials (username, password). For consumers: validates incoming requests. For publishers: adds Authorization header.\n(Consumer only) Maximum number of concurrent requests to handle. Defaults to 100.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0
+        },
         "custom_headers": {
           "description": "Custom headers as key-value pairs (e.g., {\"X-API-Key\": \"token123\"}). Added to outgoing HTTP headers for both consumers and publishers.",
           "type": "object",
+          "format": "password",
           "additionalProperties": {
             "type": "string"
           }
@@ -805,6 +840,20 @@
         },
         "message_id_header": {
           "description": "(Consumer only) Header key to extract the message ID from. Defaults to \"message-id\".",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "method": {
+          "description": "(Optional) HTTP method. For publishers: the method to use (defaults to POST). For consumers: restrict to this method (others return 405).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "path": {
+          "description": "(Consumer only) Optional request path filter. If set, only requests whose URI path matches exactly are delivered to this consumer.",
           "type": [
             "string",
             "null"
@@ -851,7 +900,8 @@
         },
         "url": {
           "description": "For consumers, the listen address (e.g., \"0.0.0.0:8080\"). For publishers, the target URL.",
-          "type": "string"
+          "type": "string",
+          "format": "password"
         },
         "workers": {
           "description": "(Consumer only) Number of worker threads to use. Defaults to 0 for unlimited.",
@@ -910,7 +960,8 @@
           "type": [
             "string",
             "null"
-          ]
+          ],
+          "format": "password"
         },
         "queue": {
           "description": "Target Queue name for point-to-point messaging. Optional if `topic` is set; defaults to route name if omitted.",
@@ -943,15 +994,17 @@
           ]
         },
         "url": {
-          "description": "Required. Connection URL in `host(port)` format. Supports comma-separated list for failover (e.g., `host1(1414),host2(1414)`).",
-          "type": "string"
+          "description": "Required. Connection URL in `host(port)` format. Supports comma-separated list for failover (e.g., `host1(1414),host2(1414)`). If it contains userinfo, it will be treated as a secret.",
+          "type": "string",
+          "format": "password"
         },
         "username": {
           "description": "Username for authentication. Optional; required if the channel enforces authentication.",
           "type": [
             "string",
             "null"
-          ]
+          ],
+          "format": "password"
         },
         "wait_timeout_ms": {
           "description": "(Consumer only) Polling timeout in milliseconds (default: 1000ms). Optional.",
@@ -1009,7 +1062,8 @@
           "type": [
             "string",
             "null"
-          ]
+          ],
+          "format": "password"
         },
         "producer_options": {
           "description": "(Publisher only) Additional librdkafka producer configuration options (key-value pairs).",
@@ -1052,15 +1106,17 @@
           ]
         },
         "url": {
-          "description": "Comma-separated list of Kafka broker URLs.",
-          "type": "string"
+          "description": "Comma-separated list of Kafka broker URLs. If it contains userinfo, it will be treated as a secret.",
+          "type": "string",
+          "format": "password"
         },
         "username": {
           "description": "Optional username for SASL authentication.",
           "type": [
             "string",
             "null"
-          ]
+          ],
+          "format": "password"
         }
       },
       "additionalProperties": false,
@@ -1270,12 +1326,20 @@
           "$ref": "#/$defs/MongoDbFormat",
           "default": "normal"
         },
+        "meta_collection": {
+          "description": "(Optional) Collection to store sequence counters and cursor positions. Defaults to the message collection if not set.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "password": {
           "description": "Optional password. Takes precedence over any credentials embedded in the `url`.\nUse embedded URL credentials for simple one-off connections but prefer explicit username/password fields (or environment-sourced secrets) for clarity and secret management in production.",
           "type": [
             "string",
             "null"
-          ]
+          ],
+          "format": "password"
         },
         "polling_interval_ms": {
           "description": "(Consumer only) Polling interval in milliseconds for the consumer (when not using Change Streams). Defaults to 100ms.",
@@ -1285,6 +1349,13 @@
           ],
           "format": "uint64",
           "minimum": 0
+        },
+        "receive_query": {
+          "description": "(Consumer only) Optional custom MongoDB query to filter messages. Provided as a JSON string (e.g., '{\"type\": \"notification\"}').",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "reply_polling_ms": {
           "description": "(Publisher only) Polling interval in milliseconds for the publisher when waiting for a reply. Defaults to 50ms.",
@@ -1331,15 +1402,17 @@
           "minimum": 0
         },
         "url": {
-          "description": "MongoDB connection string URI. Can contain a comma-separated list of hosts for a replica set.\nCredentials provided via the separate `username` and `password` fields take precedence over any credentials embedded in the URL.",
-          "type": "string"
+          "description": "MongoDB connection string URI. Can contain a comma-separated list of hosts for a replica set. If it contains userinfo, it will be treated as a secret.\nCredentials provided via the separate `username` and `password` fields take precedence over any credentials embedded in the URL.",
+          "type": "string",
+          "format": "password"
         },
         "username": {
           "description": "Optional username. Takes precedence over any credentials embedded in the `url`.\nUse embedded URL credentials for simple one-off connections but prefer explicit username/password fields (or environment-sourced secrets) for clarity and secret management in production.",
           "type": [
             "string",
             "null"
-          ]
+          ],
+          "format": "password"
         }
       },
       "additionalProperties": false,
@@ -1403,7 +1476,8 @@
           "type": [
             "string",
             "null"
-          ]
+          ],
+          "format": "password"
         },
         "protocol": {
           "description": "MQTT protocol version (V3 or V5). Defaults to V5.",
@@ -1458,15 +1532,17 @@
           ]
         },
         "url": {
-          "description": "MQTT broker URL (e.g., \"tcp://localhost:1883\"). Does not support multiple hosts.",
-          "type": "string"
+          "description": "MQTT broker URL (e.g., \"tcp://localhost:1883\"). Does not support multiple hosts. If it contains userinfo, it will be treated as a secret.",
+          "type": "string",
+          "format": "password"
         },
         "username": {
           "description": "Optional username for authentication.",
           "type": [
             "string",
             "null"
-          ]
+          ],
+          "format": "password"
         }
       },
       "additionalProperties": false,
@@ -1512,7 +1588,8 @@
           "type": [
             "string",
             "null"
-          ]
+          ],
+          "format": "password"
         },
         "prefetch_count": {
           "description": "(Consumer only) Number of messages to prefetch from the consumer. Defaults to 10000.",
@@ -1589,18 +1666,21 @@
           "type": [
             "string",
             "null"
-          ]
+          ],
+          "format": "password"
         },
         "url": {
-          "description": "Comma-separated list of NATS server URLs (e.g., \"nats://localhost:4222,nats://localhost:4223\").",
-          "type": "string"
+          "description": "Comma-separated list of NATS server URLs (e.g., \"nats://localhost:4222,nats://localhost:4223\"). If it contains userinfo, it will be treated as a secret.",
+          "type": "string",
+          "format": "password"
         },
         "username": {
           "description": "Optional username for authentication.",
           "type": [
             "string",
             "null"
-          ]
+          ],
+          "format": "password"
         }
       },
       "additionalProperties": false,
@@ -1687,7 +1767,7 @@
       "type": "object",
       "properties": {
         "batch_size": {
-          "description": "(Optional) Number of messages to process in a single batch. Defaults to 1.",
+          "description": "(Optional) Maximum number of messages to process in a single batch. The consumer waits for at least one message\nand then attempts to fetch more if available. Increasing this improves throughput but also increases\nthe potential impact of a single batch processing failure. Defaults to 1.",
           "type": "integer",
           "format": "uint",
           "default": 1,
@@ -1701,7 +1781,7 @@
           "minimum": 0
         },
         "concurrency": {
-          "description": "(Optional) Number of concurrent processing tasks for this route. Defaults to 1.",
+          "description": "(Optional) Number of concurrent processing tasks for this route. While it improves throughput for high-latency\nhandlers, it adds synchronization overhead for ordered commits and may lead to out-of-order processing\nin the handler. Defaults to 1.",
           "type": "integer",
           "format": "uint",
           "default": 1,
@@ -1832,6 +1912,7 @@
             "string",
             "null"
           ],
+          "format": "password",
           "default": null
         },
         "polling_interval_ms": {
@@ -1867,8 +1948,9 @@
           }
         },
         "url": {
-          "description": "Database connection URL.",
-          "type": "string"
+          "description": "Database connection URL. If it contains userinfo, it will be treated as a secret.",
+          "type": "string",
+          "format": "password"
         },
         "username": {
           "description": "Optional username. Takes precedence over any credentials embedded in the `url`.",
@@ -1876,6 +1958,7 @@
             "string",
             "null"
           ],
+          "format": "password",
           "default": null
         }
       },
@@ -1945,7 +2028,8 @@
           "type": [
             "string",
             "null"
-          ]
+          ],
+          "format": "password"
         },
         "key_file": {
           "description": "Path to the client private key file (PEM).",
@@ -1990,6 +2074,44 @@
         "timeout_ms"
       ]
     },
+    "WebSocketConfig": {
+      "description": "WebSocket connection configuration.",
+      "type": "object",
+      "properties": {
+        "internal_buffer_size": {
+          "description": "(Consumer only) Internal buffer size for the channel. Defaults to 100.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0
+        },
+        "message_id_header": {
+          "description": "(Consumer only) Header key to extract the message ID from the WebSocket handshake. Defaults to \"message-id\".",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "path": {
+          "description": "(Consumer only) Optional request path filter. If set, only upgrade requests whose URI path matches exactly are delivered to this consumer.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "url": {
+          "description": "For consumers, the listen address (e.g. \"0.0.0.0:9000\"). For publishers, the target URL.",
+          "type": "string",
+          "format": "password"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "url"
+      ]
+    },
     "ZeroMqConfig": {
       "type": "object",
       "properties": {
@@ -2029,7 +2151,8 @@
         },
         "url": {
           "description": "The ZeroMQ URL (e.g., \"tcp://127.0.0.1:5555\").",
-          "type": "string"
+          "type": "string",
+          "format": "password"
         }
       },
       "additionalProperties": false,

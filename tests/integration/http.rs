@@ -72,6 +72,25 @@ pub async fn test_http_performance_pipeline() {
                 serde_yaml_ng::from_value(routes_val.clone()).expect("Failed to parse routes");
 
             let in_route = routes[&in_route_name].clone();
+            let mut out_route = routes[&out_route_name].clone(); // Make out_route mutable
+
+            let enable_dummy_handler = std::env::var("MQB_ENABLE_DUMMY_HANDLER")
+                .map(|s| s.to_lowercase() == "true")
+                .unwrap_or(false);
+
+            let handler_description = if enable_dummy_handler {
+                let dummy_handler = |msg: mq_bridge::CanonicalMessage| async move {
+                    // This handler does minimal work: just forward the message.
+                    // It simulates the overhead of a handler without actual business logic.
+                    Ok(mq_bridge::Handled::Publish(msg))
+                };
+                out_route = out_route.with_handler(dummy_handler);
+                " (with dummy handler)"
+            } else {
+                ""
+            };
+
+            let in_route = routes[&in_route_name].clone();
             let out_route = routes[&out_route_name].clone();
 
             // Attempt to deploy the HTTP consumer (server) and probe readiness.
@@ -143,6 +162,16 @@ pub async fn test_http_performance_pipeline() {
         // Stop both routes (Route::stop has a built-in 5 s timeout so this won't hang).
         mq_bridge::Route::stop(&in_route_name).await;
         mq_bridge::Route::stop(&out_route_name).await;
+
+        // Reconstruct handler_description for the performance result
+        let enable_dummy_handler = std::env::var("MQB_ENABLE_DUMMY_HANDLER")
+            .map(|s| s.to_lowercase() == "true")
+            .unwrap_or(false);
+        let handler_description = if enable_dummy_handler {
+            " (with dummy handler)"
+        } else {
+            ""
+        };
 
         let messages_per_second = received as f64 / duration.as_secs_f64();
         mq_bridge::test_utils::add_performance_result(mq_bridge::test_utils::PerformanceResult {
