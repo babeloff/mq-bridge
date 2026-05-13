@@ -19,3 +19,33 @@ impl MessagePublisher for NullPublisher {
         self
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::traits::Sent;
+
+    #[tokio::test]
+    async fn test_null_publisher_acks_single_and_batch_messages() {
+        let publisher = NullPublisher;
+
+        assert!(matches!(
+            publisher
+                .send(CanonicalMessage::from("ignored"))
+                .await
+                .unwrap(),
+            Sent::Ack
+        ));
+        assert!(matches!(
+            publisher
+                .send_batch(vec![
+                    CanonicalMessage::from("one"),
+                    CanonicalMessage::from("two")
+                ])
+                .await
+                .unwrap(),
+            SentBatch::Ack
+        ));
+        assert!(publisher.as_any().is::<NullPublisher>());
+    }
+}

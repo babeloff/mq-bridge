@@ -52,3 +52,40 @@ impl From<anyhow::Error> for ProcessingError {
         ProcessingError::Retryable(err)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_connection_error_only_matches_connection_variant() {
+        assert!(ProcessingError::Connection(anyhow::anyhow!("offline")).is_connection_error());
+        assert!(!ProcessingError::Retryable(anyhow::anyhow!("retry")).is_connection_error());
+        assert!(!ProcessingError::NonRetryable(anyhow::anyhow!("stop")).is_connection_error());
+    }
+
+    #[test]
+    fn test_anyhow_error_conversions_use_default_variants() {
+        let consumer_error = ConsumerError::from(anyhow::anyhow!("consumer failure"));
+        assert!(matches!(consumer_error, ConsumerError::Connection(_)));
+
+        let processing_error = ProcessingError::from(anyhow::anyhow!("processing failure"));
+        assert!(matches!(processing_error, ProcessingError::Retryable(_)));
+    }
+
+    #[test]
+    fn test_consumer_error_display_messages() {
+        assert_eq!(
+            ConsumerError::Gap {
+                requested: 42,
+                base: 9
+            }
+            .to_string(),
+            "consumer gap: requested offset 42 but earliest available is 9"
+        );
+        assert_eq!(
+            ConsumerError::EndOfStream.to_string(),
+            "consumer reached end of stream"
+        );
+    }
+}
