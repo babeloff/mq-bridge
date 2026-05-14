@@ -307,7 +307,10 @@ impl MessagePublisher for MemoryPublisher {
 
                     Ok(Sent::Response(response))
                 } else {
-                    self.send_batch(vec![message]).await?;
+                    sender
+                        .send(vec![message])
+                        .await
+                        .map_err(|e| anyhow!("Failed to send to memory channel: {}", e))?;
                     Ok(Sent::Ack)
                 }
             }

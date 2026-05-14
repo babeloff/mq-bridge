@@ -1056,9 +1056,35 @@ fn map_responses_to_dispositions(
     failed: &[(crate::CanonicalMessage, PublisherError)],
     request_ids: &std::collections::HashSet<u128>,
 ) -> Vec<MessageDisposition> {
-    let mut dispositions = Vec::with_capacity(message_ids.len());
-    let failed_ids: std::collections::HashSet<u128> =
-        failed.iter().map(|(m, _)| m.message_id).collect();
+    let len = message_ids.len();
+    if responses.is_none() && failed.is_empty() && (len == 0 || request_ids.is_empty()) {
+        return vec![MessageDisposition::Ack; len];
+    }
+
+    // Fast path for single message batches (very common for high-concurrency low-batch setups)
+    if len == 1 {
+        let id = message_ids[0];
+        if !failed.is_empty() {
+            return vec![MessageDisposition::Nack];
+        }
+        if let Some(mut resps) = responses {
+            if let Some(resp) = resps.pop() {
+                return vec![MessageDisposition::Reply(resp)];
+            }
+        }
+        if request_ids.contains(&id) {
+            error!("Message {:032x} expected a reply (reply_to set), but publisher returned Ack. Nacking to avoid committing a lost response.", id);
+            return vec![MessageDisposition::Nack];
+        }
+        return vec![MessageDisposition::Ack];
+    }
+
+    let mut dispositions = Vec::with_capacity(len);
+    // Build failed_ids manually to avoid collect() overhead
+    let mut failed_ids = std::collections::HashSet::with_capacity(failed.len());
+    for (m, _) in failed {
+        failed_ids.insert(m.message_id);
+    }
 
     // Create a map from message_id to response message for efficient lookup.
     let mut response_map: std::collections::HashMap<u128, crate::CanonicalMessage> = responses
