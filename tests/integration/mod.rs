@@ -38,7 +38,6 @@ pub mod file;
 pub mod logic_test;
 pub mod memory;
 // performance_static was just for internal optimiztion - not a real test
-// pub mod performance_static;
 
 #[cfg(feature = "grpc")]
 pub mod grpc_tls;

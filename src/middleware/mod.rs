@@ -9,6 +9,7 @@ use crate::traits::{MessageConsumer, MessagePublisher};
 use anyhow::Result;
 use std::sync::Arc;
 
+mod buffer;
 mod cookie_jar;
 #[cfg(feature = "dedup")]
 mod deduplication;
@@ -21,6 +22,7 @@ mod random_panic;
 mod retry;
 mod weak_join;
 
+use buffer::BufferPublisher;
 use cookie_jar::{CookieJarConsumer, CookieJarPublisher};
 #[cfg(feature = "dedup")]
 use deduplication::DeduplicationConsumer;
@@ -64,6 +66,10 @@ pub async fn apply_middlewares_to_consumer(
             Middleware::RandomPanic(cfg) => Box::new(RandomPanicConsumer::new(consumer, cfg)),
             Middleware::WeakJoin(cfg) => Box::new(WeakJoinConsumer::new(consumer, cfg)),
             Middleware::Limiter(cfg) => Box::new(LimiterConsumer::new(consumer, cfg)?),
+            Middleware::Buffer(_) => {
+                tracing::warn!("Buffer middleware is ignored on consumers (input endpoints). It is currently publisher-only.");
+                consumer
+            }
             Middleware::CookieJar(cfg) => Box::new(CookieJarConsumer::new(consumer, cfg)),
             Middleware::Custom { name, config } => {
                 let factory = get_middleware_factory(name).ok_or_else(|| {
@@ -109,6 +115,7 @@ pub async fn apply_middlewares_to_publisher(
             Middleware::Delay(cfg) => Box::new(DelayPublisher::new(publisher, cfg)),
             Middleware::RandomPanic(cfg) => Box::new(RandomPanicPublisher::new(publisher, cfg)),
             Middleware::Limiter(cfg) => Box::new(LimiterPublisher::new(publisher, cfg)?),
+            Middleware::Buffer(cfg) => Box::new(BufferPublisher::new(publisher, cfg)?),
             Middleware::CookieJar(cfg) => Box::new(CookieJarPublisher::new(publisher, cfg)),
             Middleware::Custom { name, config } => {
                 let factory = get_middleware_factory(name).ok_or_else(|| {

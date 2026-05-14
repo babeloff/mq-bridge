@@ -29,7 +29,7 @@ async fn test_static_to_null_performance() {
             async move { Ok(Handled::Ack) }
         })
         .with_concurrency(8)
-        .with_batch_size(1000);
+        .with_batch_size(1);
 
     let route_name = "static_perf_bench";
     println!("--- Starting Static Consumer Performance Test (10s) ---");

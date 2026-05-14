@@ -384,8 +384,14 @@ mod tests {
             &config,
         );
 
-        publisher.send(CanonicalMessage::from("first")).await.unwrap();
-        publisher.send(CanonicalMessage::from("second")).await.unwrap();
+        publisher
+            .send(CanonicalMessage::from("first"))
+            .await
+            .unwrap();
+        publisher
+            .send(CanonicalMessage::from("second"))
+            .await
+            .unwrap();
 
         let sent = sent.lock().unwrap();
         assert!(!sent[0].metadata.contains_key("cookie"));
@@ -399,7 +405,9 @@ mod tests {
     async fn test_cookie_jar_shared_scope_can_move_values_from_consumer_to_publisher() {
         let scope = format!("shared-scope-{}", fast_uuid_v7::gen_id_string());
         let mut inbound = CanonicalMessage::from("input");
-        inbound.metadata.insert("cookie".to_string(), "sid=xyz".to_string());
+        inbound
+            .metadata
+            .insert("cookie".to_string(), "sid=xyz".to_string());
         inbound
             .metadata
             .insert("x-csrf-token".to_string(), "csrf123".to_string());
@@ -453,12 +461,12 @@ mod tests {
         publisher.send(CanonicalMessage::from("out")).await.unwrap();
 
         let sent = sent.lock().unwrap();
-        assert_eq!(sent[0].metadata.get("cookie").map(|s| s.as_str()), Some("sid=xyz"));
         assert_eq!(
-            sent[0]
-                .metadata
-                .get("x-forwarded-csrf")
-                .map(|s| s.as_str()),
+            sent[0].metadata.get("cookie").map(|s| s.as_str()),
+            Some("sid=xyz")
+        );
+        assert_eq!(
+            sent[0].metadata.get("x-forwarded-csrf").map(|s| s.as_str()),
             Some("csrf123")
         );
     }

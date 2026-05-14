@@ -360,6 +360,7 @@ fn is_known_middleware_name(name: &str) -> bool {
             | "delay"
             | "weak_join"
             | "limiter"
+            | "buffer"
             | "cookie_jar"
             | "custom"
     )
@@ -552,6 +553,7 @@ pub enum Middleware {
     Delay(DelayMiddleware),
     WeakJoin(WeakJoinMiddleware),
     Limiter(LimiterMiddleware),
+    Buffer(BufferMiddleware),
     CookieJar(CookieJarMiddleware),
     Custom {
         name: String,
@@ -644,6 +646,20 @@ pub struct DelayMiddleware {
 pub struct LimiterMiddleware {
     /// Target throughput in messages per second. Must be greater than zero.
     pub messages_per_second: f64,
+}
+
+/// Publisher-side buffer middleware configuration.
+///
+/// Buffers outbound messages briefly so multiple single-message sends can be
+/// forwarded as one `send_batch` call to the wrapped publisher.
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct BufferMiddleware {
+    /// Maximum number of messages to accumulate before flushing immediately.
+    pub max_messages: usize,
+    /// Maximum time to wait before flushing a non-full buffer.
+    pub max_delay_ms: u64,
 }
 
 /// Cookie/session jar middleware configuration.
@@ -2470,6 +2486,7 @@ kafka_to_nats:
                 Middleware::Delay(_) => {}
                 Middleware::WeakJoin(_) => {}
                 Middleware::Limiter(_) => {}
+                Middleware::Buffer(_) => {}
                 Middleware::CookieJar(_) => {}
             }
         }

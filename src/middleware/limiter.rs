@@ -40,7 +40,10 @@ pub struct LimiterConsumer {
 }
 
 impl LimiterConsumer {
-    pub fn new(inner: Box<dyn MessageConsumer>, config: &LimiterMiddleware) -> anyhow::Result<Self> {
+    pub fn new(
+        inner: Box<dyn MessageConsumer>,
+        config: &LimiterMiddleware,
+    ) -> anyhow::Result<Self> {
         if !(config.messages_per_second.is_finite() && config.messages_per_second > 0.0) {
             return Err(anyhow::anyhow!(
                 "Limiter messages_per_second must be a finite value greater than zero"
@@ -219,7 +222,10 @@ mod tests {
             Box::new(MockConsumer {
                 batches: VecDeque::from([
                     vec![CanonicalMessage::from("one"), CanonicalMessage::from("two")],
-                    vec![CanonicalMessage::from("three"), CanonicalMessage::from("four")],
+                    vec![
+                        CanonicalMessage::from("three"),
+                        CanonicalMessage::from("four"),
+                    ],
                 ]),
             }),
             &config,
@@ -242,11 +248,8 @@ mod tests {
             messages_per_second: 20.0,
         };
         let sent = Arc::new(StdMutex::new(Vec::new()));
-        let publisher = LimiterPublisher::new(
-            Box::new(MockPublisher { sent: sent.clone() }),
-            &config,
-        )
-        .unwrap();
+        let publisher =
+            LimiterPublisher::new(Box::new(MockPublisher { sent: sent.clone() }), &config).unwrap();
 
         let start = Instant::now();
         publisher.send(CanonicalMessage::from("one")).await.unwrap();
