@@ -9,20 +9,24 @@ use crate::traits::{MessageConsumer, MessagePublisher};
 use anyhow::Result;
 use std::sync::Arc;
 
+mod cookie_jar;
 #[cfg(feature = "dedup")]
 mod deduplication;
 mod delay;
 mod dlq;
+mod limiter;
 #[cfg(feature = "metrics")]
 mod metrics;
 mod random_panic;
 mod retry;
 mod weak_join;
 
+use cookie_jar::{CookieJarConsumer, CookieJarPublisher};
 #[cfg(feature = "dedup")]
 use deduplication::DeduplicationConsumer;
 use delay::{DelayConsumer, DelayPublisher};
 use dlq::DlqPublisher;
+use limiter::{LimiterConsumer, LimiterPublisher};
 #[cfg(feature = "metrics")]
 use metrics::{MetricsConsumer, MetricsPublisher};
 use random_panic::{RandomPanicConsumer, RandomPanicPublisher};
@@ -59,6 +63,8 @@ pub async fn apply_middlewares_to_consumer(
             Middleware::Delay(cfg) => Box::new(DelayConsumer::new(consumer, cfg)),
             Middleware::RandomPanic(cfg) => Box::new(RandomPanicConsumer::new(consumer, cfg)),
             Middleware::WeakJoin(cfg) => Box::new(WeakJoinConsumer::new(consumer, cfg)),
+            Middleware::Limiter(cfg) => Box::new(LimiterConsumer::new(consumer, cfg)?),
+            Middleware::CookieJar(cfg) => Box::new(CookieJarConsumer::new(consumer, cfg)),
             Middleware::Custom { name, config } => {
                 let factory = get_middleware_factory(name).ok_or_else(|| {
                     anyhow::anyhow!("Custom middleware factory '{}' not found", name)
@@ -102,6 +108,8 @@ pub async fn apply_middlewares_to_publisher(
             Middleware::Retry(cfg) => Box::new(RetryPublisher::new(publisher, cfg.clone())),
             Middleware::Delay(cfg) => Box::new(DelayPublisher::new(publisher, cfg)),
             Middleware::RandomPanic(cfg) => Box::new(RandomPanicPublisher::new(publisher, cfg)),
+            Middleware::Limiter(cfg) => Box::new(LimiterPublisher::new(publisher, cfg)?),
+            Middleware::CookieJar(cfg) => Box::new(CookieJarPublisher::new(publisher, cfg)),
             Middleware::Custom { name, config } => {
                 let factory = get_middleware_factory(name).ok_or_else(|| {
                     anyhow::anyhow!("Custom middleware factory '{}' not found", name)

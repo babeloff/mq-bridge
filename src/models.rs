@@ -191,6 +191,12 @@ fn default_multiplier() -> f64 {
 fn default_clean_session() -> bool {
     false
 }
+fn default_cookie_metadata_key() -> String {
+    "cookie".to_string()
+}
+fn default_set_cookie_metadata_key() -> String {
+    "set-cookie".to_string()
+}
 
 fn is_known_endpoint_name(name: &str) -> bool {
     matches!(
@@ -353,6 +359,8 @@ fn is_known_middleware_name(name: &str) -> bool {
             | "random_panic"
             | "delay"
             | "weak_join"
+            | "limiter"
+            | "cookie_jar"
             | "custom"
     )
 }
@@ -543,6 +551,8 @@ pub enum Middleware {
     RandomPanic(RandomPanicMiddleware),
     Delay(DelayMiddleware),
     WeakJoin(WeakJoinMiddleware),
+    Limiter(LimiterMiddleware),
+    CookieJar(CookieJarMiddleware),
     Custom {
         name: String,
         config: serde_json::Value,
@@ -621,6 +631,70 @@ pub struct RetryMiddleware {
 pub struct DelayMiddleware {
     /// Delay duration in milliseconds.
     pub delay_ms: u64,
+}
+
+/// Throughput limiter middleware configuration.
+///
+/// Applies a best-effort pacing delay so an endpoint does not exceed the configured
+/// message rate. For batch operations the limiter accounts for the number of messages
+/// in the batch, not just the batch count.
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct LimiterMiddleware {
+    /// Target throughput in messages per second. Must be greater than zero.
+    pub messages_per_second: f64,
+}
+
+/// Cookie/session jar middleware configuration.
+///
+/// Optimized for HTTP by default: it can read `cookie` and `set-cookie` metadata,
+/// persist session cookies, and inject them into later outgoing requests.
+///
+/// The middleware can also capture arbitrary metadata values into the same session store
+/// and optionally expose stored values back into message metadata.
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct CookieJarMiddleware {
+    /// Optional shared scope name. When set, middleware instances using the same scope
+    /// share one session store across endpoints/routes in the process.
+    #[serde(default)]
+    pub shared_scope: Option<String>,
+    /// Metadata key used to read/write HTTP Cookie headers. Defaults to `cookie`.
+    #[serde(default = "default_cookie_metadata_key")]
+    pub cookie_metadata_key: String,
+    /// Metadata key used to read HTTP Set-Cookie responses. Defaults to `set-cookie`.
+    #[serde(default = "default_set_cookie_metadata_key")]
+    pub set_cookie_metadata_key: String,
+    /// Additional metadata keys to persist into the session value store.
+    #[serde(default)]
+    pub capture_metadata_keys: Vec<String>,
+    /// Optional metadata prefix used to export stored values back onto each message.
+    ///
+    /// Exported keys use `PREFIXcookie.<name>` for cookies and `PREFIXvalue.<name>` for
+    /// captured generic values.
+    #[serde(default)]
+    pub export_metadata_prefix: Option<String>,
+    /// Optional mapping of outgoing metadata keys to stored session value names.
+    ///
+    /// Example: `{ "authorization": "access_token" }` copies the stored value
+    /// `access_token` into outgoing metadata key `authorization` when not already present.
+    #[serde(default)]
+    pub inject_metadata: HashMap<String, String>,
+}
+
+impl Default for CookieJarMiddleware {
+    fn default() -> Self {
+        Self {
+            shared_scope: None,
+            cookie_metadata_key: default_cookie_metadata_key(),
+            set_cookie_metadata_key: default_set_cookie_metadata_key(),
+            capture_metadata_keys: Vec::new(),
+            export_metadata_prefix: None,
+            inject_metadata: HashMap::new(),
+        }
+    }
 }
 
 /// Weak Join middleware configuration.
@@ -2395,6 +2469,8 @@ kafka_to_nats:
                 }
                 Middleware::Delay(_) => {}
                 Middleware::WeakJoin(_) => {}
+                Middleware::Limiter(_) => {}
+                Middleware::CookieJar(_) => {}
             }
         }
 
