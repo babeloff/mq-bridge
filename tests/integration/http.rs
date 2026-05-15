@@ -95,9 +95,6 @@ pub async fn test_http_performance_pipeline() {
                 ""
             };
 
-            let in_route = routes[&in_route_name].clone();
-            let out_route = routes[&out_route_name].clone();
-
             // Attempt to deploy the HTTP consumer (server) and probe readiness.
             match out_route.deploy(&out_route_name).await {
                 Ok(_) => {
@@ -167,16 +164,6 @@ pub async fn test_http_performance_pipeline() {
         // Stop both routes (Route::stop has a built-in 5 s timeout so this won't hang).
         mq_bridge::Route::stop(&in_route_name).await;
         mq_bridge::Route::stop(&out_route_name).await;
-
-        // Reconstruct handler_description for the performance result
-        let enable_dummy_handler = std::env::var("MQB_ENABLE_DUMMY_HANDLER")
-            .map(|s| s.to_lowercase() == "true")
-            .unwrap_or(false);
-        let handler_description = if enable_dummy_handler {
-            " (with dummy handler)"
-        } else {
-            ""
-        };
 
         let messages_per_second = received as f64 / duration.as_secs_f64();
         mq_bridge::test_utils::add_performance_result(mq_bridge::test_utils::PerformanceResult {

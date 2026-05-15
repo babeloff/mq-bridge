@@ -22,13 +22,18 @@ impl RateState {
     }
 
     fn reserve(&mut self, count: usize, per_message: Duration) -> Duration {
+        const MAX_DELAY: Duration = Duration::from_secs(3600);
+
         if count == 0 {
             return Duration::ZERO;
         }
 
         let now = Instant::now();
         let start_at = self.next_allowed_at.max(now);
-        self.next_allowed_at = start_at + per_message.mul_f64(count as f64);
+        let additional = per_message.mul_f64(count as f64).min(MAX_DELAY);
+        self.next_allowed_at = start_at
+            .checked_add(additional)
+            .unwrap_or_else(|| start_at + MAX_DELAY);
         start_at.saturating_duration_since(now)
     }
 }

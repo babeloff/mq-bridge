@@ -84,8 +84,7 @@
           "type": [
             "string",
             "null"
-          ],
-          "format": "password"
+          ]
         }
       },
       "additionalProperties": false,
@@ -174,6 +173,78 @@
           "format": "int32",
           "maximum": 20,
           "minimum": 0
+        }
+      },
+      "additionalProperties": false
+    },
+    "BufferMiddleware": {
+      "description": "Publisher-side buffer middleware configuration.\n\nBuffers outbound messages briefly so multiple single-message sends can be\nforwarded as one `send_batch` call to the wrapped publisher.",
+      "type": "object",
+      "properties": {
+        "max_delay_ms": {
+          "description": "Maximum time to wait before flushing a non-full buffer.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "max_messages": {
+          "description": "Maximum number of messages to accumulate before flushing immediately.",
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "max_messages",
+        "max_delay_ms"
+      ]
+    },
+    "CookieJarMiddleware": {
+      "description": "Cookie/session jar middleware configuration.\n\nOptimized for HTTP by default: it can read `cookie` and `set-cookie` metadata,\npersist session cookies, and inject them into later outgoing requests.\n\nThe middleware can also capture arbitrary metadata values into the same session store\nand optionally expose stored values back into message metadata.",
+      "type": "object",
+      "properties": {
+        "capture_metadata_keys": {
+          "description": "Additional metadata keys to persist into the session value store.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "cookie_metadata_key": {
+          "description": "Metadata key used to read/write HTTP Cookie headers. Defaults to `cookie`.",
+          "type": "string",
+          "default": "cookie"
+        },
+        "export_metadata_prefix": {
+          "description": "Optional metadata prefix used to export stored values back onto each message.\n\nExported keys use `PREFIXcookie.<name>` for cookies and `PREFIXvalue.<name>` for\ncaptured generic values.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "inject_metadata": {
+          "description": "Optional mapping of outgoing metadata keys to stored session value names.\n\nExample: `{ \"authorization\": \"access_token\" }` copies the stored value\n`access_token` into outgoing metadata key `authorization` when not already present.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {}
+        },
+        "set_cookie_metadata_key": {
+          "description": "Metadata key used to read HTTP Set-Cookie responses. Defaults to `set-cookie`.",
+          "type": "string",
+          "default": "set-cookie"
+        },
+        "shared_scope": {
+          "description": "Optional shared scope name. When set, middleware instances using the same scope\nshare one session store across endpoints/routes in the process.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
         }
       },
       "additionalProperties": false
@@ -900,8 +971,7 @@
         },
         "url": {
           "description": "For consumers, the listen address (e.g., \"0.0.0.0:8080\"). For publishers, the target URL.",
-          "type": "string",
-          "format": "password"
+          "type": "string"
         },
         "workers": {
           "description": "(Consumer only) Number of worker threads to use. Defaults to 0 for unlimited.",
@@ -999,12 +1069,11 @@
           "format": "password"
         },
         "username": {
-          "description": "Username for authentication. Optional; required if the channel enforces authentication.",
+          "description": "Username for authentication. Optional; required if the channel enforces authentication",
           "type": [
             "string",
             "null"
-          ],
-          "format": "password"
+          ]
         },
         "wait_timeout_ms": {
           "description": "(Consumer only) Polling timeout in milliseconds (default: 1000ms). Optional.",
@@ -1115,13 +1184,27 @@
           "type": [
             "string",
             "null"
-          ],
-          "format": "password"
+          ]
         }
       },
       "additionalProperties": false,
       "required": [
         "url"
+      ]
+    },
+    "LimiterMiddleware": {
+      "description": "Throughput limiter middleware configuration.\n\nApplies a best-effort pacing delay so an endpoint does not exceed the configured\nmessage rate. For batch operations the limiter accounts for the number of messages\nin the batch, not just the batch count.",
+      "type": "object",
+      "properties": {
+        "messages_per_second": {
+          "description": "Target throughput in messages per second. Must be greater than zero.",
+          "type": "number",
+          "format": "double"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "messages_per_second"
       ]
     },
     "MemoryConfig": {
@@ -1260,6 +1343,42 @@
           "additionalProperties": false,
           "required": [
             "weak_join"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "limiter": {
+              "$ref": "#/$defs/LimiterMiddleware"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "limiter"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "buffer": {
+              "$ref": "#/$defs/BufferMiddleware"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "buffer"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "cookie_jar": {
+              "$ref": "#/$defs/CookieJarMiddleware"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "cookie_jar"
           ]
         },
         {
@@ -1411,8 +1530,7 @@
           "type": [
             "string",
             "null"
-          ],
-          "format": "password"
+          ]
         }
       },
       "additionalProperties": false,
@@ -1541,8 +1659,7 @@
           "type": [
             "string",
             "null"
-          ],
-          "format": "password"
+          ]
         }
       },
       "additionalProperties": false,
@@ -1679,8 +1796,7 @@
           "type": [
             "string",
             "null"
-          ],
-          "format": "password"
+          ]
         }
       },
       "additionalProperties": false,
@@ -1958,7 +2074,6 @@
             "string",
             "null"
           ],
-          "format": "password",
           "default": null
         }
       },
