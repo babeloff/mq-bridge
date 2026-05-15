@@ -995,7 +995,7 @@ async fn handle_request_internal(
 
     // Read body with a timeout to prevent hanging on abandoned client connections.
     // This prevents "zombie" tasks from saturating the runtime during retry storms.
-    let body_collect_timeout = std::time::Duration::from_secs(10).min(state.request_timeout);
+    let body_collect_timeout = state.request_timeout;
     let body_bytes = match tokio::time::timeout(body_collect_timeout, req.collect()).await {
         Ok(Ok(b)) => b.to_bytes(),
         Ok(Err(e)) => {
@@ -1414,7 +1414,7 @@ impl MessagePublisher for HttpPublisher {
         // Use a shorter cap for body collection — the full request timeout was already
         // spent on getting the response headers. Reusing it here could double the total
         // wall time a single send() call blocks the caller.
-        let body_collect_timeout = self.request_timeout.min(std::time::Duration::from_secs(10));
+        let body_collect_timeout = self.request_timeout;
         let response_bytes_raw = match tokio::time::timeout(
             body_collect_timeout,
             response.into_body().collect(),
