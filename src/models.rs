@@ -191,6 +191,12 @@ fn default_multiplier() -> f64 {
 fn default_clean_session() -> bool {
     false
 }
+fn default_cookie_metadata_key() -> String {
+    "cookie".to_string()
+}
+fn default_set_cookie_metadata_key() -> String {
+    "set-cookie".to_string()
+}
 
 fn is_known_endpoint_name(name: &str) -> bool {
     matches!(
@@ -353,6 +359,9 @@ fn is_known_middleware_name(name: &str) -> bool {
             | "random_panic"
             | "delay"
             | "weak_join"
+            | "limiter"
+            | "buffer"
+            | "cookie_jar"
             | "custom"
     )
 }
@@ -543,6 +552,9 @@ pub enum Middleware {
     RandomPanic(RandomPanicMiddleware),
     Delay(DelayMiddleware),
     WeakJoin(WeakJoinMiddleware),
+    Limiter(LimiterMiddleware),
+    Buffer(BufferMiddleware),
+    CookieJar(CookieJarMiddleware),
     Custom {
         name: String,
         config: serde_json::Value,
@@ -621,6 +633,84 @@ pub struct RetryMiddleware {
 pub struct DelayMiddleware {
     /// Delay duration in milliseconds.
     pub delay_ms: u64,
+}
+
+/// Throughput limiter middleware configuration.
+///
+/// Applies a best-effort pacing delay so an endpoint does not exceed the configured
+/// message rate. For batch operations the limiter accounts for the number of messages
+/// in the batch, not just the batch count.
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct LimiterMiddleware {
+    /// Target throughput in messages per second. Must be greater than zero.
+    pub messages_per_second: f64,
+}
+
+/// Publisher-side buffer middleware configuration.
+///
+/// Buffers outbound messages briefly so multiple single-message sends can be
+/// forwarded as one `send_batch` call to the wrapped publisher.
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct BufferMiddleware {
+    /// Maximum number of messages to accumulate before flushing immediately.
+    pub max_messages: usize,
+    /// Maximum time to wait before flushing a non-full buffer.
+    pub max_delay_ms: u64,
+}
+
+/// Cookie/session jar middleware configuration.
+///
+/// Optimized for HTTP by default: it can read `cookie` and `set-cookie` metadata,
+/// persist session cookies, and inject them into later outgoing requests.
+///
+/// The middleware can also capture arbitrary metadata values into the same session store
+/// and optionally expose stored values back into message metadata.
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct CookieJarMiddleware {
+    /// Optional shared scope name. When set, middleware instances using the same scope
+    /// share one session store across endpoints/routes in the process.
+    #[serde(default)]
+    pub shared_scope: Option<String>,
+    /// Metadata key used to read/write HTTP Cookie headers. Defaults to `cookie`.
+    #[serde(default = "default_cookie_metadata_key")]
+    pub cookie_metadata_key: String,
+    /// Metadata key used to read HTTP Set-Cookie responses. Defaults to `set-cookie`.
+    #[serde(default = "default_set_cookie_metadata_key")]
+    pub set_cookie_metadata_key: String,
+    /// Additional metadata keys to persist into the session value store.
+    #[serde(default)]
+    pub capture_metadata_keys: Vec<String>,
+    /// Optional metadata prefix used to export stored values back onto each message.
+    ///
+    /// Exported keys use `PREFIXcookie.<name>` for cookies and `PREFIXvalue.<name>` for
+    /// captured generic values.
+    #[serde(default)]
+    pub export_metadata_prefix: Option<String>,
+    /// Optional mapping of outgoing metadata keys to stored session value names.
+    ///
+    /// Example: `{ "authorization": "access_token" }` copies the stored value
+    /// `access_token` into outgoing metadata key `authorization` when not already present.
+    #[serde(default)]
+    pub inject_metadata: HashMap<String, String>,
+}
+
+impl Default for CookieJarMiddleware {
+    fn default() -> Self {
+        Self {
+            shared_scope: None,
+            cookie_metadata_key: default_cookie_metadata_key(),
+            set_cookie_metadata_key: default_set_cookie_metadata_key(),
+            capture_metadata_keys: Vec::new(),
+            export_metadata_prefix: None,
+            inject_metadata: HashMap::new(),
+        }
+    }
 }
 
 /// Weak Join middleware configuration.
@@ -722,19 +812,24 @@ where
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct AwsConfig {
-    /// The SQS queue URL. Required for Consumer. Optional for Publisher if `topic_arn` is set.
+    /// The SQS queue URL. Required for Consumer. Optional for Publisher if `topic_arn` is set. If it contains userinfo, it will be treated as a secret.
+    #[cfg_attr(feature = "schema", schemars(extend("format"="password")))]
     pub queue_url: Option<String>,
     /// (Publisher only) The SNS topic ARN.
     pub topic_arn: Option<String>,
     /// AWS Region (e.g., "us-east-1").
     pub region: Option<String>,
     /// Custom endpoint URL (e.g., for LocalStack).
+    #[cfg_attr(feature = "schema", schemars(extend("format"="password")))]
     pub endpoint_url: Option<String>,
     /// AWS Access Key ID.
+    #[cfg_attr(feature = "schema", schemars(extend("format"="password")))]
     pub access_key: Option<String>,
     /// AWS Secret Access Key.
+    #[cfg_attr(feature = "schema", schemars(extend("format"="password")))]
     pub secret_key: Option<String>,
     /// AWS Session Token.
+    #[cfg_attr(feature = "schema", schemars(extend("format"="password")))]
     pub session_token: Option<String>,
     /// (Consumer only) Maximum number of messages to receive in a batch (1-10).
     #[cfg_attr(feature = "schema", schemars(range(min = 1, max = 10)))]
@@ -791,14 +886,16 @@ impl AwsConfig {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct KafkaConfig {
-    /// Comma-separated list of Kafka broker URLs.
+    /// Comma-separated list of Kafka broker URLs. If it contains userinfo, it will be treated as a secret.
     #[serde(alias = "brokers")]
+    #[cfg_attr(feature = "schema", schemars(extend("format"="password")))]
     pub url: String,
     /// The Kafka topic to produce to or consume from.
     pub topic: Option<String>,
     /// Optional username for SASL authentication.
     pub username: Option<String>,
     /// Optional password for SASL authentication.
+    #[cfg_attr(feature = "schema", schemars(extend("format"="password")))]
     pub password: Option<String>,
     /// TLS configuration.
     #[serde(default)]
@@ -1009,7 +1106,8 @@ impl FileConfig {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct NatsConfig {
-    /// Comma-separated list of NATS server URLs (e.g., "nats://localhost:4222,nats://localhost:4223").
+    /// Comma-separated list of NATS server URLs (e.g., "nats://localhost:4222,nats://localhost:4223"). If it contains userinfo, it will be treated as a secret.
+    #[cfg_attr(feature = "schema", schemars(extend("format"="password")))]
     pub url: String,
     /// The NATS subject to publish to or subscribe to.
     pub subject: Option<String>,
@@ -1018,11 +1116,13 @@ pub struct NatsConfig {
     /// Optional username for authentication.
     pub username: Option<String>,
     /// Optional password for authentication.
+    #[cfg_attr(feature = "schema", schemars(extend("format"="password")))]
     pub password: Option<String>,
     /// TLS configuration.
     #[serde(default)]
     pub tls: TlsConfig,
     /// Optional token for authentication.
+    #[cfg_attr(feature = "schema", schemars(extend("format"="password")))]
     pub token: Option<String>,
     /// (Publisher only) If true, the publisher uses the request-reply pattern.
     /// It sends a request and waits for a response (using `core_client.request_with_headers()`).
@@ -1145,9 +1245,10 @@ impl MemoryConfig {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct AmqpConfig {
-    /// AMQP connection URI. The `lapin` client connects to a single host specified in the URI.
+    /// AMQP connection URI. The `lapin` client connects to a single host specified in the URI. If it contains userinfo, it will be treated as a secret.
     /// For high availability, provide the address of a load balancer or use DNS resolution
     /// that points to multiple brokers. Example: "amqp://localhost:5672/vhost".
+    #[cfg_attr(feature = "schema", schemars(extend("format"="password")))]
     pub url: String,
     /// The AMQP queue name.
     pub queue: Option<String>,
@@ -1157,6 +1258,7 @@ pub struct AmqpConfig {
     /// Optional username for authentication.
     pub username: Option<String>,
     /// Optional password for authentication.
+    #[cfg_attr(feature = "schema", schemars(extend("format"="password")))]
     pub password: Option<String>,
     /// TLS configuration.
     #[serde(default)]
@@ -1227,8 +1329,9 @@ pub enum MongoDbFormat {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct MongoDbConfig {
-    /// MongoDB connection string URI. Can contain a comma-separated list of hosts for a replica set.
+    /// MongoDB connection string URI. Can contain a comma-separated list of hosts for a replica set. If it contains userinfo, it will be treated as a secret.
     /// Credentials provided via the separate `username` and `password` fields take precedence over any credentials embedded in the URL.
+    #[cfg_attr(feature = "schema", schemars(extend("format"="password")))]
     pub url: String,
     /// The MongoDB collection name.
     pub collection: Option<String>,
@@ -1236,6 +1339,7 @@ pub struct MongoDbConfig {
     /// Use embedded URL credentials for simple one-off connections but prefer explicit username/password fields (or environment-sourced secrets) for clarity and secret management in production.
     pub username: Option<String>,
     /// Optional password. Takes precedence over any credentials embedded in the `url`.
+    #[cfg_attr(feature = "schema", schemars(extend("format"="password")))]
     /// Use embedded URL credentials for simple one-off connections but prefer explicit username/password fields (or environment-sourced secrets) for clarity and secret management in production.
     pub password: Option<String>,
     /// TLS configuration.
@@ -1266,6 +1370,8 @@ pub struct MongoDbConfig {
     pub cursor_id: Option<String>,
     /// (Consumer only) Optional custom MongoDB query to filter messages. Provided as a JSON string (e.g., '{"type": "notification"}').
     pub receive_query: Option<String>,
+    /// (Optional) Collection to store sequence counters and cursor positions. Defaults to the message collection if not set.
+    pub meta_collection: Option<String>,
 }
 
 impl MongoDbConfig {
@@ -1306,13 +1412,15 @@ impl MongoDbConfig {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct MqttConfig {
-    /// MQTT broker URL (e.g., "tcp://localhost:1883"). Does not support multiple hosts.
+    /// MQTT broker URL (e.g., "tcp://localhost:1883"). Does not support multiple hosts. If it contains userinfo, it will be treated as a secret.
+    #[cfg_attr(feature = "schema", schemars(extend("format"="password")))]
     pub url: String,
     /// The MQTT topic.
     pub topic: Option<String>,
     /// Optional username for authentication.
     pub username: Option<String>,
     /// Optional password for authentication.
+    #[cfg_attr(feature = "schema", schemars(extend("format"="password")))]
     pub password: Option<String>,
     /// TLS configuration.
     #[serde(default)]
@@ -1390,6 +1498,7 @@ pub enum MqttProtocol {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct ZeroMqConfig {
+    #[cfg_attr(feature = "schema", schemars(extend("format"="password")))]
     /// The ZeroMQ URL (e.g., "tcp://127.0.0.1:5555").
     pub url: String,
     /// The socket type (PUSH, PULL, PUB, SUB, REQ, REP).
@@ -1447,6 +1556,7 @@ pub enum ZeroMqSocketType {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct GrpcConfig {
+    #[cfg_attr(feature = "schema", schemars(extend("format"="password")))]
     /// The gRPC server URL (e.g., "http://localhost:50051" for client or "0.0.0.0:50051" for server mode).
     pub url: String,
     /// Topic / subject used for both subscribe and publish paths.
@@ -1548,6 +1658,7 @@ pub struct HttpConfig {
     /// HTTP Basic Authentication credentials (username, password). For consumers: validates incoming requests. For publishers: adds Authorization header.
     /// (Consumer only) Maximum number of concurrent requests to handle. Defaults to 100.
     pub concurrency_limit: Option<usize>,
+    #[cfg_attr(feature = "schema", schemars(extend("format"="password")))]
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -1555,6 +1666,7 @@ pub struct HttpConfig {
     )]
     pub basic_auth: Option<(String, String)>,
     /// Custom headers as key-value pairs (e.g., {"X-API-Key": "token123"}). Added to outgoing HTTP headers for both consumers and publishers.
+    #[cfg_attr(feature = "schema", schemars(extend("format"="password")))]
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub custom_headers: HashMap<String, String>,
 }
@@ -1565,6 +1677,7 @@ pub struct HttpConfig {
 #[serde(deny_unknown_fields)]
 pub struct WebSocketConfig {
     /// For consumers, the listen address (e.g. "0.0.0.0:9000"). For publishers, the target URL.
+    #[cfg_attr(feature = "schema", schemars(extend("format"="password")))]
     pub url: String,
     /// (Consumer only) Optional request path filter. If set, only upgrade requests whose URI path matches exactly are delivered to this consumer.
     pub path: Option<String>,
@@ -1659,7 +1772,8 @@ impl WebSocketConfig {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct IbmMqConfig {
-    /// Required. Connection URL in `host(port)` format. Supports comma-separated list for failover (e.g., `host1(1414),host2(1414)`).
+    /// Required. Connection URL in `host(port)` format. Supports comma-separated list for failover (e.g., `host1(1414),host2(1414)`). If it contains userinfo, it will be treated as a secret.
+    #[cfg_attr(feature = "schema", schemars(extend("format"="password")))]
     pub url: String,
     /// Target Queue name for point-to-point messaging. Optional if `topic` is set; defaults to route name if omitted.
     pub queue: Option<String>,
@@ -1669,9 +1783,10 @@ pub struct IbmMqConfig {
     pub queue_manager: String,
     /// Required. Server Connection (SVRCONN) Channel name defined on the QM.
     pub channel: String,
-    /// Username for authentication. Optional; required if the channel enforces authentication.
+    /// Username for authentication. Optional; required if the channel enforces authentication
     pub username: Option<String>,
     /// Password for authentication. Optional; required if the channel enforces authentication.
+    #[cfg_attr(feature = "schema", schemars(extend("format"="password")))]
     pub password: Option<String>,
     /// TLS CipherSpec (e.g., `ANY_TLS12`). Optional; required for encrypted connections.
     pub cipher_spec: Option<String>,
@@ -1766,12 +1881,14 @@ pub struct ResponseConfig {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct SqlxConfig {
-    /// Database connection URL.
+    /// Database connection URL. If it contains userinfo, it will be treated as a secret.
+    #[cfg_attr(feature = "schema", schemars(extend("format"="password")))]
     pub url: String,
     /// Optional username. Takes precedence over any credentials embedded in the `url`.
     #[serde(default)]
     pub username: Option<String>,
     /// Optional password. Takes precedence over any credentials embedded in the `url`.
+    #[cfg_attr(feature = "schema", schemars(extend("format"="password")))]
     #[serde(default)]
     pub password: Option<String>,
     /// The table to interact with.
@@ -1840,6 +1957,7 @@ pub struct TlsConfig {
     /// Path to the client private key file (PEM).
     pub key_file: Option<String>,
     /// Password for the private key (if encrypted).
+    #[cfg_attr(feature = "schema", schemars(extend("format"="password")))]
     pub cert_password: Option<String>,
     /// If true, disable server certificate verification (insecure).
     #[serde(default)]
@@ -2359,6 +2477,9 @@ kafka_to_nats:
                 }
                 Middleware::Delay(_) => {}
                 Middleware::WeakJoin(_) => {}
+                Middleware::Limiter(_) => {}
+                Middleware::Buffer(_) => {}
+                Middleware::CookieJar(_) => {}
             }
         }
 

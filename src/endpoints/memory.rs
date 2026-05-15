@@ -307,7 +307,10 @@ impl MessagePublisher for MemoryPublisher {
 
                     Ok(Sent::Response(response))
                 } else {
-                    self.send_batch(vec![message]).await?;
+                    sender
+                        .send(vec![message])
+                        .await
+                        .map_err(|e| anyhow!("Failed to send to memory channel: {}", e))?;
                     Ok(Sent::Ack)
                 }
             }
@@ -913,6 +916,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_memory_request_reply_timeout_cleans_waiter() {
+        let topic = format!("mem_rr_timeout_{}", fast_uuid_v7::gen_id_str());
+        let correlation_id = fast_uuid_v7::gen_id_string();
+        let publisher = MemoryPublisher::new(&MemoryConfig {
+            topic: topic.clone(),
+            capacity: Some(10),
+            request_reply: true,
+            request_timeout_ms: Some(25),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let mut message = CanonicalMessage::from("request with no responder");
+        message
+            .metadata
+            .insert("correlation_id".to_string(), correlation_id.clone());
+
+        let err = publisher.send(message).await.unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("Request timed out waiting for response"));
+
+        let response_channel = get_or_create_response_channel(&topic);
+        assert!(
+            response_channel
+                .remove_waiter(&correlation_id)
+                .await
+                .is_none(),
+            "timed out request should clean up the registered waiter"
+        );
+    }
+
+    #[tokio::test]
     async fn test_memory_nack_requeue() {
         let topic = format!("test_nack_requeue_{}", fast_uuid_v7::gen_id_str());
         let config = MemoryConfig {
@@ -949,6 +985,83 @@ mod tests {
         let result =
             tokio::time::timeout(std::time::Duration::from_millis(100), consumer.receive()).await;
         assert!(result.is_err(), "Channel should be empty");
+    }
+
+    #[tokio::test]
+    async fn test_memory_dropped_batch_requeues_messages() {
+        let topic = format!("drop_requeue_{}", fast_uuid_v7::gen_id_str());
+        let config = MemoryConfig {
+            topic: topic.clone(),
+            capacity: Some(10),
+            enable_nack: true,
+            ..Default::default()
+        };
+        let mut consumer = MemoryConsumer::new(&config).unwrap();
+        let publisher = MemoryPublisher::new_local(&topic, 10);
+
+        publisher
+            .send_batch(vec!["first".into(), "second".into()])
+            .await
+            .unwrap();
+
+        let batch = consumer.receive_batch(2).await.unwrap();
+        assert_eq!(batch.messages.len(), 2);
+        drop(batch);
+
+        let requeued =
+            tokio::time::timeout(std::time::Duration::from_secs(1), consumer.receive_batch(2))
+                .await
+                .expect("Timed out waiting for dropped batch to be re-queued")
+                .unwrap();
+
+        assert_eq!(
+            requeued
+                .messages
+                .iter()
+                .map(CanonicalMessage::get_payload_str)
+                .collect::<Vec<_>>(),
+            vec!["first".to_string(), "second".to_string()]
+        );
+
+        (requeued.commit)(vec![MessageDisposition::Ack, MessageDisposition::Ack])
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_memory_batch_commit_rejects_mismatched_dispositions() {
+        let topic = format!("commit_mismatch_{}", fast_uuid_v7::gen_id_str());
+        let config = MemoryConfig {
+            topic: topic.clone(),
+            capacity: Some(10),
+            enable_nack: true,
+            ..Default::default()
+        };
+        let mut consumer = MemoryConsumer::new(&config).unwrap();
+        let publisher = MemoryPublisher::new_local(&topic, 10);
+
+        publisher
+            .send_batch(vec!["one".into(), "two".into()])
+            .await
+            .unwrap();
+
+        let batch = consumer.receive_batch(2).await.unwrap();
+        let err = (batch.commit)(vec![MessageDisposition::Ack])
+            .await
+            .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("Memory batch commit received mismatched disposition count"));
+
+        let retried =
+            tokio::time::timeout(std::time::Duration::from_secs(1), consumer.receive_batch(2))
+                .await
+                .expect("Timed out waiting for mismatched commit batch to be re-queued")
+                .unwrap();
+        assert_eq!(retried.messages.len(), 2);
+        (retried.commit)(vec![MessageDisposition::Ack, MessageDisposition::Ack])
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

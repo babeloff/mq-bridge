@@ -62,3 +62,47 @@ impl std::fmt::Debug for ReceivedBatch {
             .finish()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::traits::MessageDisposition;
+
+    #[test]
+    fn test_received_debug_hides_commit_implementation() {
+        let received = Received {
+            message: CanonicalMessage::from("single"),
+            commit: Box::new(|_| Box::pin(async move { Ok(()) })),
+        };
+
+        let debug = format!("{received:?}");
+        assert!(debug.contains("Received"));
+        assert!(debug.contains("<CommitFunc>"));
+        assert!(debug.contains("single"));
+    }
+
+    #[test]
+    fn test_received_batch_debug_hides_commit_implementation() {
+        let batch = ReceivedBatch {
+            messages: vec![
+                CanonicalMessage::from("first"),
+                CanonicalMessage::from("second"),
+            ],
+            commit: Box::new(|dispositions| {
+                Box::pin(async move {
+                    assert_eq!(dispositions.len(), 2);
+                    assert!(dispositions
+                        .into_iter()
+                        .all(|disposition| matches!(disposition, MessageDisposition::Ack)));
+                    Ok(())
+                })
+            }),
+        };
+
+        let debug = format!("{batch:?}");
+        assert!(debug.contains("ReceivedBatch"));
+        assert!(debug.contains("<BatchCommitFunc>"));
+        assert!(debug.contains("first"));
+        assert!(debug.contains("second"));
+    }
+}

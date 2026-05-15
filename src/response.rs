@@ -187,5 +187,73 @@ impl ToHandlerError for &str {
 
 #[cfg(test)]
 mod tests {
-    // Tests are integrated in type_handler or route tests, or added here
+    use super::*;
+    use crate::errors::ProcessingError;
+
+    #[test]
+    fn test_into_handled_converts_supported_success_types() {
+        assert!(matches!(().into_handled(), Handled::Ack));
+        assert!(matches!(
+            None::<CanonicalMessage>.into_handled(),
+            Handled::Ack
+        ));
+
+        let message = CanonicalMessage::from("payload");
+        match message.clone().into_handled() {
+            Handled::Publish(published) => assert_eq!(published.get_payload_str(), "payload"),
+            Handled::Ack => panic!("expected publish result"),
+        }
+
+        match Some(message).into_handled() {
+            Handled::Publish(published) => assert_eq!(published.get_payload_str(), "payload"),
+            Handled::Ack => panic!("expected publish result"),
+        }
+    }
+
+    #[test]
+    fn test_into_handler_result_converts_ok_variants() {
+        assert!(matches!(().into_handler_result().unwrap(), Handled::Ack));
+        assert!(matches!(
+            Option::<CanonicalMessage>::None
+                .into_handler_result()
+                .unwrap(),
+            Handled::Ack
+        ));
+
+        match CanonicalMessage::from("reply")
+            .into_handler_result()
+            .unwrap()
+        {
+            Handled::Publish(message) => assert_eq!(message.get_payload_str(), "reply"),
+            Handled::Ack => panic!("expected publish result"),
+        }
+
+        match Result::<Option<CanonicalMessage>, &str>::Ok(Some(CanonicalMessage::from("maybe")))
+            .into_handler_result()
+            .unwrap()
+        {
+            Handled::Publish(message) => assert_eq!(message.get_payload_str(), "maybe"),
+            Handled::Ack => panic!("expected publish result"),
+        }
+    }
+
+    #[test]
+    fn test_into_handler_result_and_to_handler_error_convert_errors() {
+        let retryable =
+            Result::<CanonicalMessage, anyhow::Error>::Err(anyhow::anyhow!("temporary"))
+                .into_handler_result()
+                .unwrap_err();
+        assert!(matches!(retryable, ProcessingError::Retryable(_)));
+
+        let non_retryable = Result::<(), &str>::Err("permanent")
+            .into_handler_result()
+            .unwrap_err();
+        assert!(matches!(non_retryable, ProcessingError::NonRetryable(_)));
+
+        let string_error = "string failure".to_string().to_handler_error();
+        assert!(matches!(string_error, ProcessingError::NonRetryable(_)));
+
+        let str_error = "str failure".to_handler_error();
+        assert!(matches!(str_error, ProcessingError::NonRetryable(_)));
+    }
 }

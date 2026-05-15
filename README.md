@@ -15,7 +15,9 @@
             crossing streams
 ```
 
-`mq-bridge` is an asynchronous message library for Rust. It connects different messaging systems, data stores, and protocols. Unlike a classic bridge that simply forwards messages, `mq-bridge` acts as a **programmable integration layer**, allowing for transformation, filtering, routing and event/command handling. It is built on Tokio and supports patterns like retries, dead-letter queues, and message deduplication.
+`mq-bridge` is an asynchronous message library for Rust. It connects message brokers, databases, files, HTTP/WebSocket endpoints, and in-memory channels behind one small set of traits.
+
+It is not only a forwarder. A route can transform, filter, fan out, retry, rate-limit, deduplicate, or turn a request into a response before the message reaches the next system. The core is built on Tokio and keeps the transport details at the edge, so application code can mostly work with `CanonicalMessage`s and handlers.
 
 
 ## Architecture
@@ -32,36 +34,45 @@ For implementation details and quick start examples for each usage type, see the
 
 ## Features
 
-*   **Supported Backends**: Kafka, NATS, AMQP (RabbitMQ), MQTT, MongoDB, SQL Databases (PostgreSQL, MySQL, SQLite via sqlx), HTTP, ZeroMQ, Files, AWS (SQS/SNS), IBM MQ, and in-memory channels.
+*   **Supported Backends**: Kafka, NATS, AMQP (RabbitMQ), MQTT, MongoDB, SQL Databases (PostgreSQL, MySQL, SQLite via sqlx), HTTP, WebSocket, ZeroMQ, Files, AWS (SQS/SNS), IBM MQ, and in-memory channels.
     > **Note**: IBM MQ is not included in the `full` feature set. It requires the `ibm-mq` feature and the IBM MQ Client library. See [mqi crate](https://crates.io/crates/mqi/) for installation details.
 *   **Configuration**: Routes can be defined via YAML, JSON or environment variables.
 *   **Programmable Logic**: Inject custom Rust handlers to transform or filter messages in-flight.
+*   **Batching**: Every endpoint uses the same `send_batch` / `receive_batch` shape. Routes default to single-message batches, but can switch to larger batches with `batch_size`.
 *   **Middleware**:
     *   **Retries**: Exponential backoff for transient failures.
     *   **Dead-Letter Queues (DLQ)**: Redirect failed messages.
     *   **Deduplication**: Message deduplication using `sled`.
+    *   **Limiter**: Best-effort throughput limiting in messages per second, including batch-aware pacing.
+    *   **Cookie Jar**: Persist and re-inject HTTP-style cookies or selected metadata across requests.
 *   **Concurrency**: Configurable concurrency per route using Tokio.
 
 ## Philosophy & Focus
 
-`mq-bridge` is designed as a **programmable integration layer**. Its primary goal is to decouple your application logic from the underlying messaging infrastructure.
+The project has one main bias: move data reliably without forcing the rest of the application to care too much about the transport.
 
-Unlike libraries that enforce specific architectural patterns (like strict CQRS/Event Sourcing domain modeling) or concurrency models (like Actors), `mq-bridge` remains unopinionated about your domain logic. Instead, it focuses on **reliable data movement** and **protocol abstraction**.
+That means `mq-bridge` tries to keep the boring parts boring. Kafka offsets, RabbitMQ nacks, HTTP responses, MongoDB polling, WebSocket frames, and file rows are all different in real life, but route code should still be able to receive a batch, process it, publish it, and commit it.
+
+Batching is a big part of that design. Every endpoint is optimized around batch-shaped APIs, even when the backend itself only has a single-message primitive. Batching is disabled by default (`batch_size: 1`) because it is the safest behavior and easiest to reason about. When throughput matters, increasing `batch_size` is usually the first knob to try. For example via `batch_size: 128` in yaml or `.with_batch_size(128)` for routes.
+
+The error handling follows the same idea. Batch publishing can report partial success, retryable failures, and non-retryable failures. Route commits are sequenced so cumulative-ack brokers do not accidentally acknowledge later messages before earlier batches are resolved. In other words: batching is not just a performance trick bolted onto the side; ack/nack behavior and retry/DLQ handling were built to work with it.
+
+What it does not try to be: a domain framework, an actor runtime, or a full stream processor. You can build CQRS-ish flows with it, but the library cares more about transport, routing, and delivery behavior than about prescribing your domain model.
 
 ## Status
 
-This library was created in 2025 and is still kind of new. 
+This library was created in 2025 and is still fairly new.
 
 It may still be possible that there are issues with
 - old or very new versions of broker servers
 - specific settings of the brokers
-- subscribe / event and response patterns if those are not available natively
-- nats, if jetstream support is disabled
-- TLS integration, as this also hasn't been tested a lot and is usually non-trivial to set up
+- subscribe/event and response patterns if those are not available natively
+- NATS without JetStream
+- TLS setups, which are usually non-trivial and have just been tested automatically, but not in detail.
 
 Automated integration and performance tests cover all supported endpoints, including queue and subscriber modes, request-reply (where supported), and protocol-specific behaviors. See the backend feature table below for details on configuration and protocol support.
 
-The following table tracks, which endpoints are already used in other projects actively for events. Send me a message or create an issue if you use an endpoint actively:
+The following table tracks which endpoints are already used actively in other projects for events. Send me a message or create an issue if you use another endpoint in production:
 
 | Endpoint  | Manual Test |
 |-----------|:-----------:|
@@ -84,17 +95,17 @@ All endpoints have automated integration tests and did not show data loss during
 
 
 ### When to use mq-bridge
-*   **Hybrid Messaging**: Connect systems speaking different protocols (e.g., MQTT to Kafka) without writing custom adapters.
-*   **Infrastructure Abstraction**: Write business logic that consumes `CanonicalMessage`s, allowing you to swap the underlying transport (e.g., switching from RabbitMQ to NATS) via configuration.
-*   **Resilient Pipelines**: Apply uniform reliability patterns (Retries, DLQ, Deduplication) across all your data flows.
-*   **Database Integration**: Easily combine databases with message brokers. Use it to ingest messages into a database (SQL/NoSQL) or to implement the Outbox Pattern by forwarding database rows to a broker.
-*   **Sidecar / Gateway**: Deploy as a standalone service to ingest, filter, and route messages before they reach your core services.
-*   **Polyglot Services**: Enable communication between services written in different languages (e.g., Node.js, Python, Go) that prefer different protocols (HTTP, gRPC, Kafka, AMQP) by acting as a universal translator and buffer.
+*   **Hybrid Messaging**: Connect systems speaking different protocols (e.g., MQTT to Kafka) without writing a custom adapter for every pair.
+*   **Batch-heavy Pipelines**: Increase throughput by moving messages in batches while keeping per-message ack/nack decisions.
+*   **Infrastructure Abstraction**: Write business logic against `CanonicalMessage`s and swap the underlying transport later.
+*   **Resilient Pipelines**: Apply retry, DLQ, deduplication, limiter, and cookie/session behavior consistently around endpoints.
+*   **Database Integration**: Combine databases with message brokers, for example by ingesting messages into SQL/MongoDB or forwarding outbox rows to a broker.
+*   **Sidecar / Gateway**: Run the bridge beside another service to ingest, filter, and route messages before they reach the core application.
 
 ### When NOT to use mq-bridge
 *   **Stateful Stream Processing**: For windowing, joins, or complex aggregations over time, dedicated stream processing engines are more suitable.
 *   **Domain Aggregate Management**: If you need a framework to manage the lifecycle, versioning, and replay of domain aggregates (Event Sourcing), use a specialized library. `mq-bridge` handles the *bus*, not the *entity*.
-*   **Specialization**: `mq-bridge` focuses on a subset of messaging patterns like pub/sub and batching, emulating them if not natively supported. If you need very specific features from a messaging library or protocol, the abstraction layer of `mq-bridge` may prevent you from using them.
+*   **Protocol-Specific Power Features**: `mq-bridge` intentionally exposes a common subset: publish/consume, pub/sub where possible, request-reply where possible, batching, middleware, and ack/nack handling. If your application depends on highly specific broker features, using that broker's native client directly may be better.
 
 ## Core Concepts
 
@@ -124,6 +135,7 @@ The table below summarizes the capabilities and configuration for each backend:
 | **NATS** | Set `subscriber_mode: true` | **Native** (Inbox) | **Yes** (JetStream Nak) |
 | **Sled** | Set `delete_after_read: false` | No | **Yes** (Tx Rollback) |
 | **SQLx** | Not supported | No | Eventual (Skip Delete) |
+| **WebSocket** | N/A | No | No |
 | **ZeroMQ** | Set `socket_type: "sub"` | **Native** (REQ/REP) | No |
 
 ### Feature Details
@@ -133,7 +145,7 @@ The table below summarizes the capabilities and configuration for each backend:
 *   **Nack Support**: If "Yes", the backend supports explicit negative acknowledgement triggering redelivery. "Eventual" means redelivery depends on timeout or connection drop. "Simulated" is handled in-memory by the bridge.
 
 ### Response Endpoint
-The `response` output endpoint allows sending a reply back to the requester. This is useful for synchronous request-reply patterns (e.g., HTTP-to-NATS-to-HTTP). Use `response: {}` as the output endpoint configuration.
+The `response` output endpoint sends a reply back to the original requester. This is useful for synchronous request-reply flows, for example HTTP-to-NATS-to-HTTP. Use `response: {}` as the output endpoint configuration.
 
 *   **Caveats**:
     *   If the input does not support responses (e.g., File, SQLx), the message sent to `response` will be dropped.
@@ -142,12 +154,12 @@ The `response` output endpoint allows sending a reply back to the requester. Thi
 
 ## Usage
 
-There is a separate repository to use mq-bridge as standalone app, for example as docker container that can be configured via yaml or env variables:
+There is a separate repository for running mq-bridge as a standalone app, for example as a Docker container configured via YAML or environment variables:
 https://github.com/marcomq/mq-bridge-app
 
 ### Programmatic Handlers
 
-For implementing business logic, `mq-bridge` provides a handler layer that is separate from transport-level middleware. This allows you to process messages programmatically.
+For business logic, `mq-bridge` provides a handler layer separate from transport-level middleware. This is where message-specific code usually belongs.
 
 #### Raw Handlers
 
@@ -174,7 +186,7 @@ let command_handler = |mut msg: CanonicalMessage| async move {
 
 #### Typed Handlers
 
-For more structured, type-safe message handling, `mq-bridge` provides `TypeHandler`. It deserializes messages into a specific Rust type before passing them to a handler function. This simplifies message processing by eliminating manual parsing and type checking.
+For more structured, type-safe message handling, `mq-bridge` provides `TypeHandler`. It deserializes messages into a specific Rust type before passing them to a handler function, so handlers do not need to repeat the same parsing code.
 
 Message selection is based on the `kind` metadata field in the `CanonicalMessage`.
 
@@ -277,13 +289,13 @@ async fn main() {
 
 ## Patterns: Request-Response
 
-`mq-bridge` supports request-response patterns, essential for building interactive services (e.g., web APIs). This pattern allows a client to send a request and wait for a correlated response. Due to the asynchronous nature of messaging, ensuring the correct response is delivered to the correct requester is critical, especially under concurrent loads.
+`mq-bridge` supports request-response patterns for interactive services such as web APIs. A client can send a request and wait for the matching response, while the bridge keeps the correlation details away from the handler.
 
-`mq-bridge` offers two ways to handle this, with the `response` output being the most direct and safest for handling concurrency.
+The `response` output is the most direct option and the safest one under concurrency.
 
 ### The `response` Output Endpoint (Recommended)
 
-The recommended approach for request-response is to use the dedicated `response` endpoint in your route's `output`.
+For request-response routes, use the dedicated `response` endpoint in the route's `output`.
 
 **How it works:**
 1. An input endpoint that supports request-response (like `http`) receives a request.
@@ -291,11 +303,11 @@ The recommended approach for request-response is to use the dedicated `response`
 3. The final message is sent to the `output`.
 4. If the output is `response: {}`, the bridge sends the message back to the original input source, which then sends it as the reply (e.g., as an HTTP response).
 
-This model inherently solves the correlation problem. The response is part of the same execution context as the request, so there's no risk of mixing up responses between different concurrent requests.
+The response stays in the same execution context as the request, so concurrent requests do not need to share a reply queue and race on correlation IDs.
 
 #### Example: MongoDB Request-Response
 
-Consider a scenario where a service writes a request document to MongoDB and waits for a reply. This library picks up the document, processes it via a handler, and writes the result back to a reply collection.
+For example, a service can write a request document to MongoDB and wait for a reply. The bridge reads the document, runs the handler, and writes the result back to the reply collection.
 
 **YAML Configuration (`mq-bridge.yaml`):**
 ```yaml
@@ -334,19 +346,19 @@ async fn run() {
 
     // 3. Attach the handler to the output endpoint
     // route.output.handler = Some(std::sync::Arc::new(handler));
-    
+
     // 4. Run the route
     // route.deploy("api_gateway").await.unwrap();
 }
 ```
 
-## Patterns: CQRS 
-mq-bridge is well-suited for implementing Command Query Responsibility Segregation (CQRS). By combining Routes with Typed Handlers, the bridge serves as both the Command Bus and the Event Bus. 
-* Command Bus: An input source (e.g., HTTP) receives a command. A TypeHandler processes it (Write Model) and optionally emits an event. 
-* Event Bus: The emitted event is published to a broker (e.g., Kafka). Downstream routes subscribe to these events to update Read Models (Projections). 
+## Patterns: CQRS
+mq-bridge can be used for CQRS-style flows. With routes and typed handlers, it can act as a command bus and an event bus without becoming a domain framework.
+* Command Bus: An input source (e.g., HTTP) receives a command. A TypeHandler processes it (Write Model) and optionally emits an event.
+* Event Bus: The emitted event is published to a broker (e.g., Kafka). Downstream routes subscribe to these events to update Read Models (Projections).
 
-```rust 
-// 1. Command Handler (Write Side) 
+```rust
+// 1. Command Handler (Write Side)
 let command_bus = TypeHandler::new()
     .add("submit_order", |cmd: SubmitOrder| async move {
         // Execute business logic, save to DB...
@@ -357,20 +369,29 @@ let command_bus = TypeHandler::new()
         ))
 });
 
-// 2. Event Handler (Read Side / Projection) 
+// 2. Event Handler (Read Side / Projection)
 let projection_handler = TypeHandler::new()
     .add("order_submitted", |evt: OrderSubmitted| async move {
         // Update read database / cache...
         // Ok(()) is equivalent to Handled::Ack
         Ok(())
-}); 
+});
 ```
-## Configuration 
 
-All routes and their endpoints are defined via a configuration file (e.g., mq-bridge.yaml), JSON, or environment variables. For a complete reference of all options, middleware, and examples, see the [Configuration Guide](CONFIGURATION.md)
+## Configuration
+
+All routes and endpoints can be defined via a configuration file (for example `mq-bridge.yaml`), JSON, or environment variables. For a complete reference of options, middleware, and examples, see the [Configuration Guide](CONFIGURATION.md).
+
+Important route-level knobs:
+
+*   `batch_size`: maximum messages per route iteration. Defaults to `1`; increase it when throughput matters.
+*   `concurrency`: number of route workers. Defaults to `1`; useful for high-latency handlers or endpoints.
+*   `commit_concurrency_limit`: maximum queued in-flight commit operations used by ordered commit sequencing. Defaults to `4096`.
+
+Middleware can be attached to inputs or outputs. The most commonly used ones are `retry`, `dlq`, `deduplication`, `limiter`, and `cookie_jar`. Retry/DLQ are especially useful with batching because partial failures can be retried or sent to a DLQ without treating the entire batch as equally broken.
 
 ## Running Tests
-The project includes a comprehensive suite of integration and performance tests that require Docker.
+The project includes integration and performance tests. Most backend tests require Docker.
 
 To run the performance benchmarks for all supported backends:
 ```sh
@@ -385,38 +406,23 @@ The times are not stable yet, it is therefore recommended to perform the integra
 
 ## Contributing
 
-We welcome contributions! See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines on how to get started, code style, and submitting pull requests.
+Contributions are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for setup notes, code style, and pull request guidelines.
 
 ## AI Disclaimer
 
-This library has been widely written with AI assistance. 
+This library has been written with a lot of AI assistance.
 
-Some of the code - the core for example, was originally written by myself, 
-but most other was generated by AI. I mostly used Gemini for 
-planning, analysis and writing, CodeRabbit for reviews and Claude and Codex
-for bug fixes and additional planning.
-While some of the AI output was great, some other output wasn't.
-I am aware that in year 2026, AI is still not generating perfect code and sometimes
+The core started as my own code, and many endpoints and docs were expanded with help from Gemini, CodeRabbit, Claude, and Codex. The useful part was speed: once the endpoint traits were stable, adding more transports became much easier. The dangerous part is the usual one: generated code can look plausible while still missing important details. I am aware that in year 2026, AI is still not generating perfect code and sometimes
 breaks simple stuff or forgets important lines during refactorings that 
-later result in severe bugs. 
-I avoided agent-mode commits to prevent hard-to-fix architectural issues and
-manually reviewed, cleaned up, and refactored all output code.
+later result in severe bugs.
+
+For that reason I reviewed each commit manually to prevent hard-to-fix architectural issuess and cleaned up, and refactored the generated output.
 
 **I do trust the current code as much as if it would be completely written by myself.**
 
-Due to the large feature set, there might still be unfixed issues. I am currently
-focusing on tests and documentation and trying not to add new features for now.
+Due to the large feature set, there may still be unfixed issues. The current focus is testing and documentation.
 
-I didn't change the AI code appearance, so you will sometimes still see code that just
-looks as it is plain from AI and also most of the readme here was actually written
-by AI. I don't think it is bad practice, to keep the original code and text appearance. 
-I'm not an english native speaker, so the AI output for english text is just
-way better than my text. For AI code, the readability is usually
-good, even if it is more verbose than what I would write.
-However, especially for the different endpoints, there is already a lot of existing
-code and the AI could also just assist a lot there. Thats mostly the reason,
-why there are so many available endpoints in this library, they just could be added
-very easily and showed a sufficient code quality.
+Some parts of the code are more verbose than I would write by hand, but I kept the readable parts when they worked well. I am not a native English speaker, so AI assistance is also useful for documentation. The important part is that the code is reviewed and tested, not that every sentence or helper function looks hand-typed from the first draft.
 
 ## License
 `mq-bridge` is licensed under the MIT License.

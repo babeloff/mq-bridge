@@ -1,9 +1,14 @@
 #![allow(dead_code, unused)]
 
-use mq_bridge::models::{Endpoint, EndpointType, HttpConfig, Route};
+use mq_bridge::models::{
+    CookieJarMiddleware, Endpoint, EndpointType, HttpConfig, Middleware, Route,
+};
 use mq_bridge::test_utils::{setup_logging, PERF_TEST_MESSAGE_COUNT};
 use serde_yaml_ng;
 use std::collections::HashMap;
+use std::convert::Infallible;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const CONFIG_YAML: &str = r#"
@@ -72,7 +77,23 @@ pub async fn test_http_performance_pipeline() {
                 serde_yaml_ng::from_value(routes_val.clone()).expect("Failed to parse routes");
 
             let in_route = routes[&in_route_name].clone();
-            let out_route = routes[&out_route_name].clone();
+            let mut out_route = routes[&out_route_name].clone(); // Make out_route mutable
+
+            let enable_dummy_handler = std::env::var("MQB_ENABLE_DUMMY_HANDLER")
+                .map(|s| s.to_lowercase() == "true")
+                .unwrap_or(false);
+
+            let handler_description = if enable_dummy_handler {
+                let dummy_handler = |msg: mq_bridge::CanonicalMessage| async move {
+                    // This handler does minimal work: just forward the message.
+                    // It simulates the overhead of a handler without actual business logic.
+                    Ok(mq_bridge::Handled::Publish(msg))
+                };
+                out_route = out_route.with_handler(dummy_handler);
+                " (with dummy handler)"
+            } else {
+                ""
+            };
 
             // Attempt to deploy the HTTP consumer (server) and probe readiness.
             match out_route.deploy(&out_route_name).await {
@@ -138,10 +159,19 @@ pub async fn test_http_performance_pipeline() {
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
+        let duration = start.elapsed();
 
         // Stop both routes (Route::stop has a built-in 5 s timeout so this won't hang).
         mq_bridge::Route::stop(&in_route_name).await;
         mq_bridge::Route::stop(&out_route_name).await;
+
+        let messages_per_second = received as f64 / duration.as_secs_f64();
+        mq_bridge::test_utils::add_performance_result(mq_bridge::test_utils::PerformanceResult {
+            test_name: "HTTP Pipeline".to_string(),
+            write_performance: messages_per_second,
+            read_performance: messages_per_second,
+            ..Default::default()
+        });
 
         assert_eq!(
             received, PERF_TEST_MESSAGE_COUNT,
@@ -170,4 +200,129 @@ async fn test_http_concurrency() {
     let output = Endpoint::new_memory("con_out_http", 10);
 
     mq_bridge::test_utils::run_concurrency_test(input, output, sender).await;
+}
+
+#[cfg(feature = "http")]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_http_cookie_jar_persists_session_headers() {
+    use bytes::Bytes;
+    use http_body_util::Full;
+    use hyper::body::Incoming;
+    use hyper::server::conn::http1;
+    use hyper::service::service_fn;
+    use hyper::{Request, Response, StatusCode};
+    use hyper_util::rt::TokioIo;
+    use mq_bridge::{CanonicalMessage, Publisher};
+    use tokio::net::TcpListener;
+
+    setup_logging();
+
+    let port = get_free_port();
+    let addr = format!("127.0.0.1:{port}");
+    let observed_headers = Arc::new(Mutex::new(Vec::<HashMap<String, String>>::new()));
+    let request_count = Arc::new(AtomicUsize::new(0));
+
+    let server = {
+        let addr = addr.clone();
+        let observed_headers = Arc::clone(&observed_headers);
+        let request_count = Arc::clone(&request_count);
+        tokio::spawn(async move {
+            let listener = TcpListener::bind(&addr).await.unwrap();
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let observed_headers = Arc::clone(&observed_headers);
+                let request_count = Arc::clone(&request_count);
+                tokio::spawn(async move {
+                    let service = service_fn(move |req: Request<Incoming>| {
+                        let observed_headers = Arc::clone(&observed_headers);
+                        let request_count = Arc::clone(&request_count);
+                        async move {
+                            let mut headers = HashMap::new();
+                            if let Some(cookie) = req
+                                .headers()
+                                .get("cookie")
+                                .and_then(|value| value.to_str().ok())
+                            {
+                                headers.insert("cookie".to_string(), cookie.to_string());
+                            }
+                            if let Some(csrf) = req
+                                .headers()
+                                .get("x-forwarded-csrf")
+                                .and_then(|value| value.to_str().ok())
+                            {
+                                headers.insert("x-forwarded-csrf".to_string(), csrf.to_string());
+                            }
+                            observed_headers.lock().unwrap().push(headers);
+
+                            let request_index = request_count.fetch_add(1, Ordering::SeqCst);
+                            let mut builder = Response::builder().status(StatusCode::OK);
+                            if request_index == 0 {
+                                builder = builder
+                                    .header("set-cookie", "session_id=abc123; Path=/; HttpOnly")
+                                    .header("x-csrf-token", "csrf-123");
+                            }
+
+                            Ok::<_, Infallible>(
+                                builder.body(Full::new(Bytes::from_static(b"ok"))).unwrap(),
+                            )
+                        }
+                    });
+
+                    let _ = http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await;
+                });
+            }
+        })
+    };
+
+    assert!(wait_for_server_ready(&addr, Duration::from_secs(5)).await);
+
+    let mut endpoint = Endpoint::new(EndpointType::Http(HttpConfig {
+        url: format!("http://{addr}"),
+        request_timeout_ms: Some(2_000),
+        ..Default::default()
+    }));
+    endpoint
+        .middlewares
+        .push(Middleware::CookieJar(CookieJarMiddleware {
+            capture_metadata_keys: vec!["x-csrf-token".to_string()],
+            inject_metadata: HashMap::from([(
+                "x-forwarded-csrf".to_string(),
+                "x-csrf-token".to_string(),
+            )]),
+            ..Default::default()
+        }));
+
+    let publisher = Publisher::new(endpoint).await.unwrap();
+    publisher
+        .request(CanonicalMessage::from("first"))
+        .await
+        .unwrap();
+    publisher
+        .request(CanonicalMessage::from("second"))
+        .await
+        .unwrap();
+
+    let started = Instant::now();
+    while request_count.load(Ordering::SeqCst) < 2 {
+        assert!(started.elapsed() < Duration::from_secs(2));
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let observed_headers = observed_headers.lock().unwrap().clone();
+    assert_eq!(observed_headers.len(), 2);
+    assert!(!observed_headers[0].contains_key("cookie"));
+    assert_eq!(
+        observed_headers[1].get("cookie").map(String::as_str),
+        Some("session_id=abc123")
+    );
+    assert_eq!(
+        observed_headers[1]
+            .get("x-forwarded-csrf")
+            .map(String::as_str),
+        Some("csrf-123")
+    );
+
+    server.abort();
 }

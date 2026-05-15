@@ -995,7 +995,7 @@ async fn handle_request_internal(
 
     // Read body with a timeout to prevent hanging on abandoned client connections.
     // This prevents "zombie" tasks from saturating the runtime during retry storms.
-    let body_collect_timeout = std::time::Duration::from_secs(10).min(state.request_timeout);
+    let body_collect_timeout = state.request_timeout;
     let body_bytes = match tokio::time::timeout(body_collect_timeout, req.collect()).await {
         Ok(Ok(b)) => b.to_bytes(),
         Ok(Err(e)) => {
@@ -1219,13 +1219,14 @@ pub struct HttpPublisher {
         >,
     >,
     url: String,
+    base_uri: hyper::Uri,
     /// Default HTTP method to use if not overridden by message metadata
     method: hyper::Method,
-    request_timeout: Option<std::time::Duration>,
+    request_timeout: std::time::Duration,
     batch_concurrency: usize,
     compression_enabled: bool,
     compression_threshold_bytes: usize,
-    basic_auth: Option<(String, String)>,
+    basic_auth_header: Option<String>,
     custom_headers: HashMap<String, String>,
 }
 
@@ -1261,6 +1262,10 @@ impl HttpPublisher {
 
         let url = config.tls.normalize_url(&config.url);
 
+        let base_uri = url
+            .parse::<hyper::Uri>()
+            .map_err(|e| anyhow::anyhow!("Invalid configured URL '{}': {}", url, e))?;
+
         let method = config
             .method
             .as_deref()
@@ -1271,21 +1276,21 @@ impl HttpPublisher {
             .transpose()?
             .unwrap_or(hyper::Method::POST);
 
-        let request_timeout = config
-            .request_timeout_ms
-            .map(std::time::Duration::from_millis);
+        let request_timeout =
+            std::time::Duration::from_millis(config.request_timeout_ms.unwrap_or(30000));
 
         let compression_threshold_bytes = config.compression_threshold_bytes.unwrap_or(1024);
 
         Ok(Self {
             client: std::sync::Arc::new(client),
             url,
+            base_uri,
             method,
             request_timeout,
             batch_concurrency,
             compression_enabled: config.compression_enabled,
             compression_threshold_bytes,
-            basic_auth: config.basic_auth.clone(),
+            basic_auth_header: basic_auth_header_value(config.basic_auth.as_ref()),
             custom_headers: config.custom_headers.clone(),
         })
     }
@@ -1307,14 +1312,6 @@ impl MessagePublisher for HttpPublisher {
             .unwrap_or_else(|| self.method.clone());
 
         let uri = if let Some(path) = message.metadata.get("http_path") {
-            let base_uri = self.url.parse::<hyper::Uri>().map_err(|e| {
-                PublisherError::NonRetryable(anyhow::anyhow!(
-                    "Invalid configured URL '{}': {}",
-                    self.url,
-                    e
-                ))
-            })?;
-
             let mut path_and_query = path.clone();
             if let Some(query) = message.metadata.get("http_query") {
                 if !query.is_empty() {
@@ -1323,10 +1320,10 @@ impl MessagePublisher for HttpPublisher {
                 }
             }
             let mut builder = hyper::Uri::builder();
-            if let Some(scheme) = base_uri.scheme() {
+            if let Some(scheme) = self.base_uri.scheme() {
                 builder = builder.scheme(scheme.clone());
             }
-            if let Some(authority) = base_uri.authority() {
+            if let Some(authority) = self.base_uri.authority() {
                 builder = builder.authority(authority.clone());
             }
             builder
@@ -1336,13 +1333,7 @@ impl MessagePublisher for HttpPublisher {
                     PublisherError::NonRetryable(anyhow::anyhow!("Failed to build URI: {}", e))
                 })?
         } else {
-            self.url.parse::<hyper::Uri>().map_err(|e| {
-                PublisherError::NonRetryable(anyhow::anyhow!(
-                    "Invalid configured URL '{}': {}",
-                    self.url,
-                    e
-                ))
-            })?
+            self.base_uri.clone()
         };
 
         let mut request_builder = Request::builder().method(method).uri(uri);
@@ -1361,7 +1352,7 @@ impl MessagePublisher for HttpPublisher {
         }
 
         // Only attach Basic auth when credentials are actually configured.
-        if let Some(header_value) = basic_auth_header_value(self.basic_auth.as_ref()) {
+        if let Some(header_value) = self.basic_auth_header.as_deref() {
             request_builder = request_builder.header("Authorization", header_value);
         }
 
@@ -1389,10 +1380,7 @@ impl MessagePublisher for HttpPublisher {
             PublisherError::NonRetryable(anyhow::anyhow!("Failed to build request: {}", e))
         })?;
 
-        let timeout_dur = self
-            .request_timeout
-            .unwrap_or(std::time::Duration::from_secs(30));
-        let future = tokio::time::timeout(timeout_dur, self.client.request(request));
+        let future = tokio::time::timeout(self.request_timeout, self.client.request(request));
 
         let response: hyper::Response<Incoming> = match future.await {
             Ok(Ok(resp)) => resp,
@@ -1408,7 +1396,7 @@ impl MessagePublisher for HttpPublisher {
         };
 
         let response_status = response.status();
-        let mut response_metadata = HashMap::new();
+        let mut response_metadata = HashMap::with_capacity(response.headers().len() + 1);
         response_metadata.insert(
             "http_version".to_string(),
             format!("{:?}", response.version()),
@@ -1426,10 +1414,7 @@ impl MessagePublisher for HttpPublisher {
         // Use a shorter cap for body collection — the full request timeout was already
         // spent on getting the response headers. Reusing it here could double the total
         // wall time a single send() call blocks the caller.
-        let body_collect_timeout = self
-            .request_timeout
-            .unwrap_or(std::time::Duration::from_secs(30))
-            .min(std::time::Duration::from_secs(10));
+        let body_collect_timeout = self.request_timeout;
         let response_bytes_raw = match tokio::time::timeout(
             body_collect_timeout,
             response.into_body().collect(),
@@ -1499,6 +1484,21 @@ impl MessagePublisher for HttpPublisher {
 
         if messages.is_empty() {
             return Ok(SentBatch::Ack);
+        }
+
+        if messages.len() == 1 {
+            let message = messages.into_iter().next().expect("checked len");
+            return match self.send(message.clone()).await {
+                Ok(Sent::Ack) => Ok(SentBatch::Ack),
+                Ok(Sent::Response(resp)) => Ok(SentBatch::Partial {
+                    responses: Some(vec![resp]),
+                    failed: Vec::new(),
+                }),
+                Err(e) => Ok(SentBatch::Partial {
+                    responses: None,
+                    failed: vec![(message, e)],
+                }),
+            };
         }
 
         trace!(

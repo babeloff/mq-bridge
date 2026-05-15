@@ -329,6 +329,13 @@ async fn test_all_performance_pipeline() {
             integration::http::test_http_performance_pipeline().await;
         }
     }
+    #[cfg(feature = "websocket")]
+    {
+        if should_run("websocket") {
+            println!("\n\n>>> Starting WebSocket Performance Pipeline Test...");
+            integration::websocket::test_websocket_performance_pipeline().await;
+        }
+    }
     #[cfg(feature = "sqlx")]
     {
         if should_run("sqlx") || should_run("postgres") {
