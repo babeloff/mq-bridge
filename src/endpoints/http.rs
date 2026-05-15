@@ -1489,8 +1489,8 @@ impl MessagePublisher for HttpPublisher {
         if messages.len() == 1 {
             let message = messages.into_iter().next().expect("checked len");
             return match self.send(message.clone()).await {
-                Sent::Ack => Ok(SentBatch::Ack),
-                Sent::Response(resp) => Ok(SentBatch::Partial {
+                Ok(Sent::Ack) => Ok(SentBatch::Ack),
+                Ok(Sent::Response(resp)) => Ok(SentBatch::Partial {
                     responses: Some(vec![resp]),
                     failed: Vec::new(),
                 }),
