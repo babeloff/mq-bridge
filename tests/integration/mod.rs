@@ -31,16 +31,15 @@ pub mod postgres;
 #[cfg(feature = "sqlx")]
 pub mod sqlite;
 pub mod tls_helpers;
-#[cfg(feature = "zeromq")]
-pub mod zeromq;
 #[cfg(feature = "websocket")]
 pub mod websocket;
+#[cfg(feature = "zeromq")]
+pub mod zeromq;
 
 pub mod file;
 pub mod logic_test;
 pub mod memory;
 // performance_static was just for internal optimiztion - not a real test
-
 
 #[cfg(feature = "grpc")]
 pub mod grpc_tls;
