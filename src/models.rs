@@ -121,6 +121,7 @@ impl Default for Route {
 ///     concurrency: 10,
 ///     batch_size: 5,
 ///     commit_concurrency_limit: 1024,
+///     ..Default::default()
 /// };
 /// ```
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
@@ -146,7 +147,20 @@ pub struct RouteOptions {
     /// Lower values apply backpressure earlier; higher values allow larger commit backlogs.
     /// Defaults to 4096.
     #[serde(default = "default_commit_concurrency_limit")]
+    #[cfg_attr(feature = "schema", schemars(range(min = 1)))]
     pub commit_concurrency_limit: usize,
+    /// Time to wait for a route to establish connections before startup fails. Defaults to 5000ms.
+    #[serde(default = "default_startup_timeout_ms")]
+    pub startup_timeout_ms: u64,
+    /// Time to wait before reconnecting after a transient route failure. Defaults to 5000ms.
+    #[serde(default = "default_reconnect_interval_ms")]
+    pub reconnect_interval_ms: u64,
+    /// Delay after an empty receive batch to avoid hot polling. Set to 0 to only yield. Defaults to 10ms.
+    #[serde(default = "default_empty_batch_delay_ms")]
+    pub empty_batch_delay_ms: u64,
+    /// Allows fault-injection middleware such as random_panic. Disabled by default.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub allow_fault_injection: bool,
 }
 
 impl Default for RouteOptions {
@@ -156,7 +170,28 @@ impl Default for RouteOptions {
             concurrency: default_concurrency(),
             batch_size: default_batch_size(),
             commit_concurrency_limit: default_commit_concurrency_limit(),
+            startup_timeout_ms: default_startup_timeout_ms(),
+            reconnect_interval_ms: default_reconnect_interval_ms(),
+            empty_batch_delay_ms: default_empty_batch_delay_ms(),
+            allow_fault_injection: false,
         }
+    }
+}
+
+impl RouteOptions {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.concurrency == 0 {
+            return Err(anyhow::anyhow!("route concurrency must be at least 1"));
+        }
+        if self.batch_size == 0 {
+            return Err(anyhow::anyhow!("route batch_size must be at least 1"));
+        }
+        if self.commit_concurrency_limit == 0 {
+            return Err(anyhow::anyhow!(
+                "route commit_concurrency_limit must be at least 1"
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -170,6 +205,22 @@ pub(crate) fn default_batch_size() -> usize {
 
 pub(crate) fn default_commit_concurrency_limit() -> usize {
     4096
+}
+
+pub(crate) fn default_startup_timeout_ms() -> u64 {
+    5000
+}
+
+pub(crate) fn default_reconnect_interval_ms() -> u64 {
+    5000
+}
+
+pub(crate) fn default_empty_batch_delay_ms() -> u64 {
+    10
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 fn default_output_endpoint() -> Endpoint {

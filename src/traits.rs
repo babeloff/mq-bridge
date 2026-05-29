@@ -192,6 +192,7 @@ pub trait MessageConsumer: Send + Sync {
                 });
             }
             // Batch was success but empty, which is unexpected for receive(1). Loop.
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
             tokio::task::yield_now().await;
         }
     }
