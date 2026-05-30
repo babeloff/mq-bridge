@@ -13,6 +13,8 @@ pub mod file;
 pub mod grpc;
 #[cfg(feature = "http")]
 pub mod http;
+#[cfg(feature = "http")]
+mod http_stream;
 #[cfg(feature = "ibm-mq")]
 pub mod ibm_mq;
 #[cfg(feature = "kafka")]
@@ -32,6 +34,7 @@ pub mod sled;
 #[cfg(feature = "sqlx")]
 pub mod sqlx;
 pub mod static_endpoint;
+pub mod stream_buffer;
 pub mod switch;
 #[cfg(feature = "websocket")]
 pub mod websocket;
@@ -39,7 +42,9 @@ pub mod websocket;
 pub mod zeromq;
 use crate::endpoints::memory::{get_or_create_channel, MemoryChannel};
 use crate::middleware::apply_middlewares_to_consumer;
-use crate::models::{Endpoint, EndpointType, MemoryConfig, Middleware, ResponseConfig};
+use crate::models::{
+    Endpoint, EndpointType, MemoryConfig, Middleware, ResponseConfig, StreamBufferConfig,
+};
 use crate::route::get_endpoint_factory;
 use crate::traits::{BoxFuture, MessageConsumer, MessagePublisher};
 use anyhow::{anyhow, Result};
@@ -69,6 +74,13 @@ impl Endpoint {
     }
     pub fn new_response() -> Self {
         Self::new(EndpointType::Response(ResponseConfig::default()))
+    }
+    pub fn new_stream_buffer(topic: &str, correlation_id: Option<&str>, capacity: usize) -> Self {
+        Self::new(EndpointType::StreamBuffer(StreamBufferConfig {
+            topic: topic.to_string(),
+            correlation_id: correlation_id.map(str::to_string),
+            capacity: Some(capacity),
+        }))
     }
     pub fn has_retry_middleware(&self) -> bool {
         self.middlewares
@@ -401,6 +413,9 @@ fn check_consumer_recursive(
                         .to_string(),
                     );
             }
+            if cfg.stream_response_to.is_some() {
+                warnings.push("Endpoint 'http' is used as a consumer, but 'stream_response_to' is a publisher-only option and will be ignored.".to_string());
+            }
             Ok(warnings)
         }
         #[cfg(feature = "sqlx")]
@@ -428,6 +443,15 @@ fn check_consumer_recursive(
                     "Endpoint 'memory' is used as a consumer, but 'request_timeout_ms' is a publisher-only option and will be ignored."
                     .to_string()
                 );
+            }
+            Ok(warnings)
+        }
+        EndpointType::StreamBuffer(cfg) => {
+            if cfg.correlation_id.is_none() {
+                return Err(anyhow!(
+                    "[route:{}] stream_buffer consumer must specify 'correlation_id'",
+                    route_name
+                ));
             }
             Ok(warnings)
         }
@@ -593,6 +617,9 @@ async fn create_base_consumer(
         EndpointType::WebSocket(cfg) => Ok(boxed(websocket::WebSocketConsumer::new(cfg).await?)),
         EndpointType::Static(cfg) => Ok(boxed(static_endpoint::StaticRequestConsumer::new(cfg)?)),
         EndpointType::Memory(cfg) => Ok(boxed(memory::MemoryConsumer::new(cfg)?)),
+        EndpointType::StreamBuffer(cfg) => {
+            Ok(boxed(stream_buffer::StreamBufferConsumer::new(cfg)?))
+        }
         #[cfg(feature = "sled")]
         EndpointType::Sled(cfg) => Ok(boxed(sled::SledConsumer::new(cfg)?)),
         #[cfg(feature = "mongodb")]
@@ -813,6 +840,12 @@ fn check_publisher_recursive(
                     .to_string()
                 );
             }
+            if _cfg.receive_streamable {
+                warnings.push(
+                    "Endpoint 'http' is used as a publisher, but 'receive_streamable' is a consumer-only option and will be ignored."
+                    .to_string()
+                );
+            }
             Ok(warnings)
         }
         #[cfg(feature = "grpc")]
@@ -885,6 +918,15 @@ fn check_publisher_recursive(
             if cfg.enable_nack {
                 warnings.push(
                     "Endpoint 'memory' is used as a publisher, but 'enable_nack' is a consumer-only option and will be ignored."
+                    .to_string()
+                );
+            }
+            Ok(warnings)
+        }
+        EndpointType::StreamBuffer(cfg) => {
+            if cfg.correlation_id.is_some() {
+                warnings.push(
+                    "Endpoint 'stream_buffer' is used as a publisher, but 'correlation_id' is a consumer-only option and will be ignored."
                     .to_string()
                 );
             }
@@ -1097,7 +1139,22 @@ async fn create_base_publisher(
         }
         #[cfg(feature = "http")]
         EndpointType::Http(cfg) => {
-            let sink = http::HttpPublisher::new(cfg).await?;
+            let stream_response_sink =
+                if let Some(stream_response_to) = cfg.stream_response_to.as_deref() {
+                    Some(
+                        create_publisher_with_depth(
+                            route_name.to_string(),
+                            stream_response_to.clone(),
+                            depth + 1,
+                        )
+                        .await?,
+                    )
+                } else {
+                    None
+                };
+            let sink =
+                http::HttpPublisher::new_with_stream_response_sink(cfg, stream_response_sink)
+                    .await?;
             Ok(Box::new(sink) as Box<dyn MessagePublisher>)
         }
         #[cfg(feature = "websocket")]
@@ -1122,6 +1179,10 @@ async fn create_base_publisher(
         )?) as Box<dyn MessagePublisher>),
         EndpointType::Memory(cfg) => {
             Ok(Box::new(memory::MemoryPublisher::new(cfg)?) as Box<dyn MessagePublisher>)
+        }
+        EndpointType::StreamBuffer(cfg) => {
+            Ok(Box::new(stream_buffer::StreamBufferPublisher::new(cfg)?)
+                as Box<dyn MessagePublisher>)
         }
         #[cfg(feature = "sled")]
         EndpointType::Sled(cfg) => {

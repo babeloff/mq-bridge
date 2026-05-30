@@ -3,6 +3,10 @@
 //  Licensed under MIT License, see License file for more details
 //  git clone https://github.com/marcomq/mq-bridge
 
+use super::http_stream::{
+    handle_streamable_request, stream_request_format, stream_response_format,
+    HttpReceiveStreamConfig,
+};
 use crate::canonical_message::tracing_support::LazyMessageIds;
 use crate::models::{HttpConfig, TlsConfig};
 use crate::traits::{
@@ -99,6 +103,7 @@ struct HttpConsumerState {
     message_id_header: String,
     request_timeout: std::time::Duration,
     fire_and_forget: bool,
+    receive_streamable: bool,
     basic_auth: Option<(String, String)>,
     compression_enabled: bool,
     compression_threshold_bytes: usize,
@@ -459,6 +464,7 @@ fn setup_http_state_and_channel(
         message_id_header,
         request_timeout,
         fire_and_forget: config.fire_and_forget,
+        receive_streamable: config.receive_streamable,
         basic_auth: config.basic_auth.clone(),
         compression_enabled: config.compression_enabled,
         compression_threshold_bytes,
@@ -868,9 +874,10 @@ async fn handle_request_internal(
 
     // Acquire a permit to limit concurrent requests and prevent resource exhaustion.
     // This applies backpressure to Hyper and prevents task explosion during retry storms.
-    let _permit = state
+    let permit = state
         .concurrency_limit
-        .acquire()
+        .clone()
+        .acquire_owned()
         .await
         .map_err(|e| anyhow!(e))?;
 
@@ -993,28 +1000,58 @@ async fn handle_request_internal(
         }
     }
 
+    if state.receive_streamable {
+        if content_encoding.is_some() {
+            return Ok(text_error_response(
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "Compressed streamable HTTP requests are not supported",
+                accepts_text,
+                Some(&state.custom_headers),
+            ));
+        }
+
+        let request_format = stream_request_format(req.headers());
+        let response_format = stream_response_format(req.headers());
+        return handle_streamable_request(
+            req.into_body(),
+            metadata,
+            HttpReceiveStreamConfig {
+                tx: state.tx.clone(),
+                fire_and_forget: state.fire_and_forget,
+                request_timeout: state.request_timeout,
+                custom_headers: state.custom_headers.clone(),
+            },
+            request_format,
+            response_format,
+            accepts_text,
+            permit,
+        )
+        .await;
+    }
+
     // Read body with a timeout to prevent hanging on abandoned client connections.
     // This prevents "zombie" tasks from saturating the runtime during retry storms.
     let body_collect_timeout = state.request_timeout;
-    let body_bytes = match tokio::time::timeout(body_collect_timeout, req.collect()).await {
-        Ok(Ok(b)) => b.to_bytes(),
-        Ok(Err(e)) => {
-            return Ok(text_error_response(
-                StatusCode::BAD_REQUEST,
-                format!("Failed to read body: {}", e),
-                accepts_text,
-                None,
-            ));
-        }
-        Err(_) => {
-            return Ok(text_error_response(
-                StatusCode::REQUEST_TIMEOUT,
-                "Timed out reading request body",
-                accepts_text,
-                None,
-            ));
-        }
-    };
+    let body_bytes =
+        match tokio::time::timeout(body_collect_timeout, req.into_body().collect()).await {
+            Ok(Ok(b)) => b.to_bytes(),
+            Ok(Err(e)) => {
+                return Ok(text_error_response(
+                    StatusCode::BAD_REQUEST,
+                    format!("Failed to read body: {}", e),
+                    accepts_text,
+                    None,
+                ));
+            }
+            Err(_) => {
+                return Ok(text_error_response(
+                    StatusCode::REQUEST_TIMEOUT,
+                    "Timed out reading request body",
+                    accepts_text,
+                    None,
+                ));
+            }
+        };
 
     // Decompress if needed
     let payload = decompress_if_needed(body_bytes, content_encoding.as_deref())
@@ -1070,7 +1107,7 @@ async fn handle_request_internal(
     // slow downstream processing. Holding it while waiting on ack_rx would cause a
     // deadlock: all permits occupied by requests waiting on downstream, no capacity
     // left for new requests, retry storm fills the channel → everything stalls.
-    drop(_permit);
+    drop(permit);
 
     if state.fire_and_forget {
         let mut builder = Response::builder().status(StatusCode::ACCEPTED);
@@ -1228,10 +1265,18 @@ pub struct HttpPublisher {
     compression_threshold_bytes: usize,
     basic_auth_header: Option<String>,
     custom_headers: HashMap<String, String>,
+    stream_response_sink: Option<std::sync::Arc<dyn MessagePublisher>>,
 }
 
 impl HttpPublisher {
     pub async fn new(config: &HttpConfig) -> anyhow::Result<Self> {
+        Self::new_with_stream_response_sink(config, None).await
+    }
+
+    pub async fn new_with_stream_response_sink(
+        config: &HttpConfig,
+        stream_response_sink: Option<std::sync::Arc<dyn MessagePublisher>>,
+    ) -> anyhow::Result<Self> {
         // Initialize TLS provider if TLS is configured for this endpoint.
         let batch_concurrency = config.batch_concurrency.unwrap_or(20).max(1);
 
@@ -1292,6 +1337,7 @@ impl HttpPublisher {
             compression_threshold_bytes,
             basic_auth_header: basic_auth_header_value(config.basic_auth.as_ref()),
             custom_headers: config.custom_headers.clone(),
+            stream_response_sink,
         })
     }
 }
@@ -1396,6 +1442,9 @@ impl MessagePublisher for HttpPublisher {
         };
 
         let response_status = response.status();
+        let stream_response_format = self.stream_response_sink.as_ref().and_then(|_| {
+            super::http_stream::streaming_response_format_from_headers(response.headers())
+        });
         let mut response_metadata = HashMap::with_capacity(response.headers().len() + 1);
         response_metadata.insert(
             "http_version".to_string(),
@@ -1408,6 +1457,34 @@ impl MessagePublisher for HttpPublisher {
                     content_encoding = Some(value_str.to_string());
                 }
                 response_metadata.insert(key.as_str().to_string(), value_str.to_string());
+            }
+        }
+
+        if response_status.is_success() {
+            if let (Some(stream_response_sink), Some(stream_response_format)) =
+                (&self.stream_response_sink, stream_response_format)
+            {
+                if content_encoding.is_some() {
+                    return Err(PublisherError::Retryable(anyhow::anyhow!(
+                        "Compressed HTTP response streams cannot be published to stream_response_to"
+                    )));
+                }
+
+                let correlation_id = message
+                    .metadata
+                    .get("correlation_id")
+                    .cloned()
+                    .unwrap_or_else(|| format!("{:032x}", message.message_id));
+                super::http_stream::publish_response_stream(
+                    response.into_body(),
+                    stream_response_sink.clone(),
+                    response_metadata,
+                    correlation_id,
+                    stream_response_format,
+                    self.request_timeout,
+                )
+                .await?;
+                return Ok(Sent::Ack);
             }
         }
 
@@ -1730,8 +1807,8 @@ fn basic_auth_header_value(basic_auth: Option<&(String, String)>) -> Option<Stri
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::endpoints::create_publisher_from_route;
-    use crate::models::{Config, EndpointType};
+    use crate::endpoints::{create_consumer_from_route, create_publisher_from_route};
+    use crate::models::{Config, Endpoint, EndpointType, StreamBufferConfig};
     use hyper::header::{ACCEPT, CONTENT_TYPE};
     use std::time::Duration;
 
@@ -1937,6 +2014,508 @@ http_route:
             _ => panic!("Expected response"),
         };
         assert_eq!(response.payload, b"response_payload".to_vec());
+    }
+
+    #[tokio::test]
+    async fn test_http_receive_streamable_sse_items_share_correlation_id() {
+        init_crypto();
+
+        let port = get_free_port();
+        let addr = format!("127.0.0.1:{}", port);
+        let url = format!("http://{}", addr);
+
+        let config = HttpConfig {
+            url: addr.clone(),
+            receive_streamable: true,
+            ..Default::default()
+        };
+
+        let mut consumer = HttpConsumer::new(&config)
+            .await
+            .expect("Failed to create consumer");
+
+        let publisher = HttpPublisher::new(&HttpConfig {
+            url,
+            ..Default::default()
+        })
+        .await
+        .expect("Failed to create publisher");
+
+        let receive_task = tokio::spawn(async move {
+            let first = consumer.receive().await.expect("first stream item");
+            let second = consumer.receive().await.expect("second stream item");
+
+            assert_eq!(first.message.get_payload_str(), "first");
+            assert_eq!(second.message.get_payload_str(), "second");
+            assert_ne!(first.message.message_id, second.message.message_id);
+
+            let first_correlation = first
+                .message
+                .metadata
+                .get("correlation_id")
+                .cloned()
+                .expect("first correlation_id");
+            let second_correlation = second
+                .message
+                .metadata
+                .get("correlation_id")
+                .cloned()
+                .expect("second correlation_id");
+            assert_eq!(first_correlation, second_correlation);
+            assert_eq!(
+                first
+                    .message
+                    .metadata
+                    .get("http_stream_index")
+                    .map(String::as_str),
+                Some("0")
+            );
+            assert_eq!(
+                second
+                    .message
+                    .metadata
+                    .get("http_stream_index")
+                    .map(String::as_str),
+                Some("1")
+            );
+            assert_eq!(
+                second.message.metadata.get("sse_id").map(String::as_str),
+                Some("evt-2")
+            );
+            assert_eq!(
+                second.message.metadata.get("sse_event").map(String::as_str),
+                Some("update")
+            );
+
+            let first_reply = CanonicalMessage::from_vec("reply-first");
+            let second_reply = CanonicalMessage::from_vec("reply-second");
+            (first.commit)(MessageDisposition::Reply(first_reply))
+                .await
+                .expect("commit first reply");
+            (second.commit)(MessageDisposition::Reply(second_reply))
+                .await
+                .expect("commit second reply");
+        });
+
+        let request =
+            CanonicalMessage::from_vec("data: first\n\nid: evt-2\nevent: update\ndata: second\n\n")
+                .with_metadata_kv("content-type", "text/event-stream")
+                .with_metadata_kv("accept", "text/event-stream")
+                .with_metadata_kv("correlation_id", "shared-stream-correlation");
+
+        let response = publisher
+            .send(request)
+            .await
+            .expect("stream request succeeds");
+        receive_task.await.expect("receive task finished");
+
+        let response = match response {
+            Sent::Response(message) => message,
+            Sent::Ack => panic!("expected streamed HTTP response body"),
+        };
+        let body = response.get_payload_str();
+        assert!(body.contains("data: reply-first"));
+        assert!(body.contains("data: reply-second"));
+        assert_eq!(
+            response.metadata.get("content-type").map(String::as_str),
+            Some("text/event-stream")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_http_publisher_stream_response_to_sink() {
+        init_crypto();
+
+        let port = get_free_port();
+        let bind_addr = format!("127.0.0.1:{}", port);
+        let listener = TcpListener::bind(&bind_addr)
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("test server addr");
+        let server_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept test request");
+            let io = TokioIo::new(stream);
+            let service = hyper::service::service_fn(|_req: Request<Incoming>| async move {
+                let stream = futures::stream::iter(vec![
+                    Ok::<_, anyhow::Error>(Frame::data(Bytes::from_static(
+                        b"id: one\ndata: alpha\n\n",
+                    ))),
+                    Ok::<_, anyhow::Error>(Frame::data(Bytes::from_static(
+                        b"id: two\nevent: delta\ndata: beta\n\n",
+                    ))),
+                ]);
+                Ok::<_, anyhow::Error>(
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header("content-type", "text/event-stream")
+                        .body(streamed(stream))
+                        .unwrap(),
+                )
+            });
+            let builder = AutoBuilder::new(TokioExecutor::new());
+            builder
+                .serve_connection(io, service)
+                .await
+                .expect("serve test response");
+        });
+
+        let sink_endpoint = Endpoint::new_memory(
+            &format!("http_stream_sink_{}", fast_uuid_v7::gen_id_str()),
+            10,
+        );
+        let mut sink_consumer = create_consumer_from_route("http_stream_sink", &sink_endpoint)
+            .await
+            .expect("create stream sink consumer");
+
+        let publisher_endpoint = Endpoint::new(EndpointType::Http(HttpConfig {
+            url: format!("http://{}", addr),
+            stream_response_to: Some(Box::new(sink_endpoint)),
+            ..Default::default()
+        }));
+        let publisher = create_publisher_from_route("http_stream_publisher", &publisher_endpoint)
+            .await
+            .expect("create http publisher");
+
+        let sent = publisher
+            .send(
+                CanonicalMessage::from_vec("prompt")
+                    .with_metadata_kv("correlation_id", "llm-stream-1"),
+            )
+            .await
+            .expect("publish request");
+        assert!(matches!(sent, Sent::Ack));
+        server_task.abort();
+        let _ = server_task.await;
+
+        let first = sink_consumer
+            .receive()
+            .await
+            .expect("first streamed response");
+        assert_eq!(first.message.get_payload_str(), "alpha");
+        assert_eq!(
+            first
+                .message
+                .metadata
+                .get("correlation_id")
+                .map(String::as_str),
+            Some("llm-stream-1")
+        );
+        assert_eq!(
+            first
+                .message
+                .metadata
+                .get("http_stream_index")
+                .map(String::as_str),
+            Some("0")
+        );
+        assert_eq!(
+            first
+                .message
+                .metadata
+                .get("http_stream_end")
+                .map(String::as_str),
+            Some("false")
+        );
+        (first.commit)(MessageDisposition::Ack).await.unwrap();
+
+        let second = sink_consumer
+            .receive()
+            .await
+            .expect("second streamed response");
+        assert_eq!(second.message.get_payload_str(), "beta");
+        assert_eq!(
+            second.message.metadata.get("sse_event").map(String::as_str),
+            Some("delta")
+        );
+        assert_eq!(
+            second
+                .message
+                .metadata
+                .get("http_stream_index")
+                .map(String::as_str),
+            Some("1")
+        );
+        (second.commit)(MessageDisposition::Ack).await.unwrap();
+
+        let end = sink_consumer.receive().await.expect("stream end marker");
+        assert!(end.message.payload.is_empty());
+        assert_eq!(
+            end.message
+                .metadata
+                .get("http_stream_end")
+                .map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            end.message
+                .metadata
+                .get("http_stream_index")
+                .map(String::as_str),
+            Some("2")
+        );
+        (end.commit)(MessageDisposition::Ack).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_http_publisher_stream_response_to_stream_buffer_isolates_parallel_responses() {
+        init_crypto();
+
+        let port = get_free_port();
+        let bind_addr = format!("127.0.0.1:{}", port);
+        let listener = TcpListener::bind(&bind_addr)
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("test server addr");
+        let server_task = tokio::spawn(async move {
+            let mut tasks = Vec::new();
+            for _ in 0..2 {
+                let (stream, _) = listener.accept().await.expect("accept test request");
+                tasks.push(tokio::spawn(async move {
+                    let io = TokioIo::new(stream);
+                    let service = hyper::service::service_fn(|req: Request<Incoming>| async move {
+                        let path = req.uri().path().trim_start_matches('/').to_string();
+                        let first = format!("data: {}-1\n\n", path);
+                        let second = format!("data: {}-2\n\n", path);
+                        let stream = futures::stream::iter(vec![
+                            Ok::<_, anyhow::Error>(Frame::data(Bytes::from(first))),
+                            Ok::<_, anyhow::Error>(Frame::data(Bytes::from(second))),
+                        ]);
+                        Ok::<_, anyhow::Error>(
+                            Response::builder()
+                                .status(StatusCode::OK)
+                                .header("content-type", "text/event-stream")
+                                .body(streamed(stream))
+                                .unwrap(),
+                        )
+                    });
+                    let builder = AutoBuilder::new(TokioExecutor::new());
+                    builder
+                        .serve_connection(io, service)
+                        .await
+                        .expect("serve test response");
+                }));
+            }
+            for task in tasks {
+                let _ = task.await;
+            }
+        });
+
+        let topic = format!("http_stream_buffer_parallel_{}", fast_uuid_v7::gen_id_str());
+        let sink_endpoint = Endpoint::new(EndpointType::StreamBuffer(StreamBufferConfig {
+            topic: topic.clone(),
+            correlation_id: None,
+            capacity: Some(20),
+        }));
+        let mut consumer_a = create_consumer_from_route(
+            "http_stream_buffer_a",
+            &Endpoint::new(EndpointType::StreamBuffer(StreamBufferConfig {
+                topic: topic.clone(),
+                correlation_id: Some("stream-a".to_string()),
+                capacity: Some(20),
+            })),
+        )
+        .await
+        .expect("create stream-a consumer");
+        let mut consumer_b = create_consumer_from_route(
+            "http_stream_buffer_b",
+            &Endpoint::new(EndpointType::StreamBuffer(StreamBufferConfig {
+                topic: topic.clone(),
+                correlation_id: Some("stream-b".to_string()),
+                capacity: Some(20),
+            })),
+        )
+        .await
+        .expect("create stream-b consumer");
+
+        let publisher_endpoint = Endpoint::new(EndpointType::Http(HttpConfig {
+            url: format!("http://{}", addr),
+            stream_response_to: Some(Box::new(sink_endpoint)),
+            ..Default::default()
+        }));
+        let publisher: std::sync::Arc<dyn MessagePublisher> =
+            create_publisher_from_route("http_stream_buffer_publisher", &publisher_endpoint)
+                .await
+                .expect("create http publisher");
+
+        let send_a = {
+            let publisher = publisher.clone();
+            tokio::spawn(async move {
+                publisher
+                    .send(
+                        CanonicalMessage::from_vec("prompt-a")
+                            .with_metadata_kv("http_path", "/a")
+                            .with_metadata_kv("correlation_id", "stream-a"),
+                    )
+                    .await
+                    .expect("send stream-a")
+            })
+        };
+        let send_b = {
+            let publisher = publisher.clone();
+            tokio::spawn(async move {
+                publisher
+                    .send(
+                        CanonicalMessage::from_vec("prompt-b")
+                            .with_metadata_kv("http_path", "/b")
+                            .with_metadata_kv("correlation_id", "stream-b"),
+                    )
+                    .await
+                    .expect("send stream-b")
+            })
+        };
+
+        assert!(matches!(send_a.await.expect("join stream-a"), Sent::Ack));
+        assert!(matches!(send_b.await.expect("join stream-b"), Sent::Ack));
+        server_task.abort();
+        let _ = server_task.await;
+
+        let mut stream_a_payloads = Vec::new();
+        loop {
+            let received = consumer_a.receive().await.expect("stream-a item");
+            let is_end = received
+                .message
+                .metadata
+                .get("http_stream_end")
+                .is_some_and(|value| value == "true");
+            assert_eq!(
+                received
+                    .message
+                    .metadata
+                    .get("correlation_id")
+                    .map(String::as_str),
+                Some("stream-a")
+            );
+            if !is_end {
+                stream_a_payloads.push(received.message.get_payload_str().to_string());
+            }
+            (received.commit)(MessageDisposition::Ack).await.unwrap();
+            if is_end {
+                break;
+            }
+        }
+
+        let mut stream_b_payloads = Vec::new();
+        loop {
+            let received = consumer_b.receive().await.expect("stream-b item");
+            let is_end = received
+                .message
+                .metadata
+                .get("http_stream_end")
+                .is_some_and(|value| value == "true");
+            assert_eq!(
+                received
+                    .message
+                    .metadata
+                    .get("correlation_id")
+                    .map(String::as_str),
+                Some("stream-b")
+            );
+            if !is_end {
+                stream_b_payloads.push(received.message.get_payload_str().to_string());
+            }
+            (received.commit)(MessageDisposition::Ack).await.unwrap();
+            if is_end {
+                break;
+            }
+        }
+
+        assert_eq!(stream_a_payloads, vec!["a-1", "a-2"]);
+        assert_eq!(stream_b_payloads, vec!["b-1", "b-2"]);
+    }
+
+    #[tokio::test]
+    async fn test_http_publisher_stream_response_to_stream_buffer_uses_message_id_fallback() {
+        init_crypto();
+
+        let port = get_free_port();
+        let bind_addr = format!("127.0.0.1:{}", port);
+        let listener = TcpListener::bind(&bind_addr)
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("test server addr");
+        let server_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept test request");
+            let io = TokioIo::new(stream);
+            let service = hyper::service::service_fn(|_req: Request<Incoming>| async move {
+                let stream = futures::stream::iter(vec![Ok::<_, anyhow::Error>(Frame::data(
+                    Bytes::from_static(b"data: fallback\n\n"),
+                ))]);
+                Ok::<_, anyhow::Error>(
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header("content-type", "text/event-stream")
+                        .body(streamed(stream))
+                        .unwrap(),
+                )
+            });
+            let builder = AutoBuilder::new(TokioExecutor::new());
+            builder
+                .serve_connection(io, service)
+                .await
+                .expect("serve test response");
+        });
+
+        let topic = format!("http_stream_buffer_fallback_{}", fast_uuid_v7::gen_id_str());
+        let sink_endpoint = Endpoint::new(EndpointType::StreamBuffer(StreamBufferConfig {
+            topic: topic.clone(),
+            correlation_id: None,
+            capacity: Some(10),
+        }));
+        let publisher_endpoint = Endpoint::new(EndpointType::Http(HttpConfig {
+            url: format!("http://{}", addr),
+            stream_response_to: Some(Box::new(sink_endpoint)),
+            ..Default::default()
+        }));
+        let publisher =
+            create_publisher_from_route("http_stream_fallback_publisher", &publisher_endpoint)
+                .await
+                .expect("create http publisher");
+
+        let request = CanonicalMessage::from_vec("prompt");
+        let expected_correlation_id = format!("{:032x}", request.message_id);
+        let mut consumer = create_consumer_from_route(
+            "http_stream_fallback_consumer",
+            &Endpoint::new(EndpointType::StreamBuffer(StreamBufferConfig {
+                topic: topic.clone(),
+                correlation_id: Some(expected_correlation_id.clone()),
+                capacity: Some(10),
+            })),
+        )
+        .await
+        .expect("create fallback consumer");
+
+        let sent = publisher.send(request).await.expect("send request");
+        assert!(matches!(sent, Sent::Ack));
+        server_task.abort();
+        let _ = server_task.await;
+
+        let item = consumer.receive().await.expect("fallback stream item");
+        assert_eq!(item.message.get_payload_str(), "fallback");
+        assert_eq!(
+            item.message
+                .metadata
+                .get("correlation_id")
+                .map(String::as_str),
+            Some(expected_correlation_id.as_str())
+        );
+        (item.commit)(MessageDisposition::Ack).await.unwrap();
+
+        let end = consumer.receive().await.expect("fallback end marker");
+        assert_eq!(
+            end.message
+                .metadata
+                .get("http_stream_end")
+                .map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            end.message
+                .metadata
+                .get("correlation_id")
+                .map(String::as_str),
+            Some(expected_correlation_id.as_str())
+        );
+        (end.commit)(MessageDisposition::Ack).await.unwrap();
     }
 
     #[tokio::test]

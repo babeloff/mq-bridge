@@ -268,6 +268,7 @@ fn is_known_endpoint_name(name: &str) -> bool {
             | "zeromq"
             | "grpc"
             | "fanout"
+            | "stream_buffer"
             | "ref"
             | "switch"
             | "response"
@@ -534,6 +535,8 @@ pub enum EndpointType {
     Grpc(GrpcConfig),
     Sqlx(SqlxConfig),
     Fanout(Vec<Endpoint>),
+    #[serde(rename = "stream_buffer")]
+    StreamBuffer(StreamBufferConfig),
     Switch(SwitchConfig),
     Response(ResponseConfig),
     Reader(Box<Endpoint>),
@@ -566,6 +569,7 @@ impl EndpointType {
             EndpointType::Grpc(_) => "grpc",
             EndpointType::Sqlx(_) => "sqlx",
             EndpointType::Fanout(_) => "fanout",
+            EndpointType::StreamBuffer(_) => "stream_buffer",
             EndpointType::Switch(_) => "switch",
             EndpointType::Response(_) => "response",
             EndpointType::Reader(_) => "reader",
@@ -582,6 +586,7 @@ impl EndpointType {
                 | EndpointType::Ref(_)
                 | EndpointType::Memory(_)
                 | EndpointType::Fanout(_)
+                | EndpointType::StreamBuffer(_)
                 | EndpointType::Switch(_)
                 | EndpointType::Response(_)
                 | EndpointType::Reader(_)
@@ -1289,6 +1294,51 @@ impl MemoryConfig {
     }
 }
 
+/// Configuration for the correlated in-process stream response buffer.
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct StreamBufferConfig {
+    /// Shared buffer topic used by both the publisher and correlated consumers.
+    pub topic: String,
+    /// Consumer-only correlation id partition to read from.
+    ///
+    /// Leave this unset for the publisher endpoint configured in
+    /// `HttpConfig::stream_response_to`. Set it on consumers so a reader only
+    /// receives messages belonging to one request or response stream.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub correlation_id: Option<String>,
+    /// Capacity of each correlation partition. Defaults to 100.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capacity: Option<usize>,
+}
+
+impl StreamBufferConfig {
+    /// Creates a `stream_buffer` config for the given topic.
+    ///
+    /// Add `with_correlation_id` when constructing a consumer for one stream.
+    /// Leave the correlation id unset when constructing the publisher buffer
+    /// used by `HttpConfig::stream_response_to`.
+    pub fn new(topic: impl Into<String>) -> Self {
+        Self {
+            topic: topic.into(),
+            ..Default::default()
+        }
+    }
+
+    /// Selects the response stream partition that a consumer should read.
+    pub fn with_correlation_id(mut self, correlation_id: impl Into<String>) -> Self {
+        self.correlation_id = Some(correlation_id.into());
+        self
+    }
+
+    /// Sets the per-correlation partition capacity.
+    pub fn with_capacity(mut self, capacity: usize) -> Self {
+        self.capacity = Some(capacity);
+        self
+    }
+}
+
 // --- AMQP Specific Configuration ---
 
 /// General AMQP connection configuration.
@@ -1691,6 +1741,20 @@ pub struct HttpConfig {
     /// (Consumer only) If true, respond immediately with 202 Accepted without waiting for downstream processing. Defaults to false.
     #[serde(default)]
     pub fire_and_forget: bool,
+    /// (Consumer only) If true, read request bodies as a stream and emit each received stream item as a separate message.
+    #[serde(default)]
+    pub receive_streamable: bool,
+    /// (Publisher only) Optional endpoint that receives streamed HTTP response items as correlated messages.
+    ///
+    /// Use a `stream_buffer` endpoint here when callers need to read streamed
+    /// response items later through a normal mq-bridge consumer. Each streamed
+    /// item is published with `correlation_id`, `http_stream_id`,
+    /// `http_stream_index`, `http_stream_format`, and `http_stream_end`
+    /// metadata. If the request message has no `correlation_id`, the HTTP
+    /// publisher uses `format!("{:032x}", request.message_id)` so callers can
+    /// derive the consumer correlation id before calling `send`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_response_to: Option<Box<Endpoint>>,
     /// (Publisher only) The number of concurrent HTTP requests to send in a batch. Defaults to 20.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub batch_concurrency: Option<usize>,
@@ -1797,6 +1861,16 @@ impl HttpConfig {
 
     pub fn with_path(mut self, path: impl Into<String>) -> Self {
         self.path = Some(path.into());
+        self
+    }
+
+    pub fn with_receive_streamable(mut self, receive_streamable: bool) -> Self {
+        self.receive_streamable = receive_streamable;
+        self
+    }
+
+    pub fn with_stream_response_to(mut self, endpoint: Endpoint) -> Self {
+        self.stream_response_to = Some(Box::new(endpoint));
         self
     }
 }
@@ -2362,6 +2436,9 @@ impl SecretExtractor for HttpConfig {
         );
         self.tls
             .extract_secrets(&format!("{}__{}", prefix, "TLS"), secrets);
+        if let Some(endpoint) = &mut self.stream_response_to {
+            endpoint.extract_secrets(&format!("{}__{}", prefix, "STREAM_RESPONSE_TO"), secrets);
+        }
     }
 }
 
