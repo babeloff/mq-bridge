@@ -63,8 +63,8 @@
 //! ));
 //! // let batch = create_consumer(&responses).await?.receive_batch(10).await?;
 //! // (batch.commit)(MessageDisposition::Ack).await?;
-//! 
-//! 
+//!
+//!
 //!
 //! ```
 
@@ -106,7 +106,6 @@
 ///         .with_capacity(100),
 /// ));
 /// ```
-
 use crate::models::StreamBufferConfig;
 use crate::traits::{
     BatchCommitFunc, BoxFuture, ConsumerError, EndpointStatus, MessageConsumer, MessageDisposition,

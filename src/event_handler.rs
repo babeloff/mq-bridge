@@ -4,7 +4,7 @@
 //  git clone https://github.com/marcomq/mq-bridge
 
 use crate::errors::PublisherError;
-use crate::traits::{send_batch_helper, Handler, MessagePublisher};
+use crate::traits::{Handler, HandlerError, MessagePublisher};
 use crate::CanonicalMessage;
 use async_trait::async_trait;
 use std::any::Any;
@@ -39,10 +39,58 @@ impl MessagePublisher for EventPublisher {
         &self,
         messages: Vec<CanonicalMessage>,
     ) -> Result<SentBatch, PublisherError> {
-        send_batch_helper(self, messages, |publisher, message| {
-            Box::pin(publisher.send(message))
-        })
-        .await
+        let results = self.handler.handle_many(messages.clone()).await;
+        if results.len() != messages.len() {
+            return Err(PublisherError::NonRetryable(anyhow::anyhow!(
+                "handler returned {} results for {} messages",
+                results.len(),
+                messages.len()
+            )));
+        }
+
+        let mut failed = Vec::new();
+        let mut iter = messages.into_iter().zip(results.into_iter());
+        while let Some((message, result)) = iter.next() {
+            match result {
+                Ok(_) => {}
+                Err(HandlerError::NonRetryable(err)) => {
+                    failed.push((message, PublisherError::NonRetryable(err)));
+                }
+                Err(HandlerError::Retryable(err)) => {
+                    failed.push((message, PublisherError::Retryable(err)));
+                    for (remaining, _) in iter {
+                        failed.push((
+                            remaining,
+                            PublisherError::Retryable(anyhow::anyhow!(
+                                "Batch aborted due to previous error"
+                            )),
+                        ));
+                    }
+                    break;
+                }
+                Err(HandlerError::Connection(err)) => {
+                    failed.push((message, PublisherError::Connection(err)));
+                    for (remaining, _) in iter {
+                        failed.push((
+                            remaining,
+                            PublisherError::Connection(anyhow::anyhow!(
+                                "Batch aborted due to previous connection error"
+                            )),
+                        ));
+                    }
+                    break;
+                }
+            }
+        }
+
+        if failed.is_empty() {
+            Ok(SentBatch::Ack)
+        } else {
+            Ok(SentBatch::Partial {
+                responses: None,
+                failed,
+            })
+        }
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -75,5 +123,52 @@ mod tests {
             .await
             .unwrap();
         assert!(event_handled.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn test_event_handler_send_batch_retryable_error_aborts_remainder() {
+        struct BatchHandler;
+
+        #[async_trait]
+        impl Handler for BatchHandler {
+            async fn handle(&self, _msg: CanonicalMessage) -> Result<Handled, HandlerError> {
+                unreachable!("send_batch should use handle_many")
+            }
+
+            async fn handle_many(
+                &self,
+                msgs: Vec<CanonicalMessage>,
+            ) -> Vec<Result<Handled, HandlerError>> {
+                msgs.into_iter()
+                    .map(|msg| {
+                        if msg.get_payload_str() == "two" {
+                            Err(HandlerError::Retryable(anyhow::anyhow!(
+                                "temporary failure"
+                            )))
+                        } else {
+                            Ok(Handled::Ack)
+                        }
+                    })
+                    .collect()
+            }
+        }
+
+        let publisher = EventPublisher::new(BatchHandler);
+        let result = publisher
+            .send_batch(vec!["one".into(), "two".into(), "three".into()])
+            .await
+            .unwrap();
+
+        match result {
+            SentBatch::Partial { responses, failed } => {
+                assert!(responses.is_none());
+                assert_eq!(failed.len(), 2);
+                assert_eq!(failed[0].0.get_payload_str(), "two");
+                assert_eq!(failed[1].0.get_payload_str(), "three");
+                assert!(matches!(failed[0].1, PublisherError::Retryable(_)));
+                assert!(matches!(failed[1].1, PublisherError::Retryable(_)));
+            }
+            other => panic!("expected partial failure, got {other:?}"),
+        }
     }
 }

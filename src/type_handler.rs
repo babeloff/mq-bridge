@@ -182,6 +182,107 @@ impl Handler for TypeHandler {
         )))
     }
 
+    async fn handle_many(&self, msgs: Vec<CanonicalMessage>) -> Vec<Result<Handled, HandlerError>> {
+        #[derive(Clone, PartialEq)]
+        enum BatchTarget {
+            Handler(String),
+            Fallback,
+        }
+
+        let mut results: Vec<Option<Result<Handled, HandlerError>>> =
+            std::iter::repeat_with(|| None).take(msgs.len()).collect();
+        let mut runs: Vec<(BatchTarget, Vec<(usize, CanonicalMessage)>)> = Vec::new();
+
+        for (index, msg) in msgs.into_iter().enumerate() {
+            let target = if let Some(type_val) = msg.metadata.get(&self.type_key) {
+                if self.handlers.contains_key(type_val) {
+                    Some(BatchTarget::Handler(type_val.clone()))
+                } else if self.fallback.is_some() {
+                    Some(BatchTarget::Fallback)
+                } else {
+                    None
+                }
+            } else if self.fallback.is_some() {
+                Some(BatchTarget::Fallback)
+            } else {
+                None
+            };
+
+            if let Some(target) = target {
+                if let Some((last_target, group)) = runs.last_mut() {
+                    if *last_target == target {
+                        group.push((index, msg));
+                        continue;
+                    }
+                }
+                runs.push((target, vec![(index, msg)]));
+            } else {
+                results[index] = Some(Err(HandlerError::NonRetryable(anyhow::anyhow!(
+                    "No handler registered for type: '{:?}' and no fallback provided",
+                    msg.metadata.get(&self.type_key)
+                ))));
+            }
+        }
+
+        for (target, group) in runs {
+            let expected = group.len();
+            let (indices, messages): (Vec<_>, Vec<_>) = group.into_iter().unzip();
+            let (handler, label) = match target {
+                BatchTarget::Handler(type_name) => {
+                    let Some(handler) = self.handlers.get(&type_name) else {
+                        for index in indices {
+                            results[index] = Some(Err(HandlerError::NonRetryable(
+                                anyhow::anyhow!("Handler batch dispatch did not produce a result"),
+                            )));
+                        }
+                        continue;
+                    };
+                    (handler, format!("Handler for type '{type_name}'"))
+                }
+                BatchTarget::Fallback => {
+                    let Some(handler) = &self.fallback else {
+                        for index in indices {
+                            results[index] = Some(Err(HandlerError::NonRetryable(
+                                anyhow::anyhow!("Handler batch dispatch did not produce a result"),
+                            )));
+                        }
+                        continue;
+                    };
+                    (handler, "Fallback handler".to_string())
+                }
+            };
+
+            let group_results = handler.handle_many(messages).await;
+
+            if group_results.len() != expected {
+                for index in indices {
+                    results[index] = Some(Err(HandlerError::NonRetryable(anyhow::anyhow!(
+                        "{} returned {} results for {} messages",
+                        label,
+                        group_results.len(),
+                        expected
+                    ))));
+                }
+                continue;
+            }
+
+            for (index, result) in indices.into_iter().zip(group_results.into_iter()) {
+                results[index] = Some(result);
+            }
+        }
+
+        results
+            .into_iter()
+            .map(|result| {
+                result.unwrap_or_else(|| {
+                    Err(HandlerError::NonRetryable(anyhow::anyhow!(
+                        "Handler batch dispatch did not produce a result"
+                    )))
+                })
+            })
+            .collect()
+    }
+
     fn register_handler(
         &self,
         type_name: &str,
@@ -198,6 +299,7 @@ mod tests {
     use super::*;
     use crate::msg;
     use serde::{Deserialize, Serialize};
+    use std::sync::{Arc, Mutex};
 
     #[derive(Serialize, Deserialize)]
     struct TestMsg {
@@ -307,6 +409,82 @@ mod tests {
 
         let res = handler.handle(msg).await;
         assert!(matches!(res, Err(HandlerError::NonRetryable(_))));
+    }
+
+    #[tokio::test]
+    async fn test_typed_handler_handle_many_preserves_dispatch_order() {
+        struct RecordingHandler {
+            name: &'static str,
+            calls: Arc<Mutex<Vec<String>>>,
+        }
+
+        #[async_trait]
+        impl Handler for RecordingHandler {
+            async fn handle(&self, msg: CanonicalMessage) -> Result<Handled, HandlerError> {
+                self.calls
+                    .lock()
+                    .unwrap()
+                    .push(format!("{}:{}", self.name, msg.get_payload_str()));
+                Ok(Handled::Ack)
+            }
+
+            async fn handle_many(
+                &self,
+                msgs: Vec<CanonicalMessage>,
+            ) -> Vec<Result<Handled, HandlerError>> {
+                let payloads = msgs
+                    .iter()
+                    .map(|msg| msg.get_payload_str())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                self.calls
+                    .lock()
+                    .unwrap()
+                    .push(format!("{}:{}", self.name, payloads));
+                msgs.into_iter().map(|_| Ok(Handled::Ack)).collect()
+            }
+        }
+
+        fn typed_msg(payload: &str, kind: &str) -> CanonicalMessage {
+            CanonicalMessage::from(payload)
+                .with_metadata(HashMap::from([("kind".to_string(), kind.to_string())]))
+        }
+
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let handler = TypeHandler::new()
+            .add_handler(
+                "a",
+                RecordingHandler {
+                    name: "a",
+                    calls: calls.clone(),
+                },
+            )
+            .add_handler(
+                "b",
+                RecordingHandler {
+                    name: "b",
+                    calls: calls.clone(),
+                },
+            );
+
+        let results = handler
+            .handle_many(vec![
+                typed_msg("a1", "a"),
+                typed_msg("a2", "a"),
+                typed_msg("b1", "b"),
+                typed_msg("a3", "a"),
+            ])
+            .await;
+
+        assert!(results.into_iter().all(|result| result.is_ok()));
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![
+                "a:a1,a2".to_string(),
+                "b:b1".to_string(),
+                "a:a3".to_string()
+            ]
+        );
     }
 
     #[tokio::test]

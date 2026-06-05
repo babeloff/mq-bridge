@@ -11,6 +11,10 @@ readme = "README.md"
 keywords = ["messaging", "kafka", "nats", "amqp", "cqrs"]
 categories = ["asynchronous", "network-programming"]
 
+[workspace]
+members = ["python/mq-bridge-py"]
+resolver = "2"
+
 [dependencies]
 
 serde = { version = "1.0", features = ["derive"] }

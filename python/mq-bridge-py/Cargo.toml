@@ -1,0 +1,45 @@
+[package]
+name = "mq-bridge-py"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+name = "mq_bridge"
+crate-type = ["cdylib", "rlib"]
+doctest = false
+
+[dependencies]
+anyhow = "1.0"
+async-trait = "0.1"
+fast-uuid-v7 = "0.1.3"
+mq-bridge = { path = "../.." }
+pyo3 = { version = "0.28.3", features = ["abi3-py38", "auto-initialize"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml_ng = "0.10"
+tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
+tracing = "0.1"
+
+[features]
+default = ["full"]
+middleware = ["mq-bridge/middleware"]
+full = ["mq-bridge/full"]
+dedup = ["mq-bridge/dedup"]
+metrics = ["mq-bridge/metrics"]
+schema = ["mq-bridge/schema"]
+test-utils = ["mq-bridge/test-utils"]
+kafka = ["mq-bridge/kafka"]
+amqp = ["mq-bridge/amqp"]
+nats = ["mq-bridge/nats"]
+mongodb = ["mq-bridge/mongodb"]
+mqtt = ["mq-bridge/mqtt"]
+http = ["mq-bridge/http"]
+websocket = ["mq-bridge/websocket"]
+aws = ["mq-bridge/aws"]
+ibm-mq = ["mq-bridge/ibm-mq"]
+zeromq = ["mq-bridge/zeromq"]
+grpc = ["mq-bridge/grpc"]
+sqlx = ["mq-bridge/sqlx"]
+rustls-ring = ["mq-bridge/rustls-ring"]
+rustls-aws-lc = ["mq-bridge/rustls-aws-lc"]

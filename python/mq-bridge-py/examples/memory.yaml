@@ -1,0 +1,15 @@
+routes:
+  orders_route:
+    input:
+      memory:
+        topic: "orders.in"
+        capacity: 1600
+    output:
+      response: {}
+    batch_size: 128
+
+publishers:
+  orders_publisher:
+    memory:
+      topic: "orders.in"
+      capacity: 1600

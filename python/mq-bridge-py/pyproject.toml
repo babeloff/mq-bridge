@@ -1,0 +1,41 @@
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "mq-bridge-py"
+dynamic = ["version"]
+description = "Thin Python bindings for mq-bridge"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+keywords = ["messaging", "tokio", "pyo3", "maturin", "mq-bridge"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.8",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Rust",
+]
+
+[project.urls]
+Homepage = "https://github.com/marcomq/mq-bridge"
+Repository = "https://github.com/marcomq/mq-bridge"
+Issues = "https://github.com/marcomq/mq-bridge/issues"
+
+[dependency-groups]
+dev = [
+  "maturin>=1.7,<2.0",
+  "pytest>=8.3",
+]
+
+[tool.maturin]
+bindings = "pyo3"
+features = ["pyo3/extension-module"]
+module-name = "mq_bridge._mq_bridge"
+python-source = "."

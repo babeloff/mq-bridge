@@ -54,6 +54,14 @@ impl From<Handled> for MessageDisposition {
 pub trait Handler: Send + Sync + 'static {
     async fn handle(&self, msg: CanonicalMessage) -> Result<Handled, HandlerError>;
 
+    async fn handle_many(&self, msgs: Vec<CanonicalMessage>) -> Vec<Result<Handled, HandlerError>> {
+        let mut results = Vec::with_capacity(msgs.len());
+        for msg in msgs {
+            results.push(self.handle(msg).await);
+        }
+        results
+    }
+
     /// Tries to register a handler for a specific type.
     /// Returns `None` if this handler does not support registration (e.g. it's not a TypeHandler).
     fn register_handler(
@@ -70,6 +78,11 @@ impl<T: Handler + ?Sized> Handler for Arc<T> {
     async fn handle(&self, msg: CanonicalMessage) -> Result<Handled, HandlerError> {
         (**self).handle(msg).await
     }
+
+    async fn handle_many(&self, msgs: Vec<CanonicalMessage>) -> Vec<Result<Handled, HandlerError>> {
+        (**self).handle_many(msgs).await
+    }
+
     fn register_handler(
         &self,
         type_name: &str,
