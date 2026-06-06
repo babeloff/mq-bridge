@@ -41,7 +41,7 @@ impl RouteHandle {
     }
 }
 
-async fn run_publisher_connect_hook(
+pub(crate) async fn run_publisher_connect_hook(
     route_name: &str,
     publisher: &Arc<dyn MessagePublisher>,
 ) -> anyhow::Result<()> {
@@ -57,7 +57,7 @@ async fn run_publisher_connect_hook(
     Ok(())
 }
 
-async fn run_consumer_connect_hook(
+pub(crate) async fn run_consumer_connect_hook(
     route_name: &str,
     consumer: &dyn MessageConsumer,
 ) -> anyhow::Result<()> {
@@ -73,7 +73,10 @@ async fn run_consumer_connect_hook(
     Ok(())
 }
 
-async fn run_publisher_disconnect_hook(route_name: &str, publisher: &Arc<dyn MessagePublisher>) {
+pub(crate) async fn run_publisher_disconnect_hook(
+    route_name: &str,
+    publisher: &Arc<dyn MessagePublisher>,
+) {
     if let Some(hook) = publisher.on_disconnect_hook() {
         if let Err(err) = hook.await {
             warn!(
@@ -84,7 +87,7 @@ async fn run_publisher_disconnect_hook(route_name: &str, publisher: &Arc<dyn Mes
     }
 }
 
-async fn run_consumer_disconnect_hook(route_name: &str, consumer: &dyn MessageConsumer) {
+pub(crate) async fn run_consumer_disconnect_hook(route_name: &str, consumer: &dyn MessageConsumer) {
     if let Some(hook) = consumer.on_disconnect_hook() {
         if let Err(err) = hook.await {
             warn!(
@@ -668,6 +671,16 @@ impl Route {
     ) -> anyhow::Result<bool> {
         let (_internal_shutdown_tx, internal_shutdown_rx) = bounded(1);
         let shutdown_rx = shutdown_rx.unwrap_or(internal_shutdown_rx);
+        if let Some(result) = crate::endpoints::try_run_fast_path_route(
+            self,
+            name,
+            shutdown_rx.clone(),
+            ready_tx.clone(),
+        )
+        .await
+        {
+            return result;
+        }
         if self.options.concurrency == 1 {
             self.run_sequentially(name, shutdown_rx, ready_tx).await
         } else {
@@ -823,9 +836,10 @@ impl Route {
             let err_tx = err_tx.clone();
             let mut commit_tasks = JoinSet::new();
             let has_retry_middleware = self.output.has_retry_middleware();
+            let batch_size = self.options.batch_size;
             join_set.spawn(async move {
                 debug!("Starting worker {}", i);
-                let mut batch_scratch = BatchScratch::with_capacity(0);
+                let mut batch_scratch = BatchScratch::with_capacity(batch_size);
                 while let Ok((messages, commit_func)) = work_rx_clone.recv().await {
                     if let Err(err) = send_batch_and_commit(
                         &publisher,

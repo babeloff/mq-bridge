@@ -1744,6 +1744,10 @@ pub struct HttpConfig {
     /// (Consumer only) If true, read request bodies as a stream and emit each received stream item as a separate message.
     #[serde(default)]
     pub receive_streamable: bool,
+    /// (Consumer only) If true, compatible `http -> response` routes may bypass the normal route consumer/worker/disposition pipeline
+    /// and reply inline for lower latency. Defaults to true. Set to false to force the normal route path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inline_response_fast_path: Option<bool>,
     /// (Publisher only) Optional endpoint that receives streamed HTTP response items as correlated messages.
     ///
     /// Use a `stream_buffer` endpoint here when callers need to read streamed
@@ -1867,6 +1871,15 @@ impl HttpConfig {
     pub fn with_receive_streamable(mut self, receive_streamable: bool) -> Self {
         self.receive_streamable = receive_streamable;
         self
+    }
+
+    pub fn with_inline_response_fast_path(mut self, inline_response_fast_path: bool) -> Self {
+        self.inline_response_fast_path = Some(inline_response_fast_path);
+        self
+    }
+
+    pub fn inline_response_fast_path_enabled(&self) -> bool {
+        self.inline_response_fast_path.unwrap_or(true)
     }
 
     pub fn with_stream_response_to(mut self, endpoint: Endpoint) -> Self {

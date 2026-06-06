@@ -49,7 +49,7 @@ impl MessagePublisher for EventPublisher {
         }
 
         let mut failed = Vec::new();
-        let mut iter = messages.into_iter().zip(results.into_iter());
+        let mut iter = messages.into_iter().zip(results);
         while let Some((message, result)) = iter.next() {
             match result {
                 Ok(_) => {}

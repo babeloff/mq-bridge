@@ -45,14 +45,18 @@ Memory benchmark:
 
 ```bash
 cd python/mq-bridge-py
+uv run maturin develop --release
 uv run python examples/bench_memory.py --messages 100000
 ```
+
+## Analysis
 
 HTTP comparison benchmark:
 
 ```bash
 cd python/mq-bridge-py
-uv run python examples/bench_http_compare.py --messages 20000 --clients 8
+uv run maturin develop --release
+uv run python analysis/bench_http_compare.py --messages 20000 --clients 8
 ```
 
 Use `--mq-output-buffer` to test mq-bridge response output buffering.

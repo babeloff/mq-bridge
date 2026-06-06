@@ -266,7 +266,7 @@ impl Handler for TypeHandler {
                 continue;
             }
 
-            for (index, result) in indices.into_iter().zip(group_results.into_iter()) {
+            for (index, result) in indices.into_iter().zip(group_results) {
                 results[index] = Some(result);
             }
         }

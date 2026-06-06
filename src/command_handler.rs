@@ -88,7 +88,7 @@ impl MessagePublisher for CommandPublisher {
         let mut responses = Vec::new();
         let mut failed = Vec::new();
 
-        let mut iter = messages.into_iter().zip(handler_results.into_iter());
+        let mut iter = messages.into_iter().zip(handler_results);
         while let Some((message, result)) = iter.next() {
             let original_id = message.message_id;
             let inbound_correlation_id = message.metadata.get("correlation_id").cloned();

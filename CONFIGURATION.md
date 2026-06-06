@@ -32,9 +32,8 @@ webhook_to_mongo:
   input:
     http:
       url: "0.0.0.0:8080"
-      # Optional: Send response back to HTTP caller via another endpoint
-      response_out:
-        static: "Accepted"
+      # Force the normal route pipeline instead of the inline HTTP response fast path.
+      inline_response_fast_path: false
     middlewares:
       - retry:
           max_attempts: 3
@@ -161,6 +160,28 @@ input:
   kafka:
     # ... kafka config
 ```
+
+### HTTP Consumer Fast Path
+
+Compatible `http -> response` routes may use an inline response fast path for lower latency. This bypasses the normal route consumer/worker/disposition pipeline, but it still keeps the output publisher chain active, including output handlers and allowed output middlewares.
+
+The fast path is only considered when:
+
+- the input has no middlewares
+- `receive_streamable` is `false`
+- `fire_and_forget` is `false`
+- output middlewares are limited to `buffer` and/or `metrics`
+
+To force the normal route pipeline, set this on the HTTP consumer:
+
+```yaml
+input:
+  http:
+    url: "0.0.0.0:8080"
+    inline_response_fast_path: false
+```
+
+This is useful when you want stable, explicit semantics regardless of future optimizations, or when you want to avoid the inline path's response behavior differences. In particular, the inline path does not automatically echo unchanged request metadata back as HTTP response headers.
 
 ### Specialized Endpoints
 

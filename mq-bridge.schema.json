@@ -518,6 +518,17 @@
         {
           "type": "object",
           "properties": {
+            "stream_buffer": {
+              "$ref": "#/$defs/StreamBufferConfig"
+            }
+          },
+          "required": [
+            "stream_buffer"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
             "switch": {
               "$ref": "#/$defs/SwitchConfig"
             }
@@ -900,6 +911,13 @@
           "type": "boolean",
           "default": false
         },
+        "inline_response_fast_path": {
+          "description": "(Consumer only) If true, compatible `http -> response` routes may bypass the normal route consumer/worker/disposition pipeline\nand reply inline for lower latency. Defaults to true. Set to false to force the normal route path.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
         "internal_buffer_size": {
           "description": "(Consumer only) Internal buffer size for the channel. Defaults to 100.",
           "type": [
@@ -939,6 +957,11 @@
           "format": "uint64",
           "minimum": 0
         },
+        "receive_streamable": {
+          "description": "(Consumer only) If true, read request bodies as a stream and emit each received stream item as a separate message.",
+          "type": "boolean",
+          "default": false
+        },
         "request_timeout_ms": {
           "description": "Timeout for HTTP requests in milliseconds. For consumers, it's the request-reply timeout. For publishers, it's the timeout for each individual request. Defaults to 30000ms.",
           "type": [
@@ -947,6 +970,17 @@
           ],
           "format": "uint64",
           "minimum": 0
+        },
+        "stream_response_to": {
+          "description": "(Publisher only) Optional endpoint that receives streamed HTTP response items as correlated messages.\n\nUse a `stream_buffer` endpoint here when callers need to read streamed\nresponse items later through a normal mq-bridge consumer. Each streamed\nitem is published with `correlation_id`, `http_stream_id`,\n`http_stream_index`, `http_stream_format`, and `http_stream_end`\nmetadata. If the request message has no `correlation_id`, the HTTP\npublisher uses `format!(\"{:032x}\", request.message_id)` so callers can\nderive the consumer correlation id before calling `send`.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Endpoint"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "tcp_keepalive_ms": {
           "description": "(Publisher only) TCP keepalive timeout for the underlying connection pool in milliseconds. Defaults to 60000ms.",
@@ -1882,6 +1916,10 @@
       "description": "Defines a single message processing route from an input to an output.",
       "type": "object",
       "properties": {
+        "allow_fault_injection": {
+          "description": "Allows fault-injection middleware such as random_panic. Disabled by default.",
+          "type": "boolean"
+        },
         "batch_size": {
           "description": "(Optional) Maximum number of messages to process in a single batch. The consumer waits for at least one message\nand then attempts to fetch more if available. Increasing this improves throughput but also increases\nthe potential impact of a single batch processing failure. Defaults to 1.",
           "type": "integer",
@@ -1894,7 +1932,7 @@
           "type": "integer",
           "format": "uint",
           "default": 4096,
-          "minimum": 0
+          "minimum": 1
         },
         "concurrency": {
           "description": "(Optional) Number of concurrent processing tasks for this route. While it improves throughput for high-latency\nhandlers, it adds synchronization overhead for ordered commits and may lead to out-of-order processing\nin the handler. Defaults to 1.",
@@ -1907,6 +1945,13 @@
           "description": "A human-readable description of the route's purpose. Defaults to an empty string.",
           "type": "string"
         },
+        "empty_batch_delay_ms": {
+          "description": "Delay after an empty receive batch to avoid hot polling. Set to 0 to only yield. Defaults to 10ms.",
+          "type": "integer",
+          "format": "uint64",
+          "default": 10,
+          "minimum": 0
+        },
         "input": {
           "description": "The input/source endpoint for the route.",
           "$ref": "#/$defs/Endpoint"
@@ -1918,6 +1963,20 @@
             "middlewares": [],
             "null": null
           }
+        },
+        "reconnect_interval_ms": {
+          "description": "Time to wait before reconnecting after a transient route failure. Defaults to 5000ms.",
+          "type": "integer",
+          "format": "uint64",
+          "default": 5000,
+          "minimum": 0
+        },
+        "startup_timeout_ms": {
+          "description": "Time to wait for a route to establish connections before startup fails. Defaults to 5000ms.",
+          "type": "integer",
+          "format": "uint64",
+          "default": 5000,
+          "minimum": 0
         }
       },
       "additionalProperties": false,
@@ -2081,6 +2140,36 @@
       "required": [
         "url",
         "table"
+      ]
+    },
+    "StreamBufferConfig": {
+      "description": "Configuration for the correlated in-process stream response buffer.",
+      "type": "object",
+      "properties": {
+        "capacity": {
+          "description": "Capacity of each correlation partition. Defaults to 100.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0
+        },
+        "correlation_id": {
+          "description": "Consumer-only correlation id partition to read from.\n\nLeave this unset for the publisher endpoint configured in\n`HttpConfig::stream_response_to`. Set it on consumers so a reader only\nreceives messages belonging to one request or response stream.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "topic": {
+          "description": "Shared buffer topic used by both the publisher and correlated consumers.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "topic"
       ]
     },
     "SwitchConfig": {

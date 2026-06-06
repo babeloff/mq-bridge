@@ -542,6 +542,100 @@ pub async fn create_consumer_from_route(
     apply_middlewares_to_consumer(consumer, &resolved_endpoint, route_name).await
 }
 
+pub(crate) async fn try_run_fast_path_route(
+    route: &crate::models::Route,
+    name: &str,
+    shutdown_rx: async_channel::Receiver<()>,
+    ready_tx: Option<async_channel::Sender<()>>,
+) -> Option<anyhow::Result<bool>> {
+    #[cfg(feature = "http")]
+    {
+        if let (EndpointType::Http(cfg), EndpointType::Response(_)) =
+            (&route.input.endpoint_type, &route.output.endpoint_type)
+        {
+            if cfg.inline_response_fast_path_enabled()
+                && route.input.middlewares.is_empty()
+                && output_middlewares_allow_http_inline_fast_path(&route.output.middlewares)
+                && !cfg.receive_streamable
+                && !cfg.fire_and_forget
+            {
+                return Some(
+                    run_http_inline_response_fast_path(
+                        route,
+                        name,
+                        shutdown_rx,
+                        ready_tx,
+                        cfg.clone(),
+                    )
+                    .await,
+                );
+            }
+        }
+    }
+
+    let _ = route;
+    let _ = name;
+    let _ = shutdown_rx;
+    let _ = ready_tx;
+    None
+}
+
+#[cfg(feature = "http")]
+fn output_middlewares_allow_http_inline_fast_path(middlewares: &[Middleware]) -> bool {
+    middlewares
+        .iter()
+        .all(|middleware| matches!(middleware, Middleware::Buffer(_) | Middleware::Metrics(_)))
+}
+
+#[cfg(feature = "http")]
+async fn run_http_inline_response_fast_path(
+    route: &crate::models::Route,
+    name: &str,
+    shutdown_rx: async_channel::Receiver<()>,
+    ready_tx: Option<async_channel::Sender<()>>,
+    http_config: crate::models::HttpConfig,
+) -> anyhow::Result<bool> {
+    let publisher = create_publisher_from_route(name, &route.output).await?;
+    let consumer =
+        http::HttpConsumer::new_with_inline_publisher(&http_config, Some(publisher.clone()))
+            .await?;
+
+    if let Err(err) = crate::route::run_publisher_connect_hook(name, &publisher).await {
+        crate::route::run_publisher_disconnect_hook(name, &publisher).await;
+        return Err(err);
+    }
+    if let Err(err) = crate::route::run_consumer_connect_hook(name, &consumer).await {
+        crate::route::run_consumer_disconnect_hook(name, &consumer).await;
+        crate::route::run_publisher_disconnect_hook(name, &publisher).await;
+        return Err(err);
+    }
+
+    tracing::info!(
+        route = name,
+        has_output_handler = route.output.handler.is_some(),
+        output_middlewares = route.output.middlewares.len(),
+        "Running HTTP inline response fast path; bypassing the normal route consumer/worker/disposition pipeline while keeping the output publisher chain active"
+    );
+    tracing::debug!(
+        route = name,
+        "HTTP inline response fast path differences: no input middlewares, no streamable input, no fire-and-forget, only buffer/metrics output middlewares allowed, and unchanged request metadata is not echoed back as response headers"
+    );
+    if let Some(tx) = ready_tx {
+        let _ = tx.send(()).await;
+    }
+
+    let stopped = shutdown_rx.recv().await.is_ok();
+    if stopped {
+        tracing::info!(
+            "Shutdown signal received in HTTP inline response runner for route '{}'.",
+            name
+        );
+    }
+    crate::route::run_consumer_disconnect_hook(name, &consumer).await;
+    crate::route::run_publisher_disconnect_hook(name, &publisher).await;
+    Ok(true)
+}
+
 async fn create_base_consumer(
     route_name: &str,
     endpoint: &Endpoint,

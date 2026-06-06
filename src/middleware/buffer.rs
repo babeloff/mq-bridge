@@ -14,8 +14,13 @@ struct PendingEntry {
     result_tx: oneshot::Sender<Result<Sent, PublisherError>>,
 }
 
+struct InFlightEntry {
+    message_id: u128,
+    result_tx: oneshot::Sender<Result<Sent, PublisherError>>,
+}
+
 struct PendingBatch {
-    entries: Vec<PendingEntry>,
+    entries: Vec<InFlightEntry>,
     messages: Vec<CanonicalMessage>,
 }
 
@@ -84,8 +89,12 @@ impl BufferCore {
 
                 for _ in 0..count {
                     if let Some(entry) = state.pending.pop_front() {
-                        messages.push(entry.message.clone());
-                        entries.push(entry);
+                        let message_id = entry.message.message_id;
+                        messages.push(entry.message);
+                        entries.push(InFlightEntry {
+                            message_id,
+                            result_tx: entry.result_tx,
+                        });
                     }
                 }
 
@@ -136,7 +145,7 @@ impl BufferCore {
 }
 
 fn distribute_batch_results(
-    entries: Vec<PendingEntry>,
+    entries: Vec<InFlightEntry>,
     send_result: Result<SentBatch, PublisherError>,
 ) {
     match send_result {
@@ -157,9 +166,9 @@ fn distribute_batch_results(
                 .collect();
 
             for entry in entries {
-                let result = if let Some(error) = failed_map.remove(&entry.message.message_id) {
+                let result = if let Some(error) = failed_map.remove(&entry.message_id) {
                     Err(error)
-                } else if let Some(response) = response_map.remove(&entry.message.message_id) {
+                } else if let Some(response) = response_map.remove(&entry.message_id) {
                     Ok(Sent::Response(response))
                 } else {
                     Ok(Sent::Ack)

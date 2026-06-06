@@ -15,6 +15,14 @@ categories = ["asynchronous", "network-programming"]
 members = ["python/mq-bridge-py"]
 resolver = "2"
 
+[profile.release]
+lto = "thin"
+
+[[bin]]
+name = "mq_bridge_http_profile"
+path = "scripts/analysis/http/mq_bridge_http_profile.rs"
+required-features = ["http"]
+
 [dependencies]
 
 serde = { version = "1.0", features = ["derive"] }

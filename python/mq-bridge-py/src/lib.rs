@@ -5,6 +5,7 @@ use std::fs;
 use std::future::Future;
 use std::num::NonZeroUsize;
 use std::path::Path;
+use std::thread;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -30,7 +31,7 @@ use serde::ser::{Error as SerError, SerializeMap, SerializeSeq};
 use serde::{Deserialize, Serialize, Serializer};
 use serde_json::Value as JsonValue;
 use tokio::runtime::{Builder, Runtime};
-use tokio::sync::{oneshot, Semaphore};
+use tokio::sync::{oneshot, OwnedSemaphorePermit, Semaphore};
 use tracing::error;
 
 const MAX_JSON_DEPTH: usize = 64;
@@ -70,58 +71,53 @@ enum PythonHandlerMode {
 #[derive(Clone)]
 struct PythonHandler {
     label: String,
-    mode: PythonHandlerMode,
-    callable: Arc<Py<PyAny>>,
+    worker: Arc<PythonWorker>,
+}
+
+struct PythonWorker {
+    tx: std::sync::mpsc::Sender<PythonWorkerRequest>,
+}
+
+struct PythonWorkerRequest {
+    messages: Vec<CanonicalMessage>,
+    reply_tx: oneshot::Sender<Vec<Result<Handled, HandlerError>>>,
+    permit: OwnedSemaphorePermit,
 }
 
 impl PythonHandler {
     fn message(label: impl Into<String>, callable: Py<PyAny>) -> Self {
+        let label = label.into();
         Self {
-            label: label.into(),
-            mode: PythonHandlerMode::Message,
-            callable: Arc::new(callable),
+            worker: Arc::new(PythonWorker::spawn(
+                label.clone(),
+                PythonHandlerMode::Message,
+                callable,
+            )),
+            label,
         }
     }
 
     fn json(label: impl Into<String>, callable: Py<PyAny>) -> Self {
+        let label = label.into();
         Self {
-            label: label.into(),
-            mode: PythonHandlerMode::Json,
-            callable: Arc::new(callable),
+            worker: Arc::new(PythonWorker::spawn(
+                label.clone(),
+                PythonHandlerMode::Json,
+                callable,
+            )),
+            label,
         }
     }
-}
 
-#[async_trait]
-impl Handler for PythonHandler {
-    async fn handle(&self, msg: CanonicalMessage) -> Result<Handled, HandlerError> {
-        let label = self.label.clone();
-        let mode = self.mode;
-        let callable = Arc::clone(&self.callable);
-        let permit = python_handler_semaphore()
-            .acquire_owned()
-            .await
-            .map_err(|err| {
-                HandlerError::NonRetryable(anyhow!("Python handler limit failed: {err}"))
-            })?;
-        tokio::task::spawn_blocking(move || {
-            let _permit = permit;
-            invoke_python_handler(callable, mode, label, msg)
-        })
-        .await
-        .map_err(|err| HandlerError::NonRetryable(anyhow!("Python handler task failed: {err}")))?
-    }
-
-    async fn handle_many(&self, msgs: Vec<CanonicalMessage>) -> Vec<Result<Handled, HandlerError>> {
-        let len = msgs.len();
-        let label = self.label.clone();
-        let mode = self.mode;
-        let callable = Arc::clone(&self.callable);
+    async fn invoke_batch(
+        &self,
+        messages: Vec<CanonicalMessage>,
+    ) -> Vec<Result<Handled, HandlerError>> {
+        let len = messages.len();
         let permit = match python_handler_semaphore().acquire_owned().await {
             Ok(permit) => permit,
             Err(err) => {
-                let error =
-                    HandlerError::NonRetryable(anyhow!("Python handler limit failed: {err}"));
+                let error = HandlerError::NonRetryable(anyhow!("Python handler limit failed: {err}"));
                 return std::iter::repeat_with(|| {
                     Err(HandlerError::NonRetryable(anyhow!(error.to_string())))
                 })
@@ -130,16 +126,30 @@ impl Handler for PythonHandler {
             }
         };
 
-        match tokio::task::spawn_blocking(move || {
-            let _permit = permit;
-            invoke_python_handler_many(callable, mode, label, msgs)
-        })
-        .await
-        {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        if let Err(err) = self.worker.tx.send(PythonWorkerRequest {
+            messages,
+            reply_tx,
+            permit,
+        }) {
+            let error = HandlerError::NonRetryable(anyhow!(
+                "Python handler worker unavailable for '{}': {}",
+                self.label,
+                err
+            ));
+            return std::iter::repeat_with(|| {
+                Err(HandlerError::NonRetryable(anyhow!(error.to_string())))
+            })
+            .take(len)
+            .collect();
+        }
+
+        match reply_rx.await {
             Ok(results) => results,
             Err(err) => std::iter::repeat_with(|| {
                 Err(HandlerError::NonRetryable(anyhow!(
-                    "Python handler task failed: {err}"
+                    "Python handler worker failed for '{}': {err}",
+                    self.label
                 )))
             })
             .take(len)
@@ -148,12 +158,51 @@ impl Handler for PythonHandler {
     }
 }
 
+impl PythonWorker {
+    fn spawn(label: String, mode: PythonHandlerMode, callable: Py<PyAny>) -> Self {
+        let (tx, rx) = std::sync::mpsc::channel::<PythonWorkerRequest>();
+        thread::Builder::new()
+            .name(format!("mqb-py-{}", label))
+            .spawn(move || {
+                while let Ok(request) = rx.recv() {
+                    let _permit = request.permit;
+                    let results = invoke_python_handler_many(
+                        &callable,
+                        mode,
+                        &label,
+                        request.messages,
+                    );
+                    let _ = request.reply_tx.send(results);
+                }
+            })
+            .expect("failed to spawn Python handler worker");
+        Self { tx }
+    }
+}
+
+#[async_trait]
+impl Handler for PythonHandler {
+    async fn handle(&self, msg: CanonicalMessage) -> Result<Handled, HandlerError> {
+        match self.invoke_batch(vec![msg]).await.into_iter().next() {
+            Some(result) => result,
+            None => Err(HandlerError::NonRetryable(anyhow!(
+                "Python handler worker returned no result for '{}'",
+                self.label
+            ))),
+        }
+    }
+
+    async fn handle_many(&self, msgs: Vec<CanonicalMessage>) -> Vec<Result<Handled, HandlerError>> {
+        self.invoke_batch(msgs).await
+    }
+}
+
 #[pyclass(module = "mq_bridge")]
 #[derive(Debug)]
 struct Message {
     payload: Vec<u8>,
     metadata: HashMap<String, String>,
-    id: Option<String>,
+    id: Option<u128>,
 }
 
 impl Message {
@@ -161,16 +210,14 @@ impl Message {
         Self {
             payload: message.payload.to_vec(),
             metadata: message.metadata.clone(),
-            id: Some(format_message_id(message.message_id)),
+            id: Some(message.message_id),
         }
     }
 
     fn to_canonical(&self) -> PyResult<CanonicalMessage> {
-        build_message(
-            self.payload.clone(),
-            Some(self.metadata.clone()),
-            self.id.as_deref(),
-        )
+        let mut message = CanonicalMessage::new(self.payload.clone(), self.id);
+        message.metadata = self.metadata.clone();
+        Ok(message)
     }
 }
 
@@ -183,7 +230,7 @@ impl Message {
         metadata: Option<HashMap<String, String>>,
         id: Option<String>,
     ) -> PyResult<Self> {
-        validate_message_id(id.as_deref())?;
+        let id = id.as_deref().map(parse_message_id).transpose()?;
         Ok(Self {
             payload,
             metadata: metadata.unwrap_or_default(),
@@ -199,7 +246,7 @@ impl Message {
         metadata: Option<HashMap<String, String>>,
         id: Option<String>,
     ) -> PyResult<Self> {
-        validate_message_id(id.as_deref())?;
+        let id = id.as_deref().map(parse_message_id).transpose()?;
         let payload = python_to_json_bytes(data)?;
         Ok(Self {
             payload,
@@ -220,7 +267,7 @@ impl Message {
 
     #[getter]
     fn id(&self) -> Option<String> {
-        self.id.clone()
+        self.id.map(format_message_id)
     }
 
     fn json(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
@@ -237,7 +284,7 @@ impl Message {
         Ok(Self {
             payload: python_to_json_bytes(data)?,
             metadata: self.metadata.clone(),
-            id: self.id.clone(),
+            id: self.id,
         })
     }
 
@@ -245,14 +292,15 @@ impl Message {
         Self {
             payload,
             metadata: self.metadata.clone(),
-            id: self.id.clone(),
+            id: self.id,
         }
     }
 
     fn __repr__(&self) -> String {
+        let id = self.id.map(format_message_id);
         format!(
             "Message(id={:?}, metadata={:?}, payload_len={})",
-            self.id,
+            id,
             self.metadata,
             self.payload.len()
         )
@@ -792,31 +840,10 @@ fn format_message_id(message_id: u128) -> String {
     fast_uuid_v7::format_uuid(message_id).to_string()
 }
 
-fn invoke_python_handler(
-    callable: Arc<Py<PyAny>>,
-    mode: PythonHandlerMode,
-    label: String,
-    message: CanonicalMessage,
-) -> Result<Handled, HandlerError> {
-    let message_id = message.message_id;
-    Python::attach(|py| -> PyResult<Handled> {
-        let arg = match mode {
-            PythonHandlerMode::Message => {
-                Py::new(py, Message::from_canonical(&message))?.into_any()
-            }
-            PythonHandlerMode::Json => json_bytes_to_python(py, message.payload.as_ref())?,
-        };
-
-        let result = callable.bind(py).call1((arg,))?;
-        python_result_to_handled(&result, message_id, &message.metadata)
-    })
-    .map_err(|err| python_error_to_handler_error(py_err_context(&label, message_id), err))
-}
-
 fn invoke_python_handler_many(
-    callable: Arc<Py<PyAny>>,
+    callable: &Py<PyAny>,
     mode: PythonHandlerMode,
-    label: String,
+    label: &str,
     messages: Vec<CanonicalMessage>,
 ) -> Vec<Result<Handled, HandlerError>> {
     Python::attach(|py| {
