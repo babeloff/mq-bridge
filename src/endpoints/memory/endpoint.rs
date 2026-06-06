@@ -2,6 +2,8 @@
 //  © Copyright 2025, by Marco Mengelkoch
 //  Licensed under MIT License, see License file for more details
 //  git clone https://github.com/marcomq/mq-bridge
+use super::memory_transport::MemoryTransport;
+use super::transport::{TransportChannel, TransportUrl};
 use crate::canonical_message::tracing_support::LazyMessageIds;
 use crate::event_store::{
     event_store_exists, get_or_create_event_store, EventStore, EventStoreConsumer,
@@ -18,9 +20,15 @@ use async_trait::async_trait;
 use once_cell::sync::Lazy;
 use std::any::Any;
 use std::collections::HashMap;
+use std::fmt;
 use std::sync::{Arc, Mutex};
 use tokio::sync::oneshot;
 use tracing::{info, trace, warn};
+
+#[cfg(unix)]
+use super::ipc_unix::UnixIpcTransport;
+#[cfg(windows)]
+use super::ipc_windows::WindowsIpcTransport;
 
 /// A map to hold memory channels for the duration of the bridge setup.
 /// This allows a consumer and publisher in different routes to connect to the same in-memory topic.
@@ -154,11 +162,12 @@ impl MemoryResponseChannel {
 
 /// Gets a shared `MemoryChannel` for a given topic, creating it if it doesn't exist.
 pub fn get_or_create_channel(config: &MemoryConfig) -> MemoryChannel {
+    let topic = memory_namespace(config).unwrap_or_else(|_| config.topic.clone());
     let mut channels = RUNTIME_MEMORY_CHANNELS.lock().unwrap();
     channels
-        .entry(config.topic.clone()) // Use the HashMap's entry API
+        .entry(topic.clone()) // Use the HashMap's entry API
         .or_insert_with(|| {
-            info!(topic = %config.topic, "Creating new runtime memory channel");
+            info!(topic = %topic, "Creating new runtime memory channel");
             MemoryChannel::new(config.capacity.unwrap_or(100))
         })
         .clone()
@@ -181,6 +190,69 @@ fn memory_channel_exists(topic: &str) -> bool {
     channels.contains_key(topic)
 }
 
+fn resolved_transport(config: &MemoryConfig) -> anyhow::Result<TransportUrl> {
+    let identifier = config.get_transport_identifier()?;
+    TransportUrl::parse(&identifier)
+}
+
+fn memory_namespace(config: &MemoryConfig) -> anyhow::Result<String> {
+    match resolved_transport(config)? {
+        TransportUrl::Memory { namespace } => Ok(namespace),
+        other => Err(anyhow!(
+            "MemoryConfig uses IPC transport '{}', which requires async endpoint construction",
+            other.display_name()
+        )),
+    }
+}
+
+fn normalized_memory_config(config: &MemoryConfig) -> anyhow::Result<MemoryConfig> {
+    let mut normalized = config.clone();
+    normalized.topic = memory_namespace(config)?;
+    normalized.url = None;
+    Ok(normalized.with_smart_defaults())
+}
+
+/// Create a transport based on the URL scheme
+#[allow(dead_code)]
+async fn create_transport_from_url(
+    url: &TransportUrl,
+    capacity: usize,
+    is_server: bool,
+) -> anyhow::Result<Arc<dyn TransportChannel>> {
+    match url {
+        TransportUrl::Memory { namespace } => {
+            info!(namespace = %namespace, "Creating in-process memory transport");
+            Ok(Arc::new(MemoryTransport::new(capacity)))
+        }
+        #[cfg(unix)]
+        TransportUrl::Unix { path } => {
+            if is_server {
+                info!(path = %path, "Creating Unix IPC server transport");
+                let transport = UnixIpcTransport::new_server(path, capacity).await?;
+                Ok(Arc::new(transport))
+            } else {
+                info!(path = %path, "Creating Unix IPC client transport");
+                let transport = UnixIpcTransport::new_client(path, capacity).await?;
+                Ok(Arc::new(transport))
+            }
+        }
+        #[cfg(windows)]
+        TransportUrl::Pipe { name } => {
+            if is_server {
+                info!(pipe = %name, "Creating Windows Named Pipe server transport");
+                let transport = WindowsIpcTransport::new_server(name, capacity).await?;
+                Ok(Arc::new(transport))
+            } else {
+                info!(pipe = %name, "Creating Windows Named Pipe client transport");
+                let transport = WindowsIpcTransport::new_client(name, capacity).await?;
+                Ok(Arc::new(transport))
+            }
+        }
+        #[cfg(not(any(unix, windows)))]
+        _ => Err(anyhow!("IPC transport not supported on this platform")),
+    }
+}
+
 /// A sink that sends messages to an in-memory channel.
 #[derive(Debug, Clone)]
 pub struct MemoryPublisher {
@@ -190,14 +262,26 @@ pub struct MemoryPublisher {
     request_timeout: std::time::Duration,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 enum PublisherBackend {
     Queue(Sender<Vec<CanonicalMessage>>),
     Log(Arc<EventStore>),
+    Transport(Arc<dyn TransportChannel>),
+}
+
+impl fmt::Debug for PublisherBackend {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Queue(_) => f.write_str("Queue(..)"),
+            Self::Log(_) => f.write_str("Log(..)"),
+            Self::Transport(_) => f.write_str("Transport(..)"),
+        }
+    }
 }
 
 impl MemoryPublisher {
     pub fn new(config: &MemoryConfig) -> anyhow::Result<Self> {
+        let config = normalized_memory_config(config)?;
         let channel_exists = memory_channel_exists(&config.topic);
         let store_exists = event_store_exists(&config.topic);
 
@@ -214,7 +298,7 @@ impl MemoryPublisher {
             let store = get_or_create_event_store(&config.topic);
             PublisherBackend::Log(store)
         } else {
-            let channel = get_or_create_channel(config);
+            let channel = get_or_create_channel(&config);
             PublisherBackend::Queue(channel.sender)
         };
 
@@ -226,6 +310,35 @@ impl MemoryPublisher {
                 config.request_timeout_ms.unwrap_or(30000),
             ),
         })
+    }
+
+    pub async fn new_async(config: &MemoryConfig) -> anyhow::Result<Self> {
+        let url = resolved_transport(config)?;
+        match &url {
+            TransportUrl::Memory { .. } => Self::new(config),
+            _ => {
+                if config.subscribe_mode {
+                    return Err(anyhow!(
+                        "IPC memory publishers do not support subscribe_mode"
+                    ));
+                }
+                if config.request_reply {
+                    return Err(anyhow!(
+                        "IPC memory publishers do not yet support request_reply"
+                    ));
+                }
+                let capacity = config.capacity.unwrap_or(100);
+                let transport = create_transport_from_url(&url, capacity, false).await?;
+                Ok(Self {
+                    topic: url.display_name(),
+                    backend: PublisherBackend::Transport(transport),
+                    request_reply: false,
+                    request_timeout: std::time::Duration::from_millis(
+                        config.request_timeout_ms.unwrap_or(30000),
+                    ),
+                })
+            }
+        }
     }
 
     /// Creates a new local memory publisher.
@@ -314,6 +427,13 @@ impl MessagePublisher for MemoryPublisher {
                     Ok(Sent::Ack)
                 }
             }
+            PublisherBackend::Transport(transport) => {
+                transport
+                    .send_batch(vec![message])
+                    .await
+                    .map_err(|e| anyhow!("Failed to send via memory transport: {}", e))?;
+                Ok(Sent::Ack)
+            }
         }
     }
 
@@ -344,6 +464,18 @@ impl MessagePublisher for MemoryPublisher {
                     .map_err(|e| anyhow!("Failed to send to memory channel: {}", e))?;
                 Ok(SentBatch::Ack)
             }
+            PublisherBackend::Transport(transport) => {
+                trace!(
+                    topic = %self.topic,
+                    message_ids = ?LazyMessageIds(&messages),
+                    "Sending batch to memory transport"
+                );
+                transport
+                    .send_batch(messages)
+                    .await
+                    .map_err(|e| anyhow!("Failed to send batch via memory transport: {}", e))?;
+                Ok(SentBatch::Ack)
+            }
         }
     }
 
@@ -361,6 +493,16 @@ impl MessagePublisher for MemoryPublisher {
                 target: self.topic.clone(),
                 details: serde_json::json!({
                     "mode": "event_store"
+                }),
+                ..Default::default()
+            },
+            PublisherBackend::Transport(transport) => EndpointStatus {
+                healthy: !transport.is_closed(),
+                target: self.topic.clone(),
+                pending: Some(transport.len()),
+                capacity: transport.capacity(),
+                details: serde_json::json!({
+                    "mode": "transport"
                 }),
                 ..Default::default()
             },
@@ -382,10 +524,27 @@ pub struct MemoryQueueConsumer {
     enable_nack: bool,
 }
 
+#[derive(Clone)]
+pub struct TransportQueueConsumer {
+    topic: String,
+    transport: Arc<dyn TransportChannel>,
+    enable_nack: bool,
+}
+
+impl fmt::Debug for TransportQueueConsumer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TransportQueueConsumer")
+            .field("topic", &self.topic)
+            .field("enable_nack", &self.enable_nack)
+            .finish_non_exhaustive()
+    }
+}
+
 /// A source that reads messages from an in-memory channel or event store.
 #[derive(Debug)]
 pub enum MemoryConsumer {
     Queue(MemoryQueueConsumer),
+    Transport(TransportQueueConsumer),
     Log {
         consumer: EventStoreConsumer,
         topic: String,
@@ -394,6 +553,7 @@ pub enum MemoryConsumer {
 
 impl MemoryConsumer {
     pub fn new(config: &MemoryConfig) -> anyhow::Result<Self> {
+        let config = normalized_memory_config(config)?;
         let channel_exists = memory_channel_exists(&config.topic);
         let store_exists = event_store_exists(&config.topic);
 
@@ -420,8 +580,30 @@ impl MemoryConsumer {
                 // the expected Queue (competing consumer) semantics requested by `subscribe_mode: false`.
                 return Err(anyhow!("Topic '{}' is already active as a Subscriber Log (EventStore), but Queue mode (MemoryChannel) was requested.", config.topic));
             }
-            let queue = MemoryQueueConsumer::new(config)?;
+            let queue = MemoryQueueConsumer::new(&config)?;
             Ok(Self::Queue(queue))
+        }
+    }
+
+    pub async fn new_async(config: &MemoryConfig) -> anyhow::Result<Self> {
+        let url = resolved_transport(config)?;
+        match &url {
+            TransportUrl::Memory { .. } => Self::new(config),
+            _ => {
+                if config.subscribe_mode {
+                    return Err(anyhow!(
+                        "IPC memory consumers do not support subscribe_mode"
+                    ));
+                }
+                let config = config.clone().with_smart_defaults();
+                let capacity = config.capacity.unwrap_or(100);
+                let transport = create_transport_from_url(&url, capacity, true).await?;
+                Ok(Self::Transport(TransportQueueConsumer {
+                    topic: url.display_name(),
+                    transport,
+                    enable_nack: config.enable_nack,
+                }))
+            }
         }
     }
 }
@@ -682,6 +864,92 @@ impl MessageConsumer for MemoryQueueConsumer {
     }
 }
 
+#[async_trait]
+impl MessageConsumer for TransportQueueConsumer {
+    async fn receive_batch(&mut self, max_messages: usize) -> Result<ReceivedBatch, ConsumerError> {
+        let mut messages = self.transport.recv_batch().await.map_err(|e| {
+            ConsumerError::Connection(anyhow!("Failed to receive via memory transport: {}", e))
+        })?;
+
+        if messages.len() > max_messages {
+            let overflow = messages.split_off(max_messages);
+            self.transport.send_batch(overflow).await.map_err(|e| {
+                ConsumerError::Connection(anyhow!(
+                    "Failed to return overflow messages to memory transport: {}",
+                    e
+                ))
+            })?;
+        }
+
+        trace!(count = messages.len(), topic = %self.topic, message_ids = ?LazyMessageIds(&messages), "Received batch from memory transport");
+
+        let topic = self.topic.clone();
+        let transport = self.transport.clone();
+        let enable_nack = self.enable_nack;
+        let expected_count = messages.len();
+        let messages_for_retry = if enable_nack {
+            messages.clone()
+        } else {
+            Vec::new()
+        };
+
+        let commit = Box::new(move |dispositions: Vec<MessageDisposition>| {
+            let transport = transport.clone();
+            let topic = topic.clone();
+            let messages_for_retry = messages_for_retry.clone();
+            Box::pin(async move {
+                if dispositions.len() != expected_count {
+                    return Err(anyhow::anyhow!(
+                        "Memory transport batch commit received mismatched disposition count: expected {}, got {}",
+                        expected_count,
+                        dispositions.len()
+                    ));
+                }
+
+                let mut to_requeue = Vec::new();
+                for (i, disposition) in dispositions.into_iter().enumerate() {
+                    match disposition {
+                        MessageDisposition::Nack if enable_nack => {
+                            if let Some(msg) = messages_for_retry.get(i) {
+                                to_requeue.push(msg.clone());
+                            }
+                        }
+                        MessageDisposition::Reply(_) => {
+                            tracing::warn!(topic = %topic, "IPC memory transport does not support reply dispositions");
+                        }
+                        MessageDisposition::Ack | MessageDisposition::Nack => {}
+                    }
+                }
+
+                if !to_requeue.is_empty() {
+                    transport.send_batch(to_requeue).await?;
+                }
+
+                Ok(())
+            }) as BoxFuture<'static, anyhow::Result<()>>
+        }) as BatchCommitFunc;
+
+        Ok(ReceivedBatch { messages, commit })
+    }
+
+    async fn status(&self) -> EndpointStatus {
+        EndpointStatus {
+            healthy: !self.transport.is_closed(),
+            target: self.topic.clone(),
+            pending: Some(self.transport.len()),
+            capacity: self.transport.capacity(),
+            details: serde_json::json!({
+                "mode": "transport"
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
 async fn handle_memory_reply(
     mut resp: CanonicalMessage,
     index: usize,
@@ -709,6 +977,7 @@ impl MessageConsumer for MemoryConsumer {
     async fn receive_batch(&mut self, max_messages: usize) -> Result<ReceivedBatch, ConsumerError> {
         match self {
             Self::Queue(q) => q.receive_batch(max_messages).await,
+            Self::Transport(t) => t.receive_batch(max_messages).await,
             Self::Log { consumer, .. } => consumer.receive_batch(max_messages).await,
         }
     }
@@ -716,6 +985,7 @@ impl MessageConsumer for MemoryConsumer {
     async fn status(&self) -> EndpointStatus {
         match self {
             Self::Queue(q) => q.status().await,
+            Self::Transport(t) => t.status().await,
             Self::Log { consumer, .. } => consumer.status().await,
         }
     }
@@ -737,6 +1007,7 @@ impl MemoryConsumer {
     pub fn channel(&self) -> MemoryChannel {
         let topic = match self {
             Self::Queue(q) => &q.topic,
+            Self::Transport(t) => &t.topic,
             Self::Log { topic, .. } => topic,
         };
         get_or_create_channel(&MemoryConfig {
@@ -809,6 +1080,50 @@ mod tests {
         let _ = (received.commit)(MessageDisposition::Ack).await;
         assert_eq!(received.message.payload, msg.payload);
         assert_eq!(consumer.channel().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_memory_url_alias_uses_same_channel_as_legacy_topic() {
+        let mut consumer = MemoryConsumer::new(&MemoryConfig::new("test-memory-url", Some(10)))
+            .expect("legacy topic consumer should be in-process memory");
+        let publisher = MemoryPublisher::new_async(&MemoryConfig::new_with_url(
+            "memory://test-memory-url",
+            Some(10),
+        ))
+        .await
+        .expect("memory URL publisher should be in-process memory");
+
+        let msg = msg!(json!({"hello": "memory-url"}));
+        publisher.send(msg.clone()).await.unwrap();
+
+        let received = consumer.receive().await.unwrap();
+        let _ = (received.commit)(MessageDisposition::Ack).await;
+        assert_eq!(received.message.payload, msg.payload);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_unix_ipc_endpoint_constructors_roundtrip() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let socket_path = temp_dir.path().join("endpoint.sock");
+        let url = format!("unix://{}", socket_path.display());
+        let config = MemoryConfig::new_with_url(url, Some(10));
+
+        assert!(config.clone().with_smart_defaults().enable_nack);
+
+        let mut consumer = MemoryConsumer::new_async(&config)
+            .await
+            .expect("IPC consumer should create a Unix socket server");
+        let publisher = MemoryPublisher::new_async(&config)
+            .await
+            .expect("IPC publisher should connect to the Unix socket server");
+
+        let msg = CanonicalMessage::from_vec(b"endpoint-ipc");
+        publisher.send(msg.clone()).await.unwrap();
+
+        let received = consumer.receive().await.unwrap();
+        (received.commit)(MessageDisposition::Ack).await.unwrap();
+        assert_eq!(received.message.payload.as_ref(), b"endpoint-ipc");
     }
 
     #[tokio::test]

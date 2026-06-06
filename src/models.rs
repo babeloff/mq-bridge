@@ -1256,8 +1256,19 @@ impl NatsConfig {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct MemoryConfig {
-    /// The topic name for the in-memory channel.
+    /// The topic name or transport URL. Can be:
+    /// - Simple name: "my-topic" (defaults to memory://my-topic)
+    /// - Memory URL: "memory://my-topic"
+    /// - IPC URL: "ipc://my-queue" or "ipc:///path/to/socket"
+    /// - Unix socket: "unix:///path/to/socket" (Unix only)
+    /// - Named pipe: "pipe://my-pipe" (Windows only)
+    ///
+    /// Either `topic` or `url` can be specified (they are serde aliases).
+    #[serde(default, skip_serializing_if = "String::is_empty", alias = "url")]
     pub topic: String,
+    /// Transport URL (serde alias for `topic`). Use either `topic` or `url`.
+    #[serde(skip)]
+    pub url: Option<String>,
     /// The capacity of the channel. Defaults to 100.
     pub capacity: Option<usize>,
     /// (Publisher only) If true, send() waits for a response.
@@ -1268,7 +1279,8 @@ pub struct MemoryConfig {
     /// (Consumer only) If true, act as a **Subscriber** (fan-out). Defaults to false (queue).
     #[serde(default)]
     pub subscribe_mode: bool,
-    /// (Consumer only) If true, enables NACK support (re-queuing), which requires cloning messages. Defaults to false.
+    /// (Consumer only) If true, enables NACK support (re-queuing), which requires cloning messages.
+    /// Defaults to false for memory:// transports, automatically true for IPC transports (ipc://, unix://, pipe://).
     #[serde(default)]
     pub enable_nack: bool,
 }
@@ -1277,10 +1289,22 @@ impl MemoryConfig {
     pub fn new(topic: impl Into<String>, capacity: Option<usize>) -> Self {
         Self {
             topic: topic.into(),
+            url: None,
             capacity,
             ..Default::default()
         }
     }
+
+    pub fn new_with_url(url: impl Into<String>, capacity: Option<usize>) -> Self {
+        let url = url.into();
+        Self {
+            topic: url.clone(),
+            url: Some(url),
+            capacity,
+            ..Default::default()
+        }
+    }
+
     pub fn with_subscribe(self, subscribe_mode: bool) -> Self {
         Self {
             subscribe_mode,
@@ -1290,6 +1314,50 @@ impl MemoryConfig {
 
     pub fn with_request_reply(mut self, request_reply: bool) -> Self {
         self.request_reply = request_reply;
+        self
+    }
+
+    /// Gets the effective transport identifier.
+    /// If topic contains ://, it's treated as a URL, otherwise as memory://topic.
+    pub fn get_transport_identifier(&self) -> anyhow::Result<String> {
+        let identifier = if !self.topic.is_empty() {
+            &self.topic
+        } else if let Some(url) = self.url.as_ref().filter(|url| !url.is_empty()) {
+            url
+        } else {
+            return Err(anyhow::anyhow!(
+                "MemoryConfig: 'topic' (or 'url' alias) is required."
+            ));
+        };
+
+        // If topic doesn't contain ://, treat it as memory://topic for backward compatibility
+        if identifier.contains("://") {
+            Ok(identifier.clone())
+        } else {
+            Ok(format!("memory://{}", identifier))
+        }
+    }
+
+    /// Check if the transport URL scheme suggests IPC (inter-process communication).
+    /// IPC transports should enable nack by default for reliability.
+    pub fn is_ipc_transport(&self) -> bool {
+        if let Ok(identifier) = self.get_transport_identifier() {
+            identifier.starts_with("ipc://")
+                || identifier.starts_with("unix://")
+                || identifier.starts_with("pipe://")
+        } else {
+            false
+        }
+    }
+
+    /// Apply smart defaults based on the transport type.
+    /// For IPC transports, enable_nack defaults to true for reliability.
+    pub fn with_smart_defaults(mut self) -> Self {
+        // Only apply smart defaults if enable_nack wasn't explicitly set
+        // We detect this by checking if it's still false (the default)
+        if !self.enable_nack && self.is_ipc_transport() {
+            self.enable_nack = true;
+        }
         self
     }
 }

@@ -710,7 +710,7 @@ async fn create_base_consumer(
         #[cfg(feature = "websocket")]
         EndpointType::WebSocket(cfg) => Ok(boxed(websocket::WebSocketConsumer::new(cfg).await?)),
         EndpointType::Static(cfg) => Ok(boxed(static_endpoint::StaticRequestConsumer::new(cfg)?)),
-        EndpointType::Memory(cfg) => Ok(boxed(memory::MemoryConsumer::new(cfg)?)),
+        EndpointType::Memory(cfg) => Ok(boxed(memory::MemoryConsumer::new_async(cfg).await?)),
         EndpointType::StreamBuffer(cfg) => {
             Ok(boxed(stream_buffer::StreamBufferConsumer::new(cfg)?))
         }
@@ -1272,7 +1272,8 @@ async fn create_base_publisher(
             cfg,
         )?) as Box<dyn MessagePublisher>),
         EndpointType::Memory(cfg) => {
-            Ok(Box::new(memory::MemoryPublisher::new(cfg)?) as Box<dyn MessagePublisher>)
+            Ok(Box::new(memory::MemoryPublisher::new_async(cfg).await?)
+                as Box<dyn MessagePublisher>)
         }
         EndpointType::StreamBuffer(cfg) => {
             Ok(Box::new(stream_buffer::StreamBufferPublisher::new(cfg)?)
