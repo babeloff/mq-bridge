@@ -1,0 +1,171 @@
+name: IBM MQ Tests
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/endpoints/ibm_mq.rs'
+      - 'tests/integration/ibm_mq*.rs'
+      - 'Cargo.toml'
+      - '.github/workflows/ibm-mq.yml'
+  pull_request:
+    branches: [main, dev]
+    paths:
+      - 'src/endpoints/ibm_mq.rs'
+      - 'tests/integration/ibm_mq*.rs'
+      - 'Cargo.toml'
+      - '.github/workflows/ibm-mq.yml'
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # Build check for IBM MQ feature
+  build-ibm-mq:
+    name: Build IBM MQ Feature
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-ibmmq-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-ibmmq-
+            ${{ runner.os }}-cargo-
+      
+      - name: Install IBM MQ Client Libraries
+        run: |
+          # Download and install IBM MQ redistributable client
+          # Using version 9.3.0.0 (adjust as needed)
+          wget https://public.dhe.ibm.com/ibmdl/export/pub/software/websphere/messaging/mqdev/redist/9.3.0.0-IBM-MQC-Redist-LinuxX64.tar.gz
+          tar -xzf 9.3.0.0-IBM-MQC-Redist-LinuxX64.tar.gz
+          
+          # Set up environment for MQ client
+          export MQ_INSTALLATION_PATH=$(pwd)/mqm
+          sudo mkdir -p /opt/mqm
+          sudo cp -r mqm/* /opt/mqm/
+          
+          # Set library path
+          echo "LD_LIBRARY_PATH=/opt/mqm/lib64:$LD_LIBRARY_PATH" >> $GITHUB_ENV
+          echo "MQ_INSTALLATION_PATH=/opt/mqm" >> $GITHUB_ENV
+      
+      - name: Verify MQ client installation
+        run: |
+          ls -la /opt/mqm/lib64/ || echo "MQ lib64 directory not found"
+          echo "LD_LIBRARY_PATH=$LD_LIBRARY_PATH"
+      
+      - name: Build with IBM MQ feature
+        run: cargo build --features ibm-mq
+      
+      - name: Run clippy on IBM MQ code
+        run: cargo clippy --features ibm-mq -- -D warnings
+
+  # Integration tests with Docker
+  integration-ibm-mq:
+    name: IBM MQ Integration Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-ibmmq-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-ibmmq-
+            ${{ runner.os }}-cargo-
+      
+      - name: Install IBM MQ Client Libraries
+        run: |
+          wget https://public.dhe.ibm.com/ibmdl/export/pub/software/websphere/messaging/mqdev/redist/9.3.0.0-IBM-MQC-Redist-LinuxX64.tar.gz
+          tar -xzf 9.3.0.0-IBM-MQC-Redist-LinuxX64.tar.gz
+          sudo mkdir -p /opt/mqm
+          sudo cp -r mqm/* /opt/mqm/
+          echo "LD_LIBRARY_PATH=/opt/mqm/lib64:$LD_LIBRARY_PATH" >> $GITHUB_ENV
+          echo "MQ_INSTALLATION_PATH=/opt/mqm" >> $GITHUB_ENV
+      
+      - name: Install JDK (for keytool - TLS tests)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y default-jdk
+      
+      - name: Generate TLS certificates
+        run: |
+          chmod +x tests/integration/scripts/gen_certs.sh
+          ./tests/integration/scripts/gen_certs.sh ibm-mq
+      
+      - name: Pull IBM MQ Docker images
+        run: |
+          docker compose -f tests/integration/docker-compose/ibm_mq.yml pull
+          docker compose -f tests/integration/docker-compose/ibm_mq_tls.yml pull
+      
+      - name: Run IBM MQ integration tests
+        run: |
+          cargo test --test integration_test --features ibm-mq,test-utils,rustls-ring -- \
+            --ignored --nocapture --test-threads=1 \
+            test_ibm_mq_subscriber_logic \
+            test_ibm_mq_performance_pipeline \
+            test_ibm_mq_chaos \
+            test_ibm_mq_status
+      
+      - name: Run IBM MQ TLS tests
+        run: |
+          cargo test --test integration_test --features ibm-mq,test-utils,rustls-ring -- \
+            --ignored --nocapture --test-threads=1 \
+            test_ibm_mq_tls_roundtrip
+
+  # Documentation check
+  docs-ibm-mq:
+    name: IBM MQ Documentation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-ibmmq-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-ibmmq-
+      
+      - name: Install IBM MQ Client Libraries
+        run: |
+          wget https://public.dhe.ibm.com/ibmdl/export/pub/software/websphere/messaging/mqdev/redist/9.3.0.0-IBM-MQC-Redist-LinuxX64.tar.gz
+          tar -xzf 9.3.0.0-IBM-MQC-Redist-LinuxX64.tar.gz
+          sudo mkdir -p /opt/mqm
+          sudo cp -r mqm/* /opt/mqm/
+          echo "LD_LIBRARY_PATH=/opt/mqm/lib64:$LD_LIBRARY_PATH" >> $GITHUB_ENV
+          echo "MQ_INSTALLATION_PATH=/opt/mqm" >> $GITHUB_ENV
+      
+      - name: Build documentation
+        run: cargo doc --features ibm-mq --no-deps
+
+# Made with Bob
