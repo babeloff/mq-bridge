@@ -5,13 +5,14 @@ use std::fs;
 use std::future::Future;
 use std::num::NonZeroUsize;
 use std::path::Path;
-use std::thread;
 use std::sync::{Arc, Mutex, OnceLock};
+use std::thread;
 use std::time::Duration;
 
 use ::mq_bridge as core;
 use anyhow::{anyhow, Context};
 use async_trait::async_trait;
+use bytes::Bytes;
 use core::endpoints::memory::MemoryConsumer;
 use core::models::{Endpoint, PublisherConfig};
 use core::traits::{Handler, MessageConsumer, MessageDisposition};
@@ -36,7 +37,7 @@ use tracing::error;
 
 const MAX_JSON_DEPTH: usize = 64;
 
-static PYTHON_HANDLER_CONCURRENCY: OnceLock<Arc<Semaphore>> = OnceLock::new();
+static PYTHON_HANDLER_CONCURRENCY: OnceLock<Option<Arc<Semaphore>>> = OnceLock::new();
 static ACTIVE_ROUTE_NAMES: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 
 create_exception!(mq_bridge, RetryableError, PyException);
@@ -65,13 +66,27 @@ struct RouteRunState {
 #[derive(Clone, Copy, Debug)]
 enum PythonHandlerMode {
     Message,
+    Payload,
     Json,
 }
 
 #[derive(Clone)]
 struct PythonHandler {
     label: String,
-    worker: Arc<PythonWorker>,
+    mode: PythonHandlerMode,
+    executor: PythonHandlerExecutor,
+}
+
+#[derive(Clone)]
+enum PythonHandlerExecutor {
+    Worker(Arc<PythonWorker>),
+    Direct(Arc<Py<PyAny>>),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PythonHandlerExecutorMode {
+    Worker,
+    Direct,
 }
 
 struct PythonWorker {
@@ -81,31 +96,43 @@ struct PythonWorker {
 struct PythonWorkerRequest {
     messages: Vec<CanonicalMessage>,
     reply_tx: oneshot::Sender<Vec<Result<Handled, HandlerError>>>,
-    permit: OwnedSemaphorePermit,
+    permit: Option<OwnedSemaphorePermit>,
 }
 
 impl PythonHandler {
     fn message(label: impl Into<String>, callable: Py<PyAny>) -> Self {
-        let label = label.into();
-        Self {
-            worker: Arc::new(PythonWorker::spawn(
-                label.clone(),
-                PythonHandlerMode::Message,
-                callable,
-            )),
-            label,
-        }
+        Self::new(label, PythonHandlerMode::Message, callable)
+    }
+
+    fn payload(label: impl Into<String>, callable: Py<PyAny>) -> Self {
+        Self::new(label, PythonHandlerMode::Payload, callable)
     }
 
     fn json(label: impl Into<String>, callable: Py<PyAny>) -> Self {
+        Self::new(label, PythonHandlerMode::Json, callable)
+    }
+
+    fn new(label: impl Into<String>, mode: PythonHandlerMode, callable: Py<PyAny>) -> Self {
+        Self::with_executor_mode(label, mode, callable, python_handler_executor_mode())
+    }
+
+    fn with_executor_mode(
+        label: impl Into<String>,
+        mode: PythonHandlerMode,
+        callable: Py<PyAny>,
+        executor_mode: PythonHandlerExecutorMode,
+    ) -> Self {
         let label = label.into();
-        Self {
-            worker: Arc::new(PythonWorker::spawn(
-                label.clone(),
-                PythonHandlerMode::Json,
-                callable,
+        let executor = match executor_mode {
+            PythonHandlerExecutorMode::Worker => PythonHandlerExecutor::Worker(Arc::new(
+                PythonWorker::spawn(label.clone(), mode, callable),
             )),
+            PythonHandlerExecutorMode::Direct => PythonHandlerExecutor::Direct(Arc::new(callable)),
+        };
+        Self {
             label,
+            mode,
+            executor,
         }
     }
 
@@ -114,47 +141,82 @@ impl PythonHandler {
         messages: Vec<CanonicalMessage>,
     ) -> Vec<Result<Handled, HandlerError>> {
         let len = messages.len();
-        let permit = match python_handler_semaphore().acquire_owned().await {
-            Ok(permit) => permit,
-            Err(err) => {
-                let error = HandlerError::NonRetryable(anyhow!("Python handler limit failed: {err}"));
-                return std::iter::repeat_with(|| {
-                    Err(HandlerError::NonRetryable(anyhow!(error.to_string())))
-                })
-                .take(len)
-                .collect();
+        let permit = if let Some(semaphore) = python_handler_semaphore() {
+            match semaphore.acquire_owned().await {
+                Ok(permit) => Some(permit),
+                Err(err) => {
+                    let error =
+                        HandlerError::NonRetryable(anyhow!("Python handler limit failed: {err}"));
+                    return std::iter::repeat_with(|| {
+                        Err(HandlerError::NonRetryable(anyhow!(error.to_string())))
+                    })
+                    .take(len)
+                    .collect();
+                }
             }
+        } else {
+            None
         };
 
-        let (reply_tx, reply_rx) = oneshot::channel();
-        if let Err(err) = self.worker.tx.send(PythonWorkerRequest {
-            messages,
-            reply_tx,
-            permit,
-        }) {
-            let error = HandlerError::NonRetryable(anyhow!(
-                "Python handler worker unavailable for '{}': {}",
-                self.label,
-                err
-            ));
-            return std::iter::repeat_with(|| {
-                Err(HandlerError::NonRetryable(anyhow!(error.to_string())))
-            })
-            .take(len)
-            .collect();
-        }
+        match &self.executor {
+            PythonHandlerExecutor::Worker(worker) => {
+                let (reply_tx, reply_rx) = oneshot::channel();
+                if let Err(err) = worker.tx.send(PythonWorkerRequest {
+                    messages,
+                    reply_tx,
+                    permit,
+                }) {
+                    let error = HandlerError::NonRetryable(anyhow!(
+                        "Python handler worker unavailable for '{}': {}",
+                        self.label,
+                        err
+                    ));
+                    return std::iter::repeat_with(|| {
+                        Err(HandlerError::NonRetryable(anyhow!(error.to_string())))
+                    })
+                    .take(len)
+                    .collect();
+                }
 
-        match reply_rx.await {
-            Ok(results) => results,
-            Err(err) => std::iter::repeat_with(|| {
-                Err(HandlerError::NonRetryable(anyhow!(
-                    "Python handler worker failed for '{}': {err}",
-                    self.label
-                )))
-            })
-            .take(len)
-            .collect(),
+                match reply_rx.await {
+                    Ok(results) => results,
+                    Err(err) => std::iter::repeat_with(|| {
+                        Err(HandlerError::NonRetryable(anyhow!(
+                            "Python handler worker failed for '{}': {err}",
+                            self.label
+                        )))
+                    })
+                    .take(len)
+                    .collect(),
+                }
+            }
+            PythonHandlerExecutor::Direct(callable) => {
+                let _permit = permit;
+                invoke_python_handler_many(callable.as_ref(), self.mode, &self.label, messages)
+            }
         }
+    }
+}
+
+fn python_handler_executor_mode() -> PythonHandlerExecutorMode {
+    match std::env::var("MQ_BRIDGE_PY_HANDLER_EXECUTOR") {
+        Ok(value) => parse_python_handler_executor_mode(Some(value.as_str())),
+        Err(_) => PythonHandlerExecutorMode::Worker,
+    }
+}
+
+fn parse_python_handler_executor_mode(value: Option<&str>) -> PythonHandlerExecutorMode {
+    match value.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(value) if value.eq_ignore_ascii_case("direct") => PythonHandlerExecutorMode::Direct,
+        Some(value) if value.eq_ignore_ascii_case("worker") => PythonHandlerExecutorMode::Worker,
+        Some(value) => {
+            tracing::warn!(
+                value,
+                "Unknown MQ_BRIDGE_PY_HANDLER_EXECUTOR value; falling back to worker"
+            );
+            PythonHandlerExecutorMode::Worker
+        }
+        None => PythonHandlerExecutorMode::Worker,
     }
 }
 
@@ -166,12 +228,8 @@ impl PythonWorker {
             .spawn(move || {
                 while let Ok(request) = rx.recv() {
                     let _permit = request.permit;
-                    let results = invoke_python_handler_many(
-                        &callable,
-                        mode,
-                        &label,
-                        request.messages,
-                    );
+                    let results =
+                        invoke_python_handler_many(&callable, mode, &label, request.messages);
                     let _ = request.reply_tx.send(results);
                 }
             })
@@ -200,7 +258,7 @@ impl Handler for PythonHandler {
 #[pyclass(module = "mq_bridge")]
 #[derive(Debug)]
 struct Message {
-    payload: Vec<u8>,
+    payload: Bytes,
     metadata: HashMap<String, String>,
     id: Option<u128>,
 }
@@ -208,14 +266,14 @@ struct Message {
 impl Message {
     fn from_canonical(message: &CanonicalMessage) -> Self {
         Self {
-            payload: message.payload.to_vec(),
+            payload: message.payload.clone(),
             metadata: message.metadata.clone(),
             id: Some(message.message_id),
         }
     }
 
     fn to_canonical(&self) -> PyResult<CanonicalMessage> {
-        let mut message = CanonicalMessage::new(self.payload.clone(), self.id);
+        let mut message = CanonicalMessage::new_bytes(self.payload.clone(), self.id);
         message.metadata = self.metadata.clone();
         Ok(message)
     }
@@ -232,7 +290,7 @@ impl Message {
     ) -> PyResult<Self> {
         let id = id.as_deref().map(parse_message_id).transpose()?;
         Ok(Self {
-            payload,
+            payload: Bytes::from(payload),
             metadata: metadata.unwrap_or_default(),
             id,
         })
@@ -249,7 +307,7 @@ impl Message {
         let id = id.as_deref().map(parse_message_id).transpose()?;
         let payload = python_to_json_bytes(data)?;
         Ok(Self {
-            payload,
+            payload: Bytes::from(payload),
             metadata: metadata.unwrap_or_default(),
             id,
         })
@@ -282,7 +340,7 @@ impl Message {
 
     fn with_json(&self, data: &Bound<'_, PyAny>) -> PyResult<Self> {
         Ok(Self {
-            payload: python_to_json_bytes(data)?,
+            payload: Bytes::from(python_to_json_bytes(data)?),
             metadata: self.metadata.clone(),
             id: self.id,
         })
@@ -290,7 +348,7 @@ impl Message {
 
     fn with_payload(&self, payload: Vec<u8>) -> Self {
         Self {
-            payload,
+            payload: Bytes::from(payload),
             metadata: self.metadata.clone(),
             id: self.id,
         }
@@ -403,6 +461,42 @@ impl Route {
         let mut route = slf.lock_route()?;
         let prev_handler = route.output.handler.take();
         let python_handler = PythonHandler::message(format!("{}:{kind}", slf.name), handler);
+
+        let new_handler = if let Some(existing) = prev_handler {
+            if let Some(extended) =
+                existing.register_handler(kind, Arc::new(python_handler.clone()))
+            {
+                extended
+            } else {
+                Arc::new(
+                    TypeHandler::new()
+                        .with_fallback(existing)
+                        .add_handler(kind, python_handler),
+                )
+            }
+        } else {
+            Arc::new(TypeHandler::new().add_handler(kind, python_handler))
+        };
+
+        route.output.handler = Some(new_handler);
+        drop(route);
+        Ok(slf)
+    }
+
+    fn add_payload_handler<'py>(
+        slf: PyRefMut<'py, Self>,
+        py: Python<'py>,
+        kind: &str,
+        handler: Py<PyAny>,
+    ) -> PyResult<PyRefMut<'py, Self>> {
+        if !handler.bind(py).is_callable() {
+            return Err(PyTypeError::new_err("handler must be callable"));
+        }
+        slf.ensure_not_running()?;
+
+        let mut route = slf.lock_route()?;
+        let prev_handler = route.output.handler.take();
+        let python_handler = PythonHandler::payload(format!("{}:{kind}", slf.name), handler);
 
         let new_handler = if let Some(existing) = prev_handler {
             if let Some(extended) =
@@ -855,20 +949,22 @@ fn invoke_python_handler_many(
                     PythonHandlerMode::Message => {
                         Py::new(py, Message::from_canonical(&message)).map(|msg| msg.into_any())
                     }
+                    PythonHandlerMode::Payload => Ok(PyBytes::new(py, message.payload.as_ref())
+                        .into_any()
+                        .unbind()),
                     PythonHandlerMode::Json => json_bytes_to_python(py, message.payload.as_ref()),
                 };
 
                 match arg {
                     Ok(arg) => match callable.bind(py).call1((arg,)) {
-                        Ok(result) => {
-                            python_result_to_handled(&result, message_id, &message.metadata)
-                                .map_err(|err| {
-                                    python_error_to_handler_error(
-                                        py_err_context(&label, message_id),
-                                        err,
-                                    )
-                                })
-                        }
+                        Ok(result) => python_result_to_handled(
+                            &result,
+                            message_id,
+                            message.metadata,
+                        )
+                        .map_err(|err| {
+                            python_error_to_handler_error(py_err_context(&label, message_id), err)
+                        }),
                         Err(err) => Err(python_error_to_handler_error(
                             py_err_context(&label, message_id),
                             err,
@@ -914,7 +1010,7 @@ fn python_error_to_handler_error(ctx: PyErrorContext<'_>, err: PyErr) -> Handler
 fn python_result_to_handled(
     obj: &Bound<'_, PyAny>,
     message_id: u128,
-    inherited_metadata: &HashMap<String, String>,
+    inherited_metadata: HashMap<String, String>,
 ) -> PyResult<Handled> {
     if obj.is_none() {
         return Ok(Handled::Ack);
@@ -928,20 +1024,20 @@ fn python_result_to_handled(
 
     if obj.is_instance_of::<PyBytes>() || obj.is_instance_of::<PyByteArray>() {
         let mut message = CanonicalMessage::from_vec(obj.extract::<Vec<u8>>()?);
-        message.metadata.extend(inherited_metadata.clone());
+        message.metadata = inherited_metadata;
         message.set_id(message_id);
         return Ok(Handled::Publish(message));
     }
 
     if let Ok(text) = obj.extract::<String>() {
         let mut message = CanonicalMessage::from(text);
-        message.metadata.extend(inherited_metadata.clone());
+        message.metadata = inherited_metadata;
         message.set_id(message_id);
         return Ok(Handled::Publish(message));
     }
 
     let mut message = CanonicalMessage::from_vec(python_to_json_bytes(obj)?);
-    message.metadata.extend(inherited_metadata.clone());
+    message.metadata = inherited_metadata;
     message.set_id(message_id);
     Ok(Handled::Publish(message))
 }
@@ -1235,14 +1331,30 @@ where
     runtime.block_on(future)
 }
 
-fn python_handler_semaphore() -> Arc<Semaphore> {
-    Arc::clone(PYTHON_HANDLER_CONCURRENCY.get_or_init(|| {
-        let limit = std::thread::available_parallelism()
+fn python_handler_semaphore() -> Option<Arc<Semaphore>> {
+    PYTHON_HANDLER_CONCURRENCY
+        .get_or_init(|| {
+            python_handler_concurrency_limit().map(|limit| Arc::new(Semaphore::new(limit)))
+        })
+        .clone()
+}
+
+fn python_handler_concurrency_limit() -> Option<usize> {
+    if let Ok(value) = std::env::var("MQ_BRIDGE_PY_HANDLER_CONCURRENCY") {
+        if value.trim() == "0" {
+            return None;
+        }
+        if let Ok(limit) = value.parse::<usize>() {
+            return Some(limit.max(1));
+        }
+    }
+
+    Some(
+        std::thread::available_parallelism()
             .map(NonZeroUsize::get)
             .unwrap_or(4)
-            .max(1);
-        Arc::new(Semaphore::new(limit))
-    }))
+            .max(1),
+    )
 }
 
 fn active_route_names() -> &'static Mutex<HashSet<String>> {
@@ -1274,7 +1386,9 @@ fn _mq_bridge(module: &Bound<'_, PyModule>) -> PyResult<()> {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::hint::black_box;
     use std::time::Duration;
+    use std::time::Instant;
 
     fn write_yaml(contents: &str) -> String {
         let path =
@@ -1422,7 +1536,7 @@ memory:
         Python::attach(|py| {
             let none_value = py.None();
             assert!(matches!(
-                python_result_to_handled(none_value.bind(py), 7, &HashMap::new()).unwrap(),
+                python_result_to_handled(none_value.bind(py), 7, HashMap::new()).unwrap(),
                 Handled::Ack
             ));
 
@@ -1439,7 +1553,7 @@ memory:
             match python_result_to_handled(
                 py_message.bind(py).as_any(),
                 11,
-                &HashMap::from([("source".to_string(), "input".to_string())]),
+                HashMap::from([("source".to_string(), "input".to_string())]),
             )
             .unwrap()
             {
@@ -1459,7 +1573,7 @@ memory:
             match python_result_to_handled(
                 py_dict.as_any(),
                 13,
-                &HashMap::from([
+                HashMap::from([
                     ("kind".to_string(), "demo.kind".to_string()),
                     ("reply_to".to_string(), "memory://reply".to_string()),
                 ]),
@@ -1620,6 +1734,81 @@ routes:
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn test_direct_python_handler_dispatches_json() {
+        let callable = Python::attach(|py| {
+            let module = PyModule::from_code(
+                py,
+                pyo3::ffi::c_str!("def handle(data):\n    return {'seen': data['value']}\n"),
+                pyo3::ffi::c_str!("direct_handler.py"),
+                pyo3::ffi::c_str!("direct_handler"),
+            )
+            .unwrap();
+            module.getattr("handle").unwrap().unbind()
+        });
+        let handler = PythonHandler::with_executor_mode(
+            "direct:test",
+            PythonHandlerMode::Json,
+            callable,
+            PythonHandlerExecutorMode::Direct,
+        );
+
+        let message = CanonicalMessage::from_json(json!({ "value": 34 })).unwrap();
+        match handler.handle(message).await.unwrap() {
+            Handled::Publish(message) => {
+                let parsed: JsonValue = message.parse().unwrap();
+                assert_eq!(parsed, json!({ "seen": 34 }));
+            }
+            Handled::Ack => panic!("expected publish"),
+        }
+    }
+
+    #[test]
+    fn test_python_handler_executor_mode_parser() {
+        assert_eq!(
+            parse_python_handler_executor_mode(None),
+            PythonHandlerExecutorMode::Worker
+        );
+        assert_eq!(
+            parse_python_handler_executor_mode(Some("")),
+            PythonHandlerExecutorMode::Worker
+        );
+        assert_eq!(
+            parse_python_handler_executor_mode(Some("worker")),
+            PythonHandlerExecutorMode::Worker
+        );
+        assert_eq!(
+            parse_python_handler_executor_mode(Some("DIRECT")),
+            PythonHandlerExecutorMode::Direct
+        );
+        assert_eq!(
+            parse_python_handler_executor_mode(Some("unknown")),
+            PythonHandlerExecutorMode::Worker
+        );
+    }
+
+    #[test]
+    fn test_python_handler_executor_mode_constructs_direct() {
+        let callable = Python::attach(|py| {
+            let module = PyModule::from_code(
+                py,
+                pyo3::ffi::c_str!("def handle(data):\n    return data\n"),
+                pyo3::ffi::c_str!("executor_mode_handler.py"),
+                pyo3::ffi::c_str!("executor_mode_handler"),
+            )
+            .unwrap();
+            module.getattr("handle").unwrap().unbind()
+        });
+        let handler = PythonHandler::with_executor_mode(
+            "executor-mode:test",
+            PythonHandlerMode::Json,
+            callable,
+            PythonHandlerExecutorMode::Direct,
+        );
+
+        assert!(matches!(handler.executor, PythonHandlerExecutor::Direct(_)));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_add_message_handler_dispatches_raw_message() {
         let path = write_yaml(
             r#"
@@ -1679,6 +1868,70 @@ routes:
         }
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_add_payload_handler_dispatches_bytes() {
+        let path = write_yaml(
+            r#"
+routes:
+  payload_typed_route:
+    input:
+      memory: { topic: "payload-typed-in", capacity: 8 }
+    output:
+      response: {}
+"#,
+        );
+
+        let route = Python::attach(|py| {
+            Py::new(
+                py,
+                Route::from_yaml(py, &path, "payload_typed_route").unwrap(),
+            )
+            .unwrap()
+        });
+        Python::attach(|py| {
+            let module = PyModule::from_code(
+                py,
+                pyo3::ffi::c_str!("def handle(payload):\n    return payload\n"),
+                pyo3::ffi::c_str!("payload_typed_route_handler.py"),
+                pyo3::ffi::c_str!("payload_typed_route_handler"),
+            )
+            .unwrap();
+            let route_ref = route.bind(py).borrow_mut();
+            Route::add_payload_handler(
+                route_ref,
+                py,
+                "demo.payload",
+                module.getattr("handle").unwrap().unbind(),
+            )
+            .unwrap();
+        });
+
+        let handler = Python::attach(|py| {
+            route
+                .bind(py)
+                .borrow()
+                .route
+                .lock()
+                .unwrap()
+                .output
+                .handler
+                .clone()
+                .expect("handler should be attached")
+        });
+
+        let message = CanonicalMessage::from_vec(b"hello".to_vec()).with_type_key("demo.payload");
+        match handler.handle(message).await.unwrap() {
+            Handled::Publish(message) => {
+                assert_eq!(message.payload.as_ref(), b"hello");
+                assert_eq!(
+                    message.metadata.get("kind").map(String::as_str),
+                    Some("demo.payload")
+                );
+            }
+            Handled::Ack => panic!("expected publish"),
+        }
+    }
+
     #[test]
     fn test_publisher_send_and_request_support_message_and_bytes() {
         let path = write_yaml(
@@ -1714,7 +1967,7 @@ publishers:
                 .request(py, message.bind(py).as_any(), None)
                 .unwrap();
 
-            assert_eq!(response.payload, b"world");
+            assert_eq!(response.payload.as_ref(), b"world");
             assert_eq!(
                 response.metadata.get("kind").map(String::as_str),
                 Some("reply")
@@ -1837,5 +2090,176 @@ routes:
 
         first.stop().unwrap();
         thread.join().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "performance microbenchmark; run with --ignored --nocapture"]
+    async fn bench_python_handler_modes() {
+        let messages = std::env::var("MQ_BRIDGE_PY_HANDLER_BENCH_MESSAGES")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(20_000);
+        let json_payload = CanonicalMessage::from_json(json!({ "value": 0 })).unwrap();
+        let raw_payload = CanonicalMessage::from_vec(b"{\"value\":0}".to_vec());
+
+        let payload_forward = PythonHandler::payload(
+            "bench:payload-forward",
+            Python::attach(|py| {
+                let module = PyModule::from_code(
+                    py,
+                    pyo3::ffi::c_str!("def handle(payload):\n    return payload\n"),
+                    pyo3::ffi::c_str!("bench_payload_forward.py"),
+                    pyo3::ffi::c_str!("bench_payload_forward"),
+                )
+                .unwrap();
+                module.getattr("handle").unwrap().unbind()
+            }),
+        );
+        let message_forward = PythonHandler::message(
+            "bench:message-forward",
+            Python::attach(|py| {
+                let module = PyModule::from_code(
+                    py,
+                    pyo3::ffi::c_str!("def handle(msg):\n    return msg.payload\n"),
+                    pyo3::ffi::c_str!("bench_message_forward.py"),
+                    pyo3::ffi::c_str!("bench_message_forward"),
+                )
+                .unwrap();
+                module.getattr("handle").unwrap().unbind()
+            }),
+        );
+        let eager_json = PythonHandler::json(
+            "bench:eager-json",
+            Python::attach(|py| {
+                let module = PyModule::from_code(
+                    py,
+                    pyo3::ffi::c_str!(
+                        "def handle(data):\n    return {'value': data['value'] + 1}\n"
+                    ),
+                    pyo3::ffi::c_str!("bench_eager_json.py"),
+                    pyo3::ffi::c_str!("bench_eager_json"),
+                )
+                .unwrap();
+                module.getattr("handle").unwrap().unbind()
+            }),
+        );
+        let message_json = PythonHandler::message(
+            "bench:message-json",
+            Python::attach(|py| {
+                let module = PyModule::from_code(
+                    py,
+                    pyo3::ffi::c_str!(
+                        "def handle(msg):\n    return msg.with_json({'value': msg.json()['value'] + 1})\n"
+                    ),
+                    pyo3::ffi::c_str!("bench_message_json.py"),
+                    pyo3::ffi::c_str!("bench_message_json"),
+                )
+                .unwrap();
+                module.getattr("handle").unwrap().unbind()
+            }),
+        );
+
+        println!(
+            "python handler microbench: messages={} executor={}",
+            messages,
+            std::env::var("MQ_BRIDGE_PY_HANDLER_EXECUTOR").unwrap_or_else(|_| "worker".into())
+        );
+        bench_python_handler_case(
+            "payload forward / single",
+            &payload_forward,
+            &raw_payload,
+            messages,
+            1,
+        )
+        .await;
+        bench_python_handler_case(
+            "payload forward / batch32",
+            &payload_forward,
+            &raw_payload,
+            messages,
+            32,
+        )
+        .await;
+        bench_python_handler_case(
+            "message forward / single",
+            &message_forward,
+            &raw_payload,
+            messages,
+            1,
+        )
+        .await;
+        bench_python_handler_case(
+            "message forward / batch32",
+            &message_forward,
+            &raw_payload,
+            messages,
+            32,
+        )
+        .await;
+        bench_python_handler_case(
+            "eager json / single",
+            &eager_json,
+            &json_payload,
+            messages,
+            1,
+        )
+        .await;
+        bench_python_handler_case(
+            "eager json / batch32",
+            &eager_json,
+            &json_payload,
+            messages,
+            32,
+        )
+        .await;
+        bench_python_handler_case(
+            "message json / single",
+            &message_json,
+            &json_payload,
+            messages,
+            1,
+        )
+        .await;
+        bench_python_handler_case(
+            "message json / batch32",
+            &message_json,
+            &json_payload,
+            messages,
+            32,
+        )
+        .await;
+    }
+
+    async fn bench_python_handler_case(
+        label: &str,
+        handler: &PythonHandler,
+        template: &CanonicalMessage,
+        messages: usize,
+        batch_size: usize,
+    ) {
+        let mut remaining = messages;
+        let mut published = 0usize;
+        let started_at = Instant::now();
+        while remaining > 0 {
+            let len = remaining.min(batch_size);
+            let batch = vec![template.clone(); len];
+            for result in handler.handle_many(batch).await {
+                match result.expect("handler result should succeed") {
+                    Handled::Publish(message) => {
+                        black_box(message.payload.len());
+                        published += 1;
+                    }
+                    Handled::Ack => {}
+                }
+            }
+            remaining -= len;
+        }
+        let elapsed = started_at.elapsed();
+        let ns_per_msg = elapsed.as_nanos() as f64 / messages as f64;
+        let msg_per_sec = messages as f64 / elapsed.as_secs_f64();
+        println!(
+            "{label:28} batch={batch_size:<2} published={published:<6} {:>9.1} ns/msg {:>10.0} msg/s",
+            ns_per_msg, msg_per_sec
+        );
     }
 }

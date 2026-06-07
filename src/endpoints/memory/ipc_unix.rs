@@ -36,7 +36,7 @@ impl UnixIpcTransport {
     /// Create a new Unix IPC transport as a server (consumer side)
     pub async fn new_server(socket_path: impl AsRef<Path>, capacity: usize) -> Result<Self> {
         let socket_path = socket_path.as_ref();
-        
+
         // Remove existing socket if it exists
         if socket_path.exists() {
             std::fs::remove_file(socket_path)?;
@@ -56,7 +56,7 @@ impl UnixIpcTransport {
         }
 
         let listener = UnixListener::bind(socket_path)?;
-        
+
         // Set restrictive permissions on socket (0600)
         #[cfg(unix)]
         {
@@ -82,9 +82,9 @@ impl UnixIpcTransport {
     /// Create a new Unix IPC transport as a client (publisher side)
     pub async fn new_client(socket_path: impl AsRef<Path>, capacity: usize) -> Result<Self> {
         let socket_path = socket_path.as_ref();
-        
+
         let stream = UnixStream::connect(socket_path).await?;
-        
+
         info!(path = %socket_path.display(), "Unix IPC client connected");
 
         Ok(Self {

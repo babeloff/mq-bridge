@@ -79,9 +79,7 @@ async fn test_unix_ipc_multiple_messages() {
 
     // Send multiple messages in a batch
     let messages: Vec<_> = (0..5)
-        .map(|i| {
-            CanonicalMessage::from_vec(format!("Message {}", i).into_bytes())
-        })
+        .map(|i| CanonicalMessage::from_vec(format!("Message {}", i).into_bytes()))
         .collect();
 
     client.send_batch(messages.clone()).await.unwrap();

@@ -359,11 +359,7 @@ fn http_version_str(version: hyper::Version) -> &'static str {
     }
 }
 
-fn request_metadata_matches(
-    request: &RequestMetadataView<'_>,
-    key: &str,
-    value: &str,
-) -> bool {
+fn request_metadata_matches(request: &RequestMetadataView<'_>, key: &str, value: &str) -> bool {
     match key {
         "http_method" => request.method.as_str() == value,
         "http_path" => request.path == value,
@@ -1077,6 +1073,7 @@ async fn handle_request_internal(
             metadata,
             HttpReceiveStreamConfig {
                 tx: state.tx.clone(),
+                inline_publisher: state.inline_publisher.clone(),
                 fire_and_forget: state.fire_and_forget,
                 request_timeout: state.request_timeout,
                 custom_headers: state.custom_headers.clone(),
@@ -1092,26 +1089,25 @@ async fn handle_request_internal(
     // Read body with a timeout to prevent hanging on abandoned client connections.
     // This prevents "zombie" tasks from saturating the runtime during retry storms.
     let body_collect_timeout = state.request_timeout;
-    let body_bytes =
-        match tokio::time::timeout(body_collect_timeout, body.collect()).await {
-            Ok(Ok(b)) => b.to_bytes(),
-            Ok(Err(e)) => {
-                return Ok(text_error_response(
-                    StatusCode::BAD_REQUEST,
-                    format!("Failed to read body: {}", e),
-                    accepts_text,
-                    None,
-                ));
-            }
-            Err(_) => {
-                return Ok(text_error_response(
-                    StatusCode::REQUEST_TIMEOUT,
-                    "Timed out reading request body",
-                    accepts_text,
-                    None,
-                ));
-            }
-        };
+    let body_bytes = match tokio::time::timeout(body_collect_timeout, body.collect()).await {
+        Ok(Ok(b)) => b.to_bytes(),
+        Ok(Err(e)) => {
+            return Ok(text_error_response(
+                StatusCode::BAD_REQUEST,
+                format!("Failed to read body: {}", e),
+                accepts_text,
+                None,
+            ));
+        }
+        Err(_) => {
+            return Ok(text_error_response(
+                StatusCode::REQUEST_TIMEOUT,
+                "Timed out reading request body",
+                accepts_text,
+                None,
+            ));
+        }
+    };
 
     // Decompress if needed
     let payload = decompress_if_needed(body_bytes, content_encoding.as_deref())
@@ -1278,7 +1274,8 @@ fn make_response(
             let mut has_content_type = false;
             let mut is_streaming = false;
             for (key, value) in &msg.metadata {
-                if request_metadata.is_some_and(|metadata| request_metadata_matches(metadata, key, value))
+                if request_metadata
+                    .is_some_and(|metadata| request_metadata_matches(metadata, key, value))
                 {
                     continue;
                 }
@@ -2771,7 +2768,10 @@ http_route:
         ));
 
         let route = crate::Route::new(input, output);
-        let handle = route.run("test_http_inline_fast_path_disabled").await.unwrap();
+        let handle = route
+            .run("test_http_inline_fast_path_disabled")
+            .await
+            .unwrap();
 
         let mut connector = HttpConnector::new();
         connector.set_nodelay(true);
@@ -2789,7 +2789,10 @@ http_route:
             .unwrap();
         let response = client.request(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(response.headers().get("content-type").unwrap(), "application/json");
+        assert_eq!(
+            response.headers().get("content-type").unwrap(),
+            "application/json"
+        );
         assert_eq!(response.headers().get("x-request-id").unwrap(), "req-123");
         let body = response.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(body, Bytes::from_static(br#"{"value":1}"#));
@@ -2875,10 +2878,12 @@ http_route:
         let mut output = Endpoint::new(EndpointType::Response(
             crate::models::ResponseConfig::default(),
         ));
-        output.middlewares.push(Middleware::Buffer(BufferMiddleware {
-            max_messages: 16,
-            max_delay_ms: 0,
-        }));
+        output
+            .middlewares
+            .push(Middleware::Buffer(BufferMiddleware {
+                max_messages: 16,
+                max_delay_ms: 0,
+            }));
         let handler = |mut msg: CanonicalMessage| async move {
             msg.payload = Bytes::from_static(b"handled-buffered");
             msg.metadata
@@ -2888,7 +2893,10 @@ http_route:
         output.handler = Some(std::sync::Arc::new(handler));
 
         let route = crate::Route::new(input, output);
-        let handle = route.run("test_http_inline_handler_buffer_path").await.unwrap();
+        let handle = route
+            .run("test_http_inline_handler_buffer_path")
+            .await
+            .unwrap();
 
         let mut connector = HttpConnector::new();
         connector.set_nodelay(true);
@@ -2913,6 +2921,62 @@ http_route:
         assert!(response.headers().get("x-request-id").is_none());
         let body = response.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(body, Bytes::from_static(b"handled-buffered"));
+
+        handle.stop().await;
+        let _ = handle.join().await;
+    }
+
+    #[tokio::test]
+    async fn test_http_streamable_route_handler_uses_inline_path() {
+        use crate::traits::Handled;
+
+        init_crypto();
+        let port = get_free_port();
+        let addr = format!("127.0.0.1:{}", port);
+
+        let input = Endpoint::new(EndpointType::Http(HttpConfig {
+            url: addr.clone(),
+            path: Some("/handler-stream".to_string()),
+            receive_streamable: true,
+            ..Default::default()
+        }));
+        let mut output = Endpoint::new(EndpointType::Response(
+            crate::models::ResponseConfig::default(),
+        ));
+        let handler = |mut msg: CanonicalMessage| async move {
+            let payload = msg.get_payload_str();
+            msg.set_payload_str(&format!("reply-{payload}"));
+            Ok(Handled::Publish(msg))
+        };
+        output.handler = Some(std::sync::Arc::new(handler));
+
+        let route = crate::Route::new(input, output);
+        let handle = route
+            .run("test_http_inline_streamable_handler_path")
+            .await
+            .unwrap();
+
+        let mut connector = HttpConnector::new();
+        connector.set_nodelay(true);
+        let client =
+            hyper_util::client::legacy::Client::builder(TokioExecutor::new()).build(connector);
+        let request = Request::builder()
+            .method(hyper::Method::POST)
+            .uri(format!("http://{addr}/handler-stream"))
+            .header("content-type", "application/x-ndjson")
+            .header("accept", "application/x-ndjson")
+            .body(http_body_util::Full::<Bytes>::new(Bytes::from_static(
+                b"first\nsecond\n",
+            )))
+            .unwrap();
+        let response = client.request(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get("content-type").unwrap(),
+            "application/x-ndjson"
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(body, Bytes::from_static(b"reply-first\nreply-second\n"));
 
         handle.stop().await;
         let _ = handle.join().await;

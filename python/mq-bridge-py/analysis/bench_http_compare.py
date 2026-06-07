@@ -66,6 +66,17 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Enable mq-bridge buffer middleware on the response output.",
     )
+    parser.add_argument(
+        "--mq-disable-inline-fast-path",
+        action="store_true",
+        help="Force mq-bridge HTTP through the normal route receive_batch path.",
+    )
+    parser.add_argument(
+        "--target-filter",
+        action="append",
+        default=[],
+        help="Only run benchmark targets whose label contains this text. Can be repeated.",
+    )
     return parser.parse_args()
 
 
@@ -93,6 +104,7 @@ def write_mq_bridge_config(
     batch_size: int,
     clients: int,
     output_buffer: bool,
+    disable_inline_fast_path: bool,
 ) -> Path:
     config_path = directory / f"bench_http_{port}.yaml"
     internal_buffer_size = max(1024, clients * 512)
@@ -126,6 +138,7 @@ routes:
         internal_buffer_size: {internal_buffer_size}
         request_timeout_ms: 30000
         concurrency_limit: {concurrency_limit}
+        inline_response_fast_path: {str(not disable_inline_fast_path).lower()}
 {output_config.rstrip()}
 """.lstrip(),
         encoding="utf-8",
@@ -204,6 +217,7 @@ def run_mq_bridge_target(
             args.batch_size,
             args.clients,
             args.mq_output_buffer,
+            args.mq_disable_inline_fast_path,
         )
         route = Route.from_yaml(str(config_path), "http_bench")
         attach_handler(route)
@@ -397,6 +411,18 @@ def main() -> None:
             True,
         ),
         (
+            "mq-bridge payload forward",
+            lambda: run_mq_bridge_target(
+                "mq-bridge payload forward",
+                args,
+                lambda route: route.add_payload_handler(
+                    KIND,
+                    lambda payload: payload,
+                ),
+            ),
+            True,
+        ),
+        (
             "mq-bridge message json",
             lambda: run_mq_bridge_target(
                 "mq-bridge message json",
@@ -442,9 +468,14 @@ def main() -> None:
     print(
         f"messages={args.messages} warmup={args.warmup} clients={args.clients} "
         f"route_concurrency={args.route_concurrency} batch_size={args.batch_size} "
-        f"mq_output_buffer={args.mq_output_buffer}"
+        f"mq_output_buffer={args.mq_output_buffer} "
+        f"mq_disable_inline_fast_path={args.mq_disable_inline_fast_path}"
     )
     for label, run_target, enabled in targets:
+        if args.target_filter and not any(
+            target_filter in label for target_filter in args.target_filter
+        ):
+            continue
         if not enabled:
             print(f"{label}: skipped (dependency not installed)")
             continue

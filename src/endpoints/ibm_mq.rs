@@ -711,7 +711,12 @@ impl MessageConsumer for IbmMqConsumer {
     }
 
     async fn status(&self) -> EndpointStatus {
-        handle_status_request(&self.tx, |reply_tx| ConsumerJob::Status { reply_tx }, "Consumer").await
+        handle_status_request(
+            &self.tx,
+            |reply_tx| ConsumerJob::Status { reply_tx },
+            "Consumer",
+        )
+        .await
     }
 
     fn as_any(&self) -> &dyn std::any::Any {

@@ -556,7 +556,6 @@ pub(crate) async fn try_run_fast_path_route(
             if cfg.inline_response_fast_path_enabled()
                 && route.input.middlewares.is_empty()
                 && output_middlewares_allow_http_inline_fast_path(&route.output.middlewares)
-                && !cfg.receive_streamable
                 && !cfg.fire_and_forget
             {
                 return Some(
@@ -582,9 +581,15 @@ pub(crate) async fn try_run_fast_path_route(
 
 #[cfg(feature = "http")]
 fn output_middlewares_allow_http_inline_fast_path(middlewares: &[Middleware]) -> bool {
-    middlewares
-        .iter()
-        .all(|middleware| matches!(middleware, Middleware::Buffer(_) | Middleware::Metrics(_)))
+    middlewares.iter().all(|middleware| {
+        matches!(
+            middleware,
+            Middleware::Buffer(_)
+                | Middleware::Delay(_)
+                | Middleware::Limiter(_)
+                | Middleware::Metrics(_)
+        )
+    })
 }
 
 #[cfg(feature = "http")]
@@ -618,7 +623,7 @@ async fn run_http_inline_response_fast_path(
     );
     tracing::debug!(
         route = name,
-        "HTTP inline response fast path differences: no input middlewares, no streamable input, no fire-and-forget, only buffer/metrics output middlewares allowed, and unchanged request metadata is not echoed back as response headers"
+        "HTTP inline response fast path differences: no input middlewares, no fire-and-forget, only buffer/metrics output middlewares allowed, and unchanged request metadata is not echoed back as response headers"
     );
     if let Some(tx) = ready_tx {
         let _ = tx.send(()).await;
@@ -1436,6 +1441,28 @@ mod tests {
         assert!(matches!(endpoint.middlewares[0], Middleware::Retry(_)));
         assert!(matches!(endpoint.middlewares[1], Middleware::Dlq(_)));
         assert!(matches!(endpoint.middlewares[2], Middleware::Metrics(_)));
+    }
+
+    #[cfg(feature = "http")]
+    #[test]
+    fn test_http_inline_fast_path_allows_simple_output_publisher_middlewares() {
+        assert!(output_middlewares_allow_http_inline_fast_path(&[
+            Middleware::Buffer(crate::models::BufferMiddleware {
+                max_messages: 16,
+                max_delay_ms: 0,
+            }),
+            Middleware::Delay(crate::models::DelayMiddleware { delay_ms: 0 }),
+            Middleware::Limiter(crate::models::LimiterMiddleware {
+                messages_per_second: 1_000_000.0,
+            }),
+        ]));
+
+        assert!(!output_middlewares_allow_http_inline_fast_path(&[
+            Middleware::Retry(crate::models::RetryMiddleware::default()),
+        ]));
+        assert!(!output_middlewares_allow_http_inline_fast_path(&[
+            Middleware::Dlq(Box::new(crate::models::DeadLetterQueueMiddleware::default())),
+        ]));
     }
 
     #[test]

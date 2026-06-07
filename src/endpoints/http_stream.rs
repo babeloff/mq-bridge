@@ -212,6 +212,7 @@ pub(super) fn format_stream_error(format: HttpStreamFormat, error: &str) -> Byte
 #[derive(Clone)]
 pub(super) struct HttpReceiveStreamConfig {
     pub(super) tx: tokio::sync::mpsc::Sender<HttpSourceMessage>,
+    pub(super) inline_publisher: Option<Arc<dyn MessagePublisher>>,
     pub(super) fire_and_forget: bool,
     pub(super) request_timeout: std::time::Duration,
     pub(super) custom_headers: HashMap<String, String>,
@@ -307,6 +308,7 @@ async fn receive_streamable_body(
         .unwrap_or_else(fast_uuid_v7::gen_id_string);
     let dispatch = HttpStreamDispatch {
         tx: config.tx,
+        inline_publisher: config.inline_publisher,
         request_timeout: config.request_timeout,
         correlation_id,
         request_format,
@@ -440,6 +442,7 @@ async fn drain_sse_stream_items(
 #[derive(Clone)]
 struct HttpStreamDispatch {
     tx: tokio::sync::mpsc::Sender<HttpSourceMessage>,
+    inline_publisher: Option<Arc<dyn MessagePublisher>>,
     request_timeout: std::time::Duration,
     correlation_id: String,
     request_format: HttpStreamFormat,
@@ -493,6 +496,22 @@ async fn send_stream_item(
 
     let response_tx = dispatch.response_tx.clone();
     let response_format = dispatch.response_format;
+    if let Some(inline_publisher) = dispatch.inline_publisher.as_ref() {
+        let disposition =
+            match tokio::time::timeout(dispatch.request_timeout, inline_publisher.send(message))
+                .await
+            {
+                Ok(Ok(Sent::Response(response))) => MessageDisposition::Reply(response),
+                Ok(Ok(Sent::Ack)) => MessageDisposition::Ack,
+                Ok(Err(error)) => {
+                    return Err(anyhow!("HTTP inline stream publisher failed: {}", error))
+                }
+                Err(_) => return Err(anyhow!("HTTP inline stream publisher timed out")),
+            };
+
+        return streamable_commit(disposition, response_tx, response_format).await;
+    }
+
     let commit = Box::new(move |disposition: MessageDisposition| {
         streamable_commit(disposition, response_tx, response_format)
     });

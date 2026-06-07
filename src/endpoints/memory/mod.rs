@@ -4,8 +4,8 @@
 //  git clone https://github.com/marcomq/mq-bridge
 
 mod endpoint;
-pub mod transport;
 pub mod memory_transport;
+pub mod transport;
 
 #[cfg(unix)]
 pub mod ipc_unix;

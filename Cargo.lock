@@ -3094,6 +3094,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "bytes",
  "fast-uuid-v7",
  "mq-bridge",
  "pyo3",
