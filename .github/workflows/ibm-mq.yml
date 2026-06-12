@@ -51,12 +51,13 @@ jobs:
           # Using version 9.3.0.0 (adjust as needed)
           wget https://public.dhe.ibm.com/ibmdl/export/pub/software/websphere/messaging/mqdev/redist/9.3.0.0-IBM-MQC-Redist-LinuxX64.tar.gz
           tar -xzf 9.3.0.0-IBM-MQC-Redist-LinuxX64.tar.gz
-          
+
           # Set up environment for MQ client
-          export MQ_INSTALLATION_PATH=$(pwd)/mqm
+          mq_root="$(find . -maxdepth 2 -type d \( -name mqm -o -name MQClient \) | head -n 1)"
+          test -n "$mq_root"
           sudo mkdir -p /opt/mqm
-          sudo cp -r mqm/* /opt/mqm/
-          
+          sudo cp -r "$mq_root"/* /opt/mqm/
+
           # Set library path
           echo "LD_LIBRARY_PATH=/opt/mqm/lib64:$LD_LIBRARY_PATH" >> $GITHUB_ENV
           echo "MQ_INSTALLATION_PATH=/opt/mqm" >> $GITHUB_ENV
@@ -99,8 +100,10 @@ jobs:
         run: |
           wget https://public.dhe.ibm.com/ibmdl/export/pub/software/websphere/messaging/mqdev/redist/9.3.0.0-IBM-MQC-Redist-LinuxX64.tar.gz
           tar -xzf 9.3.0.0-IBM-MQC-Redist-LinuxX64.tar.gz
+          mq_root="$(find . -maxdepth 2 -type d \( -name mqm -o -name MQClient \) | head -n 1)"
+          test -n "$mq_root"
           sudo mkdir -p /opt/mqm
-          sudo cp -r mqm/* /opt/mqm/
+          sudo cp -r "$mq_root"/* /opt/mqm/
           echo "LD_LIBRARY_PATH=/opt/mqm/lib64:$LD_LIBRARY_PATH" >> $GITHUB_ENV
           echo "MQ_INSTALLATION_PATH=/opt/mqm" >> $GITHUB_ENV
       
@@ -160,8 +163,10 @@ jobs:
         run: |
           wget https://public.dhe.ibm.com/ibmdl/export/pub/software/websphere/messaging/mqdev/redist/9.3.0.0-IBM-MQC-Redist-LinuxX64.tar.gz
           tar -xzf 9.3.0.0-IBM-MQC-Redist-LinuxX64.tar.gz
+          mq_root="$(find . -maxdepth 2 -type d \( -name mqm -o -name MQClient \) | head -n 1)"
+          test -n "$mq_root"
           sudo mkdir -p /opt/mqm
-          sudo cp -r mqm/* /opt/mqm/
+          sudo cp -r "$mq_root"/* /opt/mqm/
           echo "LD_LIBRARY_PATH=/opt/mqm/lib64:$LD_LIBRARY_PATH" >> $GITHUB_ENV
           echo "MQ_INSTALLATION_PATH=/opt/mqm" >> $GITHUB_ENV
       
