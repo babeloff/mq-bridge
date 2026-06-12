@@ -6,6 +6,7 @@
 pub use crate::errors::{ConsumerError, HandlerError, PublisherError};
 pub use crate::outcomes::{Handled, Received, ReceivedBatch, Sent, SentBatch};
 use crate::CanonicalMessage;
+use anyhow::anyhow;
 use async_trait::async_trait;
 pub use futures::future::BoxFuture;
 use std::any::Any;
@@ -56,8 +57,33 @@ pub trait Handler: Send + Sync + 'static {
 
     async fn handle_many(&self, msgs: Vec<CanonicalMessage>) -> Vec<Result<Handled, HandlerError>> {
         let mut results = Vec::with_capacity(msgs.len());
+        let mut remaining = msgs.len();
         for msg in msgs {
-            results.push(self.handle(msg).await);
+            remaining -= 1;
+            let result = self.handle(msg).await;
+            let aborted = match &result {
+                Err(HandlerError::Retryable(_)) => Some("retryable"),
+                Err(HandlerError::Connection(_)) => Some("connection"),
+                Err(HandlerError::NonRetryable(_)) => Some("non-retryable"),
+                Ok(_) => None,
+            };
+            results.push(result);
+            if let Some(kind) = aborted {
+                for _ in 0..remaining {
+                    results.push(Err(match kind {
+                        "retryable" => HandlerError::Retryable(anyhow!(
+                            "batch aborted after earlier retryable handler failure"
+                        )),
+                        "connection" => HandlerError::Connection(anyhow!(
+                            "batch aborted after earlier handler connection failure"
+                        )),
+                        _ => HandlerError::NonRetryable(anyhow!(
+                            "batch aborted after earlier non-retryable handler failure"
+                        )),
+                    }));
+                }
+                break;
+            }
         }
         results
     }

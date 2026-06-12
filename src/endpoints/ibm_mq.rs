@@ -49,6 +49,7 @@ async fn handle_status_request<T>(
     tx: &mpsc::Sender<T>,
     job_constructor: impl FnOnce(oneshot::Sender<EndpointStatus>) -> T,
     endpoint_type: &str,
+    target: &str,
 ) -> EndpointStatus {
     let (reply_tx, reply_rx) = oneshot::channel();
     let send_result = tokio::time::timeout(
@@ -62,6 +63,7 @@ async fn handle_status_request<T>(
         Ok(Err(_)) => {
             return EndpointStatus {
                 healthy: false,
+                target: target.to_string(),
                 error: Some(format!("{} thread disconnected", endpoint_type)),
                 ..Default::default()
             };
@@ -69,6 +71,7 @@ async fn handle_status_request<T>(
         Err(_) => {
             return EndpointStatus {
                 healthy: false,
+                target: target.to_string(),
                 error: Some("Status send timed out".to_string()),
                 ..Default::default()
             };
@@ -79,11 +82,13 @@ async fn handle_status_request<T>(
         Ok(Ok(status)) => status,
         Ok(Err(_)) => EndpointStatus {
             healthy: false,
+            target: target.to_string(),
             error: Some(format!("{} thread dropped status request", endpoint_type)),
             ..Default::default()
         },
         Err(_) => EndpointStatus {
             healthy: false,
+            target: target.to_string(),
             error: Some("Status check timed out".to_string()),
             ..Default::default()
         },
@@ -159,6 +164,7 @@ enum PublisherJob {
 
 pub struct IbmMqPublisher {
     tx: mpsc::Sender<PublisherJob>,
+    target: String,
 }
 
 impl IbmMqPublisher {
@@ -167,6 +173,11 @@ impl IbmMqPublisher {
         let (tx, mut rx) = mpsc::channel::<PublisherJob>(buffer_size);
         let (init_tx, init_rx) = oneshot::channel();
         let config = config.clone();
+        let target = config
+            .queue
+            .clone()
+            .or(config.topic.clone())
+            .unwrap_or_default();
         info!("Starting IBM MQ publisher");
 
         thread::spawn(move || {
@@ -305,6 +316,11 @@ impl IbmMqPublisher {
                         PublisherJob::Status(reply_tx) => {
                             let _ = reply_tx.send(EndpointStatus {
                                 healthy: false,
+                                target: config
+                                    .queue
+                                    .clone()
+                                    .or(config.topic.clone())
+                                    .unwrap_or_default(),
                                 error: Some("Publisher reconnecting".to_string()),
                                 ..Default::default()
                             });
@@ -323,7 +339,7 @@ impl IbmMqPublisher {
         });
 
         match init_rx.await {
-            Ok(Ok(())) => Ok(Self { tx }),
+            Ok(Ok(())) => Ok(Self { tx, target }),
             Ok(Err(e)) => Err(e),
             Err(_) => Err(PublisherError::Retryable(anyhow::anyhow!(
                 "MQ init thread panicked or dropped"
@@ -353,7 +369,7 @@ impl MessagePublisher for IbmMqPublisher {
     }
 
     async fn status(&self) -> EndpointStatus {
-        handle_status_request(&self.tx, PublisherJob::Status, "Publisher").await
+        handle_status_request(&self.tx, PublisherJob::Status, "Publisher", &self.target).await
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -663,6 +679,7 @@ async fn spawn_consumer_thread(
 pub struct IbmMqConsumer {
     tx: mpsc::Sender<ConsumerJob>,
     permit: Arc<tokio::sync::Semaphore>,
+    target: String,
 }
 
 #[async_trait]
@@ -715,6 +732,7 @@ impl MessageConsumer for IbmMqConsumer {
             &self.tx,
             |reply_tx| ConsumerJob::Status { reply_tx },
             "Consumer",
+            &self.target,
         )
         .await
     }
@@ -730,6 +748,11 @@ impl IbmMqConsumer {
         Ok(Self {
             tx,
             permit: Arc::new(Semaphore::new(1)),
+            target: config
+                .queue
+                .clone()
+                .or(config.topic.clone())
+                .unwrap_or_default(),
         })
     }
 }

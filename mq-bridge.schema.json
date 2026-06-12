@@ -916,7 +916,8 @@
           "type": [
             "boolean",
             "null"
-          ]
+          ],
+          "default": true
         },
         "internal_buffer_size": {
           "description": "(Consumer only) Internal buffer size for the channel. Defaults to 100.",
@@ -1254,7 +1255,7 @@
           "minimum": 0
         },
         "enable_nack": {
-          "description": "(Consumer only) If true, enables NACK support (re-queuing), which requires cloning messages. Defaults to false.",
+          "description": "(Consumer only) If true, enables NACK support (re-queuing), which requires cloning messages.\nDefaults to false for memory:// transports, automatically true for IPC transports (ipc://, unix://, pipe://).",
           "type": "boolean",
           "default": false
         },
@@ -1278,13 +1279,26 @@
           "default": false
         },
         "topic": {
-          "description": "The topic name for the in-memory channel.",
+          "description": "The topic name or transport URL. Can be:\n- Simple name: \"my-topic\" (defaults to memory://my-topic)\n- Memory URL: \"memory://my-topic\"\n- IPC URL: \"ipc://my-queue\" or \"ipc:///path/to/socket\"\n- Unix socket: \"unix:///path/to/socket\" (Unix only)\n- Named pipe: \"pipe://my-pipe\" (Windows only)\n\nEither `topic` or `url` can be specified (they are serde aliases).",
+          "type": "string"
+        },
+        "url": {
+          "description": "Alias for `topic`. Use either `topic` or `url`.",
           "type": "string"
         }
       },
       "additionalProperties": false,
-      "required": [
-        "topic"
+      "anyOf": [
+        {
+          "required": [
+            "topic"
+          ]
+        },
+        {
+          "required": [
+            "url"
+          ]
+        }
       ]
     },
     "MetricsMiddleware": {
@@ -1918,7 +1932,8 @@
       "properties": {
         "allow_fault_injection": {
           "description": "Allows fault-injection middleware such as random_panic. Disabled by default.",
-          "type": "boolean"
+          "type": "boolean",
+          "default": false
         },
         "batch_size": {
           "description": "(Optional) Maximum number of messages to process in a single batch. The consumer waits for at least one message\nand then attempts to fetch more if available. Increasing this improves throughput but also increases\nthe potential impact of a single batch processing failure. Defaults to 1.",

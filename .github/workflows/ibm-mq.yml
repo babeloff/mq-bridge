@@ -6,6 +6,8 @@ on:
     paths:
       - 'src/endpoints/ibm_mq.rs'
       - 'tests/integration/ibm_mq*.rs'
+      - 'tests/integration/scripts/**'
+      - 'tests/integration/docker-compose/*.yml'
       - 'Cargo.toml'
       - '.github/workflows/ibm-mq.yml'
   pull_request:
@@ -13,6 +15,8 @@ on:
     paths:
       - 'src/endpoints/ibm_mq.rs'
       - 'tests/integration/ibm_mq*.rs'
+      - 'tests/integration/scripts/**'
+      - 'tests/integration/docker-compose/*.yml'
       - 'Cargo.toml'
       - '.github/workflows/ibm-mq.yml'
   workflow_dispatch:
@@ -20,6 +24,7 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  IBM_MQ_REDIST_URL: https://public.dhe.ibm.com/ibmdl/export/pub/software/websphere/messaging/mqdev/redist/9.3.0.0-IBM-MQC-Redist-LinuxX64.tar.gz
 
 jobs:
   # Build check for IBM MQ feature
@@ -47,10 +52,15 @@ jobs:
       
       - name: Install IBM MQ Client Libraries
         run: |
-          # Download and install IBM MQ redistributable client
-          # Using version 9.3.0.0 (adjust as needed)
-          wget https://public.dhe.ibm.com/ibmdl/export/pub/software/websphere/messaging/mqdev/redist/9.3.0.0-IBM-MQC-Redist-LinuxX64.tar.gz
-          tar -xzf 9.3.0.0-IBM-MQC-Redist-LinuxX64.tar.gz
+          archive_url="$IBM_MQ_REDIST_URL"
+          archive_name="$(basename "$archive_url")"
+          checksum_name="${archive_name}.sha256"
+          curl -fsSLO "$archive_url"
+          curl -fsSL "${archive_url}.sha256" -o "$checksum_name"
+          expected_sha256="$(awk '{print $1}' "$checksum_name")"
+          test -n "$expected_sha256"
+          echo "${expected_sha256}  ${archive_name}" | sha256sum -c -
+          tar -xzf "$archive_name"
 
           # Set up environment for MQ client
           mq_root="$(find . -maxdepth 2 -type d \( -name mqm -o -name MQClient \) | head -n 1)"
@@ -98,8 +108,15 @@ jobs:
       
       - name: Install IBM MQ Client Libraries
         run: |
-          wget https://public.dhe.ibm.com/ibmdl/export/pub/software/websphere/messaging/mqdev/redist/9.3.0.0-IBM-MQC-Redist-LinuxX64.tar.gz
-          tar -xzf 9.3.0.0-IBM-MQC-Redist-LinuxX64.tar.gz
+          archive_url="$IBM_MQ_REDIST_URL"
+          archive_name="$(basename "$archive_url")"
+          checksum_name="${archive_name}.sha256"
+          curl -fsSLO "$archive_url"
+          curl -fsSL "${archive_url}.sha256" -o "$checksum_name"
+          expected_sha256="$(awk '{print $1}' "$checksum_name")"
+          test -n "$expected_sha256"
+          echo "${expected_sha256}  ${archive_name}" | sha256sum -c -
+          tar -xzf "$archive_name"
           mq_root="$(find . -maxdepth 2 -type d \( -name mqm -o -name MQClient \) | head -n 1)"
           test -n "$mq_root"
           sudo mkdir -p /opt/mqm
@@ -161,8 +178,15 @@ jobs:
       
       - name: Install IBM MQ Client Libraries
         run: |
-          wget https://public.dhe.ibm.com/ibmdl/export/pub/software/websphere/messaging/mqdev/redist/9.3.0.0-IBM-MQC-Redist-LinuxX64.tar.gz
-          tar -xzf 9.3.0.0-IBM-MQC-Redist-LinuxX64.tar.gz
+          archive_url="$IBM_MQ_REDIST_URL"
+          archive_name="$(basename "$archive_url")"
+          checksum_name="${archive_name}.sha256"
+          curl -fsSLO "$archive_url"
+          curl -fsSL "${archive_url}.sha256" -o "$checksum_name"
+          expected_sha256="$(awk '{print $1}' "$checksum_name")"
+          test -n "$expected_sha256"
+          echo "${expected_sha256}  ${archive_name}" | sha256sum -c -
+          tar -xzf "$archive_name"
           mq_root="$(find . -maxdepth 2 -type d \( -name mqm -o -name MQClient \) | head -n 1)"
           test -n "$mq_root"
           sudo mkdir -p /opt/mqm

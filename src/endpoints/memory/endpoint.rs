@@ -528,6 +528,7 @@ pub struct MemoryQueueConsumer {
 pub struct TransportQueueConsumer {
     topic: String,
     transport: Arc<dyn TransportChannel>,
+    buffer: Vec<CanonicalMessage>,
     enable_nack: bool,
 }
 
@@ -601,6 +602,7 @@ impl MemoryConsumer {
                 Ok(Self::Transport(TransportQueueConsumer {
                     topic: url.display_name(),
                     transport,
+                    buffer: Vec::new(),
                     enable_nack: config.enable_nack,
                 }))
             }
@@ -867,18 +869,20 @@ impl MessageConsumer for MemoryQueueConsumer {
 #[async_trait]
 impl MessageConsumer for TransportQueueConsumer {
     async fn receive_batch(&mut self, max_messages: usize) -> Result<ReceivedBatch, ConsumerError> {
-        let mut messages = self.transport.recv_batch().await.map_err(|e| {
-            ConsumerError::Connection(anyhow!("Failed to receive via memory transport: {}", e))
-        })?;
+        let mut messages = Vec::with_capacity(max_messages);
+        let buffered = self.buffer.len().min(max_messages);
+        if buffered > 0 {
+            messages.extend(self.buffer.drain(..buffered));
+        }
 
-        if messages.len() > max_messages {
-            let overflow = messages.split_off(max_messages);
-            self.transport.send_batch(overflow).await.map_err(|e| {
-                ConsumerError::Connection(anyhow!(
-                    "Failed to return overflow messages to memory transport: {}",
-                    e
-                ))
+        if messages.len() < max_messages {
+            let mut received = self.transport.recv_batch().await.map_err(|e| {
+                ConsumerError::Connection(anyhow!("Failed to receive via memory transport: {}", e))
             })?;
+            messages.append(&mut received);
+            if messages.len() > max_messages {
+                self.buffer = messages.split_off(max_messages);
+            }
         }
 
         trace!(count = messages.len(), topic = %self.topic, message_ids = ?LazyMessageIds(&messages), "Received batch from memory transport");

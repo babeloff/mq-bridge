@@ -264,7 +264,7 @@ async fn handle_connection(
     }
 
     drop(response_tx);
-    let _ = writer_task.await;
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(1), writer_task).await;
     Ok(())
 }
 
@@ -275,10 +275,13 @@ fn websocket_commit(
     Box::pin(async move {
         match disposition {
             MessageDisposition::Reply(message) => {
-                response_tx
+                if response_tx
                     .send(canonical_to_websocket_message(&message))
                     .await
-                    .map_err(|_| anyhow!("WebSocket connection closed before response was sent"))?;
+                    .is_err()
+                {
+                    return Ok(());
+                }
             }
             MessageDisposition::Ack | MessageDisposition::Nack => {}
         }

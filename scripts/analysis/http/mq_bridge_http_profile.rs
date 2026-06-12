@@ -287,7 +287,7 @@ fn print_help() {
            --client-url URL            run Rust load client instead of server\n\
            --clients N                 Rust load client concurrency (default 8)\n\
            --header-count N            Add N synthetic request headers in Rust load client (default 0)\n\
-           --expected-body BODY        payload | ok (default payload)\n\
+           --expected-body BODY        payload | ok | message-processed | message-accepted (default payload)\n\
            --route-concurrency N       default 8\n\
            --commit-concurrency-limit N default 1\n\
            --batch-size N              default 128\n\

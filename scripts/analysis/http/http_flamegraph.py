@@ -87,7 +87,10 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Run the profile target and load generator without cargo-flamegraph/xctrace.",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if not args.path.startswith("/"):
+        args.path = f"/{args.path}"
+    return args
 
 
 def wait_for_port(port: int, timeout: float) -> None:
@@ -145,6 +148,9 @@ def load_phase(
         thread.start()
     for thread in threads:
         thread.join(duration_s + 15)
+    stuck = [thread.name for thread in threads if thread.is_alive()]
+    if stuck:
+        raise RuntimeError(f"load workers did not finish: {', '.join(stuck)}")
     if failures:
         raise RuntimeError(f"load failed: {failures[0]}")
     elapsed = time.perf_counter() - started_at
@@ -169,24 +175,33 @@ def rust_load_phase(
     else:
         expected_arg = "ok"
     started_at = time.perf_counter()
-    proc = subprocess.run(
-        [
-            str(binary),
-            "--client-url",
-            f"http://{HOST}:{port}{path}",
-            "--duration-s",
-            str(duration_s),
-            "--clients",
-            str(clients),
-            "--expected-body",
-            expected_arg,
-            "--header-count",
-            str(header_count),
-        ],
-        check=True,
-        text=True,
-        stdout=subprocess.PIPE,
-    )
+    load_timeout_s = duration_s + 30
+    try:
+        proc = subprocess.run(
+            [
+                str(binary),
+                "--client-url",
+                f"http://{HOST}:{port}{path}",
+                "--duration-s",
+                str(duration_s),
+                "--clients",
+                str(clients),
+                "--expected-body",
+                expected_arg,
+                "--header-count",
+                str(header_count),
+            ],
+            check=True,
+            text=True,
+            stdout=subprocess.PIPE,
+            timeout=load_timeout_s,
+        )
+    except subprocess.TimeoutExpired:
+        print(
+            f"Rust load client timed out after {load_timeout_s}s: binary={binary} host={HOST} port={port} path={path}",
+            file=sys.stderr,
+        )
+        raise
     elapsed = time.perf_counter() - started_at
     print(proc.stdout.strip())
     for line in proc.stdout.splitlines():

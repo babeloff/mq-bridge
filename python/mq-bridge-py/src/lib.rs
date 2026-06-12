@@ -700,9 +700,10 @@ impl MemoryDrainer {
                 let drain_future = async move {
                     let mut drained = 0usize;
                     while drained < count {
+                        let needed = (count - drained).min(batch_size);
                         let received_batch = {
                             let mut consumer = consumer.lock().await;
-                            consumer.receive_batch(batch_size).await?
+                            consumer.receive_batch(needed).await?
                         };
                         let batch_len = received_batch.messages.len();
                         if batch_len == 0 {
@@ -715,6 +716,11 @@ impl MemoryDrainer {
                 };
 
                 if let Some(timeout_secs) = timeout {
+                    if !timeout_secs.is_finite() || timeout_secs < 0.0 {
+                        return Err(anyhow!(
+                            "timeout must be a finite, non-negative number of seconds"
+                        ));
+                    }
                     tokio::time::timeout(Duration::from_secs_f64(timeout_secs), drain_future)
                         .await
                         .map_err(|_| {

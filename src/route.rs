@@ -267,9 +267,20 @@ async fn send_batch_and_commit(
                     warn!("Message {:032x} expected a reply (reply_to set), but publisher returned Ack. Response loop broken.", id);
                 }
             }
+            let dispositions = scratch
+                .message_ids
+                .iter()
+                .map(|id| {
+                    if scratch.request_ids.contains(id) {
+                        MessageDisposition::Nack
+                    } else {
+                        MessageDisposition::Ack
+                    }
+                })
+                .collect();
             let err_tx = err_tx.clone();
             commit_tasks.spawn(async move {
-                if let Err(e) = commit(vec![MessageDisposition::Ack; batch_len]).await {
+                if let Err(e) = commit(dispositions).await {
                     error!("Commit failed: {}", e);
                     report_route_error(&err_tx, e, "Could not send commit error to main task");
                 }

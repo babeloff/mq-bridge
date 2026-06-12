@@ -30,6 +30,7 @@ impl TransportUrl {
         // Check for scheme
         if let Some((scheme, rest)) = url.split_once("://") {
             match scheme {
+                "memory" if rest.is_empty() => Err(anyhow!("Memory namespace cannot be empty")),
                 "memory" => Ok(TransportUrl::Memory {
                     namespace: rest.to_string(),
                 }),
@@ -43,10 +44,15 @@ impl TransportUrl {
                     })
                 }
                 #[cfg(windows)]
+                "pipe" if rest.is_empty() => Err(anyhow!("Pipe name cannot be empty")),
+                #[cfg(windows)]
                 "pipe" => Ok(TransportUrl::Pipe {
                     name: rest.to_string(),
                 }),
                 "ipc" => {
+                    if rest.is_empty() {
+                        return Err(anyhow!("IPC transport identifier cannot be empty"));
+                    }
                     // Platform-specific IPC handling
                     #[cfg(unix)]
                     {

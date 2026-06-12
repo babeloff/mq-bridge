@@ -13,6 +13,31 @@ use mq_bridge::endpoints::memory::ipc_unix::UnixIpcTransport;
 #[cfg(windows)]
 use mq_bridge::endpoints::memory::ipc_windows::WindowsIpcTransport;
 
+#[cfg(any(unix, windows))]
+async fn connect_with_retry<T, F, Fut>(mut make_client: F) -> T
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<T>>,
+{
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+    let mut last_error = None;
+    loop {
+        match make_client().await {
+            Ok(client) => return client,
+            Err(error) if tokio::time::Instant::now() < deadline => {
+                last_error = Some(error);
+                tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+            }
+            Err(error) => {
+                panic!(
+                    "timed out connecting IPC client: {}",
+                    last_error.unwrap_or(error)
+                );
+            }
+        }
+    }
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn test_unix_ipc_basic_roundtrip() {
@@ -29,11 +54,7 @@ async fn test_unix_ipc_basic_roundtrip() {
     // Create client (publisher) in a separate task
     let socket_path_clone = socket_path.clone();
     let client_handle = tokio::spawn(async move {
-        // Give server time to start listening
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-        UnixIpcTransport::new_client(&socket_path_clone, 10)
-            .await
-            .unwrap()
+        connect_with_retry(|| UnixIpcTransport::new_client(&socket_path_clone, 10)).await
     });
 
     let client = client_handle.await.unwrap();
@@ -69,10 +90,7 @@ async fn test_unix_ipc_multiple_messages() {
 
     let socket_path_clone = socket_path.clone();
     let client_handle = tokio::spawn(async move {
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-        UnixIpcTransport::new_client(&socket_path_clone, 10)
-            .await
-            .unwrap()
+        connect_with_retry(|| UnixIpcTransport::new_client(&socket_path_clone, 10)).await
     });
 
     let client = client_handle.await.unwrap();
@@ -125,10 +143,7 @@ async fn test_windows_pipe_basic_roundtrip() {
     // Create client in a separate task
     let pipe_name_clone = pipe_name.clone();
     let client_handle = tokio::spawn(async move {
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-        WindowsIpcTransport::new_client(&pipe_name_clone, 10)
-            .await
-            .unwrap()
+        connect_with_retry(|| WindowsIpcTransport::new_client(&pipe_name_clone, 10)).await
     });
 
     // Wait for connection

@@ -170,7 +170,7 @@ The fast path is only considered when:
 - the input has no middlewares
 - `receive_streamable` is `false`
 - `fire_and_forget` is `false`
-- output middlewares are limited to `buffer` and/or `metrics`
+- output middlewares are limited to `buffer`, `delay`, `limiter`, and/or `metrics`
 
 To force the normal route pipeline, set this on the HTTP consumer:
 

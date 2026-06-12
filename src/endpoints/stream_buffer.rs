@@ -222,9 +222,38 @@ impl MessagePublisher for StreamBufferPublisher {
         &self,
         messages: Vec<CanonicalMessage>,
     ) -> Result<SentBatch, PublisherError> {
-        for message in messages {
-            self.send(message).await?;
+        let mut messages = messages;
+        let Some(first) = messages.first() else {
+            return Ok(SentBatch::Ack);
+        };
+        let correlation_id = first
+            .metadata
+            .get("correlation_id")
+            .cloned()
+            .ok_or_else(|| {
+                PublisherError::NonRetryable(anyhow!(
+                    "stream_buffer publisher requires message metadata 'correlation_id'"
+                ))
+            })?;
+        if messages
+            .iter()
+            .any(|message| message.metadata.get("correlation_id") != Some(&correlation_id))
+        {
+            return Err(PublisherError::NonRetryable(anyhow!(
+                "stream_buffer publisher batch requires a single shared correlation_id"
+            )));
         }
+        let partition = get_or_create_partition(&self.topic, &correlation_id, self.capacity);
+        if partition.sender.is_closed() {
+            return Err(PublisherError::Retryable(anyhow!(
+                "stream_buffer partition is closed"
+            )));
+        }
+        partition
+            .sender
+            .send(std::mem::take(&mut messages))
+            .await
+            .map_err(|e| anyhow!("Failed to send to stream_buffer: {}", e))?;
         Ok(SentBatch::Ack)
     }
 

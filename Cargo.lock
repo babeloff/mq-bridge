@@ -3024,7 +3024,7 @@ dependencies = [
 
 [[package]]
 name = "mq-bridge"
-version = "0.2.15"
+version = "0.2.16"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -3090,7 +3090,7 @@ dependencies = [
 
 [[package]]
 name = "mq-bridge-py"
-version = "0.2.15"
+version = "0.2.16"
 dependencies = [
  "anyhow",
  "async-trait",

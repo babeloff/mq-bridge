@@ -1,7 +1,11 @@
+from pathlib import Path
 import threading
 import time
 
 from mq_bridge import Publisher, Route
+
+
+CONFIG_PATH = Path(__file__).with_name("memory.yaml")
 
 
 def handle_raw(message):
@@ -10,8 +14,8 @@ def handle_raw(message):
     return b"ok"
 
 
-route = Route.from_yaml("examples/memory.yaml", "orders_route").with_handler(handle_raw)
-publisher = Publisher.from_yaml("examples/memory.yaml", "orders_publisher")
+route = Route.from_yaml(str(CONFIG_PATH), "orders_route").with_handler(handle_raw)
+publisher = Publisher.from_yaml(str(CONFIG_PATH), "orders_publisher")
 
 
 def drive() -> None:

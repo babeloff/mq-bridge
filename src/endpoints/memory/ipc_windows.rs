@@ -9,7 +9,10 @@ use super::transport::TransportChannel;
 use crate::CanonicalMessage;
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::windows::named_pipe::{
     ClientOptions, NamedPipeClient, NamedPipeServer, ServerOptions,
@@ -31,7 +34,7 @@ struct WindowsIpcTransportInner {
     // For client mode (publisher)
     client: Mutex<Option<NamedPipeClient>>,
     connected: Mutex<bool>,
-    closed: Mutex<bool>,
+    closed: AtomicBool,
 }
 
 impl WindowsIpcTransport {
@@ -53,7 +56,7 @@ impl WindowsIpcTransport {
                 server: Mutex::new(Some(server)),
                 client: Mutex::new(None),
                 connected: Mutex::new(false),
-                closed: Mutex::new(false),
+                closed: AtomicBool::new(false),
             }),
         })
     }
@@ -74,7 +77,7 @@ impl WindowsIpcTransport {
                 server: Mutex::new(None),
                 client: Mutex::new(Some(client)),
                 connected: Mutex::new(true),
-                closed: Mutex::new(false),
+                closed: AtomicBool::new(false),
             }),
         })
     }
@@ -131,7 +134,7 @@ impl WindowsIpcTransport {
 #[async_trait]
 impl TransportChannel for WindowsIpcTransport {
     async fn send_batch(&self, messages: Vec<CanonicalMessage>) -> Result<()> {
-        if *self.inner.closed.lock().await {
+        if self.inner.closed.load(Ordering::SeqCst) {
             return Err(anyhow!("Windows Named Pipe transport is closed"));
         }
 
@@ -154,7 +157,7 @@ impl TransportChannel for WindowsIpcTransport {
     }
 
     async fn recv_batch(&self) -> Result<Vec<CanonicalMessage>> {
-        if *self.inner.closed.lock().await {
+        if self.inner.closed.load(Ordering::SeqCst) {
             return Err(anyhow!("Windows Named Pipe transport is closed"));
         }
 
@@ -194,17 +197,11 @@ impl TransportChannel for WindowsIpcTransport {
     }
 
     fn is_closed(&self) -> bool {
-        // This is a blocking check, but should be fast
-        if let Ok(closed) = self.inner.closed.try_lock() {
-            *closed
-        } else {
-            false
-        }
+        self.inner.closed.load(Ordering::SeqCst)
     }
 
     fn close(&self) {
-        if let Ok(mut closed) = self.inner.closed.try_lock() {
-            *closed = true;
+        if !self.inner.closed.swap(true, Ordering::SeqCst) {
             info!(pipe = %self.inner.pipe_name, "Closing Windows Named Pipe transport");
         }
     }

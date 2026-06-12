@@ -40,6 +40,7 @@ def test_memory_benchmark_smoke() -> None:
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
+        timeout=30,
     )
 
     match = next(

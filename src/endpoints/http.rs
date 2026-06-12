@@ -5,7 +5,7 @@
 
 use super::http_stream::{
     handle_streamable_request, stream_request_format, stream_response_format,
-    HttpReceiveStreamConfig,
+    HttpReceiveStreamConfig, PublishResponseStreamError,
 };
 use crate::canonical_message::tracing_support::LazyMessageIds;
 use crate::models::{HttpConfig, TlsConfig};
@@ -1579,7 +1579,7 @@ impl MessagePublisher for HttpPublisher {
                     .get("correlation_id")
                     .cloned()
                     .unwrap_or_else(|| format!("{:032x}", message.message_id));
-                super::http_stream::publish_response_stream(
+                match super::http_stream::publish_response_stream(
                     response.into_body(),
                     stream_response_sink.clone(),
                     response_metadata,
@@ -1587,7 +1587,17 @@ impl MessagePublisher for HttpPublisher {
                     stream_response_format,
                     self.request_timeout,
                 )
-                .await?;
+                .await
+                {
+                    Ok(()) => {}
+                    Err(PublishResponseStreamError::Partial(error)) => {
+                        tracing::warn!(
+                            "HTTP response stream terminated after partial publish: {}",
+                            error
+                        );
+                    }
+                    Err(PublishResponseStreamError::BeforePublish(error)) => return Err(error),
+                }
                 return Ok(Sent::Ack);
             }
         }

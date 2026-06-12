@@ -85,6 +85,7 @@ pub type PublisherConfig = HashMap<String, Endpoint>;
 /// Defines a single message processing route from an input to an output.
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[cfg_attr(feature = "schema", schemars(transform = route_schema_transform))]
 #[serde(deny_unknown_fields)]
 pub struct Route {
     /// The input/source endpoint for the route.
@@ -159,7 +160,8 @@ pub struct RouteOptions {
     #[serde(default = "default_empty_batch_delay_ms")]
     pub empty_batch_delay_ms: u64,
     /// Allows fault-injection middleware such as random_panic. Disabled by default.
-    #[serde(default, skip_serializing_if = "is_false")]
+    #[serde(default = "default_false", skip_serializing_if = "is_false")]
+    #[cfg_attr(feature = "schema", schemars(default = "default_false"))]
     pub allow_fault_injection: bool,
 }
 
@@ -221,6 +223,15 @@ pub(crate) fn default_empty_batch_delay_ms() -> u64 {
 
 fn is_false(value: &bool) -> bool {
     !*value
+}
+
+fn default_false() -> bool {
+    false
+}
+
+#[cfg(feature = "schema")]
+fn default_inline_response_fast_path_schema() -> Option<bool> {
+    Some(true)
 }
 
 fn default_output_endpoint() -> Endpoint {
@@ -1252,8 +1263,9 @@ impl NatsConfig {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+#[derive(Debug, Serialize, Clone, Default)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[cfg_attr(feature = "schema", schemars(transform = memory_config_schema_transform))]
 #[serde(deny_unknown_fields)]
 pub struct MemoryConfig {
     /// The topic name or transport URL. Can be:
@@ -1283,6 +1295,8 @@ pub struct MemoryConfig {
     /// Defaults to false for memory:// transports, automatically true for IPC transports (ipc://, unix://, pipe://).
     #[serde(default)]
     pub enable_nack: bool,
+    #[serde(skip)]
+    pub enable_nack_overridden: bool,
 }
 
 impl MemoryConfig {
@@ -1353,13 +1367,102 @@ impl MemoryConfig {
     /// Apply smart defaults based on the transport type.
     /// For IPC transports, enable_nack defaults to true for reliability.
     pub fn with_smart_defaults(mut self) -> Self {
-        // Only apply smart defaults if enable_nack wasn't explicitly set
-        // We detect this by checking if it's still false (the default)
-        if !self.enable_nack && self.is_ipc_transport() {
+        if !self.enable_nack_overridden && self.is_ipc_transport() {
             self.enable_nack = true;
         }
         self
     }
+}
+
+impl<'de> Deserialize<'de> for MemoryConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize, Default)]
+        #[serde(deny_unknown_fields)]
+        struct MemoryConfigSerde {
+            #[serde(default)]
+            topic: String,
+            #[serde(default)]
+            url: Option<String>,
+            capacity: Option<usize>,
+            #[serde(default)]
+            request_reply: bool,
+            request_timeout_ms: Option<u64>,
+            #[serde(default)]
+            subscribe_mode: bool,
+            #[serde(default)]
+            enable_nack: Option<bool>,
+        }
+
+        let raw = MemoryConfigSerde::deserialize(deserializer)?;
+        let topic = if raw.topic.is_empty() {
+            raw.url.clone().unwrap_or_default()
+        } else {
+            raw.topic
+        };
+        Ok(Self {
+            topic,
+            url: raw.url,
+            capacity: raw.capacity,
+            request_reply: raw.request_reply,
+            request_timeout_ms: raw.request_timeout_ms,
+            subscribe_mode: raw.subscribe_mode,
+            enable_nack: raw.enable_nack.unwrap_or(false),
+            enable_nack_overridden: raw.enable_nack.is_some(),
+        })
+    }
+}
+
+#[cfg(feature = "schema")]
+fn memory_config_schema_transform(schema: &mut schemars::Schema) {
+    let Some(schema_obj) = schema.as_object_mut() else {
+        return;
+    };
+
+    let Some(properties) = schema_obj
+        .get_mut("properties")
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return;
+    };
+
+    properties.insert(
+        "url".to_string(),
+        serde_json::json!({
+            "description": "Alias for `topic`. Use either `topic` or `url`.",
+            "type": "string"
+        }),
+    );
+
+    schema_obj.insert(
+        "anyOf".to_string(),
+        serde_json::json!([
+            { "required": ["topic"] },
+            { "required": ["url"] }
+        ]),
+    );
+}
+
+#[cfg(feature = "schema")]
+fn route_schema_transform(schema: &mut schemars::Schema) {
+    let Some(properties) = schema
+        .as_object_mut()
+        .and_then(|schema_obj| schema_obj.get_mut("properties"))
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return;
+    };
+
+    let Some(allow_fault_injection) = properties
+        .get_mut("allow_fault_injection")
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return;
+    };
+
+    allow_fault_injection.insert("default".to_string(), serde_json::Value::Bool(false));
 }
 
 /// Configuration for the correlated in-process stream response buffer.
@@ -1815,6 +1918,10 @@ pub struct HttpConfig {
     /// (Consumer only) If true, compatible `http -> response` routes may bypass the normal route consumer/worker/disposition pipeline
     /// and reply inline for lower latency. Defaults to true. Set to false to force the normal route path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(
+        feature = "schema",
+        schemars(default = "default_inline_response_fast_path_schema")
+    )]
     pub inline_response_fast_path: Option<bool>,
     /// (Publisher only) Optional endpoint that receives streamed HTTP response items as correlated messages.
     ///

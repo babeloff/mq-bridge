@@ -11,11 +11,16 @@ use hyper::body::Incoming;
 use hyper::{Response, StatusCode};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tracing::{trace, warn};
+use tracing::{debug, trace, warn};
 
 type BoxBody = http_body_util::combinators::BoxBody<Bytes, anyhow::Error>;
 type HttpSourceMessage = (CanonicalMessage, CommitFunc);
 type HttpStreamResponseTx = async_channel::Sender<Result<Frame<Bytes>, anyhow::Error>>;
+
+pub(super) enum PublishResponseStreamError {
+    BeforePublish(PublisherError),
+    Partial(PublisherError),
+}
 
 fn full<T: Into<Bytes>>(chunk: T) -> BoxBody {
     http_body_util::Full::new(chunk.into())
@@ -545,10 +550,9 @@ fn streamable_commit(
             )),
         };
 
-        response_tx
-            .send(Ok(frame))
-            .await
-            .map_err(|_| anyhow!("HTTP stream closed before response was sent"))?;
+        if response_tx.send(Ok(frame)).await.is_err() {
+            debug!("HTTP stream closed before response was sent");
+        }
         Ok(())
     })
 }
@@ -594,16 +598,17 @@ pub(super) async fn publish_response_stream(
     correlation_id: String,
     format: HttpStreamFormat,
     timeout: std::time::Duration,
-) -> Result<(), PublisherError> {
+) -> Result<(), PublishResponseStreamError> {
     let mut index = 0usize;
     let mut text_buffer = String::new();
+    let mut published_any = false;
 
     loop {
         let next_frame = tokio::time::timeout(timeout, body.frame()).await;
         let frame = match next_frame {
             Ok(Some(Ok(frame))) => frame,
             Ok(Some(Err(error))) => {
-                publish_error_marker(
+                if publish_error_marker(
                     &sink,
                     &base_metadata,
                     &correlation_id,
@@ -611,15 +616,34 @@ pub(super) async fn publish_response_stream(
                     index,
                     &format!("Failed to read HTTP response stream: {}", error),
                 )
-                .await?;
-                return Err(PublisherError::Retryable(anyhow!(
-                    "Failed to read HTTP response stream: {}",
-                    error
-                )));
+                .await
+                .is_ok()
+                {
+                    let _ = publish_end_marker(
+                        &sink,
+                        &base_metadata,
+                        &correlation_id,
+                        format,
+                        index + 1,
+                    )
+                    .await;
+                    return Err(PublishResponseStreamError::Partial(
+                        PublisherError::Retryable(anyhow!(
+                            "Failed to read HTTP response stream: {}",
+                            error
+                        )),
+                    ));
+                }
+                return Err(PublishResponseStreamError::BeforePublish(
+                    PublisherError::Retryable(anyhow!(
+                        "Failed to read HTTP response stream: {}",
+                        error
+                    )),
+                ));
             }
             Ok(None) => break,
             Err(_) => {
-                publish_error_marker(
+                if publish_error_marker(
                     &sink,
                     &base_metadata,
                     &correlation_id,
@@ -627,10 +651,24 @@ pub(super) async fn publish_response_stream(
                     index,
                     "HTTP response stream timeout",
                 )
-                .await?;
-                return Err(PublisherError::Retryable(anyhow!(
-                    "HTTP response stream timeout"
-                )));
+                .await
+                .is_ok()
+                {
+                    let _ = publish_end_marker(
+                        &sink,
+                        &base_metadata,
+                        &correlation_id,
+                        format,
+                        index + 1,
+                    )
+                    .await;
+                    return Err(PublishResponseStreamError::Partial(
+                        PublisherError::Retryable(anyhow!("HTTP response stream timeout")),
+                    ));
+                }
+                return Err(PublishResponseStreamError::BeforePublish(
+                    PublisherError::Retryable(anyhow!("HTTP response stream timeout")),
+                ));
             }
         };
 
@@ -643,7 +681,7 @@ pub(super) async fn publish_response_stream(
 
         match format {
             HttpStreamFormat::RawChunks => {
-                publish_stream_payload(
+                if let Err(error) = publish_stream_payload(
                     &sink,
                     data.clone(),
                     base_metadata.clone(),
@@ -651,12 +689,27 @@ pub(super) async fn publish_response_stream(
                     format,
                     index,
                 )
-                .await?;
+                .await
+                {
+                    if published_any {
+                        let _ = publish_end_marker(
+                            &sink,
+                            &base_metadata,
+                            &correlation_id,
+                            format,
+                            index,
+                        )
+                        .await;
+                        return Err(PublishResponseStreamError::Partial(error));
+                    }
+                    return Err(PublishResponseStreamError::BeforePublish(error));
+                }
+                published_any = true;
                 index += 1;
             }
             HttpStreamFormat::Ndjson => {
                 text_buffer.push_str(&String::from_utf8_lossy(data));
-                index = drain_ndjson_response_items(
+                index = match drain_ndjson_response_items(
                     &sink,
                     &mut text_buffer,
                     &base_metadata,
@@ -664,11 +717,31 @@ pub(super) async fn publish_response_stream(
                     format,
                     index,
                 )
-                .await?;
+                .await
+                {
+                    Ok(next_index) => next_index,
+                    Err(error) => {
+                        if published_any {
+                            let _ = publish_end_marker(
+                                &sink,
+                                &base_metadata,
+                                &correlation_id,
+                                format,
+                                index,
+                            )
+                            .await;
+                            return Err(PublishResponseStreamError::Partial(error));
+                        }
+                        return Err(PublishResponseStreamError::BeforePublish(error));
+                    }
+                };
+                if index > 0 {
+                    published_any = true;
+                }
             }
             HttpStreamFormat::Sse => {
                 text_buffer.push_str(&String::from_utf8_lossy(data));
-                index = drain_sse_response_items(
+                index = match drain_sse_response_items(
                     &sink,
                     &mut text_buffer,
                     &base_metadata,
@@ -676,7 +749,27 @@ pub(super) async fn publish_response_stream(
                     format,
                     index,
                 )
-                .await?;
+                .await
+                {
+                    Ok(next_index) => next_index,
+                    Err(error) => {
+                        if published_any {
+                            let _ = publish_end_marker(
+                                &sink,
+                                &base_metadata,
+                                &correlation_id,
+                                format,
+                                index,
+                            )
+                            .await;
+                            return Err(PublishResponseStreamError::Partial(error));
+                        }
+                        return Err(PublishResponseStreamError::BeforePublish(error));
+                    }
+                };
+                if index > 0 {
+                    published_any = true;
+                }
             }
         }
     }
@@ -686,7 +779,7 @@ pub(super) async fn publish_response_stream(
         HttpStreamFormat::Ndjson => {
             let tail = text_buffer.trim();
             if !tail.is_empty() {
-                publish_stream_payload(
+                if let Err(error) = publish_stream_payload(
                     &sink,
                     Bytes::copy_from_slice(tail.as_bytes()),
                     base_metadata.clone(),
@@ -694,14 +787,29 @@ pub(super) async fn publish_response_stream(
                     format,
                     index,
                 )
-                .await?;
+                .await
+                {
+                    if published_any {
+                        let _ = publish_end_marker(
+                            &sink,
+                            &base_metadata,
+                            &correlation_id,
+                            format,
+                            index,
+                        )
+                        .await;
+                        return Err(PublishResponseStreamError::Partial(error));
+                    }
+                    return Err(PublishResponseStreamError::BeforePublish(error));
+                }
+                published_any = true;
                 index += 1;
             }
         }
         HttpStreamFormat::Sse => {
             if !text_buffer.trim().is_empty() {
                 if let Some(event) = parse_sse_event(&text_buffer) {
-                    publish_sse_response_item(
+                    if let Err(error) = publish_sse_response_item(
                         &sink,
                         event,
                         &base_metadata,
@@ -709,14 +817,37 @@ pub(super) async fn publish_response_stream(
                         format,
                         index,
                     )
-                    .await?;
+                    .await
+                    {
+                        if published_any {
+                            let _ = publish_end_marker(
+                                &sink,
+                                &base_metadata,
+                                &correlation_id,
+                                format,
+                                index,
+                            )
+                            .await;
+                            return Err(PublishResponseStreamError::Partial(error));
+                        }
+                        return Err(PublishResponseStreamError::BeforePublish(error));
+                    }
+                    published_any = true;
                     index += 1;
                 }
             }
         }
     }
 
-    publish_end_marker(&sink, &base_metadata, &correlation_id, format, index).await
+    publish_end_marker(&sink, &base_metadata, &correlation_id, format, index)
+        .await
+        .map_err(|error| {
+            if published_any {
+                PublishResponseStreamError::Partial(error)
+            } else {
+                PublishResponseStreamError::BeforePublish(error)
+            }
+        })
 }
 
 async fn drain_ndjson_response_items(

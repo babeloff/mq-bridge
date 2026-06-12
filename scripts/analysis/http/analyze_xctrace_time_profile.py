@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 import argparse
 import collections
-import xml.etree.ElementTree as ET
 from pathlib import Path
+
+from defusedxml import ElementTree as ET
 
 
 def parse_args() -> argparse.Namespace:

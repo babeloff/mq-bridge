@@ -134,6 +134,21 @@ impl UnixIpcTransport {
             Err(anyhow!("Unix IPC transport not in server mode"))
         }
     }
+
+    fn is_disconnected(error: &anyhow::Error) -> bool {
+        error
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io_error| {
+                matches!(
+                    io_error.kind(),
+                    std::io::ErrorKind::UnexpectedEof
+                        | std::io::ErrorKind::BrokenPipe
+                        | std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::ConnectionAborted
+                        | std::io::ErrorKind::NotConnected
+                )
+            })
+    }
 }
 
 #[async_trait]
@@ -162,31 +177,42 @@ impl TransportChannel for UnixIpcTransport {
     }
 
     async fn recv_batch(&self) -> Result<Vec<CanonicalMessage>> {
-        if *self.inner.closed.lock().await {
-            return Err(anyhow!("Unix IPC transport is closed"));
-        }
+        loop {
+            if *self.inner.closed.lock().await {
+                return Err(anyhow!("Unix IPC transport is closed"));
+            }
 
-        // Accept connection if we don't have one yet (server mode)
-        let mut stream_guard = self.inner.stream.lock().await;
-        if stream_guard.is_none() {
-            drop(stream_guard);
-            let stream = self.accept_connection().await?;
-            stream_guard = self.inner.stream.lock().await;
-            *stream_guard = Some(stream);
-        }
+            let mut stream_guard = self.inner.stream.lock().await;
+            if stream_guard.is_none() {
+                drop(stream_guard);
+                let stream = self.accept_connection().await?;
+                stream_guard = self.inner.stream.lock().await;
+                *stream_guard = Some(stream);
+            }
 
-        if let Some(stream) = stream_guard.as_mut() {
-            let data = Self::recv_frame(stream).await?;
-            let messages: Vec<CanonicalMessage> = rmp_serde::from_slice(&data)?;
-            debug!(
-                path = %self.inner.socket_path,
-                count = messages.len(),
-                bytes = data.len(),
-                "Received batch via Unix IPC"
-            );
-            Ok(messages)
-        } else {
-            Err(anyhow!("Unix IPC transport has no active connection"))
+            let read_result = if let Some(stream) = stream_guard.as_mut() {
+                Self::recv_frame(stream).await
+            } else {
+                Err(anyhow!("Unix IPC transport has no active connection"))
+            };
+
+            match read_result {
+                Ok(data) => {
+                    let messages: Vec<CanonicalMessage> = rmp_serde::from_slice(&data)?;
+                    debug!(
+                        path = %self.inner.socket_path,
+                        count = messages.len(),
+                        bytes = data.len(),
+                        "Received batch via Unix IPC"
+                    );
+                    return Ok(messages);
+                }
+                Err(error) if Self::is_disconnected(&error) => {
+                    warn!(path = %self.inner.socket_path, error = %error, "Unix IPC peer disconnected; waiting for a new connection");
+                    *stream_guard = None;
+                }
+                Err(error) => return Err(error),
+            }
         }
     }
 

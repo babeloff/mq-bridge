@@ -59,7 +59,10 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--route-concurrency", type=int, default=8)
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.duration <= 0:
+        parser.error("--duration must be a positive integer")
+    return args
 
 
 def free_port() -> int:
