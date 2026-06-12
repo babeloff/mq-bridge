@@ -5,9 +5,8 @@ Thin Python bindings for the Rust `mq-bridge` core.
 The public API stays close to mq-bridge itself:
 
 - `Route.from_yaml(path, name)` loads one named route
-- `Route.with_handler(...)` attaches a raw `Message` handler
+- `Route.with_handler(...)` attaches a raw `Message` handler, with lazy `json()`/`text()` readers and `with_json()`/`with_payload()` response helpers
 - `Route.add_handler(kind, ...)` uses mq-bridge's `kind` dispatch and delivers decoded JSON
-- `Route.add_message_handler(kind, ...)` uses `kind` dispatch and delivers `Message` objects with lazy `json()`/`text()` readers and `with_json()`/`with_payload()` response helpers
 - `RetryableError` and `NonRetryableError` let Python handlers signal retry intent
 - `Publisher.from_yaml(path, name)` loads one named publisher
 - `Publisher.send_json(...)` and `Publisher.request_json(...)` serialize Python JSON values in Rust
@@ -23,6 +22,14 @@ cd python/mq-bridge-py
 uv sync --group dev --no-install-project
 uv run maturin develop
 uv run pytest -q
+```
+
+Performance smoke tests are skipped by default because they start routes and measure
+local throughput:
+
+```bash
+cd python/mq-bridge-py
+MQ_BRIDGE_RUN_PERF_TESTS=1 uv run pytest -q -m performance
 ```
 
 ## Examples
@@ -51,16 +58,18 @@ uv run python examples/bench_memory.py --messages 100000
 
 ## Analysis
 
-HTTP comparison benchmark:
+HTTP comparison benchmark, driven by a native load generator (`wrk`) so the
+client is never the bottleneck. It boots each server itself (mq-bridge in worker
+and direct executor modes, plus FastAPI, Starlette, Sanic, aiohttp, and
+FastStream when installed) and drives each with `wrk`:
 
 ```bash
 cd python/mq-bridge-py
 uv run maturin develop --release
-uv run python analysis/bench_http_compare.py --messages 20000 --clients 8
+uv sync --group bench   # optional Python HTTP peers
+uv run python analysis/bench_http_native.py --connections 1,8,32 --duration 8
 ```
 
-Use `--mq-output-buffer` to test mq-bridge response output buffering.
-
-Install `starlette uvicorn fastapi sanic` to include the three optional Python HTTP peers.
-
-The examples use included sample configs or create temporary benchmark configs.
+Requires `wrk` on `PATH` (`brew install wrk`). The FastStream target compares its
+ASGI custom-route path over Uvicorn; it is not a broker-backed subscriber/publisher
+benchmark. The examples use included sample configs or create temporary configs.

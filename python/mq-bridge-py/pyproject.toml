@@ -33,6 +33,19 @@ dev = [
   "maturin>=1.7,<2.0",
   "pytest>=8.3",
 ]
+bench = [
+  "aiohttp>=3.10",
+  "fastapi>=0.115",
+  "faststream>=0.6; python_version >= '3.10'",
+  "sanic>=24.6",
+  "starlette>=0.40",
+  "uvicorn>=0.30",
+]
+
+[tool.pytest.ini_options]
+markers = [
+  "performance: skipped-by-default benchmark smoke tests",
+]
 
 [tool.maturin]
 bindings = "pyo3"
