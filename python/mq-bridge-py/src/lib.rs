@@ -913,15 +913,14 @@ fn invoke_python_handler_many(
 
                 match arg {
                     Ok(arg) => match callable.bind(py).call1((arg,)) {
-                        Ok(result) => {
-                            python_result_to_handled(&result, message_id, message.metadata)
-                                .map_err(|err| {
-                                    python_error_to_handler_error(
-                                        py_err_context(&label, message_id),
-                                        err,
-                                    )
-                                })
-                        }
+                        Ok(result) => python_result_to_handled(
+                            &result,
+                            message_id,
+                            message.metadata,
+                        )
+                        .map_err(|err| {
+                            python_error_to_handler_error(py_err_context(&label, message_id), err)
+                        }),
                         Err(err) => Err(python_error_to_handler_error(
                             py_err_context(&label, message_id),
                             err,
@@ -1920,5 +1919,4 @@ routes:
         first.stop().unwrap();
         thread.join().unwrap();
     }
-
 }
