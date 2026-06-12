@@ -1,3 +1,4 @@
+import os
 import threading
 import time
 
@@ -11,8 +12,14 @@ def handle_order(message: Message) -> dict:
     return {"handled": True}
 
 
-route = Route.from_yaml("examples/memory.yaml", "orders_route").with_handler(handle_order)
-publisher = Publisher.from_yaml("examples/memory.yaml", "orders_publisher")
+CONFIG_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "examples",
+    "memory.yaml",
+)
+
+route = Route.from_yaml(CONFIG_PATH, "orders_route").with_handler(handle_order)
+publisher = Publisher.from_yaml(CONFIG_PATH, "orders_publisher")
 
 
 def drive() -> None:

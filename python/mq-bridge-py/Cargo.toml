@@ -1,8 +1,11 @@
 [package]
 name = "mq-bridge-py"
-version = "0.1.0"
+version.workspace = true
 edition = "2021"
 publish = false
+description = "Python bindings for mq-bridge, an async message-bridging library"
+license = "MIT"
+repository = "https://github.com/marcomq/mq-bridge"
 
 [lib]
 name = "mq_bridge"
@@ -26,6 +29,10 @@ tracing = "0.1"
 default = ["full"]
 middleware = ["mq-bridge/middleware"]
 full = ["mq-bridge/full"]
+# Lean, all-platform set for the `mq-bridge-py-basic` wheel (~22M): the
+# pure-Rust transports (no kafka/rdkafka C toolchain; no heavy datastore
+# drivers). memory + file endpoints are always compiled.
+basic = ["http", "nats", "mqtt", "amqp", "websocket", "zeromq", "middleware", "rustls-ring"]
 dedup = ["mq-bridge/dedup"]
 metrics = ["mq-bridge/metrics"]
 schema = ["mq-bridge/schema"]

@@ -2,6 +2,17 @@
 
 Thin Python bindings for the Rust `mq-bridge` core.
 
+## Install
+
+Pick exactly one distribution. Both install the same import path: `mq_bridge`.
+
+| Package | Install | Includes |
+| :--- | :--- | :--- |
+| Full | `pip install mq-bridge-py` | Basic set plus Kafka, AWS, gRPC, MongoDB, SQLx |
+| Basic | `pip install mq-bridge-py-basic` | HTTP, NATS, MQTT, AMQP, WebSocket, ZeroMQ, middleware |
+
+Memory and file endpoints are always present in both packages. Use `mq-bridge-py-basic` when you want the lean all-platform wheel set. Use `mq-bridge-py` when you need Kafka or the heavier non-messaging backends.
+
 The public API stays close to mq-bridge itself:
 
 - `Route.from_yaml(path, name)` loads one named route

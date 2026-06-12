@@ -1,6 +1,6 @@
 [package]
 name = "mq-bridge"
-version = "0.2.15"
+version.workspace = true
 edition = "2021"
 authors = ["Marco Mengelkoch"]
 rust-version = "1.75"  # 2021 edition was released in 1.56
@@ -14,6 +14,9 @@ categories = ["asynchronous", "network-programming"]
 [workspace]
 members = ["python/mq-bridge-py"]
 resolver = "2"
+
+[workspace.package]
+version = "0.2.15"
 
 [profile.release]
 lto = "thin"
