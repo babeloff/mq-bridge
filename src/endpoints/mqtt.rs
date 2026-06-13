@@ -14,9 +14,9 @@ use rumqttc::v5::mqttbytes::QoS as QoSV5;
 use rumqttc::v5::{
     AsyncClient as AsyncClientV5, EventLoop as EventLoopV5, MqttOptions as MqttOptionsV5,
 };
+use rumqttc::Outgoing;
 use rumqttc::Publish as PublishV3;
 use rumqttc::{tokio_rustls::rustls, AsyncClient, MqttOptions, QoS, Transport};
-use rumqttc::Outgoing;
 use std::any::Any;
 use std::collections::{HashMap, VecDeque};
 use std::fmt::Debug;
@@ -370,7 +370,9 @@ impl MessagePublisher for MqttPublisher {
                     "Failed to publish MQTT message: {}",
                     e
                 ))),
-                Err(_) => Err(PublisherError::Connection(anyhow!("MQTT publish timed out"))),
+                Err(_) => Err(PublisherError::Connection(anyhow!(
+                    "MQTT publish timed out"
+                ))),
             };
         }
 

@@ -99,16 +99,20 @@ fn armature_messaging_test() {
 
     println!("Patching {:?} for API compatibility...", source_path);
     let content = fs::read_to_string(&source_path).expect("Failed to read mq_bridge.rs");
-    let replace_expected =
-        |content: String, from: &str, to: &str, expected: usize, label: &str| -> String {
-            let count = content.matches(from).count();
-            assert_eq!(
+    let replace_expected = |content: String,
+                            from: &str,
+                            to: &str,
+                            expected: usize,
+                            label: &str|
+     -> String {
+        let count = content.matches(from).count();
+        assert_eq!(
                 count, expected,
                 "expected exactly {} `{}` patch target(s) in {:?}, found {} (upstream source may have changed)",
                 expected, label, source_path, count
             );
-            content.replacen(from, to, expected)
-        };
+        content.replacen(from, to, expected)
+    };
 
     let new_content = replace_expected(
         content,
