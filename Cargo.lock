@@ -58,9 +58,9 @@ checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
 
 [[package]]
 name = "amq-protocol"
-version = "8.3.1"
+version = "10.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "355603365d2217f7fbc03f0be085ea1440498957890f04276402012cdde445f5"
+checksum = "2eab68e8836c5812a01b34c5364d28db50bf686b442e902d9d93e4472318d86e"
 dependencies = [
  "amq-protocol-tcp",
  "amq-protocol-types",
@@ -72,24 +72,22 @@ dependencies = [
 
 [[package]]
 name = "amq-protocol-tcp"
-version = "8.3.1"
+version = "10.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8d7b97a85e08671697e724a6b7f1459ff81603613695e3151764a9529c6fec15"
+checksum = "8689f976dbd9864922f4f53e01ad2b43700ed3eb1bb5667b260522f291434dae"
 dependencies = [
  "amq-protocol-uri",
- "async-trait",
+ "async-rs",
  "cfg-if",
- "executor-trait 2.1.2",
- "reactor-trait 2.8.0",
  "tcp-stream",
  "tracing",
 ]
 
 [[package]]
 name = "amq-protocol-types"
-version = "8.3.1"
+version = "10.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a2984a816dba991b5922503921d8f94650792bdeac47c27c83830710d2567f63"
+checksum = "27894e9e57d07f701251aeee3d2ab3d7d114bc830bf722d6626027eb55f3b222"
 dependencies = [
  "cookie-factory",
  "nom 8.0.0",
@@ -99,9 +97,9 @@ dependencies = [
 
 [[package]]
 name = "amq-protocol-uri"
-version = "8.3.1"
+version = "10.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f31db8e69d1456ec8ecf6ee598707179cf1d95f34f7d30037b16ad43f0cddcff"
+checksum = "64fd5ca63f1b8cba2309aaec8595483c36f3a671225d5ab9fe8265adb9213514"
 dependencies = [
  "amq-protocol-types",
  "percent-encoding",
@@ -202,6 +200,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "async-compat"
+version = "0.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a1ba85bc55464dcbf728b56d97e119d673f4cf9062be330a9a26f3acf504a590"
+dependencies = [
+ "futures-core",
+ "futures-io",
+ "once_cell",
+ "pin-project-lite",
+ "tokio",
+]
+
+[[package]]
 name = "async-executor"
 version = "1.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -223,34 +234,10 @@ checksum = "13f937e26114b93193065fd44f507aa2e9169ad0cdabbb996920b1fe1ddea7ba"
 dependencies = [
  "async-channel",
  "async-executor",
- "async-io",
  "async-lock",
  "blocking",
  "futures-lite",
-]
-
-[[package]]
-name = "async-global-executor-trait"
-version = "2.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9af57045d58eeb1f7060e7025a1631cbc6399e0a1d10ad6735b3d0ea7f8346ce"
-dependencies = [
- "async-global-executor",
- "async-trait",
- "executor-trait 2.1.2",
-]
-
-[[package]]
-name = "async-global-executor-trait"
-version = "3.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c3727b7da74b92d2d03403cf1142706b53423e5c050791af438f8f50edea057a"
-dependencies = [
- "async-global-executor",
- "async-global-executor-trait 2.2.0",
- "async-trait",
- "executor-trait 2.1.2",
- "executor-trait 3.1.0",
+ "tokio",
 ]
 
 [[package]]
@@ -319,15 +306,19 @@ dependencies = [
 ]
 
 [[package]]
-name = "async-reactor-trait"
-version = "3.1.1"
+name = "async-rs"
+version = "0.8.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8ab52004af1f14a170088bd9e10a2d3b2f2307ce04320e58a6ce36ee531be625"
+checksum = "3cd5147201b63ba6883ffabca3a153822f71541748d7108e3e799beaeb283131"
 dependencies = [
- "async-io",
+ "async-compat",
+ "async-global-executor",
  "async-trait",
  "futures-core",
- "reactor-trait 3.1.1",
+ "futures-io",
+ "hickory-resolver",
+ "tokio",
+ "tokio-stream",
 ]
 
 [[package]]
@@ -1702,24 +1693,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "executor-trait"
-version = "2.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "13c39dff9342e4e0e16ce96be751eb21a94e94a87bb2f6e63ad1961c2ce109bf"
-dependencies = [
- "async-trait",
-]
-
-[[package]]
-name = "executor-trait"
-version = "3.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "57d6a1fc6700fa12782770cb344a29172ae940ea41d5fd5049fdf236dd6eaa92"
-dependencies = [
- "async-trait",
-]
-
-[[package]]
 name = "fast-uuid-v7"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2718,20 +2691,19 @@ dependencies = [
 
 [[package]]
 name = "lapin"
-version = "3.7.2"
+version = "4.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "913a84142a99160ecef997a5c17c53639bcbac4424a0315a5ffe6c8be8e8db86"
+checksum = "0fd20e01fd92597ca352ca7ceed3c589851ebad279dfcada48aa4d24fd3a7caa"
 dependencies = [
  "amq-protocol",
- "async-global-executor-trait 3.1.0",
- "async-reactor-trait",
+ "async-rs",
  "async-trait",
  "backon",
- "executor-trait 2.1.2",
- "flume 0.11.1",
+ "cfg-if",
+ "event-listener",
+ "flume 0.12.0",
  "futures-core",
  "futures-io",
- "reactor-trait 2.8.0",
  "tracing",
 ]
 
@@ -4224,30 +4196,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "reactor-trait"
-version = "2.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0ffbbf16bc3e4db5fdcf4b77cebf1313610b54b339712aa90088d2d9b1acb1f1"
-dependencies = [
- "async-trait",
- "reactor-trait 3.1.1",
-]
-
-[[package]]
-name = "reactor-trait"
-version = "3.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5b1c85237926dd82e8bc3634240ecf2236ea81e904b3d83cdb1df974af9af293"
-dependencies = [
- "async-io",
- "async-trait",
- "executor-trait 2.1.2",
- "flume 0.11.1",
- "futures-core",
- "futures-io",
-]
-
-[[package]]
 name = "redox_syscall"
 version = "0.2.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4522,9 +4470,9 @@ dependencies = [
 
 [[package]]
 name = "rustls-connector"
-version = "0.21.11"
+version = "0.23.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "10eb7ce243317e6b6a342ef6bff8c2e0d46d78120a9aeb2ee39693a569615c96"
+checksum = "b7664e32b0ffbec386bdf1d7cbca51a89551a90d3278f135186cd6cb3cfa889c"
 dependencies = [
  "futures-io",
  "futures-rustls",
@@ -4532,6 +4480,7 @@ dependencies = [
  "rustls 0.23.40",
  "rustls-native-certs",
  "rustls-pki-types",
+ "rustls-platform-verifier",
  "rustls-webpki 0.103.13",
 ]
 
@@ -5393,16 +5342,15 @@ checksum = "adb6935a6f5c20170eeceb1a3835a49e12e19d792f6dd344ccc76a985ca5a6ca"
 
 [[package]]
 name = "tcp-stream"
-version = "0.30.9"
+version = "0.34.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "282ebecea8280bce8b7a0695b5dc93a19839dd445cbba70d3e07c9f6e12c4653"
+checksum = "300d0735de48a565461c2ea14cc75b80ee5b6be3b4f5aeabe3553e4c2df8d23d"
 dependencies = [
+ "async-rs",
  "cfg-if",
  "futures-io",
  "p12-keystore",
- "reactor-trait 2.8.0",
  "rustls-connector",
- "rustls-pemfile",
 ]
 
 [[package]]

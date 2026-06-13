@@ -89,9 +89,9 @@ tracing-subscriber = { version = "0.3", features = ["json", "env-filter"], optio
 rdkafka = { version = "0.39", features = ["tokio"], optional = true }
 
 # AMQP (RabbitMQ).
-# Drop lapin's default `rustls` feature (it pulls aws_lc_rs via amq-protocol);
-# the crypto provider is wired through `rustls-ring` / `rustls-aws-lc` below.
-lapin = { version = "3.7", default-features = false, features = ["default-runtime"], optional = true }
+# Drop lapin's defaults so the crypto provider remains wired through
+# `rustls-ring` / `rustls-aws-lc` below.
+lapin = { version = "4.10", default-features = false, features = ["tokio", "rustls"], optional = true }
 
 # MongoDB
 mongodb = { version = "3.6", optional = true, features = ["cert-key-password"] }
