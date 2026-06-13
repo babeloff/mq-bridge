@@ -59,9 +59,13 @@ uuid = { version = "1.23" }
 fast-uuid-v7.workspace = true
 rmp-serde = "1.3"
 
-# Common TLS dependencies
-rustls = { version = "0.23", optional = true }
-tokio-rustls = { version = "0.26", optional = true }
+# Common TLS dependencies.
+# `default-features = false` strips rustls' default `aws_lc_rs` crypto provider;
+# the provider is selected explicitly via the `rustls-ring` / `rustls-aws-lc`
+# features below. This is what lets the `basic`/ring build contain NO aws-lc-sys
+# (BoringSSL C), so it cross-compiles cleanly for aarch64/armv7.
+rustls = { version = "0.23", optional = true, default-features = false, features = ["std", "tls12", "logging"] }
+tokio-rustls = { version = "0.26", optional = true, default-features = false, features = ["tls12", "logging"] }
 rustls-pemfile = { version = "2.2", optional = true }
 webpki-roots = { version = "1", optional = true }
 
@@ -83,8 +87,10 @@ tracing-subscriber = { version = "0.3", features = ["json", "env-filter"], optio
 # Kafka
 rdkafka = { version = "0.38", features = ["tokio"], optional = true }
 
-# AMQP (RabbitMQ)
-lapin = { version = "3.7", features = ["rustls"], optional = true }
+# AMQP (RabbitMQ).
+# Drop lapin's default `rustls` feature (it pulls aws_lc_rs via amq-protocol);
+# the crypto provider is wired through `rustls-ring` / `rustls-aws-lc` below.
+lapin = { version = "3.7", default-features = false, features = ["default-runtime"], optional = true }
 
 # MongoDB
 mongodb = { version = "3.6", optional = true, features = ["cert-key-password"] }
@@ -92,8 +98,11 @@ mongodb = { version = "3.6", optional = true, features = ["cert-key-password"] }
 # NATS
 async-nats = { version = "0.48", optional = true }
 
-# MQTT
-rumqttc = { version = "0.25", optional = true }
+# MQTT.
+# `use-rustls-no-provider` pulls tokio-rustls without a crypto provider (its
+# default would enable aws_lc_rs); the provider follows `tokio-rustls?/ring`
+# or `tokio-rustls?/aws_lc_rs` from the crypto features below.
+rumqttc = { version = "0.25", default-features = false, features = ["use-rustls-no-provider"], optional = true }
 
 # IBM MQ
 mqi = { version = "0.3", optional = true }
@@ -101,7 +110,7 @@ mqi = { version = "0.3", optional = true }
 # HTTP
 hyper = { version = "1.8", optional = true, features = ["client", "server", "http1", "http2"] }
 hyper-util = { version = "0.1", optional = true, features = ["tokio", "client", "client-legacy", "server", "http1", "http2"] }
-hyper-rustls = { version = "0.27", optional = true, features = ["http2"] }
+hyper-rustls = { version = "0.27", optional = true, default-features = false, features = ["http1", "http2", "tls12", "logging", "native-tokio"] }
 http-body-util = { version = "0.1", optional = true }
 http-body = { version = "1.0", optional = true }
 h2 = { version = "0.4", optional = true }
@@ -153,8 +162,11 @@ test-utils = ["dep:tracing-appender", "dep:tracing-subscriber", "dep:serde_yaml_
 # (http, grpc, mqtt, nats, amqp, …).  If neither is enabled the application binary
 # must call `rustls::crypto::CryptoProvider::install_default()` before building
 # any TLS endpoint.  This follows the same pattern as reqwest / hyper-rustls.
-rustls-ring    = ["rustls/ring",       "tokio-rustls?/ring",       "hyper-rustls?/ring"]
-rustls-aws-lc  = ["rustls/aws_lc_rs",  "tokio-rustls?/aws_lc_rs",  "hyper-rustls?/aws-lc-rs"]
+rustls-ring    = ["rustls/ring",       "tokio-rustls?/ring",       "hyper-rustls?/ring",       "lapin?/rustls--ring",      "lapin?/rustls-native-certs"]
+# `prefer-post-quantum` (X25519MLKEM768) is aws-lc-rs only — `ring` cannot do PQ —
+# so it lives here, not on `rustls-ring`. It was part of rustls' default features
+# that `default-features = false` above strips, so we re-add it explicitly.
+rustls-aws-lc  = ["rustls/aws_lc_rs",  "rustls/prefer-post-quantum", "tokio-rustls?/aws_lc_rs",  "hyper-rustls?/aws-lc-rs",  "lapin?/rustls--aws_lc_rs", "lapin?/rustls-native-certs"]
 
 # Generate Schema file
 schema = ["dep:schemars"]
