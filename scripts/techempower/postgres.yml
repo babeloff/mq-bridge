@@ -1,0 +1,19 @@
+# Local Postgres for verifying the /db and /queries tests, seeded to match the
+# TechEmpower `World` table (10,000 rows). Not part of the upstream submission —
+# TechEmpower provides its own database. For local use only:
+#
+#   docker compose -f scripts/techempower/postgres.yml up -d
+#   DATABASE_URL="postgres://benchmarkdbuser:benchmarkdbpass@127.0.0.1:5433/hello_world" \
+#     scripts/techempower/verify.sh rust
+#   docker compose -f scripts/techempower/postgres.yml down -v
+services:
+  tfb-database:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: benchmarkdbuser
+      POSTGRES_PASSWORD: benchmarkdbpass
+      POSTGRES_DB: hello_world
+    ports:
+      - "5433:5432"
+    volumes:
+      - ./seed.sql:/docker-entrypoint-initdb.d/seed.sql:ro

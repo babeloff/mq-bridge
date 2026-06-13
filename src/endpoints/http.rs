@@ -670,7 +670,12 @@ async fn spawn_http_server(
                                 tokio::spawn(async move {
                                     let io = TokioIo::new(socket);
                                     let mut builder = AutoBuilder::new(TokioExecutor::new());
-                                    builder.http1().keep_alive(true);
+                                    // `pipeline_flush(true)` coalesces the responses of
+                                    // HTTP/1.1 pipelined requests into a single buffered
+                                    // write, which raises throughput on pipelined workloads
+                                    // (e.g. the TechEmpower plaintext test) and is a no-op
+                                    // for non-pipelined traffic.
+                                    builder.http1().keep_alive(true).pipeline_flush(true);
                                     builder.http2().max_concurrent_streams(200);
                                     let conn = builder.serve_connection_with_upgrades(io, conn_service).await;
                                     if let Err(e) = conn {
@@ -747,7 +752,9 @@ async fn spawn_tls_server(
 
                                             let io = TokioIo::new(stream);
                                             let mut builder = AutoBuilder::new(TokioExecutor::new());
-                                            builder.http1().keep_alive(true);
+                                            // See the plaintext note above: coalesce pipelined
+                                            // HTTP/1.1 responses into one buffered write.
+                                            builder.http1().keep_alive(true).pipeline_flush(true);
                                             builder.http2().max_concurrent_streams(200);
                                             let conn = builder.serve_connection_with_upgrades(io, conn_service).await;
 

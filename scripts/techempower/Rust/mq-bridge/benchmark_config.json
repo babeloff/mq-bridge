@@ -1,0 +1,28 @@
+{
+  "framework": "mq-bridge",
+  "tests": [
+    {
+      "default": {
+        "json_url": "/json",
+        "plaintext_url": "/plaintext",
+        "db_url": "/db",
+        "query_url": "/queries?queries=",
+        "port": 8080,
+        "approach": "Realistic",
+        "classification": "Micro",
+        "database": "Postgres",
+        "framework": "mq-bridge",
+        "language": "Rust",
+        "flavor": "None",
+        "orm": "Raw",
+        "platform": "hyper",
+        "webserver": "hyper",
+        "os": "Linux",
+        "database_os": "Linux",
+        "display_name": "mq-bridge",
+        "notes": "Async message-bridging library. JSON/Plaintext via an http -> response inline fast path; the DB tests run sqlx queries in the route handler.",
+        "versus": "hyper"
+      }
+    }
+  ]
+}
