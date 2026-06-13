@@ -90,51 +90,58 @@ pub async fn test_mqtt_subscriber_logic() {
 
 pub async fn test_mqtt_performance_pipeline() {
     setup_logging();
-    run_test_with_docker("tests/integration/docker-compose/mqtt.yml", || async {
-        let config_yaml = CONFIG_YAML.replace(
-            "{out_capacity}",
-            &(PERF_TEST_BATCH_MESSAGE_COUNT + 1000).to_string(),
-        ); // Use a small capacity for non-perf test
-        run_performance_pipeline_test("mqtt", &config_yaml, PERF_TEST_BATCH_MESSAGE_COUNT).await;
-    })
+    run_test_with_docker(
+        "tests/integration/docker-compose/mqtt_performance.yml",
+        || async {
+            let config_yaml = CONFIG_YAML.replace(
+                "{out_capacity}",
+                &(PERF_TEST_BATCH_MESSAGE_COUNT + 1000).to_string(),
+            ); // Use a small capacity for non-perf test
+            run_performance_pipeline_test("mqtt", &config_yaml, PERF_TEST_BATCH_MESSAGE_COUNT)
+                .await;
+        },
+    )
     .await;
 }
 
 pub async fn test_mqtt_performance_direct() {
     setup_logging();
-    run_test_with_docker("tests/integration/docker-compose/mqtt.yml", || async {
-        let topic = "perf_test_mqtt_direct";
-        let config = mq_bridge::models::MqttConfig {
-            url: "mqtt://localhost:1883".to_string(),
-            // Increase the client's incoming message buffer to hold all messages from the test run.
-            queue_capacity: Some(PERF_TEST_BATCH_MESSAGE_COUNT * 4), // Extra margin
-            max_inflight: Some(60000), // Maximize sink capacity to avoid broker queue overflows
-            qos: Some(1),
-            topic: Some(topic.to_string()),
-            ..Default::default()
-        };
+    run_test_with_docker(
+        "tests/integration/docker-compose/mqtt_performance.yml",
+        || async {
+            let topic = "perf_test_mqtt_direct";
+            let config = mq_bridge::models::MqttConfig {
+                url: "mqtt://localhost:1883".to_string(),
+                // Increase the client's incoming message buffer to hold all messages from the test run.
+                queue_capacity: Some(PERF_TEST_BATCH_MESSAGE_COUNT * 4), // Extra margin
+                max_inflight: Some(60000), // Maximize sink capacity to avoid broker queue overflows
+                qos: Some(1),
+                topic: Some(topic.to_string()),
+                ..Default::default()
+            };
 
-        let result = run_direct_perf_test(
-            "MQTT",
-            || async {
-                let publisher_id = format!("pub-{}", fast_uuid_v7::gen_id());
-                let mut pub_config = config.clone();
-                pub_config.client_id = Some(publisher_id);
-                Arc::new(MqttPublisher::new(&pub_config).await.unwrap())
-            },
-            || async {
-                let consumer_id = format!("sub-{}", fast_uuid_v7::gen_id());
-                let mut consumer_config = config.clone();
-                consumer_config.client_id = Some(consumer_id);
-                Arc::new(tokio::sync::Mutex::new(
-                    MqttConsumer::new(&consumer_config).await.unwrap(),
-                ))
-            },
-        )
-        .await;
+            let result = run_direct_perf_test(
+                "MQTT",
+                || async {
+                    let publisher_id = format!("pub-{}", fast_uuid_v7::gen_id());
+                    let mut pub_config = config.clone();
+                    pub_config.client_id = Some(publisher_id);
+                    Arc::new(MqttPublisher::new(&pub_config).await.unwrap())
+                },
+                || async {
+                    let consumer_id = format!("sub-{}", fast_uuid_v7::gen_id());
+                    let mut consumer_config = config.clone();
+                    consumer_config.client_id = Some(consumer_id);
+                    Arc::new(tokio::sync::Mutex::new(
+                        MqttConsumer::new(&consumer_config).await.unwrap(),
+                    ))
+                },
+            )
+            .await;
 
-        add_performance_result(result);
-    })
+            add_performance_result(result);
+        },
+    )
     .await;
 }
 

@@ -1006,7 +1006,7 @@ fn performance_benchmarks(c: &mut Criterion) {
     bench_backend!(
         "mqtt",
         "mqtt",
-        "tests/integration/docker-compose/mqtt.yml",
+        "tests/integration/docker-compose/mqtt_performance.yml",
         mqtt_helper,
         group,
         &rt,

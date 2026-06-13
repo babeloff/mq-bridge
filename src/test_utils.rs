@@ -45,8 +45,77 @@ static PERFORMANCE_RESULTS: Lazy<Mutex<Vec<PerformanceResult>>> =
 static DOCKER_TEST_LOCK: Lazy<AsyncMutex<()>> = Lazy::new(|| AsyncMutex::new(()));
 
 /// Per-feature elapsed time tracker to enforce time budgets across sub-benchmarks.
-static BENCH_FEATURE_ELAPSED: Lazy<AsyncMutex<std::collections::HashMap<String, u64>>> =
+static BENCH_FEATURE_ELAPSED: Lazy<AsyncMutex<std::collections::HashMap<String, Duration>>> =
     Lazy::new(|| AsyncMutex::new(std::collections::HashMap::new()));
+
+/// Sub-benchmarks that have already timed out and should be skipped on later Criterion samples.
+static BENCH_TIMED_OUT_SUBBENCHES: Lazy<AsyncMutex<HashSet<String>>> =
+    Lazy::new(|| AsyncMutex::new(HashSet::new()));
+
+/// Features whose total time budget has been exceeded and should skip remaining sub-benchmarks.
+static BENCH_ABORTED_FEATURES: Lazy<AsyncMutex<HashSet<String>>> =
+    Lazy::new(|| AsyncMutex::new(HashSet::new()));
+
+fn bench_subbench_key(feature: &str, subbench: &str) -> String {
+    format!("{feature}::{subbench}")
+}
+
+async fn with_subbench_timeout_configured<F>(
+    feature: &str,
+    subbench: &str,
+    per_sub_timeout: Duration,
+    max_feature_total: Duration,
+    fut: F,
+) -> Duration
+where
+    F: std::future::Future<Output = Duration> + Send,
+{
+    let measured = match tokio::time::timeout(per_sub_timeout, fut).await {
+        Ok(d) => d,
+        Err(_) => {
+            eprintln!("BENCH-TIMEOUT feature={} subbench={}", feature, subbench);
+            BENCH_TIMED_OUT_SUBBENCHES
+                .lock()
+                .await
+                .insert(bench_subbench_key(feature, subbench));
+            per_sub_timeout
+        }
+    };
+
+    // Update accumulated time for the feature.
+    let total_elapsed = {
+        let mut map = BENCH_FEATURE_ELAPSED.lock().await;
+        let entry = map.entry(feature.to_string()).or_insert(Duration::ZERO);
+        *entry += measured;
+        *entry
+    };
+
+    if total_elapsed > max_feature_total {
+        let mut aborted = BENCH_ABORTED_FEATURES.lock().await;
+        if aborted.insert(feature.to_string()) {
+            eprintln!(
+                "BENCH-WARNING feature={} exceeded total time budget: {}s",
+                feature,
+                total_elapsed.as_secs()
+            );
+        }
+    }
+
+    measured
+}
+
+/// Returns true when the current Criterion sample should be skipped because the
+/// sub-benchmark already timed out or the feature budget has been exhausted.
+pub async fn should_skip_subbench(feature: &str, subbench: &str) -> bool {
+    if BENCH_ABORTED_FEATURES.lock().await.contains(feature) {
+        return true;
+    }
+
+    BENCH_TIMED_OUT_SUBBENCHES
+        .lock()
+        .await
+        .contains(&bench_subbench_key(feature, subbench))
+}
 
 /// Run a sub-benchmark future with a per-subbench timeout (60s) and accumulate
 /// elapsed time per feature. If the per-feature total exceeds 180s, a warning
@@ -55,29 +124,14 @@ pub async fn with_subbench_timeout<F>(feature: &str, subbench: &str, fut: F) -> 
 where
     F: std::future::Future<Output = std::time::Duration> + Send,
 {
-    let per_sub_timeout = std::time::Duration::from_secs(60);
-    let max_feature_total_secs: u64 = 180;
-
-    let measured = match tokio::time::timeout(per_sub_timeout, fut).await {
-        Ok(d) => d,
-        Err(_) => {
-            eprintln!("BENCH-TIMEOUT feature={} subbench={}", feature, subbench);
-            per_sub_timeout
-        }
-    };
-
-    // Update accumulated time for the feature
-    let mut map = BENCH_FEATURE_ELAPSED.lock().await;
-    let entry = map.entry(feature.to_string()).or_insert(0);
-    *entry += measured.as_secs();
-    if *entry > max_feature_total_secs {
-        eprintln!(
-            "BENCH-WARNING feature={} exceeded total time budget: {}s",
-            feature, *entry
-        );
-    }
-
-    measured
+    with_subbench_timeout_configured(
+        feature,
+        subbench,
+        Duration::from_secs(60),
+        Duration::from_secs(180),
+        fut,
+    )
+    .await
 }
 
 pub fn should_run(test_name: &str) -> bool {
@@ -1235,6 +1289,9 @@ macro_rules! run_benchmarks {
         $group.bench_function(concat!($name, "_single_write"), |b| {
             b.to_async($rt).iter_custom(|iters| async move {
                 let sub = concat!($name, "_single_write");
+                if $crate::test_utils::should_skip_subbench($name, sub).await {
+                    return std::time::Duration::from_nanos(1);
+                }
                 let inner = async move {
                     let mut total = std::time::Duration::ZERO;
                     // Create consumer first to support brokerless protocols like ZeroMQ
@@ -1279,6 +1336,9 @@ macro_rules! run_benchmarks {
         $group.bench_function(concat!($name, "_single_read"), |b| {
             b.to_async($rt).iter_custom(|iters| async move {
                 let sub = concat!($name, "_single_read");
+                if $crate::test_utils::should_skip_subbench($name, sub).await {
+                    return std::time::Duration::from_nanos(1);
+                }
                 let inner = async move {
                     let mut total = std::time::Duration::ZERO;
                     let consumer = backend::create_consumer().await;
@@ -1323,6 +1383,9 @@ macro_rules! run_benchmarks {
         $group.bench_function(concat!($name, "_batch_write"), |b| {
             b.to_async($rt).iter_custom(|iters| async move {
                 let sub = concat!($name, "_batch_write");
+                if $crate::test_utils::should_skip_subbench($name, sub).await {
+                    return std::time::Duration::from_nanos(1);
+                }
                 let inner = async move {
                     let mut total = std::time::Duration::ZERO;
                     let consumer = backend::create_consumer().await;
@@ -1367,6 +1430,9 @@ macro_rules! run_benchmarks {
         $group.bench_function(concat!($name, "_batch_read"), |b| {
             b.to_async($rt).iter_custom(|iters| async move {
                 let sub = concat!($name, "_batch_read");
+                if $crate::test_utils::should_skip_subbench($name, sub).await {
+                    return std::time::Duration::from_nanos(1);
+                }
                 let inner = async move {
                     let mut total = std::time::Duration::ZERO;
                     let consumer = backend::create_consumer().await;
@@ -1561,4 +1627,51 @@ pub async fn run_concurrency_test(
         "Execution too fast: {:?}",
         elapsed
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{should_skip_subbench, with_subbench_timeout_configured};
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn subbench_timeout_marks_subbench_for_skip() {
+        let feature = format!("timeout-feature-{}", fast_uuid_v7::gen_id());
+        let subbench = format!("timeout-subbench-{}", fast_uuid_v7::gen_id());
+
+        let measured = with_subbench_timeout_configured(
+            &feature,
+            &subbench,
+            Duration::from_millis(5),
+            Duration::from_secs(1),
+            async {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                Duration::from_secs(5)
+            },
+        )
+        .await;
+
+        assert_eq!(measured, Duration::from_millis(5));
+        assert!(should_skip_subbench(&feature, &subbench).await);
+    }
+
+    #[tokio::test]
+    async fn feature_budget_marks_remaining_subbenches_for_skip() {
+        let feature = format!("budget-feature-{}", fast_uuid_v7::gen_id());
+        let first = format!("budget-subbench-a-{}", fast_uuid_v7::gen_id());
+        let second = format!("budget-subbench-b-{}", fast_uuid_v7::gen_id());
+
+        let measured = with_subbench_timeout_configured(
+            &feature,
+            &first,
+            Duration::from_secs(1),
+            Duration::from_millis(10),
+            async { Duration::from_millis(15) },
+        )
+        .await;
+
+        assert_eq!(measured, Duration::from_millis(15));
+        assert!(should_skip_subbench(&feature, &first).await);
+        assert!(should_skip_subbench(&feature, &second).await);
+    }
 }
