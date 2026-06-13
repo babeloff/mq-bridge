@@ -1,8 +1,15 @@
 # TechEmpower FrameworkBenchmarks entries for mq-bridge
 
-Submission-shaped entries for the [TechEmpower FrameworkBenchmarks](https://github.com/TechEmpower/FrameworkBenchmarks)
+Benchmark entries shaped like the [TechEmpower FrameworkBenchmarks](https://github.com/TechEmpower/FrameworkBenchmarks)
 project, for both the Rust core (`mq-bridge`) and the Python bindings
 (`mq-bridge-py`).
+
+> **Status:** TechEmpower FrameworkBenchmarks is now archived (read-only), so
+> these are no longer submitted upstream — they live on as a **verified local
+> conformance + throughput harness** (`verify.sh`). For maintained public
+> benchmark suites, see the sibling entries under
+> [`scripts/the-benchmarker/`](../the-benchmarker/) (the-benchmarker/web-frameworks)
+> and [`scripts/httparena/`](../httparena/) (HttpArena).
 
 ## Scope
 
@@ -167,19 +174,21 @@ existing wrk harness still applies:
 cd python/mq-bridge-py && uv run python analysis/bench_http_native.py
 ```
 
-## Submitting upstream
+## Historical note (upstream is archived)
 
-1. **Release first.** The Dockerfiles `git clone` this repo at a ref (`MQB_REF`,
-   default `python`). Push these files and pin `MQB_REF` to a released tag so the
-   image builds reproducibly. Likewise swap the Rust `Cargo.toml` path dependency
-   for the matching `git`/crates.io release.
-2. Fork `TechEmpower/FrameworkBenchmarks` and copy:
-   - `scripts/techempower/Rust/mq-bridge/`   → `frameworks/Rust/mq-bridge/`
-   - `scripts/techempower/Python/mq-bridge-py/` → `frameworks/Python/mq-bridge-py/`
-3. Build/validate with their toolset (`./tfb --mode verify --test mq-bridge mq-bridge-py`)
-   and open the PR. Note this is a maintenance commitment: entries that break a
-   later round's CI get disabled until fixed.
+TechEmpower FrameworkBenchmarks was archived after Round 23, so there is no live
+PR target anymore. The entries kept their submission shape (per-framework
+`README.md`, `benchmark_config.json`, Dockerfile) so they remain a faithful,
+runnable reference — and so they can still be dropped into a fork of the archived
+repo to reproduce a round locally with `./tfb --mode verify --test mq-bridge
+mq-bridge-py`. The Dockerfiles `git clone` this repo at `MQB_REF` (pin to a
+released tag) and the Rust `Cargo.toml` path dependency can be swapped for a
+`git`/crates.io release for reproducible image builds.
 
-> Honest framing for the PR: `mq-bridge-py` is the interesting entry (top-tier
-> Python JSON throughput via off-GIL serialization). The Rust entry is a
-> mid-pack hyper-based result — it optimizes for bridging/routing, not raw req/s.
+For maintained public suites, the equivalent (and PR-able) entries now live
+under [`scripts/the-benchmarker/`](../the-benchmarker/) and
+[`scripts/httparena/`](../httparena/).
+
+> Honest framing: `mq-bridge-py` is the interesting entry (top-tier Python JSON
+> throughput via off-GIL serialization). The Rust entry is a mid-pack
+> hyper-based result — it optimizes for bridging/routing, not raw req/s.

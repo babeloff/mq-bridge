@@ -1,0 +1,31 @@
+# HttpArena entry for mq-bridge (Rust) — core HTTP/1.1 + cleartext HTTP/2 (h2c).
+#
+# HttpArena builds each framework from its own directory, so mq-bridge is pulled
+# in via a pinned git reference. hyper-util's auto connection builder serves both
+# HTTP/1.1 and HTTP/2 prior-knowledge (h2c) on the plaintext port, so this single
+# binary covers the H/1.1 profiles. Bump `tag` to benchmark a newer release.
+[package]
+name = "httparena-mqbridge"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "httparena-mqbridge"
+path = "src/main.rs"
+
+[dependencies]
+mq-bridge = { git = "https://github.com/marcomq/mq-bridge", tag = "v0.2.16", default-features = false, features = ["http"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+# Async-db profile: own a Postgres pool in the handler (HttpArena seeds an
+# `items` table and passes DATABASE_URL).
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "json"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
