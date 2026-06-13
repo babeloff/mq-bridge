@@ -74,6 +74,26 @@ generate_pem_dir() {
   # ls -l "$outdir"
 }
 
+generate_ibm_mq_dir() {
+  local outdir="$1"
+  local label_dir="$outdir/keys/ibmmqkey"
+  local trust_dir="$outdir/trust/0"
+  mkdir -p "$outdir" "$label_dir" "$trust_dir"
+  echo "Ensuring base certs and copying IBM MQ TLS materials to $outdir"
+  ensure_base_certs
+  cp -a "$BASE_CERT_DIR/ca.pem" "$outdir/" 2>/dev/null || true
+  cp -a "$BASE_CERT_DIR/server.crt" "$outdir/" 2>/dev/null || true
+  cp -a "$BASE_CERT_DIR/server.key" "$outdir/" 2>/dev/null || true
+  cp -a "$BASE_CERT_DIR/server.pem" "$outdir/" 2>/dev/null || true
+  cp -a "$BASE_CERT_DIR/server.key" "$label_dir/tls.key" 2>/dev/null || true
+  cp -a "$BASE_CERT_DIR/server.crt" "$label_dir/tls.crt" 2>/dev/null || true
+  cp -a "$BASE_CERT_DIR/ca.pem" "$label_dir/ca.crt" 2>/dev/null || true
+  cp -a "$BASE_CERT_DIR/ca.pem" "$trust_dir/tls.crt" 2>/dev/null || true
+  chmod 644 "$outdir"/* || true
+  chmod 644 "$label_dir"/* || true
+  chmod 644 "$trust_dir"/* || true
+}
+
 generate_keystore_dir() {
   local outdir="$1"
   mkdir -p "$outdir"
@@ -131,7 +151,11 @@ case "$CMD" in
       grpc) OUT_DIR="$OUT_ROOT/grpc-certs" ;;
       ibm-mq) OUT_DIR="$OUT_ROOT/ibm-mq-certs" ;;
     esac
-    generate_pem_dir "$OUT_DIR"
+    if [[ "$CMD" == "ibm-mq" ]]; then
+      generate_ibm_mq_dir "$OUT_DIR"
+    else
+      generate_pem_dir "$OUT_DIR"
+    fi
     ;;
   kafka)
     generate_keystore_dir "$OUT_ROOT/kafka-certs"

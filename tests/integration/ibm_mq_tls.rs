@@ -22,7 +22,7 @@ async fn test_ibm_mq_tls_roundtrip() {
         || async {
             let mut cfg = tls_helpers::ibm_mq_config_with_tls(&cert_dir, "QM1", "DEV.APP.SVRCONN");
             cfg.username = Some("app".to_string());
-            cfg.password = Some("admin".to_string());
+            cfg.password = Some("adminpass".to_string());
 
             let publisher = Arc::new(
                 IbmMqPublisher::new(&cfg)

@@ -9,8 +9,8 @@ services:
     environment:
       - LICENSE=accept
       - MQ_QMGR_NAME=QM1
-      - MQ_APP_PASSWORD=admin
-      - MQ_ADMIN_PASSWORD=admin
+      - MQ_APP_PASSWORD=adminpass
+      - MQ_ADMIN_PASSWORD=adminpass
     healthcheck:
       test: ["CMD-SHELL", "echo \"DISPLAY QLOCAL('DEV.QUEUE.1')\" | /opt/mqm/bin/runmqsc QM1"]
       interval: 10s

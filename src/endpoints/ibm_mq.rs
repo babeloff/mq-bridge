@@ -33,6 +33,7 @@ use tracing::{debug, info, trace, warn};
 // Module-level constants
 const STATUS_TIMEOUT_SECS: u64 = 1;
 const RECONNECT_DELAY_SECS: u64 = 1;
+const MQ_CERT_VAL_POLICY_NONE: i32 = 2;
 
 /// Macro to perform backout with consistent logging
 macro_rules! backout_with_logging {
@@ -105,8 +106,6 @@ macro_rules! connect_mq {
             .context("Invalid queue manager name")?;
 
         let cipher_spec_str = $config.cipher_spec.as_deref().unwrap_or("");
-        let cipher_spec =
-            MqStr::<32>::try_from(cipher_spec_str).context("Invalid cipher spec")?;
 
         let mq_server_string = format!("{}/TCP/{}", $config.channel, $config.url);
         let mq_server =
@@ -119,22 +118,49 @@ macro_rules! connect_mq {
         };
 
         let (tls_opt, cipher_opt) = if $config.tls.required {
-            let key_repo_str = $config
-                .tls
-                .cert_file
-                .as_deref()
-                .ok_or_else(|| anyhow::anyhow!("TLS required but cert_file (KeyRepo) not provided"))?;
+            let mut tls = Tls::default();
+            let mut has_tls_option = false;
 
-            let key_repo = KeyRepo(MqStr::<256>::try_from(key_repo_str).context("Invalid Key Repo")?);
+            if let Some(key_repo_str) = $config.tls.cert_file.as_deref() {
+                let key_repo =
+                    KeyRepo(MqStr::<256>::try_from(key_repo_str).context("Invalid Key Repo")?);
+                tls.key_repo(&key_repo);
+                has_tls_option = true;
+            }
 
-            let tls = Tls::new(&key_repo, None, &CipherSpec(cipher_spec));
+            if $config.tls.accept_invalid_certs {
+                tls.cert_val_policy(MQ_CERT_VAL_POLICY_NONE);
+                has_tls_option = true;
+            }
 
             if let Some(_pass) = &$config.tls.cert_password {
                 warn!("IBM MQ key repository password is not supported in this build (requires mqc_9_3_0_0 feature)");
             }
-            (Some(tls), None)
+
+            if !has_tls_option {
+                if $config.tls.ca_file.is_some() {
+                    anyhow::bail!(
+                        "IBM MQ TLS does not consume tls.ca_file directly; provide tls.cert_file as an MQ key repository or set tls.accept_invalid_certs=true"
+                    );
+                }
+                anyhow::bail!(
+                    "TLS required but neither tls.cert_file (MQ key repository) nor tls.accept_invalid_certs was provided"
+                );
+            }
+
+            (
+                Some(tls),
+                Some(CipherSpec(
+                    MqStr::<32>::try_from(cipher_spec_str).context("Invalid cipher spec")?,
+                )),
+            )
         } else {
-            (None, Some(CipherSpec(cipher_spec)))
+            (
+                None,
+                Some(CipherSpec(
+                    MqStr::<32>::try_from(cipher_spec_str).context("Invalid cipher spec")?,
+                )),
+            )
         };
 
         let opts = (

@@ -181,6 +181,26 @@ impl DockerCompose {
             .status()
             .expect("Failed to start docker compose");
 
+        if !status.success() {
+            let _ = Command::new("docker")
+                .arg("compose")
+                .arg("-f")
+                .arg(&self.compose_file)
+                .arg("ps")
+                .stdout(std::process::Stdio::inherit())
+                .stderr(std::process::Stdio::inherit())
+                .status();
+            let _ = Command::new("docker")
+                .arg("compose")
+                .arg("-f")
+                .arg(&self.compose_file)
+                .arg("logs")
+                .arg("--no-color")
+                .stdout(std::process::Stdio::inherit())
+                .stderr(std::process::Stdio::inherit())
+                .status();
+        }
+
         assert!(status.success(), "docker compose up --wait failed");
         println!("Services from {} should be up.", self.compose_file);
     }

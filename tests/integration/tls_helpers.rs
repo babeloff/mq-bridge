@@ -80,7 +80,11 @@ pub fn ibm_mq_config_with_tls(
         queue_manager.into(),
         channel.into(),
     );
-    cfg.tls = mq_bridge::models::TlsConfig::new().with_ca_file(ca.to_string_lossy());
+    // The current IBM MQ client path accepts an MQ key repository, not a PEM CA bundle.
+    // For this integration test, use TLS while skipping server certificate validation.
+    cfg.tls = mq_bridge::models::TlsConfig::new()
+        .with_ca_file(ca.to_string_lossy())
+        .with_insecure(true);
     cfg.cipher_spec = Some("ANY_TLS12".to_string());
     cfg
 }
