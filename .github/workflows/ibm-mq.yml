@@ -25,6 +25,9 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
   IBM_MQ_REDIST_URL: https://public.dhe.ibm.com/ibmdl/export/pub/software/websphere/messaging/mqdev/redist/9.3.0.0-IBM-MQC-Redist-LinuxX64.tar.gz
+  # IBM does not publish a .sha256 sidecar, so pin the expected digest here.
+  # Update both URL and digest together when bumping the MQ client version.
+  IBM_MQ_REDIST_SHA256: 9e751849f17290ee97e9f4dcbdb0f06ca3cfe672bfd7554714c57ff54d04820b
 
 jobs:
   # Build check for IBM MQ feature
@@ -54,12 +57,8 @@ jobs:
         run: |
           archive_url="$IBM_MQ_REDIST_URL"
           archive_name="$(basename "$archive_url")"
-          checksum_name="${archive_name}.sha256"
           curl -fsSLO "$archive_url"
-          curl -fsSL "${archive_url}.sha256" -o "$checksum_name"
-          expected_sha256="$(awk '{print $1}' "$checksum_name")"
-          test -n "$expected_sha256"
-          echo "${expected_sha256}  ${archive_name}" | sha256sum -c -
+          echo "${IBM_MQ_REDIST_SHA256}  ${archive_name}" | sha256sum -c -
           tar -xzf "$archive_name"
 
           # Set up environment for MQ client
@@ -110,12 +109,8 @@ jobs:
         run: |
           archive_url="$IBM_MQ_REDIST_URL"
           archive_name="$(basename "$archive_url")"
-          checksum_name="${archive_name}.sha256"
           curl -fsSLO "$archive_url"
-          curl -fsSL "${archive_url}.sha256" -o "$checksum_name"
-          expected_sha256="$(awk '{print $1}' "$checksum_name")"
-          test -n "$expected_sha256"
-          echo "${expected_sha256}  ${archive_name}" | sha256sum -c -
+          echo "${IBM_MQ_REDIST_SHA256}  ${archive_name}" | sha256sum -c -
           tar -xzf "$archive_name"
           mq_root="$(find . -maxdepth 2 -type d \( -name mqm -o -name MQClient \) | head -n 1)"
           test -n "$mq_root"
@@ -180,12 +175,8 @@ jobs:
         run: |
           archive_url="$IBM_MQ_REDIST_URL"
           archive_name="$(basename "$archive_url")"
-          checksum_name="${archive_name}.sha256"
           curl -fsSLO "$archive_url"
-          curl -fsSL "${archive_url}.sha256" -o "$checksum_name"
-          expected_sha256="$(awk '{print $1}' "$checksum_name")"
-          test -n "$expected_sha256"
-          echo "${expected_sha256}  ${archive_name}" | sha256sum -c -
+          echo "${IBM_MQ_REDIST_SHA256}  ${archive_name}" | sha256sum -c -
           tar -xzf "$archive_name"
           mq_root="$(find . -maxdepth 2 -type d \( -name mqm -o -name MQClient \) | head -n 1)"
           test -n "$mq_root"

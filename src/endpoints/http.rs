@@ -2955,7 +2955,7 @@ http_route:
         ));
         let handler = |mut msg: CanonicalMessage| async move {
             let payload = msg.get_payload_str();
-            msg.set_payload_str(&format!("reply-{payload}"));
+            msg.set_payload_str(format!("reply-{payload}"));
             Ok(Handled::Publish(msg))
         };
         output.handler = Some(std::sync::Arc::new(handler));

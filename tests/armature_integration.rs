@@ -107,7 +107,7 @@ fn armature_messaging_test() {
             )
             .replace(
                 "MemoryConfig {",
-                "MemoryConfig { request_reply: false, request_timeout_ms: None, subscribe_mode: false, enable_nack: false,",
+                "MemoryConfig { url: None, request_reply: false, request_timeout_ms: None, subscribe_mode: false, enable_nack: false, enable_nack_overridden: false,",
             )
             .replace(
                 "EndpointType::File(self.topic.clone())",
@@ -128,7 +128,7 @@ fn armature_messaging_test() {
     assert!(project_dir.exists(), "Project directory missing");
     let status = Command::new(&cargo_bin)
         .arg("test")
-        .arg("--features=mq-bridge-full")
+        .arg("--features=mq-bridge")
         .arg("--")
         .arg("--ignored")
         .current_dir(&project_dir)

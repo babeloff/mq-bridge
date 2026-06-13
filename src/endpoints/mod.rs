@@ -1461,7 +1461,7 @@ mod tests {
             Middleware::Retry(crate::models::RetryMiddleware::default()),
         ]));
         assert!(!output_middlewares_allow_http_inline_fast_path(&[
-            Middleware::Dlq(Box::new(crate::models::DeadLetterQueueMiddleware::default())),
+            Middleware::Dlq(Box::default()),
         ]));
     }
 

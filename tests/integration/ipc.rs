@@ -5,15 +5,23 @@
 
 #![cfg(any(unix, windows))]
 
+// Imports below are used only by the `#[tokio::test]` functions, which are
+// stripped when this file is included into the performance bench (a non-test
+// build), so allow them to appear unused there.
+#[allow(unused_imports)]
 use mq_bridge::endpoints::memory::transport::{TransportChannel, TransportUrl};
+#[allow(unused_imports)]
 use mq_bridge::CanonicalMessage;
 
 #[cfg(unix)]
+#[allow(unused_imports)]
 use mq_bridge::endpoints::memory::ipc_unix::UnixIpcTransport;
 #[cfg(windows)]
+#[allow(unused_imports)]
 use mq_bridge::endpoints::memory::ipc_windows::WindowsIpcTransport;
 
 #[cfg(any(unix, windows))]
+#[allow(dead_code)]
 async fn connect_with_retry<T, F, Fut>(mut make_client: F) -> T
 where
     F: FnMut() -> Fut,
