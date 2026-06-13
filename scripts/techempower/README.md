@@ -125,15 +125,22 @@ scripts/techempower/
   postgres.yml                    # local Postgres for the /db tests (not submitted)
   seed.sql                        # World table seed (10,000 rows)
   Rust/mq-bridge/                 # Rust entry (cargo binary)
+    README.md                     # framework README submitted upstream
     src/main.rs
     Cargo.toml                    # path-dep on this repo; swap to git tag for the PR
     benchmark_config.json
     mq-bridge.dockerfile
   Python/mq-bridge-py/            # Python entry
+    README.md                     # framework README submitted upstream
     server.py
     benchmark_config.json
     mq-bridge-py.dockerfile
 ```
+
+This top-level README is the developer overview and is **not** submitted
+upstream. The per-framework `README.md` files inside `Rust/mq-bridge/` and
+`Python/mq-bridge-py/` are the ones TechEmpower expects (one per entry) and get
+copied with their directories.
 
 ## Verify locally
 
