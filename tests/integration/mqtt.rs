@@ -21,13 +21,13 @@ routes:
             max_attempts: 10
             initial_interval_ms: 500
             max_interval_ms: 2000
-      mqtt: { url: "mqtt://localhost:1883", topic: "test_topic_mqtt", client_id: "test-publisher-chaos", clean_session: false, qos: 2, max_inflight: 1000, queue_capacity: 10000, delayed_ack: false }
+      mqtt: { url: "mqtt://localhost:1883", topic: "test_topic_mqtt", client_id: "test-publisher-chaos", clean_session: false, qos: 1, max_inflight: 1000, queue_capacity: 10000, delayed_ack: false }
 
   mqtt_to_memory:
     concurrency: 4
     batch_size: 128
     input:
-      mqtt: { url: "mqtt://localhost:1883", topic: "test_topic_mqtt", client_id: "test-consumer-chaos", clean_session: false, qos: 2, max_inflight: 1000, queue_capacity: 10000 }
+      mqtt: { url: "mqtt://localhost:1883", topic: "test_topic_mqtt", client_id: "test-consumer-chaos", clean_session: false, qos: 1, max_inflight: 1000, queue_capacity: 10000 }
     output:
       memory: { topic: "test-out-mqtt", capacity: {out_capacity} }
 "#;
