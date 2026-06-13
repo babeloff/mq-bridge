@@ -59,15 +59,11 @@ jobs:
           archive_name="$(basename "$archive_url")"
           curl -fsSLO "$archive_url"
           echo "${IBM_MQ_REDIST_SHA256}  ${archive_name}" | sha256sum -c -
-          tar -xzf "$archive_name"
-
-          # Set up environment for MQ client
-          mq_root="$(find . -maxdepth 2 -type d \( -name mqm -o -name MQClient \) | head -n 1)"
-          test -n "$mq_root"
+          # The redist archive extracts a self-contained MQ install tree
+          # (bin/, lib64/, inc/, ...) with no top-level mqm/ dir, so unpack
+          # it directly into the installation path.
           sudo mkdir -p /opt/mqm
-          sudo cp -r "$mq_root"/* /opt/mqm/
-
-          # Set library path
+          sudo tar -xzf "$archive_name" -C /opt/mqm
           echo "LD_LIBRARY_PATH=/opt/mqm/lib64:$LD_LIBRARY_PATH" >> $GITHUB_ENV
           echo "MQ_INSTALLATION_PATH=/opt/mqm" >> $GITHUB_ENV
       
@@ -111,11 +107,11 @@ jobs:
           archive_name="$(basename "$archive_url")"
           curl -fsSLO "$archive_url"
           echo "${IBM_MQ_REDIST_SHA256}  ${archive_name}" | sha256sum -c -
-          tar -xzf "$archive_name"
-          mq_root="$(find . -maxdepth 2 -type d \( -name mqm -o -name MQClient \) | head -n 1)"
-          test -n "$mq_root"
+          # The redist archive extracts a self-contained MQ install tree
+          # (bin/, lib64/, inc/, ...) with no top-level mqm/ dir, so unpack
+          # it directly into the installation path.
           sudo mkdir -p /opt/mqm
-          sudo cp -r "$mq_root"/* /opt/mqm/
+          sudo tar -xzf "$archive_name" -C /opt/mqm
           echo "LD_LIBRARY_PATH=/opt/mqm/lib64:$LD_LIBRARY_PATH" >> $GITHUB_ENV
           echo "MQ_INSTALLATION_PATH=/opt/mqm" >> $GITHUB_ENV
       
@@ -177,11 +173,11 @@ jobs:
           archive_name="$(basename "$archive_url")"
           curl -fsSLO "$archive_url"
           echo "${IBM_MQ_REDIST_SHA256}  ${archive_name}" | sha256sum -c -
-          tar -xzf "$archive_name"
-          mq_root="$(find . -maxdepth 2 -type d \( -name mqm -o -name MQClient \) | head -n 1)"
-          test -n "$mq_root"
+          # The redist archive extracts a self-contained MQ install tree
+          # (bin/, lib64/, inc/, ...) with no top-level mqm/ dir, so unpack
+          # it directly into the installation path.
           sudo mkdir -p /opt/mqm
-          sudo cp -r "$mq_root"/* /opt/mqm/
+          sudo tar -xzf "$archive_name" -C /opt/mqm
           echo "LD_LIBRARY_PATH=/opt/mqm/lib64:$LD_LIBRARY_PATH" >> $GITHUB_ENV
           echo "MQ_INSTALLATION_PATH=/opt/mqm" >> $GITHUB_ENV
       

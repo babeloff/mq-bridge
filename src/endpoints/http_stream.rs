@@ -627,19 +627,15 @@ pub(super) async fn publish_response_stream(
                         index + 1,
                     )
                     .await;
-                    return Err(PublishResponseStreamError::Partial(
-                        PublisherError::Retryable(anyhow!(
-                            "Failed to read HTTP response stream: {}",
-                            error
-                        )),
-                    ));
                 }
-                return Err(PublishResponseStreamError::BeforePublish(
-                    PublisherError::Retryable(anyhow!(
-                        "Failed to read HTTP response stream: {}",
-                        error
-                    )),
+                let err = PublisherError::Retryable(anyhow!(
+                    "Failed to read HTTP response stream: {}",
+                    error
                 ));
+                if published_any {
+                    return Err(PublishResponseStreamError::Partial(err));
+                }
+                return Err(PublishResponseStreamError::BeforePublish(err));
             }
             Ok(None) => break,
             Err(_) => {
@@ -662,13 +658,12 @@ pub(super) async fn publish_response_stream(
                         index + 1,
                     )
                     .await;
-                    return Err(PublishResponseStreamError::Partial(
-                        PublisherError::Retryable(anyhow!("HTTP response stream timeout")),
-                    ));
                 }
-                return Err(PublishResponseStreamError::BeforePublish(
-                    PublisherError::Retryable(anyhow!("HTTP response stream timeout")),
-                ));
+                let err = PublisherError::Retryable(anyhow!("HTTP response stream timeout"));
+                if published_any {
+                    return Err(PublishResponseStreamError::Partial(err));
+                }
+                return Err(PublishResponseStreamError::BeforePublish(err));
             }
         };
 
