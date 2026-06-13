@@ -90,6 +90,9 @@ async fn main() -> anyhow::Result<()> {
     } else {
         println!("raw payload missing");
     }
-    Syncpoint::new(&qm).commit().context("raw commit")?;
+    Syncpoint::new(&qm)
+        .commit()
+        .discard_warning()
+        .context("raw commit")?;
     Ok(())
 }
