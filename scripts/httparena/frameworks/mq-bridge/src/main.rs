@@ -28,7 +28,7 @@
 //! client advertises `Accept-Encoding: gzip`, and sent identity otherwise — so
 //! the same `/json` handler serves both the `json` and `json-comp` profiles.
 
-use mq_bridge::models::{Endpoint, EndpointType, HttpConfig};
+use mq_bridge::models::{Endpoint, EndpointType, HttpConfig, TlsConfig};
 use mq_bridge::{CanonicalMessage, Handled, HandlerError, Route};
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgPoolOptions;
@@ -284,6 +284,39 @@ async fn main() -> anyhow::Result<()> {
         pool,
     });
 
+    // Plaintext HTTP/1.1 + h2c on 8080.
+    let plaintext = build_route(make_http(listen, None), state.clone());
+    let mut handles = vec![plaintext.run("httparena").await?];
+
+    // HTTP/2 over TLS on 8443 (baseline-h2 / static-h2 / json-tls). The library
+    // advertises ALPN `h2`, so conformant clients negotiate HTTP/2 over the TLS
+    // port. Only enabled when the harness has mounted the certs, so a local
+    // plaintext-only run still works.
+    let cert = std::env::var("TLS_CERT").unwrap_or_else(|_| "/certs/server.crt".to_string());
+    let key = std::env::var("TLS_KEY").unwrap_or_else(|_| "/certs/server.key".to_string());
+    if Path::new(&cert).is_file() && Path::new(&key).is_file() {
+        // rustls needs a process-default crypto provider before any TLS endpoint.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let tls_listen =
+            std::env::var("MQB_TLS_LISTEN").unwrap_or_else(|_| "0.0.0.0:8443".to_string());
+        let mut tls = TlsConfig::new();
+        tls.required = true;
+        tls.cert_file = Some(cert);
+        tls.key_file = Some(key);
+        let tls_route = build_route(make_http(tls_listen, Some(tls)), state.clone());
+        handles.push(tls_route.run("httparena-tls").await?);
+    } else {
+        eprintln!("TLS certs not found ({cert} / {key}); serving plaintext only");
+    }
+
+    for handle in handles {
+        handle.join().await?;
+    }
+    Ok(())
+}
+
+/// Shared HTTP listener config; `tls` set => HTTPS (ALPN h2) on the TLS port.
+fn make_http(listen: String, tls: Option<TlsConfig>) -> HttpConfig {
     let mut http = HttpConfig::new(listen).with_inline_response_fast_path(true);
     http.concurrency_limit = Some(65_536);
     http.internal_buffer_size = Some(16_384);
@@ -291,12 +324,16 @@ async fn main() -> anyhow::Result<()> {
     // body is over the threshold; identity otherwise.
     http.compression_enabled = true;
     http.compression_threshold_bytes = Some(256);
+    if let Some(tls) = tls {
+        http.tls = tls;
+    }
+    http
+}
 
+/// Builds the catch-all `http -> response` route bound to `http`, dispatching
+/// every request through the shared `AppState` handler.
+fn build_route(http: HttpConfig, state: Arc<AppState>) -> Route {
     let input = Endpoint::new(EndpointType::Http(http));
     let output = Endpoint::new_response();
-
-    let route = Route::new(input, output).with_handler(move |msg| handle(state.clone(), msg));
-    let handle = route.run("httparena").await?;
-    handle.join().await?;
-    Ok(())
+    Route::new(input, output).with_handler(move |msg| handle(state.clone(), msg))
 }

@@ -11,5 +11,6 @@ RUN RUSTFLAGS="-C target-cpu=native" cargo build --release
 
 FROM debian:bookworm-slim
 COPY --from=build /app/target/release/httparena-mqbridge /server
-EXPOSE 8080
+# 8080: HTTP/1.1 + h2c.  8443: HTTP/2 over TLS (certs mounted at /certs).
+EXPOSE 8080 8443
 CMD ["/server"]

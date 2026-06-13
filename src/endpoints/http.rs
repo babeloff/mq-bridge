@@ -348,6 +348,31 @@ fn request_accepts_text(headers: &hyper::HeaderMap) -> bool {
     })
 }
 
+/// Returns true if the request's `Accept-Encoding` indicates the client can
+/// decode gzip (RFC 9110 §12.5.3). A missing header is treated as "identity
+/// only" — we do not compress, since RFC 9110 lets the server send identity by
+/// default and a client that didn't advertise gzip may be unable to decode it.
+/// An explicit `gzip;q=0` (or `*;q=0`) disables compression.
+fn request_accepts_gzip(headers: &hyper::HeaderMap) -> bool {
+    headers.get_all("accept-encoding").iter().any(|value| {
+        value.to_str().ok().is_some_and(|raw| {
+            raw.split(',').any(|item| {
+                let mut parts = item.split(';').map(str::trim);
+                let coding = parts.next().unwrap_or_default().to_ascii_lowercase();
+                if coding != "gzip" && coding != "*" {
+                    return false;
+                }
+                // Honor an explicit q=0, which excludes the coding.
+                !parts.any(|p| {
+                    p.strip_prefix("q=")
+                        .and_then(|q| q.parse::<f32>().ok())
+                        .is_some_and(|q| q == 0.0)
+                })
+            })
+        })
+    })
+}
+
 fn http_version_str(version: hyper::Version) -> &'static str {
     match version {
         hyper::Version::HTTP_09 => "HTTP/0.9",
@@ -1020,6 +1045,9 @@ async fn handle_request_internal(
         }
     }
 
+    // Whether the client can decode a gzip response (gates response compression).
+    let client_accepts_gzip = request_accepts_gzip(&parts.headers);
+
     // Extract metadata before consuming body
     let mut metadata = HashMap::with_capacity(parts.headers.len() + 6);
     let mut content_encoding = None;
@@ -1160,6 +1188,7 @@ async fn handle_request_internal(
         return make_response(
             disposition,
             state.compression_enabled,
+            client_accepts_gzip,
             state.compression_threshold_bytes,
             &state.custom_headers,
             accepts_text,
@@ -1230,6 +1259,7 @@ async fn handle_request_internal(
         Ok(Ok(disposition)) => make_response(
             disposition,
             state.compression_enabled,
+            client_accepts_gzip,
             state.compression_threshold_bytes,
             &state.custom_headers,
             accepts_text,
@@ -1262,6 +1292,7 @@ async fn handle_request_internal(
 fn make_response(
     disposition: MessageDisposition,
     compression_enabled: bool,
+    client_accepts_gzip: bool,
     compression_threshold_bytes: usize,
     custom_headers: &HashMap<String, String>,
     accepts_text: bool,
@@ -1308,10 +1339,11 @@ fn make_response(
                 builder = builder.header("content-type", "application/octet-stream");
             }
 
-            // Compress payload if enabled and beneficial
+            // Compress payload only if enabled, beneficial, and the client
+            // advertised it can decode gzip (RFC 9110 §12.5.3).
             let (payload_out, was_compressed) = compress_if_needed(
                 msg.payload,
-                compression_enabled,
+                compression_enabled && client_accepts_gzip,
                 compression_threshold_bytes,
             )?;
 
@@ -1782,7 +1814,7 @@ fn create_rustls_server_config(
         rustls::ServerConfig::builder_with_provider(crate::endpoints::get_crypto_provider()?)
             .with_safe_default_protocol_versions()?;
 
-    let config = if let Some(ca_file) = &tls_config.ca_file {
+    let mut config = if let Some(ca_file) = &tls_config.ca_file {
         // mTLS: verify client certificates using the provided CA
         let mut client_auth_roots = rustls::RootCertStore::empty();
         let mut pem = BufReader::new(File::open(ca_file).with_context(|| {
@@ -1809,6 +1841,11 @@ fn create_rustls_server_config(
             .with_single_cert(certs, key)
             .context("Failed to build rustls server config")?
     };
+
+    // Advertise HTTP/2 (and HTTP/1.1 fallback) via ALPN so TLS clients negotiate
+    // h2. The TLS accept loop already serves both protocols through hyper-util's
+    // auto Builder; without this, conformant clients fall back to HTTP/1.1.
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
 
     Ok(Arc::new(config))
 }
@@ -1930,7 +1967,7 @@ mod tests {
     use super::*;
     use crate::endpoints::{create_consumer_from_route, create_publisher_from_route};
     use crate::models::{Config, Endpoint, EndpointType, StreamBufferConfig};
-    use hyper::header::{ACCEPT, CONTENT_TYPE};
+    use hyper::header::{ACCEPT, ACCEPT_ENCODING, CONTENT_TYPE};
     use std::time::Duration;
 
     fn get_free_port() -> u16 {
@@ -2026,6 +2063,39 @@ http_route:
         let mut headers = hyper::HeaderMap::new();
         headers.insert(ACCEPT, "application/octet-stream".parse().unwrap());
         assert!(!request_accepts_text(&headers));
+    }
+
+    #[test]
+    fn test_request_accepts_gzip_false_without_header() {
+        // No Accept-Encoding => identity only, do not compress.
+        let headers = hyper::HeaderMap::new();
+        assert!(!request_accepts_gzip(&headers));
+    }
+
+    #[test]
+    fn test_request_accepts_gzip_matches_gzip_and_wildcard() {
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(ACCEPT_ENCODING, "gzip, deflate, br".parse().unwrap());
+        assert!(request_accepts_gzip(&headers));
+
+        headers.insert(ACCEPT_ENCODING, "deflate, gzip;q=0.8".parse().unwrap());
+        assert!(request_accepts_gzip(&headers));
+
+        headers.insert(ACCEPT_ENCODING, "*".parse().unwrap());
+        assert!(request_accepts_gzip(&headers));
+    }
+
+    #[test]
+    fn test_request_accepts_gzip_honors_q_zero_and_other_codings() {
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(ACCEPT_ENCODING, "gzip;q=0".parse().unwrap());
+        assert!(!request_accepts_gzip(&headers));
+
+        headers.insert(ACCEPT_ENCODING, "*;q=0".parse().unwrap());
+        assert!(!request_accepts_gzip(&headers));
+
+        headers.insert(ACCEPT_ENCODING, "br, deflate".parse().unwrap());
+        assert!(!request_accepts_gzip(&headers));
     }
 
     #[test]

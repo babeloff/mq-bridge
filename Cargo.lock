@@ -599,7 +599,7 @@ dependencies = [
  "http 1.4.0",
  "http-body 0.4.6",
  "hyper 0.14.32",
- "hyper 1.9.0",
+ "hyper 1.10.1",
  "hyper-rustls 0.24.2",
  "hyper-rustls 0.27.9",
  "hyper-util",
@@ -2298,9 +2298,9 @@ dependencies = [
 
 [[package]]
 name = "hyper"
-version = "1.9.0"
+version = "1.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6299f016b246a94207e63da54dbe807655bf9e00044f73ded42c3ac5305fbcca"
+checksum = "55281c53a1894c864990125767da440a4e630446785086f52523b20033b74498"
 dependencies = [
  "atomic-waker",
  "bytes",
@@ -2340,7 +2340,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "33ca68d021ef39cf6463ab54c1d0f5daf03377b70561305bb89a8f83aab66e0f"
 dependencies = [
  "http 1.4.0",
- "hyper 1.9.0",
+ "hyper 1.10.1",
  "hyper-util",
  "log",
  "rustls 0.23.40",
@@ -2356,7 +2356,7 @@ version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2b90d566bffbce6a75bd8b09a05aa8c2cb1fabb6cb348f8840c9e4c90a0d83b0"
 dependencies = [
- "hyper 1.9.0",
+ "hyper 1.10.1",
  "hyper-util",
  "pin-project-lite",
  "tokio",
@@ -2371,7 +2371,7 @@ checksum = "70206fc6890eaca9fde8a0bf71caa2ddfc9fe045ac9e5c70df101a7dbde866e0"
 dependencies = [
  "bytes",
  "http-body-util",
- "hyper 1.9.0",
+ "hyper 1.10.1",
  "hyper-util",
  "native-tls",
  "tokio",
@@ -2391,7 +2391,7 @@ dependencies = [
  "futures-util",
  "http 1.4.0",
  "http-body 1.0.1",
- "hyper 1.9.0",
+ "hyper 1.10.1",
  "ipnet",
  "libc",
  "percent-encoding",
@@ -3024,7 +3024,7 @@ dependencies = [
 
 [[package]]
 name = "mq-bridge"
-version = "0.2.16"
+version = "0.2.17"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -3044,7 +3044,7 @@ dependencies = [
  "h2 0.4.14",
  "http-body 1.0.1",
  "http-body-util",
- "hyper 1.9.0",
+ "hyper 1.10.1",
  "hyper-rustls 0.27.9",
  "hyper-util",
  "lapin",
@@ -3090,7 +3090,7 @@ dependencies = [
 
 [[package]]
 name = "mq-bridge-py"
-version = "0.2.16"
+version = "0.2.17"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4317,7 +4317,7 @@ dependencies = [
  "http 1.4.0",
  "http-body 1.0.1",
  "http-body-util",
- "hyper 1.9.0",
+ "hyper 1.10.1",
  "hyper-rustls 0.27.9",
  "hyper-tls",
  "hyper-util",
@@ -5682,7 +5682,7 @@ dependencies = [
  "http 1.4.0",
  "http-body 1.0.1",
  "http-body-util",
- "hyper 1.9.0",
+ "hyper 1.10.1",
  "hyper-timeout",
  "hyper-util",
  "percent-encoding",

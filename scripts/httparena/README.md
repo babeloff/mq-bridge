@@ -10,7 +10,7 @@ via `meta.json`.
 
 | Directory                | Language | Port  | Profiles |
 |--------------------------|----------|-------|----------|
-| `frameworks/mq-bridge/`            | Rust   | 8080 | baseline, pipelined, limited-conn, json, json-comp, upload, static, async-db, api-4, api-16 |
+| `frameworks/mq-bridge/`            | Rust   | 8080 + 8443 | baseline, pipelined, limited-conn, json, json-comp, upload, static, async-db, api-4, api-16, baseline-h2, static-h2 |
 | `frameworks/mq-bridge-h2c/`        | Rust   | 8082 | baseline-h2c, json-h2c |
 | `frameworks/mq-bridge-websocket/`  | Rust   | 8080 | echo-ws |
 | `frameworks/mq-bridge-py/`         | Python | 8080 | baseline, pipelined, limited-conn, json, json-comp, upload, static, async-db, api-4, api-16 |
@@ -38,11 +38,17 @@ profiles still run.
 
 ## How it works
 
-- **One AutoBuilder, two cleartext protocols.** mq-bridge's HTTP server uses
+- **One AutoBuilder, every HTTP flavour.** mq-bridge's HTTP server uses
   hyper-util's `AutoBuilder`, which negotiates HTTP/1.1 **and** HTTP/2
   prior-knowledge (h2c) on the same plaintext port. The core `mq-bridge` entry
-  (8080) serves the HTTP/1.1 profiles; `mq-bridge-h2c` is the same dispatch
-  bound to **8082** for the explicit h2c profiles.
+  binds **8080** (HTTP/1.1 + h2c) and **8443** (HTTP/2 over TLS) in one process,
+  sharing the same handler; `mq-bridge-h2c` is the same dispatch on **8082** for
+  the explicit h2c profiles.
+- **HTTP/2 over TLS (`baseline-h2`, `static-h2`).** The library advertises ALPN
+  `h2` on the TLS listener, so conformant clients negotiate HTTP/2; the TLS route
+  reads its cert/key from `/certs/server.crt` + `/certs/server.key` (overridable
+  via `TLS_CERT` / `TLS_KEY`) and is skipped when the certs are absent, so a local
+  plaintext-only run still works. Uses the `ring` crypto provider.
 - **json-comp via response compression.** Setting `compression_enabled` (with a
   256-byte threshold) makes the server gzip bodies when the client advertises
   `Accept-Encoding: gzip`, identity otherwise — so the one `/json` handler serves
@@ -61,28 +67,28 @@ profiles still run.
 
 ## Caveats — what is *not* reachable on the stock library
 
-These profiles are intentionally **not** included, because the published
-mq-bridge `v0.2.16` cannot serve them faithfully without library changes:
+These profiles are intentionally **not** included, because the library cannot
+serve them faithfully without further work:
 
 - **gRPC (`grpc-unary` etc.).** mq-bridge's gRPC server (`server_mode`) only
   speaks its *own* `Publish`/`PublishBatch` protobuf service. It cannot serve
   HttpArena's `benchmark.BenchmarkService/GetSum`, so a faithful gRPC entry would
   require adding arbitrary-service support to the library. Omitted rather than
   faked.
-- **HTTP/2 *over TLS* (`baseline-tls`, `json-tls`, `static-h2`, …).**
-  `create_rustls_server_config` does not set `alpn_protocols`, so a TLS client
-  asking for `h2` won't negotiate it. h2c on the **cleartext** port works (hence
-  the `mq-bridge-h2c` entry); h2-over-TLS needs a one-line ALPN patch upstream.
-- **HTTP/3 / QUIC.** No `quinn`/`h3` transport in the library.
+- **HTTP/3 / QUIC.** No `quinn`/`h3` transport in the library; HTTP/3 would need a
+  new UDP/QUIC listener, not a config change.
 
-When the ALPN gap is closed upstream, a `mq-bridge-tls` entry (8443, ALPN `h2`)
-covering the `*-tls` profiles becomes a drop-in addition.
+> **HTTP/2 over TLS is now supported.** Earlier revisions of these entries
+> excluded it because `create_rustls_server_config` did not set
+> `alpn_protocols`. The library now advertises ALPN `h2` on the TLS listener, so
+> the core entry covers `baseline-h2` / `static-h2` on 8443 directly — no separate
+> `mq-bridge-tls` framework needed.
 
 ## Layout
 
 ```text
 scripts/httparena/frameworks/
-  mq-bridge/           Cargo.toml  Dockerfile  meta.json  src/main.rs   # core HTTP/1.1 + h2c on 8080
+  mq-bridge/           Cargo.toml  Dockerfile  meta.json  src/main.rs   # core: 8080 (H/1.1 + h2c) + 8443 (h2 over TLS)
   mq-bridge-h2c/       Cargo.toml  Dockerfile  meta.json  src/main.rs   # explicit h2c on 8082
   mq-bridge-websocket/ Cargo.toml  Dockerfile  meta.json  src/main.rs   # echo-ws on 8080
   mq-bridge-py/        Dockerfile  meta.json   server.py               # Python core on 8080
