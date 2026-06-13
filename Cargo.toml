@@ -31,6 +31,7 @@ tracing = "0.1"
 
 [profile.release]
 lto = "thin"
+strip = "symbols"
 
 [[bin]]
 name = "mq_bridge_http_profile"

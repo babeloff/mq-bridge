@@ -30,16 +30,15 @@ jobs:
             target: x86_64
             args: --release --out dist --find-interpreter --no-default-features
           - package: mq-bridge-py-basic
+            # aarch64 basic builds natively on an arm64 runner: even with the
+            # ring crypto provider (no aws-lc), ring's ARM assembly does not
+            # cross-compile in the manylinux container ("ARM assembler must
+            # define __ARM_ARCH"). Native build sidesteps all cross-compile of
+            # native C/asm. (No armv7 row: GitHub has no native armv7 runner.)
             pyproject: pyproject-basic.toml
-            runner: ubuntu-latest
+            runner: ubuntu-24.04-arm
             os: linux
             target: aarch64
-            args: --release --out dist --find-interpreter --no-default-features
-          - package: mq-bridge-py-basic
-            pyproject: pyproject-basic.toml
-            runner: ubuntu-latest
-            os: linux
-            target: armv7
             args: --release --out dist --find-interpreter --no-default-features
           - package: mq-bridge-py-basic
             pyproject: pyproject-basic.toml
