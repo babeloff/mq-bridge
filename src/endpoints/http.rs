@@ -2672,9 +2672,10 @@ http_route:
         let mut consumer = HttpConsumer::new(&http_config).await.unwrap();
 
         let static_content = "This is a static response";
-        let static_publisher =
-            crate::endpoints::static_endpoint::StaticEndpointPublisher::new(static_content)
-                .unwrap();
+        let static_publisher = crate::endpoints::static_endpoint::StaticEndpointPublisher::new(
+            &crate::models::StaticConfig::from(static_content),
+        )
+        .unwrap();
 
         tokio::spawn(async move {
             if let Ok(received) = consumer.receive().await {
@@ -2813,6 +2814,54 @@ http_route:
         assert_eq!(response.headers().get("x-request-id").unwrap(), "req-123");
         let body = response.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(body, Bytes::from_static(br#"{"value":1}"#));
+
+        handle.stop().await;
+        let _ = handle.join().await;
+    }
+
+    #[tokio::test]
+    async fn test_http_to_static_raw_sets_content_type_handler_free() {
+        // The handler-free fast path: `http -> static` replies inline with a raw
+        // (unquoted) body and a configured content-type header. This is the
+        // TechEmpower plaintext path that bypasses any handler.
+        init_crypto();
+        let port = get_free_port();
+        let addr = format!("127.0.0.1:{}", port);
+
+        let input = Endpoint::new(EndpointType::Http(HttpConfig {
+            url: addr.clone(),
+            path: Some("/plaintext".to_string()),
+            ..Default::default()
+        }));
+        let mut metadata = HashMap::new();
+        metadata.insert("content-type".to_string(), "text/plain".to_string());
+        let output = Endpoint::new(EndpointType::Static(crate::models::StaticConfig {
+            body: "Hello, World!".to_string(),
+            raw: true,
+            metadata,
+        }));
+
+        let route = crate::Route::new(input, output);
+        let handle = route.run("test_http_to_static_raw").await.unwrap();
+
+        let mut connector = HttpConnector::new();
+        connector.set_nodelay(true);
+        let client =
+            hyper_util::client::legacy::Client::builder(TokioExecutor::new()).build(connector);
+        let request = Request::builder()
+            .method(hyper::Method::GET)
+            .uri(format!("http://{addr}/plaintext"))
+            .body(http_body_util::Full::<Bytes>::new(Bytes::new()))
+            .unwrap();
+        let response = client.request(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get("content-type").unwrap(),
+            "text/plain"
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        // Raw: no JSON quoting around the body.
+        assert_eq!(body, Bytes::from_static(b"Hello, World!"));
 
         handle.stop().await;
         let _ = handle.join().await;

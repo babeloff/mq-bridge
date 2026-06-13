@@ -13,11 +13,16 @@
 //!
 //! Design notes
 //! ------------
-//! * One route, no path filter. The handler dispatches on the request's
-//!   `http_path` metadata, so both/all endpoints share one listener/port.
+//! * Two routes share one listener/port (the HTTP server keys on the listen
+//!   address). A path-filtered `GET /plaintext -> static` route answers the
+//!   Plaintext test handler-free; a catch-all `http -> response` route dispatches
+//!   the remaining endpoints on the request's `http_path` metadata. The router
+//!   prefers the more specific (path-filtered) route, so `/plaintext` hits the
+//!   static reply and everything else falls through to the handler.
 //! * The inline fast path bypasses the route worker/disposition pipeline, so the
 //!   route `concurrency`/`batch_size` knobs do not gate the hot path; per-request
-//!   parallelism comes from the HTTP server spawning a task per connection.
+//!   parallelism comes from the HTTP server spawning a task per connection. Both
+//!   the `static` and `response` outputs take this fast path.
 //! * Database access. mq-bridge's `sqlx` *endpoint* models a table as a message
 //!   queue (INSERT publisher / polling SELECT consumer), not per-request
 //!   request-reply, so it does not fit TechEmpower's random-id `SELECT`. We
@@ -27,8 +32,9 @@
 //! * Response headers: returned-message metadata becomes response headers and
 //!   `http_status_code` sets the status. hyper adds `Date`/`Content-Length`.
 
-use mq_bridge::models::{Endpoint, EndpointType, HttpConfig, ResponseConfig};
+use mq_bridge::models::{Endpoint, EndpointType, HttpConfig, ResponseConfig, StaticConfig};
 use mq_bridge::{CanonicalMessage, Handled, HandlerError, Route};
+use std::collections::HashMap;
 use serde::Serialize;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
@@ -97,7 +103,8 @@ async fn handle_request(pool: Option<PgPool>, msg: CanonicalMessage) -> Result<H
                 .map_err(non_retryable)?;
             reply(body, "application/json")
         }
-        "/plaintext" => reply(b"Hello, World!".to_vec(), "text/plain"),
+        // Note: `/plaintext` is served handler-free by a dedicated
+        // `GET /plaintext -> static` route (see `main`), so it never reaches here.
         "/db" => match pool {
             None => error_reply(503, "DATABASE_URL not configured"),
             Some(pool) => {
@@ -160,19 +167,45 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    let mut http = HttpConfig::new(listen);
-    http.method = Some("GET".to_string());
-    // Raise above the expected max connection count so we never throttle.
-    http.concurrency_limit = Some(65_536);
-    http.internal_buffer_size = Some(16_384);
-    http.inline_response_fast_path = Some(true);
+    // Shared HTTP server settings, applied to every route on this address.
+    let http_config = |path: Option<&str>| {
+        let mut http = HttpConfig::new(listen.clone());
+        http.method = Some("GET".to_string());
+        http.path = path.map(str::to_string);
+        // Raise above the expected max connection count so we never throttle.
+        http.concurrency_limit = Some(65_536);
+        http.internal_buffer_size = Some(16_384);
+        http.inline_response_fast_path = Some(true);
+        http
+    };
 
-    let input = endpoint(EndpointType::Http(http));
-    let output = endpoint(EndpointType::Response(ResponseConfig {}));
+    // Plaintext: handler-free `GET /plaintext -> static`. The body is sent raw
+    // (no JSON quoting) with an explicit `Content-Type`/`Server`; this takes the
+    // inline fast path without ever entering the handler.
+    let plaintext_route = Route::new(
+        endpoint(EndpointType::Http(http_config(Some("/plaintext")))),
+        endpoint(EndpointType::Static(StaticConfig {
+            body: "Hello, World!".to_string(),
+            raw: true,
+            metadata: HashMap::from([
+                ("content-type".to_string(), "text/plain".to_string()),
+                ("Server".to_string(), SERVER.to_string()),
+            ]),
+        })),
+    );
+    let plaintext_handle = plaintext_route.run("techempower-plaintext").await?;
 
+    // Everything else: catch-all `http -> response` dispatched by the handler on
+    // `http_path` (/json, /db, /queries, and 404 for the rest).
     let handler = move |msg: CanonicalMessage| handle_request(pool.clone(), msg);
-    let route = Route::new(input, output).with_handler(handler);
-    let handle = route.run("techempower").await?;
-    handle.join().await?;
+    let handler_route = Route::new(
+        endpoint(EndpointType::Http(http_config(None))),
+        endpoint(EndpointType::Response(ResponseConfig {})),
+    )
+    .with_handler(handler);
+    let handler_handle = handler_route.run("techempower").await?;
+
+    handler_handle.join().await?;
+    plaintext_handle.join().await?;
     Ok(())
 }

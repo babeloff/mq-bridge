@@ -1101,7 +1101,7 @@ async fn test_delay_middleware_in_route() {
 
     // Input: Static consumer that produces "hello"
     // We apply delay middleware to it.
-    let input = Endpoint::new(EndpointType::Static("hello".to_string()))
+    let input = Endpoint::new(EndpointType::Static("hello".into()))
         .add_middleware(Middleware::Delay(DelayMiddleware { delay_ms: 100 }));
 
     // Output: Memory
@@ -1161,8 +1161,10 @@ async fn test_custom_endpoint_factory_programmatic() {
             _config: &serde_json::Value,
         ) -> anyhow::Result<Box<dyn MessageConsumer>> {
             Ok(Box::new(
-                mq_bridge::endpoints::static_endpoint::StaticRequestConsumer::new("custom_msg")
-                    .unwrap(),
+                mq_bridge::endpoints::static_endpoint::StaticRequestConsumer::new(
+                    &mq_bridge::models::StaticConfig::from("custom_msg"),
+                )
+                .unwrap(),
             ))
         }
         async fn create_publisher(
@@ -1228,7 +1230,10 @@ async fn test_custom_components_yaml_configuration() {
                 .and_then(|v| v.as_str())
                 .unwrap_or("default");
             Ok(Box::new(
-                mq_bridge::endpoints::static_endpoint::StaticRequestConsumer::new(content).unwrap(),
+                mq_bridge::endpoints::static_endpoint::StaticRequestConsumer::new(
+                    &mq_bridge::models::StaticConfig::from(content),
+                )
+                .unwrap(),
             ))
         }
         async fn create_publisher(

@@ -503,6 +503,111 @@ fn deserialize_middlewares_from_value(value: serde_json::Value) -> anyhow::Resul
     Ok(middlewares)
 }
 
+/// Configuration for the `static` endpoint.
+///
+/// Accepts either a bare string (the response body, JSON-encoded for backward
+/// compatibility) or a map for full control:
+///
+/// ```yaml
+/// # bare string  -> body is JSON-encoded ("Hello" comes back quoted)
+/// static: "Hello, World!"
+///
+/// # map form -> raw body + custom metadata (HTTP maps metadata to headers)
+/// static:
+///   body: "Hello, World!"
+///   raw: true
+///   metadata:
+///     content-type: "text/plain"
+///     server: "mq-bridge"
+/// ```
+///
+/// When `raw` is true the body is sent verbatim; otherwise it is JSON-encoded as
+/// a string. Every entry in `metadata` is attached to the produced message; when
+/// this endpoint feeds an HTTP response, those entries become response headers
+/// (e.g. `content-type`), otherwise they are ordinary message metadata.
+#[derive(Debug, Clone, Default)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct StaticConfig {
+    /// The static response body.
+    pub body: String,
+    /// Send the body verbatim instead of JSON-encoding it as a string.
+    pub raw: bool,
+    /// Extra metadata entries attached to the produced message.
+    pub metadata: std::collections::HashMap<String, String>,
+}
+
+impl Serialize for StaticConfig {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        // Backward-compatible: when no extra options are set, serialize as a bare
+        // string exactly like the historical `Static(String)` so configs written
+        // by this version remain readable by older versions.
+        if !self.raw && self.metadata.is_empty() {
+            return serializer.serialize_str(&self.body);
+        }
+        use serde::ser::SerializeStruct;
+        let mut state = serializer.serialize_struct("StaticConfig", 3)?;
+        state.serialize_field("body", &self.body)?;
+        state.serialize_field("raw", &self.raw)?;
+        state.serialize_field("metadata", &self.metadata)?;
+        state.end()
+    }
+}
+
+impl From<String> for StaticConfig {
+    fn from(body: String) -> Self {
+        StaticConfig {
+            body,
+            raw: false,
+            metadata: std::collections::HashMap::new(),
+        }
+    }
+}
+
+impl From<&str> for StaticConfig {
+    fn from(body: &str) -> Self {
+        StaticConfig::from(body.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for StaticConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Repr {
+            Str(String),
+            Map {
+                body: String,
+                #[serde(default)]
+                raw: bool,
+                #[serde(default)]
+                metadata: std::collections::HashMap<String, String>,
+            },
+        }
+        Ok(match Repr::deserialize(deserializer)? {
+            Repr::Str(body) => StaticConfig {
+                body,
+                raw: false,
+                metadata: std::collections::HashMap::new(),
+            },
+            Repr::Map {
+                body,
+                raw,
+                metadata,
+            } => StaticConfig {
+                body,
+                raw,
+                metadata,
+            },
+        })
+    }
+}
+
 /// An enumeration of all supported endpoint types.
 /// `#[serde(rename_all = "lowercase")]` ensures that the keys in the config (e.g., "kafka")
 /// match the enum variants.
@@ -532,7 +637,7 @@ pub enum EndpointType {
     Kafka(KafkaConfig),
     Nats(NatsConfig),
     File(FileConfig),
-    Static(String),
+    Static(StaticConfig),
     Ref(String),
     Memory(MemoryConfig),
     Sled(SledConfig),

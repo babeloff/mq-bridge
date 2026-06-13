@@ -550,10 +550,16 @@ pub(crate) async fn try_run_fast_path_route(
 ) -> Option<anyhow::Result<bool>> {
     #[cfg(feature = "http")]
     {
-        if let (EndpointType::Http(cfg), EndpointType::Response(_)) =
-            (&route.input.endpoint_type, &route.output.endpoint_type)
-        {
-            if cfg.inline_response_fast_path_enabled()
+        // The inline fast path applies to outputs that reply synchronously
+        // without the route worker/disposition pipeline: `response` (handler- or
+        // request-derived reply) and `static` (a fixed, pre-rendered reply).
+        let output_is_inline = matches!(
+            route.output.endpoint_type,
+            EndpointType::Response(_) | EndpointType::Static(_)
+        );
+        if let EndpointType::Http(cfg) = &route.input.endpoint_type {
+            if output_is_inline
+                && cfg.inline_response_fast_path_enabled()
                 && route.input.middlewares.is_empty()
                 && output_middlewares_allow_http_inline_fast_path(&route.output.middlewares)
                 && !cfg.fire_and_forget

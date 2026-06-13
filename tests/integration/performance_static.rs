@@ -16,7 +16,7 @@ async fn test_static_to_null_performance() {
     let counter_clone = counter.clone();
 
     // Input: Static consumer that always produces the same string.
-    let input = Endpoint::new(EndpointType::Static("benchmark_payload_data".to_string()));
+    let input = Endpoint::new(EndpointType::Static("benchmark_payload_data".into()));
 
     // Output: Null endpoint that discards everything.
     let output = Endpoint::new(EndpointType::Null);

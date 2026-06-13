@@ -14,25 +14,16 @@ use rumqttc::v5::mqttbytes::QoS as QoSV5;
 use rumqttc::v5::{
     AsyncClient as AsyncClientV5, EventLoop as EventLoopV5, MqttOptions as MqttOptionsV5,
 };
-use rumqttc::Outgoing;
 use rumqttc::Publish as PublishV3;
 use rumqttc::{tokio_rustls::rustls, AsyncClient, MqttOptions, QoS, Transport};
 use std::any::Any;
-use std::collections::{HashMap, VecDeque};
 use std::fmt::Debug;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
-use tokio::sync::oneshot;
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, trace, warn};
-
-/// How long the publisher waits for end-to-end broker confirmation (PUBACK for
-/// QoS 1, PUBCOMP for QoS 2) before treating a publish as failed and handing it
-/// back for retry. Generous enough to ride out a broker restart (the chaos
-/// test) while still bounding a permanently stuck publish.
-const CONFIRM_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
 pub enum Client {
@@ -110,91 +101,6 @@ impl Client {
     }
 }
 
-/// Tracks in-flight QoS 1/2 publishes so the publisher can wait for genuine
-/// end-to-end broker confirmation (PUBACK for QoS 1, PUBCOMP for QoS 2) instead
-/// of returning success as soon as a message is handed to rumqttc's request
-/// channel. Without this, the broker can reject a publish (e.g. `QuotaExceeded`)
-/// or lose it on restart and mq-bridge would never notice — the retry
-/// middleware never fires and the message is silently dropped.
-///
-/// Correlation relies on the event loop emitting exactly one
-/// `Outgoing::Publish(pkid)` per fresh user publish, in the same FIFO order the
-/// publishes are pushed onto rumqttc's request channel. [`MqttPublisher`]
-/// preserves that order by registering each token under `publish_lock` right
-/// before enqueuing the publish.
-#[derive(Default)]
-struct ConfirmState {
-    /// Tokens for messages enqueued but not yet assigned a packet id by the
-    /// event loop (not yet seen as `Outgoing::Publish`). FIFO.
-    awaiting_pkid: VecDeque<oneshot::Sender<bool>>,
-    /// Packet id -> completion token, for publishes the broker is confirming.
-    inflight: HashMap<u16, oneshot::Sender<bool>>,
-}
-
-#[derive(Default)]
-struct PublishConfirmer {
-    state: std::sync::Mutex<ConfirmState>,
-}
-
-impl PublishConfirmer {
-    /// Register a publish that is about to be enqueued. The returned receiver
-    /// resolves to `true` once the broker confirms delivery, or `false` if the
-    /// broker rejects it or the session is lost. Callers MUST register in the
-    /// same order they enqueue publishes (see `publish_lock`).
-    fn register(&self) -> oneshot::Receiver<bool> {
-        let (tx, rx) = oneshot::channel();
-        self.state.lock().unwrap().awaiting_pkid.push_back(tx);
-        rx
-    }
-
-    /// Drop the most recently registered token. Used when the enqueue that the
-    /// token was registered for failed, so no `Outgoing::Publish` will ever
-    /// arrive for it (otherwise it would desync every later correlation).
-    fn cancel_last(&self) {
-        self.state.lock().unwrap().awaiting_pkid.pop_back();
-    }
-
-    /// The event loop assigned `pkid` to an outgoing publish.
-    fn on_outgoing_publish(&self, pkid: u16) {
-        if pkid == 0 {
-            return; // QoS 0 — never registered, never confirmed.
-        }
-        let mut s = self.state.lock().unwrap();
-        // A resend after a session-resume reconnect reuses the original packet
-        // id; its token is already tracked, so don't consume a fresh one.
-        if s.inflight.contains_key(&pkid) {
-            return;
-        }
-        if let Some(tx) = s.awaiting_pkid.pop_front() {
-            s.inflight.insert(pkid, tx);
-        }
-    }
-
-    /// The broker reached a terminal state for `pkid`.
-    fn settle(&self, pkid: u16, delivered: bool) {
-        let tx = self.state.lock().unwrap().inflight.remove(&pkid);
-        if let Some(tx) = tx {
-            let _ = tx.send(delivered);
-        }
-    }
-
-    /// The session was lost (fresh session on (re)connect): the broker dropped
-    /// every outstanding publish, so they must all be retried.
-    fn fail_all(&self) {
-        let mut s = self.state.lock().unwrap();
-        for tx in s.awaiting_pkid.drain(..) {
-            let _ = tx.send(false);
-        }
-        for (_, tx) in s.inflight.drain() {
-            let _ = tx.send(false);
-        }
-    }
-}
-
-fn should_fail_outstanding_on_connack(has_seen_connack: bool, session_present: bool) -> bool {
-    has_seen_connack && !session_present
-}
-
 struct MqttState {
     client: Client,
     _stop_tx: mpsc::Sender<()>,
@@ -205,12 +111,6 @@ pub struct MqttPublisher {
     state: Arc<RwLock<MqttState>>,
     topic: String,
     qos: QoS,
-    confirmer: Arc<PublishConfirmer>,
-    /// Serializes the enqueue phase across concurrent `send`/`send_batch` calls
-    /// so confirmation tokens are registered in the same order publishes hit
-    /// rumqttc's request channel. Only held across the (cheap) enqueue, never
-    /// across confirmation waits.
-    publish_lock: tokio::sync::Mutex<()>,
 }
 
 impl MqttPublisher {
@@ -223,24 +123,17 @@ impl MqttPublisher {
             sanitize_for_client_id(&format!("{}-{}", APP_NAME, fast_uuid_v7::gen_id()))
         });
 
-        let confirmer = Arc::new(PublishConfirmer::default());
-        let state = Self::connect(config, &client_id, confirmer.clone()).await?;
+        let state = Self::connect(config, &client_id).await?;
         let qos = parse_qos(config.qos.unwrap_or(1));
 
         Ok(Self {
             state: Arc::new(RwLock::new(state)),
             topic: topic.to_string(),
             qos,
-            confirmer,
-            publish_lock: tokio::sync::Mutex::new(()),
         })
     }
 
-    async fn connect(
-        config: &MqttConfig,
-        client_id: &str,
-        confirmer: Arc<PublishConfirmer>,
-    ) -> anyhow::Result<MqttState> {
+    async fn connect(config: &MqttConfig, client_id: &str) -> anyhow::Result<MqttState> {
         let (client, eventloop) = create_client_and_eventloop(config, client_id).await?;
         let (stop_tx, stop_rx) = mpsc::channel(1);
         let is_connected = Arc::new(AtomicBool::new(false));
@@ -252,7 +145,6 @@ impl MqttPublisher {
             None,
             !config.delayed_ack,
             is_connected.clone(),
-            Some(confirmer),
         ));
 
         Ok(MqttState {
@@ -260,96 +152,6 @@ impl MqttPublisher {
             _stop_tx: stop_tx,
             is_connected,
         })
-    }
-
-    /// Enqueue `messages` in order and return one confirmation receiver per
-    /// successfully enqueued message. On the first enqueue failure, returns the
-    /// receivers gathered so far plus the error (the whole batch is then retried
-    /// by the caller). Only valid for QoS > 0.
-    async fn enqueue_confirmed(
-        &self,
-        messages: &[CanonicalMessage],
-    ) -> (Vec<oneshot::Receiver<bool>>, Option<anyhow::Error>) {
-        let client = self.state.read().await.client.clone();
-        let mut receivers = Vec::with_capacity(messages.len());
-        // Hold the ordering lock across the enqueue loop so token registration
-        // order matches request-channel order for pkid correlation.
-        let _guard = self.publish_lock.lock().await;
-        for message in messages {
-            let rx = self.confirmer.register();
-            let publish_future = client.publish(&self.topic, self.qos, message.clone());
-            match tokio::time::timeout(Duration::from_secs(10), publish_future).await {
-                Ok(Ok(_)) => receivers.push(rx),
-                Ok(Err(e)) => {
-                    // Enqueue failed: no Outgoing::Publish will arrive for this
-                    // token, so drop it to keep correlation aligned.
-                    self.confirmer.cancel_last();
-                    return (
-                        receivers,
-                        Some(anyhow!("Failed to publish MQTT message in batch: {}", e)),
-                    );
-                }
-                Err(_) => {
-                    self.confirmer.cancel_last();
-                    return (receivers, Some(anyhow!("MQTT publish timed out in batch")));
-                }
-            }
-        }
-        (receivers, None)
-    }
-}
-
-/// Wait for every confirmation receiver to resolve to `true` within
-/// [`CONFIRM_TIMEOUT`]. Returns `false` if any message is rejected, the session
-/// is lost, the event loop is gone, or the wait times out.
-async fn all_confirmed(receivers: Vec<oneshot::Receiver<bool>>) -> bool {
-    let wait = async {
-        for rx in receivers {
-            match rx.await {
-                Ok(true) => {}
-                _ => return false,
-            }
-        }
-        true
-    };
-    matches!(tokio::time::timeout(CONFIRM_TIMEOUT, wait).await, Ok(true))
-}
-
-/// QoS 1 PUBACK: delivery succeeded (a message reaching no subscribers is still
-/// a successful delivery to the broker, not a failure to publish).
-fn puback_v5_ok(reason: rumqttc::v5::mqttbytes::v5::PubAckReason) -> bool {
-    use rumqttc::v5::mqttbytes::v5::PubAckReason as R;
-    matches!(reason, R::Success | R::NoMatchingSubscribers)
-}
-
-/// QoS 2 PUBREC carrying a failure reason (`>= 0x80`, e.g. `QuotaExceeded`)
-/// aborts the handshake — the publish is rejected.
-fn pubrec_v5_failed(reason: rumqttc::v5::mqttbytes::v5::PubRecReason) -> bool {
-    use rumqttc::v5::mqttbytes::v5::PubRecReason as R;
-    !matches!(reason, R::Success | R::NoMatchingSubscribers)
-}
-
-/// QoS 2 PUBCOMP: the only success reason is `Success`.
-fn pubcomp_v5_ok(reason: rumqttc::v5::mqttbytes::v5::PubCompReason) -> bool {
-    matches!(reason, rumqttc::v5::mqttbytes::v5::PubCompReason::Success)
-}
-
-/// Build a `SentBatch::Partial` that hands every message in the batch back for
-/// retry. MQTT publishing is all-or-nothing here: a batch either confirms fully
-/// or is retried whole, so partial success is never reported.
-fn retry_whole_batch(messages: Vec<CanonicalMessage>) -> SentBatch {
-    let failed = messages
-        .into_iter()
-        .map(|m| {
-            (
-                m,
-                PublisherError::Retryable(anyhow!("MQTT batch not confirmed by broker")),
-            )
-        })
-        .collect();
-    SentBatch::Partial {
-        responses: None,
-        failed,
     }
 }
 
@@ -363,36 +165,20 @@ impl MessagePublisher for MqttPublisher {
             "Publishing MQTT message"
         );
 
-        // QoS 0 is fire-and-forget: there is no broker acknowledgement to wait
-        // for, so enqueueing is the only confirmation available.
-        if self.qos == QoS::AtMostOnce {
-            let client = self.state.read().await.client.clone();
-            let publish_future = client.publish(&self.topic, self.qos, message);
-            return match tokio::time::timeout(Duration::from_secs(10), publish_future).await {
-                Ok(Ok(_)) => Ok(Sent::Ack),
-                Ok(Err(e)) => Err(PublisherError::Connection(anyhow!(
-                    "Failed to publish MQTT message: {}",
-                    e
-                ))),
-                Err(_) => Err(PublisherError::Connection(anyhow!(
-                    "MQTT publish timed out"
-                ))),
-            };
-        }
+        let client = self.state.read().await.client.clone();
+        let publish_future = client.publish(&self.topic, self.qos, message);
 
-        // QoS 1/2: wait for genuine broker confirmation (PUBACK / PUBCOMP) so a
-        // rejected or lost message surfaces as a retryable error instead of a
-        // silent drop.
-        let (receivers, enqueue_err) = self.enqueue_confirmed(std::slice::from_ref(&message)).await;
-        if let Some(e) = enqueue_err {
-            return Err(PublisherError::Connection(e));
-        }
-        if all_confirmed(receivers).await {
-            Ok(Sent::Ack)
-        } else {
-            Err(PublisherError::Retryable(anyhow!(
-                "MQTT message not confirmed by broker"
-            )))
+        // We use a longer timeout here (10s) to allow for transient connection drops/reconnects
+        // without immediately failing the batch, while still preventing indefinite hangs.
+        match tokio::time::timeout(Duration::from_secs(10), publish_future).await {
+            Ok(Ok(_)) => Ok(Sent::Ack),
+            Ok(Err(e)) => Err(PublisherError::Connection(anyhow!(
+                "Failed to publish MQTT message: {}",
+                e
+            ))),
+            Err(_) => Err(PublisherError::Connection(anyhow!(
+                "MQTT publish timed out"
+            ))),
         }
     }
 
@@ -401,42 +187,54 @@ impl MessagePublisher for MqttPublisher {
         messages: Vec<CanonicalMessage>,
     ) -> Result<SentBatch, PublisherError> {
         trace!(count = messages.len(), topic = %self.topic, message_ids = ?LazyMessageIds(&messages), "Publishing batch of MQTT messages");
+        let client = self.state.read().await.client.clone();
 
-        // QoS 0: fire-and-forget, enqueue is the only confirmation.
-        if self.qos == QoS::AtMostOnce {
-            let client = self.state.read().await.client.clone();
-            for message in &messages {
-                let publish_future = client.publish(&self.topic, self.qos, message.clone());
-                if let Ok(Err(_)) | Err(_) =
-                    tokio::time::timeout(Duration::from_secs(10), publish_future).await
-                {
-                    return Ok(retry_whole_batch(messages));
+        let mut first_error: Option<anyhow::Error> = None;
+        let mut failed_indices = Vec::new();
+
+        for (i, message) in messages.iter().enumerate() {
+            if first_error.is_some() {
+                failed_indices.push(i);
+                continue;
+            }
+            let publish_future = client.publish(&self.topic, self.qos, message.clone());
+            match tokio::time::timeout(Duration::from_secs(10), publish_future).await {
+                Ok(Ok(_)) => {
+                    // Successfully enqueued
+                }
+                Ok(Err(e)) => {
+                    first_error = Some(anyhow!("Failed to publish MQTT message in batch: {}", e));
+                    failed_indices.push(i);
+                }
+                Err(_) => {
+                    first_error = Some(anyhow!("MQTT publish timed out in batch"));
+                    failed_indices.push(i);
                 }
             }
-            return Ok(SentBatch::Ack);
         }
 
-        // QoS 1/2: enqueue in order, then wait for every message to be confirmed
-        // by the broker. If enqueue fails or any confirmation does not arrive,
-        // hand the whole batch back for retry rather than reporting a false Ack.
-        let (receivers, enqueue_err) = self.enqueue_confirmed(&messages).await;
-        if let Some(e) = enqueue_err {
+        if let Some(e) = first_error {
             warn!(
-                "MQTT batch enqueue failed, marking all {} messages for retry: {}",
+                "MQTT batch send failed, marking all {} messages for retry. First error: {}",
                 messages.len(),
                 e
             );
-            return Ok(retry_whole_batch(messages));
-        }
+            let failed_messages = messages
+                .into_iter()
+                .map(|m| {
+                    (
+                        m,
+                        PublisherError::Retryable(anyhow!("Batch failed due to connection issue")),
+                    )
+                })
+                .collect();
 
-        if all_confirmed(receivers).await {
-            Ok(SentBatch::Ack)
+            Ok(SentBatch::Partial {
+                responses: None,
+                failed: failed_messages,
+            })
         } else {
-            warn!(
-                "MQTT batch not confirmed by broker, marking all {} messages for retry",
-                messages.len()
-            );
-            Ok(retry_whole_batch(messages))
+            Ok(SentBatch::Ack)
         }
     }
 
@@ -547,7 +345,6 @@ impl MqttListener {
             sub_info,
             !config.delayed_ack,
             is_connected.clone(),
-            None,
         ));
 
         client.subscribe(topic, qos).await?;
@@ -648,8 +445,10 @@ impl MessageConsumer for MqttListener {
                 }
                 let mut ack_futures = Vec::with_capacity(dispositions.len());
 
-                for (((reply_topic, correlation_data), ack), disposition) in
-                    reply_infos.into_iter().zip(acks).zip(dispositions)
+                for (((reply_topic, correlation_data), ack), disposition) in reply_infos
+                    .into_iter()
+                    .zip(acks.into_iter())
+                    .zip(dispositions.into_iter())
                 {
                     let client = client.clone();
                     ack_futures.push(async move {
@@ -816,10 +615,8 @@ async fn run_eventloop(
     subscription_info: Option<(Client, String, QoS)>,
     manual_acks: bool,
     is_connected: Arc<AtomicBool>,
-    confirmer: Option<Arc<PublishConfirmer>>,
 ) {
     let mut stopping = false;
-    let mut has_seen_connack = false;
     // A future that is always pending until we decide to start the timeout
     let mut flush_timeout: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> =
         Box::pin(futures::future::pending());
@@ -857,21 +654,7 @@ async fn run_eventloop(
                                 }
                                 rumqttc::Incoming::ConnAck(ack) => {
                                     is_connected.store(true, Ordering::Relaxed);
-                                    let fail_outstanding = should_fail_outstanding_on_connack(
-                                        has_seen_connack,
-                                        ack.session_present,
-                                    );
-                                    has_seen_connack = true;
                                     if !ack.session_present {
-                                        // Only a post-startup fresh session implies the broker
-                                        // discarded previously in-flight publishes. On the first
-                                        // ConnAck, current-session publishes may already be queued
-                                        // locally before the handshake completes.
-                                        if fail_outstanding {
-                                            if let Some(c) = &confirmer {
-                                                c.fail_all();
-                                            }
-                                        }
                                         if let Some((client, topic, qos)) = &subscription_info {
                                             let client = client.clone();
                                             let topic = topic.clone();
@@ -887,26 +670,11 @@ async fn run_eventloop(
                                         info!("Session present on V3 connection, resuming...");
                                     }
                                 }
-                                rumqttc::Incoming::PubAck(pa) => {
-                                    if let Some(c) = &confirmer {
-                                        c.settle(pa.pkid, true); // v3 PUBACK has no reason code
-                                    }
-                                }
-                                rumqttc::Incoming::PubComp(pc) => {
-                                    if let Some(c) = &confirmer {
-                                        c.settle(pc.pkid, true); // v3 PUBCOMP has no reason code
-                                    }
-                                }
                                 rumqttc::Incoming::Disconnect => {
                                     is_connected.store(false, Ordering::Relaxed);
                                 }
                                 _ => {}
                             },
-                            EventWrapper::V3(rumqttc::Event::Outgoing(Outgoing::Publish(pkid))) => {
-                                if let Some(c) = &confirmer {
-                                    c.on_outgoing_publish(pkid);
-                                }
-                            }
                             EventWrapper::V5(event_box) => {
                                 match *event_box {
                                     rumqttc::v5::Event::Incoming(rumqttc::v5::Incoming::Publish(p)) => {
@@ -925,21 +693,7 @@ async fn run_eventloop(
                                     }
                                     rumqttc::v5::Event::Incoming(rumqttc::v5::Incoming::ConnAck(ack)) => {
                                         is_connected.store(true, Ordering::Relaxed);
-                                        let fail_outstanding = should_fail_outstanding_on_connack(
-                                            has_seen_connack,
-                                            ack.session_present,
-                                        );
-                                        has_seen_connack = true;
                                         if !ack.session_present {
-                                            // Only a post-startup fresh session implies the broker
-                                            // discarded previously in-flight publishes. On the
-                                            // first ConnAck, current-session publishes may already
-                                            // be queued locally before the handshake completes.
-                                            if fail_outstanding {
-                                                if let Some(c) = &confirmer {
-                                                    c.fail_all();
-                                                }
-                                            }
                                             if let Some((client, topic, qos)) = &subscription_info {
                                                 let client = client.clone();
                                                 let topic = topic.clone();
@@ -953,31 +707,6 @@ async fn run_eventloop(
                                             }
                                         } else {
                                             info!("Session present on V5 connection, resuming...");
-                                        }
-                                    }
-                                    rumqttc::v5::Event::Incoming(rumqttc::v5::Incoming::PubAck(pa)) => {
-                                        if let Some(c) = &confirmer {
-                                            c.settle(pa.pkid, puback_v5_ok(pa.reason));
-                                        }
-                                    }
-                                    rumqttc::v5::Event::Incoming(rumqttc::v5::Incoming::PubRec(pr)) => {
-                                        // A failed PUBREC (e.g. QuotaExceeded) aborts the QoS 2
-                                        // handshake: no PUBCOMP follows, so settle it as failed now.
-                                        // A successful PUBREC is not terminal — wait for PUBCOMP.
-                                        if pubrec_v5_failed(pr.reason) {
-                                            if let Some(c) = &confirmer {
-                                                c.settle(pr.pkid, false);
-                                            }
-                                        }
-                                    }
-                                    rumqttc::v5::Event::Incoming(rumqttc::v5::Incoming::PubComp(pc)) => {
-                                        if let Some(c) = &confirmer {
-                                            c.settle(pc.pkid, pubcomp_v5_ok(pc.reason));
-                                        }
-                                    }
-                                    rumqttc::v5::Event::Outgoing(Outgoing::Publish(pkid)) => {
-                                        if let Some(c) = &confirmer {
-                                            c.on_outgoing_publish(pkid);
                                         }
                                     }
                                     rumqttc::v5::Event::Incoming(rumqttc::v5::Incoming::Disconnect(_)) => {
@@ -1178,43 +907,5 @@ fn parse_qos(qos: u8) -> QoS {
         1 => QoS::AtLeastOnce,
         2 => QoS::ExactlyOnce,
         _ => QoS::AtLeastOnce,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{should_fail_outstanding_on_connack, PublishConfirmer};
-
-    #[tokio::test]
-    async fn initial_connack_without_session_does_not_fail_current_publish() {
-        let confirmer = PublishConfirmer::default();
-        let rx = confirmer.register();
-
-        let mut has_seen_connack = false;
-        let fail_outstanding = should_fail_outstanding_on_connack(has_seen_connack, false);
-        has_seen_connack = true;
-        if fail_outstanding {
-            confirmer.fail_all();
-        }
-
-        confirmer.on_outgoing_publish(42);
-        confirmer.settle(42, true);
-
-        assert!(has_seen_connack);
-        assert!(rx.await.unwrap());
-    }
-
-    #[tokio::test]
-    async fn later_fresh_session_fails_outstanding_publish() {
-        let confirmer = PublishConfirmer::default();
-        let rx = confirmer.register();
-
-        let fail_outstanding = should_fail_outstanding_on_connack(true, false);
-        assert!(fail_outstanding);
-        if fail_outstanding {
-            confirmer.fail_all();
-        }
-
-        assert!(!rx.await.unwrap());
     }
 }

@@ -20,17 +20,28 @@ they are omitted from the Python entry on purpose.
 
 ## How it works
 
-Both entries expose a single `http -> response` route on `0.0.0.0:8080` with **no
-path filter**, and dispatch on the request's `http_path` metadata inside the
-handler. The shared HTTP server keys on the listen address, so one process/port
-serves both endpoints.
+Both entries listen on `0.0.0.0:8080`. The shared HTTP server keys on the listen
+address, so multiple routes (or, for Python, the single route) share one
+process/port.
+
+- **Rust entry: two routes.** A path-filtered `GET /plaintext -> static` route
+  answers the Plaintext test **handler-free**, and a catch-all `http -> response`
+  route dispatches the rest (`/json`, `/db`, `/queries`) on the request's
+  `http_path` metadata inside the handler. The router prefers the more specific
+  (path-filtered) route, so `/plaintext` hits the static reply and everything
+  else falls through to the handler.
+- **Python entry: one route.** A single `http -> response` route with no path
+  filter; the handler dispatches both `/json` and `/plaintext` on `http_path`.
+  (The static path is intentionally not used here — see "On bypassing the
+  handler" below.)
 
 Key properties (see the inline comments in each entry):
 
-- **Inline fast path.** An `http -> response` route replies inline, bypassing the
-  route worker/disposition pipeline. So route `concurrency`/`batch_size` do *not*
-  gate the hot path; we use `concurrency: 1`. Per-connection parallelism comes
-  from the Tokio runtime spawning a task per accepted connection.
+- **Inline fast path.** Both `http -> response` and `http -> static` routes reply
+  inline, bypassing the route worker/disposition pipeline. So route
+  `concurrency`/`batch_size` do *not* gate the hot path; we use `concurrency: 1`.
+  Per-connection parallelism comes from the Tokio runtime spawning a task per
+  accepted connection.
 - **Off-GIL work (Python).** All HTTP framing and JSON (de)serialization run in
   Rust off the GIL; the single Python worker thread only runs the trivial
   dispatch. This is the differentiator that should place `mq-bridge-py` near the
@@ -70,24 +81,41 @@ framework. The Python entry's value is off-GIL JSON serialization, not DB I/O.
 ## On bypassing the handler (switch + static)
 
 mq-bridge has a `static` endpoint (emits a fixed response body) and a `switch`
-endpoint (routes on a metadata key), so in principle `http → switch on http_path
-→ static` could answer with **no handler at all**. Two gaps stop it from being
-TechEmpower-conformant today:
+endpoint (routes on a metadata key), so `http → switch on http_path → static`
+(or just `http → static`) can answer with **no handler at all**, replying inline
+on the HTTP fast path.
 
-1. the `static` endpoint JSON-encodes its string (so `Hello, World!` comes back
-   as `"Hello, World!"` with quotes), and
-2. neither `static` nor `switch` sets the response `Content-Type`/`Server`
-   headers, so the reply defaults to `application/octet-stream` and fails the
-   header validation.
+The `static` endpoint supports the two properties this needs:
+
+1. **`raw: true`** sends the body verbatim (so `Hello, World!` is not JSON-quoted), and
+2. **`metadata:`** entries are attached to the response; for an HTTP response
+   they become headers — set `content-type` (and optionally `server`) here so the
+   reply doesn't default to `application/octet-stream`.
+
+```yaml
+plaintext:
+  input:  { http:   { url: "0.0.0.0:8080", path: "/plaintext" } }
+  output:
+    static:
+      body: "Hello, World!"
+      raw: true
+      metadata:
+        content-type: "text/plain"
+```
 
 For **plaintext** this is the only test where a static (handler-free) reply is
-allowed by the rules, and it would shave the per-request handler hop — but it
-needs those two small core additions (raw/unquoted static payload + a way to set
-the response content-type), and it would make the plaintext number measure the
-Rust core rather than the Python path. For **JSON** it is not an option at all:
-the rules require per-request serialization, not a pre-rendered string. The
-handler is therefore the conformant choice here; the static path is noted as a
-possible future throughput optimization for plaintext only.
+allowed by the rules, and it shaves the per-request handler hop. **The Rust entry
+uses it** (the `GET /plaintext -> static` route above). The **Python entry does
+not**: there the plaintext reply stays on the trivial handler. Routing Python
+plaintext through `static` would mean running a second handler-free route
+alongside the JSON handler route — and since the Python `Route.run()` owns its
+own runtime, that means two runtimes against the one process-global HTTP server.
+It's viable but unverified, and the Python entry's headline result is off-GIL
+JSON throughput, not plaintext — so it's kept simple on purpose.
+
+For **JSON** the static path is *not* an option for either entry: the rules
+require per-request serialization, not a pre-rendered string — the handler is the
+conformant choice there.
 
 ## Layout
 
