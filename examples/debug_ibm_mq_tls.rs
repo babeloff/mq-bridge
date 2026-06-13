@@ -8,7 +8,7 @@ use mqi::constants;
 use mqi::get::GetWait;
 use mqi::result::ResultCompErrExt;
 use mqi::types::{ApplName, CipherSpec, KeyRepo, MessageFormat, QueueManagerName, QueueName};
-use mqi::{MqStr, Object, Syncpoint, mqstr};
+use mqi::{mqstr, MqStr, Object, Syncpoint};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -17,9 +17,7 @@ async fn main() -> anyhow::Result<()> {
     cfg.password = Some("adminpass".to_string());
     cfg.queue = Some("DEV.QUEUE.1".to_string());
     cfg.tls.required = true;
-    cfg.tls.cert_file = Some(
-        "tests/integration/docker-compose/ibm-mq-certs/client".to_string(),
-    );
+    cfg.tls.cert_file = Some("tests/integration/docker-compose/ibm-mq-certs/client".to_string());
     cfg.cipher_spec = Some("ANY_TLS12".to_string());
 
     let publisher = IbmMqPublisher::new(&cfg).await?;
