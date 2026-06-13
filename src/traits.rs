@@ -6,6 +6,7 @@
 pub use crate::errors::{ConsumerError, HandlerError, PublisherError};
 pub use crate::outcomes::{Handled, Received, ReceivedBatch, Sent, SentBatch};
 use crate::CanonicalMessage;
+use anyhow::anyhow;
 use async_trait::async_trait;
 pub use futures::future::BoxFuture;
 use std::any::Any;
@@ -54,6 +55,39 @@ impl From<Handled> for MessageDisposition {
 pub trait Handler: Send + Sync + 'static {
     async fn handle(&self, msg: CanonicalMessage) -> Result<Handled, HandlerError>;
 
+    async fn handle_many(&self, msgs: Vec<CanonicalMessage>) -> Vec<Result<Handled, HandlerError>> {
+        let mut results = Vec::with_capacity(msgs.len());
+        let mut remaining = msgs.len();
+        for msg in msgs {
+            remaining -= 1;
+            let result = self.handle(msg).await;
+            let aborted = match &result {
+                Err(HandlerError::Retryable(_)) => Some("retryable"),
+                Err(HandlerError::Connection(_)) => Some("connection"),
+                Err(HandlerError::NonRetryable(_)) => Some("non-retryable"),
+                Ok(_) => None,
+            };
+            results.push(result);
+            if let Some(kind) = aborted {
+                for _ in 0..remaining {
+                    results.push(Err(match kind {
+                        "retryable" => HandlerError::Retryable(anyhow!(
+                            "batch aborted after earlier retryable handler failure"
+                        )),
+                        "connection" => HandlerError::Connection(anyhow!(
+                            "batch aborted after earlier handler connection failure"
+                        )),
+                        _ => HandlerError::NonRetryable(anyhow!(
+                            "batch aborted after earlier non-retryable handler failure"
+                        )),
+                    }));
+                }
+                break;
+            }
+        }
+        results
+    }
+
     /// Tries to register a handler for a specific type.
     /// Returns `None` if this handler does not support registration (e.g. it's not a TypeHandler).
     fn register_handler(
@@ -70,6 +104,11 @@ impl<T: Handler + ?Sized> Handler for Arc<T> {
     async fn handle(&self, msg: CanonicalMessage) -> Result<Handled, HandlerError> {
         (**self).handle(msg).await
     }
+
+    async fn handle_many(&self, msgs: Vec<CanonicalMessage>) -> Vec<Result<Handled, HandlerError>> {
+        (**self).handle_many(msgs).await
+    }
+
     fn register_handler(
         &self,
         type_name: &str,
@@ -192,6 +231,7 @@ pub trait MessageConsumer: Send + Sync {
                 });
             }
             // Batch was success but empty, which is unexpected for receive(1). Loop.
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
             tokio::task::yield_now().await;
         }
     }

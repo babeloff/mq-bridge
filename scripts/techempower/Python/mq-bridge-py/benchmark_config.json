@@ -1,0 +1,26 @@
+{
+  "framework": "mq-bridge-py",
+  "tests": [
+    {
+      "default": {
+        "json_url": "/json",
+        "plaintext_url": "/plaintext",
+        "port": 8080,
+        "approach": "Realistic",
+        "classification": "Micro",
+        "database": "None",
+        "framework": "mq-bridge-py",
+        "language": "Python",
+        "flavor": "None",
+        "orm": "Raw",
+        "platform": "mq-bridge",
+        "webserver": "hyper",
+        "os": "Linux",
+        "database_os": "Linux",
+        "display_name": "mq-bridge-py",
+        "notes": "Python bindings over the Rust mq-bridge core. HTTP framing and JSON serialization run in Rust off-GIL; the Python handler does the per-request dispatch.",
+        "versus": "None"
+      }
+    }
+  ]
+}

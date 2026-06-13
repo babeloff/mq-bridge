@@ -85,6 +85,7 @@ pub type PublisherConfig = HashMap<String, Endpoint>;
 /// Defines a single message processing route from an input to an output.
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[cfg_attr(feature = "schema", schemars(transform = route_schema_transform))]
 #[serde(deny_unknown_fields)]
 pub struct Route {
     /// The input/source endpoint for the route.
@@ -121,6 +122,7 @@ impl Default for Route {
 ///     concurrency: 10,
 ///     batch_size: 5,
 ///     commit_concurrency_limit: 1024,
+///     ..Default::default()
 /// };
 /// ```
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
@@ -146,7 +148,21 @@ pub struct RouteOptions {
     /// Lower values apply backpressure earlier; higher values allow larger commit backlogs.
     /// Defaults to 4096.
     #[serde(default = "default_commit_concurrency_limit")]
+    #[cfg_attr(feature = "schema", schemars(range(min = 1)))]
     pub commit_concurrency_limit: usize,
+    /// Time to wait for a route to establish connections before startup fails. Defaults to 5000ms.
+    #[serde(default = "default_startup_timeout_ms")]
+    pub startup_timeout_ms: u64,
+    /// Time to wait before reconnecting after a transient route failure. Defaults to 5000ms.
+    #[serde(default = "default_reconnect_interval_ms")]
+    pub reconnect_interval_ms: u64,
+    /// Delay after an empty receive batch to avoid hot polling. Set to 0 to only yield. Defaults to 10ms.
+    #[serde(default = "default_empty_batch_delay_ms")]
+    pub empty_batch_delay_ms: u64,
+    /// Allows fault-injection middleware such as random_panic. Disabled by default.
+    #[serde(default = "default_false", skip_serializing_if = "is_false")]
+    #[cfg_attr(feature = "schema", schemars(default = "default_false"))]
+    pub allow_fault_injection: bool,
 }
 
 impl Default for RouteOptions {
@@ -156,7 +172,28 @@ impl Default for RouteOptions {
             concurrency: default_concurrency(),
             batch_size: default_batch_size(),
             commit_concurrency_limit: default_commit_concurrency_limit(),
+            startup_timeout_ms: default_startup_timeout_ms(),
+            reconnect_interval_ms: default_reconnect_interval_ms(),
+            empty_batch_delay_ms: default_empty_batch_delay_ms(),
+            allow_fault_injection: false,
         }
+    }
+}
+
+impl RouteOptions {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.concurrency == 0 {
+            return Err(anyhow::anyhow!("route concurrency must be at least 1"));
+        }
+        if self.batch_size == 0 {
+            return Err(anyhow::anyhow!("route batch_size must be at least 1"));
+        }
+        if self.commit_concurrency_limit == 0 {
+            return Err(anyhow::anyhow!(
+                "route commit_concurrency_limit must be at least 1"
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -170,6 +207,31 @@ pub(crate) fn default_batch_size() -> usize {
 
 pub(crate) fn default_commit_concurrency_limit() -> usize {
     4096
+}
+
+pub(crate) fn default_startup_timeout_ms() -> u64 {
+    5000
+}
+
+pub(crate) fn default_reconnect_interval_ms() -> u64 {
+    5000
+}
+
+pub(crate) fn default_empty_batch_delay_ms() -> u64 {
+    10
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+fn default_false() -> bool {
+    false
+}
+
+#[cfg(feature = "schema")]
+fn default_inline_response_fast_path_schema() -> Option<bool> {
+    Some(true)
 }
 
 fn default_output_endpoint() -> Endpoint {
@@ -217,6 +279,7 @@ fn is_known_endpoint_name(name: &str) -> bool {
             | "zeromq"
             | "grpc"
             | "fanout"
+            | "stream_buffer"
             | "ref"
             | "switch"
             | "response"
@@ -440,6 +503,111 @@ fn deserialize_middlewares_from_value(value: serde_json::Value) -> anyhow::Resul
     Ok(middlewares)
 }
 
+/// Configuration for the `static` endpoint.
+///
+/// Accepts either a bare string (the response body, JSON-encoded for backward
+/// compatibility) or a map for full control:
+///
+/// ```yaml
+/// # bare string  -> body is JSON-encoded ("Hello" comes back quoted)
+/// static: "Hello, World!"
+///
+/// # map form -> raw body + custom metadata (HTTP maps metadata to headers)
+/// static:
+///   body: "Hello, World!"
+///   raw: true
+///   metadata:
+///     content-type: "text/plain"
+///     server: "mq-bridge"
+/// ```
+///
+/// When `raw` is true the body is sent verbatim; otherwise it is JSON-encoded as
+/// a string. Every entry in `metadata` is attached to the produced message; when
+/// this endpoint feeds an HTTP response, those entries become response headers
+/// (e.g. `content-type`), otherwise they are ordinary message metadata.
+#[derive(Debug, Clone, Default)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct StaticConfig {
+    /// The static response body.
+    pub body: String,
+    /// Send the body verbatim instead of JSON-encoding it as a string.
+    pub raw: bool,
+    /// Extra metadata entries attached to the produced message.
+    pub metadata: std::collections::HashMap<String, String>,
+}
+
+impl Serialize for StaticConfig {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        // Backward-compatible: when no extra options are set, serialize as a bare
+        // string exactly like the historical `Static(String)` so configs written
+        // by this version remain readable by older versions.
+        if !self.raw && self.metadata.is_empty() {
+            return serializer.serialize_str(&self.body);
+        }
+        use serde::ser::SerializeStruct;
+        let mut state = serializer.serialize_struct("StaticConfig", 3)?;
+        state.serialize_field("body", &self.body)?;
+        state.serialize_field("raw", &self.raw)?;
+        state.serialize_field("metadata", &self.metadata)?;
+        state.end()
+    }
+}
+
+impl From<String> for StaticConfig {
+    fn from(body: String) -> Self {
+        StaticConfig {
+            body,
+            raw: false,
+            metadata: std::collections::HashMap::new(),
+        }
+    }
+}
+
+impl From<&str> for StaticConfig {
+    fn from(body: &str) -> Self {
+        StaticConfig::from(body.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for StaticConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Repr {
+            Str(String),
+            Map {
+                body: String,
+                #[serde(default)]
+                raw: bool,
+                #[serde(default)]
+                metadata: std::collections::HashMap<String, String>,
+            },
+        }
+        Ok(match Repr::deserialize(deserializer)? {
+            Repr::Str(body) => StaticConfig {
+                body,
+                raw: false,
+                metadata: std::collections::HashMap::new(),
+            },
+            Repr::Map {
+                body,
+                raw,
+                metadata,
+            } => StaticConfig {
+                body,
+                raw,
+                metadata,
+            },
+        })
+    }
+}
+
 /// An enumeration of all supported endpoint types.
 /// `#[serde(rename_all = "lowercase")]` ensures that the keys in the config (e.g., "kafka")
 /// match the enum variants.
@@ -469,7 +637,7 @@ pub enum EndpointType {
     Kafka(KafkaConfig),
     Nats(NatsConfig),
     File(FileConfig),
-    Static(String),
+    Static(StaticConfig),
     Ref(String),
     Memory(MemoryConfig),
     Sled(SledConfig),
@@ -483,6 +651,8 @@ pub enum EndpointType {
     Grpc(GrpcConfig),
     Sqlx(SqlxConfig),
     Fanout(Vec<Endpoint>),
+    #[serde(rename = "stream_buffer")]
+    StreamBuffer(StreamBufferConfig),
     Switch(SwitchConfig),
     Response(ResponseConfig),
     Reader(Box<Endpoint>),
@@ -515,6 +685,7 @@ impl EndpointType {
             EndpointType::Grpc(_) => "grpc",
             EndpointType::Sqlx(_) => "sqlx",
             EndpointType::Fanout(_) => "fanout",
+            EndpointType::StreamBuffer(_) => "stream_buffer",
             EndpointType::Switch(_) => "switch",
             EndpointType::Response(_) => "response",
             EndpointType::Reader(_) => "reader",
@@ -531,6 +702,7 @@ impl EndpointType {
                 | EndpointType::Ref(_)
                 | EndpointType::Memory(_)
                 | EndpointType::Fanout(_)
+                | EndpointType::StreamBuffer(_)
                 | EndpointType::Switch(_)
                 | EndpointType::Response(_)
                 | EndpointType::Reader(_)
@@ -1196,12 +1368,24 @@ impl NatsConfig {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+#[derive(Debug, Serialize, Clone, Default)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[cfg_attr(feature = "schema", schemars(transform = memory_config_schema_transform))]
 #[serde(deny_unknown_fields)]
 pub struct MemoryConfig {
-    /// The topic name for the in-memory channel.
+    /// The topic name or transport URL. Can be:
+    /// - Simple name: "my-topic" (defaults to memory://my-topic)
+    /// - Memory URL: "memory://my-topic"
+    /// - IPC URL: "ipc://my-queue" or "ipc:///path/to/socket"
+    /// - Unix socket: "unix:///path/to/socket" (Unix only)
+    /// - Named pipe: "pipe://my-pipe" (Windows only)
+    ///
+    /// Either `topic` or `url` can be specified (they are serde aliases).
+    #[serde(default, skip_serializing_if = "String::is_empty", alias = "url")]
     pub topic: String,
+    /// Transport URL (serde alias for `topic`). Use either `topic` or `url`.
+    #[serde(skip)]
+    pub url: Option<String>,
     /// The capacity of the channel. Defaults to 100.
     pub capacity: Option<usize>,
     /// (Publisher only) If true, send() waits for a response.
@@ -1212,19 +1396,34 @@ pub struct MemoryConfig {
     /// (Consumer only) If true, act as a **Subscriber** (fan-out). Defaults to false (queue).
     #[serde(default)]
     pub subscribe_mode: bool,
-    /// (Consumer only) If true, enables NACK support (re-queuing), which requires cloning messages. Defaults to false.
+    /// (Consumer only) If true, enables NACK support (re-queuing), which requires cloning messages.
+    /// Defaults to false for memory:// transports, automatically true for IPC transports (ipc://, unix://, pipe://).
     #[serde(default)]
     pub enable_nack: bool,
+    #[serde(skip)]
+    pub enable_nack_overridden: bool,
 }
 
 impl MemoryConfig {
     pub fn new(topic: impl Into<String>, capacity: Option<usize>) -> Self {
         Self {
             topic: topic.into(),
+            url: None,
             capacity,
             ..Default::default()
         }
     }
+
+    pub fn new_with_url(url: impl Into<String>, capacity: Option<usize>) -> Self {
+        let url = url.into();
+        Self {
+            topic: url.clone(),
+            url: Some(url),
+            capacity,
+            ..Default::default()
+        }
+    }
+
     pub fn with_subscribe(self, subscribe_mode: bool) -> Self {
         Self {
             subscribe_mode,
@@ -1234,6 +1433,199 @@ impl MemoryConfig {
 
     pub fn with_request_reply(mut self, request_reply: bool) -> Self {
         self.request_reply = request_reply;
+        self
+    }
+
+    /// Gets the effective transport identifier.
+    /// If topic contains ://, it's treated as a URL, otherwise as memory://topic.
+    pub fn get_transport_identifier(&self) -> anyhow::Result<String> {
+        let identifier = if !self.topic.is_empty() {
+            &self.topic
+        } else if let Some(url) = self.url.as_ref().filter(|url| !url.is_empty()) {
+            url
+        } else {
+            return Err(anyhow::anyhow!(
+                "MemoryConfig: 'topic' (or 'url' alias) is required."
+            ));
+        };
+
+        // If topic doesn't contain ://, treat it as memory://topic for backward compatibility
+        if identifier.contains("://") {
+            Ok(identifier.clone())
+        } else {
+            Ok(format!("memory://{}", identifier))
+        }
+    }
+
+    /// Check if the transport URL scheme suggests IPC (inter-process communication).
+    /// IPC transports should enable nack by default for reliability.
+    pub fn is_ipc_transport(&self) -> bool {
+        if let Ok(identifier) = self.get_transport_identifier() {
+            identifier.starts_with("ipc://")
+                || identifier.starts_with("unix://")
+                || identifier.starts_with("pipe://")
+        } else {
+            false
+        }
+    }
+
+    /// Apply smart defaults based on the transport type.
+    /// For IPC transports, enable_nack defaults to true for reliability.
+    pub fn with_smart_defaults(mut self) -> Self {
+        if !self.enable_nack_overridden && self.is_ipc_transport() {
+            self.enable_nack = true;
+        }
+        self
+    }
+}
+
+impl<'de> Deserialize<'de> for MemoryConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize, Default)]
+        #[serde(deny_unknown_fields)]
+        struct MemoryConfigSerde {
+            #[serde(default)]
+            topic: String,
+            #[serde(default)]
+            url: Option<String>,
+            capacity: Option<usize>,
+            #[serde(default)]
+            request_reply: bool,
+            request_timeout_ms: Option<u64>,
+            #[serde(default)]
+            subscribe_mode: bool,
+            #[serde(default)]
+            enable_nack: Option<bool>,
+        }
+
+        let raw = MemoryConfigSerde::deserialize(deserializer)?;
+        if raw.topic.is_empty() && raw.url.as_deref().map_or(true, str::is_empty) {
+            return Err(serde::de::Error::custom(
+                "MemoryConfig: 'topic' (or 'url' alias) is required.",
+            ));
+        }
+        let topic = if raw.topic.is_empty() {
+            raw.url.clone().unwrap_or_default()
+        } else {
+            raw.topic
+        };
+        Ok(Self {
+            topic,
+            url: raw.url,
+            capacity: raw.capacity,
+            request_reply: raw.request_reply,
+            request_timeout_ms: raw.request_timeout_ms,
+            subscribe_mode: raw.subscribe_mode,
+            enable_nack: raw.enable_nack.unwrap_or(false),
+            enable_nack_overridden: raw.enable_nack.is_some(),
+        })
+    }
+}
+
+#[cfg(feature = "schema")]
+fn memory_config_schema_transform(schema: &mut schemars::Schema) {
+    let Some(schema_obj) = schema.as_object_mut() else {
+        return;
+    };
+
+    let Some(properties) = schema_obj
+        .get_mut("properties")
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return;
+    };
+
+    properties.insert(
+        "url".to_string(),
+        serde_json::json!({
+            "description": "Alias for `topic`. Use either `topic` or `url`.",
+            "type": "string",
+            "minLength": 1
+        }),
+    );
+
+    // Mirror the runtime check (see `MemoryConfig::deserialize`): an empty
+    // `topic`/`url` is rejected, so the schema must require a non-empty value.
+    if let Some(topic) = properties
+        .get_mut("topic")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        topic.insert("minLength".to_string(), serde_json::json!(1));
+    }
+
+    schema_obj.insert(
+        "anyOf".to_string(),
+        serde_json::json!([
+            { "required": ["topic"] },
+            { "required": ["url"] }
+        ]),
+    );
+}
+
+#[cfg(feature = "schema")]
+fn route_schema_transform(schema: &mut schemars::Schema) {
+    let Some(properties) = schema
+        .as_object_mut()
+        .and_then(|schema_obj| schema_obj.get_mut("properties"))
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return;
+    };
+
+    let Some(allow_fault_injection) = properties
+        .get_mut("allow_fault_injection")
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return;
+    };
+
+    allow_fault_injection.insert("default".to_string(), serde_json::Value::Bool(false));
+}
+
+/// Configuration for the correlated in-process stream response buffer.
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct StreamBufferConfig {
+    /// Shared buffer topic used by both the publisher and correlated consumers.
+    pub topic: String,
+    /// Consumer-only correlation id partition to read from.
+    ///
+    /// Leave this unset for the publisher endpoint configured in
+    /// `HttpConfig::stream_response_to`. Set it on consumers so a reader only
+    /// receives messages belonging to one request or response stream.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub correlation_id: Option<String>,
+    /// Capacity of each correlation partition. Defaults to 100.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capacity: Option<usize>,
+}
+
+impl StreamBufferConfig {
+    /// Creates a `stream_buffer` config for the given topic.
+    ///
+    /// Add `with_correlation_id` when constructing a consumer for one stream.
+    /// Leave the correlation id unset when constructing the publisher buffer
+    /// used by `HttpConfig::stream_response_to`.
+    pub fn new(topic: impl Into<String>) -> Self {
+        Self {
+            topic: topic.into(),
+            ..Default::default()
+        }
+    }
+
+    /// Selects the response stream partition that a consumer should read.
+    pub fn with_correlation_id(mut self, correlation_id: impl Into<String>) -> Self {
+        self.correlation_id = Some(correlation_id.into());
+        self
+    }
+
+    /// Sets the per-correlation partition capacity.
+    pub fn with_capacity(mut self, capacity: usize) -> Self {
+        self.capacity = Some(capacity);
         self
     }
 }
@@ -1445,7 +1837,9 @@ pub struct MqttConfig {
     pub session_expiry_interval: Option<u32>,
     /// (Consumer only) If true, messages are acknowledged immediately upon receipt (auto-ack).
     /// If false (default), messages are acknowledged after processing (manual-ack).
-    /// Note: This setting does not currently enable synchronous publishing (waiting for PubAck) for the MQTT publisher.
+    /// Note: For QoS 1/2 the publisher always waits for end-to-end broker
+    /// confirmation (PUBACK/PUBCOMP) before reporting success, independent of
+    /// this setting; QoS 0 remains fire-and-forget.
     #[serde(default)]
     pub delayed_ack: bool,
 }
@@ -1640,6 +2034,28 @@ pub struct HttpConfig {
     /// (Consumer only) If true, respond immediately with 202 Accepted without waiting for downstream processing. Defaults to false.
     #[serde(default)]
     pub fire_and_forget: bool,
+    /// (Consumer only) If true, read request bodies as a stream and emit each received stream item as a separate message.
+    #[serde(default)]
+    pub receive_streamable: bool,
+    /// (Consumer only) If true, compatible `http -> response` routes may bypass the normal route consumer/worker/disposition pipeline
+    /// and reply inline for lower latency. Defaults to true. Set to false to force the normal route path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(
+        feature = "schema",
+        schemars(default = "default_inline_response_fast_path_schema")
+    )]
+    pub inline_response_fast_path: Option<bool>,
+    /// (Publisher only) Optional endpoint that receives streamed HTTP response items as correlated messages.
+    ///
+    /// Use a `stream_buffer` endpoint here when callers need to read streamed
+    /// response items later through a normal mq-bridge consumer. Each streamed
+    /// item is published with `correlation_id`, `http_stream_id`,
+    /// `http_stream_index`, `http_stream_format`, and `http_stream_end`
+    /// metadata. If the request message has no `correlation_id`, the HTTP
+    /// publisher uses `format!("{:032x}", request.message_id)` so callers can
+    /// derive the consumer correlation id before calling `send`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_response_to: Option<Box<Endpoint>>,
     /// (Publisher only) The number of concurrent HTTP requests to send in a batch. Defaults to 20.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub batch_concurrency: Option<usize>,
@@ -1746,6 +2162,25 @@ impl HttpConfig {
 
     pub fn with_path(mut self, path: impl Into<String>) -> Self {
         self.path = Some(path.into());
+        self
+    }
+
+    pub fn with_receive_streamable(mut self, receive_streamable: bool) -> Self {
+        self.receive_streamable = receive_streamable;
+        self
+    }
+
+    pub fn with_inline_response_fast_path(mut self, inline_response_fast_path: bool) -> Self {
+        self.inline_response_fast_path = Some(inline_response_fast_path);
+        self
+    }
+
+    pub fn inline_response_fast_path_enabled(&self) -> bool {
+        self.inline_response_fast_path.unwrap_or(true)
+    }
+
+    pub fn with_stream_response_to(mut self, endpoint: Endpoint) -> Self {
+        self.stream_response_to = Some(Box::new(endpoint));
         self
     }
 }
@@ -2311,6 +2746,9 @@ impl SecretExtractor for HttpConfig {
         );
         self.tls
             .extract_secrets(&format!("{}__{}", prefix, "TLS"), secrets);
+        if let Some(endpoint) = &mut self.stream_response_to {
+            endpoint.extract_secrets(&format!("{}__{}", prefix, "STREAM_RESPONSE_TO"), secrets);
+        }
     }
 }
 
@@ -2819,6 +3257,14 @@ kafka_to_nats:
         assert!(!secrets.contains_key("MQB__PATH_AT_ROUTE__OUTPUT__HTTP__URL"));
         assert!(!secrets.contains_key("MQB__QUERY_AT_ROUTE__OUTPUT__HTTP__URL"));
         assert!(!secrets.contains_key("MQB__FRAGMENT_AT_ROUTE__OUTPUT__HTTP__URL"));
+    }
+
+    #[test]
+    fn test_memory_config_requires_topic_or_url() {
+        let err = serde_yaml_ng::from_str::<MemoryConfig>("{}").unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("MemoryConfig: 'topic' (or 'url' alias) is required."));
     }
 
     #[test]

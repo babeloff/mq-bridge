@@ -6,15 +6,15 @@
 use crate::endpoints::{create_consumer_from_route, create_publisher_from_route};
 use crate::errors::ProcessingError;
 pub use crate::models::Route;
-use crate::models::{Endpoint, EndpointType, RouteOptions};
+use crate::models::{Endpoint, EndpointType, Middleware, RouteOptions};
 use crate::traits::{
     BatchCommitFunc, ConsumerError, Handler, HandlerError, MessageConsumer, MessageDisposition,
     MessagePublisher, PublisherError, SentBatch,
 };
 use async_channel::{bounded, Sender};
 use serde::de::DeserializeOwned;
-use std::collections::{BTreeMap, HashMap};
-use std::sync::{Arc, OnceLock, RwLock};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::{Arc, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use tokio::{
     select,
     task::{JoinHandle, JoinSet},
@@ -41,7 +41,7 @@ impl RouteHandle {
     }
 }
 
-async fn run_publisher_connect_hook(
+pub(crate) async fn run_publisher_connect_hook(
     route_name: &str,
     publisher: &Arc<dyn MessagePublisher>,
 ) -> anyhow::Result<()> {
@@ -57,7 +57,7 @@ async fn run_publisher_connect_hook(
     Ok(())
 }
 
-async fn run_consumer_connect_hook(
+pub(crate) async fn run_consumer_connect_hook(
     route_name: &str,
     consumer: &dyn MessageConsumer,
 ) -> anyhow::Result<()> {
@@ -73,7 +73,10 @@ async fn run_consumer_connect_hook(
     Ok(())
 }
 
-async fn run_publisher_disconnect_hook(route_name: &str, publisher: &Arc<dyn MessagePublisher>) {
+pub(crate) async fn run_publisher_disconnect_hook(
+    route_name: &str,
+    publisher: &Arc<dyn MessagePublisher>,
+) {
     if let Some(hook) = publisher.on_disconnect_hook() {
         if let Err(err) = hook.await {
             warn!(
@@ -84,7 +87,7 @@ async fn run_publisher_disconnect_hook(route_name: &str, publisher: &Arc<dyn Mes
     }
 }
 
-async fn run_consumer_disconnect_hook(route_name: &str, consumer: &dyn MessageConsumer) {
+pub(crate) async fn run_consumer_disconnect_hook(route_name: &str, consumer: &dyn MessageConsumer) {
     if let Some(hook) = consumer.on_disconnect_hook() {
         if let Err(err) = hook.await {
             warn!(
@@ -109,13 +112,25 @@ struct ActiveRoute {
 static ROUTE_REGISTRY: OnceLock<RwLock<HashMap<String, ActiveRoute>>> = OnceLock::new();
 static ENDPOINT_REF_REGISTRY: OnceLock<RwLock<HashMap<String, Endpoint>>> = OnceLock::new();
 
+fn recover_read_lock<'a, T>(lock: &'a RwLock<T>, name: &str) -> RwLockReadGuard<'a, T> {
+    lock.read().unwrap_or_else(|poisoned| {
+        warn!(lock = name, "Recovering from poisoned read lock");
+        poisoned.into_inner()
+    })
+}
+
+fn recover_write_lock<'a, T>(lock: &'a RwLock<T>, name: &str) -> RwLockWriteGuard<'a, T> {
+    lock.write().unwrap_or_else(|poisoned| {
+        warn!(lock = name, "Recovering from poisoned write lock");
+        poisoned.into_inner()
+    })
+}
+
 /// Registers a named endpoint that can be referenced by other endpoints using `ref: "name"`.
 /// This will overwrite any existing endpoint with the same name.
 pub fn register_endpoint(name: &str, endpoint: Endpoint) {
     let registry = ENDPOINT_REF_REGISTRY.get_or_init(|| RwLock::new(HashMap::new()));
-    let mut writer = registry
-        .write()
-        .expect("Named endpoint registry lock poisoned");
+    let mut writer = recover_write_lock(registry, "endpoint_ref_registry");
     if writer.insert(name.to_string(), endpoint).is_some() {
         debug!("Overwriting a registered endpoint named '{}'", name);
     }
@@ -124,14 +139,227 @@ pub fn register_endpoint(name: &str, endpoint: Endpoint) {
 /// Retrieves a registered endpoint by name.
 pub fn get_endpoint(name: &str) -> Option<Endpoint> {
     let registry = ENDPOINT_REF_REGISTRY.get_or_init(|| RwLock::new(HashMap::new()));
-    let reader = registry
-        .read()
-        .expect("Named endpoint registry lock poisoned");
+    let reader = recover_read_lock(registry, "endpoint_ref_registry");
     reader.get(name).cloned()
 }
 
+fn check_fault_middleware_allowed(
+    endpoint: &Endpoint,
+    route_name: &str,
+    role: &str,
+    depth: usize,
+    visited: &mut std::collections::HashSet<String>,
+) -> anyhow::Result<()> {
+    const MAX_DEPTH: usize = 16;
+    if depth > MAX_DEPTH {
+        return Err(anyhow::anyhow!(
+            "[route:{}] Endpoint policy recursion depth exceeded limit of {}",
+            route_name,
+            MAX_DEPTH
+        ));
+    }
+
+    if endpoint
+        .middlewares
+        .iter()
+        .any(|m| matches!(m, Middleware::RandomPanic(cfg) if cfg.enabled))
+    {
+        return Err(anyhow::anyhow!(
+            "[route:{}] random_panic middleware is disabled by default for {} endpoints; set allow_fault_injection: true to enable it",
+            route_name,
+            role
+        ));
+    }
+
+    match &endpoint.endpoint_type {
+        EndpointType::Ref(name) => {
+            if !visited.insert(name.clone()) {
+                return Ok(());
+            }
+            if let Some(referenced) = get_endpoint(name) {
+                check_fault_middleware_allowed(&referenced, route_name, role, depth + 1, visited)?;
+            }
+        }
+        EndpointType::Fanout(endpoints) => {
+            for endpoint in endpoints {
+                check_fault_middleware_allowed(endpoint, route_name, role, depth + 1, visited)?;
+            }
+        }
+        EndpointType::Switch(cfg) => {
+            for endpoint in cfg.cases.values() {
+                check_fault_middleware_allowed(endpoint, route_name, role, depth + 1, visited)?;
+            }
+            if let Some(endpoint) = &cfg.default {
+                check_fault_middleware_allowed(endpoint, route_name, role, depth + 1, visited)?;
+            }
+        }
+        EndpointType::Reader(inner) => {
+            check_fault_middleware_allowed(inner, route_name, role, depth + 1, visited)?;
+        }
+        _ => {}
+    }
+
+    Ok(())
+}
+
+async fn pause_after_empty_batch(delay_ms: u64) {
+    if delay_ms > 0 {
+        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+    } else {
+        tokio::task::yield_now().await;
+    }
+}
+
+fn report_route_error(err_tx: &Sender<anyhow::Error>, err: anyhow::Error, context: &str) {
+    match err_tx.try_send(err) {
+        Ok(_) => trace!("Reported error to main task"),
+        Err(err_send) => warn!(
+            error = ?err_send,
+            "{}; main task might be down or busy.",
+            context
+        ),
+    }
+}
+
+struct BatchScratch {
+    message_ids: Vec<u128>,
+    request_ids: HashSet<u128>,
+}
+
+impl BatchScratch {
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            message_ids: Vec::with_capacity(capacity),
+            request_ids: HashSet::with_capacity(capacity),
+        }
+    }
+
+    fn fill_from(&mut self, messages: &[crate::CanonicalMessage]) {
+        self.message_ids.clear();
+        self.message_ids
+            .extend(messages.iter().map(|m| m.message_id));
+        self.request_ids.clear();
+        self.request_ids.extend(
+            messages
+                .iter()
+                .filter(|m| m.metadata.contains_key("reply_to"))
+                .map(|m| m.message_id),
+        );
+    }
+}
+
+async fn send_batch_and_commit(
+    publisher: &Arc<dyn MessagePublisher>,
+    messages: Vec<crate::CanonicalMessage>,
+    commit: BatchCommitFunc,
+    has_retry_middleware: bool,
+    err_tx: &Sender<anyhow::Error>,
+    commit_tasks: &mut JoinSet<()>,
+    scratch: &mut BatchScratch,
+) -> anyhow::Result<()> {
+    let batch_len = messages.len();
+    scratch.fill_from(&messages);
+
+    match publisher.send_batch(messages).await {
+        Ok(SentBatch::Ack) => {
+            for id in scratch.message_ids.iter() {
+                if scratch.request_ids.contains(id) {
+                    warn!("Message {:032x} expected a reply (reply_to set), but publisher returned Ack. Response loop broken.", id);
+                }
+            }
+            let dispositions = scratch
+                .message_ids
+                .iter()
+                .map(|id| {
+                    if scratch.request_ids.contains(id) {
+                        MessageDisposition::Nack
+                    } else {
+                        MessageDisposition::Ack
+                    }
+                })
+                .collect();
+            let err_tx = err_tx.clone();
+            commit_tasks.spawn(async move {
+                if let Err(e) = commit(dispositions).await {
+                    error!("Commit failed: {}", e);
+                    report_route_error(&err_tx, e, "Could not send commit error to main task");
+                }
+            });
+            Ok(())
+        }
+        Ok(SentBatch::Partial { responses, failed }) => {
+            let has_transient = failed.iter().any(|(_, e)| {
+                matches!(
+                    e,
+                    PublisherError::Retryable(_) | PublisherError::Connection(_)
+                )
+            });
+            if has_transient {
+                let (_, first_err) = failed
+                    .iter()
+                    .find(|(_, e)| {
+                        matches!(
+                            e,
+                            PublisherError::Retryable(_) | PublisherError::Connection(_)
+                        )
+                    })
+                    .expect("has_transient is true");
+                let err = anyhow::anyhow!(
+                    "Transient error in batch send ({} messages failed). First error: {}",
+                    failed.len(),
+                    first_err
+                );
+                let dispositions = map_responses_to_dispositions(
+                    &scratch.message_ids,
+                    responses,
+                    &failed,
+                    &scratch.request_ids,
+                );
+                if let Err(commit_err) = commit(dispositions).await {
+                    warn!("Commit after transient failure also failed: {}", commit_err);
+                }
+                if !has_retry_middleware {
+                    return Err(err);
+                }
+                warn!(
+                    "Transient error in batch, message(s) Nack'ed for re-delivery: {}",
+                    err
+                );
+                return Ok(());
+            }
+
+            for (msg, e) in &failed {
+                error!(
+                    "Dropping message (ID: {:032x}) due to non-retryable error: {}",
+                    msg.message_id, e
+                );
+            }
+            let err_tx = err_tx.clone();
+            let dispositions = map_responses_to_dispositions(
+                &scratch.message_ids,
+                responses,
+                &failed,
+                &scratch.request_ids,
+            );
+            commit_tasks.spawn(async move {
+                if let Err(e) = commit(dispositions).await {
+                    error!("Commit failed: {}", e);
+                    report_route_error(&err_tx, e, "Could not send commit error to main task");
+                }
+            });
+            Ok(())
+        }
+        Err(e) => {
+            warn!("Publisher error, sending {} Nacks to commit", batch_len);
+            let nack_result = commit(vec![MessageDisposition::Nack; batch_len]).await;
+            debug!("Nack commit result: {:?}", nack_result);
+            Err(e.into())
+        }
+    }
+}
+
 impl Route {
-    /// Creates a new route with default concurrency (1) and batch size (128).
+    /// Creates a new route with default concurrency (1) and batch size (1).
     ///
     /// # Arguments
     /// * `input` - The input/source endpoint for the route
@@ -147,14 +375,14 @@ impl Route {
     /// Retrieves a registered (and running) route by name.
     pub fn get(name: &str) -> Option<Self> {
         let registry = ROUTE_REGISTRY.get_or_init(|| RwLock::new(HashMap::new()));
-        let map = registry.read().expect("Route registry lock poisoned");
+        let map = recover_read_lock(registry, "route_registry");
         map.get(name).map(|active| active.route.clone())
     }
 
     /// Returns a list of all registered route names.
     pub fn list() -> Vec<String> {
         let registry = ROUTE_REGISTRY.get_or_init(|| RwLock::new(HashMap::new()));
-        let map = registry.read().expect("Route registry lock poisoned");
+        let map = recover_read_lock(registry, "route_registry");
         map.keys().cloned().collect()
     }
 
@@ -207,7 +435,7 @@ impl Route {
         };
 
         let registry = ROUTE_REGISTRY.get_or_init(|| RwLock::new(HashMap::new()));
-        let mut map = registry.write().expect("Route registry lock poisoned");
+        let mut map = recover_write_lock(registry, "route_registry");
         map.insert(name.to_string(), active);
         Ok(())
     }
@@ -219,7 +447,7 @@ impl Route {
     pub async fn stop(name: &str) -> bool {
         let registry = ROUTE_REGISTRY.get_or_init(|| RwLock::new(HashMap::new()));
         let active_opt = {
-            let mut map = registry.write().expect("Route registry lock poisoned");
+            let mut map = recover_write_lock(registry, "route_registry");
             map.remove(name)
         };
 
@@ -289,6 +517,24 @@ impl Route {
         name: &str,
         allowed_endpoints: Option<&[&str]>,
     ) -> anyhow::Result<Vec<String>> {
+        self.options.validate()?;
+        if !self.options.allow_fault_injection {
+            check_fault_middleware_allowed(
+                &self.input,
+                name,
+                "input",
+                0,
+                &mut std::collections::HashSet::new(),
+            )?;
+            check_fault_middleware_allowed(
+                &self.output,
+                name,
+                "output",
+                0,
+                &mut std::collections::HashSet::new(),
+            )?;
+        }
+
         let mut warnings = Vec::new();
         warnings.extend(crate::endpoints::check_consumer(
             name,
@@ -335,6 +581,9 @@ impl Route {
         for warning in warnings {
             tracing::warn!(route = name_str, "Configuration warning: {}", warning);
         }
+        let startup_timeout = std::time::Duration::from_millis(self.options.startup_timeout_ms);
+        let reconnect_interval =
+            tokio::time::Duration::from_millis(self.options.reconnect_interval_ms);
         let (shutdown_tx, shutdown_rx) = bounded(1);
         let (ready_tx, ready_rx) = bounded(1);
         // Use `Arc` so route/name clones are cheap (pointer copy) in the reconnect loop.
@@ -383,12 +632,26 @@ impl Route {
                                     break;
                                 }
 
-                                warn!("Route '{}' failed: {}. Reconnecting in 5 seconds...", name, e);
-                                tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                                warn!(
+                                    "Route '{}' failed: {}. Reconnecting in {}ms...",
+                                    name,
+                                    e,
+                                    reconnect_interval.as_millis()
+                                );
+                                if !reconnect_interval.is_zero() {
+                                    tokio::time::sleep(reconnect_interval).await;
+                                }
                             }
                             Err(e) => {
-                                error!("Route '{}' task panicked: {}. Reconnecting in 5 seconds...", name, e);
-                                tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                                error!(
+                                    "Route '{}' task panicked: {}. Reconnecting in {}ms...",
+                                    name,
+                                    e,
+                                    reconnect_interval.as_millis()
+                                );
+                                if !reconnect_interval.is_zero() {
+                                    tokio::time::sleep(reconnect_interval).await;
+                                }
                             }
                             _ => {} // The route should continue running.
                         }
@@ -397,13 +660,14 @@ impl Route {
             }
         });
 
-        match tokio::time::timeout(std::time::Duration::from_secs(5), ready_rx.recv()).await {
+        match tokio::time::timeout(startup_timeout, ready_rx.recv()).await {
             Ok(Ok(_)) => Ok(RouteHandle((handle, shutdown_tx))),
             _ => {
                 handle.abort();
                 Err(anyhow::anyhow!(
-                    "Route '{}' failed to start within 5 seconds or encountered an error",
-                    name_str
+                    "Route '{}' failed to start within {}ms or encountered an error",
+                    name_str,
+                    startup_timeout.as_millis()
                 ))
             }
         }
@@ -418,6 +682,16 @@ impl Route {
     ) -> anyhow::Result<bool> {
         let (_internal_shutdown_tx, internal_shutdown_rx) = bounded(1);
         let shutdown_rx = shutdown_rx.unwrap_or(internal_shutdown_rx);
+        if let Some(result) = crate::endpoints::try_run_fast_path_route(
+            self,
+            name,
+            shutdown_rx.clone(),
+            ready_tx.clone(),
+        )
+        .await
+        {
+            return result;
+        }
         if self.options.concurrency == 1 {
             self.run_sequentially(name, shutdown_rx, ready_tx).await
         } else {
@@ -453,7 +727,7 @@ impl Route {
         if let Some(tx) = ready_tx {
             let _ = tx.send(()).await;
         }
-        let mut message_ids = Vec::with_capacity(self.options.batch_size);
+        let mut batch_scratch = BatchScratch::with_capacity(self.options.batch_size);
         // Check if retry middleware is present on output
         let has_retry_middleware = self.output.has_retry_middleware();
         let run_result = loop {
@@ -468,6 +742,7 @@ impl Route {
                     let received_batch = match res {
                         Ok(batch) => {
                             if batch.messages.is_empty() {
+                                pause_after_empty_batch(self.options.empty_batch_delay_ms).await;
                                 continue; // No messages, loop to select! again
                             }
                             batch
@@ -490,94 +765,19 @@ impl Route {
                     // Process the batch sequentially without spawning a new task
                     let seq = seq_counter;
                     seq_counter += 1;
-                    let mut commit_opt = Some(wrap_commit(received_batch.commit, seq, seq_tx.clone()));
-                    let batch_len = received_batch.messages.len();
-                    message_ids.clear();
-                    message_ids.extend(received_batch.messages.iter().map(|m| m.message_id));
-                    let request_ids: std::collections::HashSet<u128> = received_batch
-                        .messages
-                        .iter()
-                        .filter(|m| m.metadata.contains_key("reply_to"))
-                        .map(|m| m.message_id)
-                        .collect();
-
-                    match publisher.send_batch(received_batch.messages).await {
-                        Ok(SentBatch::Ack) => {
-                            for id in &message_ids {
-                                if request_ids.contains(id) {
-                                    warn!("Message {:032x} expected a reply (reply_to set), but publisher returned Ack. Response loop broken.", id);
-                                }
-                            }
-                            let commit = commit_opt.take().expect("Commit already used");
-                            let err_tx = err_tx.clone();
-                            commit_tasks.spawn(async move {
-                                if let Err(e) = commit(vec![MessageDisposition::Ack; batch_len]).await {
-                                    error!("Commit failed: {}", e);
-                                    match err_tx.try_send(e) {
-                                        Ok(_) => trace!("Reported commit error to main task"),
-                                        Err(err_send) => warn!(error=?err_send, "Could not send commit error to main task, it might be down or busy."),
-                                    }
-                                }
-                            });
-                        }
-                        Ok(SentBatch::Partial { responses, failed }) => {
-                            // Connection and Retryable are both "transient" errors - treat them the same.
-                            // Connection errors from handlers or publishers both indicate a temporary
-                            // failure that should either be retried (with middleware) or crash the route.
-                            let has_transient = failed.iter().any(|(_, e)| {
-                                matches!(e, PublisherError::Retryable(_) | PublisherError::Connection(_))
-                            });
-                            if has_transient {
-                                let (_, first_err) = failed
-                                    .iter()
-                                    .find(|(_, e)| matches!(e, PublisherError::Retryable(_) | PublisherError::Connection(_)))
-                                    .expect("has_transient is true");
-                                let err = anyhow::anyhow!(
-                                    "Transient error in batch send ({} messages failed). First error: {}",
-                                    failed.len(),
-                                    first_err
-                                );
-                                // Ack/nack the batch to fill the sequencer slot.
-                                let commit = commit_opt.take().expect("Commit already used");
-                                let dispositions =
-                                    map_responses_to_dispositions(&message_ids, responses, &failed, &request_ids);
-                                if let Err(commit_err) = commit(dispositions).await {
-                                    warn!("Commit after transient failure also failed: {}", commit_err);
-                                }
-                                if !has_retry_middleware {
-                                    break Err(err);
-                                }
-                                warn!("Transient error in batch, message(s) Nack'ed for re-delivery: {}", err);
-                                tokio::task::yield_now().await;
-                                continue;
-                            }
-                            // Only non-retryable errors remain - drop them with a log.
-                            for (msg, e) in &failed {
-                                error!("Dropping message (ID: {:032x}) due to non-retryable error: {}", msg.message_id, e);
-                            }
-                            let commit = commit_opt.take().expect("Commit already used");
-                            let err_tx = err_tx.clone();
-                            let ids = std::mem::take(&mut message_ids);
-                            let req_ids = request_ids;
-                            commit_tasks.spawn(async move {
-                                let dispositions = map_responses_to_dispositions(&ids, responses, &failed, &req_ids);
-                                if let Err(e) = commit(dispositions).await {
-                                    error!("Commit failed: {}", e);
-                                    match err_tx.try_send(e) {
-                                        Ok(_) => trace!("Reported commit error to main task"),
-                                        Err(err_send) => warn!(error=?err_send, "Could not send commit error to main task, it might be down or busy."),
-                                    }
-                                }
-                            });
-                        }
-                        Err(e) => {
-                            // Any direct error from send_batch crashes the route.
-                            warn!("Publisher error, sending {} Nacks to commit", batch_len);
-                            let commit = commit_opt.take().expect("Commit already used");
-                            let nack_result = commit(vec![MessageDisposition::Nack; batch_len]).await;
-                            debug!("Nack commit result: {:?}", nack_result);
-                            break Err(e.into());
-                        }
+                    let commit = wrap_commit(received_batch.commit, seq, seq_tx.clone());
+                    if let Err(err) = send_batch_and_commit(
+                        &publisher,
+                        received_batch.messages,
+                        commit,
+                        has_retry_middleware,
+                        &err_tx,
+                        &mut commit_tasks,
+                        &mut batch_scratch,
+                    )
+                    .await
+                    {
+                        break Err(err);
                     }
 
                     tokio::task::yield_now().await;
@@ -630,11 +830,8 @@ impl Route {
             let _ = tx.send(()).await;
         }
         let (err_tx, err_rx) = bounded(1); // For critical, route-stopping errors
-                                           // channel capacity: a small buffer proportional to concurrency
-        let work_capacity = self
-            .options
-            .concurrency
-            .saturating_mul(self.options.batch_size);
+                                           // channel capacity is measured in batches, not messages
+        let work_capacity = self.options.concurrency;
         let (work_tx, work_rx) =
             bounded::<(Vec<crate::CanonicalMessage>, BatchCommitFunc)>(work_capacity);
         // --- Ordered Commit Sequencer ---
@@ -643,7 +840,6 @@ impl Route {
         let (seq_tx, sequencer_handle) = spawn_sequencer(self.options.commit_concurrency_limit);
 
         // --- Worker Pool ---
-        let batch_size = self.options.batch_size;
         let mut join_set = JoinSet::new();
         for i in 0..self.options.concurrency {
             let work_rx_clone = work_rx.clone();
@@ -651,105 +847,27 @@ impl Route {
             let err_tx = err_tx.clone();
             let mut commit_tasks = JoinSet::new();
             let has_retry_middleware = self.output.has_retry_middleware();
+            let batch_size = self.options.batch_size;
             join_set.spawn(async move {
                 debug!("Starting worker {}", i);
-                let mut message_ids = Vec::with_capacity(batch_size);
+                let mut batch_scratch = BatchScratch::with_capacity(batch_size);
                 while let Ok((messages, commit_func)) = work_rx_clone.recv().await {
-                    let mut commit_opt = Some(commit_func);
-                    let batch_len = messages.len();
-                    message_ids.clear();
-                    message_ids.extend(messages.iter().map(|m| m.message_id));
-                    let request_ids: std::collections::HashSet<u128> = messages
-                        .iter()
-                        .filter(|m| m.metadata.contains_key("reply_to"))
-                        .map(|m| m.message_id)
-                        .collect();
-
-                    match publisher.send_batch(messages).await {
-                        Ok(SentBatch::Ack) => {
-                            for id in &message_ids {
-                                if request_ids.contains(id) {
-                                    warn!("Message {:032x} expected a reply (reply_to set), but publisher returned Ack. Response loop broken.", id);
-                                }
-                            }
-                            let commit = commit_opt.take().expect("Commit already used");
-                            let err_tx = err_tx.clone();
-                            commit_tasks.spawn(async move {
-                                if let Err(e) = commit(vec![MessageDisposition::Ack; batch_len]).await {
-                                    error!("Commit failed: {}", e);
-                                    match err_tx.try_send(e) {
-                                        Ok(_) => trace!("Reported commit error to main task"),
-                                        Err(err_send) => warn!(error=?err_send, "Could not send commit error to main task, it might be down or busy."),
-                                    }
-                                }
-                            });
-                        }
-                        Ok(SentBatch::Partial { responses, failed }) => {
-                            // Connection and Retryable are both "transient" errors.
-                            let has_transient = failed.iter().any(|(_, e)| {
-                                matches!(e, PublisherError::Retryable(_) | PublisherError::Connection(_))
-                            });
-                            if has_transient {
-                                let (_, first_err) = failed
-                                    .iter()
-                                    .find(|(_, e)| matches!(e, PublisherError::Retryable(_) | PublisherError::Connection(_)))
-                                    .expect("has_transient is true");
-                                let e = anyhow::anyhow!(
-                                    "Transient error in batch send ({} messages failed). First error: {}",
-                                    failed.len(),
-                                    first_err
-                                );
-                                let commit = commit_opt.take().expect("Commit already used");
-                                // Ack/nack the batch to fill the sequencer slot.
-                                let dispositions =
-                                    map_responses_to_dispositions(&message_ids, responses, &failed, &request_ids);
-                                if let Err(commit_err) = commit(dispositions).await {
-                                    warn!("Commit after transient failure also failed: {}", commit_err);
-                                }
-                                if !has_retry_middleware {
-                                    match err_tx.try_send(e) {
-                                        Ok(_) => trace!("Reported error to main task"),
-                                        Err(err_send) => warn!(error=?err_send, "Could not send error to main task, it might be down or busy."),
-                                    }
-                                    break;
-                                }
-                                warn!("Transient error in batch, message(s) Nack'ed for re-delivery: {}", e);
-                                tokio::task::yield_now().await;
-                                continue;
-                            }
-                            // Only non-retryable errors remain - drop them with a log.
-                            for (msg, e) in &failed {
-                                error!("Worker dropping message (ID: {:032x}) due to non-retryable error: {}", msg.message_id, e);
-                            }
-                            let commit = commit_opt.take().expect("Commit already used");
-                            let err_tx = err_tx.clone();
-                            let ids = std::mem::take(&mut message_ids);
-                            let req_ids = request_ids;
-                            commit_tasks.spawn(async move {
-                                let dispositions = map_responses_to_dispositions(&ids, responses, &failed, &req_ids);
-                                if let Err(e) = commit(dispositions).await {
-                                    error!("Commit failed: {}", e);
-                                    match err_tx.try_send(e) {
-                                        Ok(_) => trace!("Reported commit error to main task"),
-                                        Err(err_send) => warn!(error=?err_send, "Could not send commit error to main task, it might be down or busy."),
-                                    }
-                                }
-                            });
-                        }
-                        Err(e) => {
-                            error!("Worker failed to send message batch: {}", e);
-                            let commit = commit_opt.take().expect("Commit already used");
-                            // Nack the commit to fill the sequencer slot and prevent a deadlock.
-                            let nack_result = commit(vec![MessageDisposition::Nack; batch_len]).await;
-                            debug!("Nack commit result: {:?}", nack_result);
-                            // Send the error back to the main task to tear down the route.
-                            match err_tx.try_send(e.into()) {
-                                Ok(_) => trace!("Reported error to main task"),
-                                Err(err_send) => warn!(error=?err_send, "Could not send error to main task, it might be down or busy."),
-                            }
-                            break;
-                        }
+                    if let Err(err) = send_batch_and_commit(
+                        &publisher,
+                        messages,
+                        commit_func,
+                        has_retry_middleware,
+                        &err_tx,
+                        &mut commit_tasks,
+                        &mut batch_scratch,
+                    )
+                    .await
+                    {
+                        error!("Worker failed to process message batch: {}", err);
+                        report_route_error(&err_tx, err, "Could not send error to main task");
+                        break;
                     }
+                    tokio::task::yield_now().await;
                 }
                 // Wait for all in-flight commits to complete
                 while commit_tasks.join_next().await.is_some() {}
@@ -792,6 +910,7 @@ impl Route {
                     let (messages, commit) = match res {
                         Ok(batch) => {
                             if batch.messages.is_empty() {
+                                pause_after_empty_batch(self.options.empty_batch_delay_ms).await;
                                 continue; // No messages, loop to select! again
                             }
                             (batch.messages, batch.commit)
@@ -881,6 +1000,26 @@ impl Route {
     }
     pub fn with_commit_concurrency_limit(mut self, limit: usize) -> Self {
         self.options.commit_concurrency_limit = limit.max(1);
+        self
+    }
+
+    pub fn with_startup_timeout_ms(mut self, timeout_ms: u64) -> Self {
+        self.options.startup_timeout_ms = timeout_ms;
+        self
+    }
+
+    pub fn with_reconnect_interval_ms(mut self, interval_ms: u64) -> Self {
+        self.options.reconnect_interval_ms = interval_ms;
+        self
+    }
+
+    pub fn with_empty_batch_delay_ms(mut self, delay_ms: u64) -> Self {
+        self.options.empty_batch_delay_ms = delay_ms;
+        self
+    }
+
+    pub fn with_fault_injection(mut self, allow: bool) -> Self {
+        self.options.allow_fault_injection = allow;
         self
     }
 
@@ -1157,7 +1296,9 @@ pub async fn stop_route(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::{Endpoint, EndpointType, FaultMode, Middleware, RandomPanicMiddleware};
+    use crate::models::{
+        Endpoint, EndpointType, FaultMode, Middleware, RandomPanicMiddleware, RouteOptions,
+    };
     use crate::traits::{
         CustomMiddlewareFactory, MessageConsumer, MessagePublisher, ReceivedBatch,
     };
@@ -1166,6 +1307,43 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
+
+    #[test]
+    fn test_route_check_rejects_zero_execution_options() {
+        let route = Route::new(
+            Endpoint::new_memory("zero_in", 10),
+            Endpoint::new_memory("zero_out", 10),
+        )
+        .with_options(RouteOptions {
+            concurrency: 0,
+            batch_size: 1,
+            commit_concurrency_limit: 1,
+            ..Default::default()
+        });
+
+        let err = route.check("zero_options", None).unwrap_err().to_string();
+        assert!(err.contains("concurrency must be at least 1"));
+    }
+
+    #[test]
+    fn test_random_panic_requires_fault_injection_opt_in() {
+        let fault_config = RandomPanicMiddleware {
+            mode: FaultMode::Timeout,
+            enabled: true,
+            ..Default::default()
+        };
+        let input = Endpoint::new_memory("fault_policy_in", 10)
+            .add_middleware(Middleware::RandomPanic(fault_config));
+        let output = Endpoint::new_memory("fault_policy_out", 10);
+        let route = Route::new(input, output);
+
+        let err = route.check("fault_policy", None).unwrap_err().to_string();
+        assert!(err.contains("allow_fault_injection"));
+        assert!(route
+            .with_fault_injection(true)
+            .check("fault_policy", None)
+            .is_ok());
+    }
 
     #[derive(Debug, Default)]
     struct CommitObservation {
@@ -1376,7 +1554,10 @@ mod tests {
         let output = Endpoint::new_memory(&out_topic, 10);
 
         let route_name = format!("fault_test_{}_{}", mode, concurrency);
-        let route = Route::new(input.clone(), output.clone()).with_concurrency(concurrency);
+        let route = Route::new(input.clone(), output.clone())
+            .with_concurrency(concurrency)
+            .with_fault_injection(true)
+            .with_reconnect_interval_ms(100);
 
         // Start the route
         route
@@ -1391,9 +1572,8 @@ mod tests {
             .unwrap();
 
         if route_should_restart {
-            // The route's worker will fail, and the supervisor will wait 5 seconds before restarting.
-            // We wait for a bit longer than that to ensure recovery has happened.
-            tokio::time::sleep(std::time::Duration::from_secs(6)).await;
+            // The route's worker will fail, then the supervisor will restart it.
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         } else {
             // Route doesn't restart, just wait a bit for the (faulty) message to pass through.
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -1440,7 +1620,9 @@ mod tests {
             .add_middleware(Middleware::RandomPanic(fault_config));
 
         let route_name = format!("pub_fault_test_{}", mode);
-        let route = Route::new(input.clone(), output.clone());
+        let route = Route::new(input.clone(), output.clone())
+            .with_fault_injection(true)
+            .with_reconnect_interval_ms(100);
 
         route
             .deploy(&route_name)
@@ -1454,7 +1636,7 @@ mod tests {
             .unwrap();
 
         if route_should_restart {
-            tokio::time::sleep(std::time::Duration::from_secs(6)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         } else {
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         }
@@ -2398,7 +2580,7 @@ mod tests {
             })),
         ];
 
-        let route = Route::new(input.clone(), output);
+        let route = Route::new(input.clone(), output).with_fault_injection(true);
         route.deploy("test_dlq_integration").await.unwrap();
 
         // Send message

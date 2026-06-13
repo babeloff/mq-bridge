@@ -12,7 +12,7 @@ use mq_bridge::models::{Endpoint, EndpointType, IbmMqConfig, Route};
 /// - Queue: DEV.QUEUE.1
 /// - Channel: DEV.APP.SVRCONN
 /// - User: app
-/// - Password: admin
+/// - Password: adminpass
 ///
 /// You might need to create the queue and channel manually on the queue manager if they don't exist.
 /// You can do this by executing into the container and using `runmqsc`.
@@ -37,7 +37,7 @@ use std::time::Instant;
 fn get_config() -> IbmMqConfig {
     IbmMqConfig {
         username: Some("app".to_string()),
-        password: Some("admin".to_string()),
+        password: Some("adminpass".to_string()),
         queue_manager: "QM1".to_string(),
         url: "localhost(1414)".to_string(),
         channel: "DEV.APP.SVRCONN".to_string(),
@@ -149,7 +149,7 @@ routes:
         channel: "DEV.APP.SVRCONN"
         queue: "DEV.QUEUE.1"
         username: "app"
-        password: "admin"
+        password: "adminpass"
   ibm_mq_to_memory:
     input:
       ibmmq:
@@ -158,7 +158,7 @@ routes:
         channel: "DEV.APP.SVRCONN"
         queue: "DEV.QUEUE.1"
         username: "app"
-        password: "admin"
+        password: "adminpass"
     output:
       memory:
         topic: "chaos_out"

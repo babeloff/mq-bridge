@@ -1,10 +1,13 @@
 #![cfg(feature = "websocket")]
 
+use futures::{SinkExt, StreamExt};
 use mq_bridge::endpoints::websocket::WebSocketConsumer;
 use mq_bridge::endpoints::websocket::WebSocketPublisher;
 use mq_bridge::models::WebSocketConfig;
 use mq_bridge::traits::{MessageConsumer, MessageDisposition, MessagePublisher};
 use mq_bridge::CanonicalMessage;
+use tokio_tungstenite::connect_async;
+use tokio_tungstenite::tungstenite::Message;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn websocket_endpoint_roundtrip() {
@@ -74,4 +77,42 @@ async fn websocket_endpoint_handles_binary_payloads() {
     (batch.commit)(vec![MessageDisposition::Ack])
         .await
         .expect("commit should succeed");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn websocket_consumer_sends_commit_reply_to_client() {
+    let mut consumer =
+        WebSocketConsumer::new(&WebSocketConfig::new("127.0.0.1:0").with_path("/reply"))
+            .await
+            .expect("consumer should be created");
+
+    let (mut stream, _) = connect_async(consumer.url())
+        .await
+        .expect("client should connect");
+
+    stream
+        .send(Message::Text("request".into()))
+        .await
+        .expect("client should send request");
+
+    let mut batch = consumer
+        .receive_batch(1)
+        .await
+        .expect("consumer should receive request");
+    assert_eq!(batch.messages.len(), 1);
+    let request = batch.messages.pop().expect("one request");
+    assert_eq!(request.get_payload_str(), "request");
+
+    (batch.commit)(vec![MessageDisposition::Reply(
+        CanonicalMessage::from_vec("response").with_metadata_kv("ws_message_type", "text"),
+    )])
+    .await
+    .expect("reply commit should succeed");
+
+    let reply = stream
+        .next()
+        .await
+        .expect("client should receive response")
+        .expect("response frame should be valid");
+    assert_eq!(reply, Message::Text("response".into()));
 }

@@ -3,9 +3,10 @@
 //  Licensed under MIT License, see License file for more details
 //  git clone https://github.com/marcomq/mq-bridge
 
-use crate::traits::{send_batch_helper, BoxFuture, Handler, MessagePublisher};
+use crate::traits::{BoxFuture, Handler, MessagePublisher};
 use crate::traits::{Handled, HandlerError};
 use crate::CanonicalMessage;
+use anyhow::anyhow;
 use async_trait::async_trait;
 use std::any::Any;
 use std::future::Future;
@@ -74,10 +75,108 @@ impl MessagePublisher for CommandPublisher {
         &self,
         messages: Vec<CanonicalMessage>,
     ) -> Result<SentBatch, PublisherError> {
-        send_batch_helper(self, messages, |publisher, message| {
-            Box::pin(publisher.send(message))
-        })
-        .await
+        let handler_results = self.handler.handle_many(messages.clone()).await;
+
+        if handler_results.len() != messages.len() {
+            return Err(PublisherError::NonRetryable(anyhow::anyhow!(
+                "handler returned {} results for {} messages",
+                handler_results.len(),
+                messages.len()
+            )));
+        }
+
+        let mut responses = Vec::new();
+        let mut failed = Vec::new();
+
+        let mut iter = messages.into_iter().zip(handler_results);
+        while let Some((message, result)) = iter.next() {
+            let original_id = message.message_id;
+            let inbound_correlation_id = message.metadata.get("correlation_id").cloned();
+            match result {
+                Ok(Handled::Ack) => {}
+                Ok(Handled::Publish(mut response_msg)) => {
+                    response_msg.message_id = original_id;
+                    let fallback_correlation_id =
+                        inbound_correlation_id.unwrap_or_else(|| format!("{:032x}", original_id));
+                    response_msg
+                        .metadata
+                        .entry("correlation_id".to_string())
+                        .or_insert(fallback_correlation_id);
+
+                    match self.inner.send(response_msg).await {
+                        Ok(Sent::Response(response)) => responses.push(response),
+                        Ok(Sent::Ack) => {}
+                        Err(PublisherError::NonRetryable(err)) => {
+                            failed.push((message, PublisherError::NonRetryable(err)));
+                        }
+                        Err(PublisherError::Retryable(err)) => {
+                            failed.push((message, PublisherError::Retryable(err)));
+                            for (remaining, _) in iter {
+                                failed.push((
+                                    remaining,
+                                    PublisherError::Retryable(anyhow!(
+                                        "Batch aborted due to previous error"
+                                    )),
+                                ));
+                            }
+                            break;
+                        }
+                        Err(PublisherError::Connection(err)) => {
+                            failed.push((message, PublisherError::Connection(err)));
+                            for (remaining, _) in iter {
+                                failed.push((
+                                    remaining,
+                                    PublisherError::Connection(anyhow!(
+                                        "Batch aborted due to previous connection error"
+                                    )),
+                                ));
+                            }
+                            break;
+                        }
+                    }
+                }
+                Err(HandlerError::NonRetryable(err)) => {
+                    failed.push((message, PublisherError::NonRetryable(err)));
+                }
+                Err(HandlerError::Retryable(err)) => {
+                    failed.push((message, PublisherError::Retryable(err)));
+                    for (remaining, _) in iter {
+                        failed.push((
+                            remaining,
+                            PublisherError::Retryable(anyhow!(
+                                "Batch aborted due to previous error"
+                            )),
+                        ));
+                    }
+                    break;
+                }
+                Err(HandlerError::Connection(err)) => {
+                    failed.push((message, PublisherError::Connection(err)));
+                    for (remaining, _) in iter {
+                        failed.push((
+                            remaining,
+                            PublisherError::Connection(anyhow!(
+                                "Batch aborted due to previous connection error"
+                            )),
+                        ));
+                    }
+                    break;
+                }
+            }
+        }
+
+        if failed.is_empty() && responses.is_empty() {
+            Ok(SentBatch::Ack)
+        } else {
+            Ok(SentBatch::Partial {
+                responses: if responses.is_empty() {
+                    None
+                } else {
+                    Some(responses)
+                },
+                failed,
+            })
+        }
     }
 
     async fn flush(&self) -> anyhow::Result<()> {
@@ -91,7 +190,7 @@ impl MessagePublisher for CommandPublisher {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use super::*;
     use crate::endpoints::memory::MemoryPublisher;
@@ -271,5 +370,186 @@ mod tests {
 
         let received = channel.drain_messages();
         assert_eq!(received[0].message_id, original_id);
+    }
+
+    #[tokio::test]
+    async fn test_command_handler_send_batch_uses_handler_handle_many() {
+        struct BatchAwareHandler {
+            single_calls: AtomicUsize,
+            batch_calls: AtomicUsize,
+        }
+
+        #[async_trait]
+        impl Handler for BatchAwareHandler {
+            async fn handle(&self, _msg: CanonicalMessage) -> Result<Handled, HandlerError> {
+                self.single_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(Handled::Ack)
+            }
+
+            async fn handle_many(
+                &self,
+                msgs: Vec<CanonicalMessage>,
+            ) -> Vec<Result<Handled, HandlerError>> {
+                self.batch_calls.fetch_add(1, Ordering::SeqCst);
+                msgs.into_iter()
+                    .map(|mut msg| {
+                        msg.set_payload_str(format!("batched {}", msg.get_payload_str()));
+                        Ok(Handled::Publish(msg))
+                    })
+                    .collect()
+            }
+        }
+
+        let memory_publisher = MemoryPublisher::new_local("test_cmd_batch_many", 10);
+        let channel = memory_publisher.channel();
+        let handler = Arc::new(BatchAwareHandler {
+            single_calls: AtomicUsize::new(0),
+            batch_calls: AtomicUsize::new(0),
+        });
+        let publisher = CommandPublisher::new(memory_publisher, handler.clone());
+
+        let result = publisher
+            .send_batch(vec!["one".into(), "two".into(), "three".into()])
+            .await
+            .unwrap();
+
+        assert!(matches!(result, SentBatch::Ack));
+        assert_eq!(handler.single_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(handler.batch_calls.load(Ordering::SeqCst), 1);
+
+        let received = channel.drain_messages();
+        assert_eq!(received.len(), 3);
+        assert_eq!(received[0].get_payload_str(), "batched one");
+        assert_eq!(received[1].get_payload_str(), "batched two");
+        assert_eq!(received[2].get_payload_str(), "batched three");
+    }
+
+    #[tokio::test]
+    async fn test_command_handler_send_batch_non_retryable_handler_error_continues() {
+        struct PartiallyFailingHandler;
+
+        #[async_trait]
+        impl Handler for PartiallyFailingHandler {
+            async fn handle(&self, _msg: CanonicalMessage) -> Result<Handled, HandlerError> {
+                unreachable!("send_batch should use handle_many")
+            }
+
+            async fn handle_many(
+                &self,
+                msgs: Vec<CanonicalMessage>,
+            ) -> Vec<Result<Handled, HandlerError>> {
+                msgs.into_iter()
+                    .map(|msg| {
+                        if msg.get_payload_str() == "two" {
+                            Err(HandlerError::NonRetryable(anyhow::anyhow!("bad message")))
+                        } else {
+                            Ok(Handled::Publish(msg))
+                        }
+                    })
+                    .collect()
+            }
+        }
+
+        let memory_publisher = MemoryPublisher::new_local("test_cmd_batch_non_retryable", 10);
+        let channel = memory_publisher.channel();
+        let publisher = CommandPublisher::new(memory_publisher, PartiallyFailingHandler);
+
+        let result = publisher
+            .send_batch(vec!["one".into(), "two".into(), "three".into()])
+            .await
+            .unwrap();
+
+        match result {
+            SentBatch::Partial { responses, failed } => {
+                assert!(responses.is_none());
+                assert_eq!(failed.len(), 1);
+                assert_eq!(failed[0].0.get_payload_str(), "two");
+                assert!(matches!(failed[0].1, PublisherError::NonRetryable(_)));
+            }
+            other => panic!("expected partial failure, got {other:?}"),
+        }
+
+        let received = channel.drain_messages();
+        assert_eq!(received.len(), 2);
+        assert_eq!(received[0].get_payload_str(), "one");
+        assert_eq!(received[1].get_payload_str(), "three");
+    }
+
+    #[tokio::test]
+    async fn test_command_handler_send_batch_retryable_publish_error_aborts_remainder() {
+        struct PublishAllHandler;
+
+        #[async_trait]
+        impl Handler for PublishAllHandler {
+            async fn handle(&self, _msg: CanonicalMessage) -> Result<Handled, HandlerError> {
+                unreachable!("send_batch should use handle_many")
+            }
+
+            async fn handle_many(
+                &self,
+                msgs: Vec<CanonicalMessage>,
+            ) -> Vec<Result<Handled, HandlerError>> {
+                msgs.into_iter()
+                    .map(|msg| Ok(Handled::Publish(msg)))
+                    .collect()
+            }
+        }
+
+        struct RetryableSecondSendPublisher {
+            sends: Arc<AtomicUsize>,
+        }
+
+        #[async_trait]
+        impl MessagePublisher for RetryableSecondSendPublisher {
+            async fn send(&self, _msg: CanonicalMessage) -> Result<Sent, PublisherError> {
+                let send_number = self.sends.fetch_add(1, Ordering::SeqCst) + 1;
+                if send_number == 2 {
+                    Err(PublisherError::Retryable(anyhow::anyhow!(
+                        "temporary failure"
+                    )))
+                } else {
+                    Ok(Sent::Ack)
+                }
+            }
+
+            async fn send_batch(
+                &self,
+                _msgs: Vec<CanonicalMessage>,
+            ) -> Result<SentBatch, PublisherError> {
+                unreachable!(
+                    "command batch publishing should preserve old sequential send behavior"
+                )
+            }
+
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+        }
+
+        let sends = Arc::new(AtomicUsize::new(0));
+        let publisher = CommandPublisher::new(
+            RetryableSecondSendPublisher {
+                sends: sends.clone(),
+            },
+            PublishAllHandler,
+        );
+
+        let result = publisher
+            .send_batch(vec!["one".into(), "two".into(), "three".into()])
+            .await
+            .unwrap();
+
+        assert_eq!(sends.load(Ordering::SeqCst), 2);
+        match result {
+            SentBatch::Partial { responses, failed } => {
+                assert!(responses.is_none());
+                assert_eq!(failed.len(), 2);
+                assert_eq!(failed[0].0.get_payload_str(), "two");
+                assert_eq!(failed[1].0.get_payload_str(), "three");
+                assert!(matches!(failed[0].1, PublisherError::Retryable(_)));
+                assert!(matches!(failed[1].1, PublisherError::Retryable(_)));
+            }
+            other => panic!("expected partial failure, got {other:?}"),
+        }
     }
 }

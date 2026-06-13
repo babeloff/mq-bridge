@@ -99,25 +99,63 @@ fn armature_messaging_test() {
 
     println!("Patching {:?} for API compatibility...", source_path);
     let content = fs::read_to_string(&source_path).expect("Failed to read mq_bridge.rs");
-    let new_content = content
-            .replace("(received.commit)(None)", "(received.commit)(None.into())")
-            .replace(
-                "(received.commit)(Some(response))",
-                "(received.commit)(Some(response).into())",
-            )
-            .replace(
-                "MemoryConfig {",
-                "MemoryConfig { request_reply: false, request_timeout_ms: None, subscribe_mode: false, enable_nack: false,",
-            )
-            .replace(
-                "EndpointType::File(self.topic.clone())",
-                "EndpointType::File(mq_bridge::models::FileConfig { path: self.topic.clone(), ..Default::default() })",
-            )
-            .replace(
-                "concurrency: 1,",
-                "options: mq_bridge::models::RouteOptions { concurrency: 1, batch_size: 128, ..Default::default() },",
-            )
-            .replace("batch_size: 128,", "");
+    let replace_expected = |content: String,
+                            from: &str,
+                            to: &str,
+                            expected: usize,
+                            label: &str|
+     -> String {
+        let count = content.matches(from).count();
+        assert_eq!(
+                count, expected,
+                "expected exactly {} `{}` patch target(s) in {:?}, found {} (upstream source may have changed)",
+                expected, label, source_path, count
+            );
+        content.replacen(from, to, expected)
+    };
+
+    let new_content = replace_expected(
+        content,
+        "(received.commit)(None)",
+        "(received.commit)(None.into())",
+        1,
+        "(received.commit)(None)",
+    );
+    let new_content = replace_expected(
+        new_content,
+        "(received.commit)(Some(response))",
+        "(received.commit)(Some(response).into())",
+        1,
+        "(received.commit)(Some(response))",
+    );
+    let new_content = replace_expected(
+        new_content,
+        "topic: self.topic.clone(),\n                capacity: Some(self.buffer_size),",
+        "topic: self.topic.clone(),\n                url: None,\n                capacity: Some(self.buffer_size),\n                request_reply: false,\n                request_timeout_ms: None,\n                subscribe_mode: false,\n                enable_nack: false,\n                enable_nack_overridden: false,",
+        1,
+        "memory config using self.topic.clone()",
+    );
+    let new_content = replace_expected(
+        new_content,
+        "topic: topic.into(),\n            capacity: Some(buffer_size),",
+        "topic: topic.into(),\n            url: None,\n            capacity: Some(buffer_size),\n            request_reply: false,\n            request_timeout_ms: None,\n            subscribe_mode: false,\n            enable_nack: false,\n            enable_nack_overridden: false,",
+        2,
+        "memory config using topic.into()",
+    );
+    let new_content = replace_expected(
+        new_content,
+        "EndpointType::File(self.topic.clone())",
+        "EndpointType::File(mq_bridge::models::FileConfig { path: self.topic.clone(), ..Default::default() })",
+        1,
+        "EndpointType::File(self.topic.clone())",
+    );
+    let new_content = replace_expected(
+        new_content,
+        "            concurrency: 1,\n            batch_size: 128,",
+        "            options: mq_bridge::models::RouteOptions {\n                concurrency: 1,\n                batch_size: 128,\n                ..Default::default()\n            },",
+        1,
+        "route concurrency/batch_size fields",
+    );
     fs::write(&source_path, new_content).expect("Failed to write patched mq_bridge.rs");
 
     // 4. Run tests
@@ -128,7 +166,7 @@ fn armature_messaging_test() {
     assert!(project_dir.exists(), "Project directory missing");
     let status = Command::new(&cargo_bin)
         .arg("test")
-        .arg("--features=mq-bridge-full")
+        .arg("--features=mq-bridge")
         .arg("--")
         .arg("--ignored")
         .current_dir(&project_dir)

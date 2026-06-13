@@ -173,7 +173,7 @@ async fn test_amqp_publisher_handles_disconnect() {
             ..Default::default()
         }));
 
-        let route_to_test = Route::new(input_ep.clone(), output_ep);
+        let route_to_test = Route::new(input_ep.clone(), output_ep).with_fault_injection(true);
         route_to_test.deploy("amqp_fault_test").await.unwrap();
 
         // 2. A verifier route to get the message out of AMQP.

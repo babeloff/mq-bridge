@@ -37,6 +37,7 @@ pub mod websocket;
 pub mod zeromq;
 
 pub mod file;
+pub mod ipc;
 pub mod logic_test;
 pub mod memory;
 // performance_static was just for internal optimiztion - not a real test

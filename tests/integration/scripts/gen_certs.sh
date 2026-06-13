@@ -22,6 +22,12 @@ fi
 
 BASE_CERT_DIR="$OUT_ROOT/certs"
 
+set_tree_permissions() {
+  local dir="$1"
+  find "$dir" -type d -exec chmod 755 {} + 2>/dev/null || true
+  find "$dir" -type f -exec chmod 644 {} + 2>/dev/null || true
+}
+
 ensure_base_certs() {
   mkdir -p "$BASE_CERT_DIR"
   # If server.pem already exists assume base certs present
@@ -57,7 +63,7 @@ EOF
 
   # Do NOT create legacy mongo.* names; use server.* exclusively
 
-  chmod 644 "$BASE_CERT_DIR"/* || true
+  set_tree_permissions "$BASE_CERT_DIR"
   # ls -l "$BASE_CERT_DIR"
 }
 
@@ -70,8 +76,39 @@ generate_pem_dir() {
   cp -a "$BASE_CERT_DIR/server.crt" "$outdir/" 2>/dev/null || true
   cp -a "$BASE_CERT_DIR/server.key" "$outdir/" 2>/dev/null || true
   cp -a "$BASE_CERT_DIR/server.pem" "$outdir/" 2>/dev/null || true
-  chmod 644 "$outdir"/* || true
+  set_tree_permissions "$outdir"
   # ls -l "$outdir"
+}
+
+generate_ibm_mq_dir() {
+  local outdir="$1"
+  local label_dir="$outdir/keys/ibmmqkey"
+  local trust_dir="$outdir/trust/0"
+  local client_repo_stem="$outdir/client"
+  local client_repo_db="${client_repo_stem}.kdb"
+  local client_repo_p12="$outdir/client.p12"
+  chmod 755 "$outdir" "$outdir/keys" "$outdir/trust" "$label_dir" "$trust_dir" 2>/dev/null || true
+  mkdir -p "$outdir" "$label_dir" "$trust_dir"
+  echo "Ensuring base certs and copying IBM MQ TLS materials to $outdir"
+  ensure_base_certs
+  cp -a "$BASE_CERT_DIR/ca.pem" "$outdir/" 2>/dev/null || true
+  cp -a "$BASE_CERT_DIR/server.crt" "$outdir/" 2>/dev/null || true
+  cp -a "$BASE_CERT_DIR/server.key" "$outdir/" 2>/dev/null || true
+  cp -a "$BASE_CERT_DIR/server.pem" "$outdir/" 2>/dev/null || true
+  cp -a "$BASE_CERT_DIR/server.key" "$label_dir/tls.key" 2>/dev/null || true
+  cp -a "$BASE_CERT_DIR/server.crt" "$label_dir/tls.crt" 2>/dev/null || true
+  cp -a "$BASE_CERT_DIR/ca.pem" "$label_dir/ca.crt" 2>/dev/null || true
+  cp -a "$BASE_CERT_DIR/ca.pem" "$trust_dir/tls.crt" 2>/dev/null || true
+  if command -v /opt/mqm/bin/runmqakm >/dev/null 2>&1; then
+    rm -f "$client_repo_stem".{kdb,rdb,crl,sth} "$client_repo_p12"
+    /opt/mqm/bin/runmqakm -keydb -create -db "$client_repo_db" -pw changeit -type cms -stash
+    /opt/mqm/bin/runmqakm -cert -add -db "$client_repo_db" -stashed -label testca -file "$BASE_CERT_DIR/ca.pem" -format ascii -trust enable
+    openssl pkcs12 -export -in "$BASE_CERT_DIR/server.crt" -inkey "$BASE_CERT_DIR/server.key" -certfile "$BASE_CERT_DIR/ca.pem" -name ibmmqkey -out "$client_repo_p12" -passout pass:changeit
+    /opt/mqm/bin/runmqakm -cert -import -file "$client_repo_p12" -pw changeit -type pkcs12 -target "$client_repo_db" -target_stashed
+  else
+    echo "runmqakm not found; IBM MQ client key repository not created"
+  fi
+  set_tree_permissions "$outdir"
 }
 
 generate_keystore_dir() {
@@ -113,7 +150,7 @@ EOF
   else
     echo "keytool not found; pkcs12 created but JKS keystore/truststore not created"
   fi
-  chmod 644 "$outdir"/* || true
+  set_tree_permissions "$outdir"
   # ls -l "$outdir"
 }
 
@@ -131,7 +168,11 @@ case "$CMD" in
       grpc) OUT_DIR="$OUT_ROOT/grpc-certs" ;;
       ibm-mq) OUT_DIR="$OUT_ROOT/ibm-mq-certs" ;;
     esac
-    generate_pem_dir "$OUT_DIR"
+    if [[ "$CMD" == "ibm-mq" ]]; then
+      generate_ibm_mq_dir "$OUT_DIR"
+    else
+      generate_pem_dir "$OUT_DIR"
+    fi
     ;;
   kafka)
     generate_keystore_dir "$OUT_ROOT/kafka-certs"

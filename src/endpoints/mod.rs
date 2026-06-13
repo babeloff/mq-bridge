@@ -13,6 +13,8 @@ pub mod file;
 pub mod grpc;
 #[cfg(feature = "http")]
 pub mod http;
+#[cfg(feature = "http")]
+mod http_stream;
 #[cfg(feature = "ibm-mq")]
 pub mod ibm_mq;
 #[cfg(feature = "kafka")]
@@ -32,6 +34,7 @@ pub mod sled;
 #[cfg(feature = "sqlx")]
 pub mod sqlx;
 pub mod static_endpoint;
+pub mod stream_buffer;
 pub mod switch;
 #[cfg(feature = "websocket")]
 pub mod websocket;
@@ -39,7 +42,9 @@ pub mod websocket;
 pub mod zeromq;
 use crate::endpoints::memory::{get_or_create_channel, MemoryChannel};
 use crate::middleware::apply_middlewares_to_consumer;
-use crate::models::{Endpoint, EndpointType, MemoryConfig, Middleware, ResponseConfig};
+use crate::models::{
+    Endpoint, EndpointType, MemoryConfig, Middleware, ResponseConfig, StreamBufferConfig,
+};
 use crate::route::get_endpoint_factory;
 use crate::traits::{BoxFuture, MessageConsumer, MessagePublisher};
 use anyhow::{anyhow, Result};
@@ -69,6 +74,13 @@ impl Endpoint {
     }
     pub fn new_response() -> Self {
         Self::new(EndpointType::Response(ResponseConfig::default()))
+    }
+    pub fn new_stream_buffer(topic: &str, correlation_id: Option<&str>, capacity: usize) -> Self {
+        Self::new(EndpointType::StreamBuffer(StreamBufferConfig {
+            topic: topic.to_string(),
+            correlation_id: correlation_id.map(str::to_string),
+            capacity: Some(capacity),
+        }))
     }
     pub fn has_retry_middleware(&self) -> bool {
         self.middlewares
@@ -401,6 +413,9 @@ fn check_consumer_recursive(
                         .to_string(),
                     );
             }
+            if cfg.stream_response_to.is_some() {
+                warnings.push("Endpoint 'http' is used as a consumer, but 'stream_response_to' is a publisher-only option and will be ignored.".to_string());
+            }
             Ok(warnings)
         }
         #[cfg(feature = "sqlx")]
@@ -428,6 +443,15 @@ fn check_consumer_recursive(
                     "Endpoint 'memory' is used as a consumer, but 'request_timeout_ms' is a publisher-only option and will be ignored."
                     .to_string()
                 );
+            }
+            Ok(warnings)
+        }
+        EndpointType::StreamBuffer(cfg) => {
+            if cfg.correlation_id.is_none() {
+                return Err(anyhow!(
+                    "[route:{}] stream_buffer consumer must specify 'correlation_id'",
+                    route_name
+                ));
             }
             Ok(warnings)
         }
@@ -518,6 +542,111 @@ pub async fn create_consumer_from_route(
     apply_middlewares_to_consumer(consumer, &resolved_endpoint, route_name).await
 }
 
+pub(crate) async fn try_run_fast_path_route(
+    route: &crate::models::Route,
+    name: &str,
+    shutdown_rx: async_channel::Receiver<()>,
+    ready_tx: Option<async_channel::Sender<()>>,
+) -> Option<anyhow::Result<bool>> {
+    #[cfg(feature = "http")]
+    {
+        // The inline fast path applies to outputs that reply synchronously
+        // without the route worker/disposition pipeline: `response` (handler- or
+        // request-derived reply) and `static` (a fixed, pre-rendered reply).
+        let output_is_inline = matches!(
+            route.output.endpoint_type,
+            EndpointType::Response(_) | EndpointType::Static(_)
+        );
+        if let EndpointType::Http(cfg) = &route.input.endpoint_type {
+            if output_is_inline
+                && cfg.inline_response_fast_path_enabled()
+                && route.input.middlewares.is_empty()
+                && output_middlewares_allow_http_inline_fast_path(&route.output.middlewares)
+                && !cfg.fire_and_forget
+            {
+                return Some(
+                    run_http_inline_response_fast_path(
+                        route,
+                        name,
+                        shutdown_rx,
+                        ready_tx,
+                        cfg.clone(),
+                    )
+                    .await,
+                );
+            }
+        }
+    }
+
+    let _ = route;
+    let _ = name;
+    let _ = shutdown_rx;
+    let _ = ready_tx;
+    None
+}
+
+#[cfg(feature = "http")]
+fn output_middlewares_allow_http_inline_fast_path(middlewares: &[Middleware]) -> bool {
+    middlewares.iter().all(|middleware| {
+        matches!(
+            middleware,
+            Middleware::Buffer(_)
+                | Middleware::Delay(_)
+                | Middleware::Limiter(_)
+                | Middleware::Metrics(_)
+        )
+    })
+}
+
+#[cfg(feature = "http")]
+async fn run_http_inline_response_fast_path(
+    route: &crate::models::Route,
+    name: &str,
+    shutdown_rx: async_channel::Receiver<()>,
+    ready_tx: Option<async_channel::Sender<()>>,
+    http_config: crate::models::HttpConfig,
+) -> anyhow::Result<bool> {
+    let publisher = create_publisher_from_route(name, &route.output).await?;
+    let consumer =
+        http::HttpConsumer::new_with_inline_publisher(&http_config, Some(publisher.clone()))
+            .await?;
+
+    if let Err(err) = crate::route::run_publisher_connect_hook(name, &publisher).await {
+        crate::route::run_publisher_disconnect_hook(name, &publisher).await;
+        return Err(err);
+    }
+    if let Err(err) = crate::route::run_consumer_connect_hook(name, &consumer).await {
+        crate::route::run_consumer_disconnect_hook(name, &consumer).await;
+        crate::route::run_publisher_disconnect_hook(name, &publisher).await;
+        return Err(err);
+    }
+
+    tracing::info!(
+        route = name,
+        has_output_handler = route.output.handler.is_some(),
+        output_middlewares = route.output.middlewares.len(),
+        "Running HTTP inline response fast path; bypassing the normal route consumer/worker/disposition pipeline while keeping the output publisher chain active"
+    );
+    tracing::debug!(
+        route = name,
+        "HTTP inline response fast path differences: no input middlewares, no fire-and-forget, only buffer/metrics output middlewares allowed, and unchanged request metadata is not echoed back as response headers"
+    );
+    if let Some(tx) = ready_tx {
+        let _ = tx.send(()).await;
+    }
+
+    let stopped = shutdown_rx.recv().await.is_ok();
+    if stopped {
+        tracing::info!(
+            "Shutdown signal received in HTTP inline response runner for route '{}'.",
+            name
+        );
+    }
+    crate::route::run_consumer_disconnect_hook(name, &consumer).await;
+    crate::route::run_publisher_disconnect_hook(name, &publisher).await;
+    Ok(true)
+}
+
 async fn create_base_consumer(
     route_name: &str,
     endpoint: &Endpoint,
@@ -564,7 +693,7 @@ async fn create_base_consumer(
                 // For persistent sessions, default client_id to route_name if not provided
                 config.client_id = Some(format!("{}-{}", crate::APP_NAME, route_name));
             }
-            Ok(boxed(mqtt::MqttConsumer::new(cfg).await?))
+            Ok(boxed(mqtt::MqttConsumer::new(&config).await?))
         }
         #[cfg(feature = "ibm-mq")]
         EndpointType::IbmMq(cfg) => {
@@ -592,7 +721,10 @@ async fn create_base_consumer(
         #[cfg(feature = "websocket")]
         EndpointType::WebSocket(cfg) => Ok(boxed(websocket::WebSocketConsumer::new(cfg).await?)),
         EndpointType::Static(cfg) => Ok(boxed(static_endpoint::StaticRequestConsumer::new(cfg)?)),
-        EndpointType::Memory(cfg) => Ok(boxed(memory::MemoryConsumer::new(cfg)?)),
+        EndpointType::Memory(cfg) => Ok(boxed(memory::MemoryConsumer::new_async(cfg).await?)),
+        EndpointType::StreamBuffer(cfg) => {
+            Ok(boxed(stream_buffer::StreamBufferConsumer::new(cfg)?))
+        }
         #[cfg(feature = "sled")]
         EndpointType::Sled(cfg) => Ok(boxed(sled::SledConsumer::new(cfg)?)),
         #[cfg(feature = "mongodb")]
@@ -813,6 +945,12 @@ fn check_publisher_recursive(
                     .to_string()
                 );
             }
+            if _cfg.receive_streamable {
+                warnings.push(
+                    "Endpoint 'http' is used as a publisher, but 'receive_streamable' is a consumer-only option and will be ignored."
+                    .to_string()
+                );
+            }
             Ok(warnings)
         }
         #[cfg(feature = "grpc")]
@@ -885,6 +1023,15 @@ fn check_publisher_recursive(
             if cfg.enable_nack {
                 warnings.push(
                     "Endpoint 'memory' is used as a publisher, but 'enable_nack' is a consumer-only option and will be ignored."
+                    .to_string()
+                );
+            }
+            Ok(warnings)
+        }
+        EndpointType::StreamBuffer(cfg) => {
+            if cfg.correlation_id.is_some() {
+                warnings.push(
+                    "Endpoint 'stream_buffer' is used as a publisher, but 'correlation_id' is a consumer-only option and will be ignored."
                     .to_string()
                 );
             }
@@ -1097,7 +1244,22 @@ async fn create_base_publisher(
         }
         #[cfg(feature = "http")]
         EndpointType::Http(cfg) => {
-            let sink = http::HttpPublisher::new(cfg).await?;
+            let stream_response_sink =
+                if let Some(stream_response_to) = cfg.stream_response_to.as_deref() {
+                    Some(
+                        create_publisher_with_depth(
+                            route_name.to_string(),
+                            stream_response_to.clone(),
+                            depth + 1,
+                        )
+                        .await?,
+                    )
+                } else {
+                    None
+                };
+            let sink =
+                http::HttpPublisher::new_with_stream_response_sink(cfg, stream_response_sink)
+                    .await?;
             Ok(Box::new(sink) as Box<dyn MessagePublisher>)
         }
         #[cfg(feature = "websocket")]
@@ -1121,7 +1283,12 @@ async fn create_base_publisher(
             cfg,
         )?) as Box<dyn MessagePublisher>),
         EndpointType::Memory(cfg) => {
-            Ok(Box::new(memory::MemoryPublisher::new(cfg)?) as Box<dyn MessagePublisher>)
+            Ok(Box::new(memory::MemoryPublisher::new_async(cfg).await?)
+                as Box<dyn MessagePublisher>)
+        }
+        EndpointType::StreamBuffer(cfg) => {
+            Ok(Box::new(stream_buffer::StreamBufferPublisher::new(cfg)?)
+                as Box<dyn MessagePublisher>)
         }
         #[cfg(feature = "sled")]
         EndpointType::Sled(cfg) => {
@@ -1280,6 +1447,28 @@ mod tests {
         assert!(matches!(endpoint.middlewares[0], Middleware::Retry(_)));
         assert!(matches!(endpoint.middlewares[1], Middleware::Dlq(_)));
         assert!(matches!(endpoint.middlewares[2], Middleware::Metrics(_)));
+    }
+
+    #[cfg(feature = "http")]
+    #[test]
+    fn test_http_inline_fast_path_allows_simple_output_publisher_middlewares() {
+        assert!(output_middlewares_allow_http_inline_fast_path(&[
+            Middleware::Buffer(crate::models::BufferMiddleware {
+                max_messages: 16,
+                max_delay_ms: 0,
+            }),
+            Middleware::Delay(crate::models::DelayMiddleware { delay_ms: 0 }),
+            Middleware::Limiter(crate::models::LimiterMiddleware {
+                messages_per_second: 1_000_000.0,
+            }),
+        ]));
+
+        assert!(!output_middlewares_allow_http_inline_fast_path(&[
+            Middleware::Retry(crate::models::RetryMiddleware::default()),
+        ]));
+        assert!(!output_middlewares_allow_http_inline_fast_path(&[
+            Middleware::Dlq(Box::default()),
+        ]));
     }
 
     #[test]

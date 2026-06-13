@@ -27,6 +27,7 @@ use tracing::{debug, trace, warn};
 use uuid::Uuid;
 
 type WebSocketSourceMessage = (CanonicalMessage, CommitFunc);
+type WebSocketResponseTx = tokio::sync::mpsc::Sender<Message>;
 
 pub struct WebSocketConsumer {
     request_rx: tokio::sync::mpsc::Receiver<WebSocketSourceMessage>,
@@ -220,7 +221,17 @@ async fn handle_connection(
         .lock()
         .map(|captured| captured.clone())
         .unwrap_or_default();
-    let (_, mut read_stream) = ws_stream.split();
+    let (mut write_stream, mut read_stream) = ws_stream.split();
+    let (response_tx, mut response_rx) = tokio::sync::mpsc::channel::<Message>(16);
+    let writer_peer_addr = peer_addr;
+    let writer_task = tokio::spawn(async move {
+        while let Some(message) = response_rx.recv().await {
+            if let Err(error) = write_stream.send(message).await {
+                debug!(error = %error, %writer_peer_addr, "Failed to send WebSocket response");
+                break;
+            }
+        }
+    });
 
     while let Some(frame) = read_stream.next().await {
         let frame = frame?;
@@ -244,13 +255,38 @@ async fn handle_connection(
             .insert("ws_peer_addr".to_string(), peer_addr.to_string());
         message.metadata.extend(metadata.headers.clone());
 
-        let commit: CommitFunc = Box::new(|_| Box::pin(async move { Ok(()) }));
+        let response_tx = response_tx.clone();
+        let commit: CommitFunc =
+            Box::new(move |disposition| websocket_commit(disposition, response_tx));
         if request_tx.send((message, commit)).await.is_err() {
             break;
         }
     }
 
+    drop(response_tx);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(1), writer_task).await;
     Ok(())
+}
+
+fn websocket_commit(
+    disposition: MessageDisposition,
+    response_tx: WebSocketResponseTx,
+) -> futures::future::BoxFuture<'static, anyhow::Result<()>> {
+    Box::pin(async move {
+        match disposition {
+            MessageDisposition::Reply(message) => {
+                if response_tx
+                    .send(canonical_to_websocket_message(&message))
+                    .await
+                    .is_err()
+                {
+                    return Ok(());
+                }
+            }
+            MessageDisposition::Ack | MessageDisposition::Nack => {}
+        }
+        Ok(())
+    })
 }
 
 fn reject_handshake(status: StatusCode, body: String) -> ErrorResponse {

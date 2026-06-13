@@ -1,0 +1,107 @@
+# Example: IPC Worker Queue Configuration
+# 
+# This example demonstrates using local IPC (Unix Domain Sockets on Unix/Linux/macOS,
+# Named Pipes on Windows) for inter-process communication between worker processes.
+#
+# Use case: Send work to a local worker process on the same machine
+# without the overhead of network protocols or external message brokers.
+#
+# Security: IPC transports rely on OS-level permissions:
+# - Unix: Socket file permissions (default 0600, owner-only)
+# - Windows: Named Pipe ACLs (default owner-only access)
+
+metrics:
+  enabled: true
+
+routes:
+  # Producer: HTTP endpoint that receives work and queues it via IPC
+  http_to_ipc:
+    input:
+      http:
+        bind: "127.0.0.1:8080"
+        path: "/submit"
+    output:
+      memory:
+        # IPC with default path resolution:
+        # Unix: /run/mq-bridge/work-queue.sock (or /tmp/mq-bridge/work-queue.sock)
+        # Windows: \\.\pipe\mq-bridge-work-queue
+        url: "ipc://work-queue"
+        capacity: 1000
+
+  # Worker: Consumes from IPC queue and processes work
+  ipc_worker:
+    concurrency: 4
+    batch_size: 10
+    input:
+      memory:
+        url: "ipc://work-queue"
+        capacity: 1000
+        # Note: enable_nack is automatically true for IPC transports
+        # (can be explicitly set to false if needed)
+    output:
+      http:
+        url: "http://localhost:9000/process"
+        method: POST
+
+---
+# Alternative: Explicit Unix socket path
+# 
+# routes:
+#   http_to_ipc:
+#     input:
+#       http:
+#         bind: "127.0.0.1:8080"
+#     output:
+#       memory:
+#         # Explicit Unix socket path
+#         url: "unix:///var/run/myapp/work.sock"
+#         capacity: 1000
+#
+#   ipc_worker:
+#     input:
+#       memory:
+#         url: "unix:///var/run/myapp/work.sock"
+#         capacity: 1000
+
+---
+# Alternative: Windows Named Pipe (explicit)
+#
+# routes:
+#   http_to_pipe:
+#     input:
+#       http:
+#         bind: "127.0.0.1:8080"
+#     output:
+#       memory:
+#         # Explicit Windows Named Pipe
+#         url: "pipe://myapp-work-queue"
+#         capacity: 1000
+#
+#   pipe_worker:
+#     input:
+#       memory:
+#         url: "pipe://myapp-work-queue"
+#         capacity: 1000
+
+---
+# Comparison with in-process memory transport:
+#
+# In-process (single process, multiple threads):
+# routes:
+#   http_to_memory:
+#     input:
+#       http:
+#         bind: "127.0.0.1:8080"
+#     output:
+#       memory:
+#         url: "memory://work-queue"  # or just: topic: "work-queue"
+#         capacity: 1000
+#
+#   memory_worker:
+#     concurrency: 8  # Multiple threads in same process
+#     input:
+#       memory:
+#         url: "memory://work-queue"
+#         capacity: 1000
+
+# Made with Bob

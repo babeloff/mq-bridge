@@ -1,0 +1,17 @@
+routes:
+  transform_route:
+    batch_size: 256
+    input:
+      memory:
+        topic: "bench.in"
+        capacity: 65536
+    output:
+      memory:
+        topic: "bench.out"
+        capacity: 65536
+
+publishers:
+  bench_publisher:
+    memory:
+      topic: "bench.in"
+      capacity: 65536

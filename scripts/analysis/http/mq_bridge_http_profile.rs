@@ -1,0 +1,665 @@
+#[cfg(feature = "http")]
+use mq_bridge::endpoints::create_publisher_from_route;
+#[cfg(feature = "http")]
+use mq_bridge::models::{Endpoint, EndpointType, HttpConfig};
+#[cfg(feature = "http")]
+use mq_bridge::traits::{MessageConsumer, MessageDisposition, MessagePublisher, Sent};
+#[cfg(feature = "http")]
+use mq_bridge::CanonicalMessage;
+#[cfg(feature = "http")]
+use mq_bridge::Route;
+#[cfg(feature = "http")]
+use std::collections::HashMap;
+#[cfg(feature = "http")]
+use std::convert::Infallible;
+#[cfg(feature = "http")]
+use std::net::SocketAddr;
+#[cfg(feature = "http")]
+use std::sync::Arc;
+
+#[cfg(feature = "http")]
+use bytes::Bytes;
+#[cfg(feature = "http")]
+use http_body_util::BodyExt;
+#[cfg(feature = "http")]
+use hyper::body::Incoming;
+#[cfg(feature = "http")]
+use hyper::service::service_fn;
+#[cfg(feature = "http")]
+use hyper::{Request, Response};
+#[cfg(feature = "http")]
+use hyper_util::client::legacy::connect::HttpConnector;
+#[cfg(feature = "http")]
+use hyper_util::rt::{TokioExecutor, TokioIo};
+#[cfg(feature = "http")]
+use hyper_util::server::conn::auto::Builder as AutoBuilder;
+
+#[cfg(not(feature = "http"))]
+fn main() {
+    eprintln!("mq_bridge_http_profile requires --features http");
+    std::process::exit(2);
+}
+
+#[cfg(feature = "http")]
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let args = ProfileArgs::parse();
+
+    if let Some(url) = args.client_url.clone() {
+        return run_rust_client(args, url).await;
+    }
+
+    if matches!(
+        args.mode,
+        ProfileMode::DirectConsumer
+            | ProfileMode::DirectConsumerAck
+            | ProfileMode::DirectConsumerFireForget
+    ) {
+        return run_direct_consumer(args).await;
+    }
+
+    if matches!(
+        args.mode,
+        ProfileMode::InlineResponse | ProfileMode::InlineBodyOnly
+    ) {
+        return run_inline_response(args).await;
+    }
+
+    if !matches!(
+        args.mode,
+        ProfileMode::Route | ProfileMode::RouteFireForget | ProfileMode::RouteHandler
+    ) {
+        return run_standalone_server(args).await;
+    }
+
+    let mut http = HttpConfig::new(format!("127.0.0.1:{}", args.port));
+    http.path = Some(args.path.clone());
+    http.method = Some("POST".to_string());
+    http.internal_buffer_size = Some(args.internal_buffer_size);
+    http.concurrency_limit = Some(args.concurrency_limit);
+    http.request_timeout_ms = Some(args.request_timeout_ms);
+    http.workers = Some(args.workers);
+    http.fire_and_forget = args.mode == ProfileMode::RouteFireForget;
+
+    let output = if args.mode == ProfileMode::RouteHandler {
+        let mut endpoint = Endpoint::new_response();
+        endpoint.handler = Some(Arc::new(|msg: CanonicalMessage| async move {
+            Ok(mq_bridge::traits::Handled::Publish(msg))
+        }));
+        endpoint
+    } else {
+        Endpoint::new_response()
+    };
+
+    let route = Route::new(Endpoint::new(EndpointType::Http(http)), output)
+        .with_concurrency(args.route_concurrency)
+        .with_commit_concurrency_limit(args.commit_concurrency_limit)
+        .with_batch_size(args.batch_size);
+
+    let handle = route.run("http_profile").await?;
+    println!(
+        "READY http://127.0.0.1:{}{} duration_s={}",
+        args.port, args.path, args.duration_s
+    );
+
+    tokio::time::sleep(std::time::Duration::from_secs(args.duration_s)).await;
+    handle.stop().await;
+    let _ = handle.join().await;
+    Ok(())
+}
+
+#[cfg(feature = "http")]
+struct ProfileArgs {
+    mode: ProfileMode,
+    port: u16,
+    path: String,
+    duration_s: u64,
+    route_concurrency: usize,
+    commit_concurrency_limit: usize,
+    batch_size: usize,
+    internal_buffer_size: usize,
+    concurrency_limit: usize,
+    request_timeout_ms: u64,
+    workers: usize,
+    client_url: Option<String>,
+    clients: usize,
+    header_count: usize,
+    expected_body: ExpectedBody,
+}
+
+#[cfg(feature = "http")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProfileMode {
+    Route,
+    RouteFireForget,
+    RouteHandler,
+    Immediate,
+    Metadata,
+    ChannelAck,
+    DirectConsumer,
+    DirectConsumerAck,
+    DirectConsumerFireForget,
+    InlineResponse,
+    InlineBodyOnly,
+}
+
+#[cfg(feature = "http")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExpectedBody {
+    Payload,
+    Ok,
+    MessageProcessed,
+    MessageAccepted,
+}
+
+#[cfg(feature = "http")]
+impl ProfileArgs {
+    fn parse() -> Self {
+        let mut args = Self {
+            mode: ProfileMode::Route,
+            port: 18080,
+            path: "/bench".to_string(),
+            duration_s: 45,
+            route_concurrency: 8,
+            commit_concurrency_limit: 1,
+            batch_size: 128,
+            internal_buffer_size: 65_536,
+            concurrency_limit: 512,
+            request_timeout_ms: 30_000,
+            workers: std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1),
+            client_url: None,
+            clients: 8,
+            header_count: 0,
+            expected_body: ExpectedBody::Payload,
+        };
+
+        let mut iter = std::env::args().skip(1);
+        while let Some(flag) = iter.next() {
+            match flag.as_str() {
+                "--mode" => args.mode = parse_mode(&next_value(&mut iter, &flag)),
+                "--client-url" => args.client_url = Some(next_value(&mut iter, &flag)),
+                "--clients" => args.clients = parse_next(&mut iter, &flag),
+                "--header-count" => args.header_count = parse_next(&mut iter, &flag),
+                "--expected-body" => {
+                    args.expected_body = parse_expected_body(&next_value(&mut iter, &flag))
+                }
+                "--port" => args.port = parse_next(&mut iter, &flag),
+                "--path" => args.path = next_value(&mut iter, &flag),
+                "--duration-s" => args.duration_s = parse_next(&mut iter, &flag),
+                "--route-concurrency" => args.route_concurrency = parse_next(&mut iter, &flag),
+                "--commit-concurrency-limit" => {
+                    args.commit_concurrency_limit = parse_next(&mut iter, &flag)
+                }
+                "--batch-size" => args.batch_size = parse_next(&mut iter, &flag),
+                "--internal-buffer-size" => {
+                    args.internal_buffer_size = parse_next(&mut iter, &flag)
+                }
+                "--concurrency-limit" => args.concurrency_limit = parse_next(&mut iter, &flag),
+                "--request-timeout-ms" => args.request_timeout_ms = parse_next(&mut iter, &flag),
+                "--workers" => args.workers = parse_next(&mut iter, &flag),
+                "--help" | "-h" => {
+                    print_help();
+                    std::process::exit(0);
+                }
+                other => {
+                    eprintln!("unknown argument: {other}");
+                    print_help();
+                    std::process::exit(2);
+                }
+            }
+        }
+
+        if !args.path.starts_with('/') {
+            args.path.insert(0, '/');
+        }
+        args
+    }
+}
+
+#[cfg(feature = "http")]
+fn parse_expected_body(value: &str) -> ExpectedBody {
+    match value {
+        "payload" => ExpectedBody::Payload,
+        "ok" => ExpectedBody::Ok,
+        "message-processed" | "message_processed" => ExpectedBody::MessageProcessed,
+        "message-accepted" | "message_accepted" => ExpectedBody::MessageAccepted,
+        other => {
+            eprintln!("invalid --expected-body: {other}");
+            print_help();
+            std::process::exit(2);
+        }
+    }
+}
+
+#[cfg(feature = "http")]
+fn parse_mode(value: &str) -> ProfileMode {
+    match value {
+        "route" => ProfileMode::Route,
+        "route-fire-forget" | "route_fire_forget" => ProfileMode::RouteFireForget,
+        "route-handler" | "route_handler" => ProfileMode::RouteHandler,
+        "immediate" => ProfileMode::Immediate,
+        "metadata" => ProfileMode::Metadata,
+        "channel-ack" | "channel_ack" => ProfileMode::ChannelAck,
+        "direct-consumer" | "direct_consumer" => ProfileMode::DirectConsumer,
+        "direct-consumer-ack" | "direct_consumer_ack" => ProfileMode::DirectConsumerAck,
+        "direct-consumer-fire-forget" | "direct_consumer_fire_forget" => {
+            ProfileMode::DirectConsumerFireForget
+        }
+        "inline-response" | "inline_response" => ProfileMode::InlineResponse,
+        "inline-body-only" | "inline_body_only" => ProfileMode::InlineBodyOnly,
+        other => {
+            eprintln!("invalid --mode: {other}");
+            print_help();
+            std::process::exit(2);
+        }
+    }
+}
+
+#[cfg(feature = "http")]
+fn next_value(iter: &mut impl Iterator<Item = String>, flag: &str) -> String {
+    iter.next().unwrap_or_else(|| {
+        eprintln!("missing value for {flag}");
+        std::process::exit(2);
+    })
+}
+
+#[cfg(feature = "http")]
+fn parse_next<T>(iter: &mut impl Iterator<Item = String>, flag: &str) -> T
+where
+    T: std::str::FromStr,
+    T::Err: std::fmt::Display,
+{
+    let value = next_value(iter, flag);
+    value.parse().unwrap_or_else(|err| {
+        eprintln!("invalid value for {flag}: {value} ({err})");
+        std::process::exit(2);
+    })
+}
+
+#[cfg(feature = "http")]
+fn print_help() {
+    eprintln!(
+        "Usage: mq_bridge_http_profile [--mode MODE] [--port PORT] [--duration-s SECONDS] [--path PATH]\n\
+         Options:\n\
+           --mode MODE                 route | route-fire-forget | route-handler | immediate | metadata | channel-ack | direct-consumer | direct-consumer-ack | direct-consumer-fire-forget | inline-response | inline-body-only (default route)\n\
+           --client-url URL            run Rust load client instead of server\n\
+           --clients N                 Rust load client concurrency (default 8)\n\
+           --header-count N            Add N synthetic request headers in Rust load client (default 0)\n\
+           --expected-body BODY        payload | ok | message-processed | message-accepted (default payload)\n\
+           --route-concurrency N       default 8\n\
+           --commit-concurrency-limit N default 1\n\
+           --batch-size N              default 128\n\
+           --internal-buffer-size N    default 65536\n\
+           --concurrency-limit N       default 512\n\
+           --request-timeout-ms N      default 30000\n\
+           --workers N                 default available parallelism"
+    );
+}
+
+#[cfg(feature = "http")]
+const PAYLOAD: &[u8] = br#"{"value":0}"#;
+
+#[cfg(feature = "http")]
+type BoxBody = http_body_util::combinators::BoxBody<Bytes, Infallible>;
+
+#[cfg(feature = "http")]
+type AckMessage = (
+    Bytes,
+    HashMap<String, String>,
+    tokio::sync::oneshot::Sender<()>,
+);
+
+#[cfg(feature = "http")]
+fn full<T: Into<Bytes>>(chunk: T) -> BoxBody {
+    http_body_util::Full::new(chunk.into()).boxed()
+}
+
+#[cfg(feature = "http")]
+async fn run_standalone_server(args: ProfileArgs) -> anyhow::Result<()> {
+    let addr: SocketAddr = format!("127.0.0.1:{}", args.port).parse()?;
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let bound_addr = listener.local_addr()?;
+    let channel_tx = if args.mode == ProfileMode::ChannelAck {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<AckMessage>(args.internal_buffer_size);
+        tokio::spawn(async move {
+            while let Some((_payload, _metadata, ack)) = rx.recv().await {
+                let _ = ack.send(());
+            }
+        });
+        Some(tx)
+    } else {
+        None
+    };
+    let mode = args.mode;
+    let path = Arc::new(args.path.clone());
+    let duration_s = args.duration_s;
+
+    let shutdown = tokio::time::sleep(std::time::Duration::from_secs(duration_s));
+    tokio::pin!(shutdown);
+
+    println!(
+        "READY http://{}{} duration_s={} mode={:?}",
+        bound_addr, args.path, duration_s, mode
+    );
+
+    loop {
+        tokio::select! {
+            _ = &mut shutdown => break,
+            accepted = listener.accept() => {
+                let (stream, _) = accepted?;
+                let io = TokioIo::new(stream);
+                let tx = channel_tx.clone();
+                let path = path.clone();
+                tokio::spawn(async move {
+                    let service = service_fn(move |req| {
+                        profile_request(mode, path.clone(), tx.clone(), req)
+                    });
+                    let builder = AutoBuilder::new(TokioExecutor::new());
+                    let conn = builder.serve_connection(io, service);
+                    if let Err(err) = conn.await {
+                        eprintln!("standalone HTTP connection error: {err}");
+                    }
+                });
+            }
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(feature = "http")]
+async fn run_direct_consumer(args: ProfileArgs) -> anyhow::Result<()> {
+    let mut http = HttpConfig::new(format!("127.0.0.1:{}", args.port));
+    http.path = Some(args.path.clone());
+    http.method = Some("POST".to_string());
+    http.internal_buffer_size = Some(args.internal_buffer_size);
+    http.concurrency_limit = Some(args.concurrency_limit);
+    http.request_timeout_ms = Some(args.request_timeout_ms);
+    http.workers = Some(args.workers);
+    http.fire_and_forget = args.mode == ProfileMode::DirectConsumerFireForget;
+
+    let mut consumer = mq_bridge::endpoints::http::HttpConsumer::new(&http).await?;
+    let bound_addr = consumer
+        .bound_addr()
+        .map(|addr| addr.to_string())
+        .unwrap_or_else(|| format!("127.0.0.1:{}", args.port));
+    println!(
+        "READY http://{}{} duration_s={} mode={:?}",
+        bound_addr, args.path, args.duration_s, args.mode
+    );
+
+    let batch_size = args.batch_size;
+    let mode = args.mode;
+    let worker = tokio::spawn(async move {
+        loop {
+            let batch = consumer.receive_batch(batch_size).await?;
+            let dispositions = match mode {
+                ProfileMode::DirectConsumer => batch
+                    .messages
+                    .into_iter()
+                    .map(MessageDisposition::Reply)
+                    .collect::<Vec<_>>(),
+                ProfileMode::DirectConsumerAck => {
+                    vec![MessageDisposition::Ack; batch.messages.len()]
+                }
+                ProfileMode::DirectConsumerFireForget => {
+                    vec![MessageDisposition::Ack; batch.messages.len()]
+                }
+                _ => unreachable!("direct consumer runner called with non-direct mode"),
+            };
+            (batch.commit)(dispositions).await?;
+        }
+        #[allow(unreachable_code)]
+        anyhow::Ok(())
+    });
+
+    tokio::time::sleep(std::time::Duration::from_secs(args.duration_s)).await;
+    worker.abort();
+    let _ = worker.await;
+    Ok(())
+}
+
+#[cfg(feature = "http")]
+async fn run_inline_response(args: ProfileArgs) -> anyhow::Result<()> {
+    let addr: SocketAddr = format!("127.0.0.1:{}", args.port).parse()?;
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let bound_addr = listener.local_addr()?;
+    let publisher =
+        create_publisher_from_route("http_profile_inline", &Endpoint::new_response()).await?;
+    let path = Arc::new(args.path.clone());
+    let duration_s = args.duration_s;
+
+    let shutdown = tokio::time::sleep(std::time::Duration::from_secs(duration_s));
+    tokio::pin!(shutdown);
+
+    println!(
+        "READY http://{}{} duration_s={} mode={:?}",
+        bound_addr, args.path, duration_s, args.mode
+    );
+
+    loop {
+        tokio::select! {
+            _ = &mut shutdown => break,
+            accepted = listener.accept() => {
+                let (stream, _) = accepted?;
+                let io = TokioIo::new(stream);
+                let path = path.clone();
+                let publisher = publisher.clone();
+                let mode = args.mode;
+                tokio::spawn(async move {
+                    let service = service_fn(move |req| {
+                        inline_response_request(mode, path.clone(), publisher.clone(), req)
+                    });
+                    let builder = AutoBuilder::new(TokioExecutor::new());
+                    let conn = builder.serve_connection(io, service);
+                    if let Err(err) = conn.await {
+                        eprintln!("inline response HTTP connection error: {err}");
+                    }
+                });
+            }
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(feature = "http")]
+async fn profile_request(
+    mode: ProfileMode,
+    expected_path: Arc<String>,
+    tx: Option<tokio::sync::mpsc::Sender<AckMessage>>,
+    req: Request<Incoming>,
+) -> Result<Response<BoxBody>, Infallible> {
+    if req.uri().path() != expected_path.as_str() {
+        return Ok(Response::builder()
+            .status(404)
+            .body(full("not found"))
+            .unwrap());
+    }
+
+    let metadata = if matches!(mode, ProfileMode::Metadata | ProfileMode::ChannelAck) {
+        build_metadata(&req)
+    } else {
+        HashMap::new()
+    };
+
+    let payload = match req.into_body().collect().await {
+        Ok(collected) => collected.to_bytes(),
+        Err(_) => {
+            return Ok(Response::builder()
+                .status(500)
+                .body(full("body error"))
+                .unwrap());
+        }
+    };
+
+    if mode == ProfileMode::ChannelAck {
+        let Some(tx) = tx else {
+            return Ok(Response::builder()
+                .status(500)
+                .body(full("missing channel"))
+                .unwrap());
+        };
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+        if tx.send((payload, metadata, ack_tx)).await.is_err() {
+            return Ok(Response::builder()
+                .status(503)
+                .body(full("channel closed"))
+                .unwrap());
+        }
+        if ack_rx.await.is_err() {
+            return Ok(Response::builder()
+                .status(503)
+                .body(full("ack closed"))
+                .unwrap());
+        }
+    }
+
+    Ok(Response::new(full("ok")))
+}
+
+#[cfg(feature = "http")]
+async fn inline_response_request(
+    mode: ProfileMode,
+    expected_path: Arc<String>,
+    publisher: Arc<dyn MessagePublisher>,
+    req: Request<Incoming>,
+) -> Result<Response<BoxBody>, Infallible> {
+    if req.uri().path() != expected_path.as_str() {
+        return Ok(Response::builder()
+            .status(404)
+            .body(full("not found"))
+            .unwrap());
+    }
+
+    let mut metadata = build_metadata(&req);
+    metadata.insert("reply_to".to_string(), "__http_inline__".to_string());
+
+    let payload = match req.into_body().collect().await {
+        Ok(collected) => collected.to_bytes(),
+        Err(_) => {
+            return Ok(Response::builder()
+                .status(500)
+                .body(full("body error"))
+                .unwrap());
+        }
+    };
+
+    let mut message = CanonicalMessage::new_bytes(payload, None);
+    message.metadata = metadata;
+
+    let response = match publisher.send(message).await {
+        Ok(Sent::Response(message)) => {
+            let mut builder = Response::builder().status(200);
+            if mode == ProfileMode::InlineResponse {
+                for (key, value) in &message.metadata {
+                    if key.eq_ignore_ascii_case("http_status_code") {
+                        continue;
+                    }
+                    builder = builder.header(key.as_str(), value.as_str());
+                }
+            }
+            builder.body(full(message.payload)).unwrap()
+        }
+        Ok(Sent::Ack) => Response::builder()
+            .status(500)
+            .body(full("missing response"))
+            .unwrap(),
+        Err(err) => Response::builder()
+            .status(500)
+            .body(full(err.to_string()))
+            .unwrap(),
+    };
+
+    Ok(response)
+}
+
+#[cfg(feature = "http")]
+fn build_metadata(req: &Request<Incoming>) -> HashMap<String, String> {
+    let mut metadata = HashMap::with_capacity(req.headers().len() + 4);
+    metadata.insert("http_method".to_string(), req.method().as_str().to_string());
+    metadata.insert("http_path".to_string(), req.uri().path().to_string());
+    metadata.insert(
+        "http_query".to_string(),
+        req.uri().query().unwrap_or("").to_string(),
+    );
+    metadata.insert("http_version".to_string(), format!("{:?}", req.version()));
+
+    for (key, value) in req.headers() {
+        if let Ok(value) = value.to_str() {
+            metadata.insert(key.as_str().to_string(), value.to_string());
+        }
+    }
+
+    metadata
+}
+
+#[cfg(feature = "http")]
+async fn run_rust_client(args: ProfileArgs, url: String) -> anyhow::Result<()> {
+    let uri: hyper::Uri = url.parse()?;
+    let expected = match args.expected_body {
+        ExpectedBody::Payload => Bytes::from_static(PAYLOAD),
+        ExpectedBody::Ok => Bytes::from_static(b"ok"),
+        ExpectedBody::MessageProcessed => Bytes::from_static(b"Message processed"),
+        ExpectedBody::MessageAccepted => Bytes::from_static(b"Message accepted for processing"),
+    };
+    let duration = std::time::Duration::from_secs(args.duration_s);
+    let stop_at = std::time::Instant::now() + duration;
+    let header_count = args.header_count;
+
+    let mut tasks = Vec::with_capacity(args.clients);
+    for _ in 0..args.clients {
+        let uri = uri.clone();
+        let expected = expected.clone();
+        tasks.push(tokio::spawn(async move {
+            let mut connector = HttpConnector::new();
+            connector.set_nodelay(true);
+            let client =
+                hyper_util::client::legacy::Client::builder(TokioExecutor::new()).build(connector);
+            let mut count = 0usize;
+
+            while std::time::Instant::now() < stop_at {
+                let mut request_builder = Request::builder()
+                    .method(hyper::Method::POST)
+                    .uri(uri.clone())
+                    .header("content-type", "application/json")
+                    .header("accept", "application/octet-stream");
+                for index in 0..header_count {
+                    request_builder =
+                        request_builder.header(format!("x-bench-{index}"), "bench-value");
+                }
+                let request = request_builder.body(http_body_util::Full::<Bytes>::new(
+                    Bytes::from_static(PAYLOAD),
+                ))?;
+                let response = client.request(request).await?;
+                if !response.status().is_success() {
+                    anyhow::bail!("HTTP {}", response.status());
+                }
+                let body = response.into_body().collect().await?.to_bytes();
+                if body != expected {
+                    anyhow::bail!("unexpected body: {:?}", body);
+                }
+                count += 1;
+            }
+
+            anyhow::Ok(count)
+        }));
+    }
+
+    let started_at = std::time::Instant::now();
+    let mut requests = 0usize;
+    for task in tasks {
+        requests += task.await??;
+    }
+    let elapsed = started_at.elapsed();
+    let rate = requests as f64 / elapsed.as_secs_f64();
+    println!(
+        "Rust load: {} requests in {:.2}s ({:.0} req/s)",
+        requests,
+        elapsed.as_secs_f64(),
+        rate
+    );
+    Ok(())
+}

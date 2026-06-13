@@ -39,3 +39,12 @@ tests/**/*.pkcs12
 # Serena + tokensave
 .serena
 .tokensave
+
+# Python packaging / local dev
+**/__pycache__/
+*.py[cod]
+*.so
+*.pyd
+.pytest_cache/
+python/mq-bridge-py/.venv/
+python/mq-bridge-py/dist/

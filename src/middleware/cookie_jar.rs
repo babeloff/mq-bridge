@@ -7,7 +7,7 @@ use crate::CanonicalMessage;
 use async_trait::async_trait;
 use std::any::Any;
 use std::collections::HashMap;
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 #[derive(Debug, Default, Clone)]
 struct SessionState {
@@ -19,15 +19,32 @@ type SessionStore = Arc<RwLock<SessionState>>;
 
 static SHARED_SESSION_STORES: OnceLock<RwLock<HashMap<String, SessionStore>>> = OnceLock::new();
 
+fn recover_read_lock<'a, T>(lock: &'a RwLock<T>, name: &str) -> RwLockReadGuard<'a, T> {
+    lock.read().unwrap_or_else(|poisoned| {
+        tracing::warn!(lock = name, "Recovering from poisoned read lock");
+        poisoned.into_inner()
+    })
+}
+
+fn recover_write_lock<'a, T>(lock: &'a RwLock<T>, name: &str) -> RwLockWriteGuard<'a, T> {
+    lock.write().unwrap_or_else(|poisoned| {
+        tracing::warn!(lock = name, "Recovering from poisoned write lock");
+        poisoned.into_inner()
+    })
+}
+
 fn get_or_create_session_store(shared_scope: Option<&str>) -> SessionStore {
     match shared_scope {
         Some(scope) => {
             let registry = SHARED_SESSION_STORES.get_or_init(|| RwLock::new(HashMap::new()));
-            if let Some(existing) = registry.read().unwrap().get(scope).cloned() {
+            if let Some(existing) = recover_read_lock(registry, "cookie_jar_registry")
+                .get(scope)
+                .cloned()
+            {
                 return existing;
             }
 
-            let mut writer = registry.write().unwrap();
+            let mut writer = recover_write_lock(registry, "cookie_jar_registry");
             writer
                 .entry(scope.to_string())
                 .or_insert_with(|| Arc::new(RwLock::new(SessionState::default())))
@@ -82,7 +99,7 @@ fn export_session_metadata(
         return;
     };
 
-    let snapshot = store.read().unwrap().clone();
+    let snapshot = recover_read_lock(store, "cookie_jar_session").clone();
     for (key, value) in snapshot.cookies {
         metadata.insert(format!("{prefix}cookie.{key}"), value);
     }
@@ -98,7 +115,7 @@ fn capture_session_inputs(
     set_cookie_metadata_key: &str,
     capture_metadata_keys: &[String],
 ) {
-    let mut state = store.write().unwrap();
+    let mut state = recover_write_lock(store, "cookie_jar_session");
 
     if let Some(cookie_header) = metadata.get(cookie_metadata_key) {
         for (name, value) in parse_cookie_header(cookie_header) {
@@ -125,7 +142,7 @@ fn inject_session_metadata(
     cookie_metadata_key: &str,
     inject_metadata: &HashMap<String, String>,
 ) {
-    let snapshot = store.read().unwrap().clone();
+    let snapshot = recover_read_lock(store, "cookie_jar_session").clone();
 
     if !metadata.contains_key(cookie_metadata_key) {
         if let Some(cookie_header) = render_cookie_header(&snapshot.cookies) {

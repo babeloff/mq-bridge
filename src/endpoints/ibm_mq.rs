@@ -30,6 +30,72 @@ use std::{sync::Arc, thread, time::Duration};
 use tokio::sync::{mpsc, oneshot, Semaphore};
 use tracing::{debug, info, trace, warn};
 
+// Module-level constants
+const STATUS_TIMEOUT_SECS: u64 = 1;
+const RECONNECT_DELAY_SECS: u64 = 1;
+const MQ_CERT_VAL_POLICY_NONE: i32 = 2;
+
+/// Macro to perform backout with consistent logging
+macro_rules! backout_with_logging {
+    ($qm:expr, $context:expr) => {
+        match Syncpoint::new($qm).backout() {
+            Ok(_) => debug!("Backout {} succeeded", $context),
+            Err(e) => warn!("Backout {} FAILED (messages may be lost): {}", $context, e),
+        }
+    };
+}
+
+/// Helper function to handle status requests with timeout
+async fn handle_status_request<T>(
+    tx: &mpsc::Sender<T>,
+    job_constructor: impl FnOnce(oneshot::Sender<EndpointStatus>) -> T,
+    endpoint_type: &str,
+    target: &str,
+) -> EndpointStatus {
+    let (reply_tx, reply_rx) = oneshot::channel();
+    let send_result = tokio::time::timeout(
+        Duration::from_secs(STATUS_TIMEOUT_SECS),
+        tx.send(job_constructor(reply_tx)),
+    )
+    .await;
+
+    match send_result {
+        Ok(Ok(_)) => {}
+        Ok(Err(_)) => {
+            return EndpointStatus {
+                healthy: false,
+                target: target.to_string(),
+                error: Some(format!("{} thread disconnected", endpoint_type)),
+                ..Default::default()
+            };
+        }
+        Err(_) => {
+            return EndpointStatus {
+                healthy: false,
+                target: target.to_string(),
+                error: Some("Status send timed out".to_string()),
+                ..Default::default()
+            };
+        }
+    }
+
+    match tokio::time::timeout(Duration::from_secs(STATUS_TIMEOUT_SECS), reply_rx).await {
+        Ok(Ok(status)) => status,
+        Ok(Err(_)) => EndpointStatus {
+            healthy: false,
+            target: target.to_string(),
+            error: Some(format!("{} thread dropped status request", endpoint_type)),
+            ..Default::default()
+        },
+        Err(_) => EndpointStatus {
+            healthy: false,
+            target: target.to_string(),
+            error: Some("Status check timed out".to_string()),
+            ..Default::default()
+        },
+    }
+}
+
 macro_rules! connect_mq {
     ($config:expr) => {
         (|| -> anyhow::Result<_> {
@@ -40,8 +106,6 @@ macro_rules! connect_mq {
             .context("Invalid queue manager name")?;
 
         let cipher_spec_str = $config.cipher_spec.as_deref().unwrap_or("");
-        let cipher_spec =
-            MqStr::<32>::try_from(cipher_spec_str).context("Invalid cipher spec")?;
 
         let mq_server_string = format!("{}/TCP/{}", $config.channel, $config.url);
         let mq_server =
@@ -54,32 +118,60 @@ macro_rules! connect_mq {
         };
 
         let (tls_opt, cipher_opt) = if $config.tls.required {
-            let key_repo_str = $config
-                .tls
-                .cert_file
-                .as_deref()
-                .ok_or_else(|| anyhow::anyhow!("TLS required but cert_file (KeyRepo) not provided"))?;
+            let cipher =
+                CipherSpec(MqStr::<32>::try_from(cipher_spec_str).context("Invalid cipher spec")?);
 
-            let key_repo = KeyRepo(MqStr::<256>::try_from(key_repo_str).context("Invalid Key Repo")?);
+            if let Some(key_repo_str) = $config.tls.cert_file.as_deref() {
+                let key_repo =
+                    KeyRepo(MqStr::<256>::try_from(key_repo_str).context("Invalid Key Repo")?);
+                let mut tls = Tls::new(&key_repo, None, &cipher);
 
-            let tls = Tls::new(&key_repo, None, &CipherSpec(cipher_spec));
+                if $config.tls.accept_invalid_certs {
+                    tls.cert_val_policy(MQ_CERT_VAL_POLICY_NONE);
+                }
 
-            if let Some(_pass) = &$config.tls.cert_password {
-                warn!("IBM MQ key repository password is not supported in this build (requires mqc_9_3_0_0 feature)");
+                if let Some(_pass) = &$config.tls.cert_password {
+                    warn!("IBM MQ key repository password is not supported in this build (requires mqc_9_3_0_0 feature)");
+                }
+
+                (Some(tls), None)
+            } else {
+                let mut tls = Tls::default();
+
+                if $config.tls.accept_invalid_certs {
+                    tls.cert_val_policy(MQ_CERT_VAL_POLICY_NONE);
+                } else if $config.tls.ca_file.is_some() {
+                    anyhow::bail!(
+                        "IBM MQ TLS does not consume tls.ca_file directly; provide tls.cert_file as an MQ key repository or set tls.accept_invalid_certs=true"
+                    );
+                } else {
+                    anyhow::bail!(
+                        "TLS required but neither tls.cert_file (MQ key repository) nor tls.accept_invalid_certs was provided"
+                    );
+                }
+
+                if let Some(_pass) = &$config.tls.cert_password {
+                    warn!("IBM MQ key repository password is not supported in this build (requires mqc_9_3_0_0 feature)");
+                }
+
+                (Some(tls), Some(cipher))
             }
-            (Some(tls), None)
         } else {
-            (None, Some(CipherSpec(cipher_spec)))
+            (
+                None,
+                Some(CipherSpec(
+                    MqStr::<32>::try_from(cipher_spec_str).context("Invalid cipher spec")?,
+                )),
+            )
         };
 
         let opts = (
-            constants::MQCNO_STANDARD_BINDING,
             ApplName(mqstr!("mq-bridge")),
+            tls_opt,
             QueueManagerName(qm_name),
             credentials,
-            mq_server,
-            tls_opt,
             cipher_opt,
+            mq_server,
         );
 
         mqi::connect::<ThreadNone>(&opts)
@@ -99,6 +191,7 @@ enum PublisherJob {
 
 pub struct IbmMqPublisher {
     tx: mpsc::Sender<PublisherJob>,
+    target: String,
 }
 
 impl IbmMqPublisher {
@@ -107,6 +200,11 @@ impl IbmMqPublisher {
         let (tx, mut rx) = mpsc::channel::<PublisherJob>(buffer_size);
         let (init_tx, init_rx) = oneshot::channel();
         let config = config.clone();
+        let target = config
+            .queue
+            .clone()
+            .or(config.topic.clone())
+            .unwrap_or_default();
         info!("Starting IBM MQ publisher");
 
         thread::spawn(move || {
@@ -119,7 +217,7 @@ impl IbmMqPublisher {
                             let _ = tx.send(Err(PublisherError::Retryable(e)));
                             return;
                         }
-                        thread::sleep(Duration::from_secs(1));
+                        thread::sleep(Duration::from_secs(RECONNECT_DELAY_SECS));
                         continue;
                     }
                 };
@@ -155,7 +253,7 @@ impl IbmMqPublisher {
                             let _ = tx.send(Err(PublisherError::Retryable(e)));
                             return;
                         }
-                        thread::sleep(Duration::from_secs(1));
+                        thread::sleep(Duration::from_secs(RECONNECT_DELAY_SECS));
                         continue;
                     }
                 };
@@ -193,10 +291,7 @@ impl IbmMqPublisher {
                                             "MQ commit failed: {}",
                                             e
                                         )));
-                                        match Syncpoint::new(&qm).backout() {
-                                            Ok(_) => debug!("Backout on reconnect succeeded"),
-                                            Err(e) => warn!("Backout on reconnect FAILED (messages may be lost): {}", e),
-                                        }
+                                        backout_with_logging!(&qm, "on commit failure");
                                     }
                                 }
                             } else if let Some(sp) = syncpoint {
@@ -248,6 +343,11 @@ impl IbmMqPublisher {
                         PublisherJob::Status(reply_tx) => {
                             let _ = reply_tx.send(EndpointStatus {
                                 healthy: false,
+                                target: config
+                                    .queue
+                                    .clone()
+                                    .or(config.topic.clone())
+                                    .unwrap_or_default(),
                                 error: Some("Publisher reconnecting".to_string()),
                                 ..Default::default()
                             });
@@ -259,19 +359,14 @@ impl IbmMqPublisher {
                     // This happens when the IbmMqPublisher struct is dropped.
                     // We should backout any transaction that might be open.
                     info!("IBM MQ publisher channel closed, backing out any active transaction before exiting thread.");
-                    match Syncpoint::new(&qm).backout() {
-                        Ok(_) => debug!("Backout on reconnect succeeded"),
-                        Err(e) => {
-                            warn!("Backout on reconnect FAILED (messages may be lost): {}", e)
-                        }
-                    }
+                    backout_with_logging!(&qm, "on channel close");
                     break;
                 }
             }
         });
 
         match init_rx.await {
-            Ok(Ok(())) => Ok(Self { tx }),
+            Ok(Ok(())) => Ok(Self { tx, target }),
             Ok(Err(e)) => Err(e),
             Err(_) => Err(PublisherError::Retryable(anyhow::anyhow!(
                 "MQ init thread panicked or dropped"
@@ -301,44 +396,7 @@ impl MessagePublisher for IbmMqPublisher {
     }
 
     async fn status(&self) -> EndpointStatus {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        let send_result = tokio::time::timeout(
-            Duration::from_secs(1),
-            self.tx.send(PublisherJob::Status(reply_tx)),
-        )
-        .await;
-
-        match send_result {
-            Ok(Ok(_)) => {}
-            Ok(Err(_)) => {
-                return EndpointStatus {
-                    healthy: false,
-                    error: Some("Publisher thread disconnected".to_string()),
-                    ..Default::default()
-                };
-            }
-            Err(_) => {
-                return EndpointStatus {
-                    healthy: false,
-                    error: Some("Status send timed out".to_string()),
-                    ..Default::default()
-                };
-            }
-        }
-
-        match tokio::time::timeout(Duration::from_secs(1), reply_rx).await {
-            Ok(Ok(status)) => status,
-            Ok(Err(_)) => EndpointStatus {
-                healthy: false,
-                error: Some("Publisher thread dropped status request".to_string()),
-                ..Default::default()
-            },
-            Err(_) => EndpointStatus {
-                healthy: false,
-                error: Some("Status check timed out".to_string()),
-                ..Default::default()
-            },
-        }
+        handle_status_request(&self.tx, PublisherJob::Status, "Publisher", &self.target).await
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -385,7 +443,7 @@ async fn spawn_consumer_thread(
                         let _ = tx.send(Err(ConsumerError::Connection(e)));
                         return;
                     }
-                    thread::sleep(Duration::from_secs(1));
+                    thread::sleep(Duration::from_secs(RECONNECT_DELAY_SECS));
                     continue;
                 }
             };
@@ -430,7 +488,7 @@ async fn spawn_consumer_thread(
                         let _ = tx.send(Err(ConsumerError::Connection(e)));
                         return;
                     }
-                    thread::sleep(Duration::from_secs(1));
+                    thread::sleep(Duration::from_secs(RECONNECT_DELAY_SECS));
                     continue;
                 }
             };
@@ -454,7 +512,6 @@ async fn spawn_consumer_thread(
                             let gmo = (
                                 constants::MQGMO_WAIT
                                     | constants::MQGMO_SYNCPOINT
-                                    | constants::MQGMO_CONVERT
                                     | constants::MQGMO_FAIL_IF_QUIESCING,
                                 get::GetWait::Wait(config.wait_timeout_ms),
                             );
@@ -494,13 +551,7 @@ async fn spawn_consumer_thread(
                             // we must backout any messages already retrieved in this syncpoint
                             // to ensure atomicity and avoid partial batch processing during shutdown.
                             warn!("Error during IBM MQ batch retrieval, backing out: {}", e);
-                            match Syncpoint::new(&qm).backout() {
-                                Ok(_) => debug!("Backout on reconnect succeeded"),
-                                Err(e) => warn!(
-                                    "Backout on reconnect FAILED (messages may be lost): {}",
-                                    e
-                                ),
-                            }
+                            backout_with_logging!(&qm, "on batch retrieval error");
                             connection_error = true;
                             let _ = reply_tx.send(Err(e));
                         } else if !messages.is_empty() {
@@ -540,13 +591,7 @@ async fn spawn_consumer_thread(
                                 .is_err()
                             {
                                 warn!("Consumer dropped reply channel, backing out transaction");
-                                match Syncpoint::new(&qm).backout() {
-                                    Ok(_) => debug!("Backout on reconnect succeeded"),
-                                    Err(e) => warn!(
-                                        "Backout on reconnect FAILED (messages may be lost): {}",
-                                        e
-                                    ),
-                                }
+                                backout_with_logging!(&qm, "on dropped reply channel");
                             }
                         } else {
                             let _ = reply_tx.send(Ok(ReceivedBatch {
@@ -632,12 +677,7 @@ async fn spawn_consumer_thread(
 
                 if connection_error {
                     warn!("Connection error detected in consumer thread, backing out any active transaction before reconnecting.");
-                    if let Err(e) = Syncpoint::new(&qm).backout() {
-                        warn!(
-                            "Backout on reconnect failed (broker may have already cleaned up): {}",
-                            e
-                        );
-                    }
+                    backout_with_logging!(&qm, "on reconnect");
                     break;
                 }
             }
@@ -647,10 +687,7 @@ async fn spawn_consumer_thread(
                 // This happens when the IbmMqConsumer struct is dropped.
                 // We should backout any active transaction before exiting.
                 info!("IBM MQ consumer channel closed, backing out any active transaction before exiting thread.");
-                match Syncpoint::new(&qm).backout() {
-                    Ok(_) => debug!("Backout on reconnect succeeded"),
-                    Err(e) => warn!("Backout on reconnect FAILED (messages may be lost): {}", e),
-                }
+                backout_with_logging!(&qm, "on channel close");
                 break;
             }
         }
@@ -668,6 +705,7 @@ async fn spawn_consumer_thread(
 pub struct IbmMqConsumer {
     tx: mpsc::Sender<ConsumerJob>,
     permit: Arc<tokio::sync::Semaphore>,
+    target: String,
 }
 
 #[async_trait]
@@ -716,44 +754,13 @@ impl MessageConsumer for IbmMqConsumer {
     }
 
     async fn status(&self) -> EndpointStatus {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        let send_result = tokio::time::timeout(
-            Duration::from_secs(1),
-            self.tx.send(ConsumerJob::Status { reply_tx }),
+        handle_status_request(
+            &self.tx,
+            |reply_tx| ConsumerJob::Status { reply_tx },
+            "Consumer",
+            &self.target,
         )
-        .await;
-
-        match send_result {
-            Ok(Ok(_)) => {}
-            Ok(Err(_)) => {
-                return EndpointStatus {
-                    healthy: false,
-                    error: Some("Consumer thread disconnected".to_string()),
-                    ..Default::default()
-                };
-            }
-            Err(_) => {
-                return EndpointStatus {
-                    healthy: false,
-                    error: Some("Status send timed out".to_string()),
-                    ..Default::default()
-                };
-            }
-        }
-
-        match tokio::time::timeout(Duration::from_secs(1), reply_rx).await {
-            Ok(Ok(status)) => status,
-            Ok(Err(_)) => EndpointStatus {
-                healthy: false,
-                error: Some("Consumer thread dropped status request".to_string()),
-                ..Default::default()
-            },
-            Err(_) => EndpointStatus {
-                healthy: false,
-                error: Some("Status check timed out".to_string()),
-                ..Default::default()
-            },
-        }
+        .await
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -767,6 +774,11 @@ impl IbmMqConsumer {
         Ok(Self {
             tx,
             permit: Arc::new(Semaphore::new(1)),
+            target: config
+                .queue
+                .clone()
+                .or(config.topic.clone())
+                .unwrap_or_default(),
         })
     }
 }
