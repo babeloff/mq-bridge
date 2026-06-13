@@ -13,7 +13,7 @@ use crate::CanonicalMessage;
 use anyhow::{anyhow, Context};
 use async_trait::async_trait;
 use sqlx::any::AnyPoolOptions;
-use sqlx::{AnyPool, Row};
+use sqlx::{AnyPool, AssertSqlSafe, Row};
 use std::time::Duration;
 use tracing::{info, trace, warn};
 
@@ -62,6 +62,10 @@ fn contains_payload_clause(query: &str) -> bool {
         }
     }
     false
+}
+
+fn audited_sql(sql: &str) -> AssertSqlSafe<&str> {
+    AssertSqlSafe(sql)
 }
 
 fn build_sqlx_url_with_tls(config: &SqlxConfig) -> anyhow::Result<String> {
@@ -199,7 +203,10 @@ impl SqlxPublisher {
             };
 
             if !create_table_query.is_empty() {
-                if let Err(e) = sqlx::query(&create_table_query).execute(&pool).await {
+                if let Err(e) = sqlx::query(audited_sql(&create_table_query))
+                    .execute(&pool)
+                    .await
+                {
                     warn!(
                         "Failed to auto-create table '{}': {}. Please ensure it exists.",
                         config.table, e
@@ -233,7 +240,10 @@ impl SqlxPublisher {
                     };
 
                     if !create_index_query.is_empty() {
-                        if let Err(e) = sqlx::query(&create_index_query).execute(&pool).await {
+                        if let Err(e) = sqlx::query(audited_sql(&create_index_query))
+                            .execute(&pool)
+                            .await
+                        {
                             let driver_lc = driver_name.to_lowercase();
                             if (driver_lc.contains("mysql") || driver_lc.contains("mariadb"))
                                 && e.as_database_error()
@@ -274,7 +284,7 @@ impl SqlxPublisher {
 impl MessagePublisher for SqlxPublisher {
     async fn send(&self, message: CanonicalMessage) -> Result<Sent, PublisherError> {
         trace!(message_id = %format!("{:032x}", message.message_id), table = %self.table, "Publishing to SQL");
-        sqlx::query(&self.insert_query)
+        sqlx::query(audited_sql(&self.insert_query))
             .bind(message.payload.to_vec())
             .execute(&self.pool)
             .await
@@ -323,7 +333,7 @@ impl MessagePublisher for SqlxPublisher {
 
         let sql = format!("{} VALUES {}", base_query, placeholders);
 
-        let mut query = sqlx::query(&sql);
+        let mut query = sqlx::query(audited_sql(&sql));
         for msg in messages {
             query = query.bind(msg.payload.to_vec());
         }
@@ -368,7 +378,7 @@ impl SqlxPublisher {
             .await
             .map_err(|e| PublisherError::Retryable(anyhow!(e)))?;
         for msg in messages {
-            sqlx::query(&self.insert_query)
+            sqlx::query(audited_sql(&self.insert_query))
                 .bind(msg.payload.to_vec())
                 .execute(&mut *tx)
                 .await
@@ -494,7 +504,7 @@ impl SqlxConsumer {
             self.table
         );
 
-        let locked_ids: Vec<i64> = sqlx::query(&lock_query)
+        let locked_ids: Vec<i64> = sqlx::query(audited_sql(&lock_query))
             .bind(limit as i64)
             .fetch_all(&mut *tx)
             .await
@@ -519,7 +529,7 @@ impl SqlxConsumer {
             self.table, placeholders
         );
 
-        let mut query = sqlx::query(&update_query);
+        let mut query = sqlx::query(audited_sql(&update_query));
         for id in &locked_ids {
             query = query.bind(*id);
         }
@@ -535,7 +545,7 @@ impl SqlxConsumer {
             self.table, placeholders
         );
 
-        let mut query = sqlx::query(&select_query);
+        let mut query = sqlx::query(audited_sql(&select_query));
         for id in &locked_ids {
             query = query.bind(*id);
         }
@@ -570,7 +580,7 @@ impl SqlxConsumer {
             self.table
         );
 
-        let locked_ids: Vec<i64> = sqlx::query(&select_query)
+        let locked_ids: Vec<i64> = sqlx::query(audited_sql(&select_query))
             .bind(limit as i64)
             .fetch_all(&mut *tx)
             .await
@@ -594,7 +604,7 @@ impl SqlxConsumer {
             self.table, placeholders
         );
 
-        let mut query = sqlx::query(&update_query);
+        let mut query = sqlx::query(audited_sql(&update_query));
         for id in &locked_ids {
             query = query.bind(*id);
         }
@@ -607,7 +617,7 @@ impl SqlxConsumer {
             "SELECT id, payload FROM {} WHERE id IN ({})",
             self.table, placeholders
         );
-        let mut query = sqlx::query(&select_payload_query);
+        let mut query = sqlx::query(audited_sql(&select_payload_query));
         for id in &locked_ids {
             query = query.bind(*id);
         }
@@ -639,7 +649,9 @@ impl SqlxConsumer {
             _ => anyhow::bail!("Unsupported driver for pending count: {}", self.driver_name),
         };
 
-        let row: sqlx::any::AnyRow = sqlx::query(&query).fetch_one(&self.pool).await?;
+        let row: sqlx::any::AnyRow = sqlx::query(audited_sql(&query))
+            .fetch_one(&self.pool)
+            .await?;
         if let Ok(c) = row.try_get::<i64, _>(0) {
             usize::try_from(c).map_err(|e| anyhow!("i64 to usize conversion failed: {}", e))
         } else {
@@ -659,18 +671,20 @@ impl MessageConsumer for SqlxConsumer {
         }
         loop {
             let rows = match self.driver_name.as_str() {
-                "PostgreSQL" | "Microsoft SQL Server" => sqlx::query(&self.select_query)
-                    .bind(max_messages as i64)
-                    .fetch_all(&self.pool)
-                    .await
-                    .map_err(|e| ConsumerError::Connection(anyhow!(e)))?,
+                "PostgreSQL" | "Microsoft SQL Server" => {
+                    sqlx::query(audited_sql(&self.select_query))
+                        .bind(max_messages as i64)
+                        .fetch_all(&self.pool)
+                        .await
+                        .map_err(|e| ConsumerError::Connection(anyhow!(e)))?
+                }
                 "MySQL" | "MariaDB" => self.fetch_and_lock_mysql(max_messages).await?,
                 "SQLite" => self.fetch_and_lock_sqlite(max_messages).await?,
                 _ => {
                     // Fallback for unknown drivers with a simple, non-locking read.
                     warn!("SQLx consumer for driver '{}' is using a non-locking read strategy. This is not safe for concurrent consumers.", self.driver_name);
                     let final_query = format!("{} LIMIT ?", self.select_query);
-                    sqlx::query(&final_query)
+                    sqlx::query(audited_sql(&final_query))
                         .bind(max_messages as i64)
                         .fetch_all(&self.pool)
                         .await
@@ -747,7 +761,7 @@ impl MessageConsumer for SqlxConsumer {
 
                             let mut attempts = 0;
                             loop {
-                                let mut query = sqlx::query(&sql);
+                                let mut query = sqlx::query(audited_sql(&sql));
                                 for id in &ids_to_ack {
                                     query = query.bind(*id);
                                 }

@@ -86,7 +86,7 @@ tracing-subscriber = { version = "0.3", features = ["json", "env-filter"], optio
 # --- Optional Endpoint Dependencies ---
 
 # Kafka
-rdkafka = { version = "0.38", features = ["tokio"], optional = true }
+rdkafka = { version = "0.39", features = ["tokio"], optional = true }
 
 # AMQP (RabbitMQ).
 # Drop lapin's default `rustls` feature (it pulls aws_lc_rs via amq-protocol);
@@ -97,7 +97,7 @@ lapin = { version = "3.7", default-features = false, features = ["default-runtim
 mongodb = { version = "3.6", optional = true, features = ["cert-key-password"] }
 
 # NATS
-async-nats = { version = "0.48", optional = true }
+async-nats = { version = "0.49", optional = true }
 
 # MQTT.
 # `use-rustls-no-provider` pulls tokio-rustls without a crypto provider (its
@@ -125,10 +125,10 @@ aws-sdk-sqs = { version = "1.92", optional = true, default-features = false, fea
 aws-sdk-sns = { version = "1.93", optional = true, default-features = false, features = ["rt-tokio", "rustls"] }
 
 # SQLx
-sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "mysql", "sqlite", "any"], optional = true }
+sqlx = { version = "0.9", features = ["runtime-tokio", "tls-rustls", "postgres", "mysql", "sqlite", "any"], optional = true }
 
 # ZeroMQ
-zeromq = { version = "0.4", optional = true }
+zeromq = { version = "0.6", optional = true }
 
 # gRPC
 tonic = { version = "0.14", optional = true, default-features = false, features = ["codegen", "transport", "tls-webpki-roots"] }
@@ -195,13 +195,12 @@ chrono = "0.4"
 metrics-util = "0.20"
 criterion = { version = "0.8", features = ["async", "async_tokio"] }
 mq-bridge = { path = ".", features = ["test-utils", "rustls-ring"] }
-reqwest = { version = "0.12", features = ["stream"] }
+reqwest = { version = "0.13", features = ["stream"] }
 
 # TLS test helpers
-rcgen = "0.9"
+rcgen = "0.14"
 tokio-rustls = { version = "0.26", features = ["ring"] }
 rustls = { version = "0.23", features = ["ring"] }
-rustls-pemfile = "2.2"
 
 [[bench]]
 name = "performance_bench"
@@ -213,6 +212,6 @@ name = "integration_test"
 required-features = ["test-utils"]
 
 [target.'cfg(windows)'.dependencies.rdkafka]
-version = "0.38"
+version = "0.39"
 features = ["cmake-build", "tokio"]
 optional = true

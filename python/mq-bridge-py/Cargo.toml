@@ -18,7 +18,7 @@ async-trait.workspace = true
 bytes = { workspace = true, features = ["serde"] }
 fast-uuid-v7.workspace = true
 mq-bridge = { path = "../.." }
-pyo3 = { version = "0.28.3", features = ["abi3-py38"] }
+pyo3 = { version = "0.29.0", features = ["abi3-py38"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 serde_yaml_ng.workspace = true
@@ -31,7 +31,7 @@ tracing.workspace = true
 # when combined with `extension-module` + `auto-initialize`. Keeping it as a
 # dev-dependency feature applies it to test/bench/example builds only.
 [dev-dependencies]
-pyo3 = { version = "0.28.3", features = ["abi3-py38", "auto-initialize"] }
+pyo3 = { version = "0.29.0", features = ["abi3-py38", "auto-initialize"] }
 
 [features]
 default = ["full"]
