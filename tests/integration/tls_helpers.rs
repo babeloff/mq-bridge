@@ -83,6 +83,8 @@ pub fn ibm_mq_config_with_tls(
     cfg.tls.cert_file = Some(cert_dir.join("client").to_string_lossy().into_owned());
     cfg.tls.required = true;
     cfg.cipher_spec = Some("ANY_TLS12".to_string());
+    // The default 4MB buffer yields empty payload reads in this TLS test setup.
+    cfg.max_message_size = 1024;
     cfg
 }
 
