@@ -20,7 +20,12 @@ RUN maturin build --release --no-default-features -F http -F pyo3/extension-modu
 FROM python:3.12-slim
 COPY --from=build /wheels/*.whl /wheels/
 RUN pip install --no-cache-dir /wheels/*.whl
-COPY server.py /app/server.py
+RUN groupadd --system mqbridge \
+    && useradd --system --gid mqbridge --home-dir /app --shell /usr/sbin/nologin mqbridge \
+    && mkdir -p /app \
+    && chown -R mqbridge:mqbridge /app
+COPY --chown=mqbridge:mqbridge server.py /app/server.py
 WORKDIR /app
 EXPOSE 8080
+USER mqbridge:mqbridge
 CMD ["python", "server.py"]

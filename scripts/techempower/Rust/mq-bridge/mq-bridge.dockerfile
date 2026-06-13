@@ -11,9 +11,12 @@ WORKDIR /src/scripts/techempower/Rust/mq-bridge
 RUN cargo build --release
 
 FROM debian:bookworm-slim
-COPY --from=build /src/scripts/techempower/Rust/mq-bridge/target/release/mq-bridge-techempower /usr/local/bin/mq-bridge-techempower
+RUN groupadd --system mqbridge \
+    && useradd --system --gid mqbridge --home-dir /nonexistent --shell /usr/sbin/nologin mqbridge
+COPY --from=build --chown=mqbridge:mqbridge /src/scripts/techempower/Rust/mq-bridge/target/release/mq-bridge-techempower /usr/local/bin/mq-bridge-techempower
 # TechEmpower runs the database as host `tfb-database`. Connection failure is
 # non-fatal, so the JSON/Plaintext tests still run if the DB is absent.
 ENV DATABASE_URL="postgres://benchmarkdbuser:benchmarkdbpass@tfb-database:5432/hello_world"
 EXPOSE 8080
+USER mqbridge:mqbridge
 CMD ["mq-bridge-techempower"]

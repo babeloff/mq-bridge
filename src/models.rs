@@ -1397,6 +1397,11 @@ impl<'de> Deserialize<'de> for MemoryConfig {
         }
 
         let raw = MemoryConfigSerde::deserialize(deserializer)?;
+        if raw.topic.is_empty() && raw.url.as_deref().map_or(true, str::is_empty) {
+            return Err(serde::de::Error::custom(
+                "MemoryConfig: 'topic' (or 'url' alias) is required.",
+            ));
+        }
         let topic = if raw.topic.is_empty() {
             raw.url.clone().unwrap_or_default()
         } else {
@@ -3137,6 +3142,14 @@ kafka_to_nats:
         assert!(!secrets.contains_key("MQB__PATH_AT_ROUTE__OUTPUT__HTTP__URL"));
         assert!(!secrets.contains_key("MQB__QUERY_AT_ROUTE__OUTPUT__HTTP__URL"));
         assert!(!secrets.contains_key("MQB__FRAGMENT_AT_ROUTE__OUTPUT__HTTP__URL"));
+    }
+
+    #[test]
+    fn test_memory_config_requires_topic_or_url() {
+        let err = serde_yaml_ng::from_str::<MemoryConfig>("{}").unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("MemoryConfig: 'topic' (or 'url' alias) is required."));
     }
 
     #[test]

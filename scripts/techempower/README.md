@@ -91,7 +91,7 @@ possible future throughput optimization for plaintext only.
 
 ## Layout
 
-```
+```text
 scripts/techempower/
   verify.sh                       # local conformance + optional wrk read
   postgres.yml                    # local Postgres for the /db tests (not submitted)

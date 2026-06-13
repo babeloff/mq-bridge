@@ -443,7 +443,7 @@ async fn spawn_consumer_thread(
                         let _ = tx.send(Err(ConsumerError::Connection(e)));
                         return;
                     }
-                    thread::sleep(Duration::from_secs(1));
+                    thread::sleep(Duration::from_secs(RECONNECT_DELAY_SECS));
                     continue;
                 }
             };
