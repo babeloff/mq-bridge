@@ -447,8 +447,8 @@ impl MessageConsumer for MqttListener {
 
                 for (((reply_topic, correlation_data), ack), disposition) in reply_infos
                     .into_iter()
-                    .zip(acks.into_iter())
-                    .zip(dispositions.into_iter())
+                    .zip(acks)
+                    .zip(dispositions)
                 {
                     let client = client.clone();
                     ack_futures.push(async move {
