@@ -83,6 +83,7 @@ pub struct StaticRequestConsumer {
     payload: Bytes,
     #[allow(dead_code)]
     content: String, // Kept for metadata/tracing if needed
+    metadata: std::collections::HashMap<String, String>,
 }
 
 impl StaticRequestConsumer {
@@ -90,6 +91,7 @@ impl StaticRequestConsumer {
         Ok(Self {
             payload: Bytes::copy_from_slice(config.body.as_bytes()),
             content: config.body.clone(),
+            metadata: config.metadata.clone(),
         })
     }
 }
@@ -97,7 +99,8 @@ impl StaticRequestConsumer {
 #[async_trait]
 impl MessageConsumer for StaticRequestConsumer {
     async fn receive(&mut self) -> Result<Received, ConsumerError> {
-        let message = CanonicalMessage::new_bytes(self.payload.clone(), None);
+        let mut message = CanonicalMessage::new_bytes(self.payload.clone(), None);
+        message.metadata = self.metadata.clone();
         trace!(message_id = %format!("{:032x}", message.message_id), "Producing static message");
         let commit = Box::new(|_disposition: MessageDisposition| {
             Box::pin(async { Ok(()) }) as BoxFuture<'static, anyhow::Result<()>>
@@ -113,7 +116,9 @@ impl MessageConsumer for StaticRequestConsumer {
         // Each message still involves cloning the payload and generating a new UUID.
         let mut messages = Vec::with_capacity(_max_messages);
         for _ in 0.._max_messages {
-            messages.push(CanonicalMessage::new_bytes(self.payload.clone(), None));
+            let mut message = CanonicalMessage::new_bytes(self.payload.clone(), None);
+            message.metadata = self.metadata.clone();
+            messages.push(message);
         }
         // For a static consumer, committing is a no-op, so we provide a simple async no-op closure.
         let commit = Box::new(|_disposition: Vec<MessageDisposition>| {

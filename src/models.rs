@@ -1542,9 +1542,19 @@ fn memory_config_schema_transform(schema: &mut schemars::Schema) {
         "url".to_string(),
         serde_json::json!({
             "description": "Alias for `topic`. Use either `topic` or `url`.",
-            "type": "string"
+            "type": "string",
+            "minLength": 1
         }),
     );
+
+    // Mirror the runtime check (see `MemoryConfig::deserialize`): an empty
+    // `topic`/`url` is rejected, so the schema must require a non-empty value.
+    if let Some(topic) = properties
+        .get_mut("topic")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        topic.insert("minLength".to_string(), serde_json::json!(1));
+    }
 
     schema_obj.insert(
         "anyOf".to_string(),
