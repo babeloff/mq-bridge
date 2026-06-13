@@ -191,6 +191,10 @@ impl PublishConfirmer {
     }
 }
 
+fn should_fail_outstanding_on_connack(has_seen_connack: bool, session_present: bool) -> bool {
+    has_seen_connack && !session_present
+}
+
 struct MqttState {
     client: Client,
     _stop_tx: mpsc::Sender<()>,
@@ -815,6 +819,7 @@ async fn run_eventloop(
     confirmer: Option<Arc<PublishConfirmer>>,
 ) {
     let mut stopping = false;
+    let mut has_seen_connack = false;
     // A future that is always pending until we decide to start the timeout
     let mut flush_timeout: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> =
         Box::pin(futures::future::pending());
@@ -852,11 +857,20 @@ async fn run_eventloop(
                                 }
                                 rumqttc::Incoming::ConnAck(ack) => {
                                     is_connected.store(true, Ordering::Relaxed);
+                                    let fail_outstanding = should_fail_outstanding_on_connack(
+                                        has_seen_connack,
+                                        ack.session_present,
+                                    );
+                                    has_seen_connack = true;
                                     if !ack.session_present {
-                                        // Fresh session: the broker dropped any in-flight
-                                        // publishes, so fail outstanding confirmations for retry.
-                                        if let Some(c) = &confirmer {
-                                            c.fail_all();
+                                        // Only a post-startup fresh session implies the broker
+                                        // discarded previously in-flight publishes. On the first
+                                        // ConnAck, current-session publishes may already be queued
+                                        // locally before the handshake completes.
+                                        if fail_outstanding {
+                                            if let Some(c) = &confirmer {
+                                                c.fail_all();
+                                            }
                                         }
                                         if let Some((client, topic, qos)) = &subscription_info {
                                             let client = client.clone();
@@ -911,11 +925,20 @@ async fn run_eventloop(
                                     }
                                     rumqttc::v5::Event::Incoming(rumqttc::v5::Incoming::ConnAck(ack)) => {
                                         is_connected.store(true, Ordering::Relaxed);
+                                        let fail_outstanding = should_fail_outstanding_on_connack(
+                                            has_seen_connack,
+                                            ack.session_present,
+                                        );
+                                        has_seen_connack = true;
                                         if !ack.session_present {
-                                            // Fresh session: broker dropped in-flight
-                                            // publishes; fail outstanding confirmations.
-                                            if let Some(c) = &confirmer {
-                                                c.fail_all();
+                                            // Only a post-startup fresh session implies the broker
+                                            // discarded previously in-flight publishes. On the
+                                            // first ConnAck, current-session publishes may already
+                                            // be queued locally before the handshake completes.
+                                            if fail_outstanding {
+                                                if let Some(c) = &confirmer {
+                                                    c.fail_all();
+                                                }
                                             }
                                             if let Some((client, topic, qos)) = &subscription_info {
                                                 let client = client.clone();
@@ -1155,5 +1178,43 @@ fn parse_qos(qos: u8) -> QoS {
         1 => QoS::AtLeastOnce,
         2 => QoS::ExactlyOnce,
         _ => QoS::AtLeastOnce,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{should_fail_outstanding_on_connack, PublishConfirmer};
+
+    #[tokio::test]
+    async fn initial_connack_without_session_does_not_fail_current_publish() {
+        let confirmer = PublishConfirmer::default();
+        let rx = confirmer.register();
+
+        let mut has_seen_connack = false;
+        let fail_outstanding = should_fail_outstanding_on_connack(has_seen_connack, false);
+        has_seen_connack = true;
+        if fail_outstanding {
+            confirmer.fail_all();
+        }
+
+        confirmer.on_outgoing_publish(42);
+        confirmer.settle(42, true);
+
+        assert!(has_seen_connack);
+        assert!(rx.await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn later_fresh_session_fails_outstanding_publish() {
+        let confirmer = PublishConfirmer::default();
+        let rx = confirmer.register();
+
+        let fail_outstanding = should_fail_outstanding_on_connack(true, false);
+        assert!(fail_outstanding);
+        if fail_outstanding {
+            confirmer.fail_all();
+        }
+
+        assert!(!rx.await.unwrap());
     }
 }

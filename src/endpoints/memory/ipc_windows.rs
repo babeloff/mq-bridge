@@ -18,7 +18,7 @@ use tokio::net::windows::named_pipe::{
     ClientOptions, NamedPipeClient, NamedPipeServer, ServerOptions,
 };
 use tokio::sync::Mutex;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 /// Windows Named Pipe transport for local IPC
 #[derive(Clone)]
@@ -235,7 +235,7 @@ mod tests {
         let client = client_task.await.unwrap();
 
         // Send from client
-        let msg = CanonicalMessage::default();
+        let msg = CanonicalMessage::from_vec(b"test");
         client.send_batch(vec![msg.clone()]).await.unwrap();
 
         // Receive on server
