@@ -5,7 +5,7 @@
 # released tag (replace `python` below with e.g. `v0.2.16`).
 FROM rust:1-bookworm AS build
 
-ARG MQB_REF=python
+ARG MQB_REF=v0.2.16
 RUN git clone --depth 1 -b "${MQB_REF}" https://github.com/marcomq/mq-bridge /src
 WORKDIR /src/scripts/techempower/Rust/mq-bridge
 RUN cargo build --release
