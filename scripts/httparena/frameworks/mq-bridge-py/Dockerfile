@@ -18,10 +18,15 @@ WORKDIR /src/python/mq-bridge-py
 RUN maturin build --release --no-default-features -F http -F pyo3/extension-module -o /wheels
 
 FROM python:3.12-slim
-COPY --from=build /wheels/*.whl /wheels/
+RUN groupadd --system appuser \
+    && useradd --system --gid appuser --create-home --home-dir /home/appuser --shell /usr/sbin/nologin appuser \
+    && mkdir -p /app /wheels \
+    && chown -R appuser:appuser /app /wheels
+COPY --from=build --chown=appuser:appuser /wheels/*.whl /wheels/
 # psycopg[binary] powers the optional /async-db profile; absent DATABASE_URL it is unused.
 RUN pip install --no-cache-dir /wheels/*.whl "psycopg[binary]>=3.1" "psycopg_pool>=3.2"
 WORKDIR /app
-COPY server.py /app/server.py
+COPY --chown=appuser:appuser server.py /app/server.py
 EXPOSE 8080
+USER appuser:appuser
 CMD ["python", "server.py"]

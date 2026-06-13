@@ -30,11 +30,10 @@ jobs:
             target: x86_64
             args: --release --out dist --find-interpreter --no-default-features
           - package: mq-bridge-py-basic
-            # aarch64 basic builds natively on an arm64 runner: even with the
-            # ring crypto provider (no aws-lc), ring's ARM assembly does not
-            # cross-compile in the manylinux container ("ARM assembler must
-            # define __ARM_ARCH"). Native build sidesteps all cross-compile of
-            # native C/asm. (No armv7 row: GitHub has no native armv7 runner.)
+            # Build the aarch64 basic wheel on a native arm64 runner to avoid
+            # ring/aws-lc-sys cross-toolchain issues in manylinux containers.
+            # If maturin's manylinux:auto still selects a container that
+            # reintroduces those issues, pin manylinux to a specific version.
             pyproject: pyproject-basic.toml
             runner: ubuntu-24.04-arm
             os: linux

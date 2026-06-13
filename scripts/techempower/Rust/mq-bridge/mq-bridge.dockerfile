@@ -1,8 +1,8 @@
 # TechEmpower Docker image for the mq-bridge (Rust) entry.
 #
 # The crate uses a path dependency on the mq-bridge repo, so we clone the repo
-# and build this example from inside it. For the upstream PR, pin the clone to a
-# released tag (replace `python` below with e.g. `v0.2.16`).
+# and build this example from inside it. For the upstream PR, the clone is
+# pinned to released tag v0.2.16; update when a newer release tag exists.
 FROM rust:1-bookworm AS build
 
 ARG MQB_REF=v0.2.16

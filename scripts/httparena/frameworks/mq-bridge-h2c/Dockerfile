@@ -8,6 +8,9 @@ COPY src ./src
 RUN RUSTFLAGS="-C target-cpu=native" cargo build --release
 
 FROM debian:bookworm-slim
-COPY --from=build /app/target/release/httparena-mqbridge-h2c /server
+RUN groupadd --system mqbridge \
+    && useradd --system --gid mqbridge --home-dir /nonexistent --shell /usr/sbin/nologin mqbridge
+COPY --from=build --chown=mqbridge:mqbridge /app/target/release/httparena-mqbridge-h2c /server
 EXPOSE 8082
+USER mqbridge:mqbridge
 CMD ["/server"]

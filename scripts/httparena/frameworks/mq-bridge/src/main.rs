@@ -296,7 +296,12 @@ async fn main() -> anyhow::Result<()> {
     let key = std::env::var("TLS_KEY").unwrap_or_else(|_| "/certs/server.key".to_string());
     if Path::new(&cert).is_file() && Path::new(&key).is_file() {
         // rustls needs a process-default crypto provider before any TLS endpoint.
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        match rustls::crypto::ring::default_provider().install_default() {
+            Ok(()) => {}
+            Err(provider) => eprintln!(
+                "rustls ring crypto provider was not installed; a process default is already set (attempted provider: {provider:?})"
+            ),
+        }
         let tls_listen =
             std::env::var("MQB_TLS_LISTEN").unwrap_or_else(|_| "0.0.0.0:8443".to_string());
         let mut tls = TlsConfig::new();

@@ -3,7 +3,7 @@ name = "mq-bridge"
 version.workspace = true
 edition = "2021"
 authors = ["Marco Mengelkoch"]
-rust-version = "1.75"  # 2021 edition was released in 1.56
+rust-version = "1.75"  # Base crate MSRV; optional amqp/http features need Rust 1.85.
 description = "An asynchronous message bridging library connecting Kafka, MQTT, AMQP, NATS, MongoDB, HTTP, and more."
 repository = "https://github.com/marcomq/mq-bridge"
 license = "MIT"
@@ -44,10 +44,10 @@ serde = { workspace = true, features = ["derive"] }
 anyhow.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time", "fs", "io-util", "net", "signal"] }
 # Note on MSRV for optional features:
-# The "http" feature (actix-web) and "aws" feature (aws-sdk-*) may require a newer Rust version than the crate MSRV (1.75).
-# - "http" (actix-web 4.x) typically requires Rust 1.75+.
-# - "aws" (aws-sdk-*) typically requires Rust 1.75+.
-# Use `rustup override set stable` or a `rust-toolchain.toml` file to use a compatible toolchain when enabling these features.
+# The base crate keeps MSRV 1.75 with default = [].
+# - "amqp" (lapin 4.10) and "http" (hyper-rustls 0.27) require Rust 1.85+.
+# - "aws" (aws-sdk-*) may require a newer stable toolchain than the base MSRV.
+# Use `rustup override set stable` or a `rust-toolchain.toml` file when enabling these features.
 async-trait.workspace = true
 serde_json.workspace = true
 thiserror = "2.0"

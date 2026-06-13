@@ -10,7 +10,7 @@ services:
       - MYSQL_USER=testuser
       - MYSQL_PASSWORD=testpass
     healthcheck:
-      test: ["CMD-SHELL", "mariadb-admin ping -h localhost -u root -p$$MYSQL_ROOT_PASSWORD"]
+      test: ["CMD-SHELL", "mariadb-admin ping -h 127.0.0.1 -u testuser -ptestpass"]
       interval: 5s
       timeout: 10s
       retries: 20
