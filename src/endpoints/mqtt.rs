@@ -445,10 +445,8 @@ impl MessageConsumer for MqttListener {
                 }
                 let mut ack_futures = Vec::with_capacity(dispositions.len());
 
-                for (((reply_topic, correlation_data), ack), disposition) in reply_infos
-                    .into_iter()
-                    .zip(acks)
-                    .zip(dispositions)
+                for (((reply_topic, correlation_data), ack), disposition) in
+                    reply_infos.into_iter().zip(acks).zip(dispositions)
                 {
                     let client = client.clone();
                     ack_futures.push(async move {
