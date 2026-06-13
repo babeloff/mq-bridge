@@ -99,6 +99,12 @@ fn armature_messaging_test() {
 
     println!("Patching {:?} for API compatibility...", source_path);
     let content = fs::read_to_string(&source_path).expect("Failed to read mq_bridge.rs");
+    let memory_config_count = content.matches("MemoryConfig {").count();
+    assert_eq!(
+        memory_config_count, 1,
+        "expected exactly one `MemoryConfig {{` to patch in {:?}, found {} (upstream source may have changed)",
+        source_path, memory_config_count
+    );
     let new_content = content
             .replace("(received.commit)(None)", "(received.commit)(None.into())")
             .replace(
