@@ -26,6 +26,11 @@ use tokio::sync::RwLock;
 use tracing::{error, info, trace};
 use uuid::Uuid;
 
+/// Maximum time to wait for a broker publisher confirmation before treating the
+/// publish as failed. Prevents the producer from hanging indefinitely when the
+/// connection drops and the confirm future never resolves.
+const CONFIRM_TIMEOUT: Duration = Duration::from_secs(5);
+
 struct AmqpState {
     connection: Connection,
     channel: Channel,
@@ -203,14 +208,22 @@ impl MessagePublisher for AmqpPublisher {
         };
 
         if !self.delayed_ack {
-            // Wait for the broker's publisher confirmation.
-            let confirm = match confirmation.await {
-                Ok(c) => c,
-                Err(e) => {
+            // Wait for the broker's publisher confirmation. Bound the wait so a
+            // dropped connection (where the confirm future may never resolve)
+            // can't hang the producer indefinitely; instead reconnect and retry.
+            let confirm = match tokio::time::timeout(CONFIRM_TIMEOUT, confirmation).await {
+                Ok(Ok(c)) => c,
+                Ok(Err(e)) => {
                     self.reconnect().await;
                     return Err(PublisherError::Retryable(anyhow!(
                         "Failed to get AMQP publisher confirmation: {}",
                         e
+                    )));
+                }
+                Err(_) => {
+                    self.reconnect().await;
+                    return Err(PublisherError::Retryable(anyhow!(
+                        "Timed out waiting for AMQP publisher confirmation"
                     )));
                 }
             };
@@ -292,8 +305,10 @@ impl MessagePublisher for AmqpPublisher {
         }
 
         for (message, confirmation) in pending_confirms {
-            match confirmation.await {
-                Ok(confirm) => {
+            // Bound each confirm wait so a dropped connection (where the confirm
+            // future may never resolve) can't hang the producer indefinitely.
+            match tokio::time::timeout(CONFIRM_TIMEOUT, confirmation).await {
+                Ok(Ok(confirm)) => {
                     if let Confirmation::Nack(_) = confirm {
                         failed_messages.push((
                             message,
@@ -301,12 +316,20 @@ impl MessagePublisher for AmqpPublisher {
                         ));
                     }
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     failed_messages.push((
                         message,
                         PublisherError::Retryable(anyhow::anyhow!(
                             "Publisher confirmation failed: {}",
                             e
+                        )),
+                    ));
+                }
+                Err(_) => {
+                    failed_messages.push((
+                        message,
+                        PublisherError::Retryable(anyhow::anyhow!(
+                            "Timed out waiting for AMQP publisher confirmation"
                         )),
                     ));
                 }
