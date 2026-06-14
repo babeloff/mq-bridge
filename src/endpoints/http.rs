@@ -1476,6 +1476,11 @@ fn make_response(
 
             let mut has_content_type = false;
             let mut is_streaming = false;
+            // An application may pre-encode the body itself (e.g. serving a cached,
+            // already-gzipped payload). When it sets `content-encoding` on the reply
+            // we honor that: forward the header and skip the server's own compression
+            // pass, so the body is never double-encoded.
+            let mut preset_encoding: Option<String> = None;
             for (key, value) in &msg.metadata {
                 if request_metadata
                     .is_some_and(|metadata| request_metadata_matches(metadata, key, value))
@@ -1490,6 +1495,10 @@ fn make_response(
                 } else if key.eq_ignore_ascii_case("transfer-encoding") && value.contains("chunked")
                 {
                     is_streaming = true;
+                } else if key.eq_ignore_ascii_case("content-encoding")
+                    && !value.trim().eq_ignore_ascii_case("identity")
+                {
+                    preset_encoding = Some(value.clone());
                 }
 
                 if !key.eq_ignore_ascii_case("content-encoding")
@@ -1504,13 +1513,19 @@ fn make_response(
                 builder = builder.header("content-type", "application/octet-stream");
             }
 
-            // Compress payload only if enabled, beneficial, and the client
-            // advertised it can decode gzip (RFC 9110 §12.5.3).
-            let (payload_out, was_compressed) = compress_if_needed(
-                msg.payload,
-                compression_enabled && client_accepts_gzip,
-                compression_threshold_bytes,
-            )?;
+            // Compress payload only if the application did not pre-encode it, and
+            // only when enabled, beneficial, and the client advertised it can
+            // decode gzip (RFC 9110 §12.5.3).
+            let (payload_out, was_compressed) = if let Some(encoding) = preset_encoding {
+                builder = builder.header("Content-Encoding", encoding);
+                (msg.payload, false)
+            } else {
+                compress_if_needed(
+                    msg.payload,
+                    compression_enabled && client_accepts_gzip,
+                    compression_threshold_bytes,
+                )?
+            };
 
             if was_compressed {
                 builder = builder.header("Content-Encoding", "gzip");
