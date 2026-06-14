@@ -38,6 +38,29 @@ const CONFIRM_TIMEOUT: Duration = Duration::from_secs(5);
 /// route would never get the error it needs to reconnect.
 const CONSUMER_HEALTH_POLL: Duration = Duration::from_secs(1);
 
+/// Maximum time any single connection-setup step (connect, create_channel,
+/// confirm_select, declares, qos, consume) may take. In lapin 4 a
+/// `Connection::connect` can return `Ok` on a socket the broker immediately
+/// force-closes; the io_loop then aborts recovery and any subsequent channel
+/// operation on that connection never resolves. Without a bound, the
+/// publisher's `reconnect` parks inside `connect` holding the state write lock
+/// forever and the whole producer wedges. Bounding each step lets the attempt
+/// fail and be retried against a fresh connection.
+const SETUP_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Bounds a single lapin setup operation, turning a hang or error into a
+/// retryable failure. See [`SETUP_TIMEOUT`].
+async fn with_setup_timeout<T>(
+    op: &str,
+    fut: impl std::future::Future<Output = Result<T, lapin::Error>>,
+) -> anyhow::Result<T> {
+    match tokio::time::timeout(SETUP_TIMEOUT, fut).await {
+        Ok(Ok(v)) => Ok(v),
+        Ok(Err(e)) => Err(anyhow!("AMQP {op} failed: {e}")),
+        Err(_) => Err(anyhow!("AMQP {op} timed out after {SETUP_TIMEOUT:?}")),
+    }
+}
+
 struct AmqpState {
     connection: Connection,
     channel: Channel,
@@ -96,18 +119,21 @@ impl AmqpPublisher {
             .as_deref()
             .ok_or_else(|| anyhow!("Queue name is required for AMQP publisher"))?;
         let conn = create_amqp_connection(config).await?;
-        let channel = conn.create_channel().await?;
+        let channel = with_setup_timeout("create_channel", conn.create_channel()).await?;
         // Enable publisher confirms on this channel to allow waiting for acks.
-        channel
-            .confirm_select(lapin::options::ConfirmSelectOptions::default())
-            .await?;
+        with_setup_timeout(
+            "confirm_select",
+            channel.confirm_select(lapin::options::ConfirmSelectOptions::default()),
+        )
+        .await?;
 
         if !config.no_declare_queue {
             if config.subscribe_mode {
                 let exchange_name = config.exchange.as_deref().unwrap_or(queue_or_exchange);
                 info!(exchange = %exchange_name, "Declaring AMQP Fanout exchange in sink");
-                channel
-                    .exchange_declare(
+                with_setup_timeout(
+                    "exchange_declare",
+                    channel.exchange_declare(
                         exchange_name.into(),
                         ExchangeKind::Fanout,
                         ExchangeDeclareOptions {
@@ -115,21 +141,24 @@ impl AmqpPublisher {
                             ..Default::default()
                         },
                         FieldTable::default(),
-                    )
-                    .await?;
+                    ),
+                )
+                .await?;
             } else {
                 // Ensure the queue exists before we try to publish to it. This is idempotent.
                 info!(queue = %queue_or_exchange, "Declaring AMQP queue in sink");
-                channel
-                    .queue_declare(
+                with_setup_timeout(
+                    "queue_declare",
+                    channel.queue_declare(
                         queue_or_exchange.into(),
                         QueueDeclareOptions {
                             durable: !config.no_persistence,
                             ..Default::default()
                         },
                         FieldTable::default(),
-                    )
-                    .await?;
+                    ),
+                )
+                .await?;
             }
         }
 
@@ -455,7 +484,7 @@ impl AmqpConsumer {
             .as_deref()
             .ok_or_else(|| anyhow!("Queue name is required for AMQP consumer"))?;
         let conn = create_amqp_connection(config).await?;
-        let channel = conn.create_channel().await?;
+        let channel = with_setup_timeout("create_channel", conn.create_channel()).await?;
 
         let is_subscriber = config.subscribe_mode;
 
@@ -463,8 +492,9 @@ impl AmqpConsumer {
             // Subscriber mode: Declare Fanout exchange and temporary queue
             let exchange_name = config.exchange.as_deref().unwrap_or(queue_or_exchange);
             info!(exchange = %exchange_name, "Declaring AMQP Fanout exchange for subscriber");
-            channel
-                .exchange_declare(
+            with_setup_timeout(
+                "exchange_declare",
+                channel.exchange_declare(
                     exchange_name.into(),
                     ExchangeKind::Fanout,
                     ExchangeDeclareOptions {
@@ -472,13 +502,15 @@ impl AmqpConsumer {
                         ..Default::default()
                     },
                     FieldTable::default(),
-                )
-                .await?;
+                ),
+            )
+            .await?;
 
             let id = fast_uuid_v7::gen_id_string();
             let queue_name_str = format!("{}-{}-{}", APP_NAME, queue_or_exchange, id);
-            let queue = channel
-                .queue_declare(
+            let queue = with_setup_timeout(
+                "queue_declare",
+                channel.queue_declare(
                     queue_name_str.clone().into(),
                     QueueDeclareOptions {
                         exclusive: true,
@@ -486,34 +518,39 @@ impl AmqpConsumer {
                         ..Default::default()
                     },
                     FieldTable::default(),
-                )
-                .await?;
+                ),
+            )
+            .await?;
             let q_name = queue.name().as_str().to_string();
 
             info!(queue = %q_name, exchange = %exchange_name, "Binding temporary queue to exchange");
-            channel
-                .queue_bind(
+            with_setup_timeout(
+                "queue_bind",
+                channel.queue_bind(
                     q_name.clone().into(),
                     exchange_name.into(),
                     "".into(),
                     QueueBindOptions::default(),
                     FieldTable::default(),
-                )
-                .await?;
+                ),
+            )
+            .await?;
             q_name
         } else {
             // Consumer mode: Declare durable queue
             info!(queue = %queue_or_exchange, "Declaring AMQP queue");
-            channel
-                .queue_declare(
+            with_setup_timeout(
+                "queue_declare",
+                channel.queue_declare(
                     queue_or_exchange.into(),
                     QueueDeclareOptions {
                         durable: !config.no_persistence,
                         ..Default::default()
                     },
                     FieldTable::default(),
-                )
-                .await?;
+                ),
+            )
+            .await?;
             queue_or_exchange.to_string()
         };
 
@@ -521,9 +558,11 @@ impl AmqpConsumer {
         // We'll get the concurrency from the route config, but for now, let's use a reasonable default
         // that can be overridden by a new method.
         let prefetch_count = config.prefetch_count.unwrap_or(100);
-        channel
-            .basic_qos(prefetch_count, BasicQosOptions::default())
-            .await?;
+        with_setup_timeout(
+            "basic_qos",
+            channel.basic_qos(prefetch_count, BasicQosOptions::default()),
+        )
+        .await?;
 
         let consumer_tag = if is_subscriber {
             format!("{}_sub_{}", APP_NAME, fast_uuid_v7::gen_id_str())
@@ -532,14 +571,16 @@ impl AmqpConsumer {
         };
         info!(queue = %queue_name, consumer_tag = %consumer_tag, "Starting AMQP consumer");
 
-        let consumer = channel
-            .basic_consume(
+        let consumer = with_setup_timeout(
+            "basic_consume",
+            channel.basic_consume(
                 queue_name.clone().into(),
                 consumer_tag.into(),
                 BasicConsumeOptions::default(),
                 FieldTable::default(),
-            )
-            .await?;
+            ),
+        )
+        .await?;
 
         Ok(Self {
             _conn: conn,
@@ -568,28 +609,32 @@ async fn create_amqp_connection(config: &AmqpConfig) -> anyhow::Result<Connectio
     }
     let conn_uri = url.to_string();
 
-    let mut last_error = None;
+    let mut last_error: Option<anyhow::Error> = None;
     for attempt in 1..=5 {
         // Avoid logging credentials embedded in URLs.
         info!(attempt = attempt, "Attempting to connect to AMQP broker");
         let conn_props = ConnectionProperties::default();
+        // Bound the connect itself: a hung TLS/AMQP handshake against a broker
+        // that is restarting must not stall the reconnect indefinitely.
         let result = if config.tls.required {
             let tls_config = build_tls_config(config).await?;
-            DefaultConnectionBuilder::new()?
+            let builder = DefaultConnectionBuilder::new()?
                 .with_uri_str(conn_uri.clone())
                 .with_properties(conn_props)
-                .with_tls_config(tls_config)
-                .connect()
-                .await
+                .with_tls_config(tls_config);
+            with_setup_timeout("connect", builder.connect()).await
         } else {
-            Connection::connect(&conn_uri, conn_props).await
+            with_setup_timeout("connect", Connection::connect(&conn_uri, conn_props)).await
         };
 
         match result {
             Ok(conn) => return Ok(conn),
             Err(e) => {
                 last_error = Some(e);
-                tokio::time::sleep(Duration::from_secs(attempt * 2)).await; // Exponential backoff
+                // No need to back off after the final attempt.
+                if attempt < 5 {
+                    tokio::time::sleep(Duration::from_secs(attempt * 2)).await; // Exponential backoff
+                }
             }
         }
     }
