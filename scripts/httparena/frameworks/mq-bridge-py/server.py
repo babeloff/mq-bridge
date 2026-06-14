@@ -32,7 +32,9 @@ from __future__ import annotations
 
 import json as _json
 import os
+import signal
 import tempfile
+import time
 from pathlib import Path
 from urllib.parse import parse_qs
 
@@ -47,7 +49,12 @@ JSON_META = {"content-type": "application/json", "Server": SERVER}
 TEXT_META = {"content-type": "text/plain", "Server": SERVER}
 NOT_FOUND_META = {"content-type": "text/plain", "Server": SERVER, "http_status_code": "404"}
 
-CONFIG = f"""
+def _config(http_workers: int) -> str:
+    # `http_workers` is the number of accept loops (each its own SO_REUSEPORT
+    # listener) inside this process. When we fan out across processes we keep
+    # this small (the single Python worker is the per-process bottleneck); in
+    # single-process mode we use all cores, matching the previous default.
+    return f"""
 routes:
   httparena:
     concurrency: 1
@@ -55,6 +62,7 @@ routes:
     input:
       http:
         url: "{LISTEN}"
+        workers: {http_workers}
         concurrency_limit: 65536
         internal_buffer_size: 16384
         inline_response_fast_path: true
@@ -221,14 +229,97 @@ def handle(message: Message) -> Message:
     return Message(b"Not Found", NOT_FOUND_META)
 
 
-def main() -> None:
+def _run_worker(http_workers: int) -> None:
+    # Per-process setup: the Postgres pool (background threads) and the Rust
+    # runtime must be created AFTER any fork, never inherited across it.
     global _POOL
     _POOL = _init_pool()
     with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
-        f.write(CONFIG)
+        f.write(_config(http_workers))
         config_path = f.name
     route = Route.from_yaml(config_path, "httparena").with_handler(handle)
     route.run()
+
+
+def _worker_count() -> int:
+    # One Python worker per process is the per-core ceiling (one GIL each), so
+    # we scale across cores with OS processes co-binding the same SO_REUSEPORT
+    # port. MQB_WORKERS overrides; <=0 means "all cores".
+    try:
+        n = int(os.environ.get("MQB_WORKERS", "0"))
+    except ValueError:
+        n = 0
+    return n if n > 0 else (os.cpu_count() or 1)
+
+
+def _set_pdeathsig() -> None:
+    # Linux best-effort: have the kernel kill this child if the supervisor dies,
+    # so workers are never orphaned. No-op elsewhere.
+    try:
+        import ctypes
+
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        PR_SET_PDEATHSIG = 1
+        libc.prctl(PR_SET_PDEATHSIG, signal.SIGKILL)
+    except Exception:  # noqa: BLE001 - purely advisory
+        pass
+
+
+def main() -> None:
+    workers = _worker_count()
+    if workers <= 1 or not hasattr(os, "fork"):
+        # Single process: use all cores for HTTP accept loops (prior default).
+        _run_worker(os.cpu_count() or 1)
+        return
+
+    # Fan out one serving process per core. Fork BEFORE creating the pool / Rust
+    # runtime so each child starts single-threaded (forking a multi-threaded
+    # process is unsafe). Each process keeps a small number of accept loops and
+    # SO_REUSEPORT balances connections across all of them. The parent stays a
+    # dedicated supervisor: it never calls route.run(), so its Python signal
+    # handler is not clobbered by the Rust runtime's own signal handling.
+    per_proc_http_workers = 2
+    children: list[int] = []
+    for _ in range(workers):
+        pid = os.fork()
+        if pid == 0:
+            _set_pdeathsig()
+            _run_worker(per_proc_http_workers)  # never returns
+            os._exit(0)
+        children.append(pid)
+
+    def _shutdown(_signum=None, _frame=None):
+        for pid in children:
+            try:
+                os.kill(pid, signal.SIGTERM)  # workers exit gracefully on TERM
+            except ProcessLookupError:
+                pass
+        deadline = time.monotonic() + 5.0
+        for pid in children:
+            while True:
+                try:
+                    done, _ = os.waitpid(pid, os.WNOHANG)
+                except ChildProcessError:
+                    break
+                if done or time.monotonic() > deadline:
+                    break
+                time.sleep(0.05)
+        for pid in children:  # escalate to anything still standing
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        raise SystemExit(0)
+
+    signal.signal(signal.SIGTERM, _shutdown)
+    signal.signal(signal.SIGINT, _shutdown)
+    # Block here; if any worker dies unexpectedly, tear the whole group down so
+    # the orchestrator restarts a clean set rather than a degraded one.
+    try:
+        os.wait()
+    except ChildProcessError:
+        pass
+    _shutdown()
 
 
 if __name__ == "__main__":

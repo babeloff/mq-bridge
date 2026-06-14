@@ -28,5 +28,13 @@ RUN pip install --no-cache-dir /wheels/*.whl "psycopg[binary]>=3.1" "psycopg_poo
 WORKDIR /app
 COPY --chown=appuser:appuser server.py /app/server.py
 EXPOSE 8080
+# Take CPython's cyclic GC off the request hot path: the JSON handlers allocate
+# many short-lived dicts/lists per request (no reference cycles), so disabling
+# the periodic collector removes its scan overhead with no leak. `count` is the
+# safe alternative if a handler ever introduces cycles.
+ENV MQ_BRIDGE_PY_GC_MODE=off
+# Scale Python across cores with one process per core (single GIL each),
+# co-binding port 8080 via SO_REUSEPORT. Unset/0 => all cores; set 1 to disable.
+ENV MQB_WORKERS=0
 USER appuser:appuser
 CMD ["python", "server.py"]
