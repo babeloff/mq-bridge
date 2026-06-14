@@ -97,7 +97,7 @@ scripts/httparena/frameworks/
 ## Submitting upstream
 
 1. Pin the version: each Rust `Cargo.toml` and the Python `Dockerfile` reference
-   this repo at tag `v0.2.16` — bump to the release you want to benchmark.
+   this repo at tag `v0.2.17` — bump to the release you want to benchmark.
 2. Fork `MDA2AV/HttpArena` and copy each `scripts/httparena/frameworks/<name>/`
    into the fork's `frameworks/<name>/`.
 3. On the PR, validate and benchmark per framework:

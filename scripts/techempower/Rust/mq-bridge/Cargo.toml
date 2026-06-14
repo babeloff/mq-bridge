@@ -6,7 +6,7 @@
 #
 # For the upstream FrameworkBenchmarks PR, replace the path dependency with a
 # pinned git/crates.io release, e.g.
-#   mq-bridge = { git = "https://github.com/marcomq/mq-bridge", tag = "v0.2.16", default-features = false, features = ["http"] }
+#   mq-bridge = { git = "https://github.com/marcomq/mq-bridge", tag = "v0.2.17", default-features = false, features = ["http"] }
 [package]
 name = "mq-bridge-techempower"
 version = "0.1.0"
