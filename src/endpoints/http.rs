@@ -1482,12 +1482,23 @@ fn make_response(
             // pass, so the body is never double-encoded.
             let mut preset_encoding: Option<String> = None;
             for (key, value) in &msg.metadata {
-                if request_metadata
-                    .is_some_and(|metadata| request_metadata_matches(metadata, key, value))
+                let is_content_type = key.eq_ignore_ascii_case("content-type");
+                // Request-echo suppression drops reply metadata that byte-matches the
+                // incoming request header of the same name, so pure passthrough/echo
+                // routes don't re-emit unchanged request headers (e.g. `x-request-id`).
+                // `content-type` is exempt: it describes the *response* representation,
+                // so when it is present on the reply it must always be sent — even when
+                // it happens to equal the request's `Content-Type` (e.g. a handler that
+                // explicitly replies `text/plain` to a `text/plain` request). Without
+                // this exemption such a reply would be suppressed and fall back to
+                // `application/octet-stream`.
+                if !is_content_type
+                    && request_metadata
+                        .is_some_and(|metadata| request_metadata_matches(metadata, key, value))
                 {
                     continue;
                 }
-                if key.eq_ignore_ascii_case("content-type") {
+                if is_content_type {
                     has_content_type = true;
                     if value.contains("text/event-stream") {
                         is_streaming = true;
@@ -3211,9 +3222,14 @@ http_route:
             .unwrap();
         let response = client.request(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+        // `content-type` describes the response representation and is exempt from
+        // request-echo suppression: the echoed body is the JSON request body, so the
+        // reply correctly carries `application/json` rather than falling back to
+        // `application/octet-stream`. Arbitrary request headers such as `x-request-id`
+        // are still suppressed.
         assert_eq!(
             response.headers().get("content-type").unwrap(),
-            "application/octet-stream"
+            "application/json"
         );
         assert!(response.headers().get("x-request-id").is_none());
         let body = response.into_body().collect().await.unwrap().to_bytes();
@@ -3376,6 +3392,62 @@ http_route:
         assert!(response.headers().get("x-request-id").is_none());
         let body = response.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(body, Bytes::from_static(b"handled-response"));
+
+        handle.stop().await;
+        let _ = handle.join().await;
+    }
+
+    #[tokio::test]
+    async fn test_http_route_handler_content_type_matching_request_is_not_suppressed() {
+        // Regression: a handler-set reply `content-type` whose value byte-matches the
+        // request's `Content-Type` must still be sent. Request-echo suppression must
+        // not drop it and fall back to `application/octet-stream`.
+        use crate::traits::Handled;
+
+        init_crypto();
+        let port = get_free_port();
+        let addr = format!("127.0.0.1:{}", port);
+
+        let input = Endpoint::new(EndpointType::Http(HttpConfig {
+            url: addr.clone(),
+            path: Some("/ct-match".to_string()),
+            ..Default::default()
+        }));
+        let mut output = Endpoint::new(EndpointType::Response(
+            crate::models::ResponseConfig::default(),
+        ));
+        let handler = |mut msg: CanonicalMessage| async move {
+            msg.payload = Bytes::from_static(b"42");
+            msg.metadata
+                .insert("content-type".to_string(), "text/plain".to_string());
+            Ok(Handled::Publish(msg))
+        };
+        output.handler = Some(std::sync::Arc::new(handler));
+
+        let route = crate::Route::new(input, output);
+        let handle = route.run("test_http_inline_ct_match").await.unwrap();
+
+        let mut connector = HttpConnector::new();
+        connector.set_nodelay(true);
+        let client =
+            hyper_util::client::legacy::Client::builder(TokioExecutor::new()).build(connector);
+        // The request `Content-Type` is byte-equal to the handler's reply value.
+        let request = Request::builder()
+            .method(hyper::Method::POST)
+            .uri(format!("http://{addr}/ct-match"))
+            .header("content-type", "text/plain")
+            .body(http_body_util::Full::<Bytes>::new(Bytes::from_static(
+                b"20",
+            )))
+            .unwrap();
+        let response = client.request(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get("content-type").unwrap(),
+            "text/plain"
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(body, Bytes::from_static(b"42"));
 
         handle.stop().await;
         let _ = handle.join().await;
