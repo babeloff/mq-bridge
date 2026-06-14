@@ -8,7 +8,7 @@ use crate::CanonicalMessage;
 use crate::APP_NAME;
 use anyhow::{anyhow, bail, Context};
 use async_trait::async_trait;
-use futures::{FutureExt, StreamExt, TryStreamExt};
+use futures::{future::join_all, FutureExt, StreamExt, TryStreamExt};
 use lapin::tcp::{OwnedIdentity, OwnedTLSConfig};
 use lapin::{
     options::{
@@ -249,6 +249,7 @@ impl MessagePublisher for AmqpPublisher {
         }
 
         let channel = self.get_channel().await;
+        let mut pending_messages = Vec::with_capacity(messages.len());
         let mut pending_confirms = Vec::with_capacity(messages.len());
         let mut failed_messages = Vec::new();
 
@@ -291,7 +292,8 @@ impl MessagePublisher for AmqpPublisher {
                 .await
             {
                 Ok(confirmation) => {
-                    pending_confirms.push((message, confirmation));
+                    pending_messages.push(message);
+                    pending_confirms.push(confirmation);
                 }
                 Err(e) => {
                     failed_messages.push((
@@ -304,34 +306,45 @@ impl MessagePublisher for AmqpPublisher {
             }
         }
 
-        for (message, confirmation) in pending_confirms {
-            // Bound each confirm wait so a dropped connection (where the confirm
-            // future may never resolve) can't hang the producer indefinitely.
-            match tokio::time::timeout(CONFIRM_TIMEOUT, confirmation).await {
-                Ok(Ok(confirm)) => {
-                    if let Confirmation::Nack(_) = confirm {
-                        failed_messages.push((
-                            message,
-                            PublisherError::Retryable(anyhow::anyhow!("Broker Nacked the message")),
-                        ));
+        if !pending_confirms.is_empty() {
+            // Bound the whole batch, not each confirmation separately. A broker
+            // reset can otherwise stall for batch_size * CONFIRM_TIMEOUT before
+            // the route can reconnect and retry.
+            match tokio::time::timeout(CONFIRM_TIMEOUT, join_all(pending_confirms)).await {
+                Ok(confirmations) => {
+                    for (message, confirmation) in pending_messages.into_iter().zip(confirmations) {
+                        match confirmation {
+                            Ok(confirm) => {
+                                if let Confirmation::Nack(_) = confirm {
+                                    failed_messages.push((
+                                        message,
+                                        PublisherError::Retryable(anyhow::anyhow!(
+                                            "Broker Nacked the message"
+                                        )),
+                                    ));
+                                }
+                            }
+                            Err(e) => {
+                                failed_messages.push((
+                                    message,
+                                    PublisherError::Retryable(anyhow::anyhow!(
+                                        "Publisher confirmation failed: {}",
+                                        e
+                                    )),
+                                ));
+                            }
+                        }
                     }
                 }
-                Ok(Err(e)) => {
-                    failed_messages.push((
-                        message,
-                        PublisherError::Retryable(anyhow::anyhow!(
-                            "Publisher confirmation failed: {}",
-                            e
-                        )),
-                    ));
-                }
                 Err(_) => {
-                    failed_messages.push((
-                        message,
-                        PublisherError::Retryable(anyhow::anyhow!(
-                            "Timed out waiting for AMQP publisher confirmation"
-                        )),
-                    ));
+                    failed_messages.extend(pending_messages.into_iter().map(|message| {
+                        (
+                            message,
+                            PublisherError::Retryable(anyhow::anyhow!(
+                                "Timed out waiting for AMQP batch publisher confirmations"
+                            )),
+                        )
+                    }));
                 }
             }
         }
