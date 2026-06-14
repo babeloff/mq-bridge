@@ -2009,6 +2009,20 @@ impl GrpcConfig {
 
 // --- HTTP Specific Configuration ---
 
+/// Supported inbound HTTP protocols for server listeners.
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum HttpServerProtocol {
+    /// Accept both HTTP/1.1 and HTTP/2, matching the current default behavior.
+    #[default]
+    Auto,
+    /// Accept only HTTP/1.x connections.
+    Http1Only,
+    /// Accept only HTTP/2 connections.
+    Http2Only,
+}
+
 /// General HTTP connection configuration.
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
@@ -2045,6 +2059,11 @@ pub struct HttpConfig {
         schemars(default = "default_inline_response_fast_path_schema")
     )]
     pub inline_response_fast_path: Option<bool>,
+    /// (Consumer only) Restrict which HTTP protocol versions a server listener accepts.
+    /// Defaults to `auto` (HTTP/1.1 + HTTP/2). On cleartext listeners, `http2_only`
+    /// means HTTP/2 prior-knowledge (h2c) only.
+    #[serde(default)]
+    pub server_protocol: HttpServerProtocol,
     /// (Publisher only) Optional endpoint that receives streamed HTTP response items as correlated messages.
     ///
     /// Use a `stream_buffer` endpoint here when callers need to read streamed
@@ -2172,6 +2191,11 @@ impl HttpConfig {
 
     pub fn with_inline_response_fast_path(mut self, inline_response_fast_path: bool) -> Self {
         self.inline_response_fast_path = Some(inline_response_fast_path);
+        self
+    }
+
+    pub fn with_server_protocol(mut self, server_protocol: HttpServerProtocol) -> Self {
+        self.server_protocol = server_protocol;
         self
     }
 

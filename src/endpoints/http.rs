@@ -8,7 +8,7 @@ use super::http_stream::{
     HttpReceiveStreamConfig, PublishResponseStreamError,
 };
 use crate::canonical_message::tracing_support::LazyMessageIds;
-use crate::models::{HttpConfig, TlsConfig};
+use crate::models::{HttpConfig, HttpServerProtocol, TlsConfig};
 use crate::traits::{
     BoxFuture, ConsumerError, MessageConsumer, MessagePublisher, ReceivedBatch, Sent,
 };
@@ -22,6 +22,7 @@ use http_body_util::BodyExt;
 use http_body_util::StreamBody;
 use hyper::{
     body::{Frame, Incoming},
+    server::conn::{http1, http2},
     Request, Response, StatusCode,
 };
 use hyper_rustls::HttpsConnectorBuilder;
@@ -215,6 +216,7 @@ struct HttpServerKey {
     listen_addr: String,
     tls: TlsConfig,
     workers: usize,
+    server_protocol: HttpServerProtocol,
 }
 
 static HTTP_SERVER_REGISTRY: OnceLock<Mutex<HashMap<HttpServerKey, Arc<SharedHttpServer>>>> =
@@ -478,6 +480,7 @@ impl HttpConsumer {
             listen_addr: addr.to_string(),
             tls: tls_config.clone(),
             workers,
+            server_protocol: config.server_protocol,
         };
         let shared_server =
             get_or_create_shared_http_server(&server_key, &tls_config, route_id, Arc::new(state))
@@ -604,6 +607,7 @@ async fn get_or_create_shared_http_server(
             listen_addr: bound_addr.to_string(),
             tls: key.tls.clone(),
             workers: key.workers,
+            server_protocol: key.server_protocol,
         }
     } else {
         key.clone()
@@ -626,13 +630,28 @@ async fn get_or_create_shared_http_server(
             "Starting shared HTTPS source on {} with {} workers",
             addr, key.workers
         );
-        spawn_tls_server(listeners, service, shutdown_rx, tls_config, key.workers).await?;
+        spawn_tls_server(
+            listeners,
+            service,
+            shutdown_rx,
+            tls_config,
+            key.workers,
+            key.server_protocol,
+        )
+        .await?;
     } else {
         info!(
             "Starting shared HTTP source on {} with {} workers",
             addr, key.workers
         );
-        spawn_http_server(listeners, service, shutdown_rx, key.workers).await?;
+        spawn_http_server(
+            listeners,
+            service,
+            shutdown_rx,
+            key.workers,
+            key.server_protocol,
+        )
+        .await?;
     }
 
     let server = Arc::new(SharedHttpServer {
@@ -760,6 +779,7 @@ async fn spawn_http_server(
     service: HttpBridgeService,
     shutdown_rx: tokio::sync::watch::Receiver<()>,
     workers: usize,
+    server_protocol: HttpServerProtocol,
 ) -> anyhow::Result<()> {
     for i in 0..workers {
         let listeners = listeners.clone();
@@ -784,15 +804,41 @@ async fn spawn_http_server(
                                 conn_service.conn_info = HttpConnInfo::default();
                                 tokio::spawn(async move {
                                     let io = TokioIo::new(socket);
-                                    let mut builder = AutoBuilder::new(TokioExecutor::new());
-                                    // `pipeline_flush(true)` coalesces the responses of
-                                    // HTTP/1.1 pipelined requests into a single buffered
-                                    // write, which raises throughput on pipelined workloads
-                                    // (e.g. the TechEmpower plaintext test) and is a no-op
-                                    // for non-pipelined traffic.
-                                    builder.http1().keep_alive(true).pipeline_flush(true);
-                                    builder.http2().max_concurrent_streams(200);
-                                    let conn = builder.serve_connection_with_upgrades(io, conn_service).await;
+                                    let conn = match server_protocol {
+                                        HttpServerProtocol::Auto => {
+                                            let mut builder = AutoBuilder::new(TokioExecutor::new());
+                                            // `pipeline_flush(true)` coalesces the responses of
+                                            // HTTP/1.1 pipelined requests into a single buffered
+                                            // write, which raises throughput on pipelined workloads
+                                            // (e.g. the TechEmpower plaintext test) and is a no-op
+                                            // for non-pipelined traffic.
+                                            builder.http1().keep_alive(true).pipeline_flush(true);
+                                            builder.http2().max_concurrent_streams(200);
+                                            builder
+                                                .serve_connection_with_upgrades(io, conn_service)
+                                                .await
+                                        }
+                                        HttpServerProtocol::Http1Only => {
+                                            let mut builder = http1::Builder::new();
+                                            builder.keep_alive(true).pipeline_flush(true);
+                                            builder
+                                                .serve_connection(io, conn_service)
+                                                .await
+                                                .map_err(|err| -> Box<dyn std::error::Error + Send + Sync> {
+                                                    Box::new(err)
+                                                })
+                                        }
+                                        HttpServerProtocol::Http2Only => {
+                                            let mut builder = http2::Builder::new(TokioExecutor::new());
+                                            builder.max_concurrent_streams(200);
+                                            builder
+                                                .serve_connection(io, conn_service)
+                                                .await
+                                                .map_err(|err| -> Box<dyn std::error::Error + Send + Sync> {
+                                                    Box::new(err)
+                                                })
+                                        }
+                                    };
                                     if let Err(e) = conn {
                                         trace!("Connection error: {}", e);
                                     }
@@ -832,6 +878,7 @@ async fn spawn_tls_server(
     shutdown_rx: tokio::sync::watch::Receiver<()>,
     tls_config: &TlsConfig,
     workers: usize,
+    server_protocol: HttpServerProtocol,
 ) -> anyhow::Result<()> {
     let rustls_server_config =
         create_rustls_server_config(tls_config).context("Failed to create rustls server config")?;
@@ -868,12 +915,38 @@ async fn spawn_tls_server(
                                             conn_service.conn_info = conn_info;
 
                                             let io = TokioIo::new(stream);
-                                            let mut builder = AutoBuilder::new(TokioExecutor::new());
-                                            // See the plaintext note above: coalesce pipelined
-                                            // HTTP/1.1 responses into one buffered write.
-                                            builder.http1().keep_alive(true).pipeline_flush(true);
-                                            builder.http2().max_concurrent_streams(200);
-                                            let conn = builder.serve_connection_with_upgrades(io, conn_service).await;
+                                            let conn = match server_protocol {
+                                                HttpServerProtocol::Auto => {
+                                                    let mut builder = AutoBuilder::new(TokioExecutor::new());
+                                                    // See the plaintext note above: coalesce pipelined
+                                                    // HTTP/1.1 responses into one buffered write.
+                                                    builder.http1().keep_alive(true).pipeline_flush(true);
+                                                    builder.http2().max_concurrent_streams(200);
+                                                    builder
+                                                        .serve_connection_with_upgrades(io, conn_service)
+                                                        .await
+                                                }
+                                                HttpServerProtocol::Http1Only => {
+                                                    let mut builder = http1::Builder::new();
+                                                    builder.keep_alive(true).pipeline_flush(true);
+                                                    builder
+                                                        .serve_connection(io, conn_service)
+                                                        .await
+                                                        .map_err(|err| -> Box<dyn std::error::Error + Send + Sync> {
+                                                            Box::new(err)
+                                                        })
+                                                }
+                                                HttpServerProtocol::Http2Only => {
+                                                    let mut builder = http2::Builder::new(TokioExecutor::new());
+                                                    builder.max_concurrent_streams(200);
+                                                    builder
+                                                        .serve_connection(io, conn_service)
+                                                        .await
+                                                        .map_err(|err| -> Box<dyn std::error::Error + Send + Sync> {
+                                                            Box::new(err)
+                                                        })
+                                                }
+                                            };
 
                                             if let Err(e) = conn {
                                                 // Benign errors like "connection closed" are expected
@@ -2060,12 +2133,35 @@ mod tests {
     use crate::endpoints::{create_consumer_from_route, create_publisher_from_route};
     use crate::models::{Config, Endpoint, EndpointType, StreamBufferConfig};
     use hyper::header::{ACCEPT, ACCEPT_ENCODING, CONTENT_TYPE};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn get_free_port() -> u16 {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.local_addr().unwrap().port()
     }
+
+    async fn wait_for_server_ready(addr: &str, timeout: Duration) -> bool {
+        let start = Instant::now();
+        while start.elapsed() < timeout {
+            if tokio::net::TcpStream::connect(addr).await.is_ok() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        false
+    }
+
+    fn raw_text_static_endpoint(body: &str) -> Endpoint {
+        let mut metadata = HashMap::new();
+        metadata.insert("content-type".to_string(), "text/plain".to_string());
+        Endpoint::new(EndpointType::Static(crate::models::StaticConfig {
+            body: body.to_string(),
+            raw: true,
+            metadata,
+        }))
+    }
+
     fn init_crypto() {
         #[cfg(feature = "rustls-aws-lc")]
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
@@ -2099,6 +2195,28 @@ http_route:
                 assert_eq!(cfg.url, "http://localhost:9090".to_string());
             }
             _ => panic!("Expected HTTP output"),
+        }
+    }
+
+    #[test]
+    fn test_http_config_yaml_server_protocol() {
+        let yaml = r#"
+http_route:
+  input:
+    http:
+      url: "127.0.0.1:8080"
+      server_protocol: http2_only
+  output:
+    response: {}
+"#;
+        let config: Config = serde_yaml_ng::from_str(yaml).expect("Failed to parse YAML");
+        let route = config.get("http_route").expect("Route not found");
+
+        match &route.input.endpoint_type {
+            EndpointType::Http(cfg) => {
+                assert_eq!(cfg.server_protocol, HttpServerProtocol::Http2Only);
+            }
+            _ => panic!("Expected HTTP input"),
         }
     }
 
@@ -2820,6 +2938,159 @@ http_route:
 
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(tokio::net::TcpStream::connect(&addr).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_http2_only_listener_accepts_h2c_prior_knowledge() {
+        init_crypto();
+        let port = get_free_port();
+        let addr = format!("127.0.0.1:{}", port);
+
+        let input = Endpoint::new(EndpointType::Http(HttpConfig {
+            url: addr.clone(),
+            path: Some("/h2c".to_string()),
+            server_protocol: HttpServerProtocol::Http2Only,
+            ..Default::default()
+        }));
+        let output = raw_text_static_endpoint("h2c-ok");
+        let handle = crate::Route::new(input, output)
+            .run("test_http2_only_h2c_prior_knowledge")
+            .await
+            .unwrap();
+
+        assert!(wait_for_server_ready(&addr, Duration::from_secs(5)).await);
+
+        let stream = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        let (mut client, connection) = h2::client::handshake(stream).await.unwrap();
+        let connection_task = tokio::spawn(async move { connection.await });
+
+        let request = Request::builder()
+            .method("GET")
+            .uri(format!("http://{addr}/h2c"))
+            .body(())
+            .unwrap();
+        let (response, _) = client.send_request(request, true).unwrap();
+        let response = response.await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let mut body = response.into_body();
+        let mut bytes = Vec::new();
+        while let Some(chunk) = body.data().await {
+            bytes.extend_from_slice(&chunk.unwrap());
+        }
+        assert_eq!(bytes, b"h2c-ok");
+
+        connection_task.abort();
+        let _ = connection_task.await;
+        handle.stop().await;
+        let _ = handle.join().await;
+    }
+
+    #[tokio::test]
+    async fn test_http2_only_listener_rejects_plain_http11() {
+        init_crypto();
+        let port = get_free_port();
+        let addr = format!("127.0.0.1:{}", port);
+
+        let input = Endpoint::new(EndpointType::Http(HttpConfig {
+            url: addr.clone(),
+            path: Some("/h2c-only".to_string()),
+            server_protocol: HttpServerProtocol::Http2Only,
+            ..Default::default()
+        }));
+        let output = raw_text_static_endpoint("should-not-be-served-over-http1");
+        let handle = crate::Route::new(input, output)
+            .run("test_http2_only_rejects_http11")
+            .await
+            .unwrap();
+
+        assert!(wait_for_server_ready(&addr, Duration::from_secs(5)).await);
+
+        let mut stream = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        stream
+            .write_all(
+                format!("GET /h2c-only HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n")
+                    .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let _ = stream.shutdown().await;
+
+        let response = tokio::time::timeout(Duration::from_secs(2), async {
+            let mut buf = Vec::new();
+            stream.read_to_end(&mut buf).await.map(|_| buf)
+        })
+        .await
+        .expect("HTTP/1.1 rejection should complete promptly");
+
+        match response {
+            Ok(buf) => {
+                let text = String::from_utf8_lossy(&buf);
+                assert!(
+                    !text.contains(" 200 ")
+                        && !text.starts_with("HTTP/1.1 200")
+                        && !text.starts_with("HTTP/1.0 200"),
+                    "Http2Only listener unexpectedly returned success: {text:?}"
+                );
+            }
+            Err(err) => {
+                assert!(
+                    matches!(
+                        err.kind(),
+                        std::io::ErrorKind::ConnectionReset
+                            | std::io::ErrorKind::UnexpectedEof
+                            | std::io::ErrorKind::BrokenPipe
+                    ),
+                    "unexpected HTTP/1.1 read error: {err}"
+                );
+            }
+        }
+
+        handle.stop().await;
+        let _ = handle.join().await;
+    }
+
+    #[tokio::test]
+    async fn test_http_default_auto_listener_accepts_http11() {
+        init_crypto();
+        let port = get_free_port();
+        let addr = format!("127.0.0.1:{}", port);
+
+        let input = Endpoint::new(EndpointType::Http(HttpConfig {
+            url: addr.clone(),
+            path: Some("/auto-http1".to_string()),
+            ..Default::default()
+        }));
+        let output = raw_text_static_endpoint("auto-ok");
+        let handle = crate::Route::new(input, output)
+            .run("test_http_default_auto_accepts_http11")
+            .await
+            .unwrap();
+
+        assert!(wait_for_server_ready(&addr, Duration::from_secs(5)).await);
+
+        let mut stream = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        stream
+            .write_all(
+                format!("GET /auto-http1 HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n")
+                    .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut response = vec![0; 1024];
+        let bytes_read = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut response))
+            .await
+            .expect("HTTP/1.1 response should arrive promptly")
+            .unwrap();
+        let text = String::from_utf8_lossy(&response[..bytes_read]);
+        assert!(
+            text.starts_with("HTTP/1.1 200"),
+            "default auto listener did not serve HTTP/1.1 successfully: {text:?}"
+        );
+        assert!(text.contains("auto-ok"));
+
+        handle.stop().await;
+        let _ = handle.join().await;
     }
 
     #[tokio::test]
