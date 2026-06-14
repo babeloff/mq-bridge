@@ -41,6 +41,11 @@ const CONSUMER_HEALTH_POLL: Duration = Duration::from_secs(1);
 struct AmqpState {
     connection: Connection,
     channel: Channel,
+    /// Bumped on every successful reconnect. Lets a worker that observed a
+    /// failure ask for a reconnect while letting concurrent workers that share
+    /// the same dead channel deduplicate, without trusting lapin's connection
+    /// status (which in lapin 4 can keep reporting `connected` on a dead link).
+    generation: u64,
 }
 
 pub struct AmqpPublisher {
@@ -131,22 +136,36 @@ impl AmqpPublisher {
         Ok(AmqpState {
             connection: conn,
             channel,
+            generation: 0,
         })
     }
 
-    async fn get_channel(&self) -> Channel {
-        self.state.read().await.channel.clone()
+    /// Returns the current channel together with the generation it belongs to.
+    /// Callers pass the generation back to `reconnect` so a reconnect only fires
+    /// for the channel that actually failed.
+    async fn get_channel(&self) -> (Channel, u64) {
+        let state = self.state.read().await;
+        (state.channel.clone(), state.generation)
     }
 
-    async fn reconnect(&self) {
+    /// Reconnect after a worker observed a failure on the channel of generation
+    /// `observed_generation`. If another worker has already reconnected since
+    /// (generation moved on), this is a no-op. We deliberately do NOT consult
+    /// `connection.status()` here: in lapin 4 a dead connection can keep
+    /// reporting `connected`, which previously made this early-return and left
+    /// the publisher wedged on a dead channel forever.
+    async fn reconnect(&self, observed_generation: u64) {
         let mut state = self.state.write().await;
-        if state.connection.status().connected() && state.channel.status().connected() {
+        if state.generation != observed_generation {
+            // A concurrent worker already rebuilt the connection.
             return;
         }
         info!("Reconnecting AMQP publisher...");
         match Self::connect(&self.config).await {
             Ok(new_state) => {
+                let next_generation = state.generation.wrapping_add(1);
                 *state = new_state;
+                state.generation = next_generation;
                 info!("AMQP publisher reconnected.");
             }
             Err(e) => {
@@ -192,7 +211,7 @@ impl MessagePublisher for AmqpPublisher {
             properties = properties.with_headers(table);
         }
 
-        let channel = self.get_channel().await;
+        let (channel, generation) = self.get_channel().await;
         let publish_fut = channel.basic_publish(
             self.exchange.clone().into(),
             self.queue.clone().into(),
@@ -206,7 +225,7 @@ impl MessagePublisher for AmqpPublisher {
         let confirmation_result = match tokio::time::timeout(CONFIRM_TIMEOUT, publish_fut).await {
             Ok(res) => res,
             Err(_) => {
-                self.reconnect().await;
+                self.reconnect(generation).await;
                 return Err(PublisherError::Retryable(anyhow!(
                     "Timed out submitting AMQP publish"
                 )));
@@ -216,7 +235,7 @@ impl MessagePublisher for AmqpPublisher {
         let confirmation = match confirmation_result {
             Ok(c) => c,
             Err(e) => {
-                self.reconnect().await;
+                self.reconnect(generation).await;
                 return Err(PublisherError::Retryable(anyhow!(
                     "Failed to publish AMQP message: {}",
                     e
@@ -231,14 +250,14 @@ impl MessagePublisher for AmqpPublisher {
             let confirm = match tokio::time::timeout(CONFIRM_TIMEOUT, confirmation).await {
                 Ok(Ok(c)) => c,
                 Ok(Err(e)) => {
-                    self.reconnect().await;
+                    self.reconnect(generation).await;
                     return Err(PublisherError::Retryable(anyhow!(
                         "Failed to get AMQP publisher confirmation: {}",
                         e
                     )));
                 }
                 Err(_) => {
-                    self.reconnect().await;
+                    self.reconnect(generation).await;
                     return Err(PublisherError::Retryable(anyhow!(
                         "Timed out waiting for AMQP publisher confirmation"
                     )));
@@ -265,7 +284,7 @@ impl MessagePublisher for AmqpPublisher {
             .await;
         }
 
-        let channel = self.get_channel().await;
+        let (channel, generation) = self.get_channel().await;
         let mut pending_messages = Vec::with_capacity(messages.len());
         let mut pending_confirms = Vec::with_capacity(messages.len());
         let mut failed_messages = Vec::new();
@@ -376,7 +395,7 @@ impl MessagePublisher for AmqpPublisher {
         }
 
         if !failed_messages.is_empty() {
-            self.reconnect().await;
+            self.reconnect(generation).await;
         }
 
         if failed_messages.is_empty() {
