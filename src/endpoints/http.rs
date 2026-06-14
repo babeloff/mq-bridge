@@ -2977,7 +2977,7 @@ http_route:
 
         let stream = tokio::net::TcpStream::connect(&addr).await.unwrap();
         let (mut client, connection) = h2::client::handshake(stream).await.unwrap();
-        let connection_task = tokio::spawn(async move { connection.await });
+        let connection_task = tokio::spawn(connection);
 
         let request = Request::builder()
             .method("GET")
