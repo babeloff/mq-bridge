@@ -31,6 +31,13 @@ use uuid::Uuid;
 /// connection drops and the confirm future never resolves.
 const CONFIRM_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How often the consumer wakes up while waiting for a message to re-check that
+/// the broker connection is still alive. In lapin 4 a dropped connection does
+/// not reliably terminate the consumer stream, so without this periodic health
+/// check `Consumer::next()` can block forever after the broker goes away and the
+/// route would never get the error it needs to reconnect.
+const CONSUMER_HEALTH_POLL: Duration = Duration::from_secs(1);
+
 struct AmqpState {
     connection: Connection,
     channel: Channel,
@@ -635,14 +642,31 @@ impl MessageConsumer for AmqpConsumer {
             });
         }
 
-        // 1. Wait for the first message. This will block until a message is available.
-        let first_delivery = match self.consumer.next().await {
-            Some(Ok(delivery)) => delivery,
-            Some(Err(e)) => return Err(ConsumerError::Connection(anyhow::anyhow!(e))),
-            None => {
-                return Err(ConsumerError::Connection(anyhow::anyhow!(
-                    "AMQP consumer stream ended unexpectedly"
-                )))
+        // 1. Wait for the first message. This blocks until a message is available,
+        //    but each wait is bounded so we can periodically verify the broker
+        //    connection is still alive. In lapin 4 a dropped connection does not
+        //    reliably terminate the consumer stream, so without this health check
+        //    `next()` would block forever after the broker goes away and the route
+        //    would never see the Connection error it needs to recreate the consumer.
+        let first_delivery = loop {
+            match tokio::time::timeout(CONSUMER_HEALTH_POLL, self.consumer.next()).await {
+                Ok(Some(Ok(delivery))) => break delivery,
+                Ok(Some(Err(e))) => return Err(ConsumerError::Connection(anyhow::anyhow!(e))),
+                Ok(None) => {
+                    return Err(ConsumerError::Connection(anyhow::anyhow!(
+                        "AMQP consumer stream ended unexpectedly"
+                    )))
+                }
+                Err(_) => {
+                    // No message arrived within the poll window. If the connection
+                    // or channel has dropped, surface a Connection error so the route
+                    // recreates the consumer; otherwise keep waiting for a message.
+                    if !self._conn.status().connected() || !self.channel.status().connected() {
+                        return Err(ConsumerError::Connection(anyhow::anyhow!(
+                            "AMQP connection lost while waiting for messages"
+                        )));
+                    }
+                }
             }
         };
 
