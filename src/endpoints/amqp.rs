@@ -140,6 +140,13 @@ impl AmqpPublisher {
 
     async fn reconnect(&self) {
         let mut state = self.state.write().await;
+        info!(
+            conn_status = ?state.connection.status(),
+            chan_status = ?state.channel.status(),
+            conn_connected = state.connection.status().connected(),
+            chan_connected = state.channel.status().connected(),
+            "DIAG: AMQP publisher reconnect() called"
+        );
         if state.connection.status().connected() && state.channel.status().connected() {
             return;
         }
@@ -288,26 +295,33 @@ impl MessagePublisher for AmqpPublisher {
                 properties = properties.with_headers(table);
             }
 
-            match channel
-                .basic_publish(
-                    self.exchange.clone().into(),
-                    self.queue.clone().into(),
-                    BasicPublishOptions::default(),
-                    &message.payload,
-                    properties,
-                )
-                .await
-            {
-                Ok(confirmation) => {
+            let publish_fut = channel.basic_publish(
+                self.exchange.clone().into(),
+                self.queue.clone().into(),
+                BasicPublishOptions::default(),
+                &message.payload,
+                properties,
+            );
+            match tokio::time::timeout(CONFIRM_TIMEOUT, publish_fut).await {
+                Ok(Ok(confirmation)) => {
                     pending_messages.push(message);
                     pending_confirms.push(confirmation);
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     failed_messages.push((
                         message,
                         PublisherError::Retryable(
                             anyhow!(e).context("Failed to publish message in batch"),
                         ),
+                    ));
+                }
+                Err(_) => {
+                    info!("DIAG: AMQP basic_publish() timed out (silent hang on dead connection)");
+                    failed_messages.push((
+                        message,
+                        PublisherError::Retryable(anyhow!(
+                            "Timed out submitting AMQP publish in batch"
+                        )),
                     ));
                 }
             }
@@ -661,7 +675,16 @@ impl MessageConsumer for AmqpConsumer {
                     // No message arrived within the poll window. If the connection
                     // or channel has dropped, surface a Connection error so the route
                     // recreates the consumer; otherwise keep waiting for a message.
-                    if !self._conn.status().connected() || !self.channel.status().connected() {
+                    let conn_connected = self._conn.status().connected();
+                    let chan_connected = self.channel.status().connected();
+                    info!(
+                        conn_status = ?self._conn.status(),
+                        chan_status = ?self.channel.status(),
+                        conn_connected,
+                        chan_connected,
+                        "DIAG: AMQP consumer poll timeout, no message"
+                    );
+                    if !conn_connected || !chan_connected {
                         return Err(ConsumerError::Connection(anyhow::anyhow!(
                             "AMQP connection lost while waiting for messages"
                         )));
