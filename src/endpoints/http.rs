@@ -880,8 +880,8 @@ async fn spawn_tls_server(
     workers: usize,
     server_protocol: HttpServerProtocol,
 ) -> anyhow::Result<()> {
-    let rustls_server_config =
-        create_rustls_server_config(tls_config).context("Failed to create rustls server config")?;
+    let rustls_server_config = create_rustls_server_config(tls_config, server_protocol)
+        .context("Failed to create rustls server config")?;
     let acceptor = TlsAcceptor::from(rustls_server_config);
 
     for i in 0..workers {
@@ -1974,6 +1974,7 @@ impl MessagePublisher for HttpPublisher {
 /// Creates a `rustls::ServerConfig` for the HTTPS server.
 fn create_rustls_server_config(
     tls_config: &TlsConfig,
+    server_protocol: HttpServerProtocol,
 ) -> anyhow::Result<Arc<rustls::ServerConfig>> {
     // Ensure a process-level rustls CryptoProvider is installed when building server config.
     // This avoids a runtime panic if the provider wasn't set elsewhere.
@@ -2022,10 +2023,15 @@ fn create_rustls_server_config(
             .context("Failed to build rustls server config")?
     };
 
-    // Advertise HTTP/2 (and HTTP/1.1 fallback) via ALPN so TLS clients negotiate
-    // h2. The TLS accept loop already serves both protocols through hyper-util's
-    // auto Builder; without this, conformant clients fall back to HTTP/1.1.
-    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    // Advertise via ALPN only the protocol(s) the server will actually serve, so
+    // negotiation matches the accept loop's `serve_connection` mode. In Auto mode
+    // hyper-util's auto Builder handles both, so advertise h2 with an HTTP/1.1
+    // fallback; otherwise constrain ALPN to the single supported protocol.
+    config.alpn_protocols = match server_protocol {
+        HttpServerProtocol::Auto => vec![b"h2".to_vec(), b"http/1.1".to_vec()],
+        HttpServerProtocol::Http1Only => vec![b"http/1.1".to_vec()],
+        HttpServerProtocol::Http2Only => vec![b"h2".to_vec()],
+    };
 
     Ok(Arc::new(config))
 }

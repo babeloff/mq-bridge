@@ -299,14 +299,20 @@ fn serve_static(state: &AppState, name: &str, want_gzip: bool) -> CanonicalMessa
 /// Serve `/json/{count}?m=`, building+gzipping the body once per `(count, m)`.
 fn serve_json(state: &AppState, count: usize, m: i64, want_gzip: bool) -> CanonicalMessage {
     let key = (count, m);
-    if let Some(cached) = state.json_cache.lock().unwrap().get(&key) {
-        return cached.into_message(want_gzip);
-    }
-    let cached = Arc::new(CachedBody::build(
-        build_json(&state.dataset, count, m),
-        "application/json",
-    ));
-    state.json_cache.lock().unwrap().insert(key, cached.clone());
+    // Hold the lock across the build via the entry API so concurrent requests for
+    // the same uncached key don't each build+gzip the body redundantly.
+    let cached = state
+        .json_cache
+        .lock()
+        .unwrap()
+        .entry(key)
+        .or_insert_with(|| {
+            Arc::new(CachedBody::build(
+                build_json(&state.dataset, count, m),
+                "application/json",
+            ))
+        })
+        .clone();
     cached.into_message(want_gzip)
 }
 
