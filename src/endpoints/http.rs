@@ -37,7 +37,7 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpSocket};
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, info, trace, warn};
 use uuid::Uuid;
@@ -595,10 +595,7 @@ async fn get_or_create_shared_http_server(
         }
     }
 
-    let listener = TcpListener::bind(&addr)
-        .await
-        .with_context(|| format!("Failed to bind to {}", addr))?;
-    let bound_addr = listener.local_addr().ok();
+    let (listeners, bound_addr) = bind_http_listeners(addr, key.workers).await?;
     let registry_key = if uses_ephemeral_port {
         let Some(bound_addr) = bound_addr else {
             return Err(anyhow!("Failed to determine bound HTTP listener address"));
@@ -611,7 +608,7 @@ async fn get_or_create_shared_http_server(
     } else {
         key.clone()
     };
-    let listener = Arc::new(listener);
+    let listeners = Arc::new(listeners);
     let router = Arc::new(SharedHttpRouter::default());
     let service = HttpBridgeService {
         router: router.clone(),
@@ -629,13 +626,13 @@ async fn get_or_create_shared_http_server(
             "Starting shared HTTPS source on {} with {} workers",
             addr, key.workers
         );
-        spawn_tls_server(listener, service, shutdown_rx, tls_config, key.workers).await?;
+        spawn_tls_server(listeners, service, shutdown_rx, tls_config, key.workers).await?;
     } else {
         info!(
             "Starting shared HTTP source on {} with {} workers",
             addr, key.workers
         );
-        spawn_http_server(listener, service, shutdown_rx, key.workers).await?;
+        spawn_http_server(listeners, service, shutdown_rx, key.workers).await?;
     }
 
     let server = Arc::new(SharedHttpServer {
@@ -667,19 +664,112 @@ async fn get_or_create_shared_http_server(
     Ok(server)
 }
 
+/// Whether to bind one `SO_REUSEPORT` listener per worker. Defaults to on for
+/// Unix targets (where the kernel hashes connections across the per-worker
+/// accept queues, eliminating shared-accept-queue contention) and is overridable
+/// via `MQ_BRIDGE_HTTP_REUSEPORT` (`0`/`false`/`off`/`no` to force the shared
+/// listener).
+fn http_reuseport_enabled() -> bool {
+    match std::env::var("MQ_BRIDGE_HTTP_REUSEPORT") {
+        Ok(value) => !matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off" | "no"
+        ),
+        Err(_) => cfg!(unix),
+    }
+}
+
+fn bind_reuseport_listener(addr: SocketAddr) -> std::io::Result<TcpListener> {
+    let socket = if addr.is_ipv4() {
+        TcpSocket::new_v4()?
+    } else {
+        TcpSocket::new_v6()?
+    };
+    socket.set_reuseaddr(true)?;
+    #[cfg(all(unix, not(target_os = "solaris"), not(target_os = "illumos")))]
+    socket.set_reuseport(true)?;
+    socket.bind(addr)?;
+    socket.listen(1024)
+}
+
+/// Bind the HTTP listener(s) for a shared server.
+///
+/// With `SO_REUSEPORT` we give each accept worker its own listener so the kernel
+/// distributes new connections across independent accept queues — there is no
+/// shared-accept-queue contention between workers (the model pyronova's
+/// thread-per-core design relies on). When `SO_REUSEPORT` is unavailable, the
+/// server is single-worker, or a per-worker bind fails, we fall back to a single
+/// shared listener (the previous behavior) so it degrades gracefully. Workers
+/// index into the returned vec modulo its length, so a 1-element vec means every
+/// worker shares one listener exactly as before.
+async fn bind_http_listeners(
+    addr: SocketAddr,
+    workers: usize,
+) -> anyhow::Result<(Vec<TcpListener>, Option<SocketAddr>)> {
+    let bind_shared = || async {
+        let listener = TcpListener::bind(&addr)
+            .await
+            .with_context(|| format!("Failed to bind to {}", addr))?;
+        let bound = listener.local_addr().ok();
+        anyhow::Ok((vec![listener], bound))
+    };
+
+    if workers <= 1 || !http_reuseport_enabled() {
+        return bind_shared().await;
+    }
+
+    // The first reuseport listener resolves the (possibly ephemeral) port that
+    // every sibling must then bind to.
+    let first = match bind_reuseport_listener(addr) {
+        Ok(listener) => listener,
+        Err(err) => {
+            warn!("SO_REUSEPORT bind failed ({err}); using a single shared HTTP listener");
+            return bind_shared().await;
+        }
+    };
+    let bound = first.local_addr().ok();
+    let sibling_addr = bound.unwrap_or(addr);
+
+    let mut listeners = Vec::with_capacity(workers);
+    listeners.push(first);
+    for _ in 1..workers {
+        match bind_reuseport_listener(sibling_addr) {
+            Ok(listener) => listeners.push(listener),
+            Err(err) => {
+                // Some workers got a private listener; the rest share via the
+                // modulo index. Still correct, just fewer independent queues.
+                warn!(
+                    "SO_REUSEPORT sibling bind failed ({err}); {} of {} workers will have a private listener",
+                    listeners.len(),
+                    workers
+                );
+                break;
+            }
+        }
+    }
+    info!(
+        "HTTP server using SO_REUSEPORT: {} listener(s) for {} workers",
+        listeners.len(),
+        workers
+    );
+    Ok((listeners, bound))
+}
+
 async fn spawn_http_server(
-    listener: Arc<TcpListener>,
+    listeners: Arc<Vec<TcpListener>>,
     service: HttpBridgeService,
     shutdown_rx: tokio::sync::watch::Receiver<()>,
     workers: usize,
 ) -> anyhow::Result<()> {
     for i in 0..workers {
-        let listener = listener.clone();
+        let listeners = listeners.clone();
+        let listener_idx = i % listeners.len();
         let service = service.clone();
         let mut shutdown_rx = shutdown_rx.clone();
 
         tokio::spawn(async move {
             trace!("HTTP worker {} started", i);
+            let listener = &listeners[listener_idx];
             loop {
                 tokio::select! {
                     _ = shutdown_rx.changed() => {
@@ -737,7 +827,7 @@ async fn spawn_http_server(
 }
 
 async fn spawn_tls_server(
-    listener: Arc<TcpListener>,
+    listeners: Arc<Vec<TcpListener>>,
     service: HttpBridgeService,
     shutdown_rx: tokio::sync::watch::Receiver<()>,
     tls_config: &TlsConfig,
@@ -748,13 +838,15 @@ async fn spawn_tls_server(
     let acceptor = TlsAcceptor::from(rustls_server_config);
 
     for i in 0..workers {
-        let listener = listener.clone();
+        let listeners = listeners.clone();
+        let listener_idx = i % listeners.len();
         let service = service.clone();
         let acceptor = acceptor.clone();
         let mut shutdown_rx = shutdown_rx.clone();
 
         tokio::spawn(async move {
             trace!("TLS worker {} started", i);
+            let listener = &listeners[listener_idx];
             loop {
                 tokio::select! {
                     _ = shutdown_rx.changed() => {
