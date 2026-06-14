@@ -5,6 +5,7 @@ use std::fs;
 use std::future::Future;
 use std::num::NonZeroUsize;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
@@ -899,14 +900,110 @@ fn format_message_id(message_id: u128) -> String {
     fast_uuid_v7::format_uuid(message_id).to_string()
 }
 
+/// Cyclic-GC strategy for the Python handler interpreter.
+///
+/// CPython's cyclic collector runs a stop-the-world sweep roughly every 700
+/// net container allocations. At high request rates that fires hundreds of
+/// times per second, each pause landing in a random request's tail latency.
+/// Because mq-bridge runs Python handlers on a single worker interpreter we can
+/// take the collector over: disable it and run `gc.collect()` off the hot path
+/// on a fixed request cadence instead. Reference counting still frees the vast
+/// majority of objects immediately, so only genuine reference cycles wait for
+/// the periodic sweep. Inspired by pyronova's GC-takeover approach.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GcMode {
+    /// Leave CPython's cyclic GC untouched (default; fully backward compatible).
+    Default,
+    /// Disable the cyclic GC; run `gc.collect()` every `threshold` messages.
+    Count,
+    /// Disable the cyclic GC entirely; never auto-collect (pure refcount).
+    Off,
+}
+
+struct GcConfig {
+    mode: GcMode,
+    threshold: u64,
+}
+
+fn gc_config() -> &'static GcConfig {
+    static GC_CONFIG: OnceLock<GcConfig> = OnceLock::new();
+    GC_CONFIG.get_or_init(|| {
+        let mode = match std::env::var("MQ_BRIDGE_PY_GC_MODE") {
+            Ok(value) => match value.trim().to_ascii_lowercase().as_str() {
+                "count" => GcMode::Count,
+                "off" => GcMode::Off,
+                "" | "default" => GcMode::Default,
+                other => {
+                    tracing::warn!(
+                        value = other,
+                        "Unknown MQ_BRIDGE_PY_GC_MODE; leaving CPython GC untouched"
+                    );
+                    GcMode::Default
+                }
+            },
+            Err(_) => GcMode::Default,
+        };
+        let threshold = std::env::var("MQ_BRIDGE_PY_GC_THRESHOLD")
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .filter(|count| *count > 0)
+            .unwrap_or(100_000);
+        GcConfig { mode, threshold }
+    })
+}
+
+/// Disable CPython's cyclic GC the first time a worker holds the GIL. Cheap
+/// (`Once` fast path) on every subsequent call.
+fn ensure_gc_configured(py: Python<'_>) {
+    static CONFIGURED: std::sync::Once = std::sync::Once::new();
+    let cfg = gc_config();
+    if cfg.mode == GcMode::Default {
+        return;
+    }
+    CONFIGURED.call_once(
+        || match py.import("gc").and_then(|gc| gc.call_method0("disable")) {
+            Ok(_) => tracing::info!(
+                mode = if cfg.mode == GcMode::Count {
+                    "count"
+                } else {
+                    "off"
+                },
+                threshold = cfg.threshold,
+                "Python cyclic GC disabled; mq-bridge driving collection off the hot path"
+            ),
+            Err(err) => tracing::warn!("Failed to disable Python GC: {err}"),
+        },
+    );
+}
+
+/// Account for `processed` handled messages and, in `count` mode, trigger
+/// `gc.collect()` when a threshold boundary is crossed. Runs under the GIL.
+fn gc_tick(py: Python<'_>, processed: u64) {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let cfg = gc_config();
+    if cfg.mode != GcMode::Count || processed == 0 {
+        return;
+    }
+    let prev = COUNTER.fetch_add(processed, Ordering::Relaxed);
+    // Only collect when this batch pushes the running total past a multiple of
+    // the threshold, so the sweep is amortized across `threshold` requests.
+    if prev / cfg.threshold != (prev + processed) / cfg.threshold {
+        if let Ok(gc) = py.import("gc") {
+            let _ = gc.call_method0("collect");
+        }
+    }
+}
+
 fn invoke_python_handler_many(
     callable: &Py<PyAny>,
     mode: PythonHandlerMode,
     label: &str,
     messages: Vec<CanonicalMessage>,
 ) -> Vec<Result<Handled, HandlerError>> {
+    let processed = messages.len() as u64;
     Python::attach(|py| {
-        messages
+        ensure_gc_configured(py);
+        let results: Vec<Result<Handled, HandlerError>> = messages
             .into_iter()
             .map(|message| {
                 let message_id = message.message_id;
@@ -938,7 +1035,9 @@ fn invoke_python_handler_many(
                     )),
                 }
             })
-            .collect()
+            .collect();
+        gc_tick(py, processed);
+        results
     })
 }
 

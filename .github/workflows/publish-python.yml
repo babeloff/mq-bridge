@@ -30,16 +30,14 @@ jobs:
             target: x86_64
             args: --release --out dist --find-interpreter --no-default-features
           - package: mq-bridge-py-basic
+            # Build the aarch64 basic wheel on a native arm64 runner to avoid
+            # ring/aws-lc-sys cross-toolchain issues in manylinux containers.
+            # If maturin's manylinux:auto still selects a container that
+            # reintroduces those issues, pin manylinux to a specific version.
             pyproject: pyproject-basic.toml
-            runner: ubuntu-latest
+            runner: ubuntu-24.04-arm
             os: linux
             target: aarch64
-            args: --release --out dist --find-interpreter --no-default-features
-          - package: mq-bridge-py-basic
-            pyproject: pyproject-basic.toml
-            runner: ubuntu-latest
-            os: linux
-            target: armv7
             args: --release --out dist --find-interpreter --no-default-features
           - package: mq-bridge-py-basic
             pyproject: pyproject-basic.toml
@@ -66,8 +64,14 @@ jobs:
             target: x86_64
             args: --release --out dist --find-interpreter
           - package: mq-bridge-py
+            # Build the full wheel for aarch64 on a NATIVE arm64 runner rather
+            # than cross-compiling from x86_64. The `full` feature pulls in
+            # aws-lc-sys (BoringSSL C), which has no pre-built artifact and
+            # fails to cross-compile in the manylinux container; building
+            # natively makes it a plain native C compile. (The basic wheel uses
+            # rustls-ring, which cross-compiles fine, so it stays on ubuntu-latest.)
             pyproject: pyproject.toml
-            runner: ubuntu-latest
+            runner: ubuntu-24.04-arm
             os: linux
             target: aarch64
             args: --release --out dist --find-interpreter

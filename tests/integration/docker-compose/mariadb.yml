@@ -9,8 +9,9 @@ services:
       - MYSQL_DATABASE=testdb
       - MYSQL_USER=testuser
       - MYSQL_PASSWORD=testpass
+      - MYSQL_PWD=testpass
     healthcheck:
-      test: ["CMD-SHELL", "mariadb-admin ping -h localhost -u root -p$$MYSQL_ROOT_PASSWORD"]
+      test: ["CMD-SHELL", "mariadb-admin ping -h 127.0.0.1 -u testuser"]
       interval: 5s
       timeout: 10s
       retries: 20

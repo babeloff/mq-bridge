@@ -8,16 +8,16 @@ use crate::CanonicalMessage;
 use crate::APP_NAME;
 use anyhow::{anyhow, bail, Context};
 use async_trait::async_trait;
-use futures::{FutureExt, StreamExt, TryStreamExt};
+use futures::{future::join_all, FutureExt, StreamExt, TryStreamExt};
 use lapin::tcp::{OwnedIdentity, OwnedTLSConfig};
 use lapin::{
-    acker::Acker,
     options::{
         BasicAckOptions, BasicConsumeOptions, BasicPublishOptions, BasicQosOptions,
         ExchangeDeclareOptions, QueueBindOptions, QueueDeclareOptions,
     },
     types::{FieldTable, ShortString},
-    BasicProperties, Channel, Connection, ConnectionProperties, Consumer, ExchangeKind,
+    Acker, BasicProperties, Channel, Confirmation, Connection, ConnectionProperties, Consumer,
+    DefaultConnectionBuilder, ExchangeKind,
 };
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -25,6 +25,11 @@ use std::{any::Any, sync::Arc};
 use tokio::sync::RwLock;
 use tracing::{error, info, trace};
 use uuid::Uuid;
+
+/// Maximum time to wait for a broker publisher confirmation before treating the
+/// publish as failed. Prevents the producer from hanging indefinitely when the
+/// connection drops and the confirm future never resolves.
+const CONFIRM_TIMEOUT: Duration = Duration::from_secs(5);
 
 struct AmqpState {
     connection: Connection,
@@ -91,7 +96,7 @@ impl AmqpPublisher {
                 info!(exchange = %exchange_name, "Declaring AMQP Fanout exchange in sink");
                 channel
                     .exchange_declare(
-                        exchange_name,
+                        exchange_name.into(),
                         ExchangeKind::Fanout,
                         ExchangeDeclareOptions {
                             durable: !config.no_persistence,
@@ -105,7 +110,7 @@ impl AmqpPublisher {
                 info!(queue = %queue_or_exchange, "Declaring AMQP queue in sink");
                 channel
                     .queue_declare(
-                        queue_or_exchange,
+                        queue_or_exchange.into(),
                         QueueDeclareOptions {
                             durable: !config.no_persistence,
                             ..Default::default()
@@ -183,8 +188,8 @@ impl MessagePublisher for AmqpPublisher {
         let channel = self.get_channel().await;
         let confirmation_result = channel
             .basic_publish(
-                &self.exchange,
-                &self.queue,
+                self.exchange.clone().into(),
+                self.queue.clone().into(),
                 BasicPublishOptions::default(),
                 &message.payload,
                 properties,
@@ -203,18 +208,26 @@ impl MessagePublisher for AmqpPublisher {
         };
 
         if !self.delayed_ack {
-            // Wait for the broker's publisher confirmation.
-            let confirm = match confirmation.await {
-                Ok(c) => c,
-                Err(e) => {
+            // Wait for the broker's publisher confirmation. Bound the wait so a
+            // dropped connection (where the confirm future may never resolve)
+            // can't hang the producer indefinitely; instead reconnect and retry.
+            let confirm = match tokio::time::timeout(CONFIRM_TIMEOUT, confirmation).await {
+                Ok(Ok(c)) => c,
+                Ok(Err(e)) => {
                     self.reconnect().await;
                     return Err(PublisherError::Retryable(anyhow!(
                         "Failed to get AMQP publisher confirmation: {}",
                         e
                     )));
                 }
+                Err(_) => {
+                    self.reconnect().await;
+                    return Err(PublisherError::Retryable(anyhow!(
+                        "Timed out waiting for AMQP publisher confirmation"
+                    )));
+                }
             };
-            if let lapin::publisher_confirm::Confirmation::Nack(_) = confirm {
+            if let Confirmation::Nack(_) = confirm {
                 return Err(PublisherError::Retryable(anyhow::anyhow!(
                     "Broker Nacked the message"
                 )));
@@ -236,6 +249,7 @@ impl MessagePublisher for AmqpPublisher {
         }
 
         let channel = self.get_channel().await;
+        let mut pending_messages = Vec::with_capacity(messages.len());
         let mut pending_confirms = Vec::with_capacity(messages.len());
         let mut failed_messages = Vec::new();
 
@@ -269,8 +283,8 @@ impl MessagePublisher for AmqpPublisher {
 
             match channel
                 .basic_publish(
-                    &self.exchange,
-                    &self.queue,
+                    self.exchange.clone().into(),
+                    self.queue.clone().into(),
                     BasicPublishOptions::default(),
                     &message.payload,
                     properties,
@@ -278,7 +292,8 @@ impl MessagePublisher for AmqpPublisher {
                 .await
             {
                 Ok(confirmation) => {
-                    pending_confirms.push((message, confirmation));
+                    pending_messages.push(message);
+                    pending_confirms.push(confirmation);
                 }
                 Err(e) => {
                     failed_messages.push((
@@ -291,24 +306,45 @@ impl MessagePublisher for AmqpPublisher {
             }
         }
 
-        for (message, confirmation) in pending_confirms {
-            match confirmation.await {
-                Ok(confirm) => {
-                    if let lapin::publisher_confirm::Confirmation::Nack(_) = confirm {
-                        failed_messages.push((
-                            message,
-                            PublisherError::Retryable(anyhow::anyhow!("Broker Nacked the message")),
-                        ));
+        if !pending_confirms.is_empty() {
+            // Bound the whole batch, not each confirmation separately. A broker
+            // reset can otherwise stall for batch_size * CONFIRM_TIMEOUT before
+            // the route can reconnect and retry.
+            match tokio::time::timeout(CONFIRM_TIMEOUT, join_all(pending_confirms)).await {
+                Ok(confirmations) => {
+                    for (message, confirmation) in pending_messages.into_iter().zip(confirmations) {
+                        match confirmation {
+                            Ok(confirm) => {
+                                if let Confirmation::Nack(_) = confirm {
+                                    failed_messages.push((
+                                        message,
+                                        PublisherError::Retryable(anyhow::anyhow!(
+                                            "Broker Nacked the message"
+                                        )),
+                                    ));
+                                }
+                            }
+                            Err(e) => {
+                                failed_messages.push((
+                                    message,
+                                    PublisherError::Retryable(anyhow::anyhow!(
+                                        "Publisher confirmation failed: {}",
+                                        e
+                                    )),
+                                ));
+                            }
+                        }
                     }
                 }
-                Err(e) => {
-                    failed_messages.push((
-                        message,
-                        PublisherError::Retryable(anyhow::anyhow!(
-                            "Publisher confirmation failed: {}",
-                            e
-                        )),
-                    ));
+                Err(_) => {
+                    failed_messages.extend(pending_messages.into_iter().map(|message| {
+                        (
+                            message,
+                            PublisherError::Retryable(anyhow::anyhow!(
+                                "Timed out waiting for AMQP batch publisher confirmations"
+                            )),
+                        )
+                    }));
                 }
             }
         }
@@ -335,8 +371,7 @@ impl MessagePublisher for AmqpPublisher {
         let error = if !healthy {
             Some(format!(
                 "Connection: '{:?}', Channel: '{:?}'",
-                conn_status.state(),
-                chan_status.state()
+                conn_status, chan_status
             ))
         } else {
             None
@@ -385,7 +420,7 @@ impl AmqpConsumer {
             info!(exchange = %exchange_name, "Declaring AMQP Fanout exchange for subscriber");
             channel
                 .exchange_declare(
-                    exchange_name,
+                    exchange_name.into(),
                     ExchangeKind::Fanout,
                     ExchangeDeclareOptions {
                         durable: true,
@@ -399,7 +434,7 @@ impl AmqpConsumer {
             let queue_name_str = format!("{}-{}-{}", APP_NAME, queue_or_exchange, id);
             let queue = channel
                 .queue_declare(
-                    &queue_name_str,
+                    queue_name_str.clone().into(),
                     QueueDeclareOptions {
                         exclusive: true,
                         auto_delete: true,
@@ -413,9 +448,9 @@ impl AmqpConsumer {
             info!(queue = %q_name, exchange = %exchange_name, "Binding temporary queue to exchange");
             channel
                 .queue_bind(
-                    &q_name,
-                    exchange_name,
-                    "",
+                    q_name.clone().into(),
+                    exchange_name.into(),
+                    "".into(),
                     QueueBindOptions::default(),
                     FieldTable::default(),
                 )
@@ -426,7 +461,7 @@ impl AmqpConsumer {
             info!(queue = %queue_or_exchange, "Declaring AMQP queue");
             channel
                 .queue_declare(
-                    queue_or_exchange,
+                    queue_or_exchange.into(),
                     QueueDeclareOptions {
                         durable: !config.no_persistence,
                         ..Default::default()
@@ -454,8 +489,8 @@ impl AmqpConsumer {
 
         let consumer = channel
             .basic_consume(
-                &queue_name,
-                &consumer_tag,
+                queue_name.clone().into(),
+                consumer_tag.into(),
                 BasicConsumeOptions::default(),
                 FieldTable::default(),
             )
@@ -495,7 +530,12 @@ async fn create_amqp_connection(config: &AmqpConfig) -> anyhow::Result<Connectio
         let conn_props = ConnectionProperties::default();
         let result = if config.tls.required {
             let tls_config = build_tls_config(config).await?;
-            Connection::connect_with_config(&conn_uri, conn_props, tls_config).await
+            DefaultConnectionBuilder::new()?
+                .with_uri_str(conn_uri.clone())
+                .with_properties(conn_props)
+                .with_tls_config(tls_config)
+                .connect()
+                .await
         } else {
             Connection::connect(&conn_uri, conn_props).await
         };
@@ -688,7 +728,7 @@ impl MessageConsumer for AmqpConsumer {
 
         if healthy {
             let passive_declare = self.channel.queue_declare(
-                &self.queue,
+                self.queue.clone().into(),
                 lapin::options::QueueDeclareOptions {
                     passive: true,
                     ..Default::default()
@@ -709,8 +749,7 @@ impl MessageConsumer for AmqpConsumer {
         } else {
             error = Some(format!(
                 "Connection: '{:?}', Channel: '{:?}'",
-                conn_status.state(),
-                chan_status.state()
+                conn_status, chan_status
             ));
         }
 
@@ -753,8 +792,8 @@ async fn handle_replies(
             // Publish response to the default exchange with the routing key set to reply_to
             if let Err(e) = channel
                 .basic_publish(
-                    "", // Default exchange
-                    rt,
+                    "".into(), // Default exchange
+                    rt.clone().into(),
                     BasicPublishOptions::default(),
                     &body,
                     props,

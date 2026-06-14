@@ -1,7 +1,5 @@
-use std::io::BufReader;
-
 use anyhow::Result;
-use rcgen::{BasicConstraints, Certificate, CertificateParams, IsCa, PKCS_ECDSA_P256_SHA256};
+use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair};
 use rustls::RootCertStore;
 
 #[cfg(feature = "rustls")]
@@ -14,22 +12,19 @@ async fn tls_handshake_example() -> Result<()> {
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     // Generate a test CA and a server certificate signed by it.
-    let mut ca_params = CertificateParams::new(vec!["localhost".into()]);
+    let mut ca_params = CertificateParams::new(vec!["localhost".into()])?;
     ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-    let ca = Certificate::from_params(ca_params)?;
-    let ca_pem = ca.serialize_pem()?;
+    let ca_key = KeyPair::generate()?;
+    let ca = ca_params.self_signed(&ca_key)?;
+    let ca_issuer = Issuer::new(ca_params, ca_key);
 
-    let mut server_params = CertificateParams::new(vec!["localhost".into()]);
-    server_params.alg = &PKCS_ECDSA_P256_SHA256;
-    let server_cert = Certificate::from_params(server_params)?;
-    let _server_cert_der = ca.serialize_der_with_signer(&server_cert)?;
+    let server_params = CertificateParams::new(vec!["localhost".into()])?;
+    let server_key = KeyPair::generate()?;
+    let _server_cert = server_params.signed_by(&server_key, &ca_issuer)?;
 
     // Verify we can add the generated CA to a RootCertStore and build a client config.
     let mut root_store = RootCertStore::empty();
-    let mut reader = BufReader::new(ca_pem.as_bytes());
-    for cert in rustls_pemfile::certs(&mut reader) {
-        root_store.add(cert?)?;
-    }
+    root_store.add(ca.der().clone())?;
 
     // Build a basic client config that trusts our test CA.
     let _client_config = rustls::ClientConfig::builder()

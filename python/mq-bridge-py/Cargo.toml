@@ -18,23 +18,34 @@ async-trait.workspace = true
 bytes = { workspace = true, features = ["serde"] }
 fast-uuid-v7.workspace = true
 mq-bridge = { path = "../.." }
-pyo3 = { version = "0.28.3", features = ["abi3-py38", "auto-initialize"] }
+pyo3 = { version = "0.29.0", features = ["abi3-py38"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 serde_yaml_ng.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "sync"] }
 tracing.workspace = true
 
+# `auto-initialize` is only needed to embed the interpreter for the in-crate
+# `cargo test` unit tests (`Python::attach`). It must NOT be enabled for the
+# wheel/`--lib` build: manylinux ships a static-only Python, which PyO3 rejects
+# when combined with `extension-module` + `auto-initialize`. Keeping it as a
+# dev-dependency feature applies it to test/bench/example builds only.
+[dev-dependencies]
+pyo3 = { version = "0.29.0", features = ["abi3-py38", "auto-initialize"] }
+
 [features]
 default = ["full"]
 # Testing-only middleware hooks; do not include this feature in production wheels.
 middleware = ["mq-bridge/middleware"]
 full = ["mq-bridge/full"]
-# Lean, all-platform set for the `mq-bridge-py-basic` wheel (~22M): the
-# pure-Rust transports (no kafka/rdkafka C toolchain; no heavy datastore
-# drivers). memory + file endpoints are always compiled. Keep `middleware`
-# disabled for production builds.
-basic = ["http", "nats", "mqtt", "amqp", "websocket", "zeromq", "middleware", "rustls-ring"]
+# Lean set for the `mq-bridge-py-basic` wheel (~14M stripped): the pure-Rust
+# transports (no kafka/rdkafka C toolchain; no heavy datastore drivers) on the
+# `ring` crypto provider so it stays free of aws-lc-sys. memory + file
+# endpoints are always compiled. amqp is excluded too (its lapin/rustls-connector
+# chain is the heaviest dep and forces aws-lc); use the full wheel for AMQP.
+# `middleware` is intentionally excluded (metrics + sled dedup are not needed in
+# production wheels; retry/DLQ are not feature-gated and remain available).
+basic = ["http", "nats", "mqtt", "websocket", "zeromq", "rustls-ring"]
 dedup = ["mq-bridge/dedup"]
 metrics = ["mq-bridge/metrics"]
 schema = ["mq-bridge/schema"]

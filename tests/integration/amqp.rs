@@ -76,7 +76,7 @@ async fn test_amqp_publisher_handles_nack() {
         );
         channel
             .queue_declare(
-                nack_queue,
+                nack_queue.into(),
                 lapin::options::QueueDeclareOptions::default(),
                 args,
             )
