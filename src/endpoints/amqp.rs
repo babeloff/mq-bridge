@@ -140,13 +140,6 @@ impl AmqpPublisher {
 
     async fn reconnect(&self) {
         let mut state = self.state.write().await;
-        info!(
-            conn_status = ?state.connection.status(),
-            chan_status = ?state.channel.status(),
-            conn_connected = state.connection.status().connected(),
-            chan_connected = state.channel.status().connected(),
-            "DIAG: AMQP publisher reconnect() called"
-        );
         if state.connection.status().connected() && state.channel.status().connected() {
             return;
         }
@@ -200,15 +193,25 @@ impl MessagePublisher for AmqpPublisher {
         }
 
         let channel = self.get_channel().await;
-        let confirmation_result = channel
-            .basic_publish(
-                self.exchange.clone().into(),
-                self.queue.clone().into(),
-                BasicPublishOptions::default(),
-                &message.payload,
-                properties,
-            )
-            .await;
+        let publish_fut = channel.basic_publish(
+            self.exchange.clone().into(),
+            self.queue.clone().into(),
+            BasicPublishOptions::default(),
+            &message.payload,
+            properties,
+        );
+        // Bound the publish submit. In lapin 4 a publish to a silently-dropped
+        // connection can hang without surfacing an error, so cap the wait and
+        // treat it as a retryable failure that triggers a reconnect.
+        let confirmation_result = match tokio::time::timeout(CONFIRM_TIMEOUT, publish_fut).await {
+            Ok(res) => res,
+            Err(_) => {
+                self.reconnect().await;
+                return Err(PublisherError::Retryable(anyhow!(
+                    "Timed out submitting AMQP publish"
+                )));
+            }
+        };
 
         let confirmation = match confirmation_result {
             Ok(c) => c,
@@ -316,7 +319,9 @@ impl MessagePublisher for AmqpPublisher {
                     ));
                 }
                 Err(_) => {
-                    info!("DIAG: AMQP basic_publish() timed out (silent hang on dead connection)");
+                    // In lapin 4 a publish submitted to a silently-dropped
+                    // connection can hang without ever surfacing an error. Bound
+                    // the submit so the batch fails fast, reconnects, and retries.
                     failed_messages.push((
                         message,
                         PublisherError::Retryable(anyhow!(
@@ -675,16 +680,7 @@ impl MessageConsumer for AmqpConsumer {
                     // No message arrived within the poll window. If the connection
                     // or channel has dropped, surface a Connection error so the route
                     // recreates the consumer; otherwise keep waiting for a message.
-                    let conn_connected = self._conn.status().connected();
-                    let chan_connected = self.channel.status().connected();
-                    info!(
-                        conn_status = ?self._conn.status(),
-                        chan_status = ?self.channel.status(),
-                        conn_connected,
-                        chan_connected,
-                        "DIAG: AMQP consumer poll timeout, no message"
-                    );
-                    if !conn_connected || !chan_connected {
+                    if !self._conn.status().connected() || !self.channel.status().connected() {
                         return Err(ConsumerError::Connection(anyhow::anyhow!(
                             "AMQP connection lost while waiting for messages"
                         )));
