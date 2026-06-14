@@ -38,12 +38,13 @@ profiles still run.
 
 ## How it works
 
-- **One AutoBuilder, every HTTP flavour.** mq-bridge's HTTP server uses
+- **Auto for core, explicit H2 for h2c.** mq-bridge's default HTTP server uses
   hyper-util's `AutoBuilder`, which negotiates HTTP/1.1 **and** HTTP/2
   prior-knowledge (h2c) on the same plaintext port. The core `mq-bridge` entry
   binds **8080** (HTTP/1.1 + h2c) and **8443** (HTTP/2 over TLS) in one process,
-  sharing the same handler; `mq-bridge-h2c` is the same dispatch on **8082** for
-  the explicit h2c profiles.
+  sharing the same handler; `mq-bridge-h2c` uses the library's
+  `server_protocol = http2_only` setting on **8082** so HttpArena's explicit
+  h2c profiles cannot fall back to HTTP/1.1.
 - **HTTP/2 over TLS (`baseline-h2`, `static-h2`).** The library advertises ALPN
   `h2` on the TLS listener, so conformant clients negotiate HTTP/2; the TLS route
   reads its cert/key from `/certs/server.crt` + `/certs/server.key` (overridable
@@ -97,7 +98,7 @@ scripts/httparena/frameworks/
 ## Submitting upstream
 
 1. Pin the version: each Rust `Cargo.toml` and the Python `Dockerfile` reference
-   this repo at tag `v0.2.16` — bump to the release you want to benchmark.
+   this repo at tag `v0.2.18` — bump to the release you want to benchmark.
 2. Fork `MDA2AV/HttpArena` and copy each `scripts/httparena/frameworks/<name>/`
    into the fork's `frameworks/<name>/`.
 3. On the PR, validate and benchmark per framework:

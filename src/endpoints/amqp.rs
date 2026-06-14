@@ -31,9 +31,44 @@ use uuid::Uuid;
 /// connection drops and the confirm future never resolves.
 const CONFIRM_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How often the consumer wakes up while waiting for a message to re-check that
+/// the broker connection is still alive. In lapin 4 a dropped connection does
+/// not reliably terminate the consumer stream, so without this periodic health
+/// check `Consumer::next()` can block forever after the broker goes away and the
+/// route would never get the error it needs to reconnect.
+const CONSUMER_HEALTH_POLL: Duration = Duration::from_secs(1);
+
+/// Maximum time any single connection-setup step (connect, create_channel,
+/// confirm_select, declares, qos, consume) may take. In lapin 4 a
+/// `Connection::connect` can return `Ok` on a socket the broker immediately
+/// force-closes; the io_loop then aborts recovery and any subsequent channel
+/// operation on that connection never resolves. Without a bound, the
+/// publisher's `reconnect` parks inside `connect` holding the state write lock
+/// forever and the whole producer wedges. Bounding each step lets the attempt
+/// fail and be retried against a fresh connection.
+const SETUP_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Bounds a single lapin setup operation, turning a hang or error into a
+/// retryable failure. See [`SETUP_TIMEOUT`].
+async fn with_setup_timeout<T>(
+    op: &str,
+    fut: impl std::future::Future<Output = Result<T, lapin::Error>>,
+) -> anyhow::Result<T> {
+    match tokio::time::timeout(SETUP_TIMEOUT, fut).await {
+        Ok(Ok(v)) => Ok(v),
+        Ok(Err(e)) => Err(anyhow!("AMQP {op} failed: {e}")),
+        Err(_) => Err(anyhow!("AMQP {op} timed out after {SETUP_TIMEOUT:?}")),
+    }
+}
+
 struct AmqpState {
     connection: Connection,
     channel: Channel,
+    /// Bumped on every successful reconnect. Lets a worker that observed a
+    /// failure ask for a reconnect while letting concurrent workers that share
+    /// the same dead channel deduplicate, without trusting lapin's connection
+    /// status (which in lapin 4 can keep reporting `connected` on a dead link).
+    generation: u64,
 }
 
 pub struct AmqpPublisher {
@@ -84,18 +119,21 @@ impl AmqpPublisher {
             .as_deref()
             .ok_or_else(|| anyhow!("Queue name is required for AMQP publisher"))?;
         let conn = create_amqp_connection(config).await?;
-        let channel = conn.create_channel().await?;
+        let channel = with_setup_timeout("create_channel", conn.create_channel()).await?;
         // Enable publisher confirms on this channel to allow waiting for acks.
-        channel
-            .confirm_select(lapin::options::ConfirmSelectOptions::default())
-            .await?;
+        with_setup_timeout(
+            "confirm_select",
+            channel.confirm_select(lapin::options::ConfirmSelectOptions::default()),
+        )
+        .await?;
 
         if !config.no_declare_queue {
             if config.subscribe_mode {
                 let exchange_name = config.exchange.as_deref().unwrap_or(queue_or_exchange);
                 info!(exchange = %exchange_name, "Declaring AMQP Fanout exchange in sink");
-                channel
-                    .exchange_declare(
+                with_setup_timeout(
+                    "exchange_declare",
+                    channel.exchange_declare(
                         exchange_name.into(),
                         ExchangeKind::Fanout,
                         ExchangeDeclareOptions {
@@ -103,43 +141,60 @@ impl AmqpPublisher {
                             ..Default::default()
                         },
                         FieldTable::default(),
-                    )
-                    .await?;
+                    ),
+                )
+                .await?;
             } else {
                 // Ensure the queue exists before we try to publish to it. This is idempotent.
                 info!(queue = %queue_or_exchange, "Declaring AMQP queue in sink");
-                channel
-                    .queue_declare(
+                with_setup_timeout(
+                    "queue_declare",
+                    channel.queue_declare(
                         queue_or_exchange.into(),
                         QueueDeclareOptions {
                             durable: !config.no_persistence,
                             ..Default::default()
                         },
                         FieldTable::default(),
-                    )
-                    .await?;
+                    ),
+                )
+                .await?;
             }
         }
 
         Ok(AmqpState {
             connection: conn,
             channel,
+            generation: 0,
         })
     }
 
-    async fn get_channel(&self) -> Channel {
-        self.state.read().await.channel.clone()
+    /// Returns the current channel together with the generation it belongs to.
+    /// Callers pass the generation back to `reconnect` so a reconnect only fires
+    /// for the channel that actually failed.
+    async fn get_channel(&self) -> (Channel, u64) {
+        let state = self.state.read().await;
+        (state.channel.clone(), state.generation)
     }
 
-    async fn reconnect(&self) {
+    /// Reconnect after a worker observed a failure on the channel of generation
+    /// `observed_generation`. If another worker has already reconnected since
+    /// (generation moved on), this is a no-op. We deliberately do NOT consult
+    /// `connection.status()` here: in lapin 4 a dead connection can keep
+    /// reporting `connected`, which previously made this early-return and left
+    /// the publisher wedged on a dead channel forever.
+    async fn reconnect(&self, observed_generation: u64) {
         let mut state = self.state.write().await;
-        if state.connection.status().connected() && state.channel.status().connected() {
+        if state.generation != observed_generation {
+            // A concurrent worker already rebuilt the connection.
             return;
         }
         info!("Reconnecting AMQP publisher...");
         match Self::connect(&self.config).await {
             Ok(new_state) => {
+                let next_generation = state.generation.wrapping_add(1);
                 *state = new_state;
+                state.generation = next_generation;
                 info!("AMQP publisher reconnected.");
             }
             Err(e) => {
@@ -185,21 +240,31 @@ impl MessagePublisher for AmqpPublisher {
             properties = properties.with_headers(table);
         }
 
-        let channel = self.get_channel().await;
-        let confirmation_result = channel
-            .basic_publish(
-                self.exchange.clone().into(),
-                self.queue.clone().into(),
-                BasicPublishOptions::default(),
-                &message.payload,
-                properties,
-            )
-            .await;
+        let (channel, generation) = self.get_channel().await;
+        let publish_fut = channel.basic_publish(
+            self.exchange.clone().into(),
+            self.queue.clone().into(),
+            BasicPublishOptions::default(),
+            &message.payload,
+            properties,
+        );
+        // Bound the publish submit. In lapin 4 a publish to a silently-dropped
+        // connection can hang without surfacing an error, so cap the wait and
+        // treat it as a retryable failure that triggers a reconnect.
+        let confirmation_result = match tokio::time::timeout(CONFIRM_TIMEOUT, publish_fut).await {
+            Ok(res) => res,
+            Err(_) => {
+                self.reconnect(generation).await;
+                return Err(PublisherError::Retryable(anyhow!(
+                    "Timed out submitting AMQP publish"
+                )));
+            }
+        };
 
         let confirmation = match confirmation_result {
             Ok(c) => c,
             Err(e) => {
-                self.reconnect().await;
+                self.reconnect(generation).await;
                 return Err(PublisherError::Retryable(anyhow!(
                     "Failed to publish AMQP message: {}",
                     e
@@ -214,14 +279,14 @@ impl MessagePublisher for AmqpPublisher {
             let confirm = match tokio::time::timeout(CONFIRM_TIMEOUT, confirmation).await {
                 Ok(Ok(c)) => c,
                 Ok(Err(e)) => {
-                    self.reconnect().await;
+                    self.reconnect(generation).await;
                     return Err(PublisherError::Retryable(anyhow!(
                         "Failed to get AMQP publisher confirmation: {}",
                         e
                     )));
                 }
                 Err(_) => {
-                    self.reconnect().await;
+                    self.reconnect(generation).await;
                     return Err(PublisherError::Retryable(anyhow!(
                         "Timed out waiting for AMQP publisher confirmation"
                     )));
@@ -248,7 +313,7 @@ impl MessagePublisher for AmqpPublisher {
             .await;
         }
 
-        let channel = self.get_channel().await;
+        let (channel, generation) = self.get_channel().await;
         let mut pending_messages = Vec::with_capacity(messages.len());
         let mut pending_confirms = Vec::with_capacity(messages.len());
         let mut failed_messages = Vec::new();
@@ -281,26 +346,35 @@ impl MessagePublisher for AmqpPublisher {
                 properties = properties.with_headers(table);
             }
 
-            match channel
-                .basic_publish(
-                    self.exchange.clone().into(),
-                    self.queue.clone().into(),
-                    BasicPublishOptions::default(),
-                    &message.payload,
-                    properties,
-                )
-                .await
-            {
-                Ok(confirmation) => {
+            let publish_fut = channel.basic_publish(
+                self.exchange.clone().into(),
+                self.queue.clone().into(),
+                BasicPublishOptions::default(),
+                &message.payload,
+                properties,
+            );
+            match tokio::time::timeout(CONFIRM_TIMEOUT, publish_fut).await {
+                Ok(Ok(confirmation)) => {
                     pending_messages.push(message);
                     pending_confirms.push(confirmation);
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     failed_messages.push((
                         message,
                         PublisherError::Retryable(
                             anyhow!(e).context("Failed to publish message in batch"),
                         ),
+                    ));
+                }
+                Err(_) => {
+                    // In lapin 4 a publish submitted to a silently-dropped
+                    // connection can hang without ever surfacing an error. Bound
+                    // the submit so the batch fails fast, reconnects, and retries.
+                    failed_messages.push((
+                        message,
+                        PublisherError::Retryable(anyhow!(
+                            "Timed out submitting AMQP publish in batch"
+                        )),
                     ));
                 }
             }
@@ -350,7 +424,7 @@ impl MessagePublisher for AmqpPublisher {
         }
 
         if !failed_messages.is_empty() {
-            self.reconnect().await;
+            self.reconnect(generation).await;
         }
 
         if failed_messages.is_empty() {
@@ -410,7 +484,7 @@ impl AmqpConsumer {
             .as_deref()
             .ok_or_else(|| anyhow!("Queue name is required for AMQP consumer"))?;
         let conn = create_amqp_connection(config).await?;
-        let channel = conn.create_channel().await?;
+        let channel = with_setup_timeout("create_channel", conn.create_channel()).await?;
 
         let is_subscriber = config.subscribe_mode;
 
@@ -418,8 +492,9 @@ impl AmqpConsumer {
             // Subscriber mode: Declare Fanout exchange and temporary queue
             let exchange_name = config.exchange.as_deref().unwrap_or(queue_or_exchange);
             info!(exchange = %exchange_name, "Declaring AMQP Fanout exchange for subscriber");
-            channel
-                .exchange_declare(
+            with_setup_timeout(
+                "exchange_declare",
+                channel.exchange_declare(
                     exchange_name.into(),
                     ExchangeKind::Fanout,
                     ExchangeDeclareOptions {
@@ -427,13 +502,15 @@ impl AmqpConsumer {
                         ..Default::default()
                     },
                     FieldTable::default(),
-                )
-                .await?;
+                ),
+            )
+            .await?;
 
             let id = fast_uuid_v7::gen_id_string();
             let queue_name_str = format!("{}-{}-{}", APP_NAME, queue_or_exchange, id);
-            let queue = channel
-                .queue_declare(
+            let queue = with_setup_timeout(
+                "queue_declare",
+                channel.queue_declare(
                     queue_name_str.clone().into(),
                     QueueDeclareOptions {
                         exclusive: true,
@@ -441,34 +518,39 @@ impl AmqpConsumer {
                         ..Default::default()
                     },
                     FieldTable::default(),
-                )
-                .await?;
+                ),
+            )
+            .await?;
             let q_name = queue.name().as_str().to_string();
 
             info!(queue = %q_name, exchange = %exchange_name, "Binding temporary queue to exchange");
-            channel
-                .queue_bind(
+            with_setup_timeout(
+                "queue_bind",
+                channel.queue_bind(
                     q_name.clone().into(),
                     exchange_name.into(),
                     "".into(),
                     QueueBindOptions::default(),
                     FieldTable::default(),
-                )
-                .await?;
+                ),
+            )
+            .await?;
             q_name
         } else {
             // Consumer mode: Declare durable queue
             info!(queue = %queue_or_exchange, "Declaring AMQP queue");
-            channel
-                .queue_declare(
+            with_setup_timeout(
+                "queue_declare",
+                channel.queue_declare(
                     queue_or_exchange.into(),
                     QueueDeclareOptions {
                         durable: !config.no_persistence,
                         ..Default::default()
                     },
                     FieldTable::default(),
-                )
-                .await?;
+                ),
+            )
+            .await?;
             queue_or_exchange.to_string()
         };
 
@@ -476,9 +558,11 @@ impl AmqpConsumer {
         // We'll get the concurrency from the route config, but for now, let's use a reasonable default
         // that can be overridden by a new method.
         let prefetch_count = config.prefetch_count.unwrap_or(100);
-        channel
-            .basic_qos(prefetch_count, BasicQosOptions::default())
-            .await?;
+        with_setup_timeout(
+            "basic_qos",
+            channel.basic_qos(prefetch_count, BasicQosOptions::default()),
+        )
+        .await?;
 
         let consumer_tag = if is_subscriber {
             format!("{}_sub_{}", APP_NAME, fast_uuid_v7::gen_id_str())
@@ -487,14 +571,16 @@ impl AmqpConsumer {
         };
         info!(queue = %queue_name, consumer_tag = %consumer_tag, "Starting AMQP consumer");
 
-        let consumer = channel
-            .basic_consume(
+        let consumer = with_setup_timeout(
+            "basic_consume",
+            channel.basic_consume(
                 queue_name.clone().into(),
                 consumer_tag.into(),
                 BasicConsumeOptions::default(),
                 FieldTable::default(),
-            )
-            .await?;
+            ),
+        )
+        .await?;
 
         Ok(Self {
             _conn: conn,
@@ -523,28 +609,32 @@ async fn create_amqp_connection(config: &AmqpConfig) -> anyhow::Result<Connectio
     }
     let conn_uri = url.to_string();
 
-    let mut last_error = None;
+    let mut last_error: Option<anyhow::Error> = None;
     for attempt in 1..=5 {
         // Avoid logging credentials embedded in URLs.
         info!(attempt = attempt, "Attempting to connect to AMQP broker");
         let conn_props = ConnectionProperties::default();
+        // Bound the connect itself: a hung TLS/AMQP handshake against a broker
+        // that is restarting must not stall the reconnect indefinitely.
         let result = if config.tls.required {
             let tls_config = build_tls_config(config).await?;
-            DefaultConnectionBuilder::new()?
+            let builder = DefaultConnectionBuilder::new()?
                 .with_uri_str(conn_uri.clone())
                 .with_properties(conn_props)
-                .with_tls_config(tls_config)
-                .connect()
-                .await
+                .with_tls_config(tls_config);
+            with_setup_timeout("connect", builder.connect()).await
         } else {
-            Connection::connect(&conn_uri, conn_props).await
+            with_setup_timeout("connect", Connection::connect(&conn_uri, conn_props)).await
         };
 
         match result {
             Ok(conn) => return Ok(conn),
             Err(e) => {
                 last_error = Some(e);
-                tokio::time::sleep(Duration::from_secs(attempt * 2)).await; // Exponential backoff
+                // No need to back off after the final attempt.
+                if attempt < 5 {
+                    tokio::time::sleep(Duration::from_secs(attempt * 2)).await; // Exponential backoff
+                }
             }
         }
     }
@@ -635,14 +725,31 @@ impl MessageConsumer for AmqpConsumer {
             });
         }
 
-        // 1. Wait for the first message. This will block until a message is available.
-        let first_delivery = match self.consumer.next().await {
-            Some(Ok(delivery)) => delivery,
-            Some(Err(e)) => return Err(ConsumerError::Connection(anyhow::anyhow!(e))),
-            None => {
-                return Err(ConsumerError::Connection(anyhow::anyhow!(
-                    "AMQP consumer stream ended unexpectedly"
-                )))
+        // 1. Wait for the first message. This blocks until a message is available,
+        //    but each wait is bounded so we can periodically verify the broker
+        //    connection is still alive. In lapin 4 a dropped connection does not
+        //    reliably terminate the consumer stream, so without this health check
+        //    `next()` would block forever after the broker goes away and the route
+        //    would never see the Connection error it needs to recreate the consumer.
+        let first_delivery = loop {
+            match tokio::time::timeout(CONSUMER_HEALTH_POLL, self.consumer.next()).await {
+                Ok(Some(Ok(delivery))) => break delivery,
+                Ok(Some(Err(e))) => return Err(ConsumerError::Connection(anyhow::anyhow!(e))),
+                Ok(None) => {
+                    return Err(ConsumerError::Connection(anyhow::anyhow!(
+                        "AMQP consumer stream ended unexpectedly"
+                    )))
+                }
+                Err(_) => {
+                    // No message arrived within the poll window. If the connection
+                    // or channel has dropped, surface a Connection error so the route
+                    // recreates the consumer; otherwise keep waiting for a message.
+                    if !self._conn.status().connected() || !self.channel.status().connected() {
+                        return Err(ConsumerError::Connection(anyhow::anyhow!(
+                            "AMQP connection lost while waiting for messages"
+                        )));
+                    }
+                }
             }
         };
 

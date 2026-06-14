@@ -2,10 +2,10 @@
 #
 # The crate uses a path dependency on the mq-bridge repo, so we clone the repo
 # and build this example from inside it. For the upstream PR, the clone is
-# pinned to released tag v0.2.16; update when a newer release tag exists.
+# pinned to released tag v0.2.18; update when a newer release tag exists.
 FROM rust:1-bookworm AS build
 
-ARG MQB_REF=v0.2.16
+ARG MQB_REF=v0.2.18
 RUN git clone --depth 1 -b "${MQB_REF}" https://github.com/marcomq/mq-bridge /src
 WORKDIR /src/scripts/techempower/Rust/mq-bridge
 RUN cargo build --release

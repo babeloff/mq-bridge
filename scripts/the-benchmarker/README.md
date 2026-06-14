@@ -45,7 +45,7 @@ installs Rust + maturin and builds `mq_bridge_py` from this repo at the pinned
 ## Submitting upstream
 
 1. Pin the version: the Rust `Cargo.toml` and Python `config.yaml` reference this
-   repo at tag `v0.2.16` — bump to the release you want to benchmark.
+   repo at tag `v0.2.18` — bump to the release you want to benchmark.
 2. Fork `the-benchmarker/web-frameworks` and copy:
    - `scripts/the-benchmarker/rust/mq-bridge/`      → `rust/mq-bridge/`
    - `scripts/the-benchmarker/python/mq-bridge-py/` → `python/mq-bridge-py/`
