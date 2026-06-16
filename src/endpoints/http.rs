@@ -52,6 +52,63 @@ struct HttpConnInfo {
     protocol_version: Option<String>,
 }
 
+/// Sharded concurrency limiter. A single `Semaphore` shared by every worker
+/// turns its permit atomic into a cross-core hot spot at high core counts; we
+/// split the budget across N independent semaphores so cores stop contending on
+/// one cache line. The aggregate permit count is preserved, so the resource
+/// bound is unchanged.
+#[derive(Clone)]
+struct ConcurrencyLimiter {
+    shards: Arc<Vec<Arc<tokio::sync::Semaphore>>>,
+}
+
+impl ConcurrencyLimiter {
+    fn new(total_permits: usize) -> Self {
+        let total = total_permits.max(1);
+        let shard_count = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .min(total)
+            .min(16)
+            .max(1);
+        let base = total / shard_count;
+        let extra = total % shard_count;
+        let shards = (0..shard_count)
+            .map(|i| Arc::new(tokio::sync::Semaphore::new(base + usize::from(i < extra))))
+            .collect();
+        Self {
+            shards: Arc::new(shards),
+        }
+    }
+
+    /// Acquire on the calling thread's shard. Each worker thread is pinned to one
+    /// shard on first use (assigned round-robin), so the common case touches a
+    /// shard no other core writes to.
+    async fn acquire(
+        &self,
+    ) -> Result<tokio::sync::OwnedSemaphorePermit, tokio::sync::AcquireError> {
+        let idx = shard_index() % self.shards.len();
+        self.shards[idx].clone().acquire_owned().await
+    }
+}
+
+/// Stable per-thread shard index, assigned round-robin the first time a thread
+/// asks. The shared counter is touched once per thread, never per request.
+fn shard_index() -> usize {
+    thread_local! {
+        static SHARD: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    }
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    SHARD.with(|shard| match shard.get() {
+        Some(idx) => idx,
+        None => {
+            let idx = NEXT.fetch_add(1, Ordering::Relaxed) as usize;
+            shard.set(Some(idx));
+            idx
+        }
+    })
+}
+
 struct RequestMetadataView<'a> {
     method: &'a hyper::Method,
     path: &'a str,
@@ -112,6 +169,9 @@ struct HttpConsumerState {
     path: Option<String>,
     tx: tokio::sync::mpsc::Sender<HttpSourceMessage>,
     inline_publisher: Option<Arc<dyn MessagePublisher>>,
+    /// True when `inline_publisher` is a bare [`ResponsePublisher`], enabling the
+    /// metadata-free echo fast path. Precomputed to keep the type check off the hot path.
+    inline_echo: bool,
     message_id_header: String,
     request_timeout: std::time::Duration,
     fire_and_forget: bool,
@@ -120,7 +180,7 @@ struct HttpConsumerState {
     compression_enabled: bool,
     compression_threshold_bytes: usize,
     custom_headers: HashMap<String, String>,
-    concurrency_limit: Arc<tokio::sync::Semaphore>,
+    concurrency_limit: ConcurrencyLimiter,
     method: Option<hyper::Method>,
 }
 
@@ -563,10 +623,17 @@ fn setup_http_state_and_channel(
         })
         .transpose()?;
 
+    let inline_echo = inline_publisher.as_ref().is_some_and(|publisher| {
+        publisher
+            .as_any()
+            .is::<crate::endpoints::response::ResponsePublisher>()
+    });
+
     let state = HttpConsumerState {
         path: normalize_http_path(config.path.as_deref()),
         tx: request_tx,
         inline_publisher,
+        inline_echo,
         message_id_header,
         request_timeout,
         fire_and_forget: config.fire_and_forget,
@@ -575,9 +642,7 @@ fn setup_http_state_and_channel(
         compression_enabled: config.compression_enabled,
         compression_threshold_bytes,
         custom_headers: config.custom_headers.clone(),
-        concurrency_limit: Arc::new(tokio::sync::Semaphore::new(
-            config.concurrency_limit.unwrap_or(100).max(1),
-        )),
+        concurrency_limit: ConcurrencyLimiter::new(config.concurrency_limit.unwrap_or(100)),
         method,
     };
     Ok((request_rx, state, buffer_size))
@@ -1142,8 +1207,7 @@ async fn handle_request_internal(
     // This applies backpressure to Hyper and prevents task explosion during retry storms.
     let permit = state
         .concurrency_limit
-        .clone()
-        .acquire_owned()
+        .acquire()
         .await
         .map_err(|e| anyhow!(e))?;
 
@@ -1214,6 +1278,22 @@ async fn handle_request_internal(
     }
 
     let (parts, body) = req.into_parts();
+
+    // Pure-echo fast path: skip metadata construction; the response is fully
+    // determined by the request. Gate is header-only so the body is untouched.
+    if inline_echo_fast_path_applies(&state, &parts.headers) {
+        let client_accepts_gzip = request_accepts_gzip(&parts.headers);
+        return inline_echo_response(
+            &state,
+            &parts.headers,
+            body,
+            client_accepts_gzip,
+            accepts_text,
+            permit,
+        )
+        .await;
+    }
+
     let request_metadata_view = RequestMetadataView {
         method: &parts.method,
         path: parts.uri.path(),
@@ -1478,6 +1558,88 @@ async fn handle_request_internal(
             ))
         }
     }
+}
+
+/// Header-only gate for [`inline_echo_response`]. Disqualifies the cases where
+/// the slow path would diverge from "200 + echoed content-type + custom headers
+/// + (gzipped) body": request `content-encoding`/`transfer-encoding`/SSE
+/// content-type (streaming or re-encoding) or an `http_status_code` override.
+fn inline_echo_fast_path_applies(state: &HttpConsumerState, headers: &hyper::HeaderMap) -> bool {
+    if !state.inline_echo || state.receive_streamable {
+        return false;
+    }
+    if headers.contains_key(hyper::header::CONTENT_ENCODING)
+        || headers.contains_key(hyper::header::TRANSFER_ENCODING)
+        || headers.contains_key("http_status_code")
+    {
+        return false;
+    }
+    if let Some(content_type) = headers.get(hyper::header::CONTENT_TYPE) {
+        if content_type
+            .to_str()
+            .is_ok_and(|value| value.contains("text/event-stream"))
+        {
+            return false;
+        }
+    }
+    true
+}
+
+/// Pure-echo response without the per-request metadata HashMap. Only call when
+/// [`inline_echo_fast_path_applies`] returned true.
+async fn inline_echo_response(
+    state: &HttpConsumerState,
+    request_headers: &hyper::HeaderMap,
+    body: Incoming,
+    client_accepts_gzip: bool,
+    accepts_text: bool,
+    permit: tokio::sync::OwnedSemaphorePermit,
+) -> anyhow::Result<Response<BoxBody>> {
+    let body_bytes = match tokio::time::timeout(state.request_timeout, body.collect()).await {
+        Ok(Ok(collected)) => collected.to_bytes(),
+        Ok(Err(e)) => {
+            return Ok(text_error_response(
+                StatusCode::BAD_REQUEST,
+                format!("Failed to read body: {}", e),
+                accepts_text,
+                None,
+            ));
+        }
+        Err(_) => {
+            return Ok(text_error_response(
+                StatusCode::REQUEST_TIMEOUT,
+                "Timed out reading request body",
+                accepts_text,
+                None,
+            ));
+        }
+    };
+    // Permit only guards the read, as in the slow path.
+    drop(permit);
+
+    let mut builder = Response::builder().status(StatusCode::OK);
+
+    // Echo the request content-type (or octet-stream), matching the slow path.
+    if let Some(content_type) = request_headers.get(hyper::header::CONTENT_TYPE) {
+        builder = builder.header(hyper::header::CONTENT_TYPE, content_type);
+    } else {
+        builder = builder.header(hyper::header::CONTENT_TYPE, "application/octet-stream");
+    }
+
+    let (payload_out, was_compressed) = compress_if_needed(
+        body_bytes,
+        state.compression_enabled && client_accepts_gzip,
+        state.compression_threshold_bytes,
+    )?;
+    if was_compressed {
+        builder = builder.header("Content-Encoding", "gzip");
+    }
+
+    for (header_name, header_value) in &state.custom_headers {
+        builder = builder.header(header_name.as_str(), header_value.as_str());
+    }
+
+    Ok(builder.body(full(payload_out)).unwrap())
 }
 
 fn make_response(
