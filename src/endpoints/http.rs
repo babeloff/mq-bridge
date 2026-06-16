@@ -69,8 +69,7 @@ impl ConcurrencyLimiter {
             .map(|n| n.get())
             .unwrap_or(1)
             .min(total)
-            .min(16)
-            .max(1);
+            .clamp(1, 16);
         let base = total / shard_count;
         let extra = total % shard_count;
         let shards = (0..shard_count)
@@ -81,14 +80,29 @@ impl ConcurrencyLimiter {
         }
     }
 
-    /// Acquire on the calling thread's shard. Each worker thread is pinned to one
-    /// shard on first use (assigned round-robin), so the common case touches a
-    /// shard no other core writes to.
+    /// Acquire a permit, preferring the calling thread's shard. Each worker thread
+    /// is pinned to one shard on first use (assigned round-robin), so the common
+    /// case touches a shard no other core writes to.
+    ///
+    /// Under skewed load (traffic concentrated on fewer threads than shards) a
+    /// saturated local shard would otherwise park while idle shards still hold
+    /// free permits, wasting the aggregate budget. To avoid that, first sweep all
+    /// shards non-blocking, round-robin from the local index, and only block on the
+    /// local shard if every shard is currently full.
     async fn acquire(
         &self,
     ) -> Result<tokio::sync::OwnedSemaphorePermit, tokio::sync::AcquireError> {
-        let idx = shard_index() % self.shards.len();
-        self.shards[idx].clone().acquire_owned().await
+        let shard_count = self.shards.len();
+        let local = shard_index() % shard_count;
+        for offset in 0..shard_count {
+            let idx = (local + offset) % shard_count;
+            if let Ok(permit) = self.shards[idx].clone().try_acquire_owned() {
+                return Ok(permit);
+            }
+        }
+        // Every shard is saturated: block on the local shard to preserve
+        // backpressure and keep the wake-up on a shard no other core writes to.
+        self.shards[local].clone().acquire_owned().await
     }
 }
 
@@ -1563,7 +1577,7 @@ async fn handle_request_internal(
 /// Header-only gate for [`inline_echo_response`]. Disqualifies the cases where
 /// the slow path would diverge from "200 + echoed content-type + custom headers
 /// + (gzipped) body": request `content-encoding`/`transfer-encoding`/SSE
-/// content-type (streaming or re-encoding) or an `http_status_code` override.
+///   content-type (streaming or re-encoding) or an `http_status_code` override.
 fn inline_echo_fast_path_applies(state: &HttpConsumerState, headers: &hyper::HeaderMap) -> bool {
     if !state.inline_echo || state.receive_streamable {
         return false;

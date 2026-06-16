@@ -61,7 +61,7 @@ run_rung() {
   if [ "$ready" -ne 1 ]; then
     echo "  [$label] server failed to start:"; sed 's/^/    /' "$log"
     kill "$server_pid" 2>/dev/null || true; wait "$server_pid" 2>/dev/null || true
-    rm -f "$log"; return
+    rm -f "$log"; return 1
   fi
 
   local out
@@ -74,6 +74,8 @@ run_rung() {
   kill "$server_pid" 2>/dev/null || true
   wait "$server_pid" 2>/dev/null || true
   rm -f "$log"
+
+  if [ -z "$rps" ]; then return 1; fi
 }
 
 echo ">> HTTP throughput ladder (workers=$WORKERS clients=$CLIENTS duration=${DURATION}s)"
