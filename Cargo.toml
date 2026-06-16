@@ -16,7 +16,7 @@ members = ["python/mq-bridge-py"]
 resolver = "2"
 
 [workspace.package]
-version = "0.2.18"
+version = "0.2.19"
 
 [workspace.dependencies]
 anyhow = "1.0"
