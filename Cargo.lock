@@ -3060,6 +3060,7 @@ name = "mq-bridge"
 version = "0.2.18"
 dependencies = [
  "anyhow",
+ "arc-swap",
  "async-channel",
  "async-nats",
  "async-trait",

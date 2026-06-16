@@ -15,6 +15,7 @@ use crate::traits::{
 use crate::traits::{CommitFunc, MessageDisposition, PublisherError, SentBatch};
 use crate::CanonicalMessage;
 use anyhow::{anyhow, Context};
+use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use base64::{engine::general_purpose, Engine as _};
 use bytes::Bytes;
@@ -123,19 +124,45 @@ struct HttpConsumerState {
     method: Option<hyper::Method>,
 }
 
+/// Immutable snapshot of the registered HTTP routes.
+///
+/// The hot path ([`SharedHttpRouter::match_route`]) reads this without locking;
+/// the rare register/unregister operations rebuild it and swap it in atomically.
 #[derive(Default)]
+struct RouteTable {
+    routes: Vec<(u64, Arc<HttpConsumerState>)>,
+}
+
+/// Routes every request for a shared listener to the consumer registered for its
+/// path+method.
+///
+/// Reads are lock-free: `match_route` loads an [`ArcSwap`] snapshot. Only the
+/// infrequent register/unregister rebuilds take `writers`, a lock the request
+/// path never touches. This replaces the previous per-request `Mutex<HashMap>`,
+/// which scaled *negatively* with core count (see `benches/router_bench.rs`).
 struct SharedHttpRouter {
-    routes: Mutex<HashMap<u64, Arc<HttpConsumerState>>>,
+    snapshot: ArcSwap<RouteTable>,
+    writers: Mutex<()>,
+}
+
+impl Default for SharedHttpRouter {
+    fn default() -> Self {
+        Self {
+            snapshot: ArcSwap::from_pointee(RouteTable::default()),
+            writers: Mutex::new(()),
+        }
+    }
 }
 
 impl SharedHttpRouter {
     fn register_route(&self, route_id: u64, state: Arc<HttpConsumerState>) -> anyhow::Result<()> {
-        let mut routes = self
-            .routes
+        let _writers = self
+            .writers
             .lock()
             .map_err(|_| anyhow!("HTTP route registry lock poisoned"))?;
 
-        for existing in routes.values() {
+        let current = self.snapshot.load();
+        for (_, existing) in current.routes.iter() {
             if routes_conflict(existing, &state) {
                 return Err(anyhow!(
                     "Conflicting HTTP consumer registration for path {:?} and method {:?}",
@@ -145,29 +172,31 @@ impl SharedHttpRouter {
             }
         }
 
-        routes.insert(route_id, state);
+        let mut routes = current.routes.clone();
+        routes.push((route_id, state));
+        self.snapshot.store(Arc::new(RouteTable { routes }));
         Ok(())
     }
 
     fn unregister_route(&self, route_id: u64) -> bool {
-        let Ok(mut routes) = self.routes.lock() else {
+        let Ok(_writers) = self.writers.lock() else {
             return false;
         };
-        routes.remove(&route_id);
-        routes.is_empty()
+        let mut routes = self.snapshot.load().routes.clone();
+        routes.retain(|(id, _)| *id != route_id);
+        let is_empty = routes.is_empty();
+        self.snapshot.store(Arc::new(RouteTable { routes }));
+        is_empty
     }
 
     fn match_route(&self, path: &str, method: &hyper::Method) -> anyhow::Result<RouteMatchResult> {
-        let routes = self
-            .routes
-            .lock()
-            .map_err(|_| anyhow!("HTTP route registry lock poisoned"))?;
+        let table = self.snapshot.load();
 
         let mut matched_path = false;
-        let mut best: Option<Arc<HttpConsumerState>> = None;
+        let mut best: Option<&Arc<HttpConsumerState>> = None;
         let mut best_specificity = (0, 0);
 
-        for state in routes.values() {
+        for (_, state) in table.routes.iter() {
             if !route_matches_path(state, path) {
                 continue;
             }
@@ -177,18 +206,23 @@ impl SharedHttpRouter {
                 let specificity = route_specificity(state);
                 if best.is_none() || specificity > best_specificity {
                     best_specificity = specificity;
-                    best = Some(Arc::clone(state));
+                    best = Some(state);
                 }
             }
         }
 
         Ok(match best {
-            Some(state) => RouteMatchResult::Matched(state),
+            // One `Arc` clone is unavoidable: the matched state must outlive the
+            // request's `.await` points (body read, channel hand-off, ack). It is
+            // a single atomic bump — cheap next to the work that follows — and is
+            // no longer serialized behind a lock.
+            Some(state) => RouteMatchResult::Matched(Arc::clone(state)),
             None if matched_path => {
-                let mut methods = routes
-                    .values()
-                    .filter(|state| route_matches_path(state, path))
-                    .filter_map(|state| state.method.clone())
+                let mut methods = table
+                    .routes
+                    .iter()
+                    .filter(|(_, state)| route_matches_path(state, path))
+                    .filter_map(|(_, state)| state.method.clone())
                     .collect::<Vec<_>>();
                 methods.sort_by(|left, right| left.as_str().cmp(right.as_str()));
                 methods.dedup();
@@ -506,7 +540,10 @@ fn setup_http_state_and_channel(
     HttpConsumerState,
     usize,
 )> {
-    let buffer_size = config.internal_buffer_size.unwrap_or(100).max(1);
+    // Default buffer for the per-route receive channel. 100 was small enough to
+    // reject bursts with 503s before the pipeline could drain them; 1024 absorbs
+    // typical bursts while staying bounded. Override via `internal_buffer_size`.
+    let buffer_size = config.internal_buffer_size.unwrap_or(1024).max(1);
     let (request_tx, request_rx) = tokio::sync::mpsc::channel::<HttpSourceMessage>(buffer_size);
 
     let message_id_header = config
@@ -992,28 +1029,17 @@ impl MessageConsumer for HttpConsumer {
     async fn receive_batch(&mut self, max_messages: usize) -> Result<ReceivedBatch, ConsumerError> {
         let max_messages = max_messages.max(1);
 
-        // Block on first message
-        let (first_message, first_commit) = self
-            .request_rx
-            .recv()
-            .await
-            .ok_or_else(|| anyhow!("HTTP source channel closed"))?;
-
-        let mut messages = Vec::with_capacity(max_messages);
-        messages.push(first_message);
-        let mut commits = Vec::with_capacity(max_messages);
-        commits.push(first_commit);
-
-        // Non-blocking collection of additional messages
-        while messages.len() < max_messages {
-            match self.request_rx.try_recv() {
-                Ok((message, commit)) => {
-                    messages.push(message);
-                    commits.push(commit);
-                }
-                Err(_) => break,
-            }
+        // Pull a whole batch in one synchronized operation: `recv_many` blocks
+        // for the first message, then drains everything already queued, up to the
+        // limit. This is cheaper than `recv().await` plus a `try_recv()` loop (one
+        // channel operation instead of N) and coalesces bursts more tightly — the
+        // single per-route receiver is otherwise a per-message wake-up point.
+        let mut batch: Vec<HttpSourceMessage> = Vec::with_capacity(max_messages);
+        if self.request_rx.recv_many(&mut batch, max_messages).await == 0 {
+            return Err(anyhow!("HTTP source channel closed").into());
         }
+
+        let (messages, commits): (Vec<_>, Vec<_>) = batch.into_iter().unzip();
 
         // Create a batch commit that handles all collected messages
         let batch_commit: crate::traits::BatchCommitFunc =

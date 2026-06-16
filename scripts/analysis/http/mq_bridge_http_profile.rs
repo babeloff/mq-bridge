@@ -136,6 +136,7 @@ enum ProfileMode {
     Immediate,
     Metadata,
     ChannelAck,
+    WorkerLocalAck,
     DirectConsumer,
     DirectConsumerAck,
     DirectConsumerFireForget,
@@ -242,6 +243,7 @@ fn parse_mode(value: &str) -> ProfileMode {
         "immediate" => ProfileMode::Immediate,
         "metadata" => ProfileMode::Metadata,
         "channel-ack" | "channel_ack" => ProfileMode::ChannelAck,
+        "worker-local-ack" | "worker_local_ack" => ProfileMode::WorkerLocalAck,
         "direct-consumer" | "direct_consumer" => ProfileMode::DirectConsumer,
         "direct-consumer-ack" | "direct_consumer_ack" => ProfileMode::DirectConsumerAck,
         "direct-consumer-fire-forget" | "direct_consumer_fire_forget" => {
@@ -283,7 +285,7 @@ fn print_help() {
     eprintln!(
         "Usage: mq_bridge_http_profile [--mode MODE] [--port PORT] [--duration-s SECONDS] [--path PATH]\n\
          Options:\n\
-           --mode MODE                 route | route-fire-forget | route-handler | immediate | metadata | channel-ack | direct-consumer | direct-consumer-ack | direct-consumer-fire-forget | inline-response | inline-body-only (default route)\n\
+           --mode MODE                 route | route-fire-forget | route-handler | immediate | metadata | channel-ack | worker-local-ack | direct-consumer | direct-consumer-ack | direct-consumer-fire-forget | inline-response | inline-body-only (default route)\n\
            --client-url URL            run Rust load client instead of server\n\
            --clients N                 Rust load client concurrency (default 8)\n\
            --header-count N            Add N synthetic request headers in Rust load client (default 0)\n\
@@ -335,6 +337,7 @@ async fn run_standalone_server(args: ProfileArgs) -> anyhow::Result<()> {
     let mode = args.mode;
     let path = Arc::new(args.path.clone());
     let duration_s = args.duration_s;
+    let buffer_size = args.internal_buffer_size;
 
     let shutdown = tokio::time::sleep(std::time::Duration::from_secs(duration_s));
     tokio::pin!(shutdown);
@@ -350,7 +353,21 @@ async fn run_standalone_server(args: ProfileArgs) -> anyhow::Result<()> {
             accepted = listener.accept() => {
                 let (stream, _) = accepted?;
                 let io = TokioIo::new(stream);
-                let tx = channel_tx.clone();
+                // WorkerLocalAck gives every connection its own channel + drain task, so
+                // there is no shared single-receiver contention (variant B in the ladder).
+                // ChannelAck reuses the one process-wide channel (variant C). The
+                // per-request work is otherwise identical, isolating the global funnel.
+                let tx = if mode == ProfileMode::WorkerLocalAck {
+                    let (tx, mut rx) = tokio::sync::mpsc::channel::<AckMessage>(buffer_size);
+                    tokio::spawn(async move {
+                        while let Some((_payload, _metadata, ack)) = rx.recv().await {
+                            let _ = ack.send(());
+                        }
+                    });
+                    Some(tx)
+                } else {
+                    channel_tx.clone()
+                };
                 let path = path.clone();
                 tokio::spawn(async move {
                     let service = service_fn(move |req| {
@@ -479,7 +496,10 @@ async fn profile_request(
             .unwrap());
     }
 
-    let metadata = if matches!(mode, ProfileMode::Metadata | ProfileMode::ChannelAck) {
+    let metadata = if matches!(
+        mode,
+        ProfileMode::Metadata | ProfileMode::ChannelAck | ProfileMode::WorkerLocalAck
+    ) {
         build_metadata(&req)
     } else {
         HashMap::new()
@@ -495,7 +515,7 @@ async fn profile_request(
         }
     };
 
-    if mode == ProfileMode::ChannelAck {
+    if matches!(mode, ProfileMode::ChannelAck | ProfileMode::WorkerLocalAck) {
         let Some(tx) = tx else {
             return Ok(Response::builder()
                 .status(500)
