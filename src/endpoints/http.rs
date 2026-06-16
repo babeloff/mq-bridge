@@ -15,6 +15,7 @@ use crate::traits::{
 use crate::traits::{CommitFunc, MessageDisposition, PublisherError, SentBatch};
 use crate::CanonicalMessage;
 use anyhow::{anyhow, Context};
+use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use base64::{engine::general_purpose, Engine as _};
 use bytes::Bytes;
@@ -49,6 +50,77 @@ type HttpSourceMessage = (CanonicalMessage, CommitFunc);
 struct HttpConnInfo {
     cipher_suite: Option<String>,
     protocol_version: Option<String>,
+}
+
+/// Sharded concurrency limiter. A single `Semaphore` shared by every worker
+/// turns its permit atomic into a cross-core hot spot at high core counts; we
+/// split the budget across N independent semaphores so cores stop contending on
+/// one cache line. The aggregate permit count is preserved, so the resource
+/// bound is unchanged.
+#[derive(Clone)]
+struct ConcurrencyLimiter {
+    shards: Arc<Vec<Arc<tokio::sync::Semaphore>>>,
+}
+
+impl ConcurrencyLimiter {
+    fn new(total_permits: usize) -> Self {
+        let total = total_permits.max(1);
+        let shard_count = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .min(total)
+            .clamp(1, 16);
+        let base = total / shard_count;
+        let extra = total % shard_count;
+        let shards = (0..shard_count)
+            .map(|i| Arc::new(tokio::sync::Semaphore::new(base + usize::from(i < extra))))
+            .collect();
+        Self {
+            shards: Arc::new(shards),
+        }
+    }
+
+    /// Acquire a permit, preferring the calling thread's shard. Each worker thread
+    /// is pinned to one shard on first use (assigned round-robin), so the common
+    /// case touches a shard no other core writes to.
+    ///
+    /// Under skewed load (traffic concentrated on fewer threads than shards) a
+    /// saturated local shard would otherwise park while idle shards still hold
+    /// free permits, wasting the aggregate budget. To avoid that, first sweep all
+    /// shards non-blocking, round-robin from the local index, and only block on the
+    /// local shard if every shard is currently full.
+    async fn acquire(
+        &self,
+    ) -> Result<tokio::sync::OwnedSemaphorePermit, tokio::sync::AcquireError> {
+        let shard_count = self.shards.len();
+        let local = shard_index() % shard_count;
+        for offset in 0..shard_count {
+            let idx = (local + offset) % shard_count;
+            if let Ok(permit) = self.shards[idx].clone().try_acquire_owned() {
+                return Ok(permit);
+            }
+        }
+        // Every shard is saturated: block on the local shard to preserve
+        // backpressure and keep the wake-up on a shard no other core writes to.
+        self.shards[local].clone().acquire_owned().await
+    }
+}
+
+/// Stable per-thread shard index, assigned round-robin the first time a thread
+/// asks. The shared counter is touched once per thread, never per request.
+fn shard_index() -> usize {
+    thread_local! {
+        static SHARD: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    }
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    SHARD.with(|shard| match shard.get() {
+        Some(idx) => idx,
+        None => {
+            let idx = NEXT.fetch_add(1, Ordering::Relaxed) as usize;
+            shard.set(Some(idx));
+            idx
+        }
+    })
 }
 
 struct RequestMetadataView<'a> {
@@ -111,6 +183,9 @@ struct HttpConsumerState {
     path: Option<String>,
     tx: tokio::sync::mpsc::Sender<HttpSourceMessage>,
     inline_publisher: Option<Arc<dyn MessagePublisher>>,
+    /// True when `inline_publisher` is a bare [`ResponsePublisher`], enabling the
+    /// metadata-free echo fast path. Precomputed to keep the type check off the hot path.
+    inline_echo: bool,
     message_id_header: String,
     request_timeout: std::time::Duration,
     fire_and_forget: bool,
@@ -119,23 +194,49 @@ struct HttpConsumerState {
     compression_enabled: bool,
     compression_threshold_bytes: usize,
     custom_headers: HashMap<String, String>,
-    concurrency_limit: Arc<tokio::sync::Semaphore>,
+    concurrency_limit: ConcurrencyLimiter,
     method: Option<hyper::Method>,
 }
 
+/// Immutable snapshot of the registered HTTP routes.
+///
+/// The hot path ([`SharedHttpRouter::match_route`]) reads this without locking;
+/// the rare register/unregister operations rebuild it and swap it in atomically.
 #[derive(Default)]
+struct RouteTable {
+    routes: Vec<(u64, Arc<HttpConsumerState>)>,
+}
+
+/// Routes every request for a shared listener to the consumer registered for its
+/// path+method.
+///
+/// Reads are lock-free: `match_route` loads an [`ArcSwap`] snapshot. Only the
+/// infrequent register/unregister rebuilds take `writers`, a lock the request
+/// path never touches. This replaces the previous per-request `Mutex<HashMap>`,
+/// which scaled *negatively* with core count (see `benches/router_bench.rs`).
 struct SharedHttpRouter {
-    routes: Mutex<HashMap<u64, Arc<HttpConsumerState>>>,
+    snapshot: ArcSwap<RouteTable>,
+    writers: Mutex<()>,
+}
+
+impl Default for SharedHttpRouter {
+    fn default() -> Self {
+        Self {
+            snapshot: ArcSwap::from_pointee(RouteTable::default()),
+            writers: Mutex::new(()),
+        }
+    }
 }
 
 impl SharedHttpRouter {
     fn register_route(&self, route_id: u64, state: Arc<HttpConsumerState>) -> anyhow::Result<()> {
-        let mut routes = self
-            .routes
+        let _writers = self
+            .writers
             .lock()
             .map_err(|_| anyhow!("HTTP route registry lock poisoned"))?;
 
-        for existing in routes.values() {
+        let current = self.snapshot.load();
+        for (_, existing) in current.routes.iter() {
             if routes_conflict(existing, &state) {
                 return Err(anyhow!(
                     "Conflicting HTTP consumer registration for path {:?} and method {:?}",
@@ -145,29 +246,31 @@ impl SharedHttpRouter {
             }
         }
 
-        routes.insert(route_id, state);
+        let mut routes = current.routes.clone();
+        routes.push((route_id, state));
+        self.snapshot.store(Arc::new(RouteTable { routes }));
         Ok(())
     }
 
     fn unregister_route(&self, route_id: u64) -> bool {
-        let Ok(mut routes) = self.routes.lock() else {
+        let Ok(_writers) = self.writers.lock() else {
             return false;
         };
-        routes.remove(&route_id);
-        routes.is_empty()
+        let mut routes = self.snapshot.load().routes.clone();
+        routes.retain(|(id, _)| *id != route_id);
+        let is_empty = routes.is_empty();
+        self.snapshot.store(Arc::new(RouteTable { routes }));
+        is_empty
     }
 
     fn match_route(&self, path: &str, method: &hyper::Method) -> anyhow::Result<RouteMatchResult> {
-        let routes = self
-            .routes
-            .lock()
-            .map_err(|_| anyhow!("HTTP route registry lock poisoned"))?;
+        let table = self.snapshot.load();
 
         let mut matched_path = false;
-        let mut best: Option<Arc<HttpConsumerState>> = None;
+        let mut best: Option<&Arc<HttpConsumerState>> = None;
         let mut best_specificity = (0, 0);
 
-        for state in routes.values() {
+        for (_, state) in table.routes.iter() {
             if !route_matches_path(state, path) {
                 continue;
             }
@@ -177,18 +280,23 @@ impl SharedHttpRouter {
                 let specificity = route_specificity(state);
                 if best.is_none() || specificity > best_specificity {
                     best_specificity = specificity;
-                    best = Some(Arc::clone(state));
+                    best = Some(state);
                 }
             }
         }
 
         Ok(match best {
-            Some(state) => RouteMatchResult::Matched(state),
+            // One `Arc` clone is unavoidable: the matched state must outlive the
+            // request's `.await` points (body read, channel hand-off, ack). It is
+            // a single atomic bump — cheap next to the work that follows — and is
+            // no longer serialized behind a lock.
+            Some(state) => RouteMatchResult::Matched(Arc::clone(state)),
             None if matched_path => {
-                let mut methods = routes
-                    .values()
-                    .filter(|state| route_matches_path(state, path))
-                    .filter_map(|state| state.method.clone())
+                let mut methods = table
+                    .routes
+                    .iter()
+                    .filter(|(_, state)| route_matches_path(state, path))
+                    .filter_map(|(_, state)| state.method.clone())
                     .collect::<Vec<_>>();
                 methods.sort_by(|left, right| left.as_str().cmp(right.as_str()));
                 methods.dedup();
@@ -506,7 +614,10 @@ fn setup_http_state_and_channel(
     HttpConsumerState,
     usize,
 )> {
-    let buffer_size = config.internal_buffer_size.unwrap_or(100).max(1);
+    // Default buffer for the per-route receive channel. 100 was small enough to
+    // reject bursts with 503s before the pipeline could drain them; 1024 absorbs
+    // typical bursts while staying bounded. Override via `internal_buffer_size`.
+    let buffer_size = config.internal_buffer_size.unwrap_or(1024).max(1);
     let (request_tx, request_rx) = tokio::sync::mpsc::channel::<HttpSourceMessage>(buffer_size);
 
     let message_id_header = config
@@ -526,10 +637,17 @@ fn setup_http_state_and_channel(
         })
         .transpose()?;
 
+    let inline_echo = inline_publisher.as_ref().is_some_and(|publisher| {
+        publisher
+            .as_any()
+            .is::<crate::endpoints::response::ResponsePublisher>()
+    });
+
     let state = HttpConsumerState {
         path: normalize_http_path(config.path.as_deref()),
         tx: request_tx,
         inline_publisher,
+        inline_echo,
         message_id_header,
         request_timeout,
         fire_and_forget: config.fire_and_forget,
@@ -538,9 +656,7 @@ fn setup_http_state_and_channel(
         compression_enabled: config.compression_enabled,
         compression_threshold_bytes,
         custom_headers: config.custom_headers.clone(),
-        concurrency_limit: Arc::new(tokio::sync::Semaphore::new(
-            config.concurrency_limit.unwrap_or(100).max(1),
-        )),
+        concurrency_limit: ConcurrencyLimiter::new(config.concurrency_limit.unwrap_or(100)),
         method,
     };
     Ok((request_rx, state, buffer_size))
@@ -992,28 +1108,17 @@ impl MessageConsumer for HttpConsumer {
     async fn receive_batch(&mut self, max_messages: usize) -> Result<ReceivedBatch, ConsumerError> {
         let max_messages = max_messages.max(1);
 
-        // Block on first message
-        let (first_message, first_commit) = self
-            .request_rx
-            .recv()
-            .await
-            .ok_or_else(|| anyhow!("HTTP source channel closed"))?;
-
-        let mut messages = Vec::with_capacity(max_messages);
-        messages.push(first_message);
-        let mut commits = Vec::with_capacity(max_messages);
-        commits.push(first_commit);
-
-        // Non-blocking collection of additional messages
-        while messages.len() < max_messages {
-            match self.request_rx.try_recv() {
-                Ok((message, commit)) => {
-                    messages.push(message);
-                    commits.push(commit);
-                }
-                Err(_) => break,
-            }
+        // Pull a whole batch in one synchronized operation: `recv_many` blocks
+        // for the first message, then drains everything already queued, up to the
+        // limit. This is cheaper than `recv().await` plus a `try_recv()` loop (one
+        // channel operation instead of N) and coalesces bursts more tightly — the
+        // single per-route receiver is otherwise a per-message wake-up point.
+        let mut batch: Vec<HttpSourceMessage> = Vec::with_capacity(max_messages);
+        if self.request_rx.recv_many(&mut batch, max_messages).await == 0 {
+            return Err(anyhow!("HTTP source channel closed").into());
         }
+
+        let (messages, commits): (Vec<_>, Vec<_>) = batch.into_iter().unzip();
 
         // Create a batch commit that handles all collected messages
         let batch_commit: crate::traits::BatchCommitFunc =
@@ -1116,8 +1221,7 @@ async fn handle_request_internal(
     // This applies backpressure to Hyper and prevents task explosion during retry storms.
     let permit = state
         .concurrency_limit
-        .clone()
-        .acquire_owned()
+        .acquire()
         .await
         .map_err(|e| anyhow!(e))?;
 
@@ -1188,6 +1292,22 @@ async fn handle_request_internal(
     }
 
     let (parts, body) = req.into_parts();
+
+    // Pure-echo fast path: skip metadata construction; the response is fully
+    // determined by the request. Gate is header-only so the body is untouched.
+    if inline_echo_fast_path_applies(&state, &parts.headers) {
+        let client_accepts_gzip = request_accepts_gzip(&parts.headers);
+        return inline_echo_response(
+            &state,
+            &parts.headers,
+            body,
+            client_accepts_gzip,
+            accepts_text,
+            permit,
+        )
+        .await;
+    }
+
     let request_metadata_view = RequestMetadataView {
         method: &parts.method,
         path: parts.uri.path(),
@@ -1454,6 +1574,88 @@ async fn handle_request_internal(
     }
 }
 
+/// Header-only gate for [`inline_echo_response`]. Disqualifies the cases where
+/// the slow path would diverge from "200 + echoed content-type + custom headers
+/// + (gzipped) body": request `content-encoding`/`transfer-encoding`/SSE
+///   content-type (streaming or re-encoding) or an `http_status_code` override.
+fn inline_echo_fast_path_applies(state: &HttpConsumerState, headers: &hyper::HeaderMap) -> bool {
+    if !state.inline_echo || state.receive_streamable {
+        return false;
+    }
+    if headers.contains_key(hyper::header::CONTENT_ENCODING)
+        || headers.contains_key(hyper::header::TRANSFER_ENCODING)
+        || headers.contains_key("http_status_code")
+    {
+        return false;
+    }
+    if let Some(content_type) = headers.get(hyper::header::CONTENT_TYPE) {
+        if content_type
+            .to_str()
+            .is_ok_and(|value| value.contains("text/event-stream"))
+        {
+            return false;
+        }
+    }
+    true
+}
+
+/// Pure-echo response without the per-request metadata HashMap. Only call when
+/// [`inline_echo_fast_path_applies`] returned true.
+async fn inline_echo_response(
+    state: &HttpConsumerState,
+    request_headers: &hyper::HeaderMap,
+    body: Incoming,
+    client_accepts_gzip: bool,
+    accepts_text: bool,
+    permit: tokio::sync::OwnedSemaphorePermit,
+) -> anyhow::Result<Response<BoxBody>> {
+    let body_bytes = match tokio::time::timeout(state.request_timeout, body.collect()).await {
+        Ok(Ok(collected)) => collected.to_bytes(),
+        Ok(Err(e)) => {
+            return Ok(text_error_response(
+                StatusCode::BAD_REQUEST,
+                format!("Failed to read body: {}", e),
+                accepts_text,
+                None,
+            ));
+        }
+        Err(_) => {
+            return Ok(text_error_response(
+                StatusCode::REQUEST_TIMEOUT,
+                "Timed out reading request body",
+                accepts_text,
+                None,
+            ));
+        }
+    };
+    // Permit only guards the read, as in the slow path.
+    drop(permit);
+
+    let mut builder = Response::builder().status(StatusCode::OK);
+
+    // Echo the request content-type (or octet-stream), matching the slow path.
+    if let Some(content_type) = request_headers.get(hyper::header::CONTENT_TYPE) {
+        builder = builder.header(hyper::header::CONTENT_TYPE, content_type);
+    } else {
+        builder = builder.header(hyper::header::CONTENT_TYPE, "application/octet-stream");
+    }
+
+    let (payload_out, was_compressed) = compress_if_needed(
+        body_bytes,
+        state.compression_enabled && client_accepts_gzip,
+        state.compression_threshold_bytes,
+    )?;
+    if was_compressed {
+        builder = builder.header("Content-Encoding", "gzip");
+    }
+
+    for (header_name, header_value) in &state.custom_headers {
+        builder = builder.header(header_name.as_str(), header_value.as_str());
+    }
+
+    Ok(builder.body(full(payload_out)).unwrap())
+}
+
 fn make_response(
     disposition: MessageDisposition,
     compression_enabled: bool,
@@ -1482,12 +1684,23 @@ fn make_response(
             // pass, so the body is never double-encoded.
             let mut preset_encoding: Option<String> = None;
             for (key, value) in &msg.metadata {
-                if request_metadata
-                    .is_some_and(|metadata| request_metadata_matches(metadata, key, value))
+                let is_content_type = key.eq_ignore_ascii_case("content-type");
+                // Request-echo suppression drops reply metadata that byte-matches the
+                // incoming request header of the same name, so pure passthrough/echo
+                // routes don't re-emit unchanged request headers (e.g. `x-request-id`).
+                // `content-type` is exempt: it describes the *response* representation,
+                // so when it is present on the reply it must always be sent — even when
+                // it happens to equal the request's `Content-Type` (e.g. a handler that
+                // explicitly replies `text/plain` to a `text/plain` request). Without
+                // this exemption such a reply would be suppressed and fall back to
+                // `application/octet-stream`.
+                if !is_content_type
+                    && request_metadata
+                        .is_some_and(|metadata| request_metadata_matches(metadata, key, value))
                 {
                     continue;
                 }
-                if key.eq_ignore_ascii_case("content-type") {
+                if is_content_type {
                     has_content_type = true;
                     if value.contains("text/event-stream") {
                         is_streaming = true;
@@ -3211,9 +3424,14 @@ http_route:
             .unwrap();
         let response = client.request(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+        // `content-type` describes the response representation and is exempt from
+        // request-echo suppression: the echoed body is the JSON request body, so the
+        // reply correctly carries `application/json` rather than falling back to
+        // `application/octet-stream`. Arbitrary request headers such as `x-request-id`
+        // are still suppressed.
         assert_eq!(
             response.headers().get("content-type").unwrap(),
-            "application/octet-stream"
+            "application/json"
         );
         assert!(response.headers().get("x-request-id").is_none());
         let body = response.into_body().collect().await.unwrap().to_bytes();
@@ -3376,6 +3594,62 @@ http_route:
         assert!(response.headers().get("x-request-id").is_none());
         let body = response.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(body, Bytes::from_static(b"handled-response"));
+
+        handle.stop().await;
+        let _ = handle.join().await;
+    }
+
+    #[tokio::test]
+    async fn test_http_route_handler_content_type_matching_request_is_not_suppressed() {
+        // Regression: a handler-set reply `content-type` whose value byte-matches the
+        // request's `Content-Type` must still be sent. Request-echo suppression must
+        // not drop it and fall back to `application/octet-stream`.
+        use crate::traits::Handled;
+
+        init_crypto();
+        let port = get_free_port();
+        let addr = format!("127.0.0.1:{}", port);
+
+        let input = Endpoint::new(EndpointType::Http(HttpConfig {
+            url: addr.clone(),
+            path: Some("/ct-match".to_string()),
+            ..Default::default()
+        }));
+        let mut output = Endpoint::new(EndpointType::Response(
+            crate::models::ResponseConfig::default(),
+        ));
+        let handler = |mut msg: CanonicalMessage| async move {
+            msg.payload = Bytes::from_static(b"42");
+            msg.metadata
+                .insert("content-type".to_string(), "text/plain".to_string());
+            Ok(Handled::Publish(msg))
+        };
+        output.handler = Some(std::sync::Arc::new(handler));
+
+        let route = crate::Route::new(input, output);
+        let handle = route.run("test_http_inline_ct_match").await.unwrap();
+
+        let mut connector = HttpConnector::new();
+        connector.set_nodelay(true);
+        let client =
+            hyper_util::client::legacy::Client::builder(TokioExecutor::new()).build(connector);
+        // The request `Content-Type` is byte-equal to the handler's reply value.
+        let request = Request::builder()
+            .method(hyper::Method::POST)
+            .uri(format!("http://{addr}/ct-match"))
+            .header("content-type", "text/plain")
+            .body(http_body_util::Full::<Bytes>::new(Bytes::from_static(
+                b"20",
+            )))
+            .unwrap();
+        let response = client.request(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get("content-type").unwrap(),
+            "text/plain"
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(body, Bytes::from_static(b"42"));
 
         handle.stop().await;
         let _ = handle.join().await;
