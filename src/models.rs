@@ -2120,6 +2120,14 @@ pub struct WebSocketConfig {
     pub message_id_header: Option<String>,
     /// (Consumer only) Internal buffer size for the channel. Defaults to 100.
     pub internal_buffer_size: Option<usize>,
+    /// (Consumer only) If true, compatible `websocket -> response` routes may bypass the normal route
+    /// consumer/worker/disposition pipeline and reply inline for lower latency. Defaults to true.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(
+        feature = "schema",
+        schemars(default = "default_inline_response_fast_path_schema")
+    )]
+    pub inline_response_fast_path: Option<bool>,
 }
 
 fn deserialize_basic_auth<'de, D>(deserializer: D) -> Result<Option<(String, String)>, D::Error>
@@ -2221,6 +2229,15 @@ impl WebSocketConfig {
     pub fn with_path(mut self, path: impl Into<String>) -> Self {
         self.path = Some(path.into());
         self
+    }
+
+    pub fn with_inline_response_fast_path(mut self, inline_response_fast_path: bool) -> Self {
+        self.inline_response_fast_path = Some(inline_response_fast_path);
+        self
+    }
+
+    pub fn inline_response_fast_path_enabled(&self) -> bool {
+        self.inline_response_fast_path.unwrap_or(true)
     }
 }
 

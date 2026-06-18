@@ -578,11 +578,51 @@ pub(crate) async fn try_run_fast_path_route(
         }
     }
 
+    #[cfg(feature = "websocket")]
+    {
+        if let EndpointType::WebSocket(cfg) = &route.input.endpoint_type {
+            if matches!(route.output.endpoint_type, EndpointType::Response(_))
+                && cfg.inline_response_fast_path_enabled()
+                && websocket_inline_fast_path_route_options_allowed(
+                    &route.options,
+                    cfg.inline_response_fast_path == Some(true),
+                )
+                && route.input.middlewares.is_empty()
+                && route.output.middlewares.is_empty()
+            {
+                return Some(
+                    websocket::run_inline_response_fast_path(
+                        name,
+                        cfg.clone(),
+                        route.output.handler.clone(),
+                        shutdown_rx,
+                        ready_tx,
+                    )
+                    .await,
+                );
+            }
+        }
+    }
+
     let _ = route;
     let _ = name;
     let _ = shutdown_rx;
     let _ = ready_tx;
     None
+}
+
+#[cfg(feature = "websocket")]
+fn websocket_inline_fast_path_route_options_allowed(
+    options: &crate::models::RouteOptions,
+    explicitly_enabled: bool,
+) -> bool {
+    if explicitly_enabled {
+        return true;
+    }
+
+    let mut defaults = crate::models::RouteOptions::default();
+    defaults.description.clone_from(&options.description);
+    options == &defaults
 }
 
 #[cfg(feature = "http")]
@@ -1433,6 +1473,23 @@ mod tests {
             .as_any()
             .is::<crate::endpoints::memory::MemoryConsumer>();
         assert!(is_subscriber, "Factory should create MemoryConsumer");
+    }
+
+    #[cfg(feature = "websocket")]
+    #[test]
+    fn websocket_inline_fast_path_default_does_not_ignore_custom_route_options() {
+        let mut options = crate::models::RouteOptions::default();
+        assert!(websocket_inline_fast_path_route_options_allowed(
+            &options, false
+        ));
+
+        options.batch_size = 128;
+        assert!(!websocket_inline_fast_path_route_options_allowed(
+            &options, false
+        ));
+        assert!(websocket_inline_fast_path_route_options_allowed(
+            &options, true
+        ));
     }
 
     #[test]

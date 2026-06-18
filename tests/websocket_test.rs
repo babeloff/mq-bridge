@@ -3,11 +3,20 @@
 use futures::{SinkExt, StreamExt};
 use mq_bridge::endpoints::websocket::WebSocketConsumer;
 use mq_bridge::endpoints::websocket::WebSocketPublisher;
-use mq_bridge::models::WebSocketConfig;
+use mq_bridge::models::{Endpoint, EndpointType, WebSocketConfig};
 use mq_bridge::traits::{MessageConsumer, MessageDisposition, MessagePublisher};
-use mq_bridge::CanonicalMessage;
+use mq_bridge::{CanonicalMessage, Handled, HandlerError, Route};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
+
+async fn echo(msg: CanonicalMessage) -> Result<Handled, HandlerError> {
+    Ok(Handled::Publish(msg))
+}
+
+fn get_free_port() -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.local_addr().unwrap().port()
+}
 
 #[tokio::test(flavor = "multi_thread")]
 async fn websocket_endpoint_roundtrip() {
@@ -115,4 +124,36 @@ async fn websocket_consumer_sends_commit_reply_to_client() {
         .expect("client should receive response")
         .expect("response frame should be valid");
     assert_eq!(reply, Message::Text("response".into()));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn websocket_default_inline_response_fast_path_replies_with_handler() {
+    let port = get_free_port();
+    let input = Endpoint::new(EndpointType::WebSocket(
+        WebSocketConfig::new(format!("127.0.0.1:{port}")).with_path("/inline"),
+    ));
+    let output = Endpoint::new_response();
+    let route = Route::new(input, output).with_handler(echo);
+    let handle = route
+        .run(&format!("websocket-inline-response-fast-path-{port}"))
+        .await
+        .expect("route should start");
+
+    let (mut stream, _) = connect_async(format!("ws://127.0.0.1:{port}/inline"))
+        .await
+        .expect("client should connect");
+    stream
+        .send(Message::Text("request".into()))
+        .await
+        .expect("client should send request");
+
+    let reply = stream
+        .next()
+        .await
+        .expect("client should receive response")
+        .expect("response frame should be valid");
+    assert_eq!(reply, Message::Text("request".into()));
+
+    handle.stop().await;
+    handle.join().await.expect("route task should finish");
 }

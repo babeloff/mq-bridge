@@ -5,8 +5,8 @@
 
 use crate::models::WebSocketConfig;
 use crate::traits::{
-    CommitFunc, ConsumerError, MessageConsumer, MessageDisposition, MessagePublisher,
-    PublisherError, ReceivedBatch, SentBatch,
+    CommitFunc, ConsumerError, Handled, Handler, MessageConsumer, MessageDisposition,
+    MessagePublisher, PublisherError, ReceivedBatch, SentBatch,
 };
 use crate::CanonicalMessage;
 use anyhow::{anyhow, Context};
@@ -23,6 +23,7 @@ use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
 use tokio_tungstenite::tungstenite::http::StatusCode;
 use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::WebSocketStream;
 use tracing::{debug, trace, warn};
 use uuid::Uuid;
 
@@ -165,6 +166,175 @@ async fn handle_connection(
     expected_path: Option<String>,
     message_id_header: String,
 ) -> anyhow::Result<()> {
+    let (ws_stream, metadata) =
+        accept_websocket_connection(stream, expected_path, message_id_header).await?;
+    let (mut write_stream, mut read_stream) = ws_stream.split();
+    let (response_tx, mut response_rx) = tokio::sync::mpsc::channel::<Message>(16);
+    let writer_peer_addr = peer_addr;
+    let writer_task = tokio::spawn(async move {
+        while let Some(message) = response_rx.recv().await {
+            if let Err(error) = write_stream.send(message).await {
+                debug!(error = %error, %writer_peer_addr, "Failed to send WebSocket response");
+                break;
+            }
+        }
+    });
+
+    while let Some(frame) = read_stream.next().await {
+        let frame = frame?;
+        if matches!(frame, Message::Close(_)) {
+            break;
+        }
+        let Some(message) = canonical_from_websocket_frame(frame, &metadata, peer_addr) else {
+            continue;
+        };
+
+        let response_tx = response_tx.clone();
+        let commit: CommitFunc =
+            Box::new(move |disposition| websocket_commit(disposition, response_tx));
+        if request_tx.send((message, commit)).await.is_err() {
+            break;
+        }
+    }
+
+    drop(response_tx);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(1), writer_task).await;
+    Ok(())
+}
+
+pub(crate) async fn run_inline_response_fast_path(
+    name: &str,
+    config: WebSocketConfig,
+    handler: Option<Arc<dyn Handler>>,
+    shutdown_rx: async_channel::Receiver<()>,
+    ready_tx: Option<async_channel::Sender<()>>,
+) -> anyhow::Result<bool> {
+    let listen_addr: SocketAddr = config
+        .url
+        .parse()
+        .with_context(|| format!("Invalid listen address: {}", config.url))?;
+    let listener = TcpListener::bind(listen_addr).await?;
+    let expected_path = config.path.as_deref().map(normalize_websocket_path);
+    let message_id_header = config
+        .message_id_header
+        .clone()
+        .unwrap_or_else(|| "message-id".to_string());
+
+    tracing::info!(
+        route = name,
+        has_output_handler = handler.is_some(),
+        "Running WebSocket inline response fast path; bypassing route middleware and the normal consumer/worker/disposition pipeline"
+    );
+    if let Some(tx) = ready_tx {
+        let _ = tx.send(()).await;
+    }
+
+    let mut connections = tokio::task::JoinSet::new();
+    loop {
+        tokio::select! {
+            _ = shutdown_rx.recv() => {
+                tracing::info!(
+                    "Shutdown signal received in WebSocket inline response runner for route '{}'.",
+                    name
+                );
+                break;
+            }
+            accept_result = listener.accept() => {
+                let (stream, peer_addr) = match accept_result {
+                    Ok(parts) => parts,
+                    Err(error) => {
+                        warn!(error = %error, "WebSocket accept failed");
+                        continue;
+                    }
+                };
+
+                let expected_path = expected_path.clone();
+                let message_id_header = message_id_header.clone();
+                let handler = handler.clone();
+                connections.spawn(async move {
+                    handle_inline_connection(stream, peer_addr, expected_path, message_id_header, handler).await
+                });
+            }
+            Some(result) = connections.join_next(), if !connections.is_empty() => {
+                match result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => debug!(error = %error, "WebSocket inline connection closed with error"),
+                    Err(error) => debug!(error = %error, "WebSocket inline connection task failed"),
+                }
+            }
+        }
+    }
+
+    connections.abort_all();
+    while connections.join_next().await.is_some() {}
+    Ok(true)
+}
+
+async fn handle_inline_connection(
+    stream: tokio::net::TcpStream,
+    peer_addr: SocketAddr,
+    expected_path: Option<String>,
+    message_id_header: String,
+    handler: Option<Arc<dyn Handler>>,
+) -> anyhow::Result<()> {
+    let (mut ws_stream, metadata) =
+        accept_websocket_connection(stream, expected_path, message_id_header).await?;
+
+    while let Some(frame) = ws_stream.next().await {
+        let frame = frame?;
+        if matches!(frame, Message::Close(_)) {
+            break;
+        }
+        let Some(message) = canonical_from_websocket_frame(frame, &metadata, peer_addr) else {
+            continue;
+        };
+
+        let reply = match handler.as_ref() {
+            Some(handler) => {
+                let original_id = message.message_id;
+                let inbound_correlation_id = message.metadata.get("correlation_id").cloned();
+                let mut handler_results = handler.handle_many(vec![message]).await;
+                if handler_results.len() != 1 {
+                    return Err(anyhow!(
+                        "handler returned {} results for 1 message",
+                        handler_results.len()
+                    ));
+                }
+
+                match handler_results.remove(0)? {
+                    Handled::Ack => None,
+                    Handled::Publish(mut response_msg) => {
+                        response_msg.message_id = original_id;
+                        response_msg
+                            .metadata
+                            .entry("correlation_id".to_string())
+                            .or_insert(
+                                inbound_correlation_id
+                                    .unwrap_or_else(|| format!("{:032x}", original_id)),
+                            );
+                        Some(response_msg)
+                    }
+                }
+            }
+            None => Some(message),
+        };
+
+        if let Some(reply) = reply {
+            ws_stream
+                .send(canonical_to_websocket_message(&reply))
+                .await?;
+        }
+    }
+
+    Ok(())
+}
+
+#[allow(clippy::result_large_err)] // TODO: find a good fix for the box issue
+async fn accept_websocket_connection(
+    stream: tokio::net::TcpStream,
+    expected_path: Option<String>,
+    message_id_header: String,
+) -> anyhow::Result<(WebSocketStream<tokio::net::TcpStream>, HandshakeMetadata)> {
     let handshake = Arc::new(Mutex::new(HandshakeMetadata::default()));
     let handshake_capture = Arc::clone(&handshake);
     let ws_stream = accept_hdr_async(stream, move |request: &Request, response: Response| {
@@ -221,51 +391,33 @@ async fn handle_connection(
         .lock()
         .map(|captured| captured.clone())
         .unwrap_or_default();
-    let (mut write_stream, mut read_stream) = ws_stream.split();
-    let (response_tx, mut response_rx) = tokio::sync::mpsc::channel::<Message>(16);
-    let writer_peer_addr = peer_addr;
-    let writer_task = tokio::spawn(async move {
-        while let Some(message) = response_rx.recv().await {
-            if let Err(error) = write_stream.send(message).await {
-                debug!(error = %error, %writer_peer_addr, "Failed to send WebSocket response");
-                break;
-            }
-        }
-    });
+    Ok((ws_stream, metadata))
+}
 
-    while let Some(frame) = read_stream.next().await {
-        let frame = frame?;
-        let (payload, message_type) = match frame {
-            Message::Text(text) => (text.to_string().into_bytes(), "text"),
-            Message::Binary(binary) => (binary.to_vec(), "binary"),
-            Message::Close(_) => break,
-            Message::Ping(_) | Message::Pong(_) => continue,
-            _ => continue,
-        };
+fn canonical_from_websocket_frame(
+    frame: Message,
+    metadata: &HandshakeMetadata,
+    peer_addr: SocketAddr,
+) -> Option<CanonicalMessage> {
+    let (payload, message_type) = match frame {
+        Message::Text(text) => (text.to_string().into_bytes(), "text"),
+        Message::Binary(binary) => (binary.to_vec(), "binary"),
+        Message::Ping(_) | Message::Pong(_) => return None,
+        _ => return None,
+    };
 
-        let mut message = CanonicalMessage::new(payload, metadata.message_id);
-        message
-            .metadata
-            .insert("ws_message_type".to_string(), message_type.to_string());
-        message
-            .metadata
-            .insert("ws_path".to_string(), metadata.path.clone());
-        message
-            .metadata
-            .insert("ws_peer_addr".to_string(), peer_addr.to_string());
-        message.metadata.extend(metadata.headers.clone());
-
-        let response_tx = response_tx.clone();
-        let commit: CommitFunc =
-            Box::new(move |disposition| websocket_commit(disposition, response_tx));
-        if request_tx.send((message, commit)).await.is_err() {
-            break;
-        }
-    }
-
-    drop(response_tx);
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(1), writer_task).await;
-    Ok(())
+    let mut message = CanonicalMessage::new(payload, metadata.message_id);
+    message
+        .metadata
+        .insert("ws_message_type".to_string(), message_type.to_string());
+    message
+        .metadata
+        .insert("ws_path".to_string(), metadata.path.clone());
+    message
+        .metadata
+        .insert("ws_peer_addr".to_string(), peer_addr.to_string());
+    message.metadata.extend(metadata.headers.clone());
+    Some(message)
 }
 
 fn websocket_commit(
@@ -331,24 +483,13 @@ fn canonical_to_websocket_message(message: &CanonicalMessage) -> Message {
 impl MessageConsumer for WebSocketConsumer {
     async fn receive_batch(&mut self, max_messages: usize) -> Result<ReceivedBatch, ConsumerError> {
         let max_messages = max_messages.max(1);
-        let (first_message, first_commit) = self
-            .request_rx
-            .recv()
-            .await
-            .ok_or_else(|| ConsumerError::EndOfStream)?;
 
-        let mut messages = vec![first_message];
-        let mut commits = vec![first_commit];
-
-        while messages.len() < max_messages {
-            match self.request_rx.try_recv() {
-                Ok((message, commit)) => {
-                    messages.push(message);
-                    commits.push(commit);
-                }
-                Err(_) => break,
-            }
+        let mut batch: Vec<WebSocketSourceMessage> = Vec::with_capacity(max_messages);
+        if self.request_rx.recv_many(&mut batch, max_messages).await == 0 {
+            return Err(ConsumerError::EndOfStream);
         }
+
+        let (messages, commits): (Vec<_>, Vec<_>) = batch.into_iter().unzip();
 
         let batch_commit: crate::traits::BatchCommitFunc =
             Box::new(move |dispositions: Vec<MessageDisposition>| {
