@@ -10,8 +10,8 @@ use anyhow::Result;
 use async_trait::async_trait;
 use std::any::Any;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::Duration;
 use tonic::transport::Channel;
 use tracing::{debug, error, info, trace, warn};
@@ -190,7 +190,11 @@ struct ServerModeConsumer {
     route_id: u64,
     shared_server: Arc<SharedGrpcServer>,
     bound_addr: std::net::SocketAddr,
-    rx: mpsc::Receiver<BridgeMessage>,
+    // One receive channel per shard; publishes are spread round-robin across the
+    // shards so many concurrent producers don't all contend on one channel.
+    rxs: Vec<mpsc::Receiver<BridgeMessage>>,
+    // Round-robin cursor for the next shard to drain first, so none starves.
+    drain_start: usize,
 }
 
 /// Tonic service implementation that fans incoming messages into a subscriber
@@ -200,13 +204,18 @@ struct BridgeService {
 }
 
 struct SharedGrpcRouter {
-    routes: Mutex<HashMap<u64, SharedGrpcRoute>>,
+    // RwLock (not Mutex): `dispatch` only reads the table, so concurrent publishes
+    // no longer serialize against each other on the lock.
+    routes: RwLock<HashMap<u64, SharedGrpcRoute>>,
 }
 
 #[derive(Clone)]
 struct SharedGrpcRoute {
     topic: String,
-    tx: mpsc::Sender<BridgeMessage>,
+    // Sharded senders; `cursor` round-robins publishes across them. `cursor` is
+    // shared (Arc) so all clones of this route advance the same counter.
+    txs: Vec<mpsc::Sender<BridgeMessage>>,
+    cursor: Arc<AtomicUsize>,
     broadcast_tx: broadcast::Sender<BridgeMessage>,
 }
 
@@ -248,7 +257,7 @@ fn normalize_grpc_topic(topic: Option<&str>) -> String {
 impl SharedGrpcRouter {
     fn new() -> Self {
         Self {
-            routes: Mutex::new(HashMap::new()),
+            routes: RwLock::new(HashMap::new()),
         }
     }
 }
@@ -262,11 +271,11 @@ impl SharedGrpcRouter {
         &self,
         route_id: u64,
         topic: String,
-        tx: mpsc::Sender<BridgeMessage>,
+        txs: Vec<mpsc::Sender<BridgeMessage>>,
     ) -> Result<()> {
         let mut routes = self
             .routes
-            .lock()
+            .write()
             .map_err(|_| anyhow::anyhow!("gRPC route registry lock poisoned"))?;
         if routes.values().any(|route| route.topic == topic) {
             return Err(anyhow::anyhow!(
@@ -279,7 +288,8 @@ impl SharedGrpcRouter {
             route_id,
             SharedGrpcRoute {
                 topic,
-                tx,
+                txs,
+                cursor: Arc::new(AtomicUsize::new(0)),
                 broadcast_tx,
             },
         );
@@ -287,7 +297,7 @@ impl SharedGrpcRouter {
     }
 
     fn unregister_route(&self, route_id: u64) -> bool {
-        let Ok(mut routes) = self.routes.lock() else {
+        let Ok(mut routes) = self.routes.write() else {
             return false;
         };
         routes.remove(&route_id);
@@ -295,7 +305,7 @@ impl SharedGrpcRouter {
     }
 
     fn route_for_topic(&self, topic: &str) -> Option<SharedGrpcRoute> {
-        let Ok(routes) = self.routes.lock() else {
+        let Ok(routes) = self.routes.read() else {
             return None;
         };
         routes.values().find(|route| route.topic == topic).cloned()
@@ -311,9 +321,12 @@ impl SharedGrpcRouter {
         let route = self
             .route_for_topic(&topic)
             .ok_or_else(|| anyhow::anyhow!("No route for topic '{}'", topic))?;
-        let _ = route.broadcast_tx.send(msg.clone());
-        route
-            .tx
+        // Only clone for the broadcast stream when someone is actually subscribed.
+        if route.broadcast_tx.receiver_count() > 0 {
+            let _ = route.broadcast_tx.send(msg.clone());
+        }
+        let shard = route.cursor.fetch_add(1, Ordering::Relaxed) % route.txs.len();
+        route.txs[shard]
             .send(msg)
             .await
             .map_err(|_| anyhow::anyhow!("No active gRPC consumer for topic '{}'", topic))?;
@@ -457,16 +470,29 @@ impl ServerModeConsumer {
             max_decoding_message_size: config.max_decoding_message_size,
         };
         let topic = normalize_grpc_topic(config.topic.as_deref());
-        let (tx, rx) = mpsc::channel(16 * 1024);
+        // Total queue depth stays ~16k, split across shards to cut producer contention.
+        let shard_count = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .clamp(1, 16);
+        let per_shard = ((16 * 1024) / shard_count).max(1);
+        let mut txs = Vec::with_capacity(shard_count);
+        let mut rxs = Vec::with_capacity(shard_count);
+        for _ in 0..shard_count {
+            let (tx, rx) = mpsc::channel(per_shard);
+            txs.push(tx);
+            rxs.push(rx);
+        }
         let route_id = GRPC_ROUTE_ID.fetch_add(1, Ordering::Relaxed);
         let shared_server =
-            get_or_create_shared_grpc_server(config, &key, route_id, topic, tx).await?;
+            get_or_create_shared_grpc_server(config, &key, route_id, topic, txs).await?;
 
         Ok(Self {
             route_id,
             bound_addr: shared_server.bound_addr,
             shared_server,
-            rx,
+            rxs,
+            drain_start: 0,
         })
     }
 
@@ -480,7 +506,7 @@ async fn get_or_create_shared_grpc_server(
     key: &GrpcServerKey,
     route_id: u64,
     topic: String,
-    tx: mpsc::Sender<BridgeMessage>,
+    txs: Vec<mpsc::Sender<BridgeMessage>>,
 ) -> Result<Arc<SharedGrpcServer>> {
     if let Ok(registry) = grpc_server_registry().lock() {
         for (existing_key, server) in registry.iter() {
@@ -490,7 +516,7 @@ async fn get_or_create_shared_grpc_server(
             if existing_key == key {
                 server
                     .router
-                    .register_route(route_id, topic.clone(), tx.clone())?;
+                    .register_route(route_id, topic.clone(), txs.clone())?;
                 return Ok(server.clone());
             }
             return Err(anyhow::anyhow!(
@@ -585,7 +611,7 @@ async fn get_or_create_shared_grpc_server(
             server.handle.abort();
             existing
                 .router
-                .register_route(route_id, topic.clone(), tx.clone())?;
+                .register_route(route_id, topic.clone(), txs.clone())?;
             return Ok(existing.clone());
         }
         server.handle.abort();
@@ -594,7 +620,7 @@ async fn get_or_create_shared_grpc_server(
             key.listen_addr
         ));
     }
-    server.router.register_route(route_id, topic, tx)?;
+    server.router.register_route(route_id, topic, txs)?;
     registry.insert(key.clone(), server.clone());
     Ok(server)
 }
@@ -620,22 +646,60 @@ impl MessageConsumer for ServerModeConsumer {
         &mut self,
         max_messages: usize,
     ) -> Result<crate::outcomes::ReceivedBatch, ConsumerError> {
+        let max_messages = max_messages.max(1);
+        let shard_count = self.rxs.len();
         let mut messages = Vec::with_capacity(max_messages);
-        loop {
-            let result = if messages.is_empty() {
-                Ok(self.rx.recv().await)
-            } else {
-                tokio::time::timeout(Duration::from_millis(GRPC_BATCH_POLL_MS), self.rx.recv())
-                    .await
-            };
-            match result {
-                Ok(Some(msg)) => {
+        'fill: loop {
+            // Greedily sweep all shards for whatever is immediately available.
+            let mut got_any = false;
+            for offset in 0..shard_count {
+                let idx = (self.drain_start + offset) % shard_count;
+                if let Ok(msg) = self.rxs[idx].try_recv() {
                     messages.push(bridge_to_canonical(msg));
+                    got_any = true;
                     if messages.len() >= max_messages {
-                        break;
+                        break 'fill;
                     }
                 }
-                Ok(None) | Err(_) => break,
+            }
+            if got_any {
+                self.drain_start = (self.drain_start + 1) % shard_count;
+                continue;
+            }
+
+            // Nothing buffered: block for the first message, then linger briefly for
+            // more. Polling every shard registers our waker on each.
+            let start = self.drain_start;
+            let poll = std::future::poll_fn(|cx| {
+                let mut all_closed = true;
+                for offset in 0..shard_count {
+                    let idx = (start + offset) % shard_count;
+                    match self.rxs[idx].poll_recv(cx) {
+                        std::task::Poll::Ready(Some(msg)) => {
+                            self.drain_start = (idx + 1) % shard_count;
+                            return std::task::Poll::Ready(Some(msg));
+                        }
+                        std::task::Poll::Ready(None) => {}
+                        std::task::Poll::Pending => all_closed = false,
+                    }
+                }
+                if all_closed {
+                    std::task::Poll::Ready(None)
+                } else {
+                    std::task::Poll::Pending
+                }
+            });
+            let next = if messages.is_empty() {
+                poll.await
+            } else {
+                match tokio::time::timeout(Duration::from_millis(GRPC_BATCH_POLL_MS), poll).await {
+                    Ok(value) => value,
+                    Err(_) => break, // linger window closed
+                }
+            };
+            match next {
+                Some(msg) => messages.push(bridge_to_canonical(msg)),
+                None => break, // every shard closed
             }
         }
         if messages.is_empty() {
