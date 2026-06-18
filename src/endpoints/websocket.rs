@@ -15,6 +15,7 @@ use futures::{SinkExt, StreamExt};
 use std::any::Any;
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::net::TcpListener;
 use tokio::sync::watch;
@@ -30,7 +31,11 @@ type WebSocketSourceMessage = (CanonicalMessage, CommitFunc);
 type WebSocketResponseTx = tokio::sync::mpsc::Sender<Message>;
 
 pub struct WebSocketConsumer {
-    request_rx: tokio::sync::mpsc::Receiver<WebSocketSourceMessage>,
+    // One receive channel per shard. Connections are spread round-robin across the
+    // shards so 16k+ producers don't all contend on a single channel's atomics.
+    request_rxs: Vec<tokio::sync::mpsc::Receiver<WebSocketSourceMessage>>,
+    // Round-robin cursor for the next shard to drain first, so none starves.
+    drain_start: usize,
     shutdown_tx: watch::Sender<bool>,
     buffer_size: usize,
     url: String,
@@ -39,7 +44,9 @@ pub struct WebSocketConsumer {
 
 impl WebSocketConsumer {
     pub async fn new(config: &WebSocketConfig) -> anyhow::Result<Self> {
-        let buffer_size = config.internal_buffer_size.unwrap_or(100).max(1);
+        // `internal_buffer_size` is the total queue depth across shards. 1024 (matching
+        // the HTTP consumer) absorbs bursts; the old 100 throttled in-flight frames.
+        let buffer_size = config.internal_buffer_size.unwrap_or(1024).max(1);
         let listen_addr: SocketAddr = config
             .url
             .parse()
@@ -51,12 +58,25 @@ impl WebSocketConsumer {
             .message_id_header
             .clone()
             .unwrap_or_else(|| "message-id".to_string());
-        let (request_tx, request_rx) = tokio::sync::mpsc::channel(buffer_size);
+
+        let shard_count = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .clamp(1, 16);
+        let per_shard = (buffer_size / shard_count).max(1);
+        let mut request_txs = Vec::with_capacity(shard_count);
+        let mut request_rxs = Vec::with_capacity(shard_count);
+        for _ in 0..shard_count {
+            let (tx, rx) = tokio::sync::mpsc::channel(per_shard);
+            request_txs.push(tx);
+            request_rxs.push(rx);
+        }
+
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
         spawn_accept_loop(
             listener,
-            request_tx,
+            request_txs,
             shutdown_rx,
             path.clone(),
             message_id_header,
@@ -69,7 +89,8 @@ impl WebSocketConsumer {
         };
 
         Ok(Self {
-            request_rx,
+            request_rxs,
+            drain_start: 0,
             shutdown_tx,
             buffer_size,
             url,
@@ -113,11 +134,12 @@ struct HandshakeMetadata {
 
 fn spawn_accept_loop(
     listener: TcpListener,
-    request_tx: tokio::sync::mpsc::Sender<WebSocketSourceMessage>,
+    request_txs: Vec<tokio::sync::mpsc::Sender<WebSocketSourceMessage>>,
     mut shutdown_rx: watch::Receiver<bool>,
     expected_path: Option<String>,
     message_id_header: String,
 ) {
+    let next_shard = AtomicUsize::new(0);
     tokio::spawn(async move {
         loop {
             tokio::select! {
@@ -135,7 +157,9 @@ fn spawn_accept_loop(
                         }
                     };
 
-                    let request_tx = request_tx.clone();
+                    // Pin each connection to one shard, round-robin, for the socket's lifetime.
+                    let shard = next_shard.fetch_add(1, Ordering::Relaxed) % request_txs.len();
+                    let request_tx = request_txs[shard].clone();
                     let expected_path = expected_path.clone();
                     let message_id_header = message_id_header.clone();
                     tokio::spawn(async move {
@@ -331,22 +355,53 @@ fn canonical_to_websocket_message(message: &CanonicalMessage) -> Message {
 impl MessageConsumer for WebSocketConsumer {
     async fn receive_batch(&mut self, max_messages: usize) -> Result<ReceivedBatch, ConsumerError> {
         let max_messages = max_messages.max(1);
-        let (first_message, first_commit) = self
-            .request_rx
-            .recv()
-            .await
-            .ok_or_else(|| ConsumerError::EndOfStream)?;
+        let shard_count = self.request_rxs.len();
 
+        // Block until any shard yields a message, scanning round-robin from `drain_start`
+        // so no shard is starved. Polling every shard registers our waker on each, so a
+        // send on any of them wakes us. EndOfStream only once every shard is closed.
+        let start = self.drain_start;
+        let first = std::future::poll_fn(|cx| {
+            let mut all_closed = true;
+            for offset in 0..shard_count {
+                let idx = (start + offset) % shard_count;
+                match self.request_rxs[idx].poll_recv(cx) {
+                    std::task::Poll::Ready(Some(item)) => {
+                        self.drain_start = (idx + 1) % shard_count;
+                        return std::task::Poll::Ready(Some(item));
+                    }
+                    std::task::Poll::Ready(None) => {}
+                    std::task::Poll::Pending => all_closed = false,
+                }
+            }
+            if all_closed {
+                std::task::Poll::Ready(None)
+            } else {
+                std::task::Poll::Pending
+            }
+        })
+        .await;
+
+        let (first_message, first_commit) = first.ok_or(ConsumerError::EndOfStream)?;
         let mut messages = vec![first_message];
         let mut commits = vec![first_commit];
 
-        while messages.len() < max_messages {
-            match self.request_rx.try_recv() {
-                Ok((message, commit)) => {
+        // Drain whatever else is immediately available, sweeping all shards.
+        'fill: while messages.len() < max_messages {
+            let mut got = false;
+            for offset in 0..shard_count {
+                let idx = (self.drain_start + offset) % shard_count;
+                if let Ok((message, commit)) = self.request_rxs[idx].try_recv() {
                     messages.push(message);
                     commits.push(commit);
+                    got = true;
+                    if messages.len() >= max_messages {
+                        break 'fill;
+                    }
                 }
-                Err(_) => break,
+            }
+            if !got {
+                break;
             }
         }
 
@@ -367,10 +422,11 @@ impl MessageConsumer for WebSocketConsumer {
     }
 
     async fn status(&self) -> crate::traits::EndpointStatus {
+        let pending: usize = self.request_rxs.iter().map(|rx| rx.len()).sum();
         crate::traits::EndpointStatus {
             healthy: true,
             target: self.url.clone(),
-            pending: Some(self.request_rx.len()),
+            pending: Some(pending),
             capacity: Some(self.buffer_size),
             details: serde_json::json!({
                 "bound_addr": self.bound_addr.to_string(),
