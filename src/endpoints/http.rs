@@ -2312,10 +2312,8 @@ fn compress_if_needed(
     use std::io::Write;
 
     // Pre-size output to avoid per-response reallocs.
-    let mut encoder = flate2::write::GzEncoder::new(
-        Vec::with_capacity(data.len() / 2 + 64),
-        Compression::fast(),
-    );
+    let mut encoder =
+        flate2::write::GzEncoder::new(Vec::with_capacity(data.len() / 2 + 64), Compression::fast());
     encoder.write_all(&data)?;
     let compressed = encoder.finish()?;
 

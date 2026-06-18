@@ -9,8 +9,8 @@ use async_trait::async_trait;
 use std::any::Any;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
-use tokio::time::{timeout_at, Duration, Instant};
 use tokio::sync::{oneshot, Mutex};
+use tokio::time::{timeout_at, Duration, Instant};
 
 struct PendingEntry {
     message: CanonicalMessage,
@@ -369,10 +369,7 @@ pub struct BufferConsumer {
 }
 
 impl BufferConsumer {
-    pub fn new(
-        inner: Box<dyn MessageConsumer>,
-        config: &BufferMiddleware,
-    ) -> anyhow::Result<Self> {
+    pub fn new(inner: Box<dyn MessageConsumer>, config: &BufferMiddleware) -> anyhow::Result<Self> {
         if config.max_messages == 0 {
             return Err(anyhow!("Buffer max_messages must be greater than zero"));
         }
