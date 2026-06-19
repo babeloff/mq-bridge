@@ -16,7 +16,7 @@ use std::any::Any;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpSocket};
 use tokio::sync::watch;
 use tokio_tungstenite::accept_hdr_async;
 use tokio_tungstenite::connect_async;
@@ -29,6 +29,23 @@ use uuid::Uuid;
 
 type WebSocketSourceMessage = (CanonicalMessage, CommitFunc);
 type WebSocketResponseTx = tokio::sync::mpsc::Sender<Message>;
+
+/// Default TCP listen backlog for the WebSocket accept socket, used when
+/// `WebSocketConfig::backlog` is unset. Higher than the OS/tokio default of
+/// 1024 to absorb large handshake bursts under high connection concurrency
+/// without the kernel dropping/resetting pending connections before
+/// `accept()` can keep up.
+const DEFAULT_WEBSOCKET_LISTEN_BACKLOG: u32 = 4096;
+
+fn bind_websocket_listener(addr: SocketAddr, backlog: Option<u32>) -> std::io::Result<TcpListener> {
+    let socket = if addr.is_ipv4() {
+        TcpSocket::new_v4()?
+    } else {
+        TcpSocket::new_v6()?
+    };
+    socket.bind(addr)?;
+    socket.listen(backlog.unwrap_or(DEFAULT_WEBSOCKET_LISTEN_BACKLOG))
+}
 
 pub struct WebSocketConsumer {
     request_rx: tokio::sync::mpsc::Receiver<WebSocketSourceMessage>,
@@ -45,7 +62,7 @@ impl WebSocketConsumer {
             .url
             .parse()
             .with_context(|| format!("Invalid listen address: {}", config.url))?;
-        let listener = TcpListener::bind(listen_addr).await?;
+        let listener = bind_websocket_listener(listen_addr, config.backlog)?;
         let bound_addr = listener.local_addr()?;
         let path = config.path.as_deref().map(normalize_websocket_path);
         let message_id_header = config
@@ -135,6 +152,7 @@ fn spawn_accept_loop(
                             continue;
                         }
                     };
+                    let _ = stream.set_nodelay(true);
 
                     let request_tx = request_tx.clone();
                     let expected_path = expected_path.clone();
@@ -213,7 +231,7 @@ pub(crate) async fn run_inline_response_fast_path(
         .url
         .parse()
         .with_context(|| format!("Invalid listen address: {}", config.url))?;
-    let listener = TcpListener::bind(listen_addr).await?;
+    let listener = bind_websocket_listener(listen_addr, config.backlog)?;
     let expected_path = config.path.as_deref().map(normalize_websocket_path);
     let message_id_header = config
         .message_id_header
@@ -247,6 +265,7 @@ pub(crate) async fn run_inline_response_fast_path(
                         continue;
                     }
                 };
+                let _ = stream.set_nodelay(true);
 
                 let expected_path = expected_path.clone();
                 let message_id_header = message_id_header.clone();

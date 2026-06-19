@@ -2120,6 +2120,10 @@ pub struct WebSocketConfig {
     pub message_id_header: Option<String>,
     /// (Consumer only) Internal buffer size for the channel. Defaults to 100.
     pub internal_buffer_size: Option<usize>,
+    /// (Consumer only) TCP listen backlog (pending-connection queue depth) for the accept socket.
+    /// Raise this if high-concurrency handshake bursts are being dropped/reset before `accept()`
+    /// can keep up. Defaults to 4096, which is higher than the OS/tokio default of 1024.
+    pub backlog: Option<u32>,
     /// (Consumer only) If true, compatible `websocket -> response` routes may bypass the normal route
     /// consumer/worker/disposition pipeline and reply inline for lower latency. Defaults to true.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2228,6 +2232,11 @@ impl WebSocketConfig {
 
     pub fn with_path(mut self, path: impl Into<String>) -> Self {
         self.path = Some(path.into());
+        self
+    }
+
+    pub fn with_backlog(mut self, backlog: u32) -> Self {
+        self.backlog = Some(backlog);
         self
     }
 
