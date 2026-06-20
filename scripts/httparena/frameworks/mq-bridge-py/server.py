@@ -30,10 +30,12 @@ client advertises ``Accept-Encoding: gzip``, identity otherwise — so the same
 
 from __future__ import annotations
 
+import gzip as _gzip
 import json as _json
 import os
 import signal
 import tempfile
+import threading
 import time
 from pathlib import Path
 from urllib.parse import parse_qs
@@ -41,36 +43,102 @@ from urllib.parse import parse_qs
 from mq_bridge import Message, Route
 
 LISTEN = os.environ.get("MQB_LISTEN", "0.0.0.0:8080")
+H2C_LISTEN = os.environ.get("MQB_H2C_LISTEN", "0.0.0.0:8082")
+TLS_LISTEN = os.environ.get("MQB_TLS_LISTEN", "0.0.0.0:8443")
+H1TLS_LISTEN = os.environ.get("MQB_H1TLS_LISTEN", "0.0.0.0:8081")
+TLS_CERT = os.environ.get("TLS_CERT", "/certs/server.crt")
+TLS_KEY = os.environ.get("TLS_KEY", "/certs/server.key")
 DATASET_PATH = os.environ.get("DATASET_PATH", "/data/dataset.json")
 STATIC_DIR = Path(os.environ.get("STATIC_DIR", "/data/static")).resolve()
 
 SERVER = "mq-bridge-py"
 JSON_META = {"content-type": "application/json", "Server": SERVER}
-TEXT_META = {"content-type": "text/plain", "Server": SERVER}
-NOT_FOUND_META = {"content-type": "text/plain", "Server": SERVER, "http_status_code": "404"}
+TEXT_META = {"content-type": "text/plain; charset=utf-8", "Server": SERVER}
+NOT_FOUND_META = {
+    "content-type": "text/plain; charset=utf-8",
+    "Server": SERVER,
+    "http_status_code": "404",
+}
 
-def _config(http_workers: int) -> str:
-    # `http_workers` is the number of accept loops (each its own SO_REUSEPORT
-    # listener) inside this process. When we fan out across processes we keep
-    # this small (the single Python worker is the per-process bottleneck); in
-    # single-process mode we use all cores, matching the previous default.
+def _tls_available() -> bool:
+    return Path(TLS_CERT).is_file() and Path(TLS_KEY).is_file()
+
+
+def _http_route(name: str, listen: str, http_workers: int, extra: str = "") -> str:
     return f"""
-routes:
-  httparena:
+  {name}:
     concurrency: 1
-    batch_size: 512
+    batch_size: 1024
     input:
       http:
-        url: "{LISTEN}"
+        url: "{listen}"
         workers: {http_workers}
         concurrency_limit: 65536
         internal_buffer_size: 16384
         inline_response_fast_path: true
         compression_enabled: true
         compression_threshold_bytes: 256
+{extra}
     output:
       response: {{}}
 """
+
+
+def _config(http_workers: int) -> tuple[str, list[str]]:
+    # `http_workers` is the number of accept loops (each its own SO_REUSEPORT
+    # listener) inside this process. When we fan out across processes we keep
+    # this small (the single Python worker is the per-process bottleneck); in
+    # single-process mode we use all cores, matching the previous default.
+    names = ["httparena"]
+    routes = [_http_route(names[0], LISTEN, http_workers)]
+
+    # HTTP/2 cleartext (prior-knowledge) on 8082 (baseline-h2c / json-h2c), using
+    # the same handlers as the plaintext listener. `http2_only` makes the port
+    # refuse HTTP/1.1, satisfying the h2c-only anti-cheat (a dual-serving port is
+    # rejected). Cleartext, so no certs are needed.
+    names.append("httparena-h2c")
+    routes.append(
+        _http_route(
+            names[-1],
+            H2C_LISTEN,
+            http_workers,
+            "        server_protocol: http2_only",
+        )
+    )
+
+    # TLS listeners, only when the harness has mounted certs — a local
+    # plaintext-only run still works.
+    if _tls_available():
+        tls_block = (
+            f'        tls:\n'
+            f'          required: true\n'
+            f'          cert_file: "{TLS_CERT}"\n'
+            f'          key_file: "{TLS_KEY}"'
+        )
+        # HTTP/2 over TLS on 8443 (baseline-h2 / static-h2): ALPN advertises `h2`.
+        names.append("httparena-tls")
+        routes.append(_http_route(names[-1], TLS_LISTEN, http_workers, tls_block))
+        # JSON over HTTP/1.1 + TLS on 8081 (json-tls): the same `/json` handler,
+        # but the port advertises ALPN `http/1.1` only so the wrk load generator
+        # negotiates HTTP/1.1 rather than upgrading to h2.
+        names.append("httparena-json-tls")
+        routes.append(
+            _http_route(
+                names[-1],
+                H1TLS_LISTEN,
+                http_workers,
+                tls_block + "\n        server_protocol: http1_only",
+            )
+        )
+
+    return "routes:\n" + "\n".join(routes), names
+
+
+# Static assets are pre-gzipped once at startup (see CachedBody) and the reply
+# carries `content-encoding: gzip` when the client accepts it — mq-bridge honors
+# that and skips re-compressing them per request. Dynamic `/json` responses are
+# serialized fresh per request (no response caching) and compressed by the
+# library's per-request gzip when the client advertises Accept-Encoding.
 
 CONTENT_TYPES = {
     "js": "application/javascript",
@@ -81,6 +149,36 @@ CONTENT_TYPES = {
     "png": "image/png",
     "svg": "image/svg+xml",
 }
+
+
+class CachedBody:
+    """A response body cached in both identity and gzip form, with pre-built
+    reply metadata for each. Lets a hot endpoint serve a request with a dict
+    lookup and zero per-request serialization, gzip, or metadata allocation.
+    The gzip variant is only kept when it actually shrinks the body."""
+
+    __slots__ = ("plain", "gzip", "_meta_plain", "_meta_gzip")
+
+    def __init__(self, body: bytes, content_type: str):
+        self.plain = body
+        self._meta_plain = {"content-type": content_type, "Server": SERVER}
+        # mtime=0 keeps the gzip bytes deterministic across processes/restarts.
+        compressed = _gzip.compress(body, compresslevel=6, mtime=0)
+        if len(compressed) < len(body):
+            self.gzip = compressed
+            self._meta_gzip = {
+                "content-type": content_type,
+                "Server": SERVER,
+                "content-encoding": "gzip",
+            }
+        else:
+            self.gzip = None
+            self._meta_gzip = None
+
+    def message(self, request: "Message", want_gzip: bool) -> "Message":
+        if want_gzip and self.gzip is not None:
+            return request.__class__(self.gzip, self._meta_gzip)
+        return request.__class__(self.plain, self._meta_plain)
 
 
 def _load_dataset() -> list[dict]:
@@ -183,18 +281,47 @@ def _content_type_for(name: str) -> str:
     return CONTENT_TYPES.get(ext, "application/octet-stream")
 
 
-def _serve_static(name: str) -> Message:
-    # Reject path traversal: the name must be a single normal path component.
-    if not name or "/" in name or name in (".", ".."):
-        return Message(b"Not Found", NOT_FOUND_META)
-    target = (STATIC_DIR / name).resolve()
-    if STATIC_DIR not in target.parents and target != STATIC_DIR:
-        return Message(b"Not Found", NOT_FOUND_META)
+def _reply(request: Message, body: bytes, metadata: dict[str, str]) -> Message:
+    return request.__class__(body, metadata)
+
+
+def _accepts_gzip(message: Message) -> bool:
+    return "gzip" in message.metadata.get("accept-encoding", "").lower()
+
+
+def _load_static_cache() -> dict[str, CachedBody]:
+    # Read and pre-gzip every static asset once at startup so each request is a
+    # dict lookup with no filesystem I/O or per-request allocation. Built at
+    # import (before fork), so worker processes share it copy-on-write.
+    cache: dict[str, CachedBody] = {}
     try:
-        body = target.read_bytes()
+        entries = list(STATIC_DIR.iterdir())
     except OSError:
-        return Message(b"Not Found", NOT_FOUND_META)
-    return Message(body, {"content-type": _content_type_for(name), "Server": SERVER})
+        return cache
+    for entry in entries:
+        try:
+            if entry.is_file():
+                cache[entry.name] = CachedBody(
+                    entry.read_bytes(), _content_type_for(entry.name)
+                )
+        except OSError:
+            continue
+    return cache
+
+
+STATIC_CACHE = _load_static_cache()
+
+
+def _serve_static(request: Message, name: str, want_gzip: bool) -> Message:
+    # Reject path traversal: the name must be a single normal path component.
+    # (The cache is keyed by bare filename, so traversal can't hit an entry, but
+    # keep the explicit guard for clarity.)
+    if not name or "/" in name or name in (".", ".."):
+        return _reply(request, b"Not Found", NOT_FOUND_META)
+    cached = STATIC_CACHE.get(name)
+    if cached is None:
+        return _reply(request, b"Not Found", NOT_FOUND_META)
+    return cached.message(request, want_gzip)
 
 
 def handle(message: Message) -> Message:
@@ -203,30 +330,37 @@ def handle(message: Message) -> Message:
     qs = parse_qs(message.metadata.get("http_query", ""))
 
     if method == "GET" and path == "/pipeline":
-        return Message(b"ok", TEXT_META)
+        return _reply(message, b"ok", TEXT_META)
     if method == "GET" and path in ("/baseline11", "/baseline2"):
         total = _query_int(qs, "a", 0) + _query_int(qs, "b", 0)
-        return Message(str(total).encode(), TEXT_META)
+        return _reply(message, str(total).encode(), TEXT_META)
     if method == "POST" and path == "/baseline11":
         total = _query_int(qs, "a", 0) + _query_int(qs, "b", 0)
         try:
             total += int(bytes(message.payload).decode().strip())
         except (ValueError, UnicodeDecodeError):
             pass
-        return Message(str(total).encode(), TEXT_META)
+        return _reply(message, str(total).encode(), TEXT_META)
     if method == "POST" and path == "/upload":
-        return Message(str(len(message.payload)).encode(), TEXT_META)
+        return _reply(message, str(len(message.payload)).encode(), TEXT_META)
     if method == "GET" and path == "/async-db":
-        return Message(_async_db(qs), JSON_META)
+        return _reply(message, _async_db(qs), JSON_META)
     if method == "GET" and path.startswith("/json/"):
         try:
             count = int(path[len("/json/"):])
         except ValueError:
             count = 0
-        return Message(_build_json(count, _query_int(qs, "m", 1)), JSON_META)
+        return _reply(message, _build_json(count, _query_int(qs, "m", 1)), JSON_META)
     if method == "GET" and path.startswith("/static/"):
-        return _serve_static(path[len("/static/"):])
-    return Message(b"Not Found", NOT_FOUND_META)
+        return _serve_static(message, path[len("/static/"):], _accepts_gzip(message))
+    return _reply(message, b"Not Found", NOT_FOUND_META)
+
+
+def _run_secondary_listener(route: Route) -> None:
+    try:
+        route.run()
+    finally:
+        os.kill(os.getpid(), signal.SIGTERM)
 
 
 def _run_worker(http_workers: int) -> None:
@@ -234,11 +368,22 @@ def _run_worker(http_workers: int) -> None:
     # runtime must be created AFTER any fork, never inherited across it.
     global _POOL
     _POOL = _init_pool()
+    config, names = _config(http_workers)
     with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
-        f.write(_config(http_workers))
+        f.write(config)
         config_path = f.name
-    route = Route.from_yaml(config_path, "httparena").with_handler(handle)
-    route.run()
+
+    routes = [Route.from_yaml(config_path, name).with_handler(handle) for name in names]
+    # Keep every port fail-fast: if any secondary listener exits, signal this
+    # worker so the parent supervisor restarts a clean set instead of leaving a
+    # partially serving process behind.
+    for route in routes[1:]:
+        threading.Thread(
+            target=_run_secondary_listener,
+            args=(route,),
+            daemon=False,
+        ).start()
+    routes[0].run()
 
 
 def _worker_count() -> int:
