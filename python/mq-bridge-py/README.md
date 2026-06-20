@@ -27,6 +27,12 @@ The Python surface is synchronous and blocking. Tokio, broker I/O, routing, and 
 
 ## Config types and schema
 
+`mq-bridge-app` can create and test route and endpoint JSON/YAML through its UI.
+It does not replace your Python code or handlers, but it is useful when you want
+a known-good connection and route shape before pasting the configuration into
+Python. Load the generated config with `Route.from_config`, `Route.from_yaml`,
+`Publisher.from_config`, or `Publisher.from_yaml`.
+
 For the `from_config` / `from_yaml_str` mappings, `mq_bridge.config` ships
 `TypedDict` definitions so editors autocomplete the config keys (`input`,
 `output`, `batch_size`, every transport config, middleware, …):
