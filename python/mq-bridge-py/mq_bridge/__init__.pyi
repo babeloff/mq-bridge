@@ -1,4 +1,7 @@
-from typing import Any, Callable, Dict, List, Mapping, Optional, Union
+from types import TracebackType
+from typing import Any, Callable, Dict, List, Mapping, Optional, Type, Union
+
+__version__: str
 
 JsonValue = Any
 HandlerResult = Optional[Union["Message", bytes, str, Dict[str, JsonValue], List[JsonValue], int, float, bool]]
@@ -48,6 +51,12 @@ class Route:
     @classmethod
     def from_yaml(cls, path: str, name: str) -> "Route": ...
 
+    @classmethod
+    def from_yaml_str(cls, text: str, name: str) -> "Route": ...
+
+    @classmethod
+    def from_config(cls, config: Mapping[str, Any], name: str) -> "Route": ...
+
     def with_handler(self, handler: Callable[[Message], HandlerResult]) -> "Route": ...
 
     def add_handler(
@@ -56,9 +65,28 @@ class Route:
         handler: Callable[[JsonValue], HandlerResult],
     ) -> "Route": ...
 
-    def run(self) -> None: ...
+    def run(self) -> None:
+        """Deploy and block the calling thread until ``stop()`` is called."""
+        ...
+
+    def start(self) -> None:
+        """Deploy on a background thread and return immediately."""
+        ...
+
+    def join(self) -> None:
+        """Block until a route started with ``start()`` has stopped."""
+        ...
 
     def stop(self) -> None: ...
+
+    def __enter__(self) -> "Route": ...
+
+    def __exit__(
+        self,
+        exc_type: Optional[Type[BaseException]],
+        exc_value: Optional[BaseException],
+        traceback: Optional[TracebackType],
+    ) -> bool: ...
 
 
 class MemoryDrainer:
@@ -80,6 +108,12 @@ class MemoryDrainer:
 class Publisher:
     @classmethod
     def from_yaml(cls, path: str, name: str) -> "Publisher": ...
+
+    @classmethod
+    def from_yaml_str(cls, text: str, name: str) -> "Publisher": ...
+
+    @classmethod
+    def from_config(cls, config: Mapping[str, Any], name: str) -> "Publisher": ...
 
     def send(
         self,

@@ -15,14 +15,53 @@ Memory and file endpoints are always present in both packages. Use `mq-bridge-py
 
 The public API stays close to mq-bridge itself:
 
-- `Route.from_yaml(path, name)` loads one named route
+- `Route.from_yaml(path, name)` loads one named route from a YAML file
+- `Route.from_yaml_str(text, name)` / `Route.from_config(mapping, name)` build a route from an in-memory YAML string or a Python `dict`, no file required
 - `Route.with_handler(...)` attaches a raw `Message` handler, with lazy `json()`/`text()` readers and `with_json()`/`with_payload()` response helpers
 - `Route.add_handler(kind, ...)` uses mq-bridge's `kind` dispatch and delivers decoded JSON
 - `RetryableError` and `NonRetryableError` let Python handlers signal retry intent
-- `Publisher.from_yaml(path, name)` loads one named publisher
+- `Publisher.from_yaml(path, name)` (plus `from_yaml_str` / `from_config`) loads one named publisher
 - `Publisher.send_json(...)` and `Publisher.request_json(...)` serialize Python JSON values in Rust
 
 The Python surface is synchronous and blocking. Tokio, broker I/O, routing, and batching all stay in Rust.
+
+## Running a route
+
+`Route.run()` **blocks the calling thread** until another thread calls `stop()` —
+it deploys the route and then parks. This is convenient for a process whose only
+job is the route, but it is a common trap: nothing after `route.run()` executes
+until the route stops.
+
+To keep running Python code after the route is up, use `start()` (non-blocking)
+or the context-manager form:
+
+```python
+route = Route.from_config(config, "orders_route").with_handler(handle)
+
+# Non-blocking: deploys, returns, and runs on a background thread.
+route.start()
+publisher.send_json({"order_id": 42}, {"kind": "order.created"})
+route.stop()
+route.join()   # optional: wait for a clean shutdown
+
+# Or scope it to a block — starts on enter, stops + joins on exit:
+with Route.from_config(config, "orders_route").with_handler(handle):
+    publisher.send_json({"order_id": 42}, {"kind": "order.created"})
+```
+
+Configuration/connection errors surface from `start()` itself, not from a
+background thread. `run()` remains available for the blocking single-route case.
+
+## Tuning (environment variables)
+
+These knobs are read from the environment at startup:
+
+| Variable | Default | Effect |
+| :--- | :--- | :--- |
+| `MQ_BRIDGE_PY_HANDLER_EXECUTOR` | `worker` | `worker` runs handlers on a dedicated interpreter thread that coalesces queued batches under one GIL acquisition (best under load); `direct` calls the handler inline. |
+| `MQ_BRIDGE_PY_HANDLER_CONCURRENCY` | CPU count | Max in-flight handler batches. `0` disables the limit. |
+| `MQ_BRIDGE_PY_GC_MODE` | `default` | `default` leaves CPython's cyclic GC alone; `count` disables it and runs `gc.collect()` every N messages; `off` disables it entirely (pure refcounting). |
+| `MQ_BRIDGE_PY_GC_THRESHOLD` | `100000` | Messages between collections when `MQ_BRIDGE_PY_GC_MODE=count`. |
 
 ## Local development
 
