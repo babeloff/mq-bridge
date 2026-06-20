@@ -557,8 +557,9 @@ impl Route {
         // rather than disappearing on the background thread.
         let deploy_name = name.clone();
         let deploy_runtime = Arc::clone(&runtime);
-        let deploy_result =
-            py.detach(move || deploy_runtime.block_on(async move { route.deploy(&deploy_name).await }));
+        let deploy_result = py.detach(move || {
+            deploy_runtime.block_on(async move { route.deploy(&deploy_name).await })
+        });
         if let Err(err) = deploy_result {
             finish_run(&run_state, &name);
             return Err(to_py_runtime_error(err));
@@ -906,7 +907,9 @@ fn named_route_from_value(value: serde_yaml_ng::Value, name: &str) -> anyhow::Re
     }
 
     serde_yaml_ng::from_value(value).with_context(|| {
-        format!("No route named '{name}' found, and the config could not be parsed as a single route")
+        format!(
+            "No route named '{name}' found, and the config could not be parsed as a single route"
+        )
     })
 }
 

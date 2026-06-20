@@ -26,6 +26,8 @@ type WebSocketSourceMessage = (CanonicalMessage, CommitFunc);
 type WebSocketResponseTx = tokio::sync::mpsc::Sender<Message>;
 
 const DEFAULT_WEBSOCKET_LISTEN_BACKLOG: u32 = 4096;
+const WEBSOCKET_REUSEPORT_ENV: &str = "MQ_BRIDGE_WEBSOCKET_REUSEPORT";
+const WEBSOCKET_ACCEPT_WORKERS_ENV: &str = "MQ_BRIDGE_WEBSOCKET_ACCEPT_WORKERS";
 
 fn bind_websocket_listener(addr: SocketAddr, backlog: Option<u32>) -> std::io::Result<TcpListener> {
     let socket = if addr.is_ipv4() {
@@ -35,6 +37,96 @@ fn bind_websocket_listener(addr: SocketAddr, backlog: Option<u32>) -> std::io::R
     };
     socket.bind(addr)?;
     socket.listen(backlog.unwrap_or(DEFAULT_WEBSOCKET_LISTEN_BACKLOG))
+}
+
+fn websocket_reuseport_enabled() -> bool {
+    match std::env::var(WEBSOCKET_REUSEPORT_ENV) {
+        Ok(value) => !matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off" | "no"
+        ),
+        Err(_) => cfg!(unix),
+    }
+}
+
+fn websocket_accept_workers() -> usize {
+    std::env::var(WEBSOCKET_ACCEPT_WORKERS_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|workers| *workers > 0)
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(usize::from)
+                .unwrap_or(1)
+        })
+}
+
+fn bind_reuseport_websocket_listener(
+    addr: SocketAddr,
+    backlog: Option<u32>,
+) -> std::io::Result<TcpListener> {
+    let socket = if addr.is_ipv4() {
+        TcpSocket::new_v4()?
+    } else {
+        TcpSocket::new_v6()?
+    };
+    socket.set_reuseaddr(true)?;
+    #[cfg(all(unix, not(target_os = "solaris"), not(target_os = "illumos")))]
+    socket.set_reuseport(true)?;
+    socket.bind(addr)?;
+    socket.listen(backlog.unwrap_or(DEFAULT_WEBSOCKET_LISTEN_BACKLOG))
+}
+
+fn bind_websocket_listeners(
+    addr: SocketAddr,
+    backlog: Option<u32>,
+) -> std::io::Result<(Vec<TcpListener>, SocketAddr)> {
+    let bind_shared = || {
+        let listener = bind_websocket_listener(addr, backlog)?;
+        let bound_addr = listener.local_addr()?;
+        Ok((vec![listener], bound_addr))
+    };
+
+    let workers = websocket_accept_workers();
+    if workers <= 1 || !websocket_reuseport_enabled() {
+        return bind_shared();
+    }
+
+    let first = match bind_reuseport_websocket_listener(addr, backlog) {
+        Ok(listener) => listener,
+        Err(error) => {
+            warn!(
+                error = %error,
+                "SO_REUSEPORT bind failed for WebSocket listener; using one shared listener"
+            );
+            return bind_shared();
+        }
+    };
+    let bound_addr = first.local_addr()?;
+    let mut listeners = Vec::with_capacity(workers);
+    listeners.push(first);
+
+    for _ in 1..workers {
+        match bind_reuseport_websocket_listener(bound_addr, backlog) {
+            Ok(listener) => listeners.push(listener),
+            Err(error) => {
+                warn!(
+                    error = %error,
+                    listeners = listeners.len(),
+                    workers,
+                    "SO_REUSEPORT sibling bind failed for WebSocket listener"
+                );
+                break;
+            }
+        }
+    }
+
+    tracing::info!(
+        listeners = listeners.len(),
+        workers,
+        "WebSocket server using SO_REUSEPORT listener sharding"
+    );
+    Ok((listeners, bound_addr))
 }
 
 pub struct WebSocketConsumer {
@@ -52,8 +144,7 @@ impl WebSocketConsumer {
             .url
             .parse()
             .with_context(|| format!("Invalid listen address: {}", config.url))?;
-        let listener = bind_websocket_listener(listen_addr, config.backlog)?;
-        let bound_addr = listener.local_addr()?;
+        let (listeners, bound_addr) = bind_websocket_listeners(listen_addr, config.backlog)?;
         let path = config.path.as_deref().map(normalize_websocket_path);
         let message_id_header = config
             .message_id_header
@@ -62,13 +153,15 @@ impl WebSocketConsumer {
         let (request_tx, request_rx) = tokio::sync::mpsc::channel(queue_capacity);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
-        spawn_accept_loop(
-            listener,
-            request_tx,
-            shutdown_rx,
-            path.clone(),
-            message_id_header,
-        );
+        for listener in listeners {
+            spawn_accept_loop(
+                listener,
+                request_tx.clone(),
+                shutdown_rx.clone(),
+                path.clone(),
+                message_id_header.clone(),
+            );
+        }
 
         let url = if let Some(path) = path {
             format!("ws://{}{}", bound_addr, path)
@@ -222,7 +315,7 @@ pub(crate) async fn run_direct_response_route(
         .url
         .parse()
         .with_context(|| format!("Invalid listen address: {}", config.url))?;
-    let listener = bind_websocket_listener(listen_addr, config.backlog)?;
+    let (listeners, _) = bind_websocket_listeners(listen_addr, config.backlog)?;
     let expected_path = config.path.as_deref().map(normalize_websocket_path);
     let message_id_header = config
         .message_id_header
@@ -238,6 +331,39 @@ pub(crate) async fn run_direct_response_route(
         let _ = tx.send(()).await;
     }
 
+    let (accepted_tx, accepted_rx) = async_channel::bounded(listeners.len().max(1) * 1024);
+    let (accept_shutdown_tx, accept_shutdown_rx) = watch::channel(false);
+    for listener in listeners {
+        let accepted_tx = accepted_tx.clone();
+        let mut accept_shutdown_rx = accept_shutdown_rx.clone();
+        let route_name = name.to_string();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    changed = accept_shutdown_rx.changed() => {
+                        if changed.is_err() || *accept_shutdown_rx.borrow() {
+                            break;
+                        }
+                    }
+                    accept_result = listener.accept() => {
+                        let (stream, peer_addr) = match accept_result {
+                            Ok(parts) => parts,
+                            Err(error) => {
+                                warn!(error = %error, route = %route_name, "WebSocket direct accept failed");
+                                continue;
+                            }
+                        };
+                        let _ = stream.set_nodelay(true);
+                        if accepted_tx.send((stream, peer_addr)).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+    }
+    drop(accepted_tx);
+
     let mut connections = tokio::task::JoinSet::new();
     loop {
         tokio::select! {
@@ -246,18 +372,14 @@ pub(crate) async fn run_direct_response_route(
                     "Shutdown signal received in WebSocket direct response runner for route '{}'.",
                     name
                 );
+                let _ = accept_shutdown_tx.send(true);
                 break;
             }
-            accept_result = listener.accept() => {
-                let (stream, peer_addr) = match accept_result {
+            accepted = accepted_rx.recv() => {
+                let (stream, peer_addr) = match accepted {
                     Ok(parts) => parts,
-                    Err(error) => {
-                        warn!(error = %error, route = name, "WebSocket direct accept failed");
-                        continue;
-                    }
+                    Err(_) => break,
                 };
-                let _ = stream.set_nodelay(true);
-
                 let expected_path = expected_path.clone();
                 let message_id_header = message_id_header.clone();
                 let handler = handler.clone();
@@ -302,6 +424,29 @@ async fn handle_direct_connection(
         return Ok(());
     };
 
+    if handler.is_none() {
+        while let Some(frame) = ws_stream.next().await {
+            let frame = frame?;
+            if frame.is_close() {
+                let _ = ws_stream.flush().await;
+                break;
+            }
+            if frame.is_ping() {
+                ws_stream.flush().await?;
+                continue;
+            }
+            if frame.is_pong() {
+                continue;
+            }
+            if frame.as_text().is_some() || frame.is_binary() {
+                ws_stream.send(frame).await?;
+            }
+        }
+
+        return Ok(());
+    }
+
+    let handler = handler.expect("handler was checked above");
     while let Some(frame) = ws_stream.next().await {
         let frame = frame?;
         if frame.is_close() {
@@ -319,29 +464,24 @@ async fn handle_direct_connection(
             continue;
         };
 
-        let handled = if let Some(handler) = handler.as_ref() {
-            let original_id = message.message_id;
-            let inbound_correlation_id = message.metadata.get("correlation_id").cloned();
-            match handler.handle(message).await {
-                Ok(Handled::Publish(mut response_msg)) => {
-                    response_msg.message_id = original_id;
-                    response_msg
-                        .metadata
-                        .entry("correlation_id".to_string())
-                        .or_insert(
-                            inbound_correlation_id
-                                .unwrap_or_else(|| format!("{:032x}", original_id)),
-                        );
-                    Handled::Publish(response_msg)
-                }
-                Ok(Handled::Ack) => Handled::Ack,
-                Err(error) => {
-                    warn!(error = %error, %peer_addr, "WebSocket direct handler failed");
-                    continue;
-                }
+        let original_id = message.message_id;
+        let inbound_correlation_id = message.metadata.get("correlation_id").cloned();
+        let handled = match handler.handle(message).await {
+            Ok(Handled::Publish(mut response_msg)) => {
+                response_msg.message_id = original_id;
+                response_msg
+                    .metadata
+                    .entry("correlation_id".to_string())
+                    .or_insert(
+                        inbound_correlation_id.unwrap_or_else(|| format!("{:032x}", original_id)),
+                    );
+                Handled::Publish(response_msg)
             }
-        } else {
-            Handled::Publish(message)
+            Ok(Handled::Ack) => Handled::Ack,
+            Err(error) => {
+                warn!(error = %error, %peer_addr, "WebSocket direct handler failed");
+                continue;
+            }
         };
 
         if let Handled::Publish(reply) = handled {
