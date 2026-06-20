@@ -368,8 +368,46 @@ pub struct BufferConsumer {
     max_delay: Duration,
 }
 
+/// Consumer types whose `receive_batch` is cancel-safe: an in-flight read can be
+/// dropped on linger without losing or double-delivering a message (they are
+/// mpsc-backed). Buffer's linger relies on this, so `new` refuses anything else.
+///
+/// This is a closed list of the immediate inner type. If Buffer is not the
+/// innermost input middleware, `inner` is another middleware wrapper and won't
+/// match — place Buffer directly above the source endpoint.
+fn inner_is_cancel_safe(inner: &dyn MessageConsumer) -> bool {
+    let any = inner.as_any();
+    #[cfg(feature = "websocket")]
+    if any.is::<crate::endpoints::websocket::WebSocketConsumer>() {
+        return true;
+    }
+    // gRPC is cancel-safe only in server mode; both modes share one type, so we
+    // downcast and ask the instance which variant it is.
+    #[cfg(feature = "grpc")]
+    if let Some(grpc) = any.downcast_ref::<crate::endpoints::grpc::GrpcConsumer>() {
+        return grpc.is_cancel_safe();
+    }
+    any.is::<crate::endpoints::memory::MemoryConsumer>()
+}
+
 impl BufferConsumer {
     pub fn new(inner: Box<dyn MessageConsumer>, config: &BufferMiddleware) -> anyhow::Result<Self> {
+        if !inner_is_cancel_safe(inner.as_ref()) {
+            return Err(anyhow!(
+                "Buffer middleware requires a cancel-safe input consumer (memory or WebSocket) \
+                 placed directly above the source endpoint; its linger may cancel an in-flight \
+                 inner receive_batch, which would corrupt delivery on other transports"
+            ));
+        }
+        Self::new_unchecked(inner, config)
+    }
+
+    /// Builds a `BufferConsumer` without the cancel-safety check. Callers must
+    /// guarantee `inner` is cancel-safe; used by tests with controlled mocks.
+    pub(crate) fn new_unchecked(
+        inner: Box<dyn MessageConsumer>,
+        config: &BufferMiddleware,
+    ) -> anyhow::Result<Self> {
         if config.max_messages == 0 {
             return Err(anyhow!("Buffer max_messages must be greater than zero"));
         }
@@ -708,7 +746,7 @@ mod tests {
     #[tokio::test]
     async fn test_buffer_consumer_coalesces_trickling_reads_and_routes_commits() {
         let committed = Arc::new(StdMutex::new(Vec::new()));
-        let mut consumer = BufferConsumer::new(
+        let mut consumer = BufferConsumer::new_unchecked(
             Box::new(TrickleConsumer {
                 next_id: Arc::new(StdMutex::new(0)),
                 limit: 8,
@@ -750,7 +788,7 @@ mod tests {
     #[tokio::test]
     async fn test_buffer_consumer_flushes_on_linger_deadline() {
         let committed = Arc::new(StdMutex::new(Vec::new()));
-        let mut consumer = BufferConsumer::new(
+        let mut consumer = BufferConsumer::new_unchecked(
             Box::new(TrickleConsumer {
                 next_id: Arc::new(StdMutex::new(0)),
                 limit: 2,
@@ -769,5 +807,28 @@ mod tests {
         let batch = consumer.receive_batch(64).await.unwrap();
         assert_eq!(batch.messages.len(), 2);
         assert!(started.elapsed() >= Duration::from_millis(30));
+    }
+
+    #[test]
+    fn test_buffer_new_rejects_non_cancel_safe_consumer() {
+        // TrickleConsumer is not on the cancel-safe whitelist, so the checked
+        // `new` must refuse it (the linger could cancel its in-flight read).
+        let result = BufferConsumer::new(
+            Box::new(TrickleConsumer {
+                next_id: Arc::new(StdMutex::new(0)),
+                limit: 1,
+                block_when_empty: false,
+                committed: Arc::new(StdMutex::new(Vec::new())),
+            }),
+            &BufferMiddleware {
+                max_messages: 8,
+                max_delay_ms: 30,
+            },
+        );
+        let err = match result {
+            Ok(_) => panic!("expected cancel-safety rejection"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("cancel-safe"), "unexpected error: {err}");
     }
 }

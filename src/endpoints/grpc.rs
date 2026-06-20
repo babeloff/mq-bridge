@@ -66,6 +66,13 @@ impl GrpcConsumer {
             bound_addr,
         })
     }
+
+    /// True when `receive_batch` is cancel-safe. Server mode is mpsc-backed (a
+    /// dropped read consumes nothing); client mode reads a tonic stream directly,
+    /// where a cancelled `message()` may drop an in-flight frame.
+    pub(crate) fn is_cancel_safe(&self) -> bool {
+        matches!(self.inner, GrpcConsumerInner::Server(_))
+    }
 }
 
 #[async_trait]
