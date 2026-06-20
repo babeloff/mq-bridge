@@ -6,6 +6,7 @@ from ._mq_bridge import (
     RetryableError,
     Route,
     __version__,
+    config_schema,
 )
 
 __all__ = [
@@ -16,4 +17,5 @@ __all__ = [
     "RetryableError",
     "Route",
     "__version__",
+    "config_schema",
 ]

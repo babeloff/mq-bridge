@@ -9,6 +9,9 @@ dynamic = ["version"]
 description = "Python bindings for mq-bridge (full: all brokers incl. Kafka)"
 readme = "README.md"
 requires-python = ">=3.9"
+dependencies = [
+  "typing-extensions>=4.0",
+]
 license = { text = "MIT" }
 license-files = ["LICENSE.python"]
 keywords = ["messaging", "tokio", "pyo3", "maturin", "mq-bridge"]
@@ -50,6 +53,6 @@ markers = [
 
 [tool.maturin]
 bindings = "pyo3"
-features = ["pyo3/extension-module", "full"]
+features = ["pyo3/extension-module", "full", "schema"]
 module-name = "mq_bridge._mq_bridge"
 python-source = "."

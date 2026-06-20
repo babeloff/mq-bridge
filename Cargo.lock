@@ -3132,6 +3132,7 @@ dependencies = [
  "fast-uuid-v7",
  "mq-bridge",
  "pyo3",
+ "schemars",
  "serde",
  "serde_json",
  "serde_yaml_ng",

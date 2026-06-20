@@ -19,6 +19,7 @@ bytes = { workspace = true, features = ["serde"] }
 fast-uuid-v7.workspace = true
 mq-bridge = { path = "../.." }
 pyo3 = { version = "0.29.0", features = ["abi3-py38"] }
+schemars = { version = "1.2", optional = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 serde_yaml_ng.workspace = true
@@ -48,7 +49,7 @@ full = ["mq-bridge/full"]
 basic = ["http", "nats", "mqtt", "websocket", "zeromq", "rustls-ring"]
 dedup = ["mq-bridge/dedup"]
 metrics = ["mq-bridge/metrics"]
-schema = ["mq-bridge/schema"]
+schema = ["dep:schemars", "mq-bridge/schema"]
 test-utils = ["mq-bridge/test-utils"]
 kafka = ["mq-bridge/kafka"]
 amqp = ["mq-bridge/amqp"]

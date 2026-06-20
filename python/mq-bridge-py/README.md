@@ -25,6 +25,42 @@ The public API stays close to mq-bridge itself:
 
 The Python surface is synchronous and blocking. Tokio, broker I/O, routing, and batching all stay in Rust.
 
+## Config types and schema
+
+For the `from_config` / `from_yaml_str` mappings, `mq_bridge.config` ships
+`TypedDict` definitions so editors autocomplete the config keys (`input`,
+`output`, `batch_size`, every transport config, middleware, …):
+
+```python
+from mq_bridge import Route
+from mq_bridge.config import ConfigDocument
+
+config: ConfigDocument = {
+    "routes": {
+        "orders": {
+            "input": {"memory": {"topic": "orders.in", "capacity": 1600}},
+            "output": {"response": {}},
+            "batch_size": 128,
+        }
+    }
+}
+route = Route.from_config(config, "orders")
+```
+
+These types are generated from the JSON Schema, which the extension produces on
+demand from the Rust models — there is no checked-in schema copy to drift:
+
+```python
+from mq_bridge import config_schema
+
+schema = config_schema()        # the JSON Schema as a dict
+```
+
+`config_schema()` is handy for editor validation of YAML configs too — dump it
+to a file and point your `# yaml-language-server: $schema=` line at it. The types
+are regenerated with `uv run python scripts/gen_config_types.py` (a test fails if
+they drift from the schema).
+
 ## Running a route
 
 `Route.run()` **blocks the calling thread** until another thread calls `stop()` —

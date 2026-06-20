@@ -3,6 +3,10 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Type, Union
 
 __version__: str
 
+def config_schema() -> Dict[str, Any]:
+    """Return the route-config JSON Schema, generated from the Rust models."""
+    ...
+
 JsonValue = Any
 HandlerResult = Optional[Union["Message", bytes, str, Dict[str, JsonValue], List[JsonValue], int, float, bool]]
 

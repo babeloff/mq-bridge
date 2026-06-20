@@ -419,6 +419,8 @@ impl Route {
         .map_err(to_py_runtime_error)
     }
 
+    /// Build a route from an in-memory YAML string. Accepts the same shapes as
+    /// `from_yaml` (a `routes:` document, a bare route map, or a single route).
     #[staticmethod]
     fn from_yaml_str(py: Python<'_>, text: &str, name: &str) -> PyResult<Self> {
         let text = text.to_string();
@@ -432,6 +434,21 @@ impl Route {
         .map_err(to_py_runtime_error)
     }
 
+    /// Build a route from an in-memory mapping (e.g. a Python ``dict``).
+    ///
+    /// The mapping may be a ``{"routes": {...}, "publishers": {...}}`` document,
+    /// a bare ``{name: route}`` map, or a single route body. ``mq_bridge.config``
+    /// exposes ``TypedDict`` types (``ConfigDocument``, ``RouteConfig``,
+    /// ``EndpointConfig``) for editor autocompletion, and ``config_schema()``
+    /// returns the full JSON Schema. Example::
+    ///
+    ///     Route.from_config(
+    ///         {"routes": {"orders": {
+    ///             "input": {"memory": {"topic": "orders.in"}},
+    ///             "output": {"response": {}},
+    ///         }}},
+    ///         "orders",
+    ///     )
     #[staticmethod]
     fn from_config(py: Python<'_>, config: &Bound<'_, PyAny>, name: &str) -> PyResult<Self> {
         let bytes = python_to_json_bytes(config)?;
@@ -1569,6 +1586,17 @@ fn finish_run(run_state: &Arc<Mutex<RouteRunState>>, name: &str) {
     }
 }
 
+/// Return the JSON Schema for the route/config mapping, generated on demand
+/// from the compiled Rust models (no checked-in copy, so it cannot drift).
+#[cfg(feature = "schema")]
+#[pyfunction]
+fn config_schema(py: Python<'_>) -> PyResult<Py<PyAny>> {
+    let schema = schemars::schema_for!(core::models::Config);
+    let json = serde_json::to_vec(&schema)
+        .map_err(|err| PyRuntimeError::new_err(format!("failed to serialize schema: {err}")))?;
+    json_bytes_to_python(py, &json)
+}
+
 #[pymodule(gil_used = true)]
 #[pyo3(name = "_mq_bridge")]
 fn _mq_bridge(module: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -1577,6 +1605,8 @@ fn _mq_bridge(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<Publisher>()?;
     module.add_class::<MemoryDrainer>()?;
     module.add("__version__", env!("CARGO_PKG_VERSION"))?;
+    #[cfg(feature = "schema")]
+    module.add_function(wrap_pyfunction!(config_schema, module)?)?;
     module.add("RetryableError", module.py().get_type::<RetryableError>())?;
     module.add(
         "NonRetryableError",
