@@ -2023,6 +2023,21 @@ pub enum HttpServerProtocol {
     Http2Only,
 }
 
+/// WebSocket route execution strategy.
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum WebSocketExecutionMode {
+    /// Use direct per-connection handling for simple `websocket -> response` routes and fall back
+    /// to the routed adapter with a warning when route semantics need the normal pipeline.
+    #[default]
+    Auto,
+    /// Require direct per-connection handling. Startup fails if the route cannot run directly.
+    DirectOnly,
+    /// Always use the normal routed consumer/worker/disposition pipeline.
+    Routed,
+}
+
 /// General HTTP connection configuration.
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
@@ -2118,20 +2133,15 @@ pub struct WebSocketConfig {
     pub path: Option<String>,
     /// (Consumer only) Header key to extract the message ID from the WebSocket handshake. Defaults to "message-id".
     pub message_id_header: Option<String>,
-    /// (Consumer only) Internal buffer size for the channel. Defaults to 100.
-    pub internal_buffer_size: Option<usize>,
+    /// (Consumer only) Queue capacity for the routed adapter. Direct response routes do not use this queue. Defaults to 100.
+    pub routed_queue_capacity: Option<usize>,
     /// (Consumer only) TCP listen backlog (pending-connection queue depth) for the accept socket.
     /// Raise this if high-concurrency handshake bursts are being dropped/reset before `accept()`
     /// can keep up. Defaults to 4096, which is higher than the OS/tokio default of 1024.
     pub backlog: Option<u32>,
-    /// (Consumer only) If true, compatible `websocket -> response` routes may bypass the normal route
-    /// consumer/worker/disposition pipeline and reply inline for lower latency. Defaults to true.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(
-        feature = "schema",
-        schemars(default = "default_inline_response_fast_path_schema")
-    )]
-    pub inline_response_fast_path: Option<bool>,
+    /// (Consumer only) Selects whether WebSocket routes run directly or through the routed pipeline.
+    #[serde(default)]
+    pub execution_mode: WebSocketExecutionMode,
 }
 
 fn deserialize_basic_auth<'de, D>(deserializer: D) -> Result<Option<(String, String)>, D::Error>
@@ -2240,13 +2250,9 @@ impl WebSocketConfig {
         self
     }
 
-    pub fn with_inline_response_fast_path(mut self, inline_response_fast_path: bool) -> Self {
-        self.inline_response_fast_path = Some(inline_response_fast_path);
+    pub fn with_execution_mode(mut self, execution_mode: WebSocketExecutionMode) -> Self {
+        self.execution_mode = execution_mode;
         self
-    }
-
-    pub fn inline_response_fast_path_enabled(&self) -> bool {
-        self.inline_response_fast_path.unwrap_or(true)
     }
 }
 

@@ -3,19 +3,33 @@
 use futures::{SinkExt, StreamExt};
 use mq_bridge::endpoints::websocket::WebSocketConsumer;
 use mq_bridge::endpoints::websocket::WebSocketPublisher;
-use mq_bridge::models::{Endpoint, EndpointType, WebSocketConfig};
+use mq_bridge::models::{Endpoint, EndpointType, WebSocketConfig, WebSocketExecutionMode};
 use mq_bridge::traits::{MessageConsumer, MessageDisposition, MessagePublisher};
 use mq_bridge::{CanonicalMessage, Handled, HandlerError, Route};
-use tokio_tungstenite::connect_async;
-use tokio_tungstenite::tungstenite::Message;
+use tokio_websockets::{ClientBuilder, Message};
 
 async fn echo(msg: CanonicalMessage) -> Result<Handled, HandlerError> {
     Ok(Handled::Publish(msg))
 }
 
+async fn ack(_msg: CanonicalMessage) -> Result<Handled, HandlerError> {
+    Ok(Handled::Ack)
+}
+
 fn get_free_port() -> u16 {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     listener.local_addr().unwrap().port()
+}
+
+async fn connect(
+    url: impl AsRef<str>,
+) -> tokio_websockets::WebSocketStream<tokio_websockets::MaybeTlsStream<tokio::net::TcpStream>> {
+    let uri = url.as_ref().parse().expect("websocket URL should parse");
+    let (stream, _) = ClientBuilder::from_uri(uri)
+        .connect()
+        .await
+        .expect("client should connect");
+    stream
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -89,18 +103,58 @@ async fn websocket_endpoint_handles_binary_payloads() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn websocket_publisher_batch_ack_means_all_messages_are_received() {
+    let mut consumer = WebSocketConsumer::new(&WebSocketConfig {
+        routed_queue_capacity: Some(2048),
+        ..WebSocketConfig::new("127.0.0.1:0").with_path("/batch")
+    })
+    .await
+    .expect("consumer should be created");
+    let publisher = WebSocketPublisher::new(&WebSocketConfig::new(consumer.url().to_string()));
+
+    let expected = 1000;
+    let messages = (0..expected)
+        .map(|index| {
+            CanonicalMessage::from_vec(format!("message-{index}"))
+                .with_metadata_kv("ws_message_type", "text")
+        })
+        .collect();
+    publisher
+        .send_batch(messages)
+        .await
+        .expect("publisher should ack only after flushing the batch");
+
+    let mut received = 0;
+    while received < expected {
+        let batch = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            consumer.receive_batch(expected - received),
+        )
+        .await
+        .expect("consumer should not time out")
+        .expect("consumer should receive");
+        let batch_len = batch.messages.len();
+        received += batch_len;
+        let commit = batch.commit;
+        commit(vec![MessageDisposition::Ack; batch_len])
+            .await
+            .expect("commit should succeed");
+    }
+
+    assert_eq!(received, expected);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn websocket_consumer_sends_commit_reply_to_client() {
     let mut consumer =
         WebSocketConsumer::new(&WebSocketConfig::new("127.0.0.1:0").with_path("/reply"))
             .await
             .expect("consumer should be created");
 
-    let (mut stream, _) = connect_async(consumer.url())
-        .await
-        .expect("client should connect");
+    let mut stream = connect(consumer.url()).await;
 
     stream
-        .send(Message::Text("request".into()))
+        .send(Message::text("request"))
         .await
         .expect("client should send request");
 
@@ -123,11 +177,11 @@ async fn websocket_consumer_sends_commit_reply_to_client() {
         .await
         .expect("client should receive response")
         .expect("response frame should be valid");
-    assert_eq!(reply, Message::Text("response".into()));
+    assert_eq!(reply.as_text(), Some("response"));
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn websocket_default_inline_response_fast_path_replies_with_handler() {
+async fn websocket_direct_response_route_replies_with_handler() {
     let port = get_free_port();
     let input = Endpoint::new(EndpointType::WebSocket(
         WebSocketConfig::new(format!("127.0.0.1:{port}")).with_path("/inline"),
@@ -139,11 +193,9 @@ async fn websocket_default_inline_response_fast_path_replies_with_handler() {
         .await
         .expect("route should start");
 
-    let (mut stream, _) = connect_async(format!("ws://127.0.0.1:{port}/inline"))
-        .await
-        .expect("client should connect");
+    let mut stream = connect(format!("ws://127.0.0.1:{port}/inline")).await;
     stream
-        .send(Message::Text("request".into()))
+        .send(Message::text("request"))
         .await
         .expect("client should send request");
 
@@ -152,7 +204,122 @@ async fn websocket_default_inline_response_fast_path_replies_with_handler() {
         .await
         .expect("client should receive response")
         .expect("response frame should be valid");
-    assert_eq!(reply, Message::Text("request".into()));
+    assert_eq!(reply.as_text(), Some("request"));
+
+    handle.stop().await;
+    handle.join().await.expect("route task should finish");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn websocket_direct_response_route_echoes_without_handler() {
+    let port = get_free_port();
+    let input = Endpoint::new(EndpointType::WebSocket(
+        WebSocketConfig::new(format!("127.0.0.1:{port}")).with_path("/echo"),
+    ));
+    let output = Endpoint::new_response();
+    let route = Route::new(input, output);
+    let handle = route
+        .run(&format!("websocket-direct-echo-{port}"))
+        .await
+        .expect("route should start");
+
+    let mut stream = connect(format!("ws://127.0.0.1:{port}/echo")).await;
+    stream
+        .send(Message::binary(vec![0, 1, 2, 3]))
+        .await
+        .expect("client should send request");
+
+    let reply = stream
+        .next()
+        .await
+        .expect("client should receive response")
+        .expect("response frame should be valid");
+    assert!(reply.is_binary());
+    assert_eq!(&reply.as_payload()[..], &[0, 1, 2, 3]);
+
+    handle.stop().await;
+    handle.join().await.expect("route task should finish");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn websocket_direct_response_route_ack_sends_no_reply() {
+    let port = get_free_port();
+    let input = Endpoint::new(EndpointType::WebSocket(
+        WebSocketConfig::new(format!("127.0.0.1:{port}")).with_path("/ack"),
+    ));
+    let output = Endpoint::new_response();
+    let route = Route::new(input, output).with_handler(ack);
+    let handle = route
+        .run(&format!("websocket-direct-ack-{port}"))
+        .await
+        .expect("route should start");
+
+    let mut stream = connect(format!("ws://127.0.0.1:{port}/ack")).await;
+    stream
+        .send(Message::text("request"))
+        .await
+        .expect("client should send request");
+    let result = tokio::time::timeout(std::time::Duration::from_millis(100), stream.next()).await;
+    assert!(result.is_err(), "ack should not produce a websocket reply");
+
+    handle.stop().await;
+    handle.join().await.expect("route task should finish");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn websocket_direct_response_route_replies_to_ping() {
+    let port = get_free_port();
+    let input = Endpoint::new(EndpointType::WebSocket(
+        WebSocketConfig::new(format!("127.0.0.1:{port}"))
+            .with_path("/ping")
+            .with_execution_mode(WebSocketExecutionMode::DirectOnly),
+    ));
+    let output = Endpoint::new_response();
+    let route = Route::new(input, output);
+    let handle = route
+        .run(&format!("websocket-direct-ping-{port}"))
+        .await
+        .expect("route should start");
+
+    let mut stream = connect(format!("ws://127.0.0.1:{port}/ping")).await;
+    stream
+        .send(Message::ping("hello"))
+        .await
+        .expect("client should send ping");
+    let reply = stream
+        .next()
+        .await
+        .expect("client should receive pong")
+        .expect("pong frame should be valid");
+    assert!(reply.is_pong());
+    assert_eq!(&reply.as_payload()[..], b"hello");
+
+    handle.stop().await;
+    handle.join().await.expect("route task should finish");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn websocket_direct_response_route_closes_wrong_path() {
+    let port = get_free_port();
+    let input = Endpoint::new(EndpointType::WebSocket(
+        WebSocketConfig::new(format!("127.0.0.1:{port}"))
+            .with_path("/expected")
+            .with_execution_mode(WebSocketExecutionMode::DirectOnly),
+    ));
+    let output = Endpoint::new_response();
+    let route = Route::new(input, output);
+    let handle = route
+        .run(&format!("websocket-direct-path-{port}"))
+        .await
+        .expect("route should start");
+
+    let mut stream = connect(format!("ws://127.0.0.1:{port}/wrong")).await;
+    let frame = stream
+        .next()
+        .await
+        .expect("server should close wrong path")
+        .expect("close frame should be valid");
+    assert!(frame.is_close());
 
     handle.stop().await;
     handle.join().await.expect("route task should finish");

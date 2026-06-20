@@ -581,25 +581,36 @@ pub(crate) async fn try_run_fast_path_route(
     #[cfg(feature = "websocket")]
     {
         if let EndpointType::WebSocket(cfg) = &route.input.endpoint_type {
-            if matches!(route.output.endpoint_type, EndpointType::Response(_))
-                && cfg.inline_response_fast_path_enabled()
-                && websocket_inline_fast_path_route_options_allowed(
-                    &route.options,
-                    cfg.inline_response_fast_path == Some(true),
-                )
-                && route.input.middlewares.is_empty()
-                && route.output.middlewares.is_empty()
-            {
-                return Some(
-                    websocket::run_inline_response_fast_path(
-                        name,
-                        cfg.clone(),
-                        route.output.handler.clone(),
-                        shutdown_rx,
-                        ready_tx,
-                    )
-                    .await,
-                );
+            match websocket_direct_route_support(route) {
+                WebSocketDirectRouteSupport::Supported => {
+                    return Some(
+                        websocket::run_direct_response_route(
+                            name,
+                            cfg.clone(),
+                            route.output.handler.clone(),
+                            shutdown_rx,
+                            ready_tx,
+                        )
+                        .await,
+                    );
+                }
+                WebSocketDirectRouteSupport::Unsupported(reason) => match cfg.execution_mode {
+                    crate::models::WebSocketExecutionMode::Auto => {
+                        tracing::warn!(
+                            route = name,
+                            reason = reason,
+                            "WebSocket route cannot run in direct mode; falling back to routed mode"
+                        );
+                    }
+                    crate::models::WebSocketExecutionMode::DirectOnly => {
+                        return Some(Err(anyhow!(
+                            "WebSocket route '{}' is configured for direct_only, but direct mode is unsupported: {}",
+                            name,
+                            reason
+                        )));
+                    }
+                    crate::models::WebSocketExecutionMode::Routed => {}
+                },
             }
         }
     }
@@ -612,14 +623,37 @@ pub(crate) async fn try_run_fast_path_route(
 }
 
 #[cfg(feature = "websocket")]
-fn websocket_inline_fast_path_route_options_allowed(
-    options: &crate::models::RouteOptions,
-    explicitly_enabled: bool,
-) -> bool {
-    if explicitly_enabled {
-        return true;
+enum WebSocketDirectRouteSupport {
+    Supported,
+    Unsupported(&'static str),
+}
+
+#[cfg(feature = "websocket")]
+fn websocket_direct_route_support(route: &crate::models::Route) -> WebSocketDirectRouteSupport {
+    let EndpointType::WebSocket(cfg) = &route.input.endpoint_type else {
+        return WebSocketDirectRouteSupport::Unsupported("input is not websocket");
+    };
+
+    if cfg.execution_mode == crate::models::WebSocketExecutionMode::Routed {
+        return WebSocketDirectRouteSupport::Unsupported("execution_mode is routed");
+    }
+    if !matches!(route.output.endpoint_type, EndpointType::Response(_)) {
+        return WebSocketDirectRouteSupport::Unsupported("output is not response");
+    }
+    if !websocket_direct_route_options_allowed(&route.options) {
+        return WebSocketDirectRouteSupport::Unsupported(
+            "custom route options require routed mode",
+        );
+    }
+    if !route.input.middlewares.is_empty() || !route.output.middlewares.is_empty() {
+        return WebSocketDirectRouteSupport::Unsupported("middleware requires routed mode");
     }
 
+    WebSocketDirectRouteSupport::Supported
+}
+
+#[cfg(feature = "websocket")]
+fn websocket_direct_route_options_allowed(options: &crate::models::RouteOptions) -> bool {
     let mut defaults = crate::models::RouteOptions::default();
     defaults.description.clone_from(&options.description);
     options == &defaults
@@ -1477,18 +1511,40 @@ mod tests {
 
     #[cfg(feature = "websocket")]
     #[test]
-    fn websocket_inline_fast_path_default_does_not_ignore_custom_route_options() {
+    fn websocket_direct_route_support_requires_default_route_options() {
         let mut options = crate::models::RouteOptions::default();
-        assert!(websocket_inline_fast_path_route_options_allowed(
-            &options, false
-        ));
+        assert!(websocket_direct_route_options_allowed(&options));
 
         options.batch_size = 128;
-        assert!(!websocket_inline_fast_path_route_options_allowed(
-            &options, false
+        assert!(!websocket_direct_route_options_allowed(&options));
+    }
+
+    #[cfg(feature = "websocket")]
+    #[test]
+    fn websocket_direct_route_support_respects_execution_mode_and_output() {
+        let input = Endpoint::new(EndpointType::WebSocket(
+            crate::models::WebSocketConfig::new("127.0.0.1:0"),
         ));
-        assert!(websocket_inline_fast_path_route_options_allowed(
-            &options, true
+        let response_route = crate::models::Route::new(input.clone(), Endpoint::new_response());
+        assert!(matches!(
+            websocket_direct_route_support(&response_route),
+            WebSocketDirectRouteSupport::Supported
+        ));
+
+        let memory_route = crate::models::Route::new(input.clone(), Endpoint::new_memory("ws", 1));
+        assert!(matches!(
+            websocket_direct_route_support(&memory_route),
+            WebSocketDirectRouteSupport::Unsupported("output is not response")
+        ));
+
+        let routed_input = Endpoint::new(EndpointType::WebSocket(
+            crate::models::WebSocketConfig::new("127.0.0.1:0")
+                .with_execution_mode(crate::models::WebSocketExecutionMode::Routed),
+        ));
+        let routed_route = crate::models::Route::new(routed_input, Endpoint::new_response());
+        assert!(matches!(
+            websocket_direct_route_support(&routed_route),
+            WebSocketDirectRouteSupport::Unsupported("execution_mode is routed")
         ));
     }
 
