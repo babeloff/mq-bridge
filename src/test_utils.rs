@@ -26,6 +26,19 @@ pub const PERF_TEST_SINGLE_MESSAGE_COUNT: usize = 10_000;
 pub const PERF_TEST_MESSAGE_COUNT: usize = PERF_TEST_BATCH_MESSAGE_COUNT;
 pub const PERF_TEST_CONCURRENCY: usize = 100;
 const MAX_PARALLEL_COMMITS: usize = 4096;
+const PERF_SEND_MAX_RETRIES: usize = 5;
+pub const PERF_CLEANUP_READ_TIMEOUT: Duration = Duration::from_secs(1);
+
+fn format_error_chain(error: &(dyn std::error::Error + 'static)) -> String {
+    let mut message = error.to_string();
+    let mut source = error.source();
+    while let Some(err) = source {
+        message.push_str(": ");
+        message.push_str(&err.to_string());
+        source = err.source();
+    }
+    message
+}
 
 /// A struct to hold the performance results for a single test run.
 #[derive(Debug, Clone, Default)]
@@ -801,7 +814,7 @@ pub async fn verify_subscriber_logic(
 ///
 /// The number of messages to write, the concurrency level and the batch
 /// size are all configurable. The test will retry sending a batch up
-/// to `MAX_RETRIES` times if any messages fail.
+/// to `PERF_SEND_MAX_RETRIES` times if any messages fail.
 ///
 /// The test will return how long it took to write all the messages to the
 /// publisher. If the count of messages written is not equal to the
@@ -872,7 +885,6 @@ pub async fn measure_write_performance(
                 let mut messages_to_send = batch;
                 let mut current_batch_size = messages_to_send.len();
                 let mut retry_count = 0;
-                const MAX_RETRIES: usize = 5;
                 loop {
                     match publisher_clone
                         .send_batch(std::mem::take(&mut messages_to_send))
@@ -913,7 +925,7 @@ pub async fn measure_write_performance(
                                     break;
                                 }
                                 retry_count += 1;
-                                if retry_count >= MAX_RETRIES {
+                                if retry_count >= PERF_SEND_MAX_RETRIES {
                                     eprintln!(
                                         "Max retries reached, giving up on {} messages",
                                         retryable.len()
@@ -927,11 +939,13 @@ pub async fn measure_write_performance(
                             }
                         }
                         Err(e) => {
-                            eprintln!("Error sending bulk messages: {}", e);
                             retry_count += 1;
-                            if retry_count >= MAX_RETRIES {
-                                eprintln!("Max retries reached, giving up on batch");
-                                break;
+                            if retry_count >= PERF_SEND_MAX_RETRIES {
+                                eprintln!(
+                                    "Max retries reached, giving up on batch: {}",
+                                    format_error_chain(&e)
+                                );
+                                return;
                             }
                         }
                     };
@@ -1014,6 +1028,16 @@ pub async fn measure_read_performance(
     consumer: Arc<tokio::sync::Mutex<dyn MessageConsumer>>,
     num_messages: usize,
 ) -> Duration {
+    measure_read_performance_with_timeout(_name, consumer, num_messages, Duration::from_secs(20))
+        .await
+}
+
+pub async fn measure_read_performance_with_timeout(
+    _name: &str,
+    consumer: Arc<tokio::sync::Mutex<dyn MessageConsumer>>,
+    num_messages: usize,
+    receive_timeout: Duration,
+) -> Duration {
     // println!("Starting read performance test (Batch) for {}", _name);
     let start_time = Instant::now();
     let mut final_count = 0;
@@ -1032,7 +1056,7 @@ pub async fn measure_read_performance(
         let mut consumer_guard = consumer_clone.lock().await;
         let receive_future = consumer_guard.receive_batch(missing);
 
-        match tokio::time::timeout(Duration::from_secs(20), receive_future).await {
+        match tokio::time::timeout(receive_timeout, receive_future).await {
             Ok(Ok(batch)) if !batch.messages.is_empty() => {
                 final_count += batch.messages.len();
                 let commit = batch.commit;
@@ -1115,6 +1139,7 @@ pub async fn measure_single_write_performance(
 
         tasks.spawn(async move {
             while let Ok(message) = rx_clone.recv().await {
+                let mut retry_count = 0;
                 loop {
                     match publisher_clone.send(message.clone()).await {
                         Ok(_) => {
@@ -1122,7 +1147,14 @@ pub async fn measure_single_write_performance(
                             break;
                         }
                         Err(e) => {
-                            eprintln!("Error sending message: {}. Retrying...", e);
+                            retry_count += 1;
+                            if retry_count >= PERF_SEND_MAX_RETRIES {
+                                eprintln!(
+                                    "Max retries reached, giving up on message: {}",
+                                    format_error_chain(&e)
+                                );
+                                return;
+                            }
                             tokio::time::sleep(Duration::from_millis(10)).await;
                             // Backoff
                         }
@@ -1309,10 +1341,11 @@ macro_rules! run_benchmarks {
                         .await;
                         total += duration;
                         tokio::time::sleep($sleep_duration).await;
-                        $crate::test_utils::measure_read_performance(
+                        $crate::test_utils::measure_read_performance_with_timeout(
                             "cleanup",
                             std::sync::Arc::clone(&consumer),
                             $msg_count,
+                            $crate::test_utils::PERF_CLEANUP_READ_TIMEOUT,
                         )
                         .await;
                         tokio::time::sleep(std::time::Duration::from_millis(1)).await;
@@ -1403,10 +1436,11 @@ macro_rules! run_benchmarks {
                         tokio::time::sleep($sleep_duration).await;
                         total += duration;
 
-                        $crate::test_utils::measure_read_performance(
+                        $crate::test_utils::measure_read_performance_with_timeout(
                             "cleanup",
                             std::sync::Arc::clone(&consumer),
                             $msg_count,
+                            $crate::test_utils::PERF_CLEANUP_READ_TIMEOUT,
                         )
                         .await;
                         tokio::time::sleep(std::time::Duration::from_millis(1)).await;
