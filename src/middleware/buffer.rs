@@ -1,5 +1,8 @@
 use crate::models::BufferMiddleware;
-use crate::traits::{BoxFuture, MessagePublisher, PublisherError, Sent, SentBatch};
+use crate::traits::{
+    BatchCommitFunc, BoxFuture, ConsumerError, EndpointStatus, MessageConsumer, MessageDisposition,
+    MessagePublisher, PublisherError, Received, ReceivedBatch, Sent, SentBatch,
+};
 use crate::CanonicalMessage;
 use anyhow::anyhow;
 use async_trait::async_trait;
@@ -7,7 +10,7 @@ use std::any::Any;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use tokio::sync::{oneshot, Mutex};
-use tokio::time::Duration;
+use tokio::time::{timeout_at, Duration, Instant};
 
 struct PendingEntry {
     message: CanonicalMessage,
@@ -354,6 +357,144 @@ impl MessagePublisher for BufferPublisher {
     }
 }
 
+/// Linger for `receive_batch`: coalesces trickling reads into real batches, up to
+/// `max_messages` or `max_delay`. Needs `batch_size` >= the desired buffer.
+///
+/// For cancel-safe consumers only (mpsc-backed: WebSocket, memory, channels): the linger
+/// may cancel an in-flight inner `receive_batch`.
+pub struct BufferConsumer {
+    inner: Box<dyn MessageConsumer>,
+    max_messages: usize,
+    max_delay: Duration,
+}
+
+/// Consumer types whose `receive_batch` is cancel-safe: an in-flight read can be
+/// dropped on linger without losing or double-delivering a message (they are
+/// mpsc-backed). Buffer's linger relies on this, so `new` refuses anything else.
+///
+/// This is a closed list of the immediate inner type. If Buffer is not the
+/// innermost input middleware, `inner` is another middleware wrapper and won't
+/// match — place Buffer directly above the source endpoint.
+fn inner_is_cancel_safe(inner: &dyn MessageConsumer) -> bool {
+    let any = inner.as_any();
+    #[cfg(feature = "websocket")]
+    if any.is::<crate::endpoints::websocket::WebSocketConsumer>() {
+        return true;
+    }
+    // gRPC is cancel-safe only in server mode; both modes share one type, so we
+    // downcast and ask the instance which variant it is.
+    #[cfg(feature = "grpc")]
+    if let Some(grpc) = any.downcast_ref::<crate::endpoints::grpc::GrpcConsumer>() {
+        return grpc.is_cancel_safe();
+    }
+    any.is::<crate::endpoints::memory::MemoryConsumer>()
+}
+
+impl BufferConsumer {
+    pub fn new(inner: Box<dyn MessageConsumer>, config: &BufferMiddleware) -> anyhow::Result<Self> {
+        if !inner_is_cancel_safe(inner.as_ref()) {
+            return Err(anyhow!(
+                "Buffer middleware requires a cancel-safe input consumer (memory or WebSocket) \
+                 placed directly above the source endpoint; its linger may cancel an in-flight \
+                 inner receive_batch, which would corrupt delivery on other transports"
+            ));
+        }
+        Self::new_unchecked(inner, config)
+    }
+
+    /// Builds a `BufferConsumer` without the cancel-safety check. Callers must
+    /// guarantee `inner` is cancel-safe; used by tests with controlled mocks.
+    pub(crate) fn new_unchecked(
+        inner: Box<dyn MessageConsumer>,
+        config: &BufferMiddleware,
+    ) -> anyhow::Result<Self> {
+        if config.max_messages == 0 {
+            return Err(anyhow!("Buffer max_messages must be greater than zero"));
+        }
+
+        Ok(Self {
+            inner,
+            max_messages: config.max_messages,
+            max_delay: Duration::from_millis(config.max_delay_ms),
+        })
+    }
+}
+
+/// Splits the merged disposition vec back to each sub-batch's original commit, in order.
+fn merge_commits(commits: Vec<(usize, BatchCommitFunc)>) -> BatchCommitFunc {
+    Box::new(move |dispositions: Vec<MessageDisposition>| {
+        Box::pin(async move {
+            let mut offset = 0usize;
+            for (count, commit) in commits {
+                let end = (offset + count).min(dispositions.len());
+                let slice = dispositions[offset..end].to_vec();
+                offset = end;
+                commit(slice).await?;
+            }
+            Ok(())
+        })
+    })
+}
+
+#[async_trait]
+impl MessageConsumer for BufferConsumer {
+    fn on_connect_hook(&self) -> Option<BoxFuture<'_, anyhow::Result<()>>> {
+        self.inner.on_connect_hook()
+    }
+
+    fn on_disconnect_hook(&self) -> Option<BoxFuture<'_, anyhow::Result<()>>> {
+        self.inner.on_disconnect_hook()
+    }
+
+    async fn receive(&mut self) -> Result<Received, ConsumerError> {
+        self.inner.receive().await
+    }
+
+    async fn receive_batch(&mut self, max_messages: usize) -> Result<ReceivedBatch, ConsumerError> {
+        let target = max_messages.min(self.max_messages).max(1);
+
+        // Block for the first read; first-read errors propagate as-is.
+        let first = self.inner.receive_batch(target).await?;
+        let mut messages = first.messages;
+
+        // Nothing to coalesce.
+        if messages.is_empty() || messages.len() >= target || self.max_delay.is_zero() {
+            return Ok(ReceivedBatch {
+                messages,
+                commit: first.commit,
+            });
+        }
+
+        // Fill until target or window close.
+        let mut commits: Vec<(usize, BatchCommitFunc)> = vec![(messages.len(), first.commit)];
+        let deadline = Instant::now() + self.max_delay;
+        while messages.len() < target {
+            let remaining = target - messages.len();
+            match timeout_at(deadline, self.inner.receive_batch(remaining)).await {
+                Ok(Ok(batch)) if !batch.messages.is_empty() => {
+                    commits.push((batch.messages.len(), batch.commit));
+                    messages.extend(batch.messages);
+                }
+                // Empty/expired/error: flush what we hold; an inner error recurs next call.
+                _ => break,
+            }
+        }
+
+        Ok(ReceivedBatch {
+            messages,
+            commit: merge_commits(commits),
+        })
+    }
+
+    async fn status(&self) -> EndpointStatus {
+        self.inner.status().await
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -536,5 +677,158 @@ mod tests {
 
         assert_eq!(batches.lock().unwrap().len(), 1);
         assert_eq!(batches.lock().unwrap()[0].len(), 1);
+    }
+
+    /// Yields one message per call (ids ascending), recording each commit's disposition.
+    /// After `limit`, ends the stream or blocks per `block_when_empty`.
+    #[derive(Clone)]
+    struct TrickleConsumer {
+        next_id: Arc<StdMutex<u128>>,
+        limit: u128,
+        block_when_empty: bool,
+        committed: Arc<StdMutex<Vec<(u128, bool)>>>,
+    }
+
+    #[async_trait]
+    impl MessageConsumer for TrickleConsumer {
+        async fn receive_batch(
+            &mut self,
+            _max_messages: usize,
+        ) -> Result<ReceivedBatch, ConsumerError> {
+            // Release the lock before any await.
+            let next_id = {
+                let mut n = self.next_id.lock().unwrap();
+                if *n >= self.limit {
+                    None
+                } else {
+                    let id = *n;
+                    *n += 1;
+                    Some(id)
+                }
+            };
+            let id = match next_id {
+                Some(id) => id,
+                None if self.block_when_empty => {
+                    // Never resolves; linger deadline must cancel it.
+                    tokio::time::sleep(Duration::from_secs(3600)).await;
+                    unreachable!();
+                }
+                None => return Err(ConsumerError::EndOfStream),
+            };
+
+            let mut message = CanonicalMessage::from("m");
+            message.message_id = id;
+
+            let committed = self.committed.clone();
+            let commit: BatchCommitFunc = Box::new(move |dispositions: Vec<MessageDisposition>| {
+                Box::pin(async move {
+                    for disposition in dispositions {
+                        committed
+                            .lock()
+                            .unwrap()
+                            .push((id, matches!(disposition, MessageDisposition::Ack)));
+                    }
+                    Ok(())
+                })
+            });
+
+            Ok(ReceivedBatch {
+                messages: vec![message],
+                commit,
+            })
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    #[tokio::test]
+    async fn test_buffer_consumer_coalesces_trickling_reads_and_routes_commits() {
+        let committed = Arc::new(StdMutex::new(Vec::new()));
+        let mut consumer = BufferConsumer::new_unchecked(
+            Box::new(TrickleConsumer {
+                next_id: Arc::new(StdMutex::new(0)),
+                limit: 8,
+                block_when_empty: false,
+                committed: committed.clone(),
+            }),
+            &BufferMiddleware {
+                max_messages: 8,
+                max_delay_ms: 50,
+            },
+        )
+        .unwrap();
+
+        // Caller asks 64; buffer caps at max_messages = 8.
+        let batch = consumer.receive_batch(64).await.unwrap();
+        assert_eq!(batch.messages.len(), 8);
+        let ids: Vec<u128> = batch.messages.iter().map(|m| m.message_id).collect();
+        assert_eq!(ids, (0..8).collect::<Vec<u128>>());
+
+        let dispositions: Vec<MessageDisposition> = (0..8)
+            .map(|i| {
+                if i % 2 == 0 {
+                    MessageDisposition::Ack
+                } else {
+                    MessageDisposition::Nack
+                }
+            })
+            .collect();
+        (batch.commit)(dispositions).await.unwrap();
+
+        let recorded = committed.lock().unwrap().clone();
+        assert_eq!(recorded.len(), 8);
+        for (i, (id, is_ack)) in recorded.iter().enumerate() {
+            assert_eq!(*id, i as u128);
+            assert_eq!(*is_ack, i % 2 == 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_buffer_consumer_flushes_on_linger_deadline() {
+        let committed = Arc::new(StdMutex::new(Vec::new()));
+        let mut consumer = BufferConsumer::new_unchecked(
+            Box::new(TrickleConsumer {
+                next_id: Arc::new(StdMutex::new(0)),
+                limit: 2,
+                block_when_empty: true,
+                committed,
+            }),
+            &BufferMiddleware {
+                max_messages: 8,
+                max_delay_ms: 30,
+            },
+        )
+        .unwrap();
+
+        // 2 messages available, then blocks: deadline must flush the partial batch.
+        let started = Instant::now();
+        let batch = consumer.receive_batch(64).await.unwrap();
+        assert_eq!(batch.messages.len(), 2);
+        assert!(started.elapsed() >= Duration::from_millis(30));
+    }
+
+    #[test]
+    fn test_buffer_new_rejects_non_cancel_safe_consumer() {
+        // TrickleConsumer is not on the cancel-safe whitelist, so the checked
+        // `new` must refuse it (the linger could cancel its in-flight read).
+        let result = BufferConsumer::new(
+            Box::new(TrickleConsumer {
+                next_id: Arc::new(StdMutex::new(0)),
+                limit: 1,
+                block_when_empty: false,
+                committed: Arc::new(StdMutex::new(Vec::new())),
+            }),
+            &BufferMiddleware {
+                max_messages: 8,
+                max_delay_ms: 30,
+            },
+        );
+        let err = match result {
+            Ok(_) => panic!("expected cancel-safety rejection"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("cancel-safe"), "unexpected error: {err}");
     }
 }

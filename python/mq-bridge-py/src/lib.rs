@@ -62,6 +62,7 @@ struct NamedPublisher {
 struct RouteRunState {
     running: bool,
     stop_tx: Option<oneshot::Sender<()>>,
+    join_handle: Option<thread::JoinHandle<()>>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -413,13 +414,51 @@ impl Route {
         let name = name.to_string();
         py.detach(move || -> anyhow::Result<Self> {
             let route = load_named_route(Path::new(&path), &name)?;
+            Self::build(route, name)
+        })
+        .map_err(to_py_runtime_error)
+    }
 
-            Ok(Self {
-                runtime: Arc::new(build_runtime()?),
-                route: Arc::new(Mutex::new(route)),
-                name,
-                run_state: Arc::new(Mutex::new(RouteRunState::default())),
-            })
+    /// Build a route from an in-memory YAML string. Accepts the same shapes as
+    /// `from_yaml` (a `routes:` document, a bare route map, or a single route).
+    #[staticmethod]
+    fn from_yaml_str(py: Python<'_>, text: &str, name: &str) -> PyResult<Self> {
+        let text = text.to_string();
+        let name = name.to_string();
+        py.detach(move || -> anyhow::Result<Self> {
+            let value = unwrap_config_root(
+                serde_yaml_ng::from_str(&text).context("failed to parse YAML config")?,
+            );
+            Self::build(named_route_from_value(value, &name)?, name)
+        })
+        .map_err(to_py_runtime_error)
+    }
+
+    /// Build a route from an in-memory mapping (e.g. a Python ``dict``).
+    ///
+    /// The mapping may be a ``{"routes": {...}, "publishers": {...}}`` document,
+    /// a bare ``{name: route}`` map, or a single route body. ``mq_bridge.config``
+    /// exposes ``TypedDict`` types (``ConfigDocument``, ``RouteConfig``,
+    /// ``EndpointConfig``) for editor autocompletion, and ``config_schema()``
+    /// returns the full JSON Schema. Example::
+    ///
+    ///     Route.from_config(
+    ///         {"routes": {"orders": {
+    ///             "input": {"memory": {"topic": "orders.in"}},
+    ///             "output": {"response": {}},
+    ///         }}},
+    ///         "orders",
+    ///     )
+    #[staticmethod]
+    fn from_config(py: Python<'_>, config: &Bound<'_, PyAny>, name: &str) -> PyResult<Self> {
+        let bytes = python_to_json_bytes(config)?;
+        let name = name.to_string();
+        py.detach(move || -> anyhow::Result<Self> {
+            let text = std::str::from_utf8(&bytes).context("config is not valid UTF-8")?;
+            let value = unwrap_config_root(
+                serde_yaml_ng::from_str(text).context("failed to parse config mapping")?,
+            );
+            Self::build(named_route_from_value(value, &name)?, name)
         })
         .map_err(to_py_runtime_error)
     }
@@ -479,26 +518,12 @@ impl Route {
         Ok(slf)
     }
 
+    /// Deploy the route and block the calling thread until `stop()` is called
+    /// (typically from another thread). Use `start()` instead if you want to
+    /// keep running Python code after the route is up.
     fn run(&self, py: Python<'_>) -> PyResult<()> {
         let route = self.lock_route()?.clone();
-        let stop_rx = {
-            let mut state = self.lock_run_state()?;
-            if state.running {
-                return Err(PyRuntimeError::new_err("Route is already running"));
-            }
-            let mut active_route_names = lock_active_route_names()?;
-            if active_route_names.contains(&self.name) || core::Route::get(&self.name).is_some() {
-                return Err(PyRuntimeError::new_err(format!(
-                    "A route named '{}' is already running",
-                    self.name
-                )));
-            }
-            active_route_names.insert(self.name.clone());
-            let (stop_tx, stop_rx) = oneshot::channel();
-            state.running = true;
-            state.stop_tx = Some(stop_tx);
-            stop_rx
-        };
+        let stop_rx = self.begin_run()?;
         let name = self.name.clone();
         let deployed_name = name.clone();
         let runtime = Arc::clone(&self.runtime);
@@ -511,18 +536,62 @@ impl Route {
                 core::Route::stop(&deployed_name).await;
                 Ok::<(), anyhow::Error>(())
             });
-
-            if let Ok(mut state) = run_state.lock() {
-                state.running = false;
-                state.stop_tx = None;
-            }
-            if let Ok(mut active_route_names) = active_route_names().lock() {
-                active_route_names.remove(&name);
-            }
-
+            finish_run(&run_state, &name);
             result
         })
         .map_err(to_py_runtime_error)
+    }
+
+    /// Deploy the route and return immediately, running it on a background
+    /// thread. Configuration and connection errors surface here. Call `stop()`
+    /// (and optionally `join()`) to shut it down. The route is also usable as a
+    /// context manager, which starts on enter and stops on exit.
+    fn start(&self, py: Python<'_>) -> PyResult<()> {
+        let route = self.lock_route()?.clone();
+        let stop_rx = self.begin_run()?;
+        let name = self.name.clone();
+        let runtime = Arc::clone(&self.runtime);
+        let run_state = Arc::clone(&self.run_state);
+
+        // Deploy synchronously so config/connection errors raise from start()
+        // rather than disappearing on the background thread.
+        let deploy_name = name.clone();
+        let deploy_runtime = Arc::clone(&runtime);
+        let deploy_result = py.detach(move || {
+            deploy_runtime.block_on(async move { route.deploy(&deploy_name).await })
+        });
+        if let Err(err) = deploy_result {
+            finish_run(&run_state, &name);
+            return Err(to_py_runtime_error(err));
+        }
+
+        let wait_name = name.clone();
+        let wait_run_state = Arc::clone(&run_state);
+        let handle = thread::Builder::new()
+            .name(format!("mqb-route-{name}"))
+            .spawn(move || {
+                let stop_name = wait_name.clone();
+                runtime.block_on(async move {
+                    let _ = stop_rx.await;
+                    core::Route::stop(&stop_name).await;
+                });
+                finish_run(&wait_run_state, &wait_name);
+            })
+            .map_err(to_py_runtime_error)?;
+
+        self.lock_run_state()?.join_handle = Some(handle);
+        Ok(())
+    }
+
+    /// Block until a route started with `start()` has fully stopped. No-op for
+    /// routes that were never started or that ran via the blocking `run()`.
+    fn join(&self, py: Python<'_>) -> PyResult<()> {
+        let handle = self.lock_run_state()?.join_handle.take();
+        if let Some(handle) = handle {
+            py.detach(|| handle.join())
+                .map_err(|_| PyRuntimeError::new_err("Route background thread panicked"))?;
+        }
+        Ok(())
     }
 
     fn stop(&self) -> PyResult<()> {
@@ -532,9 +601,51 @@ impl Route {
         }
         Ok(())
     }
+
+    fn __enter__<'a>(slf: PyRef<'a, Self>, py: Python<'a>) -> PyResult<PyRef<'a, Self>> {
+        slf.start(py)?;
+        Ok(slf)
+    }
+
+    #[pyo3(signature = (*_args))]
+    fn __exit__(&self, py: Python<'_>, _args: &Bound<'_, PyTuple>) -> PyResult<bool> {
+        self.stop()?;
+        self.join(py)?;
+        Ok(false)
+    }
 }
 
 impl Route {
+    fn build(route: CoreRoute, name: String) -> anyhow::Result<Self> {
+        Ok(Self {
+            runtime: Arc::new(build_runtime()?),
+            route: Arc::new(Mutex::new(route)),
+            name,
+            run_state: Arc::new(Mutex::new(RouteRunState::default())),
+        })
+    }
+
+    /// Mark the route as running, reserve its name, and return the stop
+    /// receiver. Shared prologue for both `run()` and `start()`.
+    fn begin_run(&self) -> PyResult<oneshot::Receiver<()>> {
+        let mut state = self.lock_run_state()?;
+        if state.running {
+            return Err(PyRuntimeError::new_err("Route is already running"));
+        }
+        let mut active_route_names = lock_active_route_names()?;
+        if active_route_names.contains(&self.name) || core::Route::get(&self.name).is_some() {
+            return Err(PyRuntimeError::new_err(format!(
+                "A route named '{}' is already running",
+                self.name
+            )));
+        }
+        active_route_names.insert(self.name.clone());
+        let (stop_tx, stop_rx) = oneshot::channel();
+        state.running = true;
+        state.stop_tx = Some(stop_tx);
+        Ok(stop_rx)
+    }
+
     fn lock_route(&self) -> PyResult<std::sync::MutexGuard<'_, CoreRoute>> {
         self.route
             .lock()
@@ -564,6 +675,14 @@ struct Publisher {
     publisher: CorePublisher,
 }
 
+impl Publisher {
+    fn build(endpoint: Endpoint) -> anyhow::Result<Self> {
+        let runtime = Arc::new(build_runtime()?);
+        let publisher = runtime.block_on(CorePublisher::new(endpoint))?;
+        Ok(Self { runtime, publisher })
+    }
+}
+
 #[pymethods]
 impl Publisher {
     #[staticmethod]
@@ -571,12 +690,34 @@ impl Publisher {
         let path = path.to_string();
         let name = name.to_string();
         py.detach(move || -> anyhow::Result<Self> {
-            let endpoint = load_named_publisher(Path::new(&path), &name)?;
+            Self::build(load_named_publisher(Path::new(&path), &name)?)
+        })
+        .map_err(to_py_runtime_error)
+    }
 
-            let runtime = Arc::new(build_runtime()?);
-            let publisher = runtime.block_on(CorePublisher::new(endpoint))?;
+    #[staticmethod]
+    fn from_yaml_str(py: Python<'_>, text: &str, name: &str) -> PyResult<Self> {
+        let text = text.to_string();
+        let name = name.to_string();
+        py.detach(move || -> anyhow::Result<Self> {
+            let value = unwrap_config_root(
+                serde_yaml_ng::from_str(&text).context("failed to parse YAML config")?,
+            );
+            Self::build(named_publisher_from_value(value, &name)?)
+        })
+        .map_err(to_py_runtime_error)
+    }
 
-            Ok(Self { runtime, publisher })
+    #[staticmethod]
+    fn from_config(py: Python<'_>, config: &Bound<'_, PyAny>, name: &str) -> PyResult<Self> {
+        let bytes = python_to_json_bytes(config)?;
+        let name = name.to_string();
+        py.detach(move || -> anyhow::Result<Self> {
+            let text = std::str::from_utf8(&bytes).context("config is not valid UTF-8")?;
+            let value = unwrap_config_root(
+                serde_yaml_ng::from_str(text).context("failed to parse config mapping")?,
+            );
+            Self::build(named_publisher_from_value(value, &name)?)
         })
         .map_err(to_py_runtime_error)
     }
@@ -755,7 +896,10 @@ fn load_config_value(path: &Path) -> anyhow::Result<serde_yaml_ng::Value> {
 }
 
 fn load_named_route(path: &Path, name: &str) -> anyhow::Result<CoreRoute> {
-    let value = load_config_value(path)?;
+    named_route_from_value(load_config_value(path)?, name)
+}
+
+fn named_route_from_value(value: serde_yaml_ng::Value, name: &str) -> anyhow::Result<CoreRoute> {
     if let Ok(document) = load_document_from_value(value.clone()) {
         if let Some(route) = document.routes.get(name).cloned() {
             return Ok(route);
@@ -763,12 +907,17 @@ fn load_named_route(path: &Path, name: &str) -> anyhow::Result<CoreRoute> {
     }
 
     serde_yaml_ng::from_value(value).with_context(|| {
-        format!("No route named '{name}' found, and the file could not be parsed as a single route")
+        format!(
+            "No route named '{name}' found, and the config could not be parsed as a single route"
+        )
     })
 }
 
 fn load_named_publisher(path: &Path, name: &str) -> anyhow::Result<Endpoint> {
-    let value = load_config_value(path)?;
+    named_publisher_from_value(load_config_value(path)?, name)
+}
+
+fn named_publisher_from_value(value: serde_yaml_ng::Value, name: &str) -> anyhow::Result<Endpoint> {
     if let Ok(document) = load_document_from_value(value.clone()) {
         if let Some(endpoint) = document.publishers.get(name).cloned() {
             return Ok(endpoint);
@@ -777,7 +926,7 @@ fn load_named_publisher(path: &Path, name: &str) -> anyhow::Result<Endpoint> {
 
     serde_yaml_ng::from_value(value).with_context(|| {
         format!(
-            "No publisher named '{name}' found, and the file could not be parsed as a single publisher endpoint"
+            "No publisher named '{name}' found, and the config could not be parsed as a single publisher endpoint"
         )
     })
 }
@@ -1428,6 +1577,29 @@ fn lock_active_route_names() -> PyResult<std::sync::MutexGuard<'static, HashSet<
         .map_err(|_| PyRuntimeError::new_err("Active route name lock poisoned"))
 }
 
+/// Clear a route's running state and release its reserved name once it has
+/// stopped. Called from whichever thread drives the route to completion.
+fn finish_run(run_state: &Arc<Mutex<RouteRunState>>, name: &str) {
+    if let Ok(mut state) = run_state.lock() {
+        state.running = false;
+        state.stop_tx = None;
+    }
+    if let Ok(mut active_route_names) = active_route_names().lock() {
+        active_route_names.remove(name);
+    }
+}
+
+/// Return the JSON Schema for the route/config mapping, generated on demand
+/// from the compiled Rust models (no checked-in copy, so it cannot drift).
+#[cfg(feature = "schema")]
+#[pyfunction]
+fn config_schema(py: Python<'_>) -> PyResult<Py<PyAny>> {
+    let schema = schemars::schema_for!(core::models::Config);
+    let json = serde_json::to_vec(&schema)
+        .map_err(|err| PyRuntimeError::new_err(format!("failed to serialize schema: {err}")))?;
+    json_bytes_to_python(py, &json)
+}
+
 #[pymodule(gil_used = true)]
 #[pyo3(name = "_mq_bridge")]
 fn _mq_bridge(module: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -1435,6 +1607,9 @@ fn _mq_bridge(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<Route>()?;
     module.add_class::<Publisher>()?;
     module.add_class::<MemoryDrainer>()?;
+    module.add("__version__", env!("CARGO_PKG_VERSION"))?;
+    #[cfg(feature = "schema")]
+    module.add_function(wrap_pyfunction!(config_schema, module)?)?;
     module.add("RetryableError", module.py().get_type::<RetryableError>())?;
     module.add(
         "NonRetryableError",

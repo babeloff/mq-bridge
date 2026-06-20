@@ -526,7 +526,6 @@ fn deserialize_middlewares_from_value(value: serde_json::Value) -> anyhow::Resul
 /// this endpoint feeds an HTTP response, those entries become response headers
 /// (e.g. `content-type`), otherwise they are ordinary message metadata.
 #[derive(Debug, Clone, Default)]
-#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct StaticConfig {
     /// The static response body.
     pub body: String,
@@ -534,6 +533,49 @@ pub struct StaticConfig {
     pub raw: bool,
     /// Extra metadata entries attached to the produced message.
     pub metadata: std::collections::HashMap<String, String>,
+}
+
+// Hand-written schema: the `Deserialize` impl below accepts either a bare string
+// or a map where only `body` is required, so the derived all-fields-required
+// object schema would reject valid configs.
+#[cfg(feature = "schema")]
+impl schemars::JsonSchema for StaticConfig {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "StaticConfig".into()
+    }
+
+    fn json_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({
+            "description": "Configuration for the `static` endpoint. Accepts either a bare string (the response body, JSON-encoded for backward compatibility) or a map where only `body` is required and `raw` / `metadata` are optional.",
+            "oneOf": [
+                {
+                    "type": "string",
+                    "description": "The response body, JSON-encoded as a string."
+                },
+                {
+                    "type": "object",
+                    "properties": {
+                        "body": {
+                            "type": "string",
+                            "description": "The static response body."
+                        },
+                        "raw": {
+                            "type": "boolean",
+                            "description": "Send the body verbatim instead of JSON-encoding it as a string.",
+                            "default": false
+                        },
+                        "metadata": {
+                            "type": "object",
+                            "description": "Extra metadata entries attached to the produced message.",
+                            "additionalProperties": { "type": "string" }
+                        }
+                    },
+                    "required": ["body"],
+                    "additionalProperties": false
+                }
+            ]
+        })
+    }
 }
 
 impl Serialize for StaticConfig {
@@ -2023,6 +2065,21 @@ pub enum HttpServerProtocol {
     Http2Only,
 }
 
+/// WebSocket route execution strategy.
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum WebSocketExecutionMode {
+    /// Use direct per-connection handling for simple `websocket -> response` routes and fall back
+    /// to the routed adapter with a warning when route semantics need the normal pipeline.
+    #[default]
+    Auto,
+    /// Require direct per-connection handling. Startup fails if the route cannot run directly.
+    DirectOnly,
+    /// Always use the normal routed consumer/worker/disposition pipeline.
+    Routed,
+}
+
 /// General HTTP connection configuration.
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
@@ -2118,8 +2175,15 @@ pub struct WebSocketConfig {
     pub path: Option<String>,
     /// (Consumer only) Header key to extract the message ID from the WebSocket handshake. Defaults to "message-id".
     pub message_id_header: Option<String>,
-    /// (Consumer only) Internal buffer size for the channel. Defaults to 100.
-    pub internal_buffer_size: Option<usize>,
+    /// (Consumer only) Queue capacity for the routed adapter. Direct response routes do not use this queue. Defaults to 100.
+    pub routed_queue_capacity: Option<usize>,
+    /// (Consumer only) TCP listen backlog (pending-connection queue depth) for the accept socket.
+    /// Raise this if high-concurrency handshake bursts are being dropped/reset before `accept()`
+    /// can keep up. Defaults to 4096, which is higher than the OS/tokio default of 1024.
+    pub backlog: Option<u32>,
+    /// (Consumer only) Selects whether WebSocket routes run directly or through the routed pipeline.
+    #[serde(default)]
+    pub execution_mode: WebSocketExecutionMode,
 }
 
 fn deserialize_basic_auth<'de, D>(deserializer: D) -> Result<Option<(String, String)>, D::Error>
@@ -2220,6 +2284,16 @@ impl WebSocketConfig {
 
     pub fn with_path(mut self, path: impl Into<String>) -> Self {
         self.path = Some(path.into());
+        self
+    }
+
+    pub fn with_backlog(mut self, backlog: u32) -> Self {
+        self.backlog = Some(backlog);
+        self
+    }
+
+    pub fn with_execution_mode(mut self, execution_mode: WebSocketExecutionMode) -> Self {
+        self.execution_mode = execution_mode;
         self
     }
 }

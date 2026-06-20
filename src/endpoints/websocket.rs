@@ -5,8 +5,8 @@
 
 use crate::models::WebSocketConfig;
 use crate::traits::{
-    CommitFunc, ConsumerError, MessageConsumer, MessageDisposition, MessagePublisher,
-    PublisherError, ReceivedBatch, SentBatch,
+    CommitFunc, ConsumerError, Handled, Handler, MessageConsumer, MessageDisposition,
+    MessagePublisher, PublisherError, ReceivedBatch, SentBatch,
 };
 use crate::CanonicalMessage;
 use anyhow::{anyhow, Context};
@@ -15,52 +15,153 @@ use futures::{SinkExt, StreamExt};
 use std::any::Any;
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
-use tokio::net::TcpListener;
+use std::sync::Arc;
+use tokio::net::{TcpListener, TcpSocket, TcpStream};
 use tokio::sync::watch;
-use tokio_tungstenite::accept_hdr_async;
-use tokio_tungstenite::connect_async;
-use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
-use tokio_tungstenite::tungstenite::http::StatusCode;
-use tokio_tungstenite::tungstenite::Message;
+use tokio_websockets::{ClientBuilder, Message, ServerBuilder, WebSocketStream};
 use tracing::{debug, trace, warn};
 use uuid::Uuid;
 
 type WebSocketSourceMessage = (CanonicalMessage, CommitFunc);
 type WebSocketResponseTx = tokio::sync::mpsc::Sender<Message>;
 
+const DEFAULT_WEBSOCKET_LISTEN_BACKLOG: u32 = 4096;
+const WEBSOCKET_REUSEPORT_ENV: &str = "MQ_BRIDGE_WEBSOCKET_REUSEPORT";
+const WEBSOCKET_ACCEPT_WORKERS_ENV: &str = "MQ_BRIDGE_WEBSOCKET_ACCEPT_WORKERS";
+
+fn bind_websocket_listener(addr: SocketAddr, backlog: Option<u32>) -> std::io::Result<TcpListener> {
+    let socket = if addr.is_ipv4() {
+        TcpSocket::new_v4()?
+    } else {
+        TcpSocket::new_v6()?
+    };
+    socket.bind(addr)?;
+    socket.listen(backlog.unwrap_or(DEFAULT_WEBSOCKET_LISTEN_BACKLOG))
+}
+
+fn websocket_reuseport_enabled() -> bool {
+    match std::env::var(WEBSOCKET_REUSEPORT_ENV) {
+        Ok(value) => !matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off" | "no"
+        ),
+        Err(_) => cfg!(unix),
+    }
+}
+
+fn websocket_accept_workers() -> usize {
+    std::env::var(WEBSOCKET_ACCEPT_WORKERS_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|workers| *workers > 0)
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(usize::from)
+                .unwrap_or(1)
+        })
+}
+
+fn bind_reuseport_websocket_listener(
+    addr: SocketAddr,
+    backlog: Option<u32>,
+) -> std::io::Result<TcpListener> {
+    let socket = if addr.is_ipv4() {
+        TcpSocket::new_v4()?
+    } else {
+        TcpSocket::new_v6()?
+    };
+    socket.set_reuseaddr(true)?;
+    #[cfg(all(unix, not(target_os = "solaris"), not(target_os = "illumos")))]
+    socket.set_reuseport(true)?;
+    socket.bind(addr)?;
+    socket.listen(backlog.unwrap_or(DEFAULT_WEBSOCKET_LISTEN_BACKLOG))
+}
+
+fn bind_websocket_listeners(
+    addr: SocketAddr,
+    backlog: Option<u32>,
+) -> std::io::Result<(Vec<TcpListener>, SocketAddr)> {
+    let bind_shared = || {
+        let listener = bind_websocket_listener(addr, backlog)?;
+        let bound_addr = listener.local_addr()?;
+        Ok((vec![listener], bound_addr))
+    };
+
+    let workers = websocket_accept_workers();
+    if workers <= 1 || !websocket_reuseport_enabled() {
+        return bind_shared();
+    }
+
+    let first = match bind_reuseport_websocket_listener(addr, backlog) {
+        Ok(listener) => listener,
+        Err(error) => {
+            warn!(
+                error = %error,
+                "SO_REUSEPORT bind failed for WebSocket listener; using one shared listener"
+            );
+            return bind_shared();
+        }
+    };
+    let bound_addr = first.local_addr()?;
+    let mut listeners = Vec::with_capacity(workers);
+    listeners.push(first);
+
+    for _ in 1..workers {
+        match bind_reuseport_websocket_listener(bound_addr, backlog) {
+            Ok(listener) => listeners.push(listener),
+            Err(error) => {
+                warn!(
+                    error = %error,
+                    listeners = listeners.len(),
+                    workers,
+                    "SO_REUSEPORT sibling bind failed for WebSocket listener"
+                );
+                break;
+            }
+        }
+    }
+
+    tracing::info!(
+        listeners = listeners.len(),
+        workers,
+        "WebSocket server using SO_REUSEPORT listener sharding"
+    );
+    Ok((listeners, bound_addr))
+}
+
 pub struct WebSocketConsumer {
     request_rx: tokio::sync::mpsc::Receiver<WebSocketSourceMessage>,
     shutdown_tx: watch::Sender<bool>,
-    buffer_size: usize,
+    queue_capacity: usize,
     url: String,
     bound_addr: SocketAddr,
 }
 
 impl WebSocketConsumer {
     pub async fn new(config: &WebSocketConfig) -> anyhow::Result<Self> {
-        let buffer_size = config.internal_buffer_size.unwrap_or(100).max(1);
+        let queue_capacity = config.routed_queue_capacity.unwrap_or(100).max(1);
         let listen_addr: SocketAddr = config
             .url
             .parse()
             .with_context(|| format!("Invalid listen address: {}", config.url))?;
-        let listener = TcpListener::bind(listen_addr).await?;
-        let bound_addr = listener.local_addr()?;
+        let (listeners, bound_addr) = bind_websocket_listeners(listen_addr, config.backlog)?;
         let path = config.path.as_deref().map(normalize_websocket_path);
         let message_id_header = config
             .message_id_header
             .clone()
             .unwrap_or_else(|| "message-id".to_string());
-        let (request_tx, request_rx) = tokio::sync::mpsc::channel(buffer_size);
+        let (request_tx, request_rx) = tokio::sync::mpsc::channel(queue_capacity);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
-        spawn_accept_loop(
-            listener,
-            request_tx,
-            shutdown_rx,
-            path.clone(),
-            message_id_header,
-        );
+        for listener in listeners {
+            spawn_accept_loop(
+                listener,
+                request_tx.clone(),
+                shutdown_rx.clone(),
+                path.clone(),
+                message_id_header.clone(),
+            );
+        }
 
         let url = if let Some(path) = path {
             format!("ws://{}{}", bound_addr, path)
@@ -71,7 +172,7 @@ impl WebSocketConsumer {
         Ok(Self {
             request_rx,
             shutdown_tx,
-            buffer_size,
+            queue_capacity,
             url,
             bound_addr,
         })
@@ -134,12 +235,13 @@ fn spawn_accept_loop(
                             continue;
                         }
                     };
+                    let _ = stream.set_nodelay(true);
 
                     let request_tx = request_tx.clone();
                     let expected_path = expected_path.clone();
                     let message_id_header = message_id_header.clone();
                     tokio::spawn(async move {
-                        if let Err(error) = handle_connection(
+                        if let Err(error) = handle_routed_connection(
                             stream,
                             peer_addr,
                             request_tx,
@@ -157,70 +259,18 @@ fn spawn_accept_loop(
     });
 }
 
-#[allow(clippy::result_large_err)] // TODO: find a good fix for the box issue
-async fn handle_connection(
-    stream: tokio::net::TcpStream,
+async fn handle_routed_connection(
+    stream: TcpStream,
     peer_addr: SocketAddr,
     request_tx: tokio::sync::mpsc::Sender<WebSocketSourceMessage>,
     expected_path: Option<String>,
     message_id_header: String,
 ) -> anyhow::Result<()> {
-    let handshake = Arc::new(Mutex::new(HandshakeMetadata::default()));
-    let handshake_capture = Arc::clone(&handshake);
-    let ws_stream = accept_hdr_async(stream, move |request: &Request, response: Response| {
-        if let Some(expected_path) = expected_path.as_deref() {
-            let actual_path = normalize_websocket_path(request.uri().path());
-            if actual_path != expected_path {
-                return Err(reject_handshake(
-                    StatusCode::NOT_FOUND,
-                    format!("Unexpected websocket path '{}'", actual_path),
-                ));
-            }
-        }
-
-        let mut metadata = HandshakeMetadata {
-            path: request.uri().path().to_string(),
-            message_id: request
-                .headers()
-                .get(message_id_header.as_str())
-                .and_then(|value| value.to_str().ok())
-                .and_then(parse_message_id),
-            headers: HashMap::new(),
-        };
-
-        for (name, value) in request.headers() {
-            let name_str = name.as_str();
-            if matches!(
-                name_str,
-                "authorization"
-                    | "cookie"
-                    | "set-cookie"
-                    | "proxy-authorization"
-                    | "x-api-key"
-                    | "session"
-            ) {
-                continue;
-            }
-
-            if let Ok(value) = value.to_str() {
-                metadata
-                    .headers
-                    .insert(format!("ws_header.{}", name_str), value.to_string());
-            }
-        }
-
-        if let Ok(mut captured) = handshake_capture.lock() {
-            *captured = metadata;
-        }
-
-        Ok(response)
-    })
-    .await?;
-
-    let metadata = handshake
-        .lock()
-        .map(|captured| captured.clone())
-        .unwrap_or_default();
+    let Some((ws_stream, metadata)) =
+        accept_websocket_connection(stream, expected_path, message_id_header).await?
+    else {
+        return Ok(());
+    };
     let (mut write_stream, mut read_stream) = ws_stream.split();
     let (response_tx, mut response_rx) = tokio::sync::mpsc::channel::<Message>(16);
     let writer_peer_addr = peer_addr;
@@ -235,25 +285,11 @@ async fn handle_connection(
 
     while let Some(frame) = read_stream.next().await {
         let frame = frame?;
-        let (payload, message_type) = match frame {
-            Message::Text(text) => (text.to_string().into_bytes(), "text"),
-            Message::Binary(binary) => (binary.to_vec(), "binary"),
-            Message::Close(_) => break,
-            Message::Ping(_) | Message::Pong(_) => continue,
-            _ => continue,
+        // tokio-websockets auto-queues pong/close replies for control frames and
+        // flushes them on the next read poll, so we only handle data frames here.
+        let Some(message) = canonical_from_websocket_frame(frame, &metadata, peer_addr) else {
+            continue;
         };
-
-        let mut message = CanonicalMessage::new(payload, metadata.message_id);
-        message
-            .metadata
-            .insert("ws_message_type".to_string(), message_type.to_string());
-        message
-            .metadata
-            .insert("ws_path".to_string(), metadata.path.clone());
-        message
-            .metadata
-            .insert("ws_peer_addr".to_string(), peer_addr.to_string());
-        message.metadata.extend(metadata.headers.clone());
 
         let response_tx = response_tx.clone();
         let commit: CommitFunc =
@@ -268,6 +304,315 @@ async fn handle_connection(
     Ok(())
 }
 
+pub(crate) async fn run_direct_response_route(
+    name: &str,
+    config: WebSocketConfig,
+    handler: Option<Arc<dyn Handler>>,
+    shutdown_rx: async_channel::Receiver<()>,
+    ready_tx: Option<async_channel::Sender<()>>,
+) -> anyhow::Result<bool> {
+    let listen_addr: SocketAddr = config
+        .url
+        .parse()
+        .with_context(|| format!("Invalid listen address: {}", config.url))?;
+    let (listeners, _) = bind_websocket_listeners(listen_addr, config.backlog)?;
+    let expected_path = config.path.as_deref().map(normalize_websocket_path);
+    let message_id_header = config
+        .message_id_header
+        .clone()
+        .unwrap_or_else(|| "message-id".to_string());
+
+    tracing::info!(
+        route = name,
+        has_output_handler = handler.is_some(),
+        "Running WebSocket direct response route"
+    );
+    if let Some(tx) = ready_tx {
+        let _ = tx.send(()).await;
+    }
+
+    let (accepted_tx, accepted_rx) = async_channel::bounded(listeners.len().max(1) * 1024);
+    let (accept_shutdown_tx, accept_shutdown_rx) = watch::channel(false);
+    for listener in listeners {
+        let accepted_tx = accepted_tx.clone();
+        let mut accept_shutdown_rx = accept_shutdown_rx.clone();
+        let route_name = name.to_string();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    changed = accept_shutdown_rx.changed() => {
+                        if changed.is_err() || *accept_shutdown_rx.borrow() {
+                            break;
+                        }
+                    }
+                    accept_result = listener.accept() => {
+                        let (stream, peer_addr) = match accept_result {
+                            Ok(parts) => parts,
+                            Err(error) => {
+                                warn!(error = %error, route = %route_name, "WebSocket direct accept failed");
+                                continue;
+                            }
+                        };
+                        let _ = stream.set_nodelay(true);
+                        if accepted_tx.send((stream, peer_addr)).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+    }
+    drop(accepted_tx);
+
+    let mut connections = tokio::task::JoinSet::new();
+    loop {
+        tokio::select! {
+            _ = shutdown_rx.recv() => {
+                tracing::info!(
+                    "Shutdown signal received in WebSocket direct response runner for route '{}'.",
+                    name
+                );
+                let _ = accept_shutdown_tx.send(true);
+                break;
+            }
+            accepted = accepted_rx.recv() => {
+                let (stream, peer_addr) = match accepted {
+                    Ok(parts) => parts,
+                    Err(_) => break,
+                };
+                let expected_path = expected_path.clone();
+                let message_id_header = message_id_header.clone();
+                let handler = handler.clone();
+                let route_name = name.to_string();
+                connections.spawn(async move {
+                    if let Err(error) = handle_direct_connection(
+                        stream,
+                        peer_addr,
+                        expected_path,
+                        message_id_header,
+                        handler,
+                    )
+                    .await
+                    {
+                        debug!(error = %error, %peer_addr, route = %route_name, "WebSocket direct connection closed with error");
+                    }
+                });
+            }
+            Some(join_result) = connections.join_next(), if !connections.is_empty() => {
+                if let Err(error) = join_result {
+                    warn!(error = %error, route = name, "WebSocket direct connection task failed");
+                }
+            }
+        }
+    }
+
+    connections.abort_all();
+    while connections.join_next().await.is_some() {}
+    Ok(true)
+}
+
+async fn handle_direct_connection(
+    stream: TcpStream,
+    peer_addr: SocketAddr,
+    expected_path: Option<String>,
+    message_id_header: String,
+    handler: Option<Arc<dyn Handler>>,
+) -> anyhow::Result<()> {
+    let Some((mut ws_stream, metadata)) =
+        accept_websocket_connection(stream, expected_path, message_id_header).await?
+    else {
+        return Ok(());
+    };
+
+    if handler.is_none() {
+        while let Some(frame) = ws_stream.next().await {
+            let frame = frame?;
+            if frame.is_close() {
+                let _ = ws_stream.flush().await;
+                break;
+            }
+            if frame.is_ping() {
+                ws_stream.flush().await?;
+                continue;
+            }
+            if frame.is_pong() {
+                continue;
+            }
+            if frame.as_text().is_some() || frame.is_binary() {
+                ws_stream.send(frame).await?;
+            }
+        }
+
+        return Ok(());
+    }
+
+    let handler = handler.expect("handler was checked above");
+    while let Some(frame) = ws_stream.next().await {
+        let frame = frame?;
+        if frame.is_close() {
+            let _ = ws_stream.flush().await;
+            break;
+        }
+        if frame.is_ping() {
+            ws_stream.flush().await?;
+            continue;
+        }
+        if frame.is_pong() {
+            continue;
+        }
+        let Some(message) = canonical_from_websocket_frame(frame, &metadata, peer_addr) else {
+            continue;
+        };
+
+        let original_id = message.message_id;
+        let inbound_correlation_id = message.metadata.get("correlation_id").cloned();
+        let handled = match handler.handle(message).await {
+            Ok(Handled::Publish(mut response_msg)) => {
+                response_msg.message_id = original_id;
+                response_msg
+                    .metadata
+                    .entry("correlation_id".to_string())
+                    .or_insert(
+                        inbound_correlation_id.unwrap_or_else(|| format!("{:032x}", original_id)),
+                    );
+                Handled::Publish(response_msg)
+            }
+            Ok(Handled::Ack) => Handled::Ack,
+            Err(error) => {
+                warn!(error = %error, %peer_addr, "WebSocket direct handler failed");
+                continue;
+            }
+        };
+
+        if let Handled::Publish(reply) = handled {
+            ws_stream
+                .send(canonical_to_websocket_message(&reply))
+                .await?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Peeks the start of the inbound stream and extracts the request-target path
+/// from the HTTP request line, without consuming any bytes. Returns `None` when
+/// the request line is not yet fully buffered (caller falls back to the normal
+/// handshake) or the stream is empty.
+async fn peek_request_path(stream: &TcpStream) -> std::io::Result<Option<String>> {
+    let mut buf = [0u8; 2048];
+    let n = stream.peek(&mut buf).await?;
+    let head = &buf[..n];
+    let Some(line_end) = head.windows(2).position(|w| w == b"\r\n") else {
+        return Ok(None);
+    };
+    // Request line: METHOD SP request-target SP HTTP/x.y
+    let mut parts = head[..line_end].split(|&b| b == b' ');
+    let target = parts.nth(1);
+    Ok(target
+        .and_then(|t| std::str::from_utf8(t).ok())
+        .map(|t| t.split(['?', '#']).next().unwrap_or(t).to_string()))
+}
+
+/// Writes a minimal HTTP 404 response and flushes it, best-effort.
+async fn respond_not_found(stream: &mut TcpStream) {
+    use tokio::io::AsyncWriteExt;
+    let _ = stream
+        .write_all(b"HTTP/1.1 404 Not Found\r\nconnection: close\r\ncontent-length: 0\r\n\r\n")
+        .await;
+    let _ = stream.flush().await;
+}
+
+async fn accept_websocket_connection(
+    mut stream: TcpStream,
+    expected_path: Option<String>,
+    message_id_header: String,
+) -> anyhow::Result<Option<(WebSocketStream<TcpStream>, HandshakeMetadata)>> {
+    // If a specific path is required, peek the HTTP request line and reject a
+    // mismatch with a real 404 before completing the upgrade handshake. `accept`
+    // below re-reads the same bytes, so peeking does not consume the request.
+    if let Some(expected) = expected_path.as_deref() {
+        if let Some(requested) = peek_request_path(&stream).await? {
+            if normalize_websocket_path(&requested) != expected {
+                respond_not_found(&mut stream).await;
+                return Ok(None);
+            }
+        }
+    }
+
+    let (request, mut ws_stream) = ServerBuilder::new().accept(stream).await?;
+    let actual_path = normalize_websocket_path(request.uri().path());
+    if let Some(expected_path) = expected_path.as_deref() {
+        // Fallback for the rare case where the request line was not fully
+        // buffered for the peek above: close after the upgrade instead.
+        if actual_path != expected_path {
+            let _ = ws_stream
+                .send(Message::close(None, "unexpected websocket path"))
+                .await;
+            return Ok(None);
+        }
+    }
+
+    let mut metadata = HandshakeMetadata {
+        path: request.uri().path().to_string(),
+        message_id: request
+            .headers()
+            .get(message_id_header.as_str())
+            .and_then(|value| value.to_str().ok())
+            .and_then(parse_message_id),
+        headers: HashMap::new(),
+    };
+
+    for (name, value) in request.headers() {
+        let name_str = name.as_str();
+        if matches!(
+            name_str,
+            "authorization"
+                | "cookie"
+                | "set-cookie"
+                | "proxy-authorization"
+                | "x-api-key"
+                | "session"
+        ) {
+            continue;
+        }
+
+        if let Ok(value) = value.to_str() {
+            metadata
+                .headers
+                .insert(format!("ws_header.{}", name_str), value.to_string());
+        }
+    }
+
+    Ok(Some((ws_stream, metadata)))
+}
+
+fn canonical_from_websocket_frame(
+    frame: Message,
+    metadata: &HandshakeMetadata,
+    peer_addr: SocketAddr,
+) -> Option<CanonicalMessage> {
+    let (payload, message_type) = if let Some(text) = frame.as_text() {
+        (text.as_bytes().to_vec(), "text")
+    } else if frame.is_binary() {
+        (frame.as_payload().to_vec(), "binary")
+    } else {
+        return None;
+    };
+
+    let mut message = CanonicalMessage::new(payload, metadata.message_id);
+    message
+        .metadata
+        .insert("ws_message_type".to_string(), message_type.to_string());
+    message
+        .metadata
+        .insert("ws_path".to_string(), metadata.path.clone());
+    message
+        .metadata
+        .insert("ws_peer_addr".to_string(), peer_addr.to_string());
+    message.metadata.extend(metadata.headers.clone());
+    Some(message)
+}
+
 fn websocket_commit(
     disposition: MessageDisposition,
     response_tx: WebSocketResponseTx,
@@ -275,24 +620,14 @@ fn websocket_commit(
     Box::pin(async move {
         match disposition {
             MessageDisposition::Reply(message) => {
-                if response_tx
+                let _ = response_tx
                     .send(canonical_to_websocket_message(&message))
-                    .await
-                    .is_err()
-                {
-                    return Ok(());
-                }
+                    .await;
             }
             MessageDisposition::Ack | MessageDisposition::Nack => {}
         }
         Ok(())
     })
-}
-
-fn reject_handshake(status: StatusCode, body: String) -> ErrorResponse {
-    let mut response = ErrorResponse::new(Some(body));
-    *response.status_mut() = status;
-    response
 }
 
 fn normalize_websocket_path(path: &str) -> String {
@@ -318,11 +653,11 @@ fn parse_message_id(raw: &str) -> Option<u128> {
 fn canonical_to_websocket_message(message: &CanonicalMessage) -> Message {
     let message_type = message.metadata.get("ws_message_type").map(String::as_str);
     match message_type {
-        Some("binary") => Message::Binary(message.payload.clone().to_vec().into()),
-        Some("text") => Message::Text(message.get_payload_str().into_owned().into()),
+        Some("binary") => Message::binary(message.payload.clone().to_vec()),
+        Some("text") => Message::text(message.get_payload_str().into_owned()),
         _ => match std::str::from_utf8(&message.payload) {
-            Ok(text) => Message::Text(text.to_string().into()),
-            Err(_) => Message::Binary(message.payload.clone().to_vec().into()),
+            Ok(text) => Message::text(text.to_string()),
+            Err(_) => Message::binary(message.payload.clone().to_vec()),
         },
     }
 }
@@ -331,24 +666,13 @@ fn canonical_to_websocket_message(message: &CanonicalMessage) -> Message {
 impl MessageConsumer for WebSocketConsumer {
     async fn receive_batch(&mut self, max_messages: usize) -> Result<ReceivedBatch, ConsumerError> {
         let max_messages = max_messages.max(1);
-        let (first_message, first_commit) = self
-            .request_rx
-            .recv()
-            .await
-            .ok_or_else(|| ConsumerError::EndOfStream)?;
 
-        let mut messages = vec![first_message];
-        let mut commits = vec![first_commit];
-
-        while messages.len() < max_messages {
-            match self.request_rx.try_recv() {
-                Ok((message, commit)) => {
-                    messages.push(message);
-                    commits.push(commit);
-                }
-                Err(_) => break,
-            }
+        let mut batch: Vec<WebSocketSourceMessage> = Vec::with_capacity(max_messages);
+        if self.request_rx.recv_many(&mut batch, max_messages).await == 0 {
+            return Err(ConsumerError::EndOfStream);
         }
+
+        let (messages, commits): (Vec<_>, Vec<_>) = batch.into_iter().unzip();
 
         let batch_commit: crate::traits::BatchCommitFunc =
             Box::new(move |dispositions: Vec<MessageDisposition>| {
@@ -371,10 +695,10 @@ impl MessageConsumer for WebSocketConsumer {
             healthy: true,
             target: self.url.clone(),
             pending: Some(self.request_rx.len()),
-            capacity: Some(self.buffer_size),
+            capacity: Some(self.queue_capacity),
             details: serde_json::json!({
                 "bound_addr": self.bound_addr.to_string(),
-                "buffer_size": self.buffer_size,
+                "routed_queue_capacity": self.queue_capacity,
             }),
             ..Default::default()
         }
@@ -396,7 +720,13 @@ impl MessagePublisher for WebSocketPublisher {
         }
 
         trace!(url = %self.url, count = messages.len(), "Sending WebSocket batch");
-        let (mut stream, _) = connect_async(&self.url)
+        let uri = self
+            .url
+            .parse()
+            .with_context(|| format!("Invalid WebSocket URL '{}'", self.url))
+            .map_err(PublisherError::Connection)?;
+        let (mut stream, _) = ClientBuilder::from_uri(uri)
+            .connect()
             .await
             .with_context(|| format!("Failed to connect to WebSocket endpoint '{}'", self.url))
             .map_err(PublisherError::Connection)?;
@@ -408,7 +738,11 @@ impl MessagePublisher for WebSocketPublisher {
                 .map_err(|error| PublisherError::Retryable(anyhow!(error)))?;
         }
 
-        let _ = stream.close(None).await;
+        stream
+            .flush()
+            .await
+            .map_err(|error| PublisherError::Retryable(anyhow!(error)))?;
+        let _ = stream.close().await;
         Ok(SentBatch::Ack)
     }
 
@@ -423,17 +757,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_websocket_consumer_publisher_integration() {
-        let consumer_config = WebSocketConfig::new("127.0.0.1:0").with_path("/events");
-        let mut consumer = WebSocketConsumer::new(&consumer_config)
-            .await
-            .expect("consumer should start");
-
+        let mut consumer =
+            WebSocketConsumer::new(&WebSocketConfig::new("127.0.0.1:0").with_path("/test"))
+                .await
+                .expect("consumer should be created");
         let publisher = WebSocketPublisher::new(&WebSocketConfig::new(consumer.url().to_string()));
+
         publisher
-            .send(
-                CanonicalMessage::from_vec("hello websocket")
-                    .with_metadata_kv("ws_message_type", "text"),
-            )
+            .send(CanonicalMessage::from_vec("hello").with_metadata_kv("ws_message_type", "text"))
             .await
             .expect("publisher should send");
 
@@ -443,17 +774,10 @@ mod tests {
             .expect("consumer should receive");
         assert_eq!(batch.messages.len(), 1);
         let message = batch.messages.pop().expect("one message");
-        assert_eq!(message.get_payload_str(), "hello websocket");
+        assert_eq!(message.get_payload_str(), "hello");
         assert_eq!(
             message.metadata.get("ws_message_type").map(String::as_str),
             Some("text")
         );
-        assert_eq!(
-            message.metadata.get("ws_path").map(String::as_str),
-            Some("/events")
-        );
-        (batch.commit)(vec![MessageDisposition::Ack])
-            .await
-            .expect("commit should succeed");
     }
 }

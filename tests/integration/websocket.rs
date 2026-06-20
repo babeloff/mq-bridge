@@ -23,7 +23,7 @@ routes:
       websocket:
         url: "127.0.0.1:{port}"
         path: "/events"
-        internal_buffer_size: {buffer_size}
+        routed_queue_capacity: {buffer_size}
     output:
       memory: { topic: "test-out-websocket", capacity: {out_capacity} }
 "#;

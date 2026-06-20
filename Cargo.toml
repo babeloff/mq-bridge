@@ -16,7 +16,7 @@ members = ["python/mq-bridge-py"]
 resolver = "2"
 
 [workspace.package]
-version = "0.2.19"
+version = "0.2.20"
 
 [workspace.dependencies]
 anyhow = "1.0"
@@ -46,6 +46,7 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "ti
 # Note on MSRV for optional features:
 # The base crate keeps MSRV 1.75 with default = [].
 # - "amqp" (lapin 4.10) requires Rust 1.88+; "http" (hyper-rustls 0.27) requires Rust 1.85+.
+# - "websocket" (tokio-websockets 0.13) requires Rust 1.89+.
 # - "aws" (aws-sdk-*) may require a newer stable toolchain than the base MSRV.
 # Use `rustup override set stable` or a `rust-toolchain.toml` file when enabling these features.
 async-trait.workspace = true
@@ -118,7 +119,7 @@ http-body = { version = "1.0", optional = true }
 h2 = { version = "0.4", optional = true }
 flate2 = { version = "1.0", optional = true }
 base64 = { version = "0.22", optional = true }
-tokio-tungstenite = { version = "0.29", optional = true }
+tokio-websockets = { version = "0.13", optional = true, default-features = false, features = ["client", "server", "sha1_smol", "fastrand"] }
 
 # AWS
 aws-config = { version = "1.8", optional = true, default-features = false, features = ["behavior-version-latest", "rt-tokio", "rustls"] }
@@ -180,7 +181,7 @@ nats = ["async-nats", "rustls", "rustls-pemfile"]
 mongodb = ["dep:mongodb"]
 mqtt = ["rumqttc", "rustls", "tokio-rustls", "rustls-pemfile", "url"]
 http = ["dep:arc-swap", "hyper", "hyper-util", "hyper-rustls", "http-body-util", "dep:http-body", "rustls", "tokio-rustls", "rustls-pemfile", "webpki-roots", "h2", "dep:flate2", "dep:base64"]
-websocket = ["dep:tokio-tungstenite"]
+websocket = ["dep:tokio-websockets"]
 aws = ["aws-config", "aws-sdk-sqs", "aws-sdk-sns", "dep:base64"]
 ibm-mq = ["mqi"]
 zeromq = ["dep:zeromq"]

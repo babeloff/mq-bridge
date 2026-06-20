@@ -17,7 +17,6 @@ def handle_raw(message):
 route = Route.from_yaml(str(CONFIG_PATH), "orders_route").with_handler(handle_raw)
 publisher = Publisher.from_yaml(str(CONFIG_PATH), "orders_publisher")
 
-
 def drive() -> None:
     time.sleep(0.2)
     publisher.send(b'{"hello":"world"}', {"kind": "raw.demo"})

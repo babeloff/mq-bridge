@@ -648,7 +648,7 @@ pub mod websocket_helper {
         let websocket_config = WebSocketConfig {
             url: "127.0.0.1:0".to_string(),
             path: Some("/bench".to_string()),
-            internal_buffer_size: Some(super::PERF_TEST_MESSAGE_COUNT * 2),
+            routed_queue_capacity: Some(super::PERF_TEST_MESSAGE_COUNT * 2),
             ..Default::default()
         };
 

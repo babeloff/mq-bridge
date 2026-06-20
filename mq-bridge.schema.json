@@ -362,7 +362,7 @@
           "type": "object",
           "properties": {
             "static": {
-              "type": "string"
+              "$ref": "#/$defs/StaticConfig"
             }
           },
           "required": [
@@ -972,6 +972,11 @@
           "format": "uint64",
           "minimum": 0
         },
+        "server_protocol": {
+          "description": "(Consumer only) Restrict which HTTP protocol versions a server listener accepts.\nDefaults to `auto` (HTTP/1.1 + HTTP/2). On cleartext listeners, `http2_only`\nmeans HTTP/2 prior-knowledge (h2c) only.",
+          "$ref": "#/$defs/HttpServerProtocol",
+          "default": "auto"
+        },
         "stream_response_to": {
           "description": "(Publisher only) Optional endpoint that receives streamed HTTP response items as correlated messages.\n\nUse a `stream_buffer` endpoint here when callers need to read streamed\nresponse items later through a normal mq-bridge consumer. Each streamed\nitem is published with `correlation_id`, `http_stream_id`,\n`http_stream_index`, `http_stream_format`, and `http_stream_end`\nmetadata. If the request message has no `correlation_id`, the HTTP\npublisher uses `format!(\"{:032x}\", request.message_id)` so callers can\nderive the consumer correlation id before calling `send`.",
           "anyOf": [
@@ -1021,6 +1026,26 @@
       "additionalProperties": false,
       "required": [
         "url"
+      ]
+    },
+    "HttpServerProtocol": {
+      "description": "Supported inbound HTTP protocols for server listeners.",
+      "oneOf": [
+        {
+          "description": "Accept both HTTP/1.1 and HTTP/2, matching the current default behavior.",
+          "type": "string",
+          "const": "auto"
+        },
+        {
+          "description": "Accept only HTTP/1.x connections.",
+          "type": "string",
+          "const": "http1_only"
+        },
+        {
+          "description": "Accept only HTTP/2 connections.",
+          "type": "string",
+          "const": "http2_only"
+        }
       ]
     },
     "IbmMqConfig": {
@@ -1280,11 +1305,13 @@
         },
         "topic": {
           "description": "The topic name or transport URL. Can be:\n- Simple name: \"my-topic\" (defaults to memory://my-topic)\n- Memory URL: \"memory://my-topic\"\n- IPC URL: \"ipc://my-queue\" or \"ipc:///path/to/socket\"\n- Unix socket: \"unix:///path/to/socket\" (Unix only)\n- Named pipe: \"pipe://my-pipe\" (Windows only)\n\nEither `topic` or `url` can be specified (they are serde aliases).",
-          "type": "string"
+          "type": "string",
+          "minLength": 1
         },
         "url": {
           "description": "Alias for `topic`. Use either `topic` or `url`.",
-          "type": "string"
+          "type": "string",
+          "minLength": 1
         }
       },
       "additionalProperties": false,
@@ -1614,7 +1641,7 @@
           ]
         },
         "delayed_ack": {
-          "description": "(Consumer only) If true, messages are acknowledged immediately upon receipt (auto-ack).\nIf false (default), messages are acknowledged after processing (manual-ack).\nNote: This setting does not currently enable synchronous publishing (waiting for PubAck) for the MQTT publisher.",
+          "description": "(Consumer only) If true, messages are acknowledged immediately upon receipt (auto-ack).\nIf false (default), messages are acknowledged after processing (manual-ack).\nNote: For QoS 1/2 the publisher always waits for end-to-end broker\nconfirmation (PUBACK/PUBCOMP) before reporting success, independent of\nthis setting; QoS 0 remains fire-and-forget.",
           "type": "boolean",
           "default": false
         },
@@ -2157,6 +2184,40 @@
         "table"
       ]
     },
+    "StaticConfig": {
+      "description": "Configuration for the `static` endpoint. Accepts either a bare string (the response body, JSON-encoded for backward compatibility) or a map where only `body` is required and `raw` / `metadata` are optional.",
+      "oneOf": [
+        {
+          "description": "The response body, JSON-encoded as a string.",
+          "type": "string"
+        },
+        {
+          "type": "object",
+          "properties": {
+            "body": {
+              "description": "The static response body.",
+              "type": "string"
+            },
+            "metadata": {
+              "description": "Extra metadata entries attached to the produced message.",
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
+            },
+            "raw": {
+              "description": "Send the body verbatim instead of JSON-encoding it as a string.",
+              "type": "boolean",
+              "default": false
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "body"
+          ]
+        }
+      ]
+    },
     "StreamBufferConfig": {
       "description": "Configuration for the correlated in-process stream response buffer.",
       "type": "object",
@@ -2297,14 +2358,19 @@
       "description": "WebSocket connection configuration.",
       "type": "object",
       "properties": {
-        "internal_buffer_size": {
-          "description": "(Consumer only) Internal buffer size for the channel. Defaults to 100.",
+        "backlog": {
+          "description": "(Consumer only) TCP listen backlog (pending-connection queue depth) for the accept socket.\nRaise this if high-concurrency handshake bursts are being dropped/reset before `accept()`\ncan keep up. Defaults to 4096, which is higher than the OS/tokio default of 1024.",
           "type": [
             "integer",
             "null"
           ],
-          "format": "uint",
+          "format": "uint32",
           "minimum": 0
+        },
+        "execution_mode": {
+          "description": "(Consumer only) Selects whether WebSocket routes run directly or through the routed pipeline.",
+          "$ref": "#/$defs/WebSocketExecutionMode",
+          "default": "auto"
         },
         "message_id_header": {
           "description": "(Consumer only) Header key to extract the message ID from the WebSocket handshake. Defaults to \"message-id\".",
@@ -2320,6 +2386,15 @@
             "null"
           ]
         },
+        "routed_queue_capacity": {
+          "description": "(Consumer only) Queue capacity for the routed adapter. Direct response routes do not use this queue. Defaults to 100.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0
+        },
         "url": {
           "description": "For consumers, the listen address (e.g. \"0.0.0.0:9000\"). For publishers, the target URL.",
           "type": "string",
@@ -2329,6 +2404,26 @@
       "additionalProperties": false,
       "required": [
         "url"
+      ]
+    },
+    "WebSocketExecutionMode": {
+      "description": "WebSocket route execution strategy.",
+      "oneOf": [
+        {
+          "description": "Use direct per-connection handling for simple `websocket -> response` routes and fall back\nto the routed adapter with a warning when route semantics need the normal pipeline.",
+          "type": "string",
+          "const": "auto"
+        },
+        {
+          "description": "Require direct per-connection handling. Startup fails if the route cannot run directly.",
+          "type": "string",
+          "const": "direct_only"
+        },
+        {
+          "description": "Always use the normal routed consumer/worker/disposition pipeline.",
+          "type": "string",
+          "const": "routed"
+        }
       ]
     },
     "ZeroMqConfig": {

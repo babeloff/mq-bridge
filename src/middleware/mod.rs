@@ -22,7 +22,7 @@ mod random_panic;
 mod retry;
 mod weak_join;
 
-use buffer::BufferPublisher;
+use buffer::{BufferConsumer, BufferPublisher};
 use cookie_jar::{CookieJarConsumer, CookieJarPublisher};
 #[cfg(feature = "dedup")]
 use deduplication::DeduplicationConsumer;
@@ -66,10 +66,7 @@ pub async fn apply_middlewares_to_consumer(
             Middleware::RandomPanic(cfg) => Box::new(RandomPanicConsumer::new(consumer, cfg)),
             Middleware::WeakJoin(cfg) => Box::new(WeakJoinConsumer::new(consumer, cfg)),
             Middleware::Limiter(cfg) => Box::new(LimiterConsumer::new(consumer, cfg)?),
-            Middleware::Buffer(_) => {
-                tracing::warn!("Buffer middleware is ignored on consumers (input endpoints). It is currently publisher-only.");
-                consumer
-            }
+            Middleware::Buffer(cfg) => Box::new(BufferConsumer::new(consumer, cfg)?),
             Middleware::CookieJar(cfg) => Box::new(CookieJarConsumer::new(consumer, cfg)),
             Middleware::Custom { name, config } => {
                 let factory = get_middleware_factory(name).ok_or_else(|| {

@@ -15,14 +15,95 @@ Memory and file endpoints are always present in both packages. Use `mq-bridge-py
 
 The public API stays close to mq-bridge itself:
 
-- `Route.from_yaml(path, name)` loads one named route
+- `Route.from_yaml(path, name)` loads one named route from a YAML file
+- `Route.from_yaml_str(text, name)` / `Route.from_config(mapping, name)` build a route from an in-memory YAML string or a Python `dict`, no file required
 - `Route.with_handler(...)` attaches a raw `Message` handler, with lazy `json()`/`text()` readers and `with_json()`/`with_payload()` response helpers
 - `Route.add_handler(kind, ...)` uses mq-bridge's `kind` dispatch and delivers decoded JSON
 - `RetryableError` and `NonRetryableError` let Python handlers signal retry intent
-- `Publisher.from_yaml(path, name)` loads one named publisher
+- `Publisher.from_yaml(path, name)` (plus `from_yaml_str` / `from_config`) loads one named publisher
 - `Publisher.send_json(...)` and `Publisher.request_json(...)` serialize Python JSON values in Rust
 
 The Python surface is synchronous and blocking. Tokio, broker I/O, routing, and batching all stay in Rust.
+
+## Config types and schema
+
+`mq-bridge-app` can create and test route and endpoint JSON/YAML through its UI.
+It does not replace your Python code or handlers, but it is useful when you want
+a known-good connection and route shape before pasting the configuration into
+Python. Load the generated config with `Route.from_config`, `Route.from_yaml`,
+`Publisher.from_config`, or `Publisher.from_yaml`.
+
+For the `from_config` / `from_yaml_str` mappings, `mq_bridge.config` ships
+`TypedDict` definitions so editors autocomplete the config keys (`input`,
+`output`, `batch_size`, every transport config, middleware, …):
+
+```python
+from mq_bridge import Route
+from mq_bridge.config import ConfigDocument
+
+config: ConfigDocument = {
+    "routes": {
+        "orders": {
+            "input": {"memory": {"topic": "orders.in", "capacity": 1600}},
+            "output": {"response": {}},
+            "batch_size": 128,
+        }
+    }
+}
+route = Route.from_config(config, "orders")
+```
+
+These types are generated from the JSON Schema, which the extension produces on
+demand from the Rust models — there is no checked-in schema copy to drift:
+
+```python
+from mq_bridge import config_schema
+
+schema = config_schema()        # the JSON Schema as a dict
+```
+
+`config_schema()` is handy for editor validation of YAML configs too — dump it
+to a file and point your `# yaml-language-server: $schema=` line at it. The types
+are regenerated with `uv run python scripts/gen_config_types.py` (a test fails if
+they drift from the schema).
+
+## Running a route
+
+`Route.run()` **blocks the calling thread** until another thread calls `stop()` —
+it deploys the route and then parks. This is convenient for a process whose only
+job is the route, but it is a common trap: nothing after `route.run()` executes
+until the route stops.
+
+To keep running Python code after the route is up, use `start()` (non-blocking)
+or the context-manager form:
+
+```python
+route = Route.from_config(config, "orders_route").with_handler(handle)
+
+# Non-blocking: deploys, returns, and runs on a background thread.
+route.start()
+publisher.send_json({"order_id": 42}, {"kind": "order.created"})
+route.stop()
+route.join()   # optional: wait for a clean shutdown
+
+# Or scope it to a block — starts on enter, stops + joins on exit:
+with Route.from_config(config, "orders_route").with_handler(handle):
+    publisher.send_json({"order_id": 42}, {"kind": "order.created"})
+```
+
+Configuration/connection errors surface from `start()` itself, not from a
+background thread. `run()` remains available for the blocking single-route case.
+
+## Tuning (environment variables)
+
+These knobs are read from the environment at startup:
+
+| Variable | Default | Effect |
+| :--- | :--- | :--- |
+| `MQ_BRIDGE_PY_HANDLER_EXECUTOR` | `worker` | `worker` runs handlers on a dedicated interpreter thread that coalesces queued batches under one GIL acquisition (best under load); `direct` calls the handler inline. |
+| `MQ_BRIDGE_PY_HANDLER_CONCURRENCY` | CPU count | Max in-flight handler batches. `0` disables the limit. |
+| `MQ_BRIDGE_PY_GC_MODE` | `default` | `default` leaves CPython's cyclic GC alone; `count` disables it and runs `gc.collect()` every N messages; `off` disables it entirely (pure refcounting). |
+| `MQ_BRIDGE_PY_GC_THRESHOLD` | `100000` | Messages between collections when `MQ_BRIDGE_PY_GC_MODE=count`. |
 
 ## Local development
 
