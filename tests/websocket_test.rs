@@ -326,7 +326,7 @@ async fn websocket_direct_response_route_replies_to_ping() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn websocket_direct_response_route_closes_wrong_path() {
+async fn websocket_direct_response_route_rejects_wrong_path_with_404() {
     let port = get_free_port();
     let input = Endpoint::new(EndpointType::WebSocket(
         WebSocketConfig::new(format!("127.0.0.1:{port}"))
@@ -340,13 +340,16 @@ async fn websocket_direct_response_route_closes_wrong_path() {
         .await
         .expect("route should start");
 
-    let mut stream = connect(format!("ws://127.0.0.1:{port}/wrong")).await;
-    let frame = stream
-        .next()
-        .await
-        .expect("server should close wrong path")
-        .expect("close frame should be valid");
-    assert!(frame.is_close());
+    // The upgrade handshake must be rejected before completing, so the client
+    // never reaches an open WebSocket connection.
+    let uri = format!("ws://127.0.0.1:{port}/wrong")
+        .parse()
+        .expect("websocket URL should parse");
+    let result = ClientBuilder::from_uri(uri).connect().await;
+    assert!(
+        result.is_err(),
+        "wrong path should be rejected with 404 before the upgrade completes"
+    );
 
     handle.stop().await;
     handle.join().await.expect("route task should finish");

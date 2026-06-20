@@ -354,14 +354,56 @@ async fn handle_direct_connection(
     Ok(())
 }
 
+/// Peeks the start of the inbound stream and extracts the request-target path
+/// from the HTTP request line, without consuming any bytes. Returns `None` when
+/// the request line is not yet fully buffered (caller falls back to the normal
+/// handshake) or the stream is empty.
+async fn peek_request_path(stream: &TcpStream) -> std::io::Result<Option<String>> {
+    let mut buf = [0u8; 2048];
+    let n = stream.peek(&mut buf).await?;
+    let head = &buf[..n];
+    let Some(line_end) = head.windows(2).position(|w| w == b"\r\n") else {
+        return Ok(None);
+    };
+    // Request line: METHOD SP request-target SP HTTP/x.y
+    let mut parts = head[..line_end].split(|&b| b == b' ');
+    let target = parts.nth(1);
+    Ok(target
+        .and_then(|t| std::str::from_utf8(t).ok())
+        .map(|t| t.split(['?', '#']).next().unwrap_or(t).to_string()))
+}
+
+/// Writes a minimal HTTP 404 response and flushes it, best-effort.
+async fn respond_not_found(stream: &mut TcpStream) {
+    use tokio::io::AsyncWriteExt;
+    let _ = stream
+        .write_all(b"HTTP/1.1 404 Not Found\r\nconnection: close\r\ncontent-length: 0\r\n\r\n")
+        .await;
+    let _ = stream.flush().await;
+}
+
 async fn accept_websocket_connection(
-    stream: TcpStream,
+    mut stream: TcpStream,
     expected_path: Option<String>,
     message_id_header: String,
 ) -> anyhow::Result<Option<(WebSocketStream<TcpStream>, HandshakeMetadata)>> {
+    // If a specific path is required, peek the HTTP request line and reject a
+    // mismatch with a real 404 before completing the upgrade handshake. `accept`
+    // below re-reads the same bytes, so peeking does not consume the request.
+    if let Some(expected) = expected_path.as_deref() {
+        if let Some(requested) = peek_request_path(&stream).await? {
+            if normalize_websocket_path(&requested) != expected {
+                respond_not_found(&mut stream).await;
+                return Ok(None);
+            }
+        }
+    }
+
     let (request, mut ws_stream) = ServerBuilder::new().accept(stream).await?;
     let actual_path = normalize_websocket_path(request.uri().path());
     if let Some(expected_path) = expected_path.as_deref() {
+        // Fallback for the rare case where the request line was not fully
+        // buffered for the peek above: close after the upgrade instead.
         if actual_path != expected_path {
             let _ = ws_stream
                 .send(Message::close(None, "unexpected websocket path"))
