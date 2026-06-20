@@ -181,6 +181,33 @@ async fn websocket_consumer_sends_commit_reply_to_client() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn websocket_routed_consumer_replies_to_ping_exactly_once() {
+    let consumer = WebSocketConsumer::new(&WebSocketConfig::new("127.0.0.1:0").with_path("/ping"))
+        .await
+        .expect("consumer should be created");
+
+    let mut stream = connect(consumer.url()).await;
+    stream
+        .send(Message::ping("hello"))
+        .await
+        .expect("client should send ping");
+
+    let pong = stream
+        .next()
+        .await
+        .expect("client should receive pong")
+        .expect("pong frame should be valid");
+    assert!(pong.is_pong());
+    assert_eq!(&pong.as_payload()[..], b"hello");
+
+    // The routed transport must not emit a second (duplicate) pong frame.
+    let extra = tokio::time::timeout(std::time::Duration::from_millis(150), stream.next()).await;
+    assert!(extra.is_err(), "ping should produce exactly one pong reply");
+
+    drop(consumer);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn websocket_direct_response_route_replies_with_handler() {
     let port = get_free_port();
     let input = Endpoint::new(EndpointType::WebSocket(

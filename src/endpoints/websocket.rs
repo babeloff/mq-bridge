@@ -192,19 +192,8 @@ async fn handle_routed_connection(
 
     while let Some(frame) = read_stream.next().await {
         let frame = frame?;
-        if frame.is_close() {
-            let _ = response_tx.send(Message::close(None, "")).await;
-            break;
-        }
-        if frame.is_ping() {
-            let _ = response_tx
-                .send(Message::pong(frame.as_payload().to_vec()))
-                .await;
-            continue;
-        }
-        if frame.is_pong() {
-            continue;
-        }
+        // tokio-websockets auto-queues pong/close replies for control frames and
+        // flushes them on the next read poll, so we only handle data frames here.
         let Some(message) = canonical_from_websocket_frame(frame, &metadata, peer_addr) else {
             continue;
         };

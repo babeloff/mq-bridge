@@ -526,7 +526,6 @@ fn deserialize_middlewares_from_value(value: serde_json::Value) -> anyhow::Resul
 /// this endpoint feeds an HTTP response, those entries become response headers
 /// (e.g. `content-type`), otherwise they are ordinary message metadata.
 #[derive(Debug, Clone, Default)]
-#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct StaticConfig {
     /// The static response body.
     pub body: String,
@@ -534,6 +533,49 @@ pub struct StaticConfig {
     pub raw: bool,
     /// Extra metadata entries attached to the produced message.
     pub metadata: std::collections::HashMap<String, String>,
+}
+
+// Hand-written schema: the `Deserialize` impl below accepts either a bare string
+// or a map where only `body` is required, so the derived all-fields-required
+// object schema would reject valid configs.
+#[cfg(feature = "schema")]
+impl schemars::JsonSchema for StaticConfig {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "StaticConfig".into()
+    }
+
+    fn json_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({
+            "description": "Configuration for the `static` endpoint. Accepts either a bare string (the response body, JSON-encoded for backward compatibility) or a map where only `body` is required and `raw` / `metadata` are optional.",
+            "oneOf": [
+                {
+                    "type": "string",
+                    "description": "The response body, JSON-encoded as a string."
+                },
+                {
+                    "type": "object",
+                    "properties": {
+                        "body": {
+                            "type": "string",
+                            "description": "The static response body."
+                        },
+                        "raw": {
+                            "type": "boolean",
+                            "description": "Send the body verbatim instead of JSON-encoding it as a string.",
+                            "default": false
+                        },
+                        "metadata": {
+                            "type": "object",
+                            "description": "Extra metadata entries attached to the produced message.",
+                            "additionalProperties": { "type": "string" }
+                        }
+                    },
+                    "required": ["body"],
+                    "additionalProperties": false
+                }
+            ]
+        })
+    }
 }
 
 impl Serialize for StaticConfig {
