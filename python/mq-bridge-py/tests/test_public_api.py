@@ -5,6 +5,7 @@ from mq_bridge import (
     Publisher,
     RetryableError,
     Route,
+    config_schema,
 )
 
 
@@ -18,6 +19,14 @@ def test_public_exports_are_available() -> None:
     assert Route is not None
     assert Publisher is not None
     assert RetryableError is not None
+    assert config_schema is not None
+
+
+def test_config_schema_is_public_api() -> None:
+    schema = config_schema()
+
+    assert isinstance(schema, dict)
+    assert schema.get("type") == "object"
 
 
 def test_message_from_json_round_trip_shape() -> None:

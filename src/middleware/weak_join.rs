@@ -43,7 +43,8 @@ impl WeakJoinConsumer {
             .collect();
 
         let merged_payload = serde_json::to_vec(&payloads).unwrap_or_default();
-        let mut new_msg = CanonicalMessage::new(merged_payload, Some(fast_uuid_v7::gen_id()));
+        let mut new_msg =
+            CanonicalMessage::new(merged_payload, Some(fast_uuid_v7::gen_id_with_sub_ms_4()));
 
         if let Some(first) = messages.first() {
             new_msg.metadata = first.metadata.clone();

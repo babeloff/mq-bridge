@@ -1,5 +1,11 @@
-// To run these tests, use the command from the project root:
-// cargo test --test integration_test -- --ignored --nocapture --test-threads=1
+// Aggregate Docker-backed integration suites. Keep these ignored so default
+// `cargo test` stays local and fast.
+//
+// Run from the project root:
+// cargo test --test integration_test --features full,test-utils --release -- --ignored --nocapture --test-threads=1
+//
+// Limit to a backend with MQB_TEST_BACKEND, for example:
+// MQB_TEST_BACKEND=kafka cargo test --test integration_test --features full,test-utils --release -- --ignored --nocapture --test-threads=1
 
 #![allow(unused_imports, dead_code)]
 

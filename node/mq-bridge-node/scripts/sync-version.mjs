@@ -2,12 +2,13 @@
 // Sync this package's version to the Cargo workspace version, the single source
 // of truth (matches how maturin derives the Python package version). Updates
 // package.json `version` and every `optionalDependencies` entry in lockstep.
-import { readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const pkgPath = resolve(here, "..", "package.json");
+const lockPath = resolve(here, "..", "package-lock.json");
 const cargoPath = resolve(here, "..", "..", "..", "Cargo.toml");
 
 const cargo = readFileSync(cargoPath, "utf8");
@@ -27,4 +28,20 @@ if (pkg.optionalDependencies) {
   }
 }
 writeFileSync(pkgPath, `${JSON.stringify(pkg, null, 2)}\n`);
-console.log(`Synced package version to ${version}`);
+
+if (existsSync(lockPath)) {
+  const lock = JSON.parse(readFileSync(lockPath, "utf8"));
+  lock.version = version;
+  const rootPackage = lock.packages?.[""];
+  if (rootPackage) {
+    rootPackage.version = version;
+    if (rootPackage.optionalDependencies) {
+      for (const name of Object.keys(rootPackage.optionalDependencies)) {
+        rootPackage.optionalDependencies[name] = version;
+      }
+    }
+  }
+  writeFileSync(lockPath, `${JSON.stringify(lock, null, 2)}\n`);
+}
+
+console.log(`Synced package files to ${version}`);

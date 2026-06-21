@@ -1653,6 +1653,8 @@ mod tests {
         Route::stop(&route_name).await;
     }
 
+    // No Docker. Ignored to keep default `cargo test` focused on the fast path.
+    // Locally measured on 2026-06-21: this plus the sequential variant ran in ~2s.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore = "Takes too much time for regular tests"]
     async fn test_route_recovery_from_faults() {
@@ -1668,6 +1670,7 @@ mod tests {
         run_consumer_fault_test(FaultMode::JsonFormatError, "{invalid json}", false, 2).await;
     }
 
+    // No Docker. Run with `cargo test test_route_recovery_from_faults -- --ignored --nocapture`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore = "Takes too much time for regular tests"]
     async fn test_route_recovery_from_faults_sequential() {
@@ -1678,6 +1681,7 @@ mod tests {
         run_consumer_fault_test(FaultMode::Disconnect, original_payload, true, 1).await;
     }
 
+    // No Docker. Locally measured on 2026-06-21 at ~1s.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore = "Takes too much time for regular tests"]
     async fn test_publisher_recovery_from_faults() {

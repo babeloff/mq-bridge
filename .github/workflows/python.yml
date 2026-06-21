@@ -67,3 +67,16 @@ jobs:
       - name: Smoke test import
         working-directory: python/mq-bridge-py
         run: uv run python -c "from mq_bridge import Message, Publisher, Route; print(Message, Publisher, Route)"
+
+      - name: Run no-default feature regression tests
+        run: |
+          cargo test -p mq-bridge-py --no-default-features --features http,rustls-ring test_config_schema_is_always_available
+          cargo test -p mq-bridge-py --no-default-features --features http,rustls-ring test_module_init_installs_rustls_provider
+
+      - name: Rebuild extension with lean no-default feature set
+        working-directory: python/mq-bridge-py
+        run: uv run maturin develop --no-default-features -F http -F rustls-ring -F pyo3/extension-module
+
+      - name: Run lean no-default public API tests
+        working-directory: python/mq-bridge-py
+        run: uv run pytest -q tests/test_public_api.py tests/test_config_types.py

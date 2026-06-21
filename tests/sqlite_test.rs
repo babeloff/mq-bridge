@@ -13,6 +13,8 @@ async fn sqlite_pipeline_integration() {
 #[tokio::test]
 #[ignore = "Test takes too long"]
 async fn sqlite_performance_direct() {
-    // Ignored by default; run explicitly with `cargo test sqlite_performance_direct -- --ignored`.
+    // File-backed, no Docker. Locally measured on 2026-06-21 at ~42s.
+    // Run explicitly with:
+    // `cargo test --test sqlite_test --features sqlx,test-utils sqlite_performance_direct -- --ignored --nocapture`.
     sqlite::test_sqlite_performance_direct().await;
 }

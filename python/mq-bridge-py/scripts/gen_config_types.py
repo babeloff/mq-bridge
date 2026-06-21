@@ -141,7 +141,8 @@ def render_typeddict(name: str, fields: dict, required: set, defn: dict) -> str:
         lines.append(doc.rstrip("\n"))
     if not fields:
         lines.append("    pass")
-    for key, expr in fields.items():
+    for key in sorted(fields):
+        expr = fields[key]
         wrapped = f"Required[{expr}]" if key in required else expr
         lines.append(f"    {key}: {wrapped}")
     return "\n".join(lines) + "\n"

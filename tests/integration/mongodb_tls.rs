@@ -12,6 +12,7 @@ mod mongodb_tls {
     #[tokio::test]
     #[ignore = "requires docker compose and openssl"]
     async fn test_mongodb_tls_connect() {
+        // Generates local cert material and starts the TLS MongoDB compose stack.
         setup_logging();
 
         // Generate certs and build TLS-enabled MongoDB config

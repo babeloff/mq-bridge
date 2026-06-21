@@ -1534,6 +1534,17 @@ fn to_py_runtime_error(err: impl std::fmt::Display) -> PyErr {
     PyRuntimeError::new_err(err.to_string())
 }
 
+fn install_default_crypto_provider() {
+    #[cfg(feature = "rustls-aws-lc")]
+    {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    }
+    #[cfg(all(feature = "rustls-ring", not(feature = "rustls-aws-lc")))]
+    {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
+}
+
 fn run_sync_task<F, T>(runtime: &Runtime, future: F) -> anyhow::Result<T>
 where
     F: Future<Output = anyhow::Result<T>>,
@@ -1591,7 +1602,6 @@ fn finish_run(run_state: &Arc<Mutex<RouteRunState>>, name: &str) {
 
 /// Return the JSON Schema for the route/config mapping, generated on demand
 /// from the compiled Rust models (no checked-in copy, so it cannot drift).
-#[cfg(feature = "schema")]
 #[pyfunction]
 fn config_schema(py: Python<'_>) -> PyResult<Py<PyAny>> {
     let schema = schemars::schema_for!(core::models::Config);
@@ -1603,12 +1613,12 @@ fn config_schema(py: Python<'_>) -> PyResult<Py<PyAny>> {
 #[pymodule(gil_used = true)]
 #[pyo3(name = "_mq_bridge")]
 fn _mq_bridge(module: &Bound<'_, PyModule>) -> PyResult<()> {
+    install_default_crypto_provider();
     module.add_class::<Message>()?;
     module.add_class::<Route>()?;
     module.add_class::<Publisher>()?;
     module.add_class::<MemoryDrainer>()?;
     module.add("__version__", env!("CARGO_PKG_VERSION"))?;
-    #[cfg(feature = "schema")]
     module.add_function(wrap_pyfunction!(config_schema, module)?)?;
     module.add("RetryableError", module.py().get_type::<RetryableError>())?;
     module.add(
@@ -1622,9 +1632,7 @@ fn _mq_bridge(module: &Bound<'_, PyModule>) -> PyResult<()> {
 mod tests {
     use super::*;
     use serde_json::json;
-    use std::hint::black_box;
     use std::time::Duration;
-    use std::time::Instant;
 
     fn write_yaml(contents: &str) -> String {
         let path =
@@ -1844,6 +1852,38 @@ memory:
                 "unexpected error: {err}"
             );
         });
+    }
+
+    #[test]
+    fn test_config_schema_is_always_available() {
+        Python::attach(|py| {
+            let schema = config_schema(py).unwrap();
+            let schema = schema.bind(py).cast::<PyDict>().unwrap();
+
+            assert_eq!(
+                schema
+                    .get_item("type")
+                    .unwrap()
+                    .unwrap()
+                    .extract::<String>()
+                    .unwrap(),
+                "object"
+            );
+        });
+    }
+
+    #[cfg(any(feature = "rustls-aws-lc", feature = "rustls-ring"))]
+    #[test]
+    fn test_module_init_installs_rustls_provider() {
+        Python::attach(|py| {
+            let module = PyModule::new(py, "_mq_bridge").unwrap();
+            _mq_bridge(&module).unwrap();
+        });
+
+        assert!(
+            rustls::crypto::CryptoProvider::get_default().is_some(),
+            "Python module init should install the selected rustls CryptoProvider"
+        );
     }
 
     #[test]

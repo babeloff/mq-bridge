@@ -52,6 +52,8 @@ async fn wait_for_server_ready(addr: &str, timeout: Duration) -> bool {
 #[tokio::test]
 #[ignore = "requires docker/local certs"]
 async fn test_http_tls_pipeline() {
+    // Generates local cert material, binds localhost ports, and pushes the
+    // performance message count through an HTTPS pipeline.
     setup_logging();
 
     // Try a few times to avoid ephemeral port race

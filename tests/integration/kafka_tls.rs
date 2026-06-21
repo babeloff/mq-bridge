@@ -13,6 +13,7 @@ mod kafka_tls {
     #[tokio::test]
     #[ignore = "requires docker compose and keytool/openssl"]
     async fn test_kafka_tls_publish_consume() {
+        // Generates local cert material and starts the TLS Kafka compose stack.
         setup_logging();
 
         // Generate certs and build TLS-enabled Kafka config

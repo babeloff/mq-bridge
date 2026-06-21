@@ -107,6 +107,71 @@ async fn test_amqp_publisher_handles_nack() {
     .await;
 }
 
+#[tokio::test]
+#[ignore = "requires docker compose"]
+async fn test_amqp_reply_publish_failure_does_not_ack_request() {
+    if !should_run("amqp") {
+        return;
+    }
+    use mq_bridge::traits::{MessageConsumer, MessageDisposition, MessagePublisher};
+
+    setup_logging();
+    run_test_with_docker("tests/integration/docker-compose/amqp.yml", || async {
+        let request_queue = format!("test_reply_fail_{}", fast_uuid_v7::gen_id_str());
+        let missing_reply_queue = format!("missing_reply_{}", fast_uuid_v7::gen_id_str());
+        let config = mq_bridge::models::AmqpConfig {
+            url: "amqp://guest:guest@localhost:5672/%2f".to_string(),
+            queue: Some(request_queue),
+            ..Default::default()
+        };
+
+        let publisher = AmqpPublisher::new(&config).await.unwrap();
+
+        {
+            let mut consumer = AmqpConsumer::new(&config).await.unwrap();
+            let mut request = mq_bridge::CanonicalMessage::from("request needing reply");
+            request
+                .metadata
+                .insert("reply_to".to_string(), missing_reply_queue);
+            request
+                .metadata
+                .insert("correlation_id".to_string(), "reply-fail-cid".to_string());
+
+            publisher.send(request).await.unwrap();
+
+            let received =
+                tokio::time::timeout(std::time::Duration::from_secs(5), consumer.receive())
+                    .await
+                    .expect("Timed out waiting for AMQP request")
+                    .unwrap();
+
+            let result = (received.commit)(MessageDisposition::Reply(
+                mq_bridge::CanonicalMessage::from("response that cannot be routed"),
+            ))
+            .await;
+
+            assert!(
+                result.is_err(),
+                "Expected AMQP reply commit to fail when reply_to queue is missing"
+            );
+        }
+
+        let mut retry_consumer = AmqpConsumer::new(&config).await.unwrap();
+        let redelivered =
+            tokio::time::timeout(std::time::Duration::from_secs(5), retry_consumer.receive())
+                .await
+                .expect("Timed out waiting for AMQP request redelivery")
+                .unwrap();
+
+        assert_eq!(
+            redelivered.message.get_payload_str(),
+            "request needing reply"
+        );
+        (redelivered.commit)(MessageDisposition::Ack).await.unwrap();
+    })
+    .await;
+}
+
 pub async fn test_amqp_subscriber_logic() {
     setup_logging();
     run_test_with_docker("tests/integration/docker-compose/amqp.yml", || async {
