@@ -474,6 +474,7 @@ pub struct AmqpConsumer {
     channel: Channel,
     queue: String,
     is_poisoned: Arc<AtomicBool>,
+    reply_confirms_selected: Arc<AtomicBool>,
     prefetch: u16,
 }
 
@@ -588,6 +589,7 @@ impl AmqpConsumer {
             channel,
             queue: queue_name,
             is_poisoned: Arc::new(AtomicBool::new(false)),
+            reply_confirms_selected: Arc::new(AtomicBool::new(false)),
             prefetch: prefetch_count,
         })
     }
@@ -791,6 +793,7 @@ impl MessageConsumer for AmqpConsumer {
         trace!(count = messages_len, queue = %self.queue, message_ids = ?LazyMessageIds(&messages), "Received batch of AMQP messages");
         let channel = self.channel.clone();
         let is_poisoned = self.is_poisoned.clone();
+        let reply_confirms_selected = self.reply_confirms_selected.clone();
         let commit: BatchCommitFunc = Box::new(move |dispositions: Vec<MessageDisposition>| {
             Box::pin(async move {
                 if dispositions.len() != reply_infos.len() {
@@ -807,7 +810,13 @@ impl MessageConsumer for AmqpConsumer {
                 }
 
                 let commit_op = async {
-                    handle_replies(&channel, &reply_infos, &dispositions).await;
+                    handle_replies(
+                        &channel,
+                        &reply_confirms_selected,
+                        &reply_infos,
+                        &dispositions,
+                    )
+                    .await?;
                     handle_dispositions(ackers, dispositions).await
                 };
 
@@ -877,9 +886,10 @@ impl MessageConsumer for AmqpConsumer {
 
 async fn handle_replies(
     channel: &Channel,
+    reply_confirms_selected: &AtomicBool,
     reply_infos: &[(Option<String>, Option<String>)],
     dispositions: &[MessageDisposition],
-) {
+) -> anyhow::Result<()> {
     for ((reply_to, correlation_id), disposition) in reply_infos.iter().zip(dispositions.iter()) {
         let payload = match (disposition, reply_to) {
             (MessageDisposition::Reply(resp), Some(_)) => Some(resp.payload.clone()),
@@ -891,26 +901,65 @@ async fn handle_replies(
         };
 
         if let (Some(rt), Some(body)) = (reply_to, payload) {
+            if !reply_confirms_selected.load(Ordering::Relaxed) {
+                tokio::time::timeout(
+                    SETUP_TIMEOUT,
+                    channel.confirm_select(lapin::options::ConfirmSelectOptions::default()),
+                )
+                .await
+                .map_err(|_| anyhow!("Timed out enabling AMQP reply confirmations"))?
+                .context("Failed to enable AMQP reply confirmations")?;
+                reply_confirms_selected.store(true, Ordering::Relaxed);
+            }
+
             let mut props = BasicProperties::default();
             if let Some(cid) = correlation_id {
                 props = props.with_correlation_id(cid.clone().into());
             }
 
             // Publish response to the default exchange with the routing key set to reply_to
-            if let Err(e) = channel
-                .basic_publish(
+            let confirmation = tokio::time::timeout(
+                CONFIRM_TIMEOUT,
+                channel.basic_publish(
                     "".into(), // Default exchange
                     rt.clone().into(),
-                    BasicPublishOptions::default(),
+                    BasicPublishOptions {
+                        mandatory: true,
+                        ..Default::default()
+                    },
                     &body,
                     props,
-                )
+                ),
+            )
+            .await
+            .map_err(|_| anyhow!("Timed out submitting AMQP reply to {}", rt))?
+            .with_context(|| format!("Failed to publish AMQP reply to {}", rt))?;
+
+            let confirmation = tokio::time::timeout(CONFIRM_TIMEOUT, confirmation)
                 .await
-            {
-                tracing::error!(reply_to = %rt, error = %e, "Failed to publish AMQP reply");
+                .map_err(|_| anyhow!("Timed out waiting for AMQP reply confirmation to {}", rt))?
+                .with_context(|| format!("Failed to get AMQP reply confirmation to {}", rt))?;
+
+            match confirmation {
+                Confirmation::Ack(None) => {}
+                Confirmation::Ack(Some(returned)) | Confirmation::Nack(Some(returned)) => {
+                    bail!(
+                        "AMQP reply to {} was returned by broker: {} {}",
+                        rt,
+                        returned.reply_code,
+                        returned.reply_text
+                    );
+                }
+                Confirmation::Nack(None) => {
+                    bail!("Broker nacked AMQP reply to {}", rt);
+                }
+                Confirmation::NotRequested => {
+                    bail!("AMQP reply confirmation was not requested for {}", rt);
+                }
             }
         }
     }
+    Ok(())
 }
 
 async fn handle_dispositions(
