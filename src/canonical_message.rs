@@ -72,7 +72,7 @@ pub(crate) fn u128_from_json(val: &serde_json::Value) -> Result<u128, String> {
 impl CanonicalMessage {
     pub fn new(payload: Vec<u8>, message_id: Option<u128>) -> Self {
         Self {
-            message_id: message_id.unwrap_or_else(fast_uuid_v7::gen_id),
+            message_id: message_id.unwrap_or_else(fast_uuid_v7::gen_id_with_sub_ms_4),
             payload: Bytes::from(payload),
             metadata: HashMap::new(),
         }
@@ -80,7 +80,7 @@ impl CanonicalMessage {
 
     pub fn new_bytes(payload: Bytes, message_id: Option<u128>) -> Self {
         Self {
-            message_id: message_id.unwrap_or_else(fast_uuid_v7::gen_id),
+            message_id: message_id.unwrap_or_else(fast_uuid_v7::gen_id_with_sub_ms_4),
             payload,
             metadata: HashMap::new(),
         }
