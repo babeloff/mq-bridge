@@ -901,15 +901,25 @@ async fn handle_replies(
         };
 
         if let (Some(rt), Some(body)) = (reply_to, payload) {
-            if !reply_confirms_selected.load(Ordering::Relaxed) {
-                tokio::time::timeout(
-                    SETUP_TIMEOUT,
-                    channel.confirm_select(lapin::options::ConfirmSelectOptions::default()),
-                )
-                .await
-                .map_err(|_| anyhow!("Timed out enabling AMQP reply confirmations"))?
-                .context("Failed to enable AMQP reply confirmations")?;
-                reply_confirms_selected.store(true, Ordering::Relaxed);
+            if reply_confirms_selected
+                .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                // Reset the flag on failure so a later attempt can retry confirm_select.
+                let result = async {
+                    tokio::time::timeout(
+                        SETUP_TIMEOUT,
+                        channel.confirm_select(lapin::options::ConfirmSelectOptions::default()),
+                    )
+                    .await
+                    .map_err(|_| anyhow!("Timed out enabling AMQP reply confirmations"))?
+                    .context("Failed to enable AMQP reply confirmations")
+                }
+                .await;
+                if result.is_err() {
+                    reply_confirms_selected.store(false, Ordering::Relaxed);
+                }
+                result?;
             }
 
             let mut props = BasicProperties::default();
