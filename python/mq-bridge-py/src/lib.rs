@@ -1632,9 +1632,7 @@ fn _mq_bridge(module: &Bound<'_, PyModule>) -> PyResult<()> {
 mod tests {
     use super::*;
     use serde_json::json;
-    use std::hint::black_box;
     use std::time::Duration;
-    use std::time::Instant;
 
     fn write_yaml(contents: &str) -> String {
         let path =
@@ -1860,9 +1858,17 @@ memory:
     fn test_config_schema_is_always_available() {
         Python::attach(|py| {
             let schema = config_schema(py).unwrap();
-            let schema = schema.bind(py).downcast::<PyDict>().unwrap();
+            let schema = schema.bind(py).cast::<PyDict>().unwrap();
 
-            assert_eq!(schema.get_item("type").unwrap().unwrap().extract::<&str>().unwrap(), "object");
+            assert_eq!(
+                schema
+                    .get_item("type")
+                    .unwrap()
+                    .unwrap()
+                    .extract::<String>()
+                    .unwrap(),
+                "object"
+            );
         });
     }
 
