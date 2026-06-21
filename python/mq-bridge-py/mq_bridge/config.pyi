@@ -9,46 +9,46 @@ from typing_extensions import Required, TypedDict
 
 class AmqpConfig(TypedDict, total=False):
     """General AMQP connection configuration."""
-    url: Required[str]
+    delayed_ack: bool
+    exchange: Optional[str]
+    no_declare_queue: bool
+    no_persistence: bool
+    password: Optional[str]
+    prefetch_count: Optional[int]
     queue: Optional[str]
     subscribe_mode: bool
-    username: Optional[str]
-    password: Optional[str]
     tls: TlsConfig
-    exchange: Optional[str]
-    prefetch_count: Optional[int]
-    no_persistence: bool
-    no_declare_queue: bool
-    delayed_ack: bool
+    url: Required[str]
+    username: Optional[str]
 
 
 class AwsConfig(TypedDict, total=False):
-    queue_url: Optional[str]
-    topic_arn: Optional[str]
-    region: Optional[str]
-    endpoint_url: Optional[str]
     access_key: Optional[str]
+    binary_payload_mode: bool
+    endpoint_url: Optional[str]
+    max_messages: Optional[int]
+    queue_url: Optional[str]
+    region: Optional[str]
     secret_key: Optional[str]
     session_token: Optional[str]
-    max_messages: Optional[int]
+    topic_arn: Optional[str]
     wait_time_seconds: Optional[int]
-    binary_payload_mode: bool
 
 
 class BufferMiddleware(TypedDict, total=False):
     """Publisher-side buffer middleware configuration."""
-    max_messages: Required[int]
     max_delay_ms: Required[int]
+    max_messages: Required[int]
 
 
 class CookieJarMiddleware(TypedDict, total=False):
     """Cookie/session jar middleware configuration."""
-    shared_scope: Optional[str]
-    cookie_metadata_key: str
-    set_cookie_metadata_key: str
     capture_metadata_keys: List[str]
+    cookie_metadata_key: str
     export_metadata_prefix: Optional[str]
     inject_metadata: Dict[str, str]
+    set_cookie_metadata_key: str
+    shared_scope: Optional[str]
 
 
 class DeadLetterQueueMiddleware(TypedDict, total=False):
@@ -69,106 +69,106 @@ class DelayMiddleware(TypedDict, total=False):
 
 class Endpoint(TypedDict, total=False):
     """Represents a connection point for messages, which can be a source (input) or a sink (output)."""
-    aws: AwsConfig
-    kafka: KafkaConfig
-    nats: NatsConfig
-    file: FileConfig
-    static: StaticConfig
-    ref: str
-    memory: MemoryConfig
-    sled: SledConfig
     amqp: AmqpConfig
+    aws: AwsConfig
+    custom: Dict[str, Any]
+    fanout: List[Endpoint]
+    file: FileConfig
+    grpc: GrpcConfig
+    http: HttpConfig
+    ibmmq: IbmMqConfig
+    kafka: KafkaConfig
+    memory: MemoryConfig
+    middlewares: List[Middleware]
     mongodb: MongoDbConfig
     mqtt: MqttConfig
-    http: HttpConfig
-    websocket: WebSocketConfig
-    ibmmq: IbmMqConfig
-    zeromq: ZeroMqConfig
-    grpc: GrpcConfig
+    nats: NatsConfig
+    null: Any
+    reader: Endpoint
+    ref: str
+    response: ResponseConfig
+    sled: SledConfig
     sqlx: SqlxConfig
-    fanout: List[Endpoint]
+    static: StaticConfig
     stream_buffer: StreamBufferConfig
     switch: SwitchConfig
-    response: ResponseConfig
-    reader: Endpoint
-    custom: Dict[str, Any]
-    null: Any
-    middlewares: List[Middleware]
+    websocket: WebSocketConfig
+    zeromq: ZeroMqConfig
 
 
 class FileConfig(TypedDict, total=False):
-    path: Required[str]
     delimiter: Optional[str]
     format: FileFormat
+    path: Required[str]
 
 
 class GrpcConfig(TypedDict, total=False):
-    url: Required[str]
-    topic: Optional[str]
-    timeout_ms: Optional[int]
-    tls: TlsConfig
-    server_mode: bool
-    initial_stream_window_size: Optional[int]
-    initial_connection_window_size: Optional[int]
     concurrency_limit_per_connection: Optional[int]
     http2_keepalive_interval_ms: Optional[int]
     http2_keepalive_timeout_ms: Optional[int]
+    initial_connection_window_size: Optional[int]
+    initial_stream_window_size: Optional[int]
     max_decoding_message_size: Optional[int]
+    server_mode: bool
+    timeout_ms: Optional[int]
+    tls: TlsConfig
+    topic: Optional[str]
+    url: Required[str]
 
 
 class HttpConfig(TypedDict, total=False):
     """General HTTP connection configuration."""
-    url: Required[str]
-    path: Optional[str]
-    method: Optional[str]
-    tls: TlsConfig
-    workers: Optional[int]
-    message_id_header: Optional[str]
-    request_timeout_ms: Optional[int]
-    internal_buffer_size: Optional[int]
-    fire_and_forget: bool
-    receive_streamable: bool
-    inline_response_fast_path: Optional[bool]
-    server_protocol: HttpServerProtocol
-    stream_response_to: Optional[Endpoint]
+    basic_auth: Optional[List[Any]]
     batch_concurrency: Optional[int]
-    tcp_keepalive_ms: Optional[int]
-    pool_idle_timeout_ms: Optional[int]
     compression_enabled: bool
     compression_threshold_bytes: Optional[int]
     concurrency_limit: Optional[int]
-    basic_auth: Optional[List[Any]]
     custom_headers: Dict[str, str]
+    fire_and_forget: bool
+    inline_response_fast_path: Optional[bool]
+    internal_buffer_size: Optional[int]
+    message_id_header: Optional[str]
+    method: Optional[str]
+    path: Optional[str]
+    pool_idle_timeout_ms: Optional[int]
+    receive_streamable: bool
+    request_timeout_ms: Optional[int]
+    server_protocol: HttpServerProtocol
+    stream_response_to: Optional[Endpoint]
+    tcp_keepalive_ms: Optional[int]
+    tls: TlsConfig
+    url: Required[str]
+    workers: Optional[int]
 
 
 class IbmMqConfig(TypedDict, total=False):
     """Connection settings for the IBM MQ Queue Manager."""
-    url: Required[str]
-    queue: Optional[str]
-    topic: Optional[str]
-    queue_manager: Required[str]
     channel: Required[str]
-    username: Optional[str]
-    password: Optional[str]
     cipher_spec: Optional[str]
-    tls: TlsConfig
-    max_message_size: int
-    wait_timeout_ms: int
-    internal_buffer_size: Optional[int]
     disable_status_inq: bool
+    internal_buffer_size: Optional[int]
+    max_message_size: int
+    password: Optional[str]
+    queue: Optional[str]
+    queue_manager: Required[str]
+    tls: TlsConfig
+    topic: Optional[str]
+    url: Required[str]
+    username: Optional[str]
+    wait_timeout_ms: int
 
 
 class KafkaConfig(TypedDict, total=False):
     """General Kafka connection configuration."""
-    url: Required[str]
-    topic: Optional[str]
-    username: Optional[str]
-    password: Optional[str]
-    tls: TlsConfig
-    group_id: Optional[str]
-    delayed_ack: bool
-    producer_options: Optional[List[List[Any]]]
     consumer_options: Optional[List[List[Any]]]
+    delayed_ack: bool
+    group_id: Optional[str]
+    password: Optional[str]
+    producer_options: Optional[List[List[Any]]]
+    tls: TlsConfig
+    topic: Optional[str]
+    url: Required[str]
+    username: Optional[str]
 
 
 class LimiterMiddleware(TypedDict, total=False):
@@ -177,12 +177,12 @@ class LimiterMiddleware(TypedDict, total=False):
 
 
 class MemoryConfig(TypedDict, total=False):
-    topic: str
     capacity: Optional[int]
+    enable_nack: bool
     request_reply: bool
     request_timeout_ms: Optional[int]
     subscribe_mode: bool
-    enable_nack: bool
+    topic: str
     url: str
 
 
@@ -193,83 +193,83 @@ class MetricsMiddleware(TypedDict, total=False):
 
 class Middleware(TypedDict, total=False):
     """An enumeration of all supported middleware types."""
-    deduplication: DeduplicationMiddleware
-    metrics: MetricsMiddleware
-    dlq: DeadLetterQueueMiddleware
-    retry: RetryMiddleware
-    random_panic: RandomPanicMiddleware
-    delay: DelayMiddleware
-    weak_join: WeakJoinMiddleware
-    limiter: LimiterMiddleware
     buffer: BufferMiddleware
     cookie_jar: CookieJarMiddleware
     custom: Dict[str, Any]
+    deduplication: DeduplicationMiddleware
+    delay: DelayMiddleware
+    dlq: DeadLetterQueueMiddleware
+    limiter: LimiterMiddleware
+    metrics: MetricsMiddleware
+    random_panic: RandomPanicMiddleware
+    retry: RetryMiddleware
+    weak_join: WeakJoinMiddleware
 
 
 class MongoDbConfig(TypedDict, total=False):
     """General MongoDB connection configuration."""
-    url: Required[str]
+    capped_size_bytes: Optional[int]
+    change_stream: bool
     collection: Optional[str]
-    username: Optional[str]
-    password: Optional[str]
-    tls: TlsConfig
+    cursor_id: Optional[str]
     database: Required[str]
+    format: MongoDbFormat
+    meta_collection: Optional[str]
+    password: Optional[str]
     polling_interval_ms: Optional[int]
+    receive_query: Optional[str]
     reply_polling_ms: Optional[int]
     request_reply: bool
-    change_stream: bool
     request_timeout_ms: Optional[int]
+    tls: TlsConfig
     ttl_seconds: Optional[int]
-    capped_size_bytes: Optional[int]
-    format: MongoDbFormat
-    cursor_id: Optional[str]
-    receive_query: Optional[str]
-    meta_collection: Optional[str]
+    url: Required[str]
+    username: Optional[str]
 
 
 class MqttConfig(TypedDict, total=False):
     """General MQTT connection configuration."""
-    url: Required[str]
-    topic: Optional[str]
-    username: Optional[str]
-    password: Optional[str]
-    tls: TlsConfig
-    client_id: Optional[str]
-    queue_capacity: Optional[int]
-    max_inflight: Optional[int]
-    qos: Optional[int]
     clean_session: bool
-    keep_alive_seconds: Optional[int]
-    protocol: MqttProtocol
-    session_expiry_interval: Optional[int]
+    client_id: Optional[str]
     delayed_ack: bool
+    keep_alive_seconds: Optional[int]
+    max_inflight: Optional[int]
+    password: Optional[str]
+    protocol: MqttProtocol
+    qos: Optional[int]
+    queue_capacity: Optional[int]
+    session_expiry_interval: Optional[int]
+    tls: TlsConfig
+    topic: Optional[str]
+    url: Required[str]
+    username: Optional[str]
 
 
 class NatsConfig(TypedDict, total=False):
     """General NATS connection configuration."""
-    url: Required[str]
-    subject: Optional[str]
-    stream: Optional[str]
-    username: Optional[str]
+    delayed_ack: bool
+    deliver_policy: Optional[NatsDeliverPolicy]
+    no_jetstream: bool
     password: Optional[str]
-    tls: TlsConfig
-    token: Optional[str]
+    prefetch_count: Optional[int]
     request_reply: bool
     request_timeout_ms: Optional[int]
-    delayed_ack: bool
-    no_jetstream: bool
-    subscriber_mode: bool
-    stream_max_messages: Optional[int]
-    deliver_policy: Optional[NatsDeliverPolicy]
+    stream: Optional[str]
     stream_max_bytes: Optional[int]
-    prefetch_count: Optional[int]
+    stream_max_messages: Optional[int]
+    subject: Optional[str]
+    subscriber_mode: bool
+    tls: TlsConfig
+    token: Optional[str]
+    url: Required[str]
+    username: Optional[str]
 
 
 class RandomPanicMiddleware(TypedDict, total=False):
     """Middleware for fault injection testing."""
+    enabled: bool
     mode: FaultMode
     trigger_on_message: Optional[int]
-    enabled: bool
 
 
 class ResponseConfig(TypedDict, total=False):
@@ -278,99 +278,99 @@ class ResponseConfig(TypedDict, total=False):
 
 class RetryMiddleware(TypedDict, total=False):
     """Retry middleware configuration."""
-    max_attempts: int
     initial_interval_ms: int
+    max_attempts: int
     max_interval_ms: int
     multiplier: float
 
 
 class Route(TypedDict, total=False):
     """Defines a single message processing route from an input to an output."""
-    input: Required[Endpoint]
-    output: Endpoint
-    description: str
-    concurrency: int
+    allow_fault_injection: bool
     batch_size: int
     commit_concurrency_limit: int
-    startup_timeout_ms: int
-    reconnect_interval_ms: int
+    concurrency: int
+    description: str
     empty_batch_delay_ms: int
-    allow_fault_injection: bool
+    input: Required[Endpoint]
+    output: Endpoint
+    reconnect_interval_ms: int
+    startup_timeout_ms: int
 
 
 class SledConfig(TypedDict, total=False):
     """General Sled database configuration"""
-    path: Required[str]
-    tree: Optional[str]
-    read_from_start: bool
     delete_after_read: bool
+    path: Required[str]
+    read_from_start: bool
+    tree: Optional[str]
 
 
 class SqlxConfig(TypedDict, total=False):
     """General SQLx connection configuration."""
+    acquire_timeout_ms: Optional[int]
+    auto_create_table: bool
+    delete_after_read: bool
+    idle_timeout_ms: Optional[int]
+    insert_query: Optional[str]
+    max_connections: Optional[int]
+    max_lifetime_ms: Optional[int]
+    min_connections: Optional[int]
+    password: Optional[str]
+    polling_interval_ms: Optional[int]
+    select_query: Optional[str]
+    table: Required[str]
+    tls: TlsConfig
     url: Required[str]
     username: Optional[str]
-    password: Optional[str]
-    table: Required[str]
-    insert_query: Optional[str]
-    select_query: Optional[str]
-    delete_after_read: bool
-    auto_create_table: bool
-    polling_interval_ms: Optional[int]
-    tls: TlsConfig
-    max_connections: Optional[int]
-    min_connections: Optional[int]
-    acquire_timeout_ms: Optional[int]
-    idle_timeout_ms: Optional[int]
-    max_lifetime_ms: Optional[int]
 
 
 class StreamBufferConfig(TypedDict, total=False):
     """Configuration for the correlated in-process stream response buffer."""
-    topic: Required[str]
-    correlation_id: Optional[str]
     capacity: Optional[int]
+    correlation_id: Optional[str]
+    topic: Required[str]
 
 
 class SwitchConfig(TypedDict, total=False):
-    metadata_key: Required[str]
     cases: Required[Dict[str, Endpoint]]
     default: Optional[Endpoint]
+    metadata_key: Required[str]
 
 
 class TlsConfig(TypedDict, total=False):
     """TLS configuration for secure connections."""
-    required: bool
+    accept_invalid_certs: bool
     ca_file: Optional[str]
     cert_file: Optional[str]
-    key_file: Optional[str]
     cert_password: Optional[str]
-    accept_invalid_certs: bool
+    key_file: Optional[str]
+    required: bool
 
 
 class WeakJoinMiddleware(TypedDict, total=False):
     """Weak Join middleware configuration."""
-    group_by: Required[str]
     expected_count: Required[int]
+    group_by: Required[str]
     timeout_ms: Required[int]
 
 
 class WebSocketConfig(TypedDict, total=False):
     """WebSocket connection configuration."""
-    url: Required[str]
-    path: Optional[str]
-    message_id_header: Optional[str]
-    routed_queue_capacity: Optional[int]
     backlog: Optional[int]
     execution_mode: WebSocketExecutionMode
+    message_id_header: Optional[str]
+    path: Optional[str]
+    routed_queue_capacity: Optional[int]
+    url: Required[str]
 
 
 class ZeroMqConfig(TypedDict, total=False):
-    url: Required[str]
-    socket_type: Optional[ZeroMqSocketType]
-    topic: Optional[str]
     bind: bool
     internal_buffer_size: Optional[int]
+    socket_type: Optional[ZeroMqSocketType]
+    topic: Optional[str]
+    url: Required[str]
 
 
 FaultMode = Literal["panic", "disconnect", "timeout", "json_format_error", "nack"]
