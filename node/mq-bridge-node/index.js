@@ -1,6 +1,6 @@
 "use strict";
 
-const native = require("./mq_bridge_node.node");
+const native = require("./native.js");
 
 class Message {
   constructor(payload, metadata = null, id = null) {
@@ -136,9 +136,19 @@ class Route {
   }
 }
 
+function configSchema() {
+  if (typeof native.configSchema !== "function") {
+    throw new Error(
+      "configSchema() is unavailable: this build was compiled without the 'schema' feature",
+    );
+  }
+  return native.configSchema();
+}
+
 module.exports = {
   Message,
   Publisher,
   Route,
-  version: native.version,
+  configSchema,
+  version: native.VERSION,
 };

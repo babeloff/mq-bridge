@@ -56,7 +56,7 @@ jobs:
         run: npm ci
 
       - name: Check Rust binding
-        run: cargo check -p mq-bridge-node --no-default-features --features "http middleware"
+        run: cargo check -p mq-bridge-node --no-default-features --features "http middleware schema"
 
       - name: Build native addon
         working-directory: node/mq-bridge-node

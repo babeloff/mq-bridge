@@ -3,7 +3,11 @@ node_modules/
 # napi-rs native build artifacts
 *.node
 *.node.*
+native.js
 native.d.ts
+
+# generated per-platform npm package dirs (created in CI)
+/npm/
 
 # npm logs / local package output
 npm-debug.log*

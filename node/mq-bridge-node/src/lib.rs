@@ -24,6 +24,15 @@ use tokio::sync::oneshot;
 #[napi(js_name = "version")]
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// JSON Schema for the route/config mapping, generated on demand from the
+/// compiled Rust models (no checked-in copy, so it cannot drift).
+#[cfg(feature = "schema")]
+#[napi(js_name = "configSchema")]
+pub fn config_schema() -> Result<JsonValue> {
+    let schema = schemars::schema_for!(core::models::Config);
+    serde_json::to_value(schema).map_err(to_napi_error)
+}
+
 #[napi(object)]
 pub struct NativeMessage {
     pub payload: Buffer,

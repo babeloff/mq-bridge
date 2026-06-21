@@ -20,6 +20,7 @@ fast-uuid-v7.workspace = true
 mq-bridge = { path = "../.." }
 napi = { version = "3", features = ["serde-json"] }
 napi-derive = "3"
+schemars = { version = "1.2", optional = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 serde_yaml_ng.workspace = true
@@ -32,11 +33,11 @@ napi-build = "2"
 [features]
 default = ["full"]
 middleware = ["mq-bridge/middleware"]
-full = ["mq-bridge/full"]
-basic = ["http", "nats", "mqtt", "websocket", "zeromq", "rustls-ring"]
+full = ["mq-bridge/full", "schema"]
+basic = ["http", "nats", "mqtt", "websocket", "zeromq", "rustls-ring", "schema"]
 dedup = ["mq-bridge/dedup"]
 metrics = ["mq-bridge/metrics"]
-schema = ["mq-bridge/schema"]
+schema = ["dep:schemars", "mq-bridge/schema"]
 test-utils = ["mq-bridge/test-utils"]
 kafka = ["mq-bridge/kafka"]
 amqp = ["mq-bridge/amqp"]

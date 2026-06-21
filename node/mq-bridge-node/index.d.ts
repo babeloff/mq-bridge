@@ -42,4 +42,10 @@ export class Route {
   join(): void;
 }
 
+/**
+ * JSON Schema for the route/config mapping, generated from the compiled Rust
+ * models. Throws if the addon was built without the `schema` feature.
+ */
+export function configSchema(): JsonValue;
+
 export const version: string;
