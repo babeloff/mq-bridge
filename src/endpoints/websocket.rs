@@ -5,7 +5,7 @@
 
 use crate::models::WebSocketConfig;
 use crate::traits::{
-    CommitFunc, ConsumerError, Handled, Handler, MessageConsumer, MessageDisposition,
+    BoxFuture, CommitFunc, ConsumerError, Handled, Handler, MessageConsumer, MessageDisposition,
     MessagePublisher, PublisherError, ReceivedBatch, SentBatch,
 };
 use crate::CanonicalMessage;
@@ -24,6 +24,7 @@ use uuid::Uuid;
 
 type WebSocketSourceMessage = (CanonicalMessage, CommitFunc);
 type WebSocketResponseTx = tokio::sync::mpsc::Sender<Message>;
+type ClientWebSocketStream = WebSocketStream<tokio_websockets::MaybeTlsStream<TcpStream>>;
 
 const DEFAULT_WEBSOCKET_LISTEN_BACKLOG: u32 = 4096;
 const WEBSOCKET_REUSEPORT_ENV: &str = "MQ_BRIDGE_WEBSOCKET_REUSEPORT";
@@ -195,13 +196,53 @@ impl Drop for WebSocketConsumer {
 
 pub struct WebSocketPublisher {
     url: String,
+    single_stream: tokio::sync::Mutex<Option<ClientWebSocketStream>>,
 }
 
 impl WebSocketPublisher {
     pub fn new(config: &WebSocketConfig) -> Self {
         Self {
             url: config.url.clone(),
+            single_stream: tokio::sync::Mutex::new(None),
         }
+    }
+
+    async fn connect_stream(&self) -> Result<ClientWebSocketStream, PublisherError> {
+        let uri = self
+            .url
+            .parse()
+            .with_context(|| format!("Invalid WebSocket URL '{}'", self.url))
+            .map_err(PublisherError::Connection)?;
+        let (stream, _) = ClientBuilder::from_uri(uri)
+            .connect()
+            .await
+            .with_context(|| format!("Failed to connect to WebSocket endpoint '{}'", self.url))
+            .map_err(PublisherError::Connection)?;
+        Ok(stream)
+    }
+
+    async fn send_single_reusing_connection(
+        &self,
+        message: CanonicalMessage,
+    ) -> Result<SentBatch, PublisherError> {
+        let mut stream_guard = self.single_stream.lock().await;
+        if stream_guard.is_none() {
+            *stream_guard = Some(self.connect_stream().await?);
+        }
+        let stream = stream_guard
+            .as_mut()
+            .expect("websocket stream was initialized above");
+
+        if let Err(error) = stream.feed(canonical_to_websocket_message(&message)).await {
+            *stream_guard = None;
+            return Err(PublisherError::Retryable(anyhow!(error)));
+        }
+        if let Err(error) = stream.flush().await {
+            *stream_guard = None;
+            return Err(PublisherError::Retryable(anyhow!(error)));
+        }
+
+        Ok(SentBatch::Ack)
     }
 }
 
@@ -720,20 +761,22 @@ impl MessagePublisher for WebSocketPublisher {
         }
 
         trace!(url = %self.url, count = messages.len(), "Sending WebSocket batch");
-        let uri = self
-            .url
-            .parse()
-            .with_context(|| format!("Invalid WebSocket URL '{}'", self.url))
-            .map_err(PublisherError::Connection)?;
-        let (mut stream, _) = ClientBuilder::from_uri(uri)
-            .connect()
-            .await
-            .with_context(|| format!("Failed to connect to WebSocket endpoint '{}'", self.url))
-            .map_err(PublisherError::Connection)?;
+        if messages.len() == 1 {
+            return self
+                .send_single_reusing_connection(
+                    messages
+                        .into_iter()
+                        .next()
+                        .expect("single-message batch should contain one message"),
+                )
+                .await;
+        }
+
+        let mut stream = self.connect_stream().await?;
 
         for message in messages {
             stream
-                .send(canonical_to_websocket_message(&message))
+                .feed(canonical_to_websocket_message(&message))
                 .await
                 .map_err(|error| PublisherError::Retryable(anyhow!(error)))?;
         }
@@ -744,6 +787,24 @@ impl MessagePublisher for WebSocketPublisher {
             .map_err(|error| PublisherError::Retryable(anyhow!(error)))?;
         let _ = stream.close().await;
         Ok(SentBatch::Ack)
+    }
+
+    async fn flush(&self) -> anyhow::Result<()> {
+        let mut stream_guard = self.single_stream.lock().await;
+        if let Some(stream) = stream_guard.as_mut() {
+            stream.flush().await?;
+        }
+        Ok(())
+    }
+
+    fn on_disconnect_hook(&self) -> Option<BoxFuture<'_, anyhow::Result<()>>> {
+        Some(Box::pin(async move {
+            let mut stream_guard = self.single_stream.lock().await;
+            if let Some(mut stream) = stream_guard.take() {
+                let _ = stream.close().await;
+            }
+            Ok(())
+        }))
     }
 
     fn as_any(&self) -> &dyn Any {

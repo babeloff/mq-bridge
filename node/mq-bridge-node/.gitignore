@@ -1,0 +1,18 @@
+node_modules/
+
+# napi-rs native build artifacts
+*.node
+*.node.*
+native.js
+native.d.ts
+
+# generated per-platform npm package dirs + downloaded CI artifacts
+/npm/
+/artifacts/
+
+# npm logs / local package output
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+*.tgz

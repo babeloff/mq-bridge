@@ -114,6 +114,12 @@ jobs:
 
       - name: Build wheels
         uses: PyO3/maturin-action@v1
+        env:
+          # Work around intermittent "HTTP2 framing layer" curl errors when
+          # cargo downloads crates inside the manylinux container.
+          CARGO_HTTP_MULTIPLEXING: "false"
+          CARGO_NET_RETRY: "5"
+          CARGO_NET_GIT_FETCH_WITH_CLI: "true"
         with:
           working-directory: python/mq-bridge-py
           command: build

@@ -103,6 +103,54 @@ async fn websocket_endpoint_handles_binary_payloads() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn websocket_publisher_reuses_connection_for_single_sends() {
+    let mut consumer = WebSocketConsumer::new(&WebSocketConfig {
+        routed_queue_capacity: Some(16),
+        ..WebSocketConfig::new("127.0.0.1:0").with_path("/single-reuse")
+    })
+    .await
+    .expect("consumer should be created");
+    let publisher = WebSocketPublisher::new(&WebSocketConfig::new(consumer.url().to_string()));
+
+    publisher
+        .send(CanonicalMessage::from_vec("first").with_metadata_kv("ws_message_type", "text"))
+        .await
+        .expect("first message should send");
+    publisher
+        .send(CanonicalMessage::from_vec("second").with_metadata_kv("ws_message_type", "text"))
+        .await
+        .expect("second message should send");
+
+    let mut peers = Vec::new();
+    while peers.len() < 2 {
+        let batch = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            consumer.receive_batch(2 - peers.len()),
+        )
+        .await
+        .expect("consumer should not time out")
+        .expect("consumer should receive");
+        let batch_len = batch.messages.len();
+        for message in batch.messages {
+            peers.push(
+                message
+                    .metadata
+                    .get("ws_peer_addr")
+                    .expect("message should include peer addr")
+                    .clone(),
+            );
+        }
+        (batch.commit)(vec![MessageDisposition::Ack; batch_len])
+            .await
+            .expect("commit should succeed");
+    }
+
+    let first_peer = &peers[0];
+    let second_peer = &peers[1];
+    assert_eq!(first_peer, second_peer);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn websocket_publisher_batch_ack_means_all_messages_are_received() {
     let mut consumer = WebSocketConsumer::new(&WebSocketConfig {
         routed_queue_capacity: Some(2048),

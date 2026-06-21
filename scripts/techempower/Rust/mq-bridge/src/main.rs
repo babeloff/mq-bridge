@@ -32,6 +32,7 @@
 //! * Response headers: returned-message metadata becomes response headers and
 //!   `http_status_code` sets the status. hyper adds `Date`/`Content-Length`.
 
+use mq_bridge::endpoints::http::{HttpRequestExt, HTTP_STATUS_CODE};
 use mq_bridge::models::{Endpoint, EndpointType, HttpConfig, ResponseConfig, StaticConfig};
 use mq_bridge::{CanonicalMessage, Handled, HandlerError, Route};
 use std::collections::HashMap;
@@ -70,18 +71,7 @@ fn reply(body: Vec<u8>, content_type: &str) -> CanonicalMessage {
 }
 
 fn error_reply(status: u16, body: &str) -> CanonicalMessage {
-    reply(body.as_bytes().to_vec(), "text/plain")
-        .with_metadata_kv("http_status_code", status.to_string())
-}
-
-/// Parse the `queries` parameter from a raw query string, clamped to 1..=500.
-fn parse_queries(query: &str) -> i64 {
-    query
-        .split('&')
-        .find_map(|pair| pair.strip_prefix("queries="))
-        .and_then(|v| v.parse::<i64>().ok())
-        .unwrap_or(1)
-        .clamp(1, MAX_QUERIES)
+    reply(body.as_bytes().to_vec(), "text/plain").with_metadata_kv(HTTP_STATUS_CODE, status.to_string())
 }
 
 async fn fetch_world(pool: &PgPool) -> Result<World, sqlx::Error> {
@@ -94,9 +84,7 @@ async fn fetch_world(pool: &PgPool) -> Result<World, sqlx::Error> {
 }
 
 async fn handle_request(pool: Option<PgPool>, msg: CanonicalMessage) -> Result<Handled, HandlerError> {
-    let path = msg.metadata.get("http_path").map(String::as_str).unwrap_or("");
-
-    let reply = match path {
+    let reply = match msg.http_path() {
         "/json" => {
             // TechEmpower requires per-request serialization (no pre-rendered string).
             let body = serde_json::to_vec(&JsonMessage { message: "Hello, World!" })
@@ -115,7 +103,7 @@ async fn handle_request(pool: Option<PgPool>, msg: CanonicalMessage) -> Result<H
         "/queries" => match pool {
             None => error_reply(503, "DATABASE_URL not configured"),
             Some(pool) => {
-                let n = parse_queries(msg.metadata.get("http_query").map(String::as_str).unwrap_or(""));
+                let n = msg.query_int("queries").unwrap_or(1).clamp(1, MAX_QUERIES);
                 let mut worlds = Vec::with_capacity(n as usize);
                 for _ in 0..n {
                     worlds.push(fetch_world(&pool).await.map_err(non_retryable)?);
