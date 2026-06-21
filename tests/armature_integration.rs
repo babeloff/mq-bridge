@@ -5,6 +5,8 @@ use std::process::Command;
 #[test]
 #[ignore = "Requires git, internet access, and takes time. Runs downstream integration tests."]
 fn armature_messaging_test() {
+    // External downstream compatibility check. This clones the Armature repo,
+    // patches its mq-bridge usage, and runs its tests; keep it explicit opt-in.
     // Define paths: Use system temp dir to avoid locking/conflicts with local target dir
     let target_dir = env::temp_dir().join("mq_bridge_integration_test");
     let test_dir = target_dir.join("armature_test");

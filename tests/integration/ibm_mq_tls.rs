@@ -12,6 +12,8 @@ use mq_bridge::traits::{MessageConsumer, MessagePublisher};
 #[tokio::test]
 #[ignore = "requires docker compose and openssl/runmqakm"]
 async fn test_ibm_mq_tls_roundtrip() {
+    // Generates local cert material and starts the TLS IBM MQ compose stack.
+    // Requires IBM MQ key database tooling in addition to Docker Compose.
     setup_logging();
 
     // Generate certs and build TLS-enabled IBM MQ config

@@ -32,6 +32,8 @@ routes:
 #[tokio::test]
 #[ignore = "requires local certs and network"]
 async fn test_grpc_tls_roundtrip() {
+    // Generates local cert material and binds localhost ports for an in-process
+    // TLS gRPC pipeline. No Docker is expected.
     setup_logging();
 
     let yaml_val: serde_yaml_ng::Value =
