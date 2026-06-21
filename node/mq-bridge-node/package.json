@@ -1,0 +1,36 @@
+{
+  "name": "mq-bridge",
+  "version": "0.2.0",
+  "description": "Node.js bindings for mq-bridge",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/marcomq/mq-bridge.git",
+    "directory": "node/mq-bridge-node"
+  },
+  "main": "index.js",
+  "types": "index.d.ts",
+  "files": [
+    "index.js",
+    "index.d.ts",
+    "*.node"
+  ],
+  "napi": {
+    "binaryName": "mq_bridge_node"
+  },
+  "scripts": {
+    "build": "napi build --release",
+    "build:basic": "napi build --release --no-default-features --features \"basic middleware\" --dts native.d.ts",
+    "build:ci": "napi build --no-default-features --features \"http middleware\" --dts native.d.ts",
+    "build:debug": "napi build",
+    "example": "node examples/http-handler.js",
+    "test": "node --test test/*.test.js",
+    "artifacts": "napi artifacts"
+  },
+  "devDependencies": {
+    "@napi-rs/cli": "^3.0.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
