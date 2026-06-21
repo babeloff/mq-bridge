@@ -45,6 +45,11 @@ impl AwsConsumer {
 
 #[async_trait]
 impl MessageConsumer for AwsConsumer {
+    // SQS acks by deleting each message by its receipt handle, so commits are
+    // independent and safe to run concurrently and out of order.
+    fn commit_requires_order(&self) -> bool {
+        false
+    }
     async fn receive_batch(&mut self, max_messages: usize) -> Result<ReceivedBatch, ConsumerError> {
         let mut messages = Vec::with_capacity(max_messages);
         let mut receipt_handles = Vec::with_capacity(max_messages);

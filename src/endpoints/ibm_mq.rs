@@ -710,6 +710,9 @@ pub struct IbmMqConsumer {
 
 #[async_trait]
 impl MessageConsumer for IbmMqConsumer {
+    // Intentionally keeps the ordered default: messages are retrieved under an MQ
+    // syncpoint and committed/backed-out as one transaction, so commits must stay
+    // serialized and in order to preserve transaction boundaries.
     async fn receive_batch(
         &mut self,
         max_messages: usize,

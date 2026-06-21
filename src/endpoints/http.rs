@@ -1236,6 +1236,11 @@ async fn spawn_tls_server(
 
 #[async_trait]
 impl MessageConsumer for HttpConsumer {
+    // Each request is acked/replied independently (no shared cursor), so commits
+    // can run concurrently and out of order.
+    fn commit_requires_order(&self) -> bool {
+        false
+    }
     async fn receive_batch(&mut self, max_messages: usize) -> Result<ReceivedBatch, ConsumerError> {
         let max_messages = max_messages.max(1);
 

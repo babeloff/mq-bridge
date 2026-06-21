@@ -77,6 +77,12 @@ impl GrpcConsumer {
 
 #[async_trait]
 impl MessageConsumer for GrpcConsumer {
+    // Both modes use no-op commits (client mode subscribes to a server stream with
+    // no ack; server mode replies per call), so commits are order-independent.
+    fn commit_requires_order(&self) -> bool {
+        false
+    }
+
     async fn receive_batch(
         &mut self,
         max_messages: usize,

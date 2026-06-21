@@ -98,6 +98,10 @@ impl StaticRequestConsumer {
 
 #[async_trait]
 impl MessageConsumer for StaticRequestConsumer {
+    // Committing is a no-op for a static consumer, so ordering is irrelevant.
+    fn commit_requires_order(&self) -> bool {
+        false
+    }
     async fn receive(&mut self) -> Result<Received, ConsumerError> {
         let mut message = CanonicalMessage::new_bytes(self.payload.clone(), None);
         message.metadata = self.metadata.clone();

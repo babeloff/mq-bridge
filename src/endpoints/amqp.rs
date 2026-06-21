@@ -713,6 +713,14 @@ fn delivery_to_canonical_message(delivery: &lapin::message::Delivery) -> Canonic
 
 #[async_trait]
 impl MessageConsumer for AmqpConsumer {
+    // AMQP acks each delivery individually (`BasicAckOptions::default()` =>
+    // multiple: false; nacks via BasicNack), and already acks a batch's deliveries
+    // concurrently via buffer_unordered. Out-of-order acks across batches are
+    // therefore safe: un-acked deliveries are redelivered on reconnect, so this is
+    // NOT a cumulative-ack transport despite historically sharing the sequencer.
+    fn commit_requires_order(&self) -> bool {
+        false
+    }
     async fn receive_batch(&mut self, max_messages: usize) -> Result<ReceivedBatch, ConsumerError> {
         if self.is_poisoned.load(Ordering::Relaxed) {
             return Err(ConsumerError::Connection(anyhow::anyhow!(

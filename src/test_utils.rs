@@ -656,7 +656,16 @@ impl Drop for PerformanceSummaryPrinter {
             "{:-<25}-|-{:->15}-|-{:->15}-|-{:->15}-|-{:->15}",
             "", "", "", "", ""
         );
-        for result in results.iter() {
+        // Group each broker's direct and "<broker> Pipeline" rows next to each other
+        // so the direct-vs-pipeline gap (route-layer overhead) is easy to read off.
+        let mut sorted: Vec<&PerformanceResult> = results.iter().collect();
+        sorted.sort_by(|a, b| {
+            let base = |n: &str| n.trim_end_matches(" Pipeline").to_string();
+            base(&a.test_name)
+                .cmp(&base(&b.test_name))
+                .then(a.test_name.cmp(&b.test_name))
+        });
+        for result in sorted {
             println!(
                 "{:<25} | {:>15} | {:>15} | {:>15} | {:>15}",
                 result.test_name,

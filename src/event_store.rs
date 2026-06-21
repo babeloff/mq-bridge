@@ -477,6 +477,9 @@ pub struct EventStoreConsumer {
 
 #[async_trait]
 impl MessageConsumer for EventStoreConsumer {
+    // Intentionally keeps the ordered default: the consumer advances a per-reader
+    // position cursor in the log, so out-of-order commits could skip un-acked
+    // events. (Backs the memory Log and file-event-store backends.)
     async fn receive_batch(&mut self, max_messages: usize) -> Result<ReceivedBatch, ConsumerError> {
         self.store
             .register_subscriber(self.subscriber_id.clone())

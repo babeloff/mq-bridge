@@ -749,6 +749,11 @@ impl MongoDbConsumer {
 
 #[async_trait]
 impl MessageConsumer for MongoDbConsumer {
+    // MongoDB acks each document individually (update/delete by id), so commits
+    // can run concurrently and out of order.
+    fn commit_requires_order(&self) -> bool {
+        false
+    }
     async fn receive(&mut self) -> Result<Received, ConsumerError> {
         let extra_filter = self.receive_query.clone().unwrap_or_default();
         loop {

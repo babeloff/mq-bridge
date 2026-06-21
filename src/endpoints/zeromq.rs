@@ -372,6 +372,11 @@ impl ZeroMqConsumer {
 }
 #[async_trait]
 impl MessageConsumer for ZeroMqConsumer {
+    // ZeroMQ has no broker-side ack (commit only routes per-message REQ/REP
+    // replies or is a no-op), so commits are order-independent.
+    fn commit_requires_order(&self) -> bool {
+        false
+    }
     async fn receive_batch(&mut self, max_messages: usize) -> Result<ReceivedBatch, ConsumerError> {
         if max_messages == 0 {
             return Ok(ReceivedBatch {

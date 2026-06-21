@@ -279,6 +279,10 @@ impl MqttConsumer {
 
 #[async_trait]
 impl MessageConsumer for MqttConsumer {
+    // MQTT acks per packet id (PUBACK), so commits are order-independent.
+    fn commit_requires_order(&self) -> bool {
+        false
+    }
     async fn receive(&mut self) -> Result<Received, ConsumerError> {
         self.0.receive().await
     }
@@ -364,6 +368,10 @@ impl MqttListener {
 
 #[async_trait]
 impl MessageConsumer for MqttListener {
+    // MQTT acks per packet id (PUBACK), so commits are order-independent.
+    fn commit_requires_order(&self) -> bool {
+        false
+    }
     async fn receive(&mut self) -> Result<Received, ConsumerError> {
         let internal = self
             .message_rx

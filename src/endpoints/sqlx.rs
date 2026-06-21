@@ -662,6 +662,12 @@ impl SqlxConsumer {
 }
 #[async_trait]
 impl MessageConsumer for SqlxConsumer {
+    // Acking deletes rows by id (`DELETE ... WHERE id IN (...)`), so each batch's
+    // commit is independent; out-of-order concurrent commits cannot lose other
+    // batches' rows.
+    fn commit_requires_order(&self) -> bool {
+        false
+    }
     async fn receive_batch(&mut self, max_messages: usize) -> Result<ReceivedBatch, ConsumerError> {
         if max_messages == 0 {
             return Ok(ReceivedBatch {

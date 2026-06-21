@@ -188,12 +188,14 @@ impl MessagePublisher for NatsPublisher {
 
         match &self.client {
             NatsClient::JetStream(_jetstream) => {
-                // Use send_batch_helper to send messages sequentially.
-                // This avoids overwhelming the NATS client buffer with too many in-flight messages when using JetStream with acks.
+                // send_batch_helper pipelines the per-message PubAcks (bounded
+                // in-flight, order preserved), so batch_size now translates into
+                // overlapping acks instead of one serial round trip per message.
                 crate::traits::send_batch_helper(self, messages, |p, m| Box::pin(p.send(m))).await
             }
             NatsClient::Core(_) => {
-                // Core NATS is fire-and-forget, so the helper is efficient enough.
+                // Core NATS is fire-and-forget (no server ack); the helper just
+                // streams the publishes into the client write buffer.
                 crate::traits::send_batch_helper(self, messages, |p, m| Box::pin(p.send(m))).await
             }
         }
@@ -292,6 +294,12 @@ impl NatsConsumer {
 
 #[async_trait]
 impl MessageConsumer for NatsConsumer {
+    // JetStream acks each message individually (and Core has no ack), so commits
+    // can run concurrently without risking the data loss cumulative-ack brokers face.
+    fn commit_requires_order(&self) -> bool {
+        false
+    }
+
     async fn receive_batch(&mut self, max_messages: usize) -> Result<ReceivedBatch, ConsumerError> {
         self.core
             .receive_batch(max_messages, &self.subject, &self.client)

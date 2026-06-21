@@ -214,6 +214,11 @@ impl SledConsumer {
 
 #[async_trait]
 impl MessageConsumer for SledConsumer {
+    // Acking removes each message from the inflight tree by key (or is a no-op when
+    // not deleting), so commits are independent and order-free.
+    fn commit_requires_order(&self) -> bool {
+        false
+    }
     async fn receive(&mut self) -> Result<Received, ConsumerError> {
         loop {
             let next_item = if self.delete_after_read {

@@ -255,6 +255,23 @@ pub trait MessageConsumer: Send + Sync {
         })
     }
 
+    /// Whether this consumer's commits (acks) must be applied in the order the
+    /// batches were received.
+    ///
+    /// Defaults to `true` (the safe choice). Cumulative-ack transports such as
+    /// Kafka and AMQP **must** keep this `true`: acking a later offset implicitly
+    /// acks everything before it, so committing out of order would silently drop
+    /// the messages in between on a crash. For these the route funnels commits
+    /// through a single ordered sequencer.
+    ///
+    /// Transports that ack each message/batch individually (NATS JetStream,
+    /// MQTT, MongoDB, in-memory) can override this to `false`. The route then runs
+    /// their commits concurrently (bounded by `commit_concurrency_limit`) instead
+    /// of serially, which removes the per-batch ack round trip as a throughput cap.
+    fn commit_requires_order(&self) -> bool {
+        true
+    }
+
     async fn status(&self) -> EndpointStatus {
         EndpointStatus {
             healthy: true,
@@ -473,10 +490,21 @@ pub trait CustomMiddlewareFactory: Send + Sync + std::fmt::Debug {
     }
 }
 
+/// Default number of per-message sends kept in flight concurrently by
+/// [`send_batch_helper`]. Bounds in-flight work so a large batch cannot overwhelm
+/// the underlying client's buffers (e.g. NATS JetStream PubAcks).
+pub const SEND_BATCH_CONCURRENCY: usize = 128;
+
 /// A helper function to send messages in bulk by calling `send` for each one.
 /// This is useful for `MessagePublisher` implementations that don't have a native bulk sending mechanism.
 /// Requires that "send" is implemented for the publisher. Otherwise causes an infinite loop,
 /// as send is calling "send_batch" by default.
+///
+/// Sends are pipelined: up to [`SEND_BATCH_CONCURRENCY`] are kept in flight at once
+/// via `buffered`, which preserves message order (futures are started and their
+/// results collected in input order) while overlapping per-message round trips
+/// (e.g. JetStream PubAcks). This is the same enqueue-in-order / await-acks-pipelined
+/// shape the native Kafka and AMQP paths use, so ordered transports stay ordered.
 pub async fn send_batch_helper<P: MessagePublisher + ?Sized>(
     publisher: &P,
     messages: Vec<CanonicalMessage>,
@@ -484,46 +512,29 @@ pub async fn send_batch_helper<P: MessagePublisher + ?Sized>(
         + Send
         + Sync,
 ) -> Result<SentBatch, PublisherError> {
+    use futures::stream::StreamExt;
+
     let mut responses = Vec::new();
     let mut failed_messages = Vec::new();
 
-    let mut iter = messages.into_iter();
-    while let Some(msg) = iter.next() {
-        match callback(publisher, msg.clone()).await {
+    // Pair each result with its message so failures can report the message back.
+    // `buffered` preserves order, so results arrive in the same order as `messages`.
+    let callback = &callback;
+    let mut results = futures::stream::iter(messages.into_iter().map(|msg| async move {
+        let result = callback(publisher, msg.clone()).await;
+        (msg, result)
+    }))
+    .buffered(SEND_BATCH_CONCURRENCY);
+
+    while let Some((msg, result)) = results.next().await {
+        match result {
             Ok(Sent::Response(resp)) => responses.push(resp),
             Ok(Sent::Ack) => {}
-            Err(PublisherError::Retryable(e)) => {
-                // A retryable error likely affects the whole connection.
-                // We must return what succeeded so far (responses) and mark the rest as failed.
-                failed_messages.push((msg, PublisherError::Retryable(e)));
-                for m in iter {
-                    failed_messages.push((
-                        m,
-                        PublisherError::Retryable(anyhow::anyhow!(
-                            "Batch aborted due to previous error"
-                        )),
-                    ));
-                }
-                break;
-            }
-            Err(PublisherError::Connection(e)) => {
-                // Treat connection errors as affecting the whole batch, propagate immediately.
-                failed_messages.push((msg, PublisherError::Connection(e)));
-                for m in iter {
-                    failed_messages.push((
-                        m,
-                        PublisherError::Connection(anyhow::anyhow!(
-                            "Batch aborted due to previous connection error"
-                        )),
-                    ));
-                }
-                break;
-            }
-            Err(PublisherError::NonRetryable(e)) => {
-                // A non-retryable error is specific to this message.
-                // Collect it and continue with the rest of the batch.
-                failed_messages.push((msg, PublisherError::NonRetryable(e)));
-            }
+            // Each send is awaited independently, so report each message's actual
+            // outcome. Transient (Retryable/Connection) failures are surfaced with
+            // their error so the route can Nack them for redelivery; messages that
+            // did succeed before/around the failure are not needlessly resent.
+            Err(e) => failed_messages.push((msg, e)),
         }
     }
 
@@ -623,17 +634,56 @@ mod tests {
                 assert_eq!(resps.len(), 1);
                 assert_eq!(resps[0].get_payload_str(), "resp1");
 
-                // 2. Verify failures
-                // Message 2 failed explicitly
-                // Message 3 failed implicitly because batch was aborted
-                assert_eq!(failed.len(), 2);
+                // 2. Verify failures. Sends are pipelined and awaited independently,
+                // so only message 2 (the one that errored) is reported failed;
+                // message 3 still succeeds (Ack) and is not needlessly resent.
+                assert_eq!(failed.len(), 1);
                 assert_eq!(failed[0].0.get_payload_str(), "2");
                 assert!(matches!(failed[0].1, PublisherError::Retryable(_)));
-
-                assert_eq!(failed[1].0.get_payload_str(), "3");
-                assert!(matches!(failed[1].1, PublisherError::Retryable(_)));
             }
             _ => panic!("Expected Partial result"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_send_batch_helper_preserves_response_order() {
+        // The first message resolves last (longest sleep). With `buffered` the
+        // responses must still come back in input order; an unordered combinator
+        // would surface them in completion order instead.
+        let publisher = MockPublisher;
+        let count = 16u64;
+        let msgs: Vec<CanonicalMessage> = (0..count)
+            .map(|i| CanonicalMessage::from(i.to_string()))
+            .collect();
+
+        let result = send_batch_helper(&publisher, msgs, |_pub, msg| {
+            Box::pin(async move {
+                let i: u64 = msg.get_payload_str().parse().unwrap();
+                // Earlier messages sleep longer, so completion order is reversed.
+                tokio::time::sleep(std::time::Duration::from_millis((count - i) * 2)).await;
+                let mut resp = CanonicalMessage::from(msg.get_payload_str().to_string());
+                resp.message_id = msg.message_id;
+                Ok(Sent::Response(resp))
+            })
+        })
+        .await
+        .unwrap();
+
+        match result {
+            SentBatch::Partial { responses, failed } => {
+                assert!(failed.is_empty());
+                let responses = responses.expect("expected responses");
+                let order: Vec<u64> = responses
+                    .iter()
+                    .map(|r| r.get_payload_str().parse().unwrap())
+                    .collect();
+                assert_eq!(
+                    order,
+                    (0..count).collect::<Vec<u64>>(),
+                    "buffered must preserve input order",
+                );
+            }
+            SentBatch::Ack => panic!("expected per-message responses"),
         }
     }
 

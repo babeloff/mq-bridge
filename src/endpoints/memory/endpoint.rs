@@ -743,6 +743,11 @@ impl Drop for RequeueGuard {
 
 #[async_trait]
 impl MessageConsumer for MemoryQueueConsumer {
+    // Channel-backed: commit only requeues this batch's own nacks (no cursor),
+    // so commits are order-independent.
+    fn commit_requires_order(&self) -> bool {
+        false
+    }
     async fn receive_batch(&mut self, max_messages: usize) -> Result<ReceivedBatch, ConsumerError> {
         // If the internal buffer has messages, return them first.
 
@@ -868,6 +873,10 @@ impl MessageConsumer for MemoryQueueConsumer {
 
 #[async_trait]
 impl MessageConsumer for TransportQueueConsumer {
+    // Channel-backed: no cursor, commits are order-independent.
+    fn commit_requires_order(&self) -> bool {
+        false
+    }
     async fn receive_batch(&mut self, max_messages: usize) -> Result<ReceivedBatch, ConsumerError> {
         let mut messages = Vec::with_capacity(max_messages);
         let buffered = self.buffer.len().min(max_messages);
@@ -978,6 +987,16 @@ async fn handle_memory_reply(
 
 #[async_trait]
 impl MessageConsumer for MemoryConsumer {
+    // Delegate to the active backend: channel backends commit order-independently;
+    // the Log (event-store) backend keeps the conservative default because its
+    // per-subscriber cursor is position-based.
+    fn commit_requires_order(&self) -> bool {
+        match self {
+            Self::Queue(q) => q.commit_requires_order(),
+            Self::Transport(t) => t.commit_requires_order(),
+            Self::Log { consumer, .. } => consumer.commit_requires_order(),
+        }
+    }
     async fn receive_batch(&mut self, max_messages: usize) -> Result<ReceivedBatch, ConsumerError> {
         match self {
             Self::Queue(q) => q.receive_batch(max_messages).await,
@@ -1046,6 +1065,9 @@ impl MemorySubscriber {
 
 #[async_trait]
 impl MessageConsumer for MemorySubscriber {
+    fn commit_requires_order(&self) -> bool {
+        self.consumer.commit_requires_order()
+    }
     async fn receive_batch(&mut self, max_messages: usize) -> Result<ReceivedBatch, ConsumerError> {
         self.consumer.receive_batch(max_messages).await
     }
