@@ -416,59 +416,35 @@ impl Publisher {
     }
 
     #[napi]
-    pub fn send(&self, message: NativeMessage) -> Result<()> {
-        let message = message.into_canonical()?;
-        let publisher = self.publisher.clone();
-        let runtime = Arc::clone(&self.runtime);
-        run_sync_task(&runtime, async move {
-            match publisher.send(message).await? {
-                Sent::Ack | Sent::Response(_) => Ok(()),
-            }
-        })
+    pub async fn send(&self, message: NativeMessage) -> Result<()> {
+        self.send_on_runtime(message.into_canonical()?).await
     }
 
     #[napi]
-    pub fn request(&self, message: NativeMessage) -> Result<NativeMessage> {
-        let message = message.into_canonical()?;
-        let publisher = self.publisher.clone();
-        let runtime = Arc::clone(&self.runtime);
-        run_sync_task(&runtime, async move {
-            let response = publisher.request(message).await?;
-            Ok(NativeMessage::from_canonical(&response))
-        })
+    pub async fn request(&self, message: NativeMessage) -> Result<NativeMessage> {
+        self.request_on_runtime(message.into_canonical()?).await
     }
 
     #[napi]
-    pub fn send_json(
+    pub async fn send_json(
         &self,
         data: JsonValue,
         metadata: Option<HashMap<String, String>>,
         id: Option<String>,
     ) -> Result<()> {
-        let message = json_input_to_canonical(data, metadata, id.as_deref())?;
-        let publisher = self.publisher.clone();
-        let runtime = Arc::clone(&self.runtime);
-        run_sync_task(&runtime, async move {
-            match publisher.send(message).await? {
-                Sent::Ack | Sent::Response(_) => Ok(()),
-            }
-        })
+        self.send_on_runtime(json_input_to_canonical(data, metadata, id.as_deref())?)
+            .await
     }
 
     #[napi]
-    pub fn request_json(
+    pub async fn request_json(
         &self,
         data: JsonValue,
         metadata: Option<HashMap<String, String>>,
         id: Option<String>,
     ) -> Result<NativeMessage> {
-        let message = json_input_to_canonical(data, metadata, id.as_deref())?;
-        let publisher = self.publisher.clone();
-        let runtime = Arc::clone(&self.runtime);
-        run_sync_task(&runtime, async move {
-            let response = publisher.request(message).await?;
-            Ok(NativeMessage::from_canonical(&response))
-        })
+        self.request_on_runtime(json_input_to_canonical(data, metadata, id.as_deref())?)
+            .await
     }
 }
 
@@ -479,6 +455,26 @@ impl Publisher {
             .block_on(CorePublisher::new(endpoint))
             .map_err(to_napi_error)?;
         Ok(Self { runtime, publisher })
+    }
+
+    // Run the work on this publisher's own runtime (where its transport is
+    // bound) and await the result without blocking the JS thread. Awaiting the
+    // JoinHandle is runtime-agnostic, so napi's executor only parks on it.
+    async fn send_on_runtime(&self, message: CanonicalMessage) -> Result<()> {
+        let publisher = self.publisher.clone();
+        let handle = self.runtime.spawn(async move { publisher.send(message).await });
+        match handle.await.map_err(to_napi_error)?.map_err(to_napi_error)? {
+            Sent::Ack | Sent::Response(_) => Ok(()),
+        }
+    }
+
+    async fn request_on_runtime(&self, message: CanonicalMessage) -> Result<NativeMessage> {
+        let publisher = self.publisher.clone();
+        let handle = self
+            .runtime
+            .spawn(async move { publisher.request(message).await });
+        let response = handle.await.map_err(to_napi_error)?.map_err(to_napi_error)?;
+        Ok(NativeMessage::from_canonical(&response))
     }
 }
 
@@ -624,13 +620,6 @@ fn parse_message_id(id: &str) -> Result<u128> {
 
 fn format_message_id(message_id: u128) -> String {
     fast_uuid_v7::format_uuid(message_id).to_string()
-}
-
-fn run_sync_task<F, T>(runtime: &Runtime, future: F) -> Result<T>
-where
-    F: std::future::Future<Output = anyhow::Result<T>>,
-{
-    runtime.block_on(future).map_err(to_napi_error)
 }
 
 fn active_route_names() -> &'static Mutex<HashSet<String>> {

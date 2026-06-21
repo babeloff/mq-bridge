@@ -14,8 +14,7 @@
     "index.js",
     "index.d.ts",
     "native.js",
-    "native.d.ts",
-    "*.node"
+    "native.d.ts"
   ],
   "napi": {
     "binaryName": "mq_bridge_node",
@@ -34,7 +33,16 @@
     "build:debug": "napi build --platform --js native.js --dts native.d.ts",
     "example": "node examples/http-handler.js",
     "test": "node --test test/*.test.js",
-    "sync-version": "node scripts/sync-version.mjs"
+    "sync-version": "node scripts/sync-version.mjs",
+    "create-npm-dirs": "napi create-npm-dirs",
+    "artifacts": "napi artifacts"
+  },
+  "optionalDependencies": {
+    "mq-bridge-darwin-x64": "0.2.20",
+    "mq-bridge-darwin-arm64": "0.2.20",
+    "mq-bridge-linux-x64-gnu": "0.2.20",
+    "mq-bridge-linux-arm64-gnu": "0.2.20",
+    "mq-bridge-win32-x64-msvc": "0.2.20"
   },
   "devDependencies": {
     "@napi-rs/cli": "^3.0.0"

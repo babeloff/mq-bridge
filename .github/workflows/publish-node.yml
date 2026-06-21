@@ -1,14 +1,20 @@
 name: Publish Node Package
 
-# Publishes a single self-contained `mq-bridge` npm package that bundles the
-# native addon for every supported platform. The napi-rs loader (native.js)
-# resolves the matching `mq_bridge_node.<triple>.node` locally at require time,
-# so there are no per-platform sub-packages.
+# Publishes the napi-rs addon as the standard layout: a thin root package
+# `mq-bridge` plus one binary package per platform
+# (`mq-bridge-darwin-arm64`, `mq-bridge-linux-x64-gnu`, ...). The root lists the
+# platform packages as optionalDependencies, so each consumer downloads only its
+# own ~20MB binary; the napi loader (native.js) requires the matching one.
 #
-# Auth: OIDC trusted publishing only — NO npm token. Because only one package is
-# published, a single trusted-publisher entry on npmjs.com is enough (configure
-# it once against this repo + workflow). npm >= 11.5.1 performs the OIDC
-# handshake and attaches build provenance automatically.
+# Linux is built inside a Debian 11 (glibc 2.31) container so the binaries run on
+# RHEL 9 (glibc 2.34), Debian 11/12 and Ubuntu 20.04+ — covering the priority
+# server targets. macOS/Windows build natively.
+#
+# Auth: token-or-OIDC. If the `NPM_TOKEN` secret is set it is used (needed for the
+# one-time bootstrap that creates the 5 platform packages, since npm has no
+# pending-publisher concept). Once all six packages exist and trusted publishing
+# is configured for them, remove the secret and publishing continues via OIDC
+# (id-token) with provenance — no token.
 
 on:
   release:
@@ -20,28 +26,81 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build:
+  build-linux:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    container:
+      # Debian 11 bullseye => glibc 2.31 baseline (runs on RHEL 9 / Debian 11+ /
+      # Ubuntu 20.04+). Pulled natively per arch on the matching runner.
+      image: node:20-bullseye
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v4
+
+      # rdkafka builds librdkafka from source (cc/make) and aws-lc-sys needs
+      # cmake; the slim node image lacks these.
+      - name: Install build toolchain
+        run: |
+          apt-get update -qq
+          apt-get install -y --no-install-recommends build-essential cmake perl pkg-config
+
+      - name: Install Rust toolchain
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Install Node dependencies
+        working-directory: node/mq-bridge-node
+        run: npm ci
+
+      - name: Build native addon (full)
+        working-directory: node/mq-bridge-node
+        env:
+          CARGO_NET_RETRY: "5"
+          CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+        run: >-
+          npx napi build --platform --release --strip
+          --target ${{ matrix.target }}
+          --js native.js --dts native.d.ts
+
+      - name: Upload addon
+        uses: actions/upload-artifact@v4
+        with:
+          name: bindings-${{ matrix.target }}
+          path: node/mq-bridge-node/*.node
+          if-no-files-found: error
+
+      # The root package ships the generated loader; upload it once.
+      - name: Upload loader
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        uses: actions/upload-artifact@v4
+        with:
+          name: loader
+          path: |
+            node/mq-bridge-node/native.js
+            node/mq-bridge-node/native.d.ts
+          if-no-files-found: error
+
+  build-native:
     name: Build ${{ matrix.target }}
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
-      # Runner choices mirror publish-python.yml, where the same `full` C deps
-      # (rdkafka, zeromq, aws-lc) are already built on all five platforms.
-      # NOTE: Linux binaries link against the runner's glibc. For older-distro
-      # support, switch these to a manylinux/zig build later.
       matrix:
         include:
           - runner: macos-15-intel
             target: x86_64-apple-darwin
           - runner: macos-latest
             target: aarch64-apple-darwin
-          - runner: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-          - runner: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
           - runner: windows-latest
             target: x86_64-pc-windows-msvc
-
     steps:
       - uses: actions/checkout@v4
 
@@ -75,16 +134,13 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: bindings-${{ matrix.target }}
-          path: |
-            node/mq-bridge-node/*.node
-            node/mq-bridge-node/native.js
-            node/mq-bridge-node/native.d.ts
+          path: node/mq-bridge-node/*.node
           if-no-files-found: error
 
   publish:
     name: Publish to npm
     runs-on: ubuntu-latest
-    needs: build
+    needs: [build-linux, build-native]
     permissions:
       contents: read
       id-token: write # OIDC trusted publishing + provenance
@@ -96,28 +152,56 @@ jobs:
         with:
           node-version: "20"
           registry-url: "https://registry.npmjs.org"
+          cache: npm
+          cache-dependency-path: node/mq-bridge-node/package-lock.json
 
       # Trusted publishing (OIDC) requires npm >= 11.5.1.
       - name: Update npm
         run: npm install -g npm@latest
 
+      - name: Install Node dependencies
+        working-directory: node/mq-bridge-node
+        run: npm ci
+
       - name: Sync version from Cargo workspace
         working-directory: node/mq-bridge-node
         run: npm run sync-version
 
-      - name: Download all platform addons
+      - name: Download loader into package root
         uses: actions/download-artifact@v4
         with:
+          name: loader
           path: node/mq-bridge-node
+
+      - name: Download platform addons
+        uses: actions/download-artifact@v4
+        with:
           pattern: bindings-*
-          merge-multiple: true
+          path: node/mq-bridge-node/artifacts
 
-      - name: List package contents
+      - name: Create per-platform npm dirs
         working-directory: node/mq-bridge-node
+        run: npx napi create-npm-dirs
+
+      - name: Distribute addons into npm dirs
+        working-directory: node/mq-bridge-node
+        run: npx napi artifacts -d artifacts
+
+      - name: List npm dirs
+        working-directory: node/mq-bridge-node
+        run: ls -R npm
+
+      - name: Publish platform packages and root
+        working-directory: node/mq-bridge-node
+        env:
+          # Empty when the secret is unset -> npm falls back to OIDC.
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NPM_CONFIG_PROVENANCE: "true"
         run: |
-          ls -lh *.node native.js native.d.ts
-          npm pack --dry-run
-
-      - name: Publish (OIDC, no token)
-        working-directory: node/mq-bridge-node
-        run: npm publish --access public
+          set -e
+          for dir in npm/*/; do
+            echo "Publishing $dir"
+            npm publish "$dir" --access public
+          done
+          echo "Publishing root package"
+          npm publish --access public

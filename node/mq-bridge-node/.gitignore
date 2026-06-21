@@ -6,8 +6,9 @@ node_modules/
 native.js
 native.d.ts
 
-# generated per-platform npm package dirs (created in CI)
+# generated per-platform npm package dirs + downloaded CI artifacts
 /npm/
+/artifacts/
 
 # npm logs / local package output
 npm-debug.log*

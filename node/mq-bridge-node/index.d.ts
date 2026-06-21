@@ -25,10 +25,10 @@ export class Publisher {
   static fromYaml(path: string, name: string): Publisher;
   static fromYamlStr(text: string, name: string): Publisher;
   static fromConfig(config: JsonValue, name: string): Publisher;
-  send(message: Message): void;
-  request(message: Message): Message;
-  sendJson(data: JsonValue, metadata?: Metadata | null, id?: string | null): void;
-  requestJson(data: JsonValue, metadata?: Metadata | null, id?: string | null): Message;
+  send(message: Message): Promise<void>;
+  request(message: Message): Promise<Message>;
+  sendJson(data: JsonValue, metadata?: Metadata | null, id?: string | null): Promise<void>;
+  requestJson(data: JsonValue, metadata?: Metadata | null, id?: string | null): Promise<Message>;
 }
 
 export class Route {

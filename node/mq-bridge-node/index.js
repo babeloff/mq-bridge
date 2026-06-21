@@ -70,19 +70,19 @@ class Publisher {
   }
 
   send(message) {
-    this._native.send(Message._toNative(message));
+    return this._native.send(Message._toNative(message));
   }
 
-  request(message) {
-    return Message._fromNative(this._native.request(Message._toNative(message)));
+  async request(message) {
+    return Message._fromNative(await this._native.request(Message._toNative(message)));
   }
 
   sendJson(data, metadata = null, id = null) {
-    this._native.sendJson(data, metadata, id);
+    return this._native.sendJson(data, metadata, id);
   }
 
-  requestJson(data, metadata = null, id = null) {
-    return Message._fromNative(this._native.requestJson(data, metadata, id));
+  async requestJson(data, metadata = null, id = null) {
+    return Message._fromNative(await this._native.requestJson(data, metadata, id));
   }
 }
 

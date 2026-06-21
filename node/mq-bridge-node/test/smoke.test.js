@@ -68,7 +68,7 @@ test("Message round-trips JSON, text, metadata, and ids", () => {
   assert.equal(raw.metadata.source, "test");
 });
 
-test("Publisher.requestJson echoes through response endpoint", () => {
+test("Publisher.requestJson echoes through response endpoint", async () => {
   const publisher = Publisher.fromYamlStr(
     `
 publishers:
@@ -78,7 +78,7 @@ publishers:
     "echo",
   );
 
-  const response = publisher.requestJson({ orderId: 7 }, { kind: "order.test" });
+  const response = await publisher.requestJson({ orderId: 7 }, { kind: "order.test" });
   assert.deepEqual(response.json(), { orderId: 7 });
   assert.equal(response.metadata.kind, "order.test");
 });
