@@ -19,6 +19,7 @@
 //!   Tokio multi-thread runtime, one task per connection, bypassing the route
 //!   worker/disposition pipeline.
 
+use mq_bridge::endpoints::http::{HttpRequestExt, HTTP_STATUS_CODE};
 use mq_bridge::models::{Endpoint, EndpointType, HttpConfig};
 use mq_bridge::{CanonicalMessage, Handled, HandlerError, Route};
 
@@ -34,16 +35,11 @@ fn text_200(body: Vec<u8>) -> CanonicalMessage {
 }
 
 fn not_found() -> CanonicalMessage {
-    CanonicalMessage::new(b"Not Found".to_vec(), None)
-        .with_metadata_kv("content-type", "text/plain")
-        .with_metadata_kv("http_status_code", "404")
+    text_200(b"Not Found".to_vec()).with_metadata_kv(HTTP_STATUS_CODE, "404")
 }
 
 async fn handle(msg: CanonicalMessage) -> Result<Handled, HandlerError> {
-    let method = msg.metadata.get("http_method").map(String::as_str).unwrap_or("");
-    let path = msg.metadata.get("http_path").map(String::as_str).unwrap_or("");
-
-    let reply = match (method, path) {
+    let reply = match (msg.http_method(), msg.http_path()) {
         ("GET", "/") => empty_200(),
         ("POST", "/user") => empty_200(),
         ("GET", p) => match p.strip_prefix(USER_PREFIX) {

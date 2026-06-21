@@ -411,6 +411,128 @@ pub fn guess_content_type(path_or_extension: &str) -> &'static str {
     }
 }
 
+/// Metadata key holding the request method (e.g. `GET`).
+pub const HTTP_METHOD: &str = "http_method";
+/// Metadata key holding the request path (e.g. `/users`).
+pub const HTTP_PATH: &str = "http_path";
+/// Metadata key holding the raw request query string, without the leading `?`.
+pub const HTTP_QUERY: &str = "http_query";
+/// Metadata key holding the negotiated HTTP version (e.g. `HTTP/1.1`).
+pub const HTTP_VERSION: &str = "http_version";
+/// Metadata key that, when set on a reply, overrides the response status code.
+pub const HTTP_STATUS_CODE: &str = "http_status_code";
+
+/// Reads the request line and headers a handler receives from an [`http`]
+/// consumer, which exposes them as message metadata. These accessors save a
+/// handler from hardcoding the metadata keys and the `metadata.get(..)` dance:
+///
+/// ```no_run
+/// use mq_bridge::endpoints::http::HttpRequestExt;
+/// use mq_bridge::CanonicalMessage;
+///
+/// fn route(msg: &CanonicalMessage) -> i64 {
+///     match (msg.http_method(), msg.http_path()) {
+///         ("GET", "/sum") => msg.query_int("a").unwrap_or(0) + msg.query_int("b").unwrap_or(0),
+///         _ => 0,
+///     }
+/// }
+/// ```
+///
+/// [`http`]: crate::endpoints::http
+pub trait HttpRequestExt {
+    /// The request method, or `""` if absent.
+    fn http_method(&self) -> &str;
+    /// The request path, or `""` if absent.
+    fn http_path(&self) -> &str;
+    /// The raw query string (no leading `?`), or `""` if absent.
+    fn http_query(&self) -> &str;
+    /// The raw, still-percent-encoded value of a query parameter, if present.
+    fn query_param(&self, key: &str) -> Option<&str>;
+    /// A query parameter parsed as an `i64`, if present and numeric.
+    fn query_int(&self, key: &str) -> Option<i64>;
+    /// Whether the client advertised `Accept-Encoding: gzip`.
+    fn accepts_gzip(&self) -> bool;
+}
+
+impl HttpRequestExt for CanonicalMessage {
+    fn http_method(&self) -> &str {
+        self.metadata.get(HTTP_METHOD).map(String::as_str).unwrap_or("")
+    }
+
+    fn http_path(&self) -> &str {
+        self.metadata.get(HTTP_PATH).map(String::as_str).unwrap_or("")
+    }
+
+    fn http_query(&self) -> &str {
+        self.metadata.get(HTTP_QUERY).map(String::as_str).unwrap_or("")
+    }
+
+    fn query_param(&self, key: &str) -> Option<&str> {
+        self.http_query().split('&').find_map(|pair| {
+            let (k, v) = pair.split_once('=')?;
+            (k == key).then_some(v)
+        })
+    }
+
+    fn query_int(&self, key: &str) -> Option<i64> {
+        self.query_param(key)?.parse().ok()
+    }
+
+    fn accepts_gzip(&self) -> bool {
+        self.metadata
+            .get("accept-encoding")
+            .is_some_and(|v| v.to_ascii_lowercase().contains("gzip"))
+    }
+}
+
+#[cfg(test)]
+mod request_ext_tests {
+    use super::*;
+
+    fn request(method: &str, path: &str, query: &str) -> CanonicalMessage {
+        CanonicalMessage::new(Vec::new(), None)
+            .with_metadata_kv(HTTP_METHOD, method)
+            .with_metadata_kv(HTTP_PATH, path)
+            .with_metadata_kv(HTTP_QUERY, query)
+    }
+
+    #[test]
+    fn reads_request_line() {
+        let msg = request("GET", "/sum", "a=2&b=40");
+        assert_eq!(msg.http_method(), "GET");
+        assert_eq!(msg.http_path(), "/sum");
+        assert_eq!(msg.http_query(), "a=2&b=40");
+    }
+
+    #[test]
+    fn missing_metadata_reads_as_empty() {
+        let msg = CanonicalMessage::new(Vec::new(), None);
+        assert_eq!(msg.http_method(), "");
+        assert_eq!(msg.query_param("a"), None);
+        assert_eq!(msg.query_int("a"), None);
+    }
+
+    #[test]
+    fn parses_query_params_by_exact_key() {
+        let msg = request("GET", "/", "a=2&ab=9&b=40");
+        assert_eq!(msg.query_param("a"), Some("2"));
+        assert_eq!(msg.query_param("ab"), Some("9"));
+        assert_eq!(msg.query_int("b"), Some(40));
+        assert_eq!(msg.query_param("missing"), None);
+        // A prefix of an existing key must not match it.
+        assert_eq!(msg.query_param("c"), None);
+    }
+
+    #[test]
+    fn detects_gzip_support() {
+        let yes = request("GET", "/", "").with_metadata_kv("accept-encoding", "br, GZIP");
+        let no = request("GET", "/", "").with_metadata_kv("accept-encoding", "deflate");
+        assert!(yes.accepts_gzip());
+        assert!(!no.accepts_gzip());
+        assert!(!request("GET", "/", "").accepts_gzip());
+    }
+}
+
 fn routes_conflict(left: &HttpConsumerState, right: &HttpConsumerState) -> bool {
     left.path == right.path
         && (left.method == right.method || left.method.is_none() || right.method.is_none())
@@ -496,10 +618,10 @@ fn http_version_str(version: hyper::Version) -> &'static str {
 
 fn request_metadata_matches(request: &RequestMetadataView<'_>, key: &str, value: &str) -> bool {
     match key {
-        "http_method" => request.method.as_str() == value,
-        "http_path" => request.path == value,
-        "http_query" => request.query.unwrap_or("") == value,
-        "http_version" => http_version_str(request.version) == value,
+        HTTP_METHOD => request.method.as_str() == value,
+        HTTP_PATH => request.path == value,
+        HTTP_QUERY => request.query.unwrap_or("") == value,
+        HTTP_VERSION => http_version_str(request.version) == value,
         "tls_cipher_suite" => request.conn_info.cipher_suite.as_deref() == Some(value),
         "tls_protocol_version" => request.conn_info.protocol_version.as_deref() == Some(value),
         _ => request
@@ -1338,14 +1460,14 @@ async fn handle_request_internal(
     let mut content_encoding = None;
 
     metadata.extend([
-        ("http_method".to_string(), parts.method.to_string()),
-        ("http_path".to_string(), parts.uri.path().to_string()),
+        (HTTP_METHOD.to_string(), parts.method.to_string()),
+        (HTTP_PATH.to_string(), parts.uri.path().to_string()),
         (
-            "http_query".to_string(),
+            HTTP_QUERY.to_string(),
             parts.uri.query().unwrap_or("").to_string(),
         ),
         (
-            "http_version".to_string(),
+            HTTP_VERSION.to_string(),
             http_version_str(parts.version).to_string(),
         ),
     ]);
@@ -1363,10 +1485,10 @@ async fn handle_request_internal(
                 content_encoding = Some(v_str.to_string());
             }
             let k_str = key.as_str();
-            if k_str == "http_method"
-                || k_str == "http_path"
-                || k_str == "http_query"
-                || k_str == "http_version"
+            if k_str == HTTP_METHOD
+                || k_str == HTTP_PATH
+                || k_str == HTTP_QUERY
+                || k_str == HTTP_VERSION
                 || k_str.eq_ignore_ascii_case("tls_cipher_suite")
                 || k_str.eq_ignore_ascii_case("tls_protocol_version")
             {
@@ -1584,7 +1706,7 @@ fn inline_echo_fast_path_applies(state: &HttpConsumerState, headers: &hyper::Hea
     }
     if headers.contains_key(hyper::header::CONTENT_ENCODING)
         || headers.contains_key(hyper::header::TRANSFER_ENCODING)
-        || headers.contains_key("http_status_code")
+        || headers.contains_key(HTTP_STATUS_CODE)
     {
         return false;
     }
@@ -1669,7 +1791,7 @@ fn make_response(
         MessageDisposition::Reply(mut msg) => {
             let status = msg
                 .metadata
-                .remove("http_status_code")
+                .remove(HTTP_STATUS_CODE)
                 .and_then(|s| s.parse::<u16>().ok())
                 .and_then(|code| StatusCode::from_u16(code).ok())
                 .unwrap_or(StatusCode::OK);
@@ -1889,13 +2011,13 @@ impl MessagePublisher for HttpPublisher {
 
         let method = message
             .metadata
-            .get("http_method")
+            .get(HTTP_METHOD)
             .and_then(|m| hyper::Method::from_bytes(m.as_bytes()).ok())
             .unwrap_or_else(|| self.method.clone());
 
-        let uri = if let Some(path) = message.metadata.get("http_path") {
+        let uri = if let Some(path) = message.metadata.get(HTTP_PATH) {
             let mut path_and_query = path.clone();
-            if let Some(query) = message.metadata.get("http_query") {
+            if let Some(query) = message.metadata.get(HTTP_QUERY) {
                 if !query.is_empty() {
                     path_and_query.push('?');
                     path_and_query.push_str(query);
@@ -1921,10 +2043,10 @@ impl MessagePublisher for HttpPublisher {
         let mut request_builder = Request::builder().method(method).uri(uri);
 
         for (key, value) in &message.metadata {
-            if key == "http_method"
-                || key == "http_path"
-                || key == "http_query"
-                || key == "http_version"
+            if key == HTTP_METHOD
+                || key == HTTP_PATH
+                || key == HTTP_QUERY
+                || key == HTTP_VERSION
                 || key == "tls_cipher_suite"
                 || key == "tls_protocol_version"
             {
@@ -1982,10 +2104,7 @@ impl MessagePublisher for HttpPublisher {
             super::http_stream::streaming_response_format_from_headers(response.headers())
         });
         let mut response_metadata = HashMap::with_capacity(response.headers().len() + 1);
-        response_metadata.insert(
-            "http_version".to_string(),
-            format!("{:?}", response.version()),
-        );
+        response_metadata.insert(HTTP_VERSION.to_string(), format!("{:?}", response.version()));
         let mut content_encoding = None;
         for (key, value) in response.headers() {
             if let Ok(value_str) = value.to_str() {
