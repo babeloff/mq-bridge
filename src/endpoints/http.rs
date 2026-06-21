@@ -456,15 +456,24 @@ pub trait HttpRequestExt {
 
 impl HttpRequestExt for CanonicalMessage {
     fn http_method(&self) -> &str {
-        self.metadata.get(HTTP_METHOD).map(String::as_str).unwrap_or("")
+        self.metadata
+            .get(HTTP_METHOD)
+            .map(String::as_str)
+            .unwrap_or("")
     }
 
     fn http_path(&self) -> &str {
-        self.metadata.get(HTTP_PATH).map(String::as_str).unwrap_or("")
+        self.metadata
+            .get(HTTP_PATH)
+            .map(String::as_str)
+            .unwrap_or("")
     }
 
     fn http_query(&self) -> &str {
-        self.metadata.get(HTTP_QUERY).map(String::as_str).unwrap_or("")
+        self.metadata
+            .get(HTTP_QUERY)
+            .map(String::as_str)
+            .unwrap_or("")
     }
 
     fn query_param(&self, key: &str) -> Option<&str> {
@@ -2104,7 +2113,10 @@ impl MessagePublisher for HttpPublisher {
             super::http_stream::streaming_response_format_from_headers(response.headers())
         });
         let mut response_metadata = HashMap::with_capacity(response.headers().len() + 1);
-        response_metadata.insert(HTTP_VERSION.to_string(), format!("{:?}", response.version()));
+        response_metadata.insert(
+            HTTP_VERSION.to_string(),
+            format!("{:?}", response.version()),
+        );
         let mut content_encoding = None;
         for (key, value) in response.headers() {
             if let Ok(value_str) = value.to_str() {

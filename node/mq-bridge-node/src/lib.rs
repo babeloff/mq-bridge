@@ -462,8 +462,14 @@ impl Publisher {
     // JoinHandle is runtime-agnostic, so napi's executor only parks on it.
     async fn send_on_runtime(&self, message: CanonicalMessage) -> Result<()> {
         let publisher = self.publisher.clone();
-        let handle = self.runtime.spawn(async move { publisher.send(message).await });
-        match handle.await.map_err(to_napi_error)?.map_err(to_napi_error)? {
+        let handle = self
+            .runtime
+            .spawn(async move { publisher.send(message).await });
+        match handle
+            .await
+            .map_err(to_napi_error)?
+            .map_err(to_napi_error)?
+        {
             Sent::Ack | Sent::Response(_) => Ok(()),
         }
     }
@@ -473,7 +479,10 @@ impl Publisher {
         let handle = self
             .runtime
             .spawn(async move { publisher.request(message).await });
-        let response = handle.await.map_err(to_napi_error)?.map_err(to_napi_error)?;
+        let response = handle
+            .await
+            .map_err(to_napi_error)?
+            .map_err(to_napi_error)?;
         Ok(NativeMessage::from_canonical(&response))
     }
 }
