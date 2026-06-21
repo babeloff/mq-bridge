@@ -293,7 +293,7 @@ impl Route {
 
         let wait_name = name.clone();
         let wait_run_state = Arc::clone(&run_state);
-        let handle = thread::Builder::new()
+        let handle = match thread::Builder::new()
             .name(format!("mqb-node-route-{name}"))
             .spawn(move || {
                 let stop_name = wait_name.clone();
@@ -302,8 +302,16 @@ impl Route {
                     core::Route::stop(&stop_name).await;
                 });
                 finish_run(&wait_run_state, &wait_name);
-            })
-            .map_err(to_napi_error)?;
+            }) {
+            Ok(handle) => handle,
+            Err(err) => {
+                // Spawn failed after the route was deployed; stop it and clear
+                // run state so the name isn't orphaned and can be started again.
+                deploy_runtime.block_on(async { core::Route::stop(&name).await });
+                finish_run(&run_state, &name);
+                return Err(to_napi_error(err));
+            }
+        };
 
         self.lock_run_state()?.join_handle = Some(handle);
         Ok(())

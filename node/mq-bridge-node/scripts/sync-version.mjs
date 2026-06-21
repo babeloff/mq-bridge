@@ -11,7 +11,8 @@ const pkgPath = resolve(here, "..", "package.json");
 const cargoPath = resolve(here, "..", "..", "..", "Cargo.toml");
 
 const cargo = readFileSync(cargoPath, "utf8");
-const match = cargo.match(/\[workspace\.package\][\s\S]*?version\s*=\s*"([^"]+)"/);
+// Anchor `version` to line start so it can't match `rust-version` or similar.
+const match = cargo.match(/\[workspace\.package\][\s\S]*?(?:^|\n)\s*version\s*=\s*"([^"]+)"/);
 if (!match) {
   console.error("Could not find [workspace.package] version in Cargo.toml");
   process.exit(1);

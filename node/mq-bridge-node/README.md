@@ -22,7 +22,7 @@ npm run example
 ## Handler shape
 
 ```ts
-import { Message, Route } from "@mq-bridge/node";
+import { Message, Route } from "mq-bridge";
 
 const route = Route.fromYamlStr(config, "orders");
 

@@ -29,6 +29,8 @@ jobs:
   build-linux:
     name: Build ${{ matrix.target }}
     runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
     container:
       # Debian 11 bullseye => glibc 2.31 baseline (runs on RHEL 9 / Debian 11+ /
       # Ubuntu 20.04+). Pulled natively per arch on the matching runner.
@@ -91,6 +93,8 @@ jobs:
   build-native:
     name: Build ${{ matrix.target }}
     runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -157,7 +161,7 @@ jobs:
 
       # Trusted publishing (OIDC) requires npm >= 11.5.1.
       - name: Update npm
-        run: npm install -g npm@latest
+        run: npm install -g npm@11.5.1
 
       - name: Install Node dependencies
         working-directory: node/mq-bridge-node
