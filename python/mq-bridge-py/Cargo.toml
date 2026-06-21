@@ -17,9 +17,10 @@ anyhow.workspace = true
 async-trait.workspace = true
 bytes = { workspace = true, features = ["serde"] }
 fast-uuid-v7.workspace = true
-mq-bridge = { path = "../.." }
+mq-bridge = { path = "../..", features = ["schema"] }
 pyo3 = { version = "0.29.0", features = ["abi3-py38"] }
-schemars = { version = "1.2", optional = true }
+rustls = { version = "0.23", optional = true, default-features = false, features = ["std", "tls12", "logging"] }
+schemars = "1.2"
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 serde_yaml_ng.workspace = true
@@ -38,7 +39,7 @@ pyo3 = { version = "0.29.0", features = ["abi3-py38", "auto-initialize"] }
 default = ["full"]
 # Testing-only middleware hooks; do not include this feature in production wheels.
 middleware = ["mq-bridge/middleware"]
-full = ["mq-bridge/full"]
+full = ["mq-bridge/full", "rustls-aws-lc"]
 # Lean set for the `mq-bridge-py-basic` wheel (~14M stripped): the pure-Rust
 # transports (no kafka/rdkafka C toolchain; no heavy datastore drivers) on the
 # `ring` crypto provider so it stays free of aws-lc-sys. memory + file
@@ -49,7 +50,9 @@ full = ["mq-bridge/full"]
 basic = ["http", "nats", "mqtt", "websocket", "zeromq", "rustls-ring"]
 dedup = ["mq-bridge/dedup"]
 metrics = ["mq-bridge/metrics"]
-schema = ["dep:schemars", "mq-bridge/schema"]
+# Compatibility alias: config_schema is part of the public Python API and is
+# always compiled.
+schema = []
 test-utils = ["mq-bridge/test-utils"]
 kafka = ["mq-bridge/kafka"]
 amqp = ["mq-bridge/amqp"]
@@ -63,5 +66,5 @@ ibm-mq = ["mq-bridge/ibm-mq"]
 zeromq = ["mq-bridge/zeromq"]
 grpc = ["mq-bridge/grpc"]
 sqlx = ["mq-bridge/sqlx"]
-rustls-ring = ["mq-bridge/rustls-ring"]
-rustls-aws-lc = ["mq-bridge/rustls-aws-lc"]
+rustls-ring = ["dep:rustls", "rustls/ring", "mq-bridge/rustls-ring"]
+rustls-aws-lc = ["dep:rustls", "rustls/aws_lc_rs", "rustls/prefer-post-quantum", "mq-bridge/rustls-aws-lc"]

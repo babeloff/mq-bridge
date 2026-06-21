@@ -15,7 +15,7 @@ RUN pip install --no-cache-dir maturin
 
 RUN git clone --depth 1 -b "${MQB_REF}" https://github.com/marcomq/mq-bridge /src
 WORKDIR /src/python/mq-bridge-py
-RUN maturin build --release --no-default-features -F http -F pyo3/extension-module -o /wheels
+RUN maturin build --release --no-default-features -F http -F rustls-ring -F pyo3/extension-module -o /wheels
 
 FROM python:3.12-slim
 RUN groupadd --system appuser \
