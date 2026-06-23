@@ -195,6 +195,28 @@ jobs:
         working-directory: node/mq-bridge-node
         run: ls -R npm
 
+      # The default per-platform README is ~88 bytes; paired with a 50-67MB
+      # binary that low-content signature trips npm's new-package spam filter
+      # (E403 "Package name triggered spam detection"). Give each stub a real
+      # README plus description/homepage/keywords so it doesn't read as a
+      # placeholder. (Server-side heuristic; reduces but cannot guarantee a pass.)
+      - name: Enrich platform package metadata
+        working-directory: node/mq-bridge-node
+        run: |
+          set -e
+          for dir in npm/*/; do
+            name=$(node -p "require('./$dir/package.json').name")
+            cat > "$dir/README.md" <<EOF
+          # $name
+
+          Prebuilt native binary for the [\`mq-bridge\`](https://github.com/marcomq/mq-bridge)
+          Node.js addon (napi-rs). This is a platform-specific dependency of the
+          \`mq-bridge\` package and is selected automatically via optionalDependencies —
+          you install \`mq-bridge\`, not this package directly.
+          EOF
+            node -e "const p='./$dir/package.json',j=require(p);j.description='Prebuilt '+j.name+' binary for the mq-bridge Node.js addon';j.homepage='https://github.com/marcomq/mq-bridge#readme';j.keywords=['mq-bridge','napi','native','prebuilt','addon'];require('fs').writeFileSync(p,JSON.stringify(j,null,2)+'\n')"
+          done
+
       - name: Publish platform packages and root
         working-directory: node/mq-bridge-node
         env:
@@ -203,9 +225,27 @@ jobs:
           NPM_CONFIG_PROVENANCE: "true"
         run: |
           set -e
-          for dir in npm/*/; do
-            echo "Publishing $dir"
+          publish() {
+            local dir="$1" name ver
+            name=$(node -p "require('./$dir/package.json').name")
+            ver=$(node -p "require('./$dir/package.json').version")
+            # Skip if this exact version is already on the registry; a re-run
+            # after a partial publish must not fail on already-published dirs.
+            if npm view "$name@$ver" version >/dev/null 2>&1; then
+              echo "Skipping $name@$ver (already published)"
+              return 0
+            fi
+            echo "Publishing $dir ($name@$ver)"
             npm publish "$dir" --access public
+          }
+          for dir in npm/*/; do
+            publish "$dir"
           done
           echo "Publishing root package"
-          npm publish --access public
+          root_name=$(node -p "require('./package.json').name")
+          root_ver=$(node -p "require('./package.json').version")
+          if npm view "$root_name@$root_ver" version >/dev/null 2>&1; then
+            echo "Skipping $root_name@$root_ver (already published)"
+          else
+            npm publish --access public
+          fi

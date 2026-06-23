@@ -259,7 +259,7 @@ pub trait MessageConsumer: Send + Sync {
     /// batches were received.
     ///
     /// Defaults to `true` (the safe choice). Cumulative-ack transports such as
-    /// Kafka and AMQP **must** keep this `true`: acking a later offset implicitly
+    /// Kafka **must** keep this `true`: acking a later offset implicitly
     /// acks everything before it, so committing out of order would silently drop
     /// the messages in between on a crash. For these the route funnels commits
     /// through a single ordered sequencer.
@@ -501,10 +501,9 @@ pub const SEND_BATCH_CONCURRENCY: usize = 128;
 /// as send is calling "send_batch" by default.
 ///
 /// Sends are pipelined: up to [`SEND_BATCH_CONCURRENCY`] are kept in flight at once
-/// via `buffered`, which preserves message order (futures are started and their
-/// results collected in input order) while overlapping per-message round trips
-/// (e.g. JetStream PubAcks). This is the same enqueue-in-order / await-acks-pipelined
-/// shape the native Kafka and AMQP paths use, so ordered transports stay ordered.
+/// via `buffer_unordered`, then responses and failures are restored to input order
+/// before returning. This avoids head-of-line blocking when an early send is slow
+/// while still overlapping per-message round trips (e.g. JetStream PubAcks).
 pub async fn send_batch_helper<P: MessagePublisher + ?Sized>(
     publisher: &P,
     messages: Vec<CanonicalMessage>,
@@ -518,25 +517,36 @@ pub async fn send_batch_helper<P: MessagePublisher + ?Sized>(
     let mut failed_messages = Vec::new();
 
     // Pair each result with its message so failures can report the message back.
-    // `buffered` preserves order, so results arrive in the same order as `messages`.
+    // Poll unordered to keep slots full, then sort successful responses and
+    // failures back into input order before exposing them to callers.
     let callback = &callback;
-    let mut results = futures::stream::iter(messages.into_iter().map(|msg| async move {
-        let result = callback(publisher, msg.clone()).await;
-        (msg, result)
-    }))
-    .buffered(SEND_BATCH_CONCURRENCY);
+    let mut results = futures::stream::iter(messages.into_iter().enumerate().map(
+        |(idx, msg)| async move {
+            let result = callback(publisher, msg.clone()).await;
+            (idx, msg, result)
+        },
+    ))
+    .buffer_unordered(SEND_BATCH_CONCURRENCY);
 
-    while let Some((msg, result)) = results.next().await {
+    while let Some((idx, msg, result)) = results.next().await {
         match result {
-            Ok(Sent::Response(resp)) => responses.push(resp),
+            Ok(Sent::Response(resp)) => responses.push((idx, resp)),
             Ok(Sent::Ack) => {}
             // Each send is awaited independently, so report each message's actual
             // outcome. Transient (Retryable/Connection) failures are surfaced with
             // their error so the route can Nack them for redelivery; messages that
             // did succeed before/around the failure are not needlessly resent.
-            Err(e) => failed_messages.push((msg, e)),
+            Err(e) => failed_messages.push((idx, msg, e)),
         }
     }
+
+    responses.sort_by_key(|(idx, _)| *idx);
+    let responses: Vec<_> = responses.into_iter().map(|(_, resp)| resp).collect();
+    failed_messages.sort_by_key(|(idx, _, _)| *idx);
+    let failed_messages: Vec<_> = failed_messages
+        .into_iter()
+        .map(|(_, msg, err)| (msg, err))
+        .collect();
 
     if failed_messages.is_empty() && responses.is_empty() {
         Ok(SentBatch::Ack)
@@ -588,6 +598,10 @@ mod tests {
     use super::*;
     use crate::CanonicalMessage;
     use anyhow::anyhow;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
 
     struct MockPublisher;
     #[async_trait]
@@ -647,9 +661,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_send_batch_helper_preserves_response_order() {
-        // The first message resolves last (longest sleep). With `buffered` the
-        // responses must still come back in input order; an unordered combinator
-        // would surface them in completion order instead.
+        // The first message resolves last (longest sleep). The helper polls sends
+        // unordered internally, but responses must still come back in input order.
         let publisher = MockPublisher;
         let count = 16u64;
         let msgs: Vec<CanonicalMessage> = (0..count)
@@ -680,8 +693,73 @@ mod tests {
                 assert_eq!(
                     order,
                     (0..count).collect::<Vec<u64>>(),
-                    "buffered must preserve input order",
+                    "send_batch_helper must preserve input order",
                 );
+            }
+            SentBatch::Ack => panic!("expected per-message responses"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_send_batch_helper_keeps_pipeline_full_when_early_send_is_slow() {
+        let publisher = Arc::new(MockPublisher);
+        let total = SEND_BATCH_CONCURRENCY + 1;
+        let msgs: Vec<CanonicalMessage> = (0..total)
+            .map(|i| CanonicalMessage::from(i.to_string()))
+            .collect();
+        let started = Arc::new(AtomicUsize::new(0));
+        let all_started = Arc::new(tokio::sync::Notify::new());
+        let release_first = Arc::new(tokio::sync::Notify::new());
+
+        let helper = tokio::spawn({
+            let publisher = Arc::clone(&publisher);
+            let started = Arc::clone(&started);
+            let all_started = Arc::clone(&all_started);
+            let release_first = Arc::clone(&release_first);
+            async move {
+                send_batch_helper(&publisher, msgs, |_pub, msg| {
+                    let started = Arc::clone(&started);
+                    let all_started = Arc::clone(&all_started);
+                    let release_first = Arc::clone(&release_first);
+                    Box::pin(async move {
+                        let idx: usize = msg.get_payload_str().parse().unwrap();
+                        if started.fetch_add(1, Ordering::SeqCst) + 1 == total {
+                            all_started.notify_waiters();
+                        }
+                        if idx == 0 {
+                            release_first.notified().await;
+                        }
+                        let mut resp = CanonicalMessage::from(idx.to_string());
+                        resp.message_id = msg.message_id;
+                        Ok(Sent::Response(resp))
+                    })
+                })
+                .await
+            }
+        });
+
+        tokio::time::timeout(std::time::Duration::from_millis(200), async {
+            loop {
+                if started.load(Ordering::SeqCst) == total {
+                    break;
+                }
+                all_started.notified().await;
+            }
+        })
+        .await
+        .expect("a completed later send should free a slot even while the first send is blocked");
+
+        release_first.notify_waiters();
+        let result = helper.await.unwrap().unwrap();
+        match result {
+            SentBatch::Partial { responses, failed } => {
+                assert!(failed.is_empty());
+                let order: Vec<usize> = responses
+                    .expect("expected responses")
+                    .iter()
+                    .map(|r| r.get_payload_str().parse().unwrap())
+                    .collect();
+                assert_eq!(order, (0..total).collect::<Vec<_>>());
             }
             SentBatch::Ack => panic!("expected per-message responses"),
         }
