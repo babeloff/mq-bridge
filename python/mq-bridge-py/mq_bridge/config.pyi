@@ -110,6 +110,7 @@ class GrpcConfig(TypedDict, total=False):
     initial_stream_window_size: Optional[int]
     max_decoding_message_size: Optional[int]
     server_mode: bool
+    shared: Optional[bool]
     timeout_ms: Optional[int]
     tls: TlsConfig
     topic: Optional[str]
@@ -134,6 +135,7 @@ class HttpConfig(TypedDict, total=False):
     receive_streamable: bool
     request_timeout_ms: Optional[int]
     server_protocol: HttpServerProtocol
+    shared: Optional[bool]
     stream_response_to: Optional[Endpoint]
     tcp_keepalive_ms: Optional[int]
     tls: TlsConfig
@@ -165,6 +167,7 @@ class KafkaConfig(TypedDict, total=False):
     group_id: Optional[str]
     password: Optional[str]
     producer_options: Optional[List[List[Any]]]
+    shared: Optional[bool]
     tls: TlsConfig
     topic: Optional[str]
     url: Required[str]
@@ -221,6 +224,7 @@ class MongoDbConfig(TypedDict, total=False):
     reply_polling_ms: Optional[int]
     request_reply: bool
     request_timeout_ms: Optional[int]
+    shared: Optional[bool]
     tls: TlsConfig
     ttl_seconds: Optional[int]
     url: Required[str]
@@ -254,6 +258,7 @@ class NatsConfig(TypedDict, total=False):
     prefetch_count: Optional[int]
     request_reply: bool
     request_timeout_ms: Optional[int]
+    shared: Optional[bool]
     stream: Optional[str]
     stream_max_bytes: Optional[int]
     stream_max_messages: Optional[int]
@@ -319,6 +324,7 @@ class SqlxConfig(TypedDict, total=False):
     password: Optional[str]
     polling_interval_ms: Optional[int]
     select_query: Optional[str]
+    shared: Optional[bool]
     table: Required[str]
     tls: TlsConfig
     url: Required[str]

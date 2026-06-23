@@ -30,11 +30,16 @@ def test_generated_config_types_are_up_to_date() -> None:
     generator = _load_generator()
     pyi, py = generator.generate()
 
+    regen = (
+        "stale generated config types. Rebuild the extension and regenerate:\n"
+        "    cd python/mq-bridge-py && uv run maturin develop "
+        "&& uv run --no-sync python scripts/gen_config_types.py"
+    )
     assert pyi == (PACKAGE_DIR / "mq_bridge" / "config.pyi").read_text(), (
-        "config.pyi is stale; regenerate with scripts/gen_config_types.py"
+        f"config.pyi is {regen}"
     )
     assert py == (PACKAGE_DIR / "mq_bridge" / "config.py").read_text(), (
-        "config.py is stale; regenerate with scripts/gen_config_types.py"
+        f"config.py is {regen}"
     )
 
 

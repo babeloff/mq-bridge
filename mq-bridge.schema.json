@@ -805,6 +805,14 @@
           "type": "boolean",
           "default": false
         },
+        "shared": {
+          "description": "(Publisher only) Share one gRPC channel per connection (default: true); false forces a dedicated channel.",
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "default": null
+        },
         "timeout_ms": {
           "description": "Timeout in milliseconds.\n- Client mode: used as the connection timeout and per-request deadline.\n- Server mode: applied as the per-request deadline on the embedded server.",
           "type": [
@@ -976,6 +984,14 @@
           "description": "(Consumer only) Restrict which HTTP protocol versions a server listener accepts.\nDefaults to `auto` (HTTP/1.1 + HTTP/2). On cleartext listeners, `http2_only`\nmeans HTTP/2 prior-knowledge (h2c) only.",
           "$ref": "#/$defs/HttpServerProtocol",
           "default": "auto"
+        },
+        "shared": {
+          "description": "(Publisher only) Share one HTTP client per connection (default: true); false forces a dedicated client.",
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "default": null
         },
         "stream_response_to": {
           "description": "(Publisher only) Optional endpoint that receives streamed HTTP response items as correlated messages.\n\nUse a `stream_buffer` endpoint here when callers need to read streamed\nresponse items later through a normal mq-bridge consumer. Each streamed\nitem is published with `correlation_id`, `http_stream_id`,\n`http_stream_index`, `http_stream_format`, and `http_stream_end`\nmetadata. If the request message has no `correlation_id`, the HTTP\npublisher uses `format!(\"{:032x}\", request.message_id)` so callers can\nderive the consumer correlation id before calling `send`.",
@@ -1214,6 +1230,14 @@
               }
             ]
           }
+        },
+        "shared": {
+          "description": "(Publisher only) Share one producer per connection (default: true); false gives a dedicated producer.",
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "default": null
         },
         "tls": {
           "description": "TLS configuration.",
@@ -1574,6 +1598,14 @@
           "format": "uint64",
           "minimum": 0
         },
+        "shared": {
+          "description": "Share one MongoDB client per connection (default: true); false forces a dedicated client.",
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "default": null
+        },
         "tls": {
           "description": "TLS configuration.",
           "$ref": "#/$defs/TlsConfig",
@@ -1805,6 +1837,14 @@
           ],
           "format": "uint64",
           "minimum": 0
+        },
+        "shared": {
+          "description": "Share one NATS client per connection (default: true); false forces a dedicated connection.",
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "default": null
         },
         "stream": {
           "description": "(Consumer only). The JetStream stream name. Required for Consumers.",
@@ -2147,6 +2187,14 @@
             "string",
             "null"
           ]
+        },
+        "shared": {
+          "description": "Share one connection pool per connection (default: true); false forces a dedicated pool.",
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "default": null
         },
         "table": {
           "description": "The table to interact with.",
