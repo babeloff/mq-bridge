@@ -1948,7 +1948,7 @@ fn build_http_client(config: &HttpConfig) -> anyhow::Result<HttpClient> {
 async fn create_shared_http_client(
     config: &HttpConfig,
 ) -> anyhow::Result<std::sync::Arc<HttpClient>> {
-    let identity = crate::connection_registry::identity_hash((
+    let identity = crate::connection_registry::connection_identity((
         config.tls.required,
         &config.tls.ca_file,
         &config.tls.cert_file,

@@ -1496,7 +1496,7 @@ impl MessageConsumer for MongoDbSubscriber {
 /// Returns a shared MongoDB client for this connection, building one on first use.
 /// The collection/database are handles off the client, so a single client serves all.
 async fn create_shared_client(config: &MongoDbConfig) -> anyhow::Result<std::sync::Arc<Client>> {
-    let identity = crate::connection_registry::identity_hash((
+    let identity = crate::connection_registry::connection_identity((
         &config.url,
         &config.username,
         &config.password,

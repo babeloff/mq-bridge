@@ -21,11 +21,14 @@
 
 use std::any::Any;
 use std::collections::HashMap;
+use std::fmt::Debug;
 use std::future::Future;
-use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 
-type Key = (&'static str, u64);
+/// `(tag, identity)` where `identity` is the full structural connection identity
+/// (see [`connection_identity`]). Using the complete identity rather than a hash
+/// means two distinct connections can never collide onto the same cache entry.
+type Key = (&'static str, String);
 
 static REGISTRY: OnceLock<RwLock<HashMap<Key, Weak<dyn Any + Send + Sync>>>> = OnceLock::new();
 
@@ -41,14 +44,14 @@ fn inflight() -> &'static Mutex<HashMap<Key, Arc<tokio::sync::Mutex<()>>>> {
     INFLIGHT.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Hash a connection identity (any `Hash`able value) into the `u64` used in the key.
+/// Build the canonical connection identity used in the cache key from any
+/// `Debug`able value. The `Debug` representation is a complete, lossless encoding
+/// of the identity, so — unlike a hash — distinct connections never collide.
 ///
 /// Pass only fields that determine which underlying client is appropriate, e.g.
 /// `(url, username, &tls)`. Two callers with the same tag and identity share a client.
-pub fn identity_hash<H: Hash>(identity: H) -> u64 {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    identity.hash(&mut hasher);
-    hasher.finish()
+pub fn connection_identity<H: Debug>(identity: H) -> String {
+    format!("{identity:?}")
 }
 
 /// Return the cached shared client of type `T` for `(tag, identity)`, or build one with
@@ -59,7 +62,7 @@ pub fn identity_hash<H: Hash>(identity: H) -> u64 {
 /// racing on the same key resolves by preferring whichever entry is already live.
 pub async fn get_or_create<T, F, Fut>(
     tag: &'static str,
-    identity: u64,
+    identity: String,
     shared: bool,
     build: F,
 ) -> anyhow::Result<Arc<T>>
@@ -85,7 +88,7 @@ where
         let mut inflight = inflight()
             .lock()
             .expect("connection registry inflight lock poisoned");
-        Arc::clone(inflight.entry(key).or_default())
+        Arc::clone(inflight.entry(key.clone()).or_default())
     };
     let _build_guard = build_lock.lock().await;
 
@@ -136,7 +139,7 @@ mod tests {
     #[tokio::test]
     async fn shared_key_returns_same_arc_and_builds_once() {
         let builds = Arc::new(AtomicUsize::new(0));
-        let id = identity_hash(("broker:9092", "alice"));
+        let id = connection_identity(("broker:9092", "alice"));
         let make = |value: u32| {
             let builds = builds.clone();
             move || {
@@ -148,7 +151,7 @@ mod tests {
             }
         };
 
-        let a = get_or_create("test-share", id, true, make(1))
+        let a = get_or_create("test-share", id.clone(), true, make(1))
             .await
             .unwrap();
         let b = get_or_create("test-share", id, true, make(2))
@@ -163,11 +166,12 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_cold_callers_build_once() {
         let builds = Arc::new(AtomicUsize::new(0));
-        let id = identity_hash(("broker:9092", "concurrent"));
+        let id = connection_identity(("broker:9092", "concurrent"));
 
         let mut handles = Vec::new();
         for _ in 0..16 {
             let builds = builds.clone();
+            let id = id.clone();
             handles.push(tokio::spawn(async move {
                 get_or_create("test-concurrent", id, true, || {
                     let builds = builds.clone();
@@ -192,8 +196,8 @@ mod tests {
 
     #[tokio::test]
     async fn not_shared_always_builds_fresh() {
-        let id = identity_hash(("broker:9092", "bob"));
-        let a = get_or_create("test-dedicated", id, false, || build_client(1))
+        let id = connection_identity(("broker:9092", "bob"));
+        let a = get_or_create("test-dedicated", id.clone(), false, || build_client(1))
             .await
             .unwrap();
         let b = get_or_create("test-dedicated", id, false, || build_client(1))
@@ -204,8 +208,8 @@ mod tests {
 
     #[tokio::test]
     async fn entry_released_after_last_arc_drops() {
-        let id = identity_hash(("broker:9092", "carol"));
-        let a = get_or_create("test-release", id, true, || build_client(7))
+        let id = connection_identity(("broker:9092", "carol"));
+        let a = get_or_create("test-release", id.clone(), true, || build_client(7))
             .await
             .unwrap();
         let key = ("test-release", id);
@@ -217,12 +221,12 @@ mod tests {
 
     #[tokio::test]
     async fn differing_identity_yields_distinct_clients() {
-        let a = get_or_create("test-id", identity_hash("server-a"), true, || {
+        let a = get_or_create("test-id", connection_identity("server-a"), true, || {
             build_client(1)
         })
         .await
         .unwrap();
-        let b = get_or_create("test-id", identity_hash("server-b"), true, || {
+        let b = get_or_create("test-id", connection_identity("server-b"), true, || {
             build_client(2)
         })
         .await

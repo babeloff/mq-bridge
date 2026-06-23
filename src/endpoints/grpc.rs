@@ -748,7 +748,7 @@ impl GrpcPublisher {
         let url = config.tls.normalize_url(&config.url);
         // Share one channel across publishers with the same connection settings; the
         // channel multiplexes and the topic is per-message.
-        let identity = crate::connection_registry::identity_hash((
+        let identity = crate::connection_registry::connection_identity((
             &url,
             config.tls.required,
             &config.tls.ca_file,

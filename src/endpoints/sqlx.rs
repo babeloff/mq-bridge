@@ -155,7 +155,7 @@ async fn create_sqlx_pool(config: &SqlxConfig) -> anyhow::Result<AnyPool> {
 
 /// Returns a shared connection pool for this database, building one on first use.
 async fn create_shared_sqlx_pool(config: &SqlxConfig) -> anyhow::Result<std::sync::Arc<AnyPool>> {
-    let identity = crate::connection_registry::identity_hash((
+    let identity = crate::connection_registry::connection_identity((
         &config.url,
         &config.username,
         &config.password,

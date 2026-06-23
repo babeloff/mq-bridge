@@ -108,7 +108,7 @@ impl KafkaPublisher {
         // topic is chosen per-record, so a single producer serves every topic; sharing
         // consolidates broker connections, the background poll thread, and batching.
         // Producer-level settings (creds, TLS, producer_options) form the cache key.
-        let identity = crate::connection_registry::identity_hash((
+        let identity = crate::connection_registry::connection_identity((
             &config.url,
             &config.username,
             &config.password,

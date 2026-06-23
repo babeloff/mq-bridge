@@ -811,7 +811,7 @@
             "boolean",
             "null"
           ],
-          "default": null
+          "default": true
         },
         "timeout_ms": {
           "description": "Timeout in milliseconds.\n- Client mode: used as the connection timeout and per-request deadline.\n- Server mode: applied as the per-request deadline on the embedded server.",
@@ -991,7 +991,7 @@
             "boolean",
             "null"
           ],
-          "default": null
+          "default": true
         },
         "stream_response_to": {
           "description": "(Publisher only) Optional endpoint that receives streamed HTTP response items as correlated messages.\n\nUse a `stream_buffer` endpoint here when callers need to read streamed\nresponse items later through a normal mq-bridge consumer. Each streamed\nitem is published with `correlation_id`, `http_stream_id`,\n`http_stream_index`, `http_stream_format`, and `http_stream_end`\nmetadata. If the request message has no `correlation_id`, the HTTP\npublisher uses `format!(\"{:032x}\", request.message_id)` so callers can\nderive the consumer correlation id before calling `send`.",
@@ -1237,7 +1237,7 @@
             "boolean",
             "null"
           ],
-          "default": null
+          "default": true
         },
         "tls": {
           "description": "TLS configuration.",
@@ -1604,7 +1604,7 @@
             "boolean",
             "null"
           ],
-          "default": null
+          "default": true
         },
         "tls": {
           "description": "TLS configuration.",
@@ -1844,7 +1844,7 @@
             "boolean",
             "null"
           ],
-          "default": null
+          "default": true
         },
         "stream": {
           "description": "(Consumer only). The JetStream stream name. Required for Consumers.",
@@ -2194,7 +2194,7 @@
             "boolean",
             "null"
           ],
-          "default": null
+          "default": true
         },
         "table": {
           "description": "The table to interact with.",

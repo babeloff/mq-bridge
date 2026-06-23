@@ -234,6 +234,12 @@ fn default_inline_response_fast_path_schema() -> Option<bool> {
     Some(true)
 }
 
+/// Schema default for `shared` fields, whose runtime default is `true`.
+#[cfg(feature = "schema")]
+fn default_shared_schema() -> Option<bool> {
+    Some(true)
+}
+
 fn default_output_endpoint() -> Endpoint {
     Endpoint::new(EndpointType::Null)
 }
@@ -1128,6 +1134,7 @@ pub struct KafkaConfig {
     pub consumer_options: Option<Vec<(String, String)>>,
     /// (Publisher only) Share one producer per connection (default: true); false gives a dedicated producer.
     #[serde(default)]
+    #[cfg_attr(feature = "schema", schemars(default = "default_shared_schema"))]
     pub shared: Option<bool>,
 }
 
@@ -1367,6 +1374,7 @@ pub struct NatsConfig {
     pub prefetch_count: Option<usize>,
     /// Share one NATS client per connection (default: true); false forces a dedicated connection.
     #[serde(default)]
+    #[cfg_attr(feature = "schema", schemars(default = "default_shared_schema"))]
     pub shared: Option<bool>,
 }
 
@@ -1814,6 +1822,7 @@ pub struct MongoDbConfig {
     pub meta_collection: Option<String>,
     /// Share one MongoDB client per connection (default: true); false forces a dedicated client.
     #[serde(default)]
+    #[cfg_attr(feature = "schema", schemars(default = "default_shared_schema"))]
     pub shared: Option<bool>,
 }
 
@@ -2037,6 +2046,7 @@ pub struct GrpcConfig {
     pub max_decoding_message_size: Option<usize>,
     /// (Publisher only) Share one gRPC channel per connection (default: true); false forces a dedicated channel.
     #[serde(default)]
+    #[cfg_attr(feature = "schema", schemars(default = "default_shared_schema"))]
     pub shared: Option<bool>,
 }
 
@@ -2175,6 +2185,7 @@ pub struct HttpConfig {
     pub custom_headers: HashMap<String, String>,
     /// (Publisher only) Share one HTTP client per connection (default: true); false forces a dedicated client.
     #[serde(default)]
+    #[cfg_attr(feature = "schema", schemars(default = "default_shared_schema"))]
     pub shared: Option<bool>,
 }
 
@@ -2471,6 +2482,7 @@ pub struct SqlxConfig {
     pub max_lifetime_ms: Option<u64>,
     /// Share one connection pool per connection (default: true); false forces a dedicated pool.
     #[serde(default)]
+    #[cfg_attr(feature = "schema", schemars(default = "default_shared_schema"))]
     pub shared: Option<bool>,
 }
 
