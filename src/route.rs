@@ -1211,6 +1211,7 @@ enum CommitRouter {
 
 impl CommitRouter {
     fn new(ordered: bool, commit_concurrency_limit: usize) -> Self {
+        let commit_concurrency_limit = commit_concurrency_limit.max(1);
         if ordered {
             let (seq_tx, handle) = spawn_sequencer(commit_concurrency_limit);
             CommitRouter::Ordered { seq_tx, handle }
