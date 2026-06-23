@@ -29,6 +29,8 @@ enum NatsClient {
 pub struct NatsPublisher {
     client: NatsClient,
     core_client: async_nats::Client,
+    // Retains the shared registry entry so concurrent publishers reuse this connection.
+    _shared_client: std::sync::Arc<async_nats::Client>,
     subject: String,
     // If false, wait for JetStream acknowledgment; if true, fire-and-forget.
     delayed_ack: bool,
@@ -50,8 +52,31 @@ impl NatsPublisher {
         } else {
             config.stream.as_deref().unwrap_or_default()
         };
-        let options = build_nats_options(config).await?;
-        let nats_client = options.connect(&config.url).await?;
+        // Share one NATS connection across publishers with the same connection settings;
+        // the subject is per-publish. JetStream context/stream setup stays per-publisher.
+        let identity = crate::connection_registry::identity_hash((
+            &config.url,
+            &config.username,
+            &config.password,
+            &config.token,
+            config.tls.required,
+            &config.tls.ca_file,
+            &config.tls.cert_file,
+            &config.tls.key_file,
+            config.tls.accept_invalid_certs,
+        ));
+        let config_clone = config.clone();
+        let shared_client = crate::connection_registry::get_or_create(
+            "nats-client",
+            identity,
+            config.shared.unwrap_or(true),
+            move || async move {
+                let options = build_nats_options(&config_clone).await?;
+                Ok(options.connect(&config_clone.url).await?)
+            },
+        )
+        .await?;
+        let nats_client = (*shared_client).clone();
         let core_client = nats_client.clone();
 
         let client = if !config.no_jetstream {
@@ -83,6 +108,7 @@ impl NatsPublisher {
         Ok(Self {
             client,
             core_client,
+            _shared_client: shared_client,
             subject: subject.to_string(),
             delayed_ack: config.delayed_ack,
             request_reply: config.request_reply,

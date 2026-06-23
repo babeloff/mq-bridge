@@ -734,6 +734,8 @@ impl MessageConsumer for ServerModeConsumer {
 
 pub struct GrpcPublisher {
     client: BridgeClient<Channel>,
+    // Retains the shared registry entry so concurrent publishers reuse this channel.
+    _shared_channel: std::sync::Arc<Channel>,
     url: String,
     timeout: Option<Duration>,
     topic: Option<String>,
@@ -744,10 +746,33 @@ impl GrpcPublisher {
         // Use a lazy channel so the publisher route can start before a server-mode
         // gRPC consumer has finished binding its embedded listener.
         let url = config.tls.normalize_url(&config.url);
-        let endpoint = make_endpoint(config, &url).await?;
-        let client = BridgeClient::new(endpoint.connect_lazy());
+        // Share one channel across publishers with the same connection settings; the
+        // channel multiplexes and the topic is per-message.
+        let identity = crate::connection_registry::identity_hash((
+            &url,
+            config.tls.required,
+            &config.tls.ca_file,
+            &config.tls.cert_file,
+            &config.tls.key_file,
+            config.tls.accept_invalid_certs,
+            config.timeout_ms,
+        ));
+        let config_clone = config.clone();
+        let url_for_build = url.clone();
+        let shared_channel = crate::connection_registry::get_or_create(
+            "grpc-channel",
+            identity,
+            config.shared.unwrap_or(true),
+            move || async move {
+                let endpoint = make_endpoint(&config_clone, &url_for_build).await?;
+                Ok(endpoint.connect_lazy())
+            },
+        )
+        .await?;
+        let client = BridgeClient::new((*shared_channel).clone());
         Ok(Self {
             client,
+            _shared_channel: shared_channel,
             url,
             timeout: config.timeout_ms.map(Duration::from_millis),
             topic: Some(

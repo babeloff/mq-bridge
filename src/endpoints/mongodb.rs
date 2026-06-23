@@ -197,6 +197,8 @@ pub struct MongoDbPublisher {
     collection: Collection<Document>,
     meta_collection: Collection<Document>,
     db: Database,
+    // Retains the shared registry entry so concurrent publishers reuse this client/pool.
+    _shared_client: std::sync::Arc<Client>,
     collection_name: String,
     request_reply: bool,
     request_timeout: Duration,
@@ -226,7 +228,8 @@ impl MongoDbPublisher {
             .collection
             .as_deref()
             .ok_or_else(|| anyhow!("Collection name is required for MongoDB publisher"))?;
-        let client = create_client(config).await?;
+        let shared_client = create_shared_client(config).await?;
+        let client = (*shared_client).clone();
         let db = client.database(&config.database);
 
         if let Some(capped_size) = config.capped_size_bytes {
@@ -318,6 +321,7 @@ impl MongoDbPublisher {
             collection,
             meta_collection,
             db,
+            _shared_client: shared_client,
             collection_name: collection_name.to_string(),
             request_reply: config.request_reply,
             request_timeout: Duration::from_millis(config.request_timeout_ms.unwrap_or(30000)),
@@ -1487,6 +1491,29 @@ impl MessageConsumer for MongoDbSubscriber {
     fn as_any(&self) -> &dyn Any {
         self
     }
+}
+
+/// Returns a shared MongoDB client for this connection, building one on first use.
+/// The collection/database are handles off the client, so a single client serves all.
+async fn create_shared_client(config: &MongoDbConfig) -> anyhow::Result<std::sync::Arc<Client>> {
+    let identity = crate::connection_registry::identity_hash((
+        &config.url,
+        &config.username,
+        &config.password,
+        config.tls.required,
+        &config.tls.ca_file,
+        &config.tls.cert_file,
+        &config.tls.cert_password,
+        config.tls.accept_invalid_certs,
+    ));
+    let config_clone = config.clone();
+    crate::connection_registry::get_or_create(
+        "mongodb-client",
+        identity,
+        config.shared.unwrap_or(true),
+        move || async move { create_client(&config_clone).await },
+    )
+    .await
 }
 
 async fn create_client(config: &MongoDbConfig) -> anyhow::Result<Client> {

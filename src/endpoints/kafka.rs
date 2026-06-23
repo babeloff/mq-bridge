@@ -23,8 +23,28 @@ use std::time::Duration;
 use tracing::{debug, info, trace};
 use uuid::Uuid;
 
-pub struct KafkaPublisher {
+/// Shared rdkafka producer. The flush on `Drop` runs only when the last holder is
+/// dropped, so publishers sharing this producer don't flush each other's buffers early.
+pub struct SharedKafkaProducer {
     producer: FutureProducer,
+}
+
+impl std::ops::Deref for SharedKafkaProducer {
+    type Target = FutureProducer;
+    fn deref(&self) -> &FutureProducer {
+        &self.producer
+    }
+}
+
+impl Drop for SharedKafkaProducer {
+    fn drop(&mut self) {
+        debug!("Shared Kafka producer dropped, attempting to flush remaining messages.");
+        self.producer.flush(Duration::from_secs(5)).ok();
+    }
+}
+
+pub struct KafkaPublisher {
+    producer: Arc<SharedKafkaProducer>,
     topic: String,
     delayed_ack: bool,
 }
@@ -84,23 +104,40 @@ impl KafkaPublisher {
             }
         }
 
-        let producer: FutureProducer = client_config
-            .create()
-            .context("Failed to create Kafka producer")?;
+        // Share one producer across publishers with the same connection settings. The
+        // topic is chosen per-record, so a single producer serves every topic; sharing
+        // consolidates broker connections, the background poll thread, and batching.
+        // Producer-level settings (creds, TLS, producer_options) form the cache key.
+        let identity = crate::connection_registry::identity_hash((
+            &config.url,
+            &config.username,
+            &config.password,
+            config.tls.required,
+            &config.tls.ca_file,
+            &config.tls.cert_file,
+            &config.tls.key_file,
+            config.tls.accept_invalid_certs,
+            &config.producer_options,
+        ));
+        let shared = config.shared.unwrap_or(true);
+        let producer = crate::connection_registry::get_or_create(
+            "kafka-producer",
+            identity,
+            shared,
+            move || async move {
+                let producer: FutureProducer = client_config
+                    .create()
+                    .context("Failed to create Kafka producer")?;
+                Ok(SharedKafkaProducer { producer })
+            },
+        )
+        .await?;
+
         Ok(Self {
             producer,
             topic: topic.to_string(),
             delayed_ack: config.delayed_ack,
         })
-    }
-}
-
-impl Drop for KafkaPublisher {
-    /// On drop, attempt a non-blocking flush.
-    /// This is a best-effort attempt. For guaranteed delivery, call `disconnect()` explicitly.
-    fn drop(&mut self) {
-        debug!("KafkaPublisher dropped, attempting to flush remaining messages.");
-        self.producer.flush(Duration::from_secs(5)).ok(); // Non-blocking flush
     }
 }
 

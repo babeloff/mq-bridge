@@ -161,6 +161,56 @@ input:
     # ... kafka config
 ```
 
+### TLS & Security Hardening
+
+Most endpoints accept a `tls` block. The available fields are:
+
+```yaml
+tls:
+  required: true                   # enable TLS
+  ca_file: "./certs/ca.pem"        # CA to verify the server
+  cert_file: "./certs/client.pem"  # client cert (mTLS)
+  key_file: "./certs/client.key"   # client private key (mTLS)
+  cert_password: "secret"          # password for an encrypted key (where supported)
+  accept_invalid_certs: false      # NEVER set true in production
+```
+
+**Hardening checklist (e.g. for PCI-DSS Req 4.2.1):**
+
+1. **Enable TLS on every endpoint carrying sensitive data** (`required: true`) and supply
+   a `ca_file`. Use mTLS (`cert_file` + `key_file`) for mutual authentication where the
+   broker supports it.
+2. **Never disable certificate validation.** `accept_invalid_certs` defaults to `false`;
+   leaving it that way is required — setting it `true` on a sensitive path defeats TLS.
+3. **Choose the crypto provider feature.** Build with `rustls-aws-lc` (FIPS-capable, also
+   enables post-quantum key exchange) or `rustls-ring`. The rustls-based endpoints — NATS,
+   MQTT, HTTP, gRPC, WebSocket, AMQP — only ever negotiate rustls's safe TLS 1.2/1.3 AEAD
+   cipher suites; weak/legacy suites (RC4, 3DES, CBC-SHA1, export) cannot be offered, so
+   "strong ciphers only" holds without any explicit cipher list.
+4. **Kafka** (librdkafka/OpenSSL): certificate verification is on by default
+   (`enable.ssl.certificate.verification` follows `accept_invalid_certs`). If an auditor
+   requires an explicit allowlist, pin it via `producer_options` / `consumer_options`:
+   ```yaml
+   kafka:
+     producer_options: [["ssl.cipher.suites", "ECDHE-RSA-AES256-GCM-SHA384"]]
+     consumer_options: [["ssl.cipher.suites", "ECDHE-RSA-AES256-GCM-SHA384"]]
+   ```
+5. **IBM MQ** (native stack): set a strong `cipher_spec` (a TLS 1.2/1.3 CipherSpec) — it is
+   required for encrypted connections.
+6. **Keep sensitive payloads out of logs.** Message payloads are emitted at `trace` level;
+   run production above `trace` and confirm no cardholder data (PAN) reaches logs or traces.
+7. **Do not commit secrets.** Source passwords and tokens from a secrets manager or env vars
+   (`MQB__...`) rather than checked-in config.
+
+**Notes and boundaries:**
+
+- TLS 1.3 alone is sufficient in 2026 (Mozilla "Modern" profile). The rustls endpoints
+  currently negotiate **TLS 1.2 and 1.3** (both are PCI-acceptable). A central
+  "TLS 1.3-only" toggle is not yet configurable in the library; enforce a minimum protocol
+  version on the broker/server side, which is the side that accepts the connection.
+- Kafka and IBM MQ use native TLS stacks, so a library-wide version policy cannot be
+  applied to them — configure their minimum TLS version on the broker.
+
 ### HTTP Consumer Fast Path
 
 Compatible `http -> response` routes may use an inline response fast path for lower latency. This bypasses the normal route consumer/worker/disposition pipeline, but it still keeps the output publisher chain active, including output handlers and allowed output middlewares.
@@ -182,6 +232,36 @@ input:
 ```
 
 This is useful when you want stable, explicit semantics regardless of future optimizations, or when you want to avoid the inline path's response behavior differences. In particular, the inline path does not automatically echo unchanged request metadata back as HTTP response headers.
+
+### Connection Sharing
+
+Publishers that target the same server reuse one underlying transport client by
+default, instead of each opening its own. This consolidates TCP connections, background
+threads, and batching, and follows each driver's own guidance (one shared producer /
+client / pool per application). Sharing applies to **Kafka, NATS, MongoDB, SQLx, HTTP,
+and gRPC**; the client is keyed by its connection-level settings (URL, auth, TLS, and
+client-level options), never by topic/subject/collection. A shared client is released
+once the last publisher using it is dropped.
+
+Set `shared: false` on a publisher to give it a dedicated connection:
+
+```yaml
+orders_out:
+  output:
+    kafka:
+      topic: "orders"
+      url: "localhost:9092"
+      shared: false   # dedicated producer — keeps this latency-sensitive topic off a busy producer's queue
+```
+
+*   **Kafka**: a single producer serves every topic and is the recommended setup. Use
+    `shared: false` to isolate a latency-sensitive topic from a high-throughput one so
+    they don't share one internal send queue (head-of-line blocking).
+*   **SQLx**: a shared pool means its `max_connections` is a budget shared across every
+    route using that database. Use `shared: false` if a route needs its own pool.
+*   **gRPC**: a shared channel multiplexes over one HTTP/2 connection; at very high
+    concurrency its max-concurrent-streams cap can bottleneck — `shared: false` gives a
+    dedicated channel.
 
 ### Specialized Endpoints
 

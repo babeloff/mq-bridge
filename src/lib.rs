@@ -4,6 +4,7 @@
 //  git clone https://github.com/marcomq/mq-bridge
 pub mod canonical_message;
 pub mod command_handler;
+pub mod connection_registry;
 pub mod endpoints;
 pub mod errors;
 pub mod event_handler;

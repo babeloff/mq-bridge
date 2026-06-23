@@ -1126,6 +1126,9 @@ pub struct KafkaConfig {
     /// (Consumer only) Additional librdkafka consumer configuration options (key-value pairs).
     #[serde(default)]
     pub consumer_options: Option<Vec<(String, String)>>,
+    /// (Publisher only) Share one producer per connection (default: true); false gives a dedicated producer.
+    #[serde(default)]
+    pub shared: Option<bool>,
 }
 
 impl KafkaConfig {
@@ -1362,6 +1365,9 @@ pub struct NatsConfig {
     pub stream_max_bytes: Option<i64>,
     /// (Consumer only) Number of messages to prefetch from the consumer. Defaults to 10000.
     pub prefetch_count: Option<usize>,
+    /// Share one NATS client per connection (default: true); false forces a dedicated connection.
+    #[serde(default)]
+    pub shared: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, Default, PartialEq, Eq)]
@@ -1806,6 +1812,9 @@ pub struct MongoDbConfig {
     pub receive_query: Option<String>,
     /// (Optional) Collection to store sequence counters and cursor positions. Defaults to the message collection if not set.
     pub meta_collection: Option<String>,
+    /// Share one MongoDB client per connection (default: true); false forces a dedicated client.
+    #[serde(default)]
+    pub shared: Option<bool>,
 }
 
 impl MongoDbConfig {
@@ -2026,6 +2035,9 @@ pub struct GrpcConfig {
     /// Maximum size of a decoded incoming message in bytes. **Server-mode only.** Default 4 MiB.
     #[serde(default)]
     pub max_decoding_message_size: Option<usize>,
+    /// (Publisher only) Share one gRPC channel per connection (default: true); false forces a dedicated channel.
+    #[serde(default)]
+    pub shared: Option<bool>,
 }
 
 impl GrpcConfig {
@@ -2161,6 +2173,9 @@ pub struct HttpConfig {
     #[cfg_attr(feature = "schema", schemars(extend("format"="password")))]
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub custom_headers: HashMap<String, String>,
+    /// (Publisher only) Share one HTTP client per connection (default: true); false forces a dedicated client.
+    #[serde(default)]
+    pub shared: Option<bool>,
 }
 
 /// WebSocket connection configuration.
@@ -2454,6 +2469,9 @@ pub struct SqlxConfig {
     pub idle_timeout_ms: Option<u64>,
     /// Maximum lifetime of a connection in milliseconds. Defaults to 1800000ms (30 minutes).
     pub max_lifetime_ms: Option<u64>,
+    /// Share one connection pool per connection (default: true); false forces a dedicated pool.
+    #[serde(default)]
+    pub shared: Option<bool>,
 }
 
 // --- Common Configuration ---
