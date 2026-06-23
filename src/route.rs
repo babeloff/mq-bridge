@@ -284,6 +284,8 @@ async fn send_batch_and_commit(
             // pressure to the producer instead of queueing tasks unbounded.
             let permit = acquire_commit_permit(commit_semaphore).await;
             let err_tx = err_tx.clone();
+            // Reap finished commits so completed results don't accumulate until shutdown.
+            while commit_tasks.try_join_next().is_some() {}
             commit_tasks.spawn(async move {
                 let _permit = permit;
                 if let Err(e) = commit(dispositions).await {
@@ -348,6 +350,8 @@ async fn send_batch_and_commit(
                 &scratch.request_ids,
             );
             let permit = acquire_commit_permit(commit_semaphore).await;
+            // Reap finished commits so completed results don't accumulate until shutdown.
+            while commit_tasks.try_join_next().is_some() {}
             commit_tasks.spawn(async move {
                 let _permit = permit;
                 if let Err(e) = commit(dispositions).await {
