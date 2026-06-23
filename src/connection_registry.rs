@@ -23,7 +23,7 @@ use std::any::Any;
 use std::collections::HashMap;
 use std::future::Future;
 use std::hash::{Hash, Hasher};
-use std::sync::{Arc, OnceLock, RwLock, Weak};
+use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 
 type Key = (&'static str, u64);
 
@@ -31,6 +31,14 @@ static REGISTRY: OnceLock<RwLock<HashMap<Key, Weak<dyn Any + Send + Sync>>>> = O
 
 fn registry() -> &'static RwLock<HashMap<Key, Weak<dyn Any + Send + Sync>>> {
     REGISTRY.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+/// Per-key async locks that serialize first-time construction so concurrent cold
+/// callers don't each run `build` and open duplicate connections.
+static INFLIGHT: OnceLock<Mutex<HashMap<Key, Arc<tokio::sync::Mutex<()>>>>> = OnceLock::new();
+
+fn inflight() -> &'static Mutex<HashMap<Key, Arc<tokio::sync::Mutex<()>>>> {
+    INFLIGHT.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 /// Hash a connection identity (any `Hash`able value) into the `u64` used in the key.
@@ -70,7 +78,23 @@ where
         return Ok(existing);
     }
 
-    // Build outside the lock — never await while holding it.
+    // Serialize construction per key: only one builder runs at a time, so racing
+    // cold callers wait here and then find the cached client instead of each
+    // opening its own connection.
+    let build_lock = {
+        let mut inflight = inflight()
+            .lock()
+            .expect("connection registry inflight lock poisoned");
+        Arc::clone(inflight.entry(key).or_default())
+    };
+    let _build_guard = build_lock.lock().await;
+
+    // A builder that won the race may have cached a live client while we waited.
+    if let Some(existing) = lookup::<T>(&key) {
+        return Ok(existing);
+    }
+
+    // Build outside the registry lock — never await while holding it.
     let built: Arc<T> = Arc::new(build().await?);
 
     let mut map = registry()
@@ -133,6 +157,36 @@ mod tests {
 
         assert!(Arc::ptr_eq(&a, &b));
         assert_eq!(*a, 1); // second build is discarded; first client wins
+        assert_eq!(builds.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_cold_callers_build_once() {
+        let builds = Arc::new(AtomicUsize::new(0));
+        let id = identity_hash(("broker:9092", "concurrent"));
+
+        let mut handles = Vec::new();
+        for _ in 0..16 {
+            let builds = builds.clone();
+            handles.push(tokio::spawn(async move {
+                get_or_create("test-concurrent", id, true, || {
+                    let builds = builds.clone();
+                    async move {
+                        builds.fetch_add(1, Ordering::SeqCst);
+                        // Hold the build open so racing callers pile up behind it.
+                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                        Ok(42u32)
+                    }
+                })
+                .await
+                .unwrap()
+            }));
+        }
+
+        let first = handles.pop().unwrap().await.unwrap();
+        for h in handles {
+            assert!(Arc::ptr_eq(&first, &h.await.unwrap()));
+        }
         assert_eq!(builds.load(Ordering::SeqCst), 1);
     }
 

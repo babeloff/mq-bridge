@@ -740,10 +740,15 @@ mod tests {
 
         tokio::time::timeout(std::time::Duration::from_millis(200), async {
             loop {
+                // Register the waiter before checking so a notify_waiters() landing
+                // between the check and the await is not lost (Notify doesn't buffer).
+                let notified = all_started.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
                 if started.load(Ordering::SeqCst) == total {
                     break;
                 }
-                all_started.notified().await;
+                notified.await;
             }
         })
         .await

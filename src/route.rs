@@ -248,12 +248,14 @@ impl BatchScratch {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn send_batch_and_commit(
     publisher: &Arc<dyn MessagePublisher>,
     messages: Vec<crate::CanonicalMessage>,
     commit: BatchCommitFunc,
     has_retry_middleware: bool,
     err_tx: &Sender<anyhow::Error>,
+    commit_semaphore: Option<&Arc<tokio::sync::Semaphore>>,
     commit_tasks: &mut JoinSet<()>,
     scratch: &mut BatchScratch,
 ) -> anyhow::Result<()> {
@@ -278,8 +280,12 @@ async fn send_batch_and_commit(
                     }
                 })
                 .collect();
+            // Acquire the dispatch slot before spawning so a slow commit backstreams
+            // pressure to the producer instead of queueing tasks unbounded.
+            let permit = acquire_commit_permit(commit_semaphore).await;
             let err_tx = err_tx.clone();
             commit_tasks.spawn(async move {
+                let _permit = permit;
                 if let Err(e) = commit(dispositions).await {
                     error!("Commit failed: {}", e);
                     report_route_error(&err_tx, e, "Could not send commit error to main task");
@@ -341,7 +347,9 @@ async fn send_batch_and_commit(
                 &failed,
                 &scratch.request_ids,
             );
+            let permit = acquire_commit_permit(commit_semaphore).await;
             commit_tasks.spawn(async move {
+                let _permit = permit;
                 if let Err(e) = commit(dispositions).await {
                     error!("Commit failed: {}", e);
                     report_route_error(&err_tx, e, "Could not send commit error to main task");
@@ -726,6 +734,7 @@ impl Route {
             consumer.commit_requires_order(),
             self.options.commit_concurrency_limit,
         );
+        let commit_semaphore = commit_router.dispatch_semaphore();
         let mut seq_counter = 0u64;
 
         if let Some(tx) = ready_tx {
@@ -776,6 +785,7 @@ impl Route {
                         commit,
                         has_retry_middleware,
                         &err_tx,
+                        commit_semaphore.as_ref(),
                         &mut commit_tasks,
                         &mut batch_scratch,
                     )
@@ -846,6 +856,8 @@ impl Route {
             consumer.commit_requires_order(),
             self.options.commit_concurrency_limit,
         );
+        // Shared across workers so the limit bounds total commits in flight, not per-worker.
+        let commit_semaphore = commit_router.dispatch_semaphore();
 
         // --- Worker Pool ---
         let mut join_set = JoinSet::new();
@@ -853,6 +865,7 @@ impl Route {
             let work_rx_clone = work_rx.clone();
             let publisher = Arc::clone(&publisher);
             let err_tx = err_tx.clone();
+            let commit_semaphore = commit_semaphore.clone();
             let mut commit_tasks = JoinSet::new();
             let has_retry_middleware = self.output.has_retry_middleware();
             let batch_size = self.options.batch_size;
@@ -866,6 +879,7 @@ impl Route {
                         commit_func,
                         has_retry_middleware,
                         &err_tx,
+                        commit_semaphore.as_ref(),
                         &mut commit_tasks,
                         &mut batch_scratch,
                     )
@@ -1227,9 +1241,22 @@ impl CommitRouter {
     fn wrap(&self, commit: BatchCommitFunc, seq: u64) -> BatchCommitFunc {
         match self {
             CommitRouter::Ordered { seq_tx, .. } => wrap_commit(commit, seq, seq_tx.clone()),
-            CommitRouter::Unordered { semaphore } => {
-                wrap_commit_unordered(commit, Arc::clone(semaphore))
-            }
+            // Unordered commits need no wrapping: the dispatcher acquires a
+            // `commit_concurrency_limit` permit *before* spawning each commit
+            // (see `dispatch_semaphore`), so backpressure applies at queue time
+            // instead of letting blocked commit tasks pile up unbounded.
+            CommitRouter::Unordered { .. } => commit,
+        }
+    }
+
+    /// Semaphore that bounds how many unordered commits may be queued/in-flight at
+    /// once. The dispatcher acquires a permit before spawning a commit task and
+    /// holds it for the task's lifetime. `None` for the ordered path, whose
+    /// bounded sequencer channel already limits outstanding commits.
+    fn dispatch_semaphore(&self) -> Option<Arc<tokio::sync::Semaphore>> {
+        match self {
+            CommitRouter::Ordered { .. } => None,
+            CommitRouter::Unordered { semaphore } => Some(Arc::clone(semaphore)),
         }
     }
 
@@ -1243,21 +1270,18 @@ impl CommitRouter {
     }
 }
 
-/// Wraps a commit for the unordered path: commits run concurrently instead of
-/// through the serial sequencer, bounded by a shared semaphore so at most
-/// `commit_concurrency_limit` acks are in flight at once. Used only for consumers
-/// whose `commit_requires_order()` is `false` (individual-ack transports).
-fn wrap_commit_unordered(
-    commit: BatchCommitFunc,
-    semaphore: Arc<tokio::sync::Semaphore>,
-) -> BatchCommitFunc {
-    Box::new(move |dispositions| {
-        Box::pin(async move {
-            // If the semaphore was closed (route shutting down) just run the commit.
-            let _permit = semaphore.acquire_owned().await.ok();
-            commit(dispositions).await
-        })
-    })
+/// Acquires a commit-dispatch permit before a commit task is spawned, so the
+/// caller blocks (applies backpressure) once `commit_concurrency_limit` commits
+/// are already queued rather than spawning unbounded tasks. The returned permit is
+/// held for the spawned task's lifetime. `None` (no semaphore, or a closed one
+/// during shutdown) means the commit runs unbounded.
+async fn acquire_commit_permit(
+    semaphore: Option<&Arc<tokio::sync::Semaphore>>,
+) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    match semaphore {
+        Some(sem) => Arc::clone(sem).acquire_owned().await.ok(),
+        None => None,
+    }
 }
 
 fn map_responses_to_dispositions(
