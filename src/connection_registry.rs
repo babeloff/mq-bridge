@@ -50,6 +50,10 @@ fn inflight() -> &'static Mutex<HashMap<Key, Arc<tokio::sync::Mutex<()>>>> {
 ///
 /// Pass only fields that determine which underlying client is appropriate, e.g.
 /// `(url, username, &tls)`. Two callers with the same tag and identity share a client.
+///
+/// The encoding is order-sensitive: any map-like field (e.g. a `Vec` of option
+/// pairs) must be canonicalized — typically sorted — by the caller first, so that
+/// configs that differ only in field order still resolve to the same client.
 pub fn connection_identity<H: Debug>(identity: H) -> String {
     format!("{identity:?}")
 }
@@ -100,22 +104,41 @@ where
     // Build outside the registry lock — never await while holding it.
     let built: Arc<T> = Arc::new(build().await?);
 
-    let mut map = registry()
-        .write()
-        .expect("connection registry lock poisoned");
-    // Another task may have inserted a live client while we were building.
-    if let Some(weak) = map.get(&key) {
-        if let Some(arc) = weak.upgrade() {
-            if let Ok(typed) = arc.downcast::<T>() {
-                return Ok(typed);
+    let resolved = {
+        let mut map = registry()
+            .write()
+            .expect("connection registry lock poisoned");
+        // Opportunistically drop keys whose shared client has been released, so the
+        // registry doesn't accumulate dead `Weak` entries over the process lifetime.
+        map.retain(|_, weak| weak.strong_count() > 0);
+        // Another task may have inserted a live client while we were building.
+        match map
+            .get(&key)
+            .and_then(Weak::upgrade)
+            .and_then(|arc| arc.downcast::<T>().ok())
+        {
+            Some(existing) => existing,
+            None => {
+                map.insert(
+                    key.clone(),
+                    Arc::downgrade(&(built.clone() as Arc<dyn Any + Send + Sync>)),
+                );
+                built
             }
         }
-    }
-    map.insert(
-        key,
-        Arc::downgrade(&(built.clone() as Arc<dyn Any + Send + Sync>)),
-    );
-    Ok(built)
+    };
+
+    // The client is now cached, so future callers resolve via `lookup` without the
+    // build lock. Release our guard and drop the per-key INFLIGHT entry so the map
+    // doesn't accumulate dead locks. Callers already blocked on this lock still hold
+    // their own `Arc` clone and, once they wake, find the cached client.
+    drop(_build_guard);
+    inflight()
+        .lock()
+        .expect("connection registry inflight lock poisoned")
+        .remove(&key);
+
+    Ok(resolved)
 }
 
 fn lookup<T: Send + Sync + 'static>(key: &Key) -> Option<Arc<T>> {

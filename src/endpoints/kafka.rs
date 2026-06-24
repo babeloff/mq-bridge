@@ -108,6 +108,13 @@ impl KafkaPublisher {
         // topic is chosen per-record, so a single producer serves every topic; sharing
         // consolidates broker connections, the background poll thread, and batching.
         // Producer-level settings (creds, TLS, producer_options) form the cache key.
+        // Sort producer_options first: the identity is order-sensitive, so equivalent
+        // configs listing the same options in a different order must still share.
+        let producer_options = config.producer_options.as_ref().map(|opts| {
+            let mut sorted = opts.clone();
+            sorted.sort();
+            sorted
+        });
         let identity = crate::connection_registry::connection_identity((
             &config.url,
             &config.username,
@@ -117,7 +124,7 @@ impl KafkaPublisher {
             &config.tls.cert_file,
             &config.tls.key_file,
             config.tls.accept_invalid_certs,
-            &config.producer_options,
+            &producer_options,
         ));
         let shared = config.shared.unwrap_or(true);
         let producer = crate::connection_registry::get_or_create(
