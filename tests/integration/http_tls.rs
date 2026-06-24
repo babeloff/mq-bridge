@@ -120,7 +120,7 @@ async fn test_http_tls_pipeline() {
                     in_channel.fill_messages(messages).await.unwrap();
 
                     let memory_channel = out_route.output.channel().unwrap();
-                    let deadline = Duration::from_secs(180);
+                    let deadline = Duration::from_secs(90);
                     let start = Instant::now();
                     let mut received = 0usize;
                     while start.elapsed() < deadline {
