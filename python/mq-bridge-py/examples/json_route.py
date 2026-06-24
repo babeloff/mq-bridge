@@ -13,11 +13,11 @@ def handle_order(data):
     return {"accepted": True, "order_id": data["order_id"]}
 
 
-route = Route.from_yaml(str(CONFIG_PATH), "orders_route").add_handler(
+route = Route.from_file(str(CONFIG_PATH), "orders_route").add_handler(
     "order.created",
     handle_order,
 )
-publisher = Publisher.from_yaml(str(CONFIG_PATH), "orders_publisher")
+publisher = Publisher.from_file(str(CONFIG_PATH), "orders_publisher")
 
 
 def drive() -> None:

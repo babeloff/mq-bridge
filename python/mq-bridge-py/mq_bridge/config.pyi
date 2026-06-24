@@ -395,6 +395,6 @@ EndpointConfig = Endpoint
 RoutesConfig = Dict[str, Route]
 
 class ConfigDocument(TypedDict, total=False):
-    """Top-level config accepted by from_config / from_yaml_str."""
+    """Top-level config accepted by from_config / from_str."""
     routes: Dict[str, Route]
     publishers: Dict[str, Endpoint]

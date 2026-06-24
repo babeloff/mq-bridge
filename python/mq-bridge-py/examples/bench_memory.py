@@ -52,9 +52,9 @@ def main() -> None:
     if args.senders < 1:
         raise ValueError("--senders must be at least 1")
 
-    transform_route = Route.from_yaml(str(CONFIG_PATH), "transform_route")
+    transform_route = Route.from_file(str(CONFIG_PATH), "transform_route")
     publishers = [
-        Publisher.from_yaml(str(CONFIG_PATH), "bench_publisher")
+        Publisher.from_file(str(CONFIG_PATH), "bench_publisher")
         for _ in range(args.senders)
     ]
     drainer = MemoryDrainer.from_topic("bench.out", 65_536)

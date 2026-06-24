@@ -408,30 +408,53 @@ struct Route {
 
 #[pymethods]
 impl Route {
+    /// Build a route from a YAML or JSON config file. Accepts a `routes:`
+    /// document, a bare `{name: route}` map, or a single route body. Omit
+    /// `name` (or pass `""`) when the file is a single bare route body.
     #[staticmethod]
-    fn from_yaml(py: Python<'_>, path: &str, name: &str) -> PyResult<Self> {
+    #[pyo3(signature = (path, name=None))]
+    fn from_file(py: Python<'_>, path: &str, name: Option<&str>) -> PyResult<Self> {
         let path = path.to_string();
-        let name = name.to_string();
+        let name = normalize_name(name).map(str::to_string);
         py.detach(move || -> anyhow::Result<Self> {
-            let route = load_named_route(Path::new(&path), &name)?;
-            Self::build(route, name)
+            let route = load_named_route(Path::new(&path), name.as_deref())?;
+            Self::build(route, name.unwrap_or_else(default_route_name))
         })
         .map_err(to_py_runtime_error)
     }
 
-    /// Build a route from an in-memory YAML string. Accepts the same shapes as
-    /// `from_yaml` (a `routes:` document, a bare route map, or a single route).
+    /// Deprecated alias for `from_file`.
     #[staticmethod]
-    fn from_yaml_str(py: Python<'_>, text: &str, name: &str) -> PyResult<Self> {
+    #[pyo3(signature = (path, name=None))]
+    fn from_yaml(py: Python<'_>, path: &str, name: Option<&str>) -> PyResult<Self> {
+        warn_deprecated(py, c"Route.from_yaml is deprecated; use Route.from_file")?;
+        Self::from_file(py, path, name)
+    }
+
+    /// Build a route from an in-memory YAML or JSON string. Accepts the same
+    /// shapes as `from_file`. Omit `name` (or pass `""`) when the string is a
+    /// single bare route body.
+    #[staticmethod]
+    #[pyo3(signature = (text, name=None))]
+    fn from_str(py: Python<'_>, text: &str, name: Option<&str>) -> PyResult<Self> {
         let text = text.to_string();
-        let name = name.to_string();
+        let name = normalize_name(name).map(str::to_string);
         py.detach(move || -> anyhow::Result<Self> {
             let value = unwrap_config_root(
                 serde_yaml_ng::from_str(&text).context("failed to parse YAML config")?,
             );
-            Self::build(named_route_from_value(value, &name)?, name)
+            let route = named_route_from_value(value, name.as_deref())?;
+            Self::build(route, name.unwrap_or_else(default_route_name))
         })
         .map_err(to_py_runtime_error)
+    }
+
+    /// Deprecated alias for `from_str`.
+    #[staticmethod]
+    #[pyo3(signature = (text, name=None))]
+    fn from_yaml_str(py: Python<'_>, text: &str, name: Option<&str>) -> PyResult<Self> {
+        warn_deprecated(py, c"Route.from_yaml_str is deprecated; use Route.from_str")?;
+        Self::from_str(py, text, name)
     }
 
     /// Build a route from an in-memory mapping (e.g. a Python ``dict``).
@@ -449,16 +472,26 @@ impl Route {
     ///         }}},
     ///         "orders",
     ///     )
+    ///
+    /// Omit ``name`` (or pass ``""``) to treat the mapping as a single bare
+    /// route body, in which case a name is generated automatically::
+    ///
+    ///     Route.from_config({
+    ///         "input": {"memory": {"topic": "orders.in"}},
+    ///         "output": {"response": {}},
+    ///     })
     #[staticmethod]
-    fn from_config(py: Python<'_>, config: &Bound<'_, PyAny>, name: &str) -> PyResult<Self> {
+    #[pyo3(signature = (config, name=None))]
+    fn from_config(py: Python<'_>, config: &Bound<'_, PyAny>, name: Option<&str>) -> PyResult<Self> {
         let bytes = python_to_json_bytes(config)?;
-        let name = name.to_string();
+        let name = normalize_name(name).map(str::to_string);
         py.detach(move || -> anyhow::Result<Self> {
             let text = std::str::from_utf8(&bytes).context("config is not valid UTF-8")?;
             let value = unwrap_config_root(
                 serde_yaml_ng::from_str(text).context("failed to parse config mapping")?,
             );
-            Self::build(named_route_from_value(value, &name)?, name)
+            let route = named_route_from_value(value, name.as_deref())?;
+            Self::build(route, name.unwrap_or_else(default_route_name))
         })
         .map_err(to_py_runtime_error)
     }
@@ -694,39 +727,66 @@ impl Publisher {
 
 #[pymethods]
 impl Publisher {
+    /// Build a publisher from a YAML or JSON config file. Accepts a
+    /// `publishers:` document, a bare `{name: endpoint}` map, or a single
+    /// endpoint body. Omit `name` (or pass `""`) for a single bare endpoint.
     #[staticmethod]
-    fn from_yaml(py: Python<'_>, path: &str, name: &str) -> PyResult<Self> {
+    #[pyo3(signature = (path, name=None))]
+    fn from_file(py: Python<'_>, path: &str, name: Option<&str>) -> PyResult<Self> {
         let path = path.to_string();
-        let name = name.to_string();
+        let name = normalize_name(name).map(str::to_string);
         py.detach(move || -> anyhow::Result<Self> {
-            Self::build(load_named_publisher(Path::new(&path), &name)?)
+            Self::build(load_named_publisher(Path::new(&path), name.as_deref())?)
         })
         .map_err(to_py_runtime_error)
     }
 
+    /// Deprecated alias for `from_file`.
     #[staticmethod]
-    fn from_yaml_str(py: Python<'_>, text: &str, name: &str) -> PyResult<Self> {
+    #[pyo3(signature = (path, name=None))]
+    fn from_yaml(py: Python<'_>, path: &str, name: Option<&str>) -> PyResult<Self> {
+        warn_deprecated(py, c"Publisher.from_yaml is deprecated; use Publisher.from_file")?;
+        Self::from_file(py, path, name)
+    }
+
+    /// Build a publisher from an in-memory YAML or JSON string. Omit `name`
+    /// (or pass `""`) when the string is a single bare endpoint body.
+    #[staticmethod]
+    #[pyo3(signature = (text, name=None))]
+    fn from_str(py: Python<'_>, text: &str, name: Option<&str>) -> PyResult<Self> {
         let text = text.to_string();
-        let name = name.to_string();
+        let name = normalize_name(name).map(str::to_string);
         py.detach(move || -> anyhow::Result<Self> {
             let value = unwrap_config_root(
                 serde_yaml_ng::from_str(&text).context("failed to parse YAML config")?,
             );
-            Self::build(named_publisher_from_value(value, &name)?)
+            Self::build(named_publisher_from_value(value, name.as_deref())?)
         })
         .map_err(to_py_runtime_error)
     }
 
+    /// Deprecated alias for `from_str`.
     #[staticmethod]
-    fn from_config(py: Python<'_>, config: &Bound<'_, PyAny>, name: &str) -> PyResult<Self> {
+    #[pyo3(signature = (text, name=None))]
+    fn from_yaml_str(py: Python<'_>, text: &str, name: Option<&str>) -> PyResult<Self> {
+        warn_deprecated(py, c"Publisher.from_yaml_str is deprecated; use Publisher.from_str")?;
+        Self::from_str(py, text, name)
+    }
+
+    /// Build a publisher from an in-memory mapping. Omit `name` (or pass `""`)
+    /// to treat the mapping as a single bare endpoint body, e.g.
+    /// ``Publisher.from_config({"response": {}})``.
+    #[staticmethod]
+    #[pyo3(signature = (config, name=None))]
+    fn from_config(py: Python<'_>, config: &Bound<'_, PyAny>, name: Option<&str>) -> PyResult<Self> {
         let bytes = python_to_json_bytes(config)?;
-        let name = name.to_string();
+        let name = normalize_name(name).map(str::to_string);
         py.detach(move || -> anyhow::Result<Self> {
             let text = std::str::from_utf8(&bytes).context("config is not valid UTF-8")?;
             let value = unwrap_config_root(
                 serde_yaml_ng::from_str(text).context("failed to parse config mapping")?,
             );
-            Self::build(named_publisher_from_value(value, &name)?)
+            Self::build(named_publisher_from_value(value, name.as_deref())?)
         })
         .map_err(to_py_runtime_error)
     }
@@ -904,40 +964,79 @@ fn load_config_value(path: &Path) -> anyhow::Result<serde_yaml_ng::Value> {
     Ok(unwrap_config_root(value))
 }
 
-fn load_named_route(path: &Path, name: &str) -> anyhow::Result<CoreRoute> {
+fn load_named_route(path: &Path, name: Option<&str>) -> anyhow::Result<CoreRoute> {
     named_route_from_value(load_config_value(path)?, name)
 }
 
-fn named_route_from_value(value: serde_yaml_ng::Value, name: &str) -> anyhow::Result<CoreRoute> {
-    if let Ok(document) = load_document_from_value(value.clone()) {
-        if let Some(route) = document.routes.get(name).cloned() {
-            return Ok(route);
+/// Resolve a route from a config value. When `name` is `Some`, look it up in a
+/// `routes:` document (falling back to a single-route body). When `name` is
+/// `None`, the value must be a single bare route body.
+fn named_route_from_value(
+    value: serde_yaml_ng::Value,
+    name: Option<&str>,
+) -> anyhow::Result<CoreRoute> {
+    if let Some(name) = name {
+        if let Ok(document) = load_document_from_value(value.clone()) {
+            if let Some(route) = document.routes.get(name).cloned() {
+                return Ok(route);
+            }
         }
     }
 
-    serde_yaml_ng::from_value(value).with_context(|| {
-        format!(
+    serde_yaml_ng::from_value(value).with_context(|| match name {
+        Some(name) => format!(
             "No route named '{name}' found, and the config could not be parsed as a single route"
-        )
+        ),
+        None => "config could not be parsed as a single route body".to_string(),
     })
 }
 
-fn load_named_publisher(path: &Path, name: &str) -> anyhow::Result<Endpoint> {
+fn load_named_publisher(path: &Path, name: Option<&str>) -> anyhow::Result<Endpoint> {
     named_publisher_from_value(load_config_value(path)?, name)
 }
 
-fn named_publisher_from_value(value: serde_yaml_ng::Value, name: &str) -> anyhow::Result<Endpoint> {
-    if let Ok(document) = load_document_from_value(value.clone()) {
-        if let Some(endpoint) = document.publishers.get(name).cloned() {
-            return Ok(endpoint);
+/// Resolve a publisher endpoint from a config value. When `name` is `Some`,
+/// look it up in a `publishers:` document (falling back to a single endpoint
+/// body). When `name` is `None`, the value must be a single bare endpoint body.
+fn named_publisher_from_value(
+    value: serde_yaml_ng::Value,
+    name: Option<&str>,
+) -> anyhow::Result<Endpoint> {
+    if let Some(name) = name {
+        if let Ok(document) = load_document_from_value(value.clone()) {
+            if let Some(endpoint) = document.publishers.get(name).cloned() {
+                return Ok(endpoint);
+            }
         }
     }
 
-    serde_yaml_ng::from_value(value).with_context(|| {
-        format!(
+    serde_yaml_ng::from_value(value).with_context(|| match name {
+        Some(name) => format!(
             "No publisher named '{name}' found, and the config could not be parsed as a single publisher endpoint"
-        )
+        ),
+        None => "config could not be parsed as a single endpoint body".to_string(),
     })
+}
+
+/// Map an optional name from the Python boundary to `None` when missing or
+/// empty, so callers can omit it (or pass `""`) to mean "no name".
+fn normalize_name(name: Option<&str>) -> Option<&str> {
+    name.filter(|n| !n.is_empty())
+}
+
+/// Emit a Python `DeprecationWarning` from a deprecated constructor alias.
+fn warn_deprecated(py: Python<'_>, message: &std::ffi::CStr) -> PyResult<()> {
+    PyErr::warn(
+        py,
+        &py.get_type::<pyo3::exceptions::PyDeprecationWarning>(),
+        message,
+        1,
+    )
+}
+
+/// Generated identity for a route built without an explicit name.
+fn default_route_name() -> String {
+    format!("route-{}", fast_uuid_v7::gen_id())
 }
 
 fn load_document_from_value(value: serde_yaml_ng::Value) -> anyhow::Result<ConfigDocument> {
@@ -1662,7 +1761,7 @@ my_route:
 "#,
         );
 
-        let route = Python::attach(|py| Route::from_yaml(py, &path, "my_route")).unwrap();
+        let route = Python::attach(|py| Route::from_file(py, &path, Some("my_route"))).unwrap();
         assert_eq!(route.name, "my_route");
     }
 
@@ -1679,7 +1778,7 @@ routes:
 "#,
         );
 
-        let route = Python::attach(|py| Route::from_yaml(py, &path, "section_route")).unwrap();
+        let route = Python::attach(|py| Route::from_file(py, &path, Some("section_route"))).unwrap();
         assert_eq!(route.name, "section_route");
     }
 
@@ -1694,8 +1793,23 @@ output:
 "#,
         );
 
-        let route = Python::attach(|py| Route::from_yaml(py, &path, "orders_route")).unwrap();
+        let route = Python::attach(|py| Route::from_file(py, &path, Some("orders_route"))).unwrap();
         assert_eq!(route.name, "orders_route");
+    }
+
+    #[test]
+    fn test_route_from_yaml_without_name_parses_single_route() {
+        let path = write_yaml(
+            r#"
+input:
+  memory: { topic: "nameless-in", capacity: 8 }
+output:
+  memory: { topic: "nameless-out", capacity: 8 }
+"#,
+        );
+
+        let route = Python::attach(|py| Route::from_file(py, &path, None)).unwrap();
+        assert!(route.name.starts_with("route-"));
     }
 
     #[test]
@@ -1708,7 +1822,7 @@ publishers:
 "#,
         );
 
-        let _publisher = Python::attach(|py| Publisher::from_yaml(py, &path, "echo")).unwrap();
+        let _publisher = Python::attach(|py| Publisher::from_file(py, &path, Some("echo"))).unwrap();
     }
 
     #[test]
@@ -1722,7 +1836,7 @@ memory:
         );
 
         let _publisher =
-            Python::attach(|py| Publisher::from_yaml(py, &path, "orders_publisher")).unwrap();
+            Python::attach(|py| Publisher::from_file(py, &path, Some("orders_publisher"))).unwrap();
     }
 
     #[test]
@@ -1936,7 +2050,7 @@ routes:
         );
 
         let route = Python::attach(|py| {
-            Py::new(py, Route::from_yaml(py, &path, "raw_route").unwrap()).unwrap()
+            Py::new(py, Route::from_file(py, &path, Some("raw_route")).unwrap()).unwrap()
         });
         Python::attach(|py| {
             let module = PyModule::from_code(
@@ -1965,7 +2079,7 @@ routes:
         );
 
         let route = Python::attach(|py| {
-            Py::new(py, Route::from_yaml(py, &path, "typed_route").unwrap()).unwrap()
+            Py::new(py, Route::from_file(py, &path, Some("typed_route")).unwrap()).unwrap()
         });
         Python::attach(|py| {
             let module = PyModule::from_code(
@@ -2099,7 +2213,7 @@ publishers:
 "#,
         );
 
-        let publisher = Python::attach(|py| Publisher::from_yaml(py, &path, "echo")).unwrap();
+        let publisher = Python::attach(|py| Publisher::from_file(py, &path, Some("echo"))).unwrap();
         Python::attach(|py| {
             let bytes_arg = PyBytes::new(py, b"hello");
             publisher
@@ -2143,7 +2257,7 @@ publishers:
 "#,
         );
 
-        let publisher = Python::attach(|py| Publisher::from_yaml(py, &path, "echo")).unwrap();
+        let publisher = Python::attach(|py| Publisher::from_file(py, &path, Some("echo"))).unwrap();
         Python::attach(|py| {
             let data = PyDict::new(py);
             data.set_item("order_id", 42).unwrap();
@@ -2203,7 +2317,7 @@ routes:
         );
 
         let route =
-            Arc::new(Python::attach(|py| Route::from_yaml(py, &path, "stoppable_route")).unwrap());
+            Arc::new(Python::attach(|py| Route::from_file(py, &path, Some("stoppable_route"))).unwrap());
         let run_route = Arc::clone(&route);
         let thread = std::thread::spawn(move || {
             Python::attach(|py| run_route.run(py)).unwrap();
@@ -2228,8 +2342,8 @@ routes:
         );
 
         let first =
-            Arc::new(Python::attach(|py| Route::from_yaml(py, &path, "shared_route")).unwrap());
-        let second = Python::attach(|py| Route::from_yaml(py, &path, "shared_route")).unwrap();
+            Arc::new(Python::attach(|py| Route::from_file(py, &path, Some("shared_route"))).unwrap());
+        let second = Python::attach(|py| Route::from_file(py, &path, Some("shared_route"))).unwrap();
 
         let run_route = Arc::clone(&first);
         let thread = std::thread::spawn(move || {

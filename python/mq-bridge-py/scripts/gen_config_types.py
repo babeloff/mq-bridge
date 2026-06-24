@@ -192,7 +192,7 @@ def generate() -> tuple[str, str]:
         "RoutesConfig = Dict[str, Route]\n"
         "\n"
         "class ConfigDocument(TypedDict, total=False):\n"
-        '    """Top-level config accepted by from_config / from_yaml_str."""\n'
+        '    """Top-level config accepted by from_config / from_str."""\n'
         "    routes: Dict[str, Route]\n"
         "    publishers: Dict[str, Endpoint]\n"
     )

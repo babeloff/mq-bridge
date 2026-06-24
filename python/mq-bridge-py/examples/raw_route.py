@@ -14,8 +14,8 @@ def handle_raw(message):
     return b"ok"
 
 
-route = Route.from_yaml(str(CONFIG_PATH), "orders_route").with_handler(handle_raw)
-publisher = Publisher.from_yaml(str(CONFIG_PATH), "orders_publisher")
+route = Route.from_file(str(CONFIG_PATH), "orders_route").with_handler(handle_raw)
+publisher = Publisher.from_file(str(CONFIG_PATH), "orders_publisher")
 
 def drive() -> None:
     time.sleep(0.2)

@@ -128,8 +128,39 @@ def test_publisher_request_json_echoes_via_config() -> None:
     assert reply.id is not None
 
 
-def test_publisher_from_yaml_str_echoes() -> None:
-    publisher = Publisher.from_yaml_str(
+def test_publisher_from_config_without_name_uses_bare_endpoint() -> None:
+    # No name => the mapping is a single bare endpoint body.
+    publisher = Publisher.from_config({"response": {}})
+
+    reply = publisher.request(b"ping")
+
+    assert reply.payload == b"ping"
+
+
+def test_route_from_config_without_name_uses_bare_route() -> None:
+    in_topic = _unique("pytest.in")
+    out_topic = _unique("pytest.out")
+
+    # No name => the mapping is a single bare route body.
+    route = Route.from_config(
+        {
+            "input": {"memory": {"topic": in_topic, "capacity": 4096}},
+            "output": {"memory": {"topic": out_topic, "capacity": 4096}},
+        }
+    ).with_handler(lambda msg: msg)
+    publisher = Publisher.from_config({"memory": {"topic": in_topic, "capacity": 4096}})
+    drainer = MemoryDrainer.from_topic(out_topic, 4096)
+
+    route.start()
+    try:
+        publisher.send(b"hello")
+        assert drainer.drain(1, timeout=5.0) == 1
+    finally:
+        route.stop()
+
+
+def test_publisher_from_str_echoes() -> None:
+    publisher = Publisher.from_str(
         """
         publishers:
           echo:
@@ -137,6 +168,15 @@ def test_publisher_from_yaml_str_echoes() -> None:
         """,
         "echo",
     )
+
+    reply = publisher.request(b"ping")
+
+    assert reply.payload == b"ping"
+
+
+def test_from_yaml_str_alias_is_deprecated_but_works() -> None:
+    with pytest.warns(DeprecationWarning):
+        publisher = Publisher.from_yaml_str("response: {}")
 
     reply = publisher.request(b"ping")
 

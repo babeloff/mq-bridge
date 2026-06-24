@@ -15,12 +15,14 @@ Memory and file endpoints are always present in both packages. Use `mq-bridge-py
 
 The public API stays close to mq-bridge itself:
 
-- `Route.from_yaml(path, name)` loads one named route from a YAML file
-- `Route.from_yaml_str(text, name)` / `Route.from_config(mapping, name)` build a route from an in-memory YAML string or a Python `dict`, no file required
+- `Route.from_file(path, name=None)` loads a route from a YAML/JSON file. The three constructors differ only by source: `from_file` (path), `from_str` (in-memory string), `from_config` (Python `dict`)
+- The `name` is optional: pass it to pick one entry out of a `routes:`/`publishers:` document, or omit it to treat the whole config as a single bare route/endpoint body
 - `Route.with_handler(...)` attaches a raw `Message` handler, with lazy `json()`/`text()` readers and `with_json()`/`with_payload()` response helpers
 - `Route.add_handler(kind, ...)` uses mq-bridge's `kind` dispatch and delivers decoded JSON
 - `RetryableError` and `NonRetryableError` let Python handlers signal retry intent
-- `Publisher.from_yaml(path, name)` (plus `from_yaml_str` / `from_config`) loads one named publisher
+- `Publisher.from_file(path, name=None)` (plus `from_str` / `from_config`) builds a publisher endpoint
+
+`from_yaml` / `from_yaml_str` remain as deprecated aliases for `from_file` / `from_str`.
 - `Publisher.send_json(...)` and `Publisher.request_json(...)` serialize Python JSON values in Rust
 
 The Python surface is synchronous and blocking. Tokio, broker I/O, routing, and batching all stay in Rust.
@@ -30,10 +32,10 @@ The Python surface is synchronous and blocking. Tokio, broker I/O, routing, and 
 `mq-bridge-app` can create and test route and endpoint JSON/YAML through its UI.
 It does not replace your Python code or handlers, but it is useful when you want
 a known-good connection and route shape before pasting the configuration into
-Python. Load the generated config with `Route.from_config`, `Route.from_yaml`,
-`Publisher.from_config`, or `Publisher.from_yaml`.
+Python. Load the generated config with `Route.from_config`, `Route.from_file`,
+`Publisher.from_config`, or `Publisher.from_file`.
 
-For the `from_config` / `from_yaml_str` mappings, `mq_bridge.config` ships
+For the `from_config` / `from_str` mappings, `mq_bridge.config` ships
 `TypedDict` definitions so editors autocomplete the config keys (`input`,
 `output`, `batch_size`, every transport config, middleware, …):
 
