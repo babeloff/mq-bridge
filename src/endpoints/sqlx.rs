@@ -153,8 +153,40 @@ async fn create_sqlx_pool(config: &SqlxConfig) -> anyhow::Result<AnyPool> {
     Ok(pool_options.connect(&url).await?)
 }
 
+/// Returns a shared connection pool for this database, building one on first use.
+async fn create_shared_sqlx_pool(config: &SqlxConfig) -> anyhow::Result<std::sync::Arc<AnyPool>> {
+    let identity = crate::connection_registry::connection_identity((
+        &config.url,
+        &config.username,
+        &config.password,
+        config.tls.required,
+        &config.tls.ca_file,
+        &config.tls.cert_file,
+        &config.tls.key_file,
+        &config.tls.cert_password,
+        config.tls.accept_invalid_certs,
+        (
+            config.max_connections,
+            config.min_connections,
+            config.acquire_timeout_ms,
+            config.idle_timeout_ms,
+            config.max_lifetime_ms,
+        ),
+    ));
+    let config_clone = config.clone();
+    crate::connection_registry::get_or_create(
+        "sqlx-pool",
+        identity,
+        config.shared.unwrap_or(true),
+        move || async move { create_sqlx_pool(&config_clone).await },
+    )
+    .await
+}
+
 pub struct SqlxPublisher {
     pool: AnyPool,
+    // Retains the shared registry entry so concurrent publishers reuse this pool.
+    _shared_pool: std::sync::Arc<AnyPool>,
     insert_query: String,
     driver_name: String,
     table: String,
@@ -169,7 +201,8 @@ impl SqlxPublisher {
                 config.table
             ));
         }
-        let pool = create_sqlx_pool(config).await?;
+        let shared_pool = create_shared_sqlx_pool(config).await?;
+        let pool = (*shared_pool).clone();
         let table = config.table.clone();
 
         // Acquire a connection to determine the driver so we can use the correct SQL syntax.
@@ -273,6 +306,7 @@ impl SqlxPublisher {
 
         Ok(Self {
             pool,
+            _shared_pool: shared_pool,
             insert_query,
             driver_name,
             table,
@@ -662,6 +696,12 @@ impl SqlxConsumer {
 }
 #[async_trait]
 impl MessageConsumer for SqlxConsumer {
+    // Acking deletes rows by id (`DELETE ... WHERE id IN (...)`), so each batch's
+    // commit is independent; out-of-order concurrent commits cannot lose other
+    // batches' rows.
+    fn commit_requires_order(&self) -> bool {
+        false
+    }
     async fn receive_batch(&mut self, max_messages: usize) -> Result<ReceivedBatch, ConsumerError> {
         if max_messages == 0 {
             return Ok(ReceivedBatch {

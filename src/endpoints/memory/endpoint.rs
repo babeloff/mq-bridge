@@ -694,6 +694,48 @@ impl MemoryQueueConsumer {
     }
 }
 
+/// Requeues messages onto a topic's channel without ever blocking the caller.
+///
+/// Tries a non-blocking send first; if the channel is momentarily full, the
+/// blocking send is finished on a detached task. This matters when called from a
+/// commit, which holds a route dispatch permit: a blocking `send().await` there
+/// would stall the whole commit dispatcher (and thus the consumer that drains
+/// this very channel) into a deadlock. Messages are never dropped on a full
+/// channel — they are requeued in the background. The only loss is a *closed*
+/// channel (or no runtime), which is logged as an error.
+fn requeue_messages(topic: &str, messages: Vec<CanonicalMessage>) {
+    if messages.is_empty() {
+        return;
+    }
+    let count = messages.len();
+    let channel = get_or_create_channel(&MemoryConfig {
+        topic: topic.to_string(),
+        capacity: None,
+        ..Default::default()
+    });
+    match channel.sender.try_send(messages) {
+        Ok(_) => {}
+        Err(async_channel::TrySendError::Closed(_)) => {
+            tracing::error!(topic = %topic, count, "Dropped messages: memory channel closed during requeue");
+        }
+        Err(async_channel::TrySendError::Full(msgs)) => match tokio::runtime::Handle::try_current()
+        {
+            Ok(handle) => {
+                let sender = channel.sender.clone();
+                let topic = topic.to_string();
+                handle.spawn(async move {
+                    if let Err(e) = sender.send(msgs).await {
+                        tracing::error!(topic = %topic, count, "Dropped messages: background requeue failed: {}", e);
+                    }
+                });
+            }
+            Err(_) => {
+                tracing::error!(topic = %topic, count, "Dropped messages: no runtime to complete requeue");
+            }
+        },
+    }
+}
+
 struct RequeueGuard {
     topic: String,
     messages: Vec<CanonicalMessage>,
@@ -701,48 +743,17 @@ struct RequeueGuard {
 
 impl Drop for RequeueGuard {
     fn drop(&mut self) {
-        if !self.messages.is_empty() {
-            let topic = self.topic.clone();
-            let count = self.messages.len();
-            let messages = std::mem::take(&mut self.messages);
-
-            let channel = get_or_create_channel(&MemoryConfig {
-                topic: topic.clone(),
-                capacity: None,
-                ..Default::default()
-            });
-
-            match channel.sender.try_send(messages) {
-                Ok(_) => {
-                    tracing::info!(topic = %topic, count, "Requeued dropped batch via RequeueGuard");
-                }
-                Err(e) => {
-                    let msgs = match e {
-                        async_channel::TrySendError::Full(m) => m,
-                        async_channel::TrySendError::Closed(m) => m,
-                    };
-                    tracing::warn!(topic = %topic, count, "Failed to requeue dropped batch (channel full/closed), spawning retry");
-                    let sender = channel.sender.clone();
-                    if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                        handle.spawn(async move {
-                            if let Err(e) = sender.send(msgs).await {
-                                tracing::error!(
-                                    "Failed to requeue dropped batch in background: {}",
-                                    e
-                                );
-                            }
-                        });
-                    } else {
-                        tracing::error!(topic = %topic, count, "No active runtime found, could not requeue dropped batch via RequeueGuard");
-                    }
-                }
-            }
-        }
+        requeue_messages(&self.topic, std::mem::take(&mut self.messages));
     }
 }
 
 #[async_trait]
 impl MessageConsumer for MemoryQueueConsumer {
+    // Channel-backed: commit only requeues this batch's own nacks (no cursor),
+    // so commits are order-independent.
+    fn commit_requires_order(&self) -> bool {
+        false
+    }
     async fn receive_batch(&mut self, max_messages: usize) -> Result<ReceivedBatch, ConsumerError> {
         // If the internal buffer has messages, return them first.
 
@@ -827,16 +838,10 @@ impl MessageConsumer for MemoryQueueConsumer {
                     }
                 }
 
-                if !to_requeue.is_empty() {
-                    let main_channel = get_or_create_channel(&MemoryConfig {
-                        topic: topic.to_string(),
-                        capacity: None,
-                        ..Default::default()
-                    });
-                    if main_channel.sender.send(to_requeue).await.is_err() {
-                        tracing::error!("Failed to re-queue NACKed messages to memory channel as it was closed.");
-                    }
-                }
+                // Requeue nacked messages without blocking the commit: this runs
+                // while holding a dispatch permit, so a blocking send into a full
+                // channel would deadlock the route. Messages are not dropped.
+                requeue_messages(&topic, to_requeue);
 
                 // Disarm the guard after all awaits are finished.
                 if let Some(g) = &mut guard {
@@ -868,6 +873,10 @@ impl MessageConsumer for MemoryQueueConsumer {
 
 #[async_trait]
 impl MessageConsumer for TransportQueueConsumer {
+    // Channel-backed: no cursor, commits are order-independent.
+    fn commit_requires_order(&self) -> bool {
+        false
+    }
     async fn receive_batch(&mut self, max_messages: usize) -> Result<ReceivedBatch, ConsumerError> {
         let mut messages = Vec::with_capacity(max_messages);
         let buffered = self.buffer.len().min(max_messages);
@@ -973,11 +982,27 @@ async fn handle_memory_reply(
             return;
         }
     }
-    let _ = response_channel.sender.send(resp).await;
+    // No waiter: deliver best-effort. A forward route (no `reply_to`) still gets a
+    // publisher response per message but nothing drains this channel; a blocking
+    // send would fill the buffer and, since this runs inside a commit holding a
+    // dispatch permit, deadlock the route. Drop on overflow instead.
+    if let Err(async_channel::TrySendError::Full(_)) = response_channel.sender.try_send(resp) {
+        trace!("Dropping unconsumed memory response (response channel full, no waiter)");
+    }
 }
 
 #[async_trait]
 impl MessageConsumer for MemoryConsumer {
+    // Delegate to the active backend: channel backends commit order-independently;
+    // the Log (event-store) backend keeps the conservative default because its
+    // per-subscriber cursor is position-based.
+    fn commit_requires_order(&self) -> bool {
+        match self {
+            Self::Queue(q) => q.commit_requires_order(),
+            Self::Transport(t) => t.commit_requires_order(),
+            Self::Log { consumer, .. } => consumer.commit_requires_order(),
+        }
+    }
     async fn receive_batch(&mut self, max_messages: usize) -> Result<ReceivedBatch, ConsumerError> {
         match self {
             Self::Queue(q) => q.receive_batch(max_messages).await,
@@ -1046,6 +1071,9 @@ impl MemorySubscriber {
 
 #[async_trait]
 impl MessageConsumer for MemorySubscriber {
+    fn commit_requires_order(&self) -> bool {
+        self.consumer.commit_requires_order()
+    }
     async fn receive_batch(&mut self, max_messages: usize) -> Result<ReceivedBatch, ConsumerError> {
         self.consumer.receive_batch(max_messages).await
     }
@@ -1381,6 +1409,106 @@ mod tests {
         (retried.commit)(vec![MessageDisposition::Ack, MessageDisposition::Ack])
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_memory_nack_requeue_does_not_block_and_loses_nothing() {
+        // Regression: nacked messages are requeued from inside a commit (which holds
+        // a route dispatch permit). If the input channel is full, a blocking send
+        // there would deadlock the route. The requeue must return immediately AND
+        // not drop the nacked messages — they get requeued in the background.
+        let topic = format!("nack_requeue_{}", fast_uuid_v7::gen_id_str());
+        let config = MemoryConfig {
+            topic: topic.clone(),
+            capacity: Some(1), // one batch slot, so the channel is easily full
+            enable_nack: true,
+            ..Default::default()
+        };
+        let mut consumer = MemoryConsumer::new(&config).unwrap();
+        let publisher = MemoryPublisher::new_local(&topic, 1);
+
+        publisher.send_batch(vec!["A".into()]).await.unwrap();
+        let batch_a = consumer.receive_batch(4).await.unwrap();
+        assert_eq!(batch_a.messages.len(), 1);
+
+        // Fill the (capacity-1) channel so A's nack-requeue cannot fit immediately.
+        publisher.send_batch(vec!["B".into()]).await.unwrap();
+
+        // Commit A with a Nack. The channel is full, so the requeue must defer to a
+        // background task rather than block the commit.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            (batch_a.commit)(vec![MessageDisposition::Nack]),
+        )
+        .await
+        .expect("nack commit blocked requeuing into a full input channel")
+        .unwrap();
+
+        // Both A (requeued) and B must still be delivered — nothing dropped.
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while seen.len() < 2 && std::time::Instant::now() < deadline {
+            if let Ok(Ok(batch)) = tokio::time::timeout(
+                std::time::Duration::from_millis(200),
+                consumer.receive_batch(4),
+            )
+            .await
+            {
+                for m in &batch.messages {
+                    seen.insert(m.get_payload_str().into_owned());
+                }
+                let n = batch.messages.len();
+                (batch.commit)(vec![MessageDisposition::Ack; n])
+                    .await
+                    .unwrap();
+            }
+        }
+        assert!(seen.contains("A"), "nacked message A was lost");
+        assert!(seen.contains("B"), "message B was lost");
+    }
+
+    #[tokio::test]
+    async fn test_memory_reply_overflow_does_not_block_commit() {
+        // Regression: a forward route (memory -> a publisher that returns responses,
+        // e.g. HTTP) still produces a publisher response per message, mapped to a
+        // Reply disposition. Nothing drains the per-topic response channel and no
+        // waiter is registered, so committing must not block once that bounded
+        // channel fills — otherwise the commit wedges while holding a dispatch
+        // permit and deadlocks the whole route. See `handle_memory_reply`.
+        let topic = format!("reply_overflow_{}", fast_uuid_v7::gen_id_str());
+        let config = MemoryConfig {
+            topic: topic.clone(),
+            capacity: Some(1000),
+            ..Default::default()
+        };
+        let mut consumer = MemoryConsumer::new(&config).unwrap();
+        let publisher = MemoryPublisher::new_local(&topic, 1000);
+
+        // Far more replies than the response channel capacity (100), nothing draining.
+        let total = 500usize;
+        let msgs: Vec<CanonicalMessage> = (0..total).map(|i| format!("m{i}").into()).collect();
+        publisher.send_batch(msgs).await.unwrap();
+
+        let mut handled = 0usize;
+        while handled < total {
+            let batch = consumer.receive_batch(16).await.unwrap();
+            let n = batch.messages.len();
+            if n == 0 {
+                break;
+            }
+            let dispositions: Vec<MessageDisposition> = (0..n)
+                .map(|i| MessageDisposition::Reply(format!("r{i}").into()))
+                .collect();
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                (batch.commit)(dispositions),
+            )
+            .await
+            .expect("commit blocked delivering replies to a full, undrained response channel")
+            .unwrap();
+            handled += n;
+        }
+        assert_eq!(handled, total);
     }
 
     #[tokio::test]

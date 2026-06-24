@@ -567,7 +567,8 @@ impl Route {
 
         let wait_name = name.clone();
         let wait_run_state = Arc::clone(&run_state);
-        let handle = thread::Builder::new()
+        let cleanup_runtime = Arc::clone(&runtime);
+        let handle = match thread::Builder::new()
             .name(format!("mqb-route-{name}"))
             .spawn(move || {
                 let stop_name = wait_name.clone();
@@ -576,8 +577,16 @@ impl Route {
                     core::Route::stop(&stop_name).await;
                 });
                 finish_run(&wait_run_state, &wait_name);
-            })
-            .map_err(to_py_runtime_error)?;
+            }) {
+            Ok(handle) => handle,
+            Err(err) => {
+                // The route is already deployed and run_state marked running; a failed
+                // spawn would otherwise leak the deployed route and its name reservation.
+                py.detach(|| cleanup_runtime.block_on(async { core::Route::stop(&name).await }));
+                finish_run(&run_state, &name);
+                return Err(to_py_runtime_error(err));
+            }
+        };
 
         self.lock_run_state()?.join_handle = Some(handle);
         Ok(())

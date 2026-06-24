@@ -474,7 +474,7 @@ pub struct AmqpConsumer {
     channel: Channel,
     queue: String,
     is_poisoned: Arc<AtomicBool>,
-    reply_confirms_selected: Arc<AtomicBool>,
+    reply_confirms_selected: Arc<tokio::sync::OnceCell<()>>,
     prefetch: u16,
 }
 
@@ -589,7 +589,7 @@ impl AmqpConsumer {
             channel,
             queue: queue_name,
             is_poisoned: Arc::new(AtomicBool::new(false)),
-            reply_confirms_selected: Arc::new(AtomicBool::new(false)),
+            reply_confirms_selected: Arc::new(tokio::sync::OnceCell::new()),
             prefetch: prefetch_count,
         })
     }
@@ -713,6 +713,14 @@ fn delivery_to_canonical_message(delivery: &lapin::message::Delivery) -> Canonic
 
 #[async_trait]
 impl MessageConsumer for AmqpConsumer {
+    // AMQP acks each delivery individually (`BasicAckOptions::default()` =>
+    // multiple: false; nacks via BasicNack), and already acks a batch's deliveries
+    // concurrently via buffer_unordered. Out-of-order acks across batches are
+    // therefore safe: un-acked deliveries are redelivered on reconnect, so this is
+    // NOT a cumulative-ack transport despite historically sharing the sequencer.
+    fn commit_requires_order(&self) -> bool {
+        false
+    }
     async fn receive_batch(&mut self, max_messages: usize) -> Result<ReceivedBatch, ConsumerError> {
         if self.is_poisoned.load(Ordering::Relaxed) {
             return Err(ConsumerError::Connection(anyhow::anyhow!(
@@ -886,7 +894,7 @@ impl MessageConsumer for AmqpConsumer {
 
 async fn handle_replies(
     channel: &Channel,
-    reply_confirms_selected: &AtomicBool,
+    reply_confirms_selected: &tokio::sync::OnceCell<()>,
     reply_infos: &[(Option<String>, Option<String>)],
     dispositions: &[MessageDisposition],
 ) -> anyhow::Result<()> {
@@ -901,26 +909,22 @@ async fn handle_replies(
         };
 
         if let (Some(rt), Some(body)) = (reply_to, payload) {
-            if reply_confirms_selected
-                .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
-                .is_ok()
-            {
-                // Reset the flag on failure so a later attempt can retry confirm_select.
-                let result = async {
+            // Enable publisher confirms on the channel exactly once. Concurrent commits
+            // share this cell and all await the first confirm_select, so none publishes a
+            // reply before confirms are active. On error the cell stays uninitialized so a
+            // later commit retries.
+            reply_confirms_selected
+                .get_or_try_init(|| async {
                     tokio::time::timeout(
                         SETUP_TIMEOUT,
                         channel.confirm_select(lapin::options::ConfirmSelectOptions::default()),
                     )
                     .await
                     .map_err(|_| anyhow!("Timed out enabling AMQP reply confirmations"))?
-                    .context("Failed to enable AMQP reply confirmations")
-                }
-                .await;
-                if result.is_err() {
-                    reply_confirms_selected.store(false, Ordering::Relaxed);
-                }
-                result?;
-            }
+                    .context("Failed to enable AMQP reply confirmations")?;
+                    Ok::<(), anyhow::Error>(())
+                })
+                .await?;
 
             let mut props = BasicProperties::default();
             if let Some(cid) = correlation_id {

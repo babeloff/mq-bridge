@@ -373,6 +373,9 @@ fn requeue_messages(sender: Sender<Vec<CanonicalMessage>>, messages: Vec<Canonic
 
 #[async_trait]
 impl MessageConsumer for StreamBufferConsumer {
+    // Intentionally keeps the ordered default: messages are buffered per
+    // correlation partition and removed in order on ack (with end-marker
+    // semantics), so commits are kept ordered to avoid corrupting partition state.
     async fn receive_batch(&mut self, max_messages: usize) -> Result<ReceivedBatch, ConsumerError> {
         let mut messages = self.get_buffered_messages(max_messages).await?;
         while messages.len() < max_messages.max(1) / 2 {

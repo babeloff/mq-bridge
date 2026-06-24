@@ -897,6 +897,9 @@ impl FileConsumer {
 
 #[async_trait]
 impl MessageConsumer for FileConsumer {
+    // Intentionally keeps the ordered default: the offset-tracking backend commits
+    // a cumulative byte offset (the max acked `file_offset`), so out-of-order
+    // commits could advance the offset past un-acked messages and lose them.
     async fn receive_batch(&mut self, max_messages: usize) -> Result<ReceivedBatch, ConsumerError> {
         match &mut self.backend {
             ConsumerBackend::EventStore(c) => c.receive_batch(max_messages).await,

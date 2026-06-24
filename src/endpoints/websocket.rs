@@ -221,9 +221,9 @@ impl WebSocketPublisher {
         Ok(stream)
     }
 
-    async fn send_single_reusing_connection(
+    async fn send_reusing_connection(
         &self,
-        message: CanonicalMessage,
+        messages: impl IntoIterator<Item = CanonicalMessage>,
     ) -> Result<SentBatch, PublisherError> {
         let mut stream_guard = self.single_stream.lock().await;
         if stream_guard.is_none() {
@@ -233,9 +233,11 @@ impl WebSocketPublisher {
             .as_mut()
             .expect("websocket stream was initialized above");
 
-        if let Err(error) = stream.feed(canonical_to_websocket_message(&message)).await {
-            *stream_guard = None;
-            return Err(PublisherError::Retryable(anyhow!(error)));
+        for message in messages {
+            if let Err(error) = stream.feed(canonical_to_websocket_message(&message)).await {
+                *stream_guard = None;
+                return Err(PublisherError::Retryable(anyhow!(error)));
+            }
         }
         if let Err(error) = stream.flush().await {
             *stream_guard = None;
@@ -705,6 +707,11 @@ fn canonical_to_websocket_message(message: &CanonicalMessage) -> Message {
 
 #[async_trait]
 impl MessageConsumer for WebSocketConsumer {
+    // Each frame is acked/replied independently (no shared cursor), so commits
+    // can run concurrently and out of order.
+    fn commit_requires_order(&self) -> bool {
+        false
+    }
     async fn receive_batch(&mut self, max_messages: usize) -> Result<ReceivedBatch, ConsumerError> {
         let max_messages = max_messages.max(1);
 
@@ -761,32 +768,7 @@ impl MessagePublisher for WebSocketPublisher {
         }
 
         trace!(url = %self.url, count = messages.len(), "Sending WebSocket batch");
-        if messages.len() == 1 {
-            return self
-                .send_single_reusing_connection(
-                    messages
-                        .into_iter()
-                        .next()
-                        .expect("single-message batch should contain one message"),
-                )
-                .await;
-        }
-
-        let mut stream = self.connect_stream().await?;
-
-        for message in messages {
-            stream
-                .feed(canonical_to_websocket_message(&message))
-                .await
-                .map_err(|error| PublisherError::Retryable(anyhow!(error)))?;
-        }
-
-        stream
-            .flush()
-            .await
-            .map_err(|error| PublisherError::Retryable(anyhow!(error)))?;
-        let _ = stream.close().await;
-        Ok(SentBatch::Ack)
+        self.send_reusing_connection(messages).await
     }
 
     async fn flush(&self) -> anyhow::Result<()> {

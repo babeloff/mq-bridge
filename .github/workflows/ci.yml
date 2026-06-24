@@ -23,17 +23,13 @@ jobs:
         with:
           components: rustfmt, clippy
       
-      - name: Cache cargo registry
-        uses: actions/cache@v4
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
+          # Differentiates the matrix `check` job per feature set; evaluates to an
+          # empty string (no-op) in non-matrix jobs. rust-cache already keys on the
+          # job id, OS, rustc version, and lockfiles automatically.
+          key: ${{ matrix.features }}
       
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -65,24 +61,20 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
       
-      - name: Cache cargo registry
-        uses: actions/cache@v4
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
+          # Differentiates the matrix `check` job per feature set; evaluates to an
+          # empty string (no-op) in non-matrix jobs. rust-cache already keys on the
+          # job id, OS, rustc version, and lockfiles automatically.
+          key: ${{ matrix.features }}
       
-      - name: Build
+      - name: Check
         run: |
           if [ -z "${{ matrix.features }}" ]; then
-            cargo build --release
+            cargo check --all-targets
           else
-            cargo build --release --features "${{ matrix.features }}"
+            cargo check --all-targets --features "${{ matrix.features }}"
           fi
 
   # Unit tests
@@ -95,23 +87,25 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
       
-      - name: Cache cargo registry
-        uses: actions/cache@v4
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
+          # Differentiates the matrix `check` job per feature set; evaluates to an
+          # empty string (no-op) in non-matrix jobs. rust-cache already keys on the
+          # job id, OS, rustc version, and lockfiles automatically.
+          key: ${{ matrix.features }}
       
       - name: Run unit tests
-        run: cargo test --lib --features=full 
+        run: cargo test --lib --features=full
 # currently - just random panic test
 #      - name: Run long-running unit tests
 #        run: cargo test --lib --features=full -- --ignored --nocapture
+
+      - name: Run non-Docker integration tests
+        run: cargo test --test ref_test --test sqlite_test --test tls_example --test websocket_test --features=full
+
+      - name: Memory leak soak (route commit-task JoinSet)
+        run: cargo test --test memory_leak_test --features=full -- --ignored --nocapture
 
   # Integration tests (requires Docker) split into parallel jobs
   integration-others:
@@ -127,17 +121,13 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
       
-      - name: Cache cargo registry
-        uses: actions/cache@v4
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
+          # Differentiates the matrix `check` job per feature set; evaluates to an
+          # empty string (no-op) in non-matrix jobs. rust-cache already keys on the
+          # job id, OS, rustc version, and lockfiles automatically.
+          key: ${{ matrix.features }}
       
       - name: Pre-pull docker images
         run: |
@@ -175,17 +165,13 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
 
-      - name: Cache cargo registry
-        uses: actions/cache@v4
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
+          # Differentiates the matrix `check` job per feature set; evaluates to an
+          # empty string (no-op) in non-matrix jobs. rust-cache already keys on the
+          # job id, OS, rustc version, and lockfiles automatically.
+          key: ${{ matrix.features }}
 
       - name: Pre-pull docker images
         run: |
@@ -223,17 +209,13 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
 
-      - name: Cache cargo registry
-        uses: actions/cache@v4
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
+          # Differentiates the matrix `check` job per feature set; evaluates to an
+          # empty string (no-op) in non-matrix jobs. rust-cache already keys on the
+          # job id, OS, rustc version, and lockfiles automatically.
+          key: ${{ matrix.features }}
 
       - name: Pre-pull docker images
         run: |
@@ -264,20 +246,13 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
       
-      - name: Cache cargo registry
-        uses: actions/cache@v4
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
+          # Differentiates the matrix `check` job per feature set; evaluates to an
+          # empty string (no-op) in non-matrix jobs. rust-cache already keys on the
+          # job id, OS, rustc version, and lockfiles automatically.
+          key: ${{ matrix.features }}
       
-      - name: Build documentation
-        run: cargo doc --all-features --no-deps
-      
-      - name: Check for broken links
-        run: cargo doc --all-features --no-deps 2>&1 | grep -i "warning\|error" && exit 1 || exit 0
+      - name: Build documentation (deny warnings)
+        run: RUSTDOCFLAGS="-D warnings" cargo doc --all-features --no-deps

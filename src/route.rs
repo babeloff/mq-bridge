@@ -248,12 +248,14 @@ impl BatchScratch {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn send_batch_and_commit(
     publisher: &Arc<dyn MessagePublisher>,
     messages: Vec<crate::CanonicalMessage>,
     commit: BatchCommitFunc,
     has_retry_middleware: bool,
     err_tx: &Sender<anyhow::Error>,
+    commit_semaphore: Option<&Arc<tokio::sync::Semaphore>>,
     commit_tasks: &mut JoinSet<()>,
     scratch: &mut BatchScratch,
 ) -> anyhow::Result<()> {
@@ -278,8 +280,14 @@ async fn send_batch_and_commit(
                     }
                 })
                 .collect();
+            // Acquire the dispatch slot before spawning so a slow commit backstreams
+            // pressure to the producer instead of queueing tasks unbounded.
+            let permit = acquire_commit_permit(commit_semaphore).await;
             let err_tx = err_tx.clone();
+            // Reap finished commits so completed results don't accumulate until shutdown.
+            while commit_tasks.try_join_next().is_some() {}
             commit_tasks.spawn(async move {
+                let _permit = permit;
                 if let Err(e) = commit(dispositions).await {
                     error!("Commit failed: {}", e);
                     report_route_error(&err_tx, e, "Could not send commit error to main task");
@@ -341,7 +349,11 @@ async fn send_batch_and_commit(
                 &failed,
                 &scratch.request_ids,
             );
+            let permit = acquire_commit_permit(commit_semaphore).await;
+            // Reap finished commits so completed results don't accumulate until shutdown.
+            while commit_tasks.try_join_next().is_some() {}
             commit_tasks.spawn(async move {
+                let _permit = permit;
                 if let Err(e) = commit(dispositions).await {
                     error!("Commit failed: {}", e);
                     report_route_error(&err_tx, e, "Could not send commit error to main task");
@@ -720,8 +732,13 @@ impl Route {
         let (err_tx, err_rx) = bounded(1);
         let mut commit_tasks = JoinSet::new();
 
-        // Sequencer setup to ensure ordered commits even with parallel commit tasks
-        let (seq_tx, sequencer_handle) = spawn_sequencer(self.options.commit_concurrency_limit);
+        // Ordered consumers (cumulative-ack) commit through the serial sequencer;
+        // individual-ack consumers commit concurrently under a semaphore.
+        let commit_router = CommitRouter::new(
+            consumer.commit_requires_order(),
+            self.options.commit_concurrency_limit,
+        );
+        let commit_semaphore = commit_router.dispatch_semaphore();
         let mut seq_counter = 0u64;
 
         if let Some(tx) = ready_tx {
@@ -765,13 +782,14 @@ impl Route {
                     // Process the batch sequentially without spawning a new task
                     let seq = seq_counter;
                     seq_counter += 1;
-                    let commit = wrap_commit(received_batch.commit, seq, seq_tx.clone());
+                    let commit = commit_router.wrap(received_batch.commit, seq);
                     if let Err(err) = send_batch_and_commit(
                         &publisher,
                         received_batch.messages,
                         commit,
                         has_retry_middleware,
                         &err_tx,
+                        commit_semaphore.as_ref(),
                         &mut commit_tasks,
                         &mut batch_scratch,
                     )
@@ -785,7 +803,6 @@ impl Route {
             }
         };
 
-        drop(seq_tx);
         // Drain errors while waiting for tasks to finish to prevent deadlocks and lost errors
         loop {
             select! {
@@ -802,7 +819,7 @@ impl Route {
             }
         }
         drop(err_rx);
-        let _ = sequencer_handle.await;
+        commit_router.shutdown().await;
         run_consumer_disconnect_hook(name, consumer.as_ref()).await;
         run_publisher_disconnect_hook(name, &publisher).await;
         run_result
@@ -834,10 +851,17 @@ impl Route {
         let work_capacity = self.options.concurrency;
         let (work_tx, work_rx) =
             bounded::<(Vec<crate::CanonicalMessage>, BatchCommitFunc)>(work_capacity);
-        // --- Ordered Commit Sequencer ---
-        // To prevent data loss with cumulative-ack brokers (Kafka/AMQP), commits must happen in order.
-        // We assign a sequence number to each batch and use a sequencer task to enforce order.
-        let (seq_tx, sequencer_handle) = spawn_sequencer(self.options.commit_concurrency_limit);
+        // --- Commit Dispatch ---
+        // Cumulative-ack brokers (Kafka/AMQP) must commit in order, so their commits
+        // are funnelled through a single sequencer to prevent data loss. Individual-ack
+        // brokers commit concurrently (bounded by commit_concurrency_limit) so the
+        // per-batch ack round trip no longer caps throughput.
+        let commit_router = CommitRouter::new(
+            consumer.commit_requires_order(),
+            self.options.commit_concurrency_limit,
+        );
+        // Shared across workers so the limit bounds total commits in flight, not per-worker.
+        let commit_semaphore = commit_router.dispatch_semaphore();
 
         // --- Worker Pool ---
         let mut join_set = JoinSet::new();
@@ -845,6 +869,7 @@ impl Route {
             let work_rx_clone = work_rx.clone();
             let publisher = Arc::clone(&publisher);
             let err_tx = err_tx.clone();
+            let commit_semaphore = commit_semaphore.clone();
             let mut commit_tasks = JoinSet::new();
             let has_retry_middleware = self.output.has_retry_middleware();
             let batch_size = self.options.batch_size;
@@ -858,6 +883,7 @@ impl Route {
                         commit_func,
                         has_retry_middleware,
                         &err_tx,
+                        commit_semaphore.as_ref(),
                         &mut commit_tasks,
                         &mut batch_scratch,
                     )
@@ -937,7 +963,7 @@ impl Route {
                     // the work item to avoid creating sequence gaps if the work channel
                     // is closed while producing batches.
                     let seq = seq_counter;
-                    let wrapped_commit = wrap_commit(commit, seq, seq_tx.clone());
+                    let wrapped_commit = commit_router.wrap(commit, seq);
 
                     match work_tx.send((messages, wrapped_commit)).await {
                         Ok(()) => {
@@ -966,9 +992,8 @@ impl Route {
         // Wait for all worker tasks to complete.
         while join_set.join_next().await.is_some() {}
 
-        // Close sequencer
-        drop(seq_tx);
-        let _ = sequencer_handle.await;
+        // Close sequencer (if any) now that all in-flight commits have drained.
+        commit_router.shutdown().await;
         run_consumer_disconnect_hook(name, consumer.as_ref()).await;
         run_publisher_disconnect_hook(name, &publisher).await;
 
@@ -1189,6 +1214,80 @@ fn wrap_commit(
     })
 }
 
+/// Routes batch commits either through the ordered sequencer (cumulative-ack
+/// transports) or concurrently under a semaphore (individual-ack transports),
+/// chosen once per route from the consumer's `commit_requires_order()`.
+enum CommitRouter {
+    Ordered {
+        seq_tx: Sender<(u64, SequencerItem)>,
+        handle: JoinHandle<()>,
+    },
+    Unordered {
+        semaphore: Arc<tokio::sync::Semaphore>,
+    },
+}
+
+impl CommitRouter {
+    fn new(ordered: bool, commit_concurrency_limit: usize) -> Self {
+        let commit_concurrency_limit = commit_concurrency_limit.max(1);
+        if ordered {
+            let (seq_tx, handle) = spawn_sequencer(commit_concurrency_limit);
+            CommitRouter::Ordered { seq_tx, handle }
+        } else {
+            CommitRouter::Unordered {
+                semaphore: Arc::new(tokio::sync::Semaphore::new(commit_concurrency_limit)),
+            }
+        }
+    }
+
+    /// Wraps a batch commit for its dispatch mode. `seq` is only used by the
+    /// ordered path; it is ignored when commits run concurrently.
+    fn wrap(&self, commit: BatchCommitFunc, seq: u64) -> BatchCommitFunc {
+        match self {
+            CommitRouter::Ordered { seq_tx, .. } => wrap_commit(commit, seq, seq_tx.clone()),
+            // Unordered commits need no wrapping: the dispatcher acquires a
+            // `commit_concurrency_limit` permit *before* spawning each commit
+            // (see `dispatch_semaphore`), so backpressure applies at queue time
+            // instead of letting blocked commit tasks pile up unbounded.
+            CommitRouter::Unordered { .. } => commit,
+        }
+    }
+
+    /// Semaphore that bounds how many unordered commits may be queued/in-flight at
+    /// once. The dispatcher acquires a permit before spawning a commit task and
+    /// holds it for the task's lifetime. `None` for the ordered path, whose
+    /// bounded sequencer channel already limits outstanding commits.
+    fn dispatch_semaphore(&self) -> Option<Arc<tokio::sync::Semaphore>> {
+        match self {
+            CommitRouter::Ordered { .. } => None,
+            CommitRouter::Unordered { semaphore } => Some(Arc::clone(semaphore)),
+        }
+    }
+
+    /// Tears down the sequencer (if any). Call only after all workers and their
+    /// in-flight commit tasks have drained, so the sequencer's senders are gone.
+    async fn shutdown(self) {
+        if let CommitRouter::Ordered { seq_tx, handle } = self {
+            drop(seq_tx);
+            let _ = handle.await;
+        }
+    }
+}
+
+/// Acquires a commit-dispatch permit before a commit task is spawned, so the
+/// caller blocks (applies backpressure) once `commit_concurrency_limit` commits
+/// are already queued rather than spawning unbounded tasks. The returned permit is
+/// held for the spawned task's lifetime. `None` (no semaphore, or a closed one
+/// during shutdown) means the commit runs unbounded.
+async fn acquire_commit_permit(
+    semaphore: Option<&Arc<tokio::sync::Semaphore>>,
+) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    match semaphore {
+        Some(sem) => Arc::clone(sem).acquire_owned().await.ok(),
+        None => None,
+    }
+}
+
 fn map_responses_to_dispositions(
     message_ids: &[u128],
     responses: Option<Vec<crate::CanonicalMessage>>,
@@ -1355,6 +1454,10 @@ mod tests {
     #[derive(Debug)]
     struct CommitTrackingMiddlewareFactory {
         observation: Arc<CommitObservation>,
+        // Drives the wrapped consumer's `commit_requires_order()`, letting one
+        // factory exercise both the ordered (sequencer) and unordered (semaphore)
+        // commit paths.
+        requires_order: bool,
     }
 
     #[derive(Debug)]
@@ -1363,6 +1466,7 @@ mod tests {
     struct CommitTrackingConsumer {
         inner: Box<dyn MessageConsumer>,
         observation: Arc<CommitObservation>,
+        requires_order: bool,
     }
 
     struct ReorderingPublisher {
@@ -1380,6 +1484,7 @@ mod tests {
             Ok(Box::new(CommitTrackingConsumer {
                 inner: consumer,
                 observation: Arc::clone(&self.observation),
+                requires_order: self.requires_order,
             }))
         }
     }
@@ -1398,6 +1503,10 @@ mod tests {
 
     #[async_trait::async_trait]
     impl MessageConsumer for CommitTrackingConsumer {
+        fn commit_requires_order(&self) -> bool {
+            self.requires_order
+        }
+
         async fn receive_batch(
             &mut self,
             max_messages: usize,
@@ -1474,6 +1583,7 @@ mod tests {
             &tracking_name,
             Arc::new(CommitTrackingMiddlewareFactory {
                 observation: Arc::clone(&observation),
+                requires_order: true,
             }),
         );
         register_middleware_factory(
@@ -1529,6 +1639,96 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_concurrent_route_commits_are_ordered_and_non_overlapping() {
         assert_route_commits_are_ordered_and_non_overlapping(4).await;
+    }
+
+    /// Drives a route whose consumer reports `commit_requires_order() == false`
+    /// and returns what the commit tracker observed. Each commit sleeps 20ms, so
+    /// overlapping commits push `max_active` above 1.
+    async fn run_unordered_commit_route(
+        concurrency: usize,
+        commit_concurrency_limit: usize,
+        message_count: u64,
+    ) -> Arc<CommitObservation> {
+        let unique_id = fast_uuid_v7::gen_id().to_string();
+        let tracking_name = format!("track_unordered_{}", unique_id);
+        let in_topic = format!("unordered_commit_in_{}", unique_id);
+        let observation = Arc::new(CommitObservation::default());
+
+        register_middleware_factory(
+            &tracking_name,
+            Arc::new(CommitTrackingMiddlewareFactory {
+                observation: Arc::clone(&observation),
+                requires_order: false,
+            }),
+        );
+
+        let input = Endpoint::new_memory(&in_topic, 64).add_middleware(Middleware::Custom {
+            name: tracking_name,
+            config: serde_json::Value::Null,
+        });
+        let output = Endpoint::new(EndpointType::Null);
+
+        let route = Route::new(input.clone(), output)
+            .with_concurrency(concurrency)
+            .with_batch_size(1)
+            .with_commit_concurrency_limit(commit_concurrency_limit);
+
+        let input_channel = input.channel().unwrap();
+        let messages = (0..message_count)
+            .map(|seq| crate::CanonicalMessage::from(seq.to_string()))
+            .collect();
+        input_channel.fill_messages(messages).await.unwrap();
+        input_channel.close();
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            route.run_until_err("unordered_commit_test", None, None),
+        )
+        .await
+        .expect("Route should not hang while draining finite input")
+        .expect("Route should complete without commit errors");
+
+        observation
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_unordered_commits_run_concurrently_without_loss() {
+        let observation = run_unordered_commit_route(4, 4, 6).await;
+
+        // Every batch must still be committed exactly once (no data loss), even
+        // though completion order is not guaranteed.
+        let mut completed = observation.completed.lock().unwrap().clone();
+        completed.sort_unstable();
+        assert_eq!(
+            completed,
+            (0..6).collect::<Vec<u64>>(),
+            "Every message must be committed exactly once",
+        );
+
+        // The whole point of the unordered path: commits overlap instead of being
+        // serialized one-at-a-time by the sequencer.
+        assert!(
+            observation.max_active.load(Ordering::SeqCst) > 1,
+            "Unordered commits must run concurrently (max_active was {})",
+            observation.max_active.load(Ordering::SeqCst),
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_unordered_commits_respect_concurrency_limit() {
+        // commit_concurrency_limit caps how many commits run at once even when the
+        // route concurrency is higher.
+        let observation = run_unordered_commit_route(4, 2, 8).await;
+
+        let mut completed = observation.completed.lock().unwrap().clone();
+        completed.sort_unstable();
+        assert_eq!(completed, (0..8).collect::<Vec<u64>>());
+
+        assert!(
+            observation.max_active.load(Ordering::SeqCst) <= 2,
+            "Concurrent commits must stay within commit_concurrency_limit (max_active was {})",
+            observation.max_active.load(Ordering::SeqCst),
+        );
     }
 
     // Helper function to run a fault injection test on the consumer side.

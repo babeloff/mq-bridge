@@ -1236,6 +1236,11 @@ async fn spawn_tls_server(
 
 #[async_trait]
 impl MessageConsumer for HttpConsumer {
+    // Each request is acked/replied independently (no shared cursor), so commits
+    // can run concurrently and out of order.
+    fn commit_requires_order(&self) -> bool {
+        false
+    }
     async fn receive_batch(&mut self, max_messages: usize) -> Result<ReceivedBatch, ConsumerError> {
         let max_messages = max_messages.max(1);
 
@@ -1905,6 +1910,63 @@ fn make_response(
     }
 }
 
+/// Persistent, connection-pooling hyper client used by `HttpPublisher`.
+type HttpClient = hyper_util::client::legacy::Client<
+    hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>,
+    http_body_util::Full<Bytes>,
+>;
+
+/// Builds a connection-pooling hyper client for the given TLS/connector settings.
+fn build_http_client(config: &HttpConfig) -> anyhow::Result<HttpClient> {
+    let tls_client_config = create_rustls_client_config(&config.tls)
+        .context("Failed to create rustls client config")?;
+
+    let mut http_connector = HttpConnector::new();
+    http_connector.enforce_http(false);
+    http_connector.set_nodelay(true);
+    if let Some(keepalive) = config.tcp_keepalive_ms {
+        http_connector.set_keepalive(Some(std::time::Duration::from_millis(keepalive)));
+    }
+
+    // Handles both http and https, and http1/http2.
+    let https_connector = HttpsConnectorBuilder::new()
+        .with_tls_config(tls_client_config)
+        .https_or_http()
+        .enable_http1()
+        .enable_http2()
+        .wrap_connector(http_connector);
+
+    let mut client_builder = hyper_util::client::legacy::Client::builder(TokioExecutor::new());
+    if let Some(timeout) = config.pool_idle_timeout_ms {
+        client_builder.pool_idle_timeout(std::time::Duration::from_millis(timeout));
+    }
+    Ok(client_builder.build(https_connector))
+}
+
+/// Returns a shared HTTP client for these client-level settings, building one on first
+/// use. The request URL is per-message, so one client serves all targets it can reach.
+async fn create_shared_http_client(
+    config: &HttpConfig,
+) -> anyhow::Result<std::sync::Arc<HttpClient>> {
+    let identity = crate::connection_registry::connection_identity((
+        config.tls.required,
+        &config.tls.ca_file,
+        &config.tls.cert_file,
+        &config.tls.key_file,
+        config.tls.accept_invalid_certs,
+        config.tcp_keepalive_ms,
+        config.pool_idle_timeout_ms,
+    ));
+    let config_clone = config.clone();
+    crate::connection_registry::get_or_create(
+        "http-client",
+        identity,
+        config.shared.unwrap_or(true),
+        move || async move { build_http_client(&config_clone) },
+    )
+    .await
+}
+
 /// A publisher that sends messages to an HTTP endpoint using hyper.
 ///
 /// Features:
@@ -1916,12 +1978,7 @@ fn make_response(
 #[derive(Clone)]
 pub struct HttpPublisher {
     /// Persistent HTTP client with connection pooling
-    client: std::sync::Arc<
-        hyper_util::client::legacy::Client<
-            hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>,
-            http_body_util::Full<Bytes>,
-        >,
-    >,
+    client: std::sync::Arc<HttpClient>,
     url: String,
     base_uri: hyper::Uri,
     /// Default HTTP method to use if not overridden by message metadata
@@ -1947,30 +2004,8 @@ impl HttpPublisher {
         // Initialize TLS provider if TLS is configured for this endpoint.
         let batch_concurrency = config.batch_concurrency.unwrap_or(20).max(1);
 
-        let tls_client_config = create_rustls_client_config(&config.tls)
-            .context("Failed to create rustls client config")?;
-
-        let mut http_connector = HttpConnector::new();
-        http_connector.enforce_http(false);
-        http_connector.set_nodelay(true);
-        if let Some(keepalive) = config.tcp_keepalive_ms {
-            http_connector.set_keepalive(Some(std::time::Duration::from_millis(keepalive)));
-        }
-
-        // Create HTTPS connector that handles both http and https, and http1/http2
-        let https_connector = HttpsConnectorBuilder::new()
-            .with_tls_config(tls_client_config)
-            .https_or_http()
-            .enable_http1()
-            .enable_http2()
-            .wrap_connector(http_connector);
-
-        // Create persistent client with connection pooling
-        let mut client_builder = hyper_util::client::legacy::Client::builder(TokioExecutor::new());
-        if let Some(timeout) = config.pool_idle_timeout_ms {
-            client_builder.pool_idle_timeout(std::time::Duration::from_millis(timeout));
-        }
-        let client = client_builder.build(https_connector);
+        // Share one pooled client across publishers with the same client-level settings.
+        let client = create_shared_http_client(config).await?;
 
         let url = config.tls.normalize_url(&config.url);
 
@@ -1994,7 +2029,7 @@ impl HttpPublisher {
         let compression_threshold_bytes = config.compression_threshold_bytes.unwrap_or(1024);
 
         Ok(Self {
-            client: std::sync::Arc::new(client),
+            client,
             url,
             base_uri,
             method,

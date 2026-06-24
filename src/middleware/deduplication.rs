@@ -164,6 +164,9 @@ impl DeduplicationConsumer {
 
 #[async_trait]
 impl MessageConsumer for DeduplicationConsumer {
+    fn commit_requires_order(&self) -> bool {
+        self.inner.commit_requires_order()
+    }
     fn on_connect_hook(&self) -> Option<BoxFuture<'_, anyhow::Result<()>>> {
         self.inner.on_connect_hook()
     }
