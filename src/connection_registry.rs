@@ -102,7 +102,28 @@ where
     }
 
     // Build outside the registry lock — never await while holding it.
-    let built: Arc<T> = Arc::new(build().await?);
+    let built: Arc<T> = match build().await {
+        Ok(client) => Arc::new(client),
+        Err(err) => {
+            // Build failed: nothing to cache. Remove our INFLIGHT entry so keys that
+            // never build don't accumulate dead locks — but only if it's still our
+            // lock and no other caller is queued or holds a clone (strong_count == 2:
+            // our `build_lock` plus the map's). When callers are serialized behind us
+            // we leave the entry so they keep coordinating on the same lock and retry
+            // the build once we release the guard.
+            let mut inflight = inflight()
+                .lock()
+                .expect("connection registry inflight lock poisoned");
+            if inflight
+                .get(&key)
+                .is_some_and(|queued| Arc::ptr_eq(queued, &build_lock))
+                && Arc::strong_count(&build_lock) == 2
+            {
+                inflight.remove(&key);
+            }
+            return Err(err);
+        }
+    };
 
     let resolved = {
         let mut map = registry()
