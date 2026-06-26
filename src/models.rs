@@ -247,8 +247,7 @@ fn default_kafka_partitions_schema() -> Option<i32> {
 }
 
 /// Partition count used when auto-creating a Kafka topic if none is configured.
-/// >1 so writes spread across multiple logs and consumers can parallelise; ordering
-/// is then per-key (we key by message_id), not global across the topic.
+/// ordering is per-key (we key by message_id), not global across the topic if > 1
 pub const DEFAULT_KAFKA_PARTITIONS: i32 = 6;
 
 fn default_output_endpoint() -> Endpoint {
