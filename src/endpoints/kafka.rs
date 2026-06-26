@@ -59,12 +59,16 @@ impl KafkaPublisher {
         let mut client_config = create_common_config(config);
         client_config
             // --- Performance Tuning ---
-            .set("linger.ms", "100") // Wait 100ms to batch messages for reliability
+            .set("linger.ms", "5")
             .set("batch.num.messages", "10000") // Max messages per batch.
             .set("compression.type", "lz4") // Efficient compression.
             // --- Reliability ---
-            .set("acks", "all") // Wait for all in-sync replicas (safer)
-            .set("retries", "3") // Retry up to 3 times
+            // Idempotent producer: keeps acks=all but lets librdkafka pipeline up to 5
+            // in-flight requests per connection while the broker dedupes retries via
+            // sequence numbers. Strictly safer than plain retries (no dup/reorder on retry)
+            // *and* faster, because batches no longer have to be sent strictly one-at-a-time.
+            .set("enable.idempotence", "true")
+            .set("acks", "all") // Required by idempotence; waits for all in-sync replicas
             .set("request.timeout.ms", "30000"); // 30 second timeout
 
         // Apply custom producer options, allowing overrides of defaults
@@ -77,7 +81,10 @@ impl KafkaPublisher {
         // Create the topic if it doesn't exist
         if !topic.is_empty() {
             let admin_client: AdminClient<_> = client_config.create()?;
-            let new_topic = NewTopic::new(topic, 1, TopicReplication::Fixed(1));
+            let partitions = config
+                .partitions
+                .unwrap_or(crate::models::DEFAULT_KAFKA_PARTITIONS);
+            let new_topic = NewTopic::new(topic, partitions, TopicReplication::Fixed(1));
             let results = admin_client
                 .create_topics(&[new_topic], &AdminOptions::new())
                 .await?;
@@ -386,11 +393,11 @@ impl KafkaConsumer {
             let mut producer_config = create_common_config(config);
             // Apply similar defaults as KafkaPublisher for reliability
             producer_config
-                .set("linger.ms", "100")
+                .set("linger.ms", "5")
                 .set("batch.num.messages", "10000")
                 .set("compression.type", "lz4")
+                .set("enable.idempotence", "true")
                 .set("acks", "all")
-                .set("retries", "3")
                 .set("request.timeout.ms", "30000");
             // Apply custom producer options, allowing overrides of defaults
             if let Some(options) = &config.producer_options {

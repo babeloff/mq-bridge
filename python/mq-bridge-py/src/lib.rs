@@ -482,7 +482,11 @@ impl Route {
     ///     })
     #[staticmethod]
     #[pyo3(signature = (config, name=None))]
-    fn from_config(py: Python<'_>, config: &Bound<'_, PyAny>, name: Option<&str>) -> PyResult<Self> {
+    fn from_config(
+        py: Python<'_>,
+        config: &Bound<'_, PyAny>,
+        name: Option<&str>,
+    ) -> PyResult<Self> {
         let bytes = python_to_json_bytes(config)?;
         let name = normalize_name(name).map(str::to_string);
         py.detach(move || -> anyhow::Result<Self> {
@@ -745,7 +749,10 @@ impl Publisher {
     #[staticmethod]
     #[pyo3(signature = (path, name=None))]
     fn from_yaml(py: Python<'_>, path: &str, name: Option<&str>) -> PyResult<Self> {
-        warn_deprecated(py, c"Publisher.from_yaml is deprecated; use Publisher.from_file")?;
+        warn_deprecated(
+            py,
+            c"Publisher.from_yaml is deprecated; use Publisher.from_file",
+        )?;
         Self::from_file(py, path, name)
     }
 
@@ -769,7 +776,10 @@ impl Publisher {
     #[staticmethod]
     #[pyo3(signature = (text, name=None))]
     fn from_yaml_str(py: Python<'_>, text: &str, name: Option<&str>) -> PyResult<Self> {
-        warn_deprecated(py, c"Publisher.from_yaml_str is deprecated; use Publisher.from_str")?;
+        warn_deprecated(
+            py,
+            c"Publisher.from_yaml_str is deprecated; use Publisher.from_str",
+        )?;
         Self::from_str(py, text, name)
     }
 
@@ -778,7 +788,11 @@ impl Publisher {
     /// ``Publisher.from_config({"response": {}})``.
     #[staticmethod]
     #[pyo3(signature = (config, name=None))]
-    fn from_config(py: Python<'_>, config: &Bound<'_, PyAny>, name: Option<&str>) -> PyResult<Self> {
+    fn from_config(
+        py: Python<'_>,
+        config: &Bound<'_, PyAny>,
+        name: Option<&str>,
+    ) -> PyResult<Self> {
         let bytes = python_to_json_bytes(config)?;
         let name = normalize_name(name).map(str::to_string);
         py.detach(move || -> anyhow::Result<Self> {
@@ -1778,7 +1792,8 @@ routes:
 "#,
         );
 
-        let route = Python::attach(|py| Route::from_file(py, &path, Some("section_route"))).unwrap();
+        let route =
+            Python::attach(|py| Route::from_file(py, &path, Some("section_route"))).unwrap();
         assert_eq!(route.name, "section_route");
     }
 
@@ -1822,7 +1837,8 @@ publishers:
 "#,
         );
 
-        let _publisher = Python::attach(|py| Publisher::from_file(py, &path, Some("echo"))).unwrap();
+        let _publisher =
+            Python::attach(|py| Publisher::from_file(py, &path, Some("echo"))).unwrap();
     }
 
     #[test]
@@ -2079,7 +2095,11 @@ routes:
         );
 
         let route = Python::attach(|py| {
-            Py::new(py, Route::from_file(py, &path, Some("typed_route")).unwrap()).unwrap()
+            Py::new(
+                py,
+                Route::from_file(py, &path, Some("typed_route")).unwrap(),
+            )
+            .unwrap()
         });
         Python::attach(|py| {
             let module = PyModule::from_code(
@@ -2316,8 +2336,9 @@ routes:
 "#,
         );
 
-        let route =
-            Arc::new(Python::attach(|py| Route::from_file(py, &path, Some("stoppable_route"))).unwrap());
+        let route = Arc::new(
+            Python::attach(|py| Route::from_file(py, &path, Some("stoppable_route"))).unwrap(),
+        );
         let run_route = Arc::clone(&route);
         let thread = std::thread::spawn(move || {
             Python::attach(|py| run_route.run(py)).unwrap();
@@ -2341,9 +2362,11 @@ routes:
 "#,
         );
 
-        let first =
-            Arc::new(Python::attach(|py| Route::from_file(py, &path, Some("shared_route"))).unwrap());
-        let second = Python::attach(|py| Route::from_file(py, &path, Some("shared_route"))).unwrap();
+        let first = Arc::new(
+            Python::attach(|py| Route::from_file(py, &path, Some("shared_route"))).unwrap(),
+        );
+        let second =
+            Python::attach(|py| Route::from_file(py, &path, Some("shared_route"))).unwrap();
 
         let run_route = Arc::clone(&first);
         let thread = std::thread::spawn(move || {
