@@ -39,7 +39,7 @@ The constructor names are kept aligned across languages, so a config loader read
 
 The `name` argument is optional in both: pass it to select one entry from a `routes:`/`publishers:` document, or omit it to treat the config as a single bare route/endpoint body.
 
-The Python binding also holds up well under load: it currently ranks among the top Python frameworks for requests-per-second on the third-party [http-arena.com](https://www.http-arena.com/#sort=rps:-1&q=python) HTTP benchmark. See [the Python analysis notes](python/mq-bridge-py/README.md#analysis) for the local HTTP comparison harness.
+The Python binding also holds up well under load on the third-party [http-arena.com](https://www.http-arena.com/#sort=rps:-1&q=python) requests-per-second HTTP benchmark (live leaderboard — rankings shift over time). See [the Python analysis notes](python/mq-bridge-py/README.md#analysis) for the local HTTP comparison harness.
 
 
 ## Architecture
@@ -183,7 +183,7 @@ https://github.com/marcomq/mq-bridge-app
 
 `mq-bridge-app` can be used to create and test route and endpoint configurations through a UI. The generated JSON/YAML can then be copied into an application and loaded by the Rust library or the Python bindings.
 
-This does not replace application code or handlers, but it is useful when you want a known-good connection and route shape before pasting the configuration into code. For Python and Node projects, routes and publishers are commonly loaded from JSON/YAML with `Route.from_file`/`fromFile`, `Route.from_str`/`fromStr`, `Route.from_config`/`fromConfig`, and the matching `Publisher.*` constructors.
+This does not replace application code or handlers, but it is useful when you want a known-good connection and route shape before pasting the configuration into code. For Python and Node projects, routes and publishers are commonly loaded from JSON/YAML with `Route.from_file`/`fromFile` (a file path) and `Route.from_str`/`fromStr` (a JSON/YAML string), while `Route.from_config`/`fromConfig` takes an already-parsed dict/JS object. The matching `Publisher.*` constructors work the same way.
 
 ### Programmatic Handlers
 

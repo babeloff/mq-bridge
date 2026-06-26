@@ -42,7 +42,8 @@ Middleware is configured through the normal mq-bridge route config.
 
 ## Loading config
 
-The constructors mirror the Python bindings so the same names work across both:
+The constructors mirror the Python bindings — the same capabilities are exposed
+in both, with Node using camelCase names where Python uses snake_case:
 
 - `Route.fromFile(path, name?)` loads from a YAML/JSON file
 - `Route.fromStr(text, name?)` loads from an in-memory YAML/JSON string

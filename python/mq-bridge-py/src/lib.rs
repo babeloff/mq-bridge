@@ -415,7 +415,7 @@ impl Route {
     #[staticmethod]
     #[pyo3(signature = (path, name=None))]
     fn from_yaml(py: Python<'_>, path: &str, name: Option<&str>) -> PyResult<Self> {
-        warn_deprecated(py, c"Route.from_yaml is deprecated; use Route.from_file")?;
+        warn_deprecated(py, "Route.from_yaml is deprecated; use Route.from_file")?;
         Self::from_file(py, path, name)
     }
 
@@ -439,7 +439,7 @@ impl Route {
     #[staticmethod]
     #[pyo3(signature = (text, name=None))]
     fn from_yaml_str(py: Python<'_>, text: &str, name: Option<&str>) -> PyResult<Self> {
-        warn_deprecated(py, c"Route.from_yaml_str is deprecated; use Route.from_str")?;
+        warn_deprecated(py, "Route.from_yaml_str is deprecated; use Route.from_str")?;
         Self::from_str(py, text, name)
     }
 
@@ -738,7 +738,7 @@ impl Publisher {
     fn from_yaml(py: Python<'_>, path: &str, name: Option<&str>) -> PyResult<Self> {
         warn_deprecated(
             py,
-            c"Publisher.from_yaml is deprecated; use Publisher.from_file",
+            "Publisher.from_yaml is deprecated; use Publisher.from_file",
         )?;
         Self::from_file(py, path, name)
     }
@@ -763,7 +763,7 @@ impl Publisher {
     fn from_yaml_str(py: Python<'_>, text: &str, name: Option<&str>) -> PyResult<Self> {
         warn_deprecated(
             py,
-            c"Publisher.from_yaml_str is deprecated; use Publisher.from_str",
+            "Publisher.from_yaml_str is deprecated; use Publisher.from_str",
         )?;
         Self::from_str(py, text, name)
     }
@@ -948,11 +948,14 @@ impl MemoryDrainer {
 }
 
 /// Emit a Python `DeprecationWarning` from a deprecated constructor alias.
-fn warn_deprecated(py: Python<'_>, message: &std::ffi::CStr) -> PyResult<()> {
+fn warn_deprecated(py: Python<'_>, message: &str) -> PyResult<()> {
+    // Build the C string at runtime rather than with a `c"..."` literal so the
+    // crate keeps compiling on its MSRV (c-string literals stabilized in 1.77).
+    let message = std::ffi::CString::new(message).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     PyErr::warn(
         py,
         &py.get_type::<pyo3::exceptions::PyDeprecationWarning>(),
-        message,
+        &message,
         1,
     )
 }

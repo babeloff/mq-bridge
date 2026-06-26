@@ -81,6 +81,19 @@ publishers:
   const response = await publisher.requestJson({ orderId: 7 }, { kind: "order.test" });
   assert.deepEqual(response.json(), { orderId: 7 });
   assert.equal(response.metadata.kind, "order.test");
+
+  // Keep the deprecated index.js wrapper alias exercised: fromYamlStr should
+  // build an equivalent publisher.
+  const aliased = Publisher.fromYamlStr(
+    `
+publishers:
+  echo:
+    response: {}
+`,
+    "echo",
+  );
+  const aliasResponse = await aliased.requestJson({ orderId: 8 });
+  assert.deepEqual(aliasResponse.json(), { orderId: 8 });
 });
 
 test("Route.withHandler serves an HTTP response", async () => {

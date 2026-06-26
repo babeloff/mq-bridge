@@ -70,6 +70,9 @@ function parseArgs(argv) {
   if (!Number.isInteger(args.duration) || args.duration <= 0) {
     throw new Error("--duration must be a positive integer");
   }
+  if (!Number.isInteger(args.routeConcurrency) || args.routeConcurrency <= 0) {
+    throw new Error("--route-concurrency must be a positive integer");
+  }
   return args;
 }
 
@@ -129,7 +132,7 @@ function wrkLua(sendKind) {
 
 function runWrk(port, connections, duration, luaPath) {
   const threads = Math.min(connections, os.cpus().length || 8);
-  const out = spawnSync(
+  const result = spawnSync(
     "wrk",
     [
       `-t${threads}`,
@@ -140,7 +143,16 @@ function runWrk(port, connections, duration, luaPath) {
       `http://${HOST}:${port}${PATH}`,
     ],
     { encoding: "utf8" },
-  ).stdout || "";
+  );
+  if (result.error) {
+    throw new Error(`failed to run wrk: ${result.error.message}`);
+  }
+  if (result.status !== 0) {
+    throw new Error(
+      `wrk exited with status ${result.status}: ${(result.stderr || "").trim()}`,
+    );
+  }
+  const out = result.stdout || "";
   const req = REQ_RE.exec(out);
   const lat = LAT_RE.exec(out);
   return { rps: req ? Number.parseFloat(req[1]) : 0, lat: lat ? lat[1] : "?" };
@@ -152,8 +164,29 @@ function runWrk(port, connections, duration, luaPath) {
 
 async function spawnNode(source, prefix, port) {
   const script = writeTemp(prefix, "server.js", source);
-  const proc = spawn(process.execPath, [script], { stdio: "ignore" });
-  await waitForPort(port);
+  const proc = spawn(process.execPath, [script], {
+    stdio: ["ignore", "ignore", "pipe"],
+  });
+  let stderr = "";
+  proc.stderr.on("data", (chunk) => {
+    stderr += chunk.toString();
+  });
+  let ready = false;
+  const exitPromise = new Promise((_, reject) => {
+    proc.once("exit", (code, signal) => {
+      // Once ready, exit is the expected teardown; only treat it as a crash
+      // while we are still waiting for the port.
+      if (ready) return;
+      reject(
+        new Error(
+          `server (${prefix}) exited before becoming ready ` +
+            `(code=${code}, signal=${signal}):\n${stderr.trim()}`,
+        ),
+      );
+    });
+  });
+  await Promise.race([waitForPort(port), exitPromise]);
+  ready = true;
   return proc;
 }
 

@@ -110,6 +110,7 @@ pub fn named_publisher_from_value(
 /// Parse a value that may be a `{routes, publishers}` document, a bare
 /// `{name: route}` map, or (without those sections) a plain route map.
 pub fn load_document_from_value(value: serde_yaml_ng::Value) -> anyhow::Result<ConfigDocument> {
+    let value = unwrap_config_root(value);
     let section_key = |name: &str| serde_yaml_ng::Value::String(name.to_string());
     let routes_key = section_key("routes");
     let publishers_key = section_key("publishers");
@@ -148,10 +149,17 @@ pub fn parse_publishers_section(value: serde_yaml_ng::Value) -> anyhow::Result<P
         serde_yaml_ng::Value::Sequence(_) => {
             let entries: Vec<NamedPublisher> = serde_yaml_ng::from_value(value)
                 .context("failed to parse 'publishers' array section")?;
-            Ok(entries
-                .into_iter()
-                .map(|entry| (entry.name, entry.endpoint))
-                .collect())
+            let mut publishers = PublisherConfig::new();
+            for entry in entries {
+                if publishers.contains_key(&entry.name) {
+                    return Err(anyhow::anyhow!(
+                        "duplicate publisher name '{}' in 'publishers' array section",
+                        entry.name
+                    ));
+                }
+                publishers.insert(entry.name, entry.endpoint);
+            }
+            Ok(publishers)
         }
         other => Err(anyhow::anyhow!(
             "failed to parse 'publishers' section: expected a map or array, got {other:?}"

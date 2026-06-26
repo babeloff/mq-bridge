@@ -100,20 +100,25 @@ async fn nats_request_with_retry(
     publisher: &mq_bridge::endpoints::nats::NatsPublisher,
     payload: &[u8],
 ) -> mq_bridge::traits::Sent {
-    for attempt in 0..5 {
+    // Retry "no responders" until a generous deadline rather than a fixed attempt
+    // count, so the request-reply tests absorb slower NATS or responder startup.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
         let msg = CanonicalMessage::new(payload.to_vec(), None);
         match tokio::time::timeout(std::time::Duration::from_secs(5), publisher.send(msg))
             .await
             .expect("Timed out waiting for NATS request response")
         {
             Ok(sent) => return sent,
-            Err(e) if e.to_string().contains("no responders") && attempt < 4 => {
+            Err(e) if e.to_string().contains("no responders") => {
+                if std::time::Instant::now() >= deadline {
+                    panic!("NATS request kept getting 'no responders' until deadline: {e:?}");
+                }
                 tokio::time::sleep(std::time::Duration::from_millis(200)).await;
             }
             Err(e) => panic!("NATS request failed: {e:?}"),
         }
     }
-    unreachable!("NATS request retry loop exited without a result")
 }
 
 #[cfg(feature = "kafka")]

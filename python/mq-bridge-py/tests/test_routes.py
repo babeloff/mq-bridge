@@ -157,6 +157,7 @@ def test_route_from_config_without_name_uses_bare_route() -> None:
         assert drainer.drain(1, timeout=5.0) == 1
     finally:
         route.stop()
+        route.join()
 
 
 def test_publisher_from_str_echoes() -> None:
