@@ -1,6 +1,6 @@
 {
   "name": "mq-bridge",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Node.js bindings for mq-bridge",
   "license": "MIT",
   "repository": {
@@ -32,6 +32,7 @@
     "build:ci": "napi build --platform --no-default-features --features \"http middleware schema\" --js native.js --dts native.d.ts",
     "build:debug": "napi build --platform --js native.js --dts native.d.ts",
     "example": "node examples/http-handler.js",
+    "bench:http": "node analysis/bench_http_native.js",
     "test": "node --test test/*.test.js",
     "sync-version": "node scripts/sync-version.mjs",
     "create-npm-dirs": "napi create-npm-dirs",

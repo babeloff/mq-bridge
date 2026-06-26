@@ -52,3 +52,27 @@ The constructors mirror the Python bindings so the same names work across both:
 The `name` is optional: pass it to pick one entry out of a `routes:`/`publishers:`
 document, or omit it to treat the whole config as a single bare route/endpoint body.
 `fromYaml` / `fromYamlStr` remain as deprecated aliases for `fromFile` / `fromStr`.
+
+## Analysis
+
+HTTP comparison benchmark, driven by a native load generator (`wrk`) so the
+client is never the bottleneck. It boots each server in its own process — the
+mq-bridge Node route plus raw Node `http`, uWebSockets.js, Fastify, and Express
+(all peers run only when installed) — and drives each with `wrk`:
+
+```bash
+cd node/mq-bridge-node
+npm run build                 # release addon (the bench is meaningless on a debug build)
+npm i -D fastify express      # optional Node HTTP peers
+npm i -D uNetworking/uWebSockets.js#v20.51.0   # the http-arena Node leader (native, from GitHub)
+npm run bench:http -- --connections 1,8,32 --duration 8
+```
+
+Requires `wrk` on `PATH` (`brew install wrk`). The `mqb` target needs the addon
+built with the `http` feature (`npm run build` or `npm run build:ci`). Each
+server echoes a tiny JSON body with `value` incremented; mq-bridge routes on the
+`kind` header while the framework peers post plain JSON.
+
+`uws` (uWebSockets.js) is the framework that tops public Node benchmarks like
+http-arena and TechEmpower — it bypasses Node's `http` stack with a C++ socket
+layer, so it is the most demanding yardstick here.

@@ -724,7 +724,10 @@ impl Publisher {
         let path = path.to_string();
         let name = common::normalize_name(name).map(str::to_string);
         py.detach(move || -> anyhow::Result<Self> {
-            Self::build(common::load_named_publisher(Path::new(&path), name.as_deref())?)
+            Self::build(common::load_named_publisher(
+                Path::new(&path),
+                name.as_deref(),
+            )?)
         })
         .map_err(to_py_runtime_error)
     }
@@ -1731,7 +1734,8 @@ memory:
         );
 
         let document =
-            common::load_document_from_value(common::load_config_value(Path::new(&path)).unwrap()).unwrap();
+            common::load_document_from_value(common::load_config_value(Path::new(&path)).unwrap())
+                .unwrap();
         assert!(document.routes.contains_key("orders_route"));
         assert!(document.publishers.contains_key("incoming"));
     }

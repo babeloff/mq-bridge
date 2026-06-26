@@ -44,7 +44,9 @@ impl NativeMessage {
         Self {
             payload: message.payload.to_vec().into(),
             metadata: Some(message.metadata.clone()),
-            id: Some(core::canonical_message::format_message_id(message.message_id)),
+            id: Some(core::canonical_message::format_message_id(
+                message.message_id,
+            )),
         }
     }
 
@@ -422,9 +424,7 @@ impl Publisher {
     #[napi(factory)]
     pub fn from_file(path: String, name: Option<String>) -> Result<Self> {
         let name = common::normalize_name(name.as_deref());
-        Self::build(
-            common::load_named_publisher(Path::new(&path), name).map_err(to_napi_error)?,
-        )
+        Self::build(common::load_named_publisher(Path::new(&path), name).map_err(to_napi_error)?)
     }
 
     /// Deprecated alias for `from_file`.
