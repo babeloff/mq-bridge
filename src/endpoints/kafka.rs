@@ -76,6 +76,15 @@ impl KafkaPublisher {
             for (key, value) in options {
                 client_config.set(key, value);
             }
+            // Idempotence requires acks=all; if the caller weakened acks, relax
+            // idempotence too (unless they set it explicitly) so librdkafka accepts the config.
+            let weakened_acks = options
+                .iter()
+                .any(|(k, v)| k == "acks" && v != "all" && v != "-1");
+            let set_idempotence = options.iter().any(|(k, _)| k == "enable.idempotence");
+            if weakened_acks && !set_idempotence {
+                client_config.set("enable.idempotence", "false");
+            }
         }
 
         // Create the topic if it doesn't exist
