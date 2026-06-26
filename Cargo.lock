@@ -3148,6 +3148,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "mq-bridge-bindings-common"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
+ "fast-uuid-v7",
+ "mq-bridge",
+ "serde",
+ "serde_yaml_ng",
+ "tokio",
+]
+
+[[package]]
 name = "mq-bridge-node"
 version = "0.3.0"
 dependencies = [
@@ -3156,11 +3168,11 @@ dependencies = [
  "bytes",
  "fast-uuid-v7",
  "mq-bridge",
+ "mq-bridge-bindings-common",
  "napi",
  "napi-build",
  "napi-derive",
  "schemars",
- "serde",
  "serde_json",
  "serde_yaml_ng",
  "tokio",
@@ -3176,6 +3188,7 @@ dependencies = [
  "bytes",
  "fast-uuid-v7",
  "mq-bridge",
+ "mq-bridge-bindings-common",
  "pyo3",
  "rustls 0.23.40",
  "schemars",

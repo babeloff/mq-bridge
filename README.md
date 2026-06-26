@@ -33,7 +33,7 @@ It is not only a forwarder. A route can transform, filter, fan out, retry, rate-
 The constructor names are kept aligned across languages, so a config loader reads the same in either binding (Python uses `snake_case`, Node uses `camelCase`):
 
 - `Route.from_file` / `Route.fromFile` — load a route from a YAML/JSON file
-- `Route.from_str` / `Route.fromStr` — load from an in-memory string
+- `Route.from_str` / `Route.fromStr` — load from an in-memory YAML/JSON string
 - `Route.from_config` / `Route.fromConfig` — load from a dict / JS object
 - the matching `Publisher.*` constructors build a publisher endpoint
 

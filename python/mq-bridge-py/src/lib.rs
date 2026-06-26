@@ -1,6 +1,7 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+#[cfg(test)]
 use std::fs;
 use std::future::Future;
 use std::num::NonZeroUsize;
@@ -14,25 +15,26 @@ use ::mq_bridge as core;
 use anyhow::{anyhow, Context};
 use async_trait::async_trait;
 use bytes::Bytes;
+use core::canonical_message::format_message_id;
 use core::endpoints::memory::MemoryConsumer;
-use core::models::{Endpoint, PublisherConfig};
+use core::models::Endpoint;
 use core::traits::{Handler, MessageConsumer, MessageDisposition};
 use core::type_handler::TypeHandler;
 use core::{
     CanonicalMessage, Handled, HandlerError, Publisher as CorePublisher, Route as CoreRoute, Sent,
 };
+use mq_bridge_bindings_common as common;
 use pyo3::conversion::IntoPyObjectExt;
 use pyo3::create_exception;
 use pyo3::exceptions::{PyException, PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyByteArray, PyBytes, PyDict, PyList, PyModule, PyTuple, PyType};
-use serde::de::{
-    DeserializeSeed, Error as DeError, IntoDeserializer, MapAccess, SeqAccess, Visitor,
-};
+use serde::de::{DeserializeSeed, Error as DeError, MapAccess, SeqAccess, Visitor};
 use serde::ser::{Error as SerError, SerializeMap, SerializeSeq};
-use serde::{Deserialize, Serialize, Serializer};
+use serde::{Serialize, Serializer};
+#[cfg(test)]
 use serde_json::Value as JsonValue;
-use tokio::runtime::{Builder, Runtime};
+use tokio::runtime::Runtime;
 use tokio::sync::{oneshot, OwnedSemaphorePermit, Semaphore};
 use tracing::error;
 
@@ -43,20 +45,6 @@ static ACTIVE_ROUTE_NAMES: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 
 create_exception!(mq_bridge, RetryableError, PyException);
 create_exception!(mq_bridge, NonRetryableError, PyException);
-
-#[derive(Debug, Default, Deserialize)]
-struct ConfigDocument {
-    #[serde(default)]
-    routes: HashMap<String, CoreRoute>,
-    #[serde(default)]
-    publishers: PublisherConfig,
-}
-
-#[derive(Debug, Deserialize)]
-struct NamedPublisher {
-    name: String,
-    endpoint: Endpoint,
-}
 
 #[derive(Default)]
 struct RouteRunState {
@@ -415,10 +403,10 @@ impl Route {
     #[pyo3(signature = (path, name=None))]
     fn from_file(py: Python<'_>, path: &str, name: Option<&str>) -> PyResult<Self> {
         let path = path.to_string();
-        let name = normalize_name(name).map(str::to_string);
+        let name = common::normalize_name(name).map(str::to_string);
         py.detach(move || -> anyhow::Result<Self> {
-            let route = load_named_route(Path::new(&path), name.as_deref())?;
-            Self::build(route, name.unwrap_or_else(default_route_name))
+            let route = common::load_named_route(Path::new(&path), name.as_deref())?;
+            Self::build(route, name.unwrap_or_else(common::default_route_name))
         })
         .map_err(to_py_runtime_error)
     }
@@ -438,13 +426,11 @@ impl Route {
     #[pyo3(signature = (text, name=None))]
     fn from_str(py: Python<'_>, text: &str, name: Option<&str>) -> PyResult<Self> {
         let text = text.to_string();
-        let name = normalize_name(name).map(str::to_string);
+        let name = common::normalize_name(name).map(str::to_string);
         py.detach(move || -> anyhow::Result<Self> {
-            let value = unwrap_config_root(
-                serde_yaml_ng::from_str(&text).context("failed to parse YAML config")?,
-            );
-            let route = named_route_from_value(value, name.as_deref())?;
-            Self::build(route, name.unwrap_or_else(default_route_name))
+            let value = serde_yaml_ng::from_str(&text).context("failed to parse YAML config")?;
+            let route = common::named_route_from_value(value, name.as_deref())?;
+            Self::build(route, name.unwrap_or_else(common::default_route_name))
         })
         .map_err(to_py_runtime_error)
     }
@@ -488,14 +474,12 @@ impl Route {
         name: Option<&str>,
     ) -> PyResult<Self> {
         let bytes = python_to_json_bytes(config)?;
-        let name = normalize_name(name).map(str::to_string);
+        let name = common::normalize_name(name).map(str::to_string);
         py.detach(move || -> anyhow::Result<Self> {
             let text = std::str::from_utf8(&bytes).context("config is not valid UTF-8")?;
-            let value = unwrap_config_root(
-                serde_yaml_ng::from_str(text).context("failed to parse config mapping")?,
-            );
-            let route = named_route_from_value(value, name.as_deref())?;
-            Self::build(route, name.unwrap_or_else(default_route_name))
+            let value = serde_yaml_ng::from_str(text).context("failed to parse config mapping")?;
+            let route = common::named_route_from_value(value, name.as_deref())?;
+            Self::build(route, name.unwrap_or_else(common::default_route_name))
         })
         .map_err(to_py_runtime_error)
     }
@@ -664,7 +648,7 @@ impl Route {
 impl Route {
     fn build(route: CoreRoute, name: String) -> anyhow::Result<Self> {
         Ok(Self {
-            runtime: Arc::new(build_runtime()?),
+            runtime: Arc::new(common::build_runtime()?),
             route: Arc::new(Mutex::new(route)),
             name,
             run_state: Arc::new(Mutex::new(RouteRunState::default())),
@@ -723,7 +707,7 @@ struct Publisher {
 
 impl Publisher {
     fn build(endpoint: Endpoint) -> anyhow::Result<Self> {
-        let runtime = Arc::new(build_runtime()?);
+        let runtime = Arc::new(common::build_runtime()?);
         let publisher = runtime.block_on(CorePublisher::new(endpoint))?;
         Ok(Self { runtime, publisher })
     }
@@ -738,9 +722,9 @@ impl Publisher {
     #[pyo3(signature = (path, name=None))]
     fn from_file(py: Python<'_>, path: &str, name: Option<&str>) -> PyResult<Self> {
         let path = path.to_string();
-        let name = normalize_name(name).map(str::to_string);
+        let name = common::normalize_name(name).map(str::to_string);
         py.detach(move || -> anyhow::Result<Self> {
-            Self::build(load_named_publisher(Path::new(&path), name.as_deref())?)
+            Self::build(common::load_named_publisher(Path::new(&path), name.as_deref())?)
         })
         .map_err(to_py_runtime_error)
     }
@@ -762,12 +746,10 @@ impl Publisher {
     #[pyo3(signature = (text, name=None))]
     fn from_str(py: Python<'_>, text: &str, name: Option<&str>) -> PyResult<Self> {
         let text = text.to_string();
-        let name = normalize_name(name).map(str::to_string);
+        let name = common::normalize_name(name).map(str::to_string);
         py.detach(move || -> anyhow::Result<Self> {
-            let value = unwrap_config_root(
-                serde_yaml_ng::from_str(&text).context("failed to parse YAML config")?,
-            );
-            Self::build(named_publisher_from_value(value, name.as_deref())?)
+            let value = serde_yaml_ng::from_str(&text).context("failed to parse YAML config")?;
+            Self::build(common::named_publisher_from_value(value, name.as_deref())?)
         })
         .map_err(to_py_runtime_error)
     }
@@ -794,13 +776,11 @@ impl Publisher {
         name: Option<&str>,
     ) -> PyResult<Self> {
         let bytes = python_to_json_bytes(config)?;
-        let name = normalize_name(name).map(str::to_string);
+        let name = common::normalize_name(name).map(str::to_string);
         py.detach(move || -> anyhow::Result<Self> {
             let text = std::str::from_utf8(&bytes).context("config is not valid UTF-8")?;
-            let value = unwrap_config_root(
-                serde_yaml_ng::from_str(text).context("failed to parse config mapping")?,
-            );
-            Self::build(named_publisher_from_value(value, name.as_deref())?)
+            let value = serde_yaml_ng::from_str(text).context("failed to parse config mapping")?;
+            Self::build(common::named_publisher_from_value(value, name.as_deref())?)
         })
         .map_err(to_py_runtime_error)
     }
@@ -900,7 +880,7 @@ impl MemoryDrainer {
         let topic = topic.to_string();
         py.detach(move || -> anyhow::Result<Self> {
             Ok(Self {
-                runtime: Arc::new(build_runtime()?),
+                runtime: Arc::new(common::build_runtime()?),
                 consumer: Arc::new(tokio::sync::Mutex::new(MemoryConsumer::new_local(
                     &topic, capacity,
                 ))),
@@ -964,80 +944,6 @@ impl MemoryDrainer {
     }
 }
 
-fn build_runtime() -> anyhow::Result<Runtime> {
-    Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .context("failed to build Tokio runtime")
-}
-
-fn load_config_value(path: &Path) -> anyhow::Result<serde_yaml_ng::Value> {
-    let raw = fs::read_to_string(path)
-        .with_context(|| format!("failed to read YAML config from {}", path.display()))?;
-    let value = serde_yaml_ng::from_str(&raw).context("failed to parse YAML config")?;
-    Ok(unwrap_config_root(value))
-}
-
-fn load_named_route(path: &Path, name: Option<&str>) -> anyhow::Result<CoreRoute> {
-    named_route_from_value(load_config_value(path)?, name)
-}
-
-/// Resolve a route from a config value. When `name` is `Some`, look it up in a
-/// `routes:` document (falling back to a single-route body). When `name` is
-/// `None`, the value must be a single bare route body.
-fn named_route_from_value(
-    value: serde_yaml_ng::Value,
-    name: Option<&str>,
-) -> anyhow::Result<CoreRoute> {
-    if let Some(name) = name {
-        if let Ok(document) = load_document_from_value(value.clone()) {
-            if let Some(route) = document.routes.get(name).cloned() {
-                return Ok(route);
-            }
-        }
-    }
-
-    serde_yaml_ng::from_value(value).with_context(|| match name {
-        Some(name) => format!(
-            "No route named '{name}' found, and the config could not be parsed as a single route"
-        ),
-        None => "config could not be parsed as a single route body".to_string(),
-    })
-}
-
-fn load_named_publisher(path: &Path, name: Option<&str>) -> anyhow::Result<Endpoint> {
-    named_publisher_from_value(load_config_value(path)?, name)
-}
-
-/// Resolve a publisher endpoint from a config value. When `name` is `Some`,
-/// look it up in a `publishers:` document (falling back to a single endpoint
-/// body). When `name` is `None`, the value must be a single bare endpoint body.
-fn named_publisher_from_value(
-    value: serde_yaml_ng::Value,
-    name: Option<&str>,
-) -> anyhow::Result<Endpoint> {
-    if let Some(name) = name {
-        if let Ok(document) = load_document_from_value(value.clone()) {
-            if let Some(endpoint) = document.publishers.get(name).cloned() {
-                return Ok(endpoint);
-            }
-        }
-    }
-
-    serde_yaml_ng::from_value(value).with_context(|| match name {
-        Some(name) => format!(
-            "No publisher named '{name}' found, and the config could not be parsed as a single publisher endpoint"
-        ),
-        None => "config could not be parsed as a single endpoint body".to_string(),
-    })
-}
-
-/// Map an optional name from the Python boundary to `None` when missing or
-/// empty, so callers can omit it (or pass `""`) to mean "no name".
-fn normalize_name(name: Option<&str>) -> Option<&str> {
-    name.filter(|n| !n.is_empty())
-}
-
 /// Emit a Python `DeprecationWarning` from a deprecated constructor alias.
 fn warn_deprecated(py: Python<'_>, message: &std::ffi::CStr) -> PyResult<()> {
     PyErr::warn(
@@ -1048,69 +954,6 @@ fn warn_deprecated(py: Python<'_>, message: &std::ffi::CStr) -> PyResult<()> {
     )
 }
 
-/// Generated identity for a route built without an explicit name.
-fn default_route_name() -> String {
-    format!("route-{}", fast_uuid_v7::gen_id())
-}
-
-fn load_document_from_value(value: serde_yaml_ng::Value) -> anyhow::Result<ConfigDocument> {
-    let section_key = |name: &str| serde_yaml_ng::Value::String(name.to_string());
-    let routes_key = section_key("routes");
-    let publishers_key = section_key("publishers");
-
-    if let Some(map) = value.as_mapping() {
-        if map.contains_key(&routes_key) || map.contains_key(&publishers_key) {
-            let routes = map
-                .get(&routes_key)
-                .map_or_else(
-                    || Ok(HashMap::new()),
-                    |section| serde_yaml_ng::from_value(section.clone()),
-                )
-                .context("failed to parse 'routes' section")?;
-            let publishers = map.get(&publishers_key).map_or_else(
-                || Ok(PublisherConfig::new()),
-                |section| parse_publishers_section(section.clone()),
-            )?;
-            return Ok(ConfigDocument { routes, publishers });
-        }
-    }
-
-    let routes = serde_yaml_ng::from_value(value).context("failed to parse YAML as a route map")?;
-    Ok(ConfigDocument {
-        routes,
-        publishers: PublisherConfig::new(),
-    })
-}
-
-fn unwrap_config_root(value: serde_yaml_ng::Value) -> serde_yaml_ng::Value {
-    if let Some(map) = value.as_mapping() {
-        let config_key = serde_yaml_ng::Value::String("config".to_string());
-        if let Some(config) = map.get(&config_key) {
-            return config.clone();
-        }
-    }
-    value
-}
-
-fn parse_publishers_section(value: serde_yaml_ng::Value) -> anyhow::Result<PublisherConfig> {
-    match value {
-        serde_yaml_ng::Value::Mapping(_) => {
-            serde_yaml_ng::from_value(value).context("failed to parse 'publishers' section")
-        }
-        serde_yaml_ng::Value::Sequence(_) => {
-            let entries: Vec<NamedPublisher> = serde_yaml_ng::from_value(value)
-                .context("failed to parse 'publishers' array section")?;
-            Ok(entries
-                .into_iter()
-                .map(|entry| (entry.name, entry.endpoint))
-                .collect())
-        }
-        other => Err(anyhow!(
-            "failed to parse 'publishers' section: expected a map or array, got {other:?}"
-        )),
-    }
-}
-
 fn validate_message_id(id: Option<&str>) -> PyResult<()> {
     if let Some(id) = id {
         let _ = parse_message_id(id)?;
@@ -1119,8 +962,7 @@ fn validate_message_id(id: Option<&str>) -> PyResult<()> {
 }
 
 fn parse_message_id(id: &str) -> PyResult<u128> {
-    core::canonical_message::deserialize_u128(JsonValue::String(id.to_string()).into_deserializer())
-        .map_err(|err| PyValueError::new_err(format!("invalid message id '{id}': {err}")))
+    core::canonical_message::message_id_from_str(id).map_err(PyValueError::new_err)
 }
 
 fn build_message(
@@ -1165,10 +1007,6 @@ fn json_input_to_canonical(
 ) -> PyResult<CanonicalMessage> {
     validate_message_id(id)?;
     build_message(python_to_json_bytes(data)?, metadata, id)
-}
-
-fn format_message_id(message_id: u128) -> String {
-    fast_uuid_v7::format_uuid(message_id).to_string()
 }
 
 /// Cyclic-GC strategy for the Python handler interpreter.
@@ -1893,7 +1731,7 @@ memory:
         );
 
         let document =
-            load_document_from_value(load_config_value(Path::new(&path)).unwrap()).unwrap();
+            common::load_document_from_value(common::load_config_value(Path::new(&path)).unwrap()).unwrap();
         assert!(document.routes.contains_key("orders_route"));
         assert!(document.publishers.contains_key("incoming"));
     }

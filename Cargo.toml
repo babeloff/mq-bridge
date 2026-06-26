@@ -12,7 +12,7 @@ keywords = ["messaging", "kafka", "nats", "amqp", "cqrs"]
 categories = ["asynchronous", "network-programming"]
 
 [workspace]
-members = ["python/mq-bridge-py", "node/mq-bridge-node"]
+members = ["bindings-common", "python/mq-bridge-py", "node/mq-bridge-node"]
 resolver = "2"
 
 [workspace.package]

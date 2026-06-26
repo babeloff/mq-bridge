@@ -1,5 +1,4 @@
 use std::collections::{HashMap, HashSet};
-use std::fs;
 use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
@@ -7,18 +6,18 @@ use std::thread;
 use ::mq_bridge as core;
 use anyhow::Context;
 use async_trait::async_trait;
-use core::models::{Endpoint, PublisherConfig};
+use core::models::Endpoint;
 use core::traits::Handler;
 use core::type_handler::TypeHandler;
 use core::{
     CanonicalMessage, Handled, HandlerError, Publisher as CorePublisher, Route as CoreRoute, Sent,
 };
+use mq_bridge_bindings_common as common;
 use napi::bindgen_prelude::*;
 use napi::threadsafe_function::ThreadsafeFunction;
 use napi_derive::napi;
-use serde::de::IntoDeserializer;
 use serde_json::Value as JsonValue;
-use tokio::runtime::{Builder, Runtime};
+use tokio::runtime::Runtime;
 use tokio::sync::oneshot;
 
 #[napi(js_name = "version")]
@@ -45,7 +44,7 @@ impl NativeMessage {
         Self {
             payload: message.payload.to_vec().into(),
             metadata: Some(message.metadata.clone()),
-            id: Some(format_message_id(message.message_id)),
+            id: Some(core::canonical_message::format_message_id(message.message_id)),
         }
     }
 
@@ -188,10 +187,10 @@ impl Route {
     /// `name` (or pass `""`) when the file is a single bare route body.
     #[napi(factory)]
     pub fn from_file(path: String, name: Option<String>) -> Result<Self> {
-        let name = normalize_name(name);
+        let name = common::normalize_name(name.as_deref()).map(str::to_string);
         let route =
-            load_named_route(Path::new(&path), name.as_deref()).map_err(to_napi_error)?;
-        Self::build(route, name.unwrap_or_else(default_route_name))
+            common::load_named_route(Path::new(&path), name.as_deref()).map_err(to_napi_error)?;
+        Self::build(route, name.unwrap_or_else(common::default_route_name))
     }
 
     /// Deprecated alias for `from_file`.
@@ -205,14 +204,13 @@ impl Route {
     /// single bare route body.
     #[napi(factory)]
     pub fn from_str(text: String, name: Option<String>) -> Result<Self> {
-        let name = normalize_name(name);
-        let value = unwrap_config_root(
-            serde_yaml_ng::from_str(&text)
-                .context("failed to parse YAML config")
-                .map_err(to_napi_error)?,
-        );
-        let route = named_route_from_value(value, name.as_deref()).map_err(to_napi_error)?;
-        Self::build(route, name.unwrap_or_else(default_route_name))
+        let name = common::normalize_name(name.as_deref()).map(str::to_string);
+        let value = serde_yaml_ng::from_str(&text)
+            .context("failed to parse YAML config")
+            .map_err(to_napi_error)?;
+        let route =
+            common::named_route_from_value(value, name.as_deref()).map_err(to_napi_error)?;
+        Self::build(route, name.unwrap_or_else(common::default_route_name))
     }
 
     /// Deprecated alias for `from_str`.
@@ -227,13 +225,13 @@ impl Route {
     /// body, in which case a name is generated automatically.
     #[napi(factory)]
     pub fn from_config(config: JsonValue, name: Option<String>) -> Result<Self> {
-        let name = normalize_name(name);
+        let name = common::normalize_name(name.as_deref()).map(str::to_string);
         let value = serde_yaml_ng::to_value(config)
             .context("failed to convert config mapping")
             .map_err(to_napi_error)?;
-        let route = named_route_from_value(unwrap_config_root(value), name.as_deref())
-            .map_err(to_napi_error)?;
-        Self::build(route, name.unwrap_or_else(default_route_name))
+        let route =
+            common::named_route_from_value(value, name.as_deref()).map_err(to_napi_error)?;
+        Self::build(route, name.unwrap_or_else(common::default_route_name))
     }
 
     #[napi]
@@ -362,7 +360,7 @@ impl Route {
 impl Route {
     fn build(route: CoreRoute, name: String) -> Result<Self> {
         Ok(Self {
-            runtime: Arc::new(build_runtime().map_err(to_napi_error)?),
+            runtime: Arc::new(common::build_runtime().map_err(to_napi_error)?),
             route: Arc::new(Mutex::new(route)),
             name,
             run_state: Arc::new(Mutex::new(RouteRunState::default())),
@@ -423,9 +421,9 @@ impl Publisher {
     /// (or pass `""`) when the file is a single bare endpoint body.
     #[napi(factory)]
     pub fn from_file(path: String, name: Option<String>) -> Result<Self> {
-        let name = normalize_name(name);
+        let name = common::normalize_name(name.as_deref());
         Self::build(
-            load_named_publisher(Path::new(&path), name.as_deref()).map_err(to_napi_error)?,
+            common::load_named_publisher(Path::new(&path), name).map_err(to_napi_error)?,
         )
     }
 
@@ -439,13 +437,11 @@ impl Publisher {
     /// `name` (or pass `""`) when the string is a single bare endpoint body.
     #[napi(factory)]
     pub fn from_str(text: String, name: Option<String>) -> Result<Self> {
-        let name = normalize_name(name);
-        let value = unwrap_config_root(
-            serde_yaml_ng::from_str(&text)
-                .context("failed to parse YAML config")
-                .map_err(to_napi_error)?,
-        );
-        Self::build(named_publisher_from_value(value, name.as_deref()).map_err(to_napi_error)?)
+        let name = common::normalize_name(name.as_deref());
+        let value = serde_yaml_ng::from_str(&text)
+            .context("failed to parse YAML config")
+            .map_err(to_napi_error)?;
+        Self::build(common::named_publisher_from_value(value, name).map_err(to_napi_error)?)
     }
 
     /// Deprecated alias for `from_str`.
@@ -459,14 +455,11 @@ impl Publisher {
     /// body.
     #[napi(factory)]
     pub fn from_config(config: JsonValue, name: Option<String>) -> Result<Self> {
-        let name = normalize_name(name);
+        let name = common::normalize_name(name.as_deref());
         let value = serde_yaml_ng::to_value(config)
             .context("failed to convert config mapping")
             .map_err(to_napi_error)?;
-        Self::build(
-            named_publisher_from_value(unwrap_config_root(value), name.as_deref())
-                .map_err(to_napi_error)?,
-        )
+        Self::build(common::named_publisher_from_value(value, name).map_err(to_napi_error)?)
     }
 
     #[napi]
@@ -504,7 +497,7 @@ impl Publisher {
 
 impl Publisher {
     fn build(endpoint: Endpoint) -> Result<Self> {
-        let runtime = Arc::new(build_runtime().map_err(to_napi_error)?);
+        let runtime = Arc::new(common::build_runtime().map_err(to_napi_error)?);
         let publisher = runtime
             .block_on(CorePublisher::new(endpoint))
             .map_err(to_napi_error)?;
@@ -541,147 +534,6 @@ impl Publisher {
     }
 }
 
-fn build_runtime() -> anyhow::Result<Runtime> {
-    Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .context("failed to build Tokio runtime")
-}
-
-fn load_config_value(path: &Path) -> anyhow::Result<serde_yaml_ng::Value> {
-    let raw = fs::read_to_string(path)
-        .with_context(|| format!("failed to read config '{}'", path.display()))?;
-    serde_yaml_ng::from_str(&raw).context("failed to parse YAML config")
-}
-
-fn load_named_route(path: &Path, name: Option<&str>) -> anyhow::Result<CoreRoute> {
-    named_route_from_value(load_config_value(path)?, name)
-}
-
-/// Resolve a route from a config value. When `name` is `Some`, look it up in a
-/// `routes:` document (falling back to a single-route body). When `name` is
-/// `None`, the value must be a single bare route body.
-fn named_route_from_value(
-    value: serde_yaml_ng::Value,
-    name: Option<&str>,
-) -> anyhow::Result<CoreRoute> {
-    let value = unwrap_config_root(value);
-    if let Some(name) = name {
-        if let Ok(document) = load_document_from_value(value.clone()) {
-            if let Some(route) = document.routes.get(name).cloned() {
-                return Ok(route);
-            }
-        }
-    }
-
-    serde_yaml_ng::from_value(value).with_context(|| match name {
-        Some(name) => format!(
-            "No route named '{name}' found, and the config could not be parsed as a single route"
-        ),
-        None => "config could not be parsed as a single route body".to_string(),
-    })
-}
-
-fn load_named_publisher(path: &Path, name: Option<&str>) -> anyhow::Result<Endpoint> {
-    named_publisher_from_value(load_config_value(path)?, name)
-}
-
-/// Resolve a publisher endpoint from a config value. When `name` is `Some`,
-/// look it up in a `publishers:` document (falling back to a single endpoint
-/// body). When `name` is `None`, the value must be a single bare endpoint body.
-fn named_publisher_from_value(
-    value: serde_yaml_ng::Value,
-    name: Option<&str>,
-) -> anyhow::Result<Endpoint> {
-    if let Some(name) = name {
-        if let Ok(document) = load_document_from_value(value.clone()) {
-            if let Some(endpoint) = document.publishers.get(name).cloned() {
-                return Ok(endpoint);
-            }
-        }
-    }
-
-    serde_yaml_ng::from_value(value).with_context(|| match name {
-        Some(name) => format!(
-            "No publisher named '{name}' found, and the config could not be parsed as a single publisher endpoint"
-        ),
-        None => "config could not be parsed as a single endpoint body".to_string(),
-    })
-}
-
-/// Map an optional name from the JS boundary to `None` when missing or empty,
-/// so callers can omit it (or pass `""`) to mean "no name".
-fn normalize_name(name: Option<String>) -> Option<String> {
-    name.filter(|n| !n.is_empty())
-}
-
-/// Generated identity for a route built without an explicit name.
-fn default_route_name() -> String {
-    format!("route-{}", fast_uuid_v7::gen_id_string())
-}
-
-fn load_document_from_value(value: serde_yaml_ng::Value) -> anyhow::Result<ConfigDocument> {
-    let section_key = |name: &str| serde_yaml_ng::Value::String(name.to_string());
-    let routes_key = section_key("routes");
-    let publishers_key = section_key("publishers");
-
-    if let Some(map) = value.as_mapping() {
-        if map.contains_key(&routes_key) || map.contains_key(&publishers_key) {
-            let routes = map
-                .get(&routes_key)
-                .map_or_else(
-                    || Ok(HashMap::new()),
-                    |section| serde_yaml_ng::from_value(section.clone()),
-                )
-                .context("failed to parse 'routes' section")?;
-            let publishers = map.get(&publishers_key).map_or_else(
-                || Ok(PublisherConfig::new()),
-                |section| parse_publishers_section(section.clone()),
-            )?;
-            return Ok(ConfigDocument { routes, publishers });
-        }
-    }
-
-    let routes = serde_yaml_ng::from_value(value).context("failed to parse YAML as a route map")?;
-    Ok(ConfigDocument {
-        routes,
-        publishers: PublisherConfig::new(),
-    })
-}
-
-fn parse_publishers_section(value: serde_yaml_ng::Value) -> anyhow::Result<PublisherConfig> {
-    serde_yaml_ng::from_value(value.clone()).or_else(|err| {
-        let map = value
-            .as_mapping()
-            .ok_or_else(|| anyhow::anyhow!("failed to parse publishers section: {err}"))?;
-        let mut publishers = PublisherConfig::new();
-        for (key, endpoint_value) in map {
-            let name = key
-                .as_str()
-                .ok_or_else(|| anyhow::anyhow!("publisher names must be strings"))?;
-            let endpoint: Endpoint = serde_yaml_ng::from_value(endpoint_value.clone())
-                .with_context(|| format!("failed to parse publisher '{name}'"))?;
-            publishers.insert(name.to_string(), endpoint);
-        }
-        Ok(publishers)
-    })
-}
-
-struct ConfigDocument {
-    routes: HashMap<String, CoreRoute>,
-    publishers: PublisherConfig,
-}
-
-fn unwrap_config_root(value: serde_yaml_ng::Value) -> serde_yaml_ng::Value {
-    if let Some(map) = value.as_mapping() {
-        let config_key = serde_yaml_ng::Value::String("config".to_string());
-        if let Some(config) = map.get(&config_key) {
-            return config.clone();
-        }
-    }
-    value
-}
-
 fn build_message(
     payload: Vec<u8>,
     metadata: Option<HashMap<String, String>>,
@@ -708,12 +560,7 @@ fn json_input_to_canonical(
 }
 
 fn parse_message_id(id: &str) -> Result<u128> {
-    core::canonical_message::deserialize_u128(JsonValue::String(id.to_string()).into_deserializer())
-        .map_err(|err| Error::from_reason(format!("invalid message id '{id}': {err}")))
-}
-
-fn format_message_id(message_id: u128) -> String {
-    fast_uuid_v7::format_uuid(message_id).to_string()
+    core::canonical_message::message_id_from_str(id).map_err(Error::from_reason)
 }
 
 fn active_route_names() -> &'static Mutex<HashSet<String>> {

@@ -45,7 +45,7 @@ Middleware is configured through the normal mq-bridge route config.
 The constructors mirror the Python bindings so the same names work across both:
 
 - `Route.fromFile(path, name?)` loads from a YAML/JSON file
-- `Route.fromStr(text, name?)` loads from an in-memory string
+- `Route.fromStr(text, name?)` loads from an in-memory YAML/JSON string
 - `Route.fromConfig(obj, name?)` loads from a JS object
 - `Publisher.fromFile` / `Publisher.fromStr` / `Publisher.fromConfig` build a publisher endpoint
 

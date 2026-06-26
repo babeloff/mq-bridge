@@ -15,7 +15,7 @@ Memory and file endpoints are always present in both packages. Use `mq-bridge-py
 
 The public API stays close to mq-bridge itself:
 
-- `Route.from_file(path, name=None)` loads a route from a YAML/JSON file. The three constructors differ only by source: `from_file` (path), `from_str` (in-memory string), `from_config` (Python `dict`)
+- `Route.from_file(path, name=None)` loads a route from a YAML/JSON file. The three constructors differ only by source: `from_file` (path), `from_str` (in-memory YAML/JSON string), `from_config` (Python `dict`)
 - The `name` is optional: pass it to pick one entry out of a `routes:`/`publishers:` document, or omit it to treat the whole config as a single bare route/endpoint body
 - `Route.with_handler(...)` attaches a raw `Message` handler, with lazy `json()`/`text()` readers and `with_json()`/`with_payload()` response helpers
 - `Route.add_handler(kind, ...)` uses mq-bridge's `kind` dispatch and delivers decoded JSON
