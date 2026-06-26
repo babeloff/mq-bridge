@@ -951,7 +951,8 @@ impl MemoryDrainer {
 fn warn_deprecated(py: Python<'_>, message: &str) -> PyResult<()> {
     // Build the C string at runtime rather than with a `c"..."` literal so the
     // crate keeps compiling on its MSRV (c-string literals stabilized in 1.77).
-    let message = std::ffi::CString::new(message).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let message =
+        std::ffi::CString::new(message).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     PyErr::warn(
         py,
         &py.get_type::<pyo3::exceptions::PyDeprecationWarning>(),
