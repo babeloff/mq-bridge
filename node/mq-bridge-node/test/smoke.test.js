@@ -69,7 +69,7 @@ test("Message round-trips JSON, text, metadata, and ids", () => {
 });
 
 test("Publisher.requestJson echoes through response endpoint", async () => {
-  const publisher = Publisher.fromYamlStr(
+  const publisher = Publisher.fromStr(
     `
 publishers:
   echo:
@@ -86,7 +86,7 @@ publishers:
 test("Route.withHandler serves an HTTP response", async () => {
   const port = await freePort();
   const routeName = `node_with_handler_${port}`;
-  const route = Route.fromYamlStr(
+  const route = Route.fromStr(
     httpRouteConfig(routeName, port, "/with-handler"),
     routeName,
   );
@@ -120,7 +120,7 @@ test("Route.withHandler serves an HTTP response", async () => {
 test("Route.addHandler dispatches by kind with middleware config", async () => {
   const port = await freePort();
   const routeName = `node_add_handler_${port}`;
-  const route = Route.fromYamlStr(
+  const route = Route.fromStr(
     httpRouteConfig(routeName, port, "/typed-handler", true),
     routeName,
   );

@@ -57,16 +57,26 @@ class Publisher {
     this._native = nativePublisher;
   }
 
-  static fromYaml(path, name) {
-    return new Publisher(native.Publisher.fromYaml(path, name));
+  static fromFile(path, name) {
+    return new Publisher(native.Publisher.fromFile(path, name));
   }
 
-  static fromYamlStr(text, name) {
-    return new Publisher(native.Publisher.fromYamlStr(text, name));
+  static fromStr(text, name) {
+    return new Publisher(native.Publisher.fromStr(text, name));
   }
 
   static fromConfig(config, name) {
     return new Publisher(native.Publisher.fromConfig(config, name));
+  }
+
+  /** @deprecated Use {@link Publisher.fromFile} instead. */
+  static fromYaml(path, name) {
+    return new Publisher(native.Publisher.fromFile(path, name));
+  }
+
+  /** @deprecated Use {@link Publisher.fromStr} instead. */
+  static fromYamlStr(text, name) {
+    return new Publisher(native.Publisher.fromStr(text, name));
   }
 
   send(message) {
@@ -91,16 +101,26 @@ class Route {
     this._native = nativeRoute;
   }
 
-  static fromYaml(path, name) {
-    return new Route(native.Route.fromYaml(path, name));
+  static fromFile(path, name) {
+    return new Route(native.Route.fromFile(path, name));
   }
 
-  static fromYamlStr(text, name) {
-    return new Route(native.Route.fromYamlStr(text, name));
+  static fromStr(text, name) {
+    return new Route(native.Route.fromStr(text, name));
   }
 
   static fromConfig(config, name) {
     return new Route(native.Route.fromConfig(config, name));
+  }
+
+  /** @deprecated Use {@link Route.fromFile} instead. */
+  static fromYaml(path, name) {
+    return new Route(native.Route.fromFile(path, name));
+  }
+
+  /** @deprecated Use {@link Route.fromStr} instead. */
+  static fromYamlStr(text, name) {
+    return new Route(native.Route.fromStr(text, name));
   }
 
   withHandler(handler) {

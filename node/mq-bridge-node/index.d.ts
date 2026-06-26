@@ -22,9 +22,13 @@ export class Message {
 }
 
 export class Publisher {
-  static fromYaml(path: string, name: string): Publisher;
-  static fromYamlStr(text: string, name: string): Publisher;
-  static fromConfig(config: JsonValue, name: string): Publisher;
+  static fromFile(path: string, name?: string | null): Publisher;
+  static fromStr(text: string, name?: string | null): Publisher;
+  static fromConfig(config: JsonValue, name?: string | null): Publisher;
+  /** @deprecated Use {@link Publisher.fromFile} instead. */
+  static fromYaml(path: string, name?: string | null): Publisher;
+  /** @deprecated Use {@link Publisher.fromStr} instead. */
+  static fromYamlStr(text: string, name?: string | null): Publisher;
   send(message: Message): Promise<void>;
   request(message: Message): Promise<Message>;
   sendJson(data: JsonValue, metadata?: Metadata | null, id?: string | null): Promise<void>;
@@ -32,9 +36,13 @@ export class Publisher {
 }
 
 export class Route {
-  static fromYaml(path: string, name: string): Route;
-  static fromYamlStr(text: string, name: string): Route;
-  static fromConfig(config: JsonValue, name: string): Route;
+  static fromFile(path: string, name?: string | null): Route;
+  static fromStr(text: string, name?: string | null): Route;
+  static fromConfig(config: JsonValue, name?: string | null): Route;
+  /** @deprecated Use {@link Route.fromFile} instead. */
+  static fromYaml(path: string, name?: string | null): Route;
+  /** @deprecated Use {@link Route.fromStr} instead. */
+  static fromYamlStr(text: string, name?: string | null): Route;
   withHandler(handler: MessageHandler): void;
   addHandler(kind: string, handler: JsonHandler): void;
   start(): void;

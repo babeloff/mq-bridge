@@ -24,7 +24,7 @@ npm run example
 ```ts
 import { Message, Route } from "mq-bridge";
 
-const route = Route.fromYamlStr(config, "orders");
+const route = Route.fromStr(config, "orders");
 
 route.withHandler(async (message) => {
   const data = message.json();
@@ -39,3 +39,16 @@ route.start();
 ```
 
 Middleware is configured through the normal mq-bridge route config.
+
+## Loading config
+
+The constructors mirror the Python bindings so the same names work across both:
+
+- `Route.fromFile(path, name?)` loads from a YAML/JSON file
+- `Route.fromStr(text, name?)` loads from an in-memory string
+- `Route.fromConfig(obj, name?)` loads from a JS object
+- `Publisher.fromFile` / `Publisher.fromStr` / `Publisher.fromConfig` build a publisher endpoint
+
+The `name` is optional: pass it to pick one entry out of a `routes:`/`publishers:`
+document, or omit it to treat the whole config as a single bare route/endpoint body.
+`fromYaml` / `fromYamlStr` remain as deprecated aliases for `fromFile` / `fromStr`.

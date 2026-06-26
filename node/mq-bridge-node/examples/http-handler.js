@@ -54,7 +54,7 @@ routes:
       response: {}
 `;
 
-  const route = Route.fromYamlStr(config, "node_http_handler");
+  const route = Route.fromStr(config, "node_http_handler");
   route.addHandler("order.created", async (data) => {
     return Message.fromJson(
       {

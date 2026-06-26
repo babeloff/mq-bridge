@@ -183,36 +183,57 @@ struct RouteRunState {
 
 #[napi]
 impl Route {
+    /// Build a route from a YAML or JSON config file. Accepts a `routes:`
+    /// document, a bare `{name: route}` map, or a single route body. Omit
+    /// `name` (or pass `""`) when the file is a single bare route body.
     #[napi(factory)]
-    pub fn from_yaml(path: String, name: String) -> Result<Self> {
-        Self::build(
-            load_named_route(Path::new(&path), &name).map_err(to_napi_error)?,
-            name,
-        )
+    pub fn from_file(path: String, name: Option<String>) -> Result<Self> {
+        let name = normalize_name(name);
+        let route =
+            load_named_route(Path::new(&path), name.as_deref()).map_err(to_napi_error)?;
+        Self::build(route, name.unwrap_or_else(default_route_name))
     }
 
+    /// Deprecated alias for `from_file`.
     #[napi(factory)]
-    pub fn from_yaml_str(text: String, name: String) -> Result<Self> {
+    pub fn from_yaml(path: String, name: Option<String>) -> Result<Self> {
+        Self::from_file(path, name)
+    }
+
+    /// Build a route from an in-memory YAML or JSON string. Accepts the same
+    /// shapes as `from_file`. Omit `name` (or pass `""`) when the string is a
+    /// single bare route body.
+    #[napi(factory)]
+    pub fn from_str(text: String, name: Option<String>) -> Result<Self> {
+        let name = normalize_name(name);
         let value = unwrap_config_root(
             serde_yaml_ng::from_str(&text)
                 .context("failed to parse YAML config")
                 .map_err(to_napi_error)?,
         );
-        Self::build(
-            load_route_from_value(value, &name).map_err(to_napi_error)?,
-            name,
-        )
+        let route = named_route_from_value(value, name.as_deref()).map_err(to_napi_error)?;
+        Self::build(route, name.unwrap_or_else(default_route_name))
     }
 
+    /// Deprecated alias for `from_str`.
     #[napi(factory)]
-    pub fn from_config(config: JsonValue, name: String) -> Result<Self> {
+    pub fn from_yaml_str(text: String, name: Option<String>) -> Result<Self> {
+        Self::from_str(text, name)
+    }
+
+    /// Build a route from an in-memory mapping (e.g. a JS object). Accepts a
+    /// `routes:` document, a bare `{name: route}` map, or a single route body.
+    /// Omit `name` (or pass `""`) to treat the mapping as a single bare route
+    /// body, in which case a name is generated automatically.
+    #[napi(factory)]
+    pub fn from_config(config: JsonValue, name: Option<String>) -> Result<Self> {
+        let name = normalize_name(name);
         let value = serde_yaml_ng::to_value(config)
             .context("failed to convert config mapping")
             .map_err(to_napi_error)?;
-        Self::build(
-            load_route_from_value(unwrap_config_root(value), &name).map_err(to_napi_error)?,
-            name,
-        )
+        let route = named_route_from_value(unwrap_config_root(value), name.as_deref())
+            .map_err(to_napi_error)?;
+        Self::build(route, name.unwrap_or_else(default_route_name))
     }
 
     #[napi]
@@ -398,28 +419,53 @@ pub struct Publisher {
 
 #[napi]
 impl Publisher {
+    /// Build a publisher endpoint from a YAML or JSON config file. Omit `name`
+    /// (or pass `""`) when the file is a single bare endpoint body.
     #[napi(factory)]
-    pub fn from_yaml(path: String, name: String) -> Result<Self> {
-        Self::build(load_named_publisher(Path::new(&path), &name).map_err(to_napi_error)?)
+    pub fn from_file(path: String, name: Option<String>) -> Result<Self> {
+        let name = normalize_name(name);
+        Self::build(
+            load_named_publisher(Path::new(&path), name.as_deref()).map_err(to_napi_error)?,
+        )
     }
 
+    /// Deprecated alias for `from_file`.
     #[napi(factory)]
-    pub fn from_yaml_str(text: String, name: String) -> Result<Self> {
+    pub fn from_yaml(path: String, name: Option<String>) -> Result<Self> {
+        Self::from_file(path, name)
+    }
+
+    /// Build a publisher endpoint from an in-memory YAML or JSON string. Omit
+    /// `name` (or pass `""`) when the string is a single bare endpoint body.
+    #[napi(factory)]
+    pub fn from_str(text: String, name: Option<String>) -> Result<Self> {
+        let name = normalize_name(name);
         let value = unwrap_config_root(
             serde_yaml_ng::from_str(&text)
                 .context("failed to parse YAML config")
                 .map_err(to_napi_error)?,
         );
-        Self::build(named_publisher_from_value(value, &name).map_err(to_napi_error)?)
+        Self::build(named_publisher_from_value(value, name.as_deref()).map_err(to_napi_error)?)
     }
 
+    /// Deprecated alias for `from_str`.
     #[napi(factory)]
-    pub fn from_config(config: JsonValue, name: String) -> Result<Self> {
+    pub fn from_yaml_str(text: String, name: Option<String>) -> Result<Self> {
+        Self::from_str(text, name)
+    }
+
+    /// Build a publisher endpoint from an in-memory mapping (e.g. a JS object).
+    /// Omit `name` (or pass `""`) to treat the mapping as a single bare endpoint
+    /// body.
+    #[napi(factory)]
+    pub fn from_config(config: JsonValue, name: Option<String>) -> Result<Self> {
+        let name = normalize_name(name);
         let value = serde_yaml_ng::to_value(config)
             .context("failed to convert config mapping")
             .map_err(to_napi_error)?;
         Self::build(
-            named_publisher_from_value(unwrap_config_root(value), &name).map_err(to_napi_error)?,
+            named_publisher_from_value(unwrap_config_root(value), name.as_deref())
+                .map_err(to_napi_error)?,
         )
     }
 
@@ -508,39 +554,70 @@ fn load_config_value(path: &Path) -> anyhow::Result<serde_yaml_ng::Value> {
     serde_yaml_ng::from_str(&raw).context("failed to parse YAML config")
 }
 
-fn load_named_route(path: &Path, name: &str) -> anyhow::Result<CoreRoute> {
-    load_route_from_value(load_config_value(path)?, name)
+fn load_named_route(path: &Path, name: Option<&str>) -> anyhow::Result<CoreRoute> {
+    named_route_from_value(load_config_value(path)?, name)
 }
 
-fn load_route_from_value(value: serde_yaml_ng::Value, name: &str) -> anyhow::Result<CoreRoute> {
-    let config = unwrap_config_root(value);
-    let document = load_document_from_value(config)?;
-    let route = document
-        .routes
-        .get(name)
-        .cloned()
-        .ok_or_else(|| anyhow::anyhow!("route '{name}' not found in config"))?;
-    route
-        .try_into()
-        .with_context(|| format!("failed to build route '{name}'"))
-}
-
-fn load_named_publisher(path: &Path, name: &str) -> anyhow::Result<Endpoint> {
-    named_publisher_from_value(load_config_value(path)?, name)
-}
-
-fn named_publisher_from_value(value: serde_yaml_ng::Value, name: &str) -> anyhow::Result<Endpoint> {
-    if let Ok(document) = load_document_from_value(value.clone()) {
-        if let Some(endpoint) = document.publishers.get(name).cloned() {
-            return Ok(endpoint);
+/// Resolve a route from a config value. When `name` is `Some`, look it up in a
+/// `routes:` document (falling back to a single-route body). When `name` is
+/// `None`, the value must be a single bare route body.
+fn named_route_from_value(
+    value: serde_yaml_ng::Value,
+    name: Option<&str>,
+) -> anyhow::Result<CoreRoute> {
+    let value = unwrap_config_root(value);
+    if let Some(name) = name {
+        if let Ok(document) = load_document_from_value(value.clone()) {
+            if let Some(route) = document.routes.get(name).cloned() {
+                return Ok(route);
+            }
         }
     }
 
-    serde_yaml_ng::from_value(value).with_context(|| {
-        format!(
-            "No publisher named '{name}' found, and the config could not be parsed as a single publisher endpoint"
-        )
+    serde_yaml_ng::from_value(value).with_context(|| match name {
+        Some(name) => format!(
+            "No route named '{name}' found, and the config could not be parsed as a single route"
+        ),
+        None => "config could not be parsed as a single route body".to_string(),
     })
+}
+
+fn load_named_publisher(path: &Path, name: Option<&str>) -> anyhow::Result<Endpoint> {
+    named_publisher_from_value(load_config_value(path)?, name)
+}
+
+/// Resolve a publisher endpoint from a config value. When `name` is `Some`,
+/// look it up in a `publishers:` document (falling back to a single endpoint
+/// body). When `name` is `None`, the value must be a single bare endpoint body.
+fn named_publisher_from_value(
+    value: serde_yaml_ng::Value,
+    name: Option<&str>,
+) -> anyhow::Result<Endpoint> {
+    if let Some(name) = name {
+        if let Ok(document) = load_document_from_value(value.clone()) {
+            if let Some(endpoint) = document.publishers.get(name).cloned() {
+                return Ok(endpoint);
+            }
+        }
+    }
+
+    serde_yaml_ng::from_value(value).with_context(|| match name {
+        Some(name) => format!(
+            "No publisher named '{name}' found, and the config could not be parsed as a single publisher endpoint"
+        ),
+        None => "config could not be parsed as a single endpoint body".to_string(),
+    })
+}
+
+/// Map an optional name from the JS boundary to `None` when missing or empty,
+/// so callers can omit it (or pass `""`) to mean "no name".
+fn normalize_name(name: Option<String>) -> Option<String> {
+    name.filter(|n| !n.is_empty())
+}
+
+/// Generated identity for a route built without an explicit name.
+fn default_route_name() -> String {
+    format!("route-{}", fast_uuid_v7::gen_id_string())
 }
 
 fn load_document_from_value(value: serde_yaml_ng::Value) -> anyhow::Result<ConfigDocument> {

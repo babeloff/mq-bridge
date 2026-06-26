@@ -165,6 +165,7 @@ class KafkaConfig(TypedDict, total=False):
     consumer_options: Optional[List[List[Any]]]
     delayed_ack: bool
     group_id: Optional[str]
+    partitions: Optional[int]
     password: Optional[str]
     producer_options: Optional[List[List[Any]]]
     shared: Optional[bool]

@@ -20,6 +20,28 @@
 It is not only a forwarder. A route can transform, filter, fan out, retry, rate-limit, deduplicate, or turn a request into a response before the message reaches the next system. The core is built on Tokio and keeps the transport details at the edge, so application code can mostly work with `CanonicalMessage`s and handlers.
 
 
+## Language Bindings
+
+`mq-bridge` is a Rust library, but the same engine ships as native bindings for **Python** and **Node.js**. The Tokio runtime, broker I/O, routing, and batching all stay in Rust; the binding is a thin layer for handlers and configuration.
+
+| Language | Package | Install |
+| :--- | :--- | :--- |
+| Rust | [`mq-bridge`](https://crates.io/crates/mq-bridge) | `cargo add mq-bridge` |
+| Python | [`mq-bridge-py`](python/mq-bridge-py/README.md) ([PyPI](https://pypi.org/project/mq-bridge-py/)) | `pip install mq-bridge-py` |
+| Node.js | [`mq-bridge`](node/mq-bridge-node/README.md) ([npm](https://www.npmjs.com/package/mq-bridge)) | `npm install mq-bridge` |
+
+The constructor names are kept aligned across languages, so a config loader reads the same in either binding (Python uses `snake_case`, Node uses `camelCase`):
+
+- `Route.from_file` / `Route.fromFile` — load a route from a YAML/JSON file
+- `Route.from_str` / `Route.fromStr` — load from an in-memory string
+- `Route.from_config` / `Route.fromConfig` — load from a dict / JS object
+- the matching `Publisher.*` constructors build a publisher endpoint
+
+The `name` argument is optional in both: pass it to select one entry from a `routes:`/`publishers:` document, or omit it to treat the config as a single bare route/endpoint body.
+
+The Python binding also holds up well under load: it currently ranks among the top Python frameworks for requests-per-second on the third-party [http-arena.com](https://www.http-arena.com/#sort=rps:-1&q=python) HTTP benchmark. See [the Python analysis notes](python/mq-bridge-py/README.md#analysis) for the local HTTP comparison harness.
+
+
 ## Architecture
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for a detailed overview of the internal design, extensibility, and usage patterns.
@@ -161,7 +183,7 @@ https://github.com/marcomq/mq-bridge-app
 
 `mq-bridge-app` can be used to create and test route and endpoint configurations through a UI. The generated JSON/YAML can then be copied into an application and loaded by the Rust library or the Python bindings.
 
-This does not replace application code or handlers, but it is useful when you want a known-good connection and route shape before pasting the configuration into code. For Python projects, routes and publishers are commonly loaded from JSON/YAML with `Route.from_config`, `Route.from_yaml`, `Publisher.from_config`, or `Publisher.from_yaml`.
+This does not replace application code or handlers, but it is useful when you want a known-good connection and route shape before pasting the configuration into code. For Python and Node projects, routes and publishers are commonly loaded from JSON/YAML with `Route.from_file`/`fromFile`, `Route.from_str`/`fromStr`, `Route.from_config`/`fromConfig`, and the matching `Publisher.*` constructors.
 
 ### Programmatic Handlers
 
