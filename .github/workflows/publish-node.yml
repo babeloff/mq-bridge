@@ -67,6 +67,9 @@ jobs:
         env:
           CARGO_NET_RETRY: "5"
           CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+          # curl's HTTP/2 multiplexing flakes on Windows runners ("[55] Failed
+          # sending data to the peer"); force HTTP/1.1 so fetches are reliable.
+          CARGO_HTTP_MULTIPLEXING: "false"
         run: >-
           npx napi build --platform --release --strip
           --target ${{ matrix.target }}
@@ -129,6 +132,9 @@ jobs:
         env:
           CARGO_NET_RETRY: "5"
           CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+          # curl's HTTP/2 multiplexing flakes on Windows runners ("[55] Failed
+          # sending data to the peer"); force HTTP/1.1 so fetches are reliable.
+          CARGO_HTTP_MULTIPLEXING: "false"
         run: >-
           npx napi build --platform --release --strip
           --target ${{ matrix.target }}
