@@ -94,10 +94,25 @@ impl MessageConsumer for GrpcConsumer {
     }
 
     async fn status(&self) -> crate::traits::EndpointStatus {
+        // Server mode: healthy as long as the embedded server task is still
+        // running. Client mode: a tonic client stream has no cheap liveness
+        // probe, so report healthy and leave verification to the next receive.
+        let (healthy, details) = match &self.inner {
+            GrpcConsumerInner::Server(s) => (
+                !s.shared_server.handle.is_finished(),
+                serde_json::json!({ "mode": "server", "bound_addr": self.bound_addr }),
+            ),
+            GrpcConsumerInner::Client(_) => (true, serde_json::json!({ "mode": "client" })),
+        };
         crate::traits::EndpointStatus {
-            healthy: true,
+            healthy,
             target: self.url.clone(),
-            details: serde_json::json!({ "bound_addr": self.bound_addr }),
+            error: if healthy {
+                None
+            } else {
+                Some("gRPC server task stopped".to_string())
+            },
+            details,
             ..Default::default()
         }
     }

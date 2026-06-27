@@ -1,6 +1,7 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+#[cfg(test)]
 use std::fs;
 use std::future::Future;
 use std::num::NonZeroUsize;
@@ -14,25 +15,26 @@ use ::mq_bridge as core;
 use anyhow::{anyhow, Context};
 use async_trait::async_trait;
 use bytes::Bytes;
+use core::canonical_message::format_message_id;
 use core::endpoints::memory::MemoryConsumer;
-use core::models::{Endpoint, PublisherConfig};
+use core::models::Endpoint;
 use core::traits::{Handler, MessageConsumer, MessageDisposition};
 use core::type_handler::TypeHandler;
 use core::{
     CanonicalMessage, Handled, HandlerError, Publisher as CorePublisher, Route as CoreRoute, Sent,
 };
+use mq_bridge_bindings_common as common;
 use pyo3::conversion::IntoPyObjectExt;
 use pyo3::create_exception;
 use pyo3::exceptions::{PyException, PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyByteArray, PyBytes, PyDict, PyList, PyModule, PyTuple, PyType};
-use serde::de::{
-    DeserializeSeed, Error as DeError, IntoDeserializer, MapAccess, SeqAccess, Visitor,
-};
+use serde::de::{DeserializeSeed, Error as DeError, MapAccess, SeqAccess, Visitor};
 use serde::ser::{Error as SerError, SerializeMap, SerializeSeq};
-use serde::{Deserialize, Serialize, Serializer};
+use serde::{Serialize, Serializer};
+#[cfg(test)]
 use serde_json::Value as JsonValue;
-use tokio::runtime::{Builder, Runtime};
+use tokio::runtime::Runtime;
 use tokio::sync::{oneshot, OwnedSemaphorePermit, Semaphore};
 use tracing::error;
 
@@ -43,20 +45,6 @@ static ACTIVE_ROUTE_NAMES: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 
 create_exception!(mq_bridge, RetryableError, PyException);
 create_exception!(mq_bridge, NonRetryableError, PyException);
-
-#[derive(Debug, Default, Deserialize)]
-struct ConfigDocument {
-    #[serde(default)]
-    routes: HashMap<String, CoreRoute>,
-    #[serde(default)]
-    publishers: PublisherConfig,
-}
-
-#[derive(Debug, Deserialize)]
-struct NamedPublisher {
-    name: String,
-    endpoint: Endpoint,
-}
 
 #[derive(Default)]
 struct RouteRunState {
@@ -408,30 +396,51 @@ struct Route {
 
 #[pymethods]
 impl Route {
+    /// Build a route from a YAML or JSON config file. Accepts a `routes:`
+    /// document, a bare `{name: route}` map, or a single route body. Omit
+    /// `name` (or pass `""`) when the file is a single bare route body.
     #[staticmethod]
-    fn from_yaml(py: Python<'_>, path: &str, name: &str) -> PyResult<Self> {
+    #[pyo3(signature = (path, name=None))]
+    fn from_file(py: Python<'_>, path: &str, name: Option<&str>) -> PyResult<Self> {
         let path = path.to_string();
-        let name = name.to_string();
+        let name = common::normalize_name(name).map(str::to_string);
         py.detach(move || -> anyhow::Result<Self> {
-            let route = load_named_route(Path::new(&path), &name)?;
-            Self::build(route, name)
+            let route = common::load_named_route(Path::new(&path), name.as_deref())?;
+            Self::build(route, name.unwrap_or_else(common::default_route_name))
         })
         .map_err(to_py_runtime_error)
     }
 
-    /// Build a route from an in-memory YAML string. Accepts the same shapes as
-    /// `from_yaml` (a `routes:` document, a bare route map, or a single route).
+    /// Deprecated alias for `from_file`.
     #[staticmethod]
-    fn from_yaml_str(py: Python<'_>, text: &str, name: &str) -> PyResult<Self> {
+    #[pyo3(signature = (path, name=None))]
+    fn from_yaml(py: Python<'_>, path: &str, name: Option<&str>) -> PyResult<Self> {
+        warn_deprecated(py, "Route.from_yaml is deprecated; use Route.from_file")?;
+        Self::from_file(py, path, name)
+    }
+
+    /// Build a route from an in-memory YAML or JSON string. Accepts the same
+    /// shapes as `from_file`. Omit `name` (or pass `""`) when the string is a
+    /// single bare route body.
+    #[staticmethod]
+    #[pyo3(signature = (text, name=None))]
+    fn from_str(py: Python<'_>, text: &str, name: Option<&str>) -> PyResult<Self> {
         let text = text.to_string();
-        let name = name.to_string();
+        let name = common::normalize_name(name).map(str::to_string);
         py.detach(move || -> anyhow::Result<Self> {
-            let value = unwrap_config_root(
-                serde_yaml_ng::from_str(&text).context("failed to parse YAML config")?,
-            );
-            Self::build(named_route_from_value(value, &name)?, name)
+            let value = serde_yaml_ng::from_str(&text).context("failed to parse YAML config")?;
+            let route = common::named_route_from_value(value, name.as_deref())?;
+            Self::build(route, name.unwrap_or_else(common::default_route_name))
         })
         .map_err(to_py_runtime_error)
+    }
+
+    /// Deprecated alias for `from_str`.
+    #[staticmethod]
+    #[pyo3(signature = (text, name=None))]
+    fn from_yaml_str(py: Python<'_>, text: &str, name: Option<&str>) -> PyResult<Self> {
+        warn_deprecated(py, "Route.from_yaml_str is deprecated; use Route.from_str")?;
+        Self::from_str(py, text, name)
     }
 
     /// Build a route from an in-memory mapping (e.g. a Python ``dict``).
@@ -449,16 +458,28 @@ impl Route {
     ///         }}},
     ///         "orders",
     ///     )
+    ///
+    /// Omit ``name`` (or pass ``""``) to treat the mapping as a single bare
+    /// route body, in which case a name is generated automatically::
+    ///
+    ///     Route.from_config({
+    ///         "input": {"memory": {"topic": "orders.in"}},
+    ///         "output": {"response": {}},
+    ///     })
     #[staticmethod]
-    fn from_config(py: Python<'_>, config: &Bound<'_, PyAny>, name: &str) -> PyResult<Self> {
+    #[pyo3(signature = (config, name=None))]
+    fn from_config(
+        py: Python<'_>,
+        config: &Bound<'_, PyAny>,
+        name: Option<&str>,
+    ) -> PyResult<Self> {
         let bytes = python_to_json_bytes(config)?;
-        let name = name.to_string();
+        let name = common::normalize_name(name).map(str::to_string);
         py.detach(move || -> anyhow::Result<Self> {
             let text = std::str::from_utf8(&bytes).context("config is not valid UTF-8")?;
-            let value = unwrap_config_root(
-                serde_yaml_ng::from_str(text).context("failed to parse config mapping")?,
-            );
-            Self::build(named_route_from_value(value, &name)?, name)
+            let value = serde_yaml_ng::from_str(text).context("failed to parse config mapping")?;
+            let route = common::named_route_from_value(value, name.as_deref())?;
+            Self::build(route, name.unwrap_or_else(common::default_route_name))
         })
         .map_err(to_py_runtime_error)
     }
@@ -627,7 +648,7 @@ impl Route {
 impl Route {
     fn build(route: CoreRoute, name: String) -> anyhow::Result<Self> {
         Ok(Self {
-            runtime: Arc::new(build_runtime()?),
+            runtime: Arc::new(common::build_runtime()?),
             route: Arc::new(Mutex::new(route)),
             name,
             run_state: Arc::new(Mutex::new(RouteRunState::default())),
@@ -686,7 +707,7 @@ struct Publisher {
 
 impl Publisher {
     fn build(endpoint: Endpoint) -> anyhow::Result<Self> {
-        let runtime = Arc::new(build_runtime()?);
+        let runtime = Arc::new(common::build_runtime()?);
         let publisher = runtime.block_on(CorePublisher::new(endpoint))?;
         Ok(Self { runtime, publisher })
     }
@@ -694,39 +715,75 @@ impl Publisher {
 
 #[pymethods]
 impl Publisher {
+    /// Build a publisher from a YAML or JSON config file. Accepts a
+    /// `publishers:` document, a bare `{name: endpoint}` map, or a single
+    /// endpoint body. Omit `name` (or pass `""`) for a single bare endpoint.
     #[staticmethod]
-    fn from_yaml(py: Python<'_>, path: &str, name: &str) -> PyResult<Self> {
+    #[pyo3(signature = (path, name=None))]
+    fn from_file(py: Python<'_>, path: &str, name: Option<&str>) -> PyResult<Self> {
         let path = path.to_string();
-        let name = name.to_string();
+        let name = common::normalize_name(name).map(str::to_string);
         py.detach(move || -> anyhow::Result<Self> {
-            Self::build(load_named_publisher(Path::new(&path), &name)?)
+            Self::build(common::load_named_publisher(
+                Path::new(&path),
+                name.as_deref(),
+            )?)
         })
         .map_err(to_py_runtime_error)
     }
 
+    /// Deprecated alias for `from_file`.
     #[staticmethod]
-    fn from_yaml_str(py: Python<'_>, text: &str, name: &str) -> PyResult<Self> {
+    #[pyo3(signature = (path, name=None))]
+    fn from_yaml(py: Python<'_>, path: &str, name: Option<&str>) -> PyResult<Self> {
+        warn_deprecated(
+            py,
+            "Publisher.from_yaml is deprecated; use Publisher.from_file",
+        )?;
+        Self::from_file(py, path, name)
+    }
+
+    /// Build a publisher from an in-memory YAML or JSON string. Omit `name`
+    /// (or pass `""`) when the string is a single bare endpoint body.
+    #[staticmethod]
+    #[pyo3(signature = (text, name=None))]
+    fn from_str(py: Python<'_>, text: &str, name: Option<&str>) -> PyResult<Self> {
         let text = text.to_string();
-        let name = name.to_string();
+        let name = common::normalize_name(name).map(str::to_string);
         py.detach(move || -> anyhow::Result<Self> {
-            let value = unwrap_config_root(
-                serde_yaml_ng::from_str(&text).context("failed to parse YAML config")?,
-            );
-            Self::build(named_publisher_from_value(value, &name)?)
+            let value = serde_yaml_ng::from_str(&text).context("failed to parse YAML config")?;
+            Self::build(common::named_publisher_from_value(value, name.as_deref())?)
         })
         .map_err(to_py_runtime_error)
     }
 
+    /// Deprecated alias for `from_str`.
     #[staticmethod]
-    fn from_config(py: Python<'_>, config: &Bound<'_, PyAny>, name: &str) -> PyResult<Self> {
+    #[pyo3(signature = (text, name=None))]
+    fn from_yaml_str(py: Python<'_>, text: &str, name: Option<&str>) -> PyResult<Self> {
+        warn_deprecated(
+            py,
+            "Publisher.from_yaml_str is deprecated; use Publisher.from_str",
+        )?;
+        Self::from_str(py, text, name)
+    }
+
+    /// Build a publisher from an in-memory mapping. Omit `name` (or pass `""`)
+    /// to treat the mapping as a single bare endpoint body, e.g.
+    /// ``Publisher.from_config({"response": {}})``.
+    #[staticmethod]
+    #[pyo3(signature = (config, name=None))]
+    fn from_config(
+        py: Python<'_>,
+        config: &Bound<'_, PyAny>,
+        name: Option<&str>,
+    ) -> PyResult<Self> {
         let bytes = python_to_json_bytes(config)?;
-        let name = name.to_string();
+        let name = common::normalize_name(name).map(str::to_string);
         py.detach(move || -> anyhow::Result<Self> {
             let text = std::str::from_utf8(&bytes).context("config is not valid UTF-8")?;
-            let value = unwrap_config_root(
-                serde_yaml_ng::from_str(text).context("failed to parse config mapping")?,
-            );
-            Self::build(named_publisher_from_value(value, &name)?)
+            let value = serde_yaml_ng::from_str(text).context("failed to parse config mapping")?;
+            Self::build(common::named_publisher_from_value(value, name.as_deref())?)
         })
         .map_err(to_py_runtime_error)
     }
@@ -826,7 +883,7 @@ impl MemoryDrainer {
         let topic = topic.to_string();
         py.detach(move || -> anyhow::Result<Self> {
             Ok(Self {
-                runtime: Arc::new(build_runtime()?),
+                runtime: Arc::new(common::build_runtime()?),
                 consumer: Arc::new(tokio::sync::Mutex::new(MemoryConsumer::new_local(
                     &topic, capacity,
                 ))),
@@ -890,112 +947,290 @@ impl MemoryDrainer {
     }
 }
 
-fn build_runtime() -> anyhow::Result<Runtime> {
-    Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .context("failed to build Tokio runtime")
+/// A pull-based consumer over any mq-bridge input endpoint.
+///
+/// `poll()` receives a batch of messages but does **not** acknowledge them;
+/// call `commit()` once the messages have been durably handled to ack every
+/// batch returned since the previous commit (advancing offsets / removing them
+/// from the source). This manual-commit model gives at-least-once delivery
+/// across a failed downstream load (e.g. feeding a `dlt` resource). The endpoint
+/// config decides durability (consumer vs subscriber mode), exactly as it does
+/// for a route input.
+///
+/// Relationship to the Rust core: this is a boundary-friendly projection of the
+/// core `MessageConsumer::receive_batch`, which is the low-level primitive. Two
+/// differences are deliberate, both because a Rust commit closure cannot be
+/// handed across the FFI boundary for Python to call later:
+///   - `receive_batch` returns the messages *and* their commit closure together;
+///     `poll()` returns only the messages and keeps the closure on the Rust side,
+///     so committing becomes the separate `commit()` call.
+///   - that closure accepts a per-message disposition vector (ack/nack/reject);
+///     `poll()` + `commit()` only ack the whole batch.
+/// `poll()` additionally layers a `timeout_ms` over `receive_batch` (which has no
+/// timeout of its own). Native Rust code should use `receive_batch` directly — it
+/// is strictly more expressive and needs no deferred-commit state.
+#[pyclass(module = "mq_bridge")]
+struct Consumer {
+    runtime: Arc<Runtime>,
+    // `None` once `close()` has dropped the underlying consumer.
+    consumer: Arc<tokio::sync::Mutex<Option<Box<dyn MessageConsumer>>>>,
+    pending: Arc<Mutex<Vec<(core::traits::BatchCommitFunc, usize)>>>,
+    exhausted: Arc<std::sync::atomic::AtomicBool>,
 }
 
-fn load_config_value(path: &Path) -> anyhow::Result<serde_yaml_ng::Value> {
-    let raw = fs::read_to_string(path)
-        .with_context(|| format!("failed to read YAML config from {}", path.display()))?;
-    let value = serde_yaml_ng::from_str(&raw).context("failed to parse YAML config")?;
-    Ok(unwrap_config_root(value))
+impl Consumer {
+    fn build(name: String, endpoint: Endpoint) -> anyhow::Result<Self> {
+        let runtime = Arc::new(common::build_runtime()?);
+        let consumer = runtime.block_on(core::endpoints::create_consumer_from_route(
+            &name, &endpoint,
+        ))?;
+        Ok(Self {
+            runtime,
+            consumer: Arc::new(tokio::sync::Mutex::new(Some(consumer))),
+            pending: Arc::new(Mutex::new(Vec::new())),
+            exhausted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        })
+    }
+
+    fn lock_pending(
+        &self,
+    ) -> PyResult<std::sync::MutexGuard<'_, Vec<(core::traits::BatchCommitFunc, usize)>>> {
+        self.pending
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("Consumer commit lock poisoned"))
+    }
 }
 
-fn load_named_route(path: &Path, name: &str) -> anyhow::Result<CoreRoute> {
-    named_route_from_value(load_config_value(path)?, name)
-}
+#[pymethods]
+impl Consumer {
+    /// Build a consumer from a YAML or JSON config file. Accepts a
+    /// `consumers:` document entry (with `name`) or a single bare endpoint body.
+    #[staticmethod]
+    #[pyo3(signature = (path, name=None))]
+    fn from_file(py: Python<'_>, path: &str, name: Option<&str>) -> PyResult<Self> {
+        let path = path.to_string();
+        let resolved = common::normalize_name(name).map(str::to_string);
+        py.detach(move || -> anyhow::Result<Self> {
+            let endpoint = common::load_named_consumer(Path::new(&path), resolved.as_deref())?;
+            Self::build(
+                resolved.unwrap_or_else(common::default_route_name),
+                endpoint,
+            )
+        })
+        .map_err(to_py_runtime_error)
+    }
 
-fn named_route_from_value(value: serde_yaml_ng::Value, name: &str) -> anyhow::Result<CoreRoute> {
-    if let Ok(document) = load_document_from_value(value.clone()) {
-        if let Some(route) = document.routes.get(name).cloned() {
-            return Ok(route);
+    /// Build a consumer from an in-memory YAML or JSON string.
+    #[staticmethod]
+    #[pyo3(signature = (text, name=None))]
+    fn from_str(py: Python<'_>, text: &str, name: Option<&str>) -> PyResult<Self> {
+        let text = text.to_string();
+        let resolved = common::normalize_name(name).map(str::to_string);
+        py.detach(move || -> anyhow::Result<Self> {
+            let value = serde_yaml_ng::from_str(&text).context("failed to parse YAML config")?;
+            let endpoint = common::named_consumer_from_value(value, resolved.as_deref())?;
+            Self::build(
+                resolved.unwrap_or_else(common::default_route_name),
+                endpoint,
+            )
+        })
+        .map_err(to_py_runtime_error)
+    }
+
+    /// Build a consumer from an in-memory mapping (e.g. a Python ``dict``).
+    /// Omit ``name`` to treat the mapping as a single bare endpoint body, e.g.
+    /// ``Consumer.from_config({"nats": {"subject": "orders", "url": ...}})``.
+    #[staticmethod]
+    #[pyo3(signature = (config, name=None))]
+    fn from_config(
+        py: Python<'_>,
+        config: &Bound<'_, PyAny>,
+        name: Option<&str>,
+    ) -> PyResult<Self> {
+        let bytes = python_to_json_bytes(config)?;
+        let resolved = common::normalize_name(name).map(str::to_string);
+        py.detach(move || -> anyhow::Result<Self> {
+            let text = std::str::from_utf8(&bytes).context("config is not valid UTF-8")?;
+            let value = serde_yaml_ng::from_str(text).context("failed to parse config mapping")?;
+            let endpoint = common::named_consumer_from_value(value, resolved.as_deref())?;
+            Self::build(
+                resolved.unwrap_or_else(common::default_route_name),
+                endpoint,
+            )
+        })
+        .map_err(to_py_runtime_error)
+    }
+
+    /// Receive up to `max` messages without acknowledging them. Returns an empty
+    /// list if `timeout_ms` milliseconds elapse with nothing received, or if the
+    /// source is exhausted (see `exhausted`). Omit `timeout_ms` to block until a
+    /// message arrives. The returned messages are committed by the next
+    /// `commit()` call.
+    #[pyo3(signature = (max=256, timeout_ms=None))]
+    fn poll(&self, py: Python<'_>, max: usize, timeout_ms: Option<u64>) -> PyResult<Vec<Message>> {
+        let runtime = Arc::clone(&self.runtime);
+        let consumer = Arc::clone(&self.consumer);
+        let exhausted = Arc::clone(&self.exhausted);
+        let max = max.max(1);
+        let outcome = py
+            .detach(move || {
+                run_sync_task(&runtime, async move {
+                    let mut guard = consumer.lock().await;
+                    let consumer = guard
+                        .as_mut()
+                        .ok_or_else(|| anyhow!("consumer is closed"))?;
+                    let recv = consumer.receive_batch(max);
+                    let batch = if let Some(timeout_ms) = timeout_ms {
+                        match tokio::time::timeout(Duration::from_millis(timeout_ms), recv).await {
+                            Ok(result) => result,
+                            Err(_) => return Ok(None),
+                        }
+                    } else {
+                        recv.await
+                    };
+                    match batch {
+                        Ok(batch) => Ok(Some(batch)),
+                        Err(core::errors::ConsumerError::EndOfStream) => {
+                            exhausted.store(true, Ordering::SeqCst);
+                            Ok(None)
+                        }
+                        Err(err) => Err(err.into()),
+                    }
+                })
+            })
+            .map_err(to_py_runtime_error)?;
+
+        let Some(batch) = outcome else {
+            return Ok(Vec::new());
+        };
+        let messages: Vec<Message> = batch.messages.iter().map(Message::from_canonical).collect();
+        let count = batch.messages.len();
+        if count > 0 {
+            self.lock_pending()?.push((batch.commit, count));
+        }
+        Ok(messages)
+    }
+
+    /// Acknowledge every batch returned by `poll()` since the last `commit()`,
+    /// advancing the consumer offset.
+    ///
+    /// Calling this is required, not optional. Without it the offset never
+    /// advances (messages are re-delivered on the next run), most brokers stall
+    /// once their unacknowledged/prefetch window fills, and uncommitted batches
+    /// are held in memory so the process grows unbounded. To retry a failed
+    /// batch, simply don't commit it — it will be redelivered.
+    fn commit(&self, py: Python<'_>) -> PyResult<()> {
+        let commits: Vec<(core::traits::BatchCommitFunc, usize)> =
+            std::mem::take(&mut *self.lock_pending()?);
+        if commits.is_empty() {
+            return Ok(());
+        }
+        let runtime = Arc::clone(&self.runtime);
+        let (err, tail) = py
+            .detach(move || {
+                run_sync_task(&runtime, async move {
+                    let mut iter = commits.into_iter();
+                    while let Some((commit, len)) = iter.next() {
+                        if let Err(err) = commit(vec![MessageDisposition::Ack; len]).await {
+                            // Hand back the batches we never attempted so they can be retried.
+                            return Ok((Some(err), iter.collect::<Vec<_>>()));
+                        }
+                    }
+                    Ok((None, Vec::new()))
+                })
+            })
+            .map_err(to_py_runtime_error)?;
+        if !tail.is_empty() {
+            let mut pending = self.lock_pending()?;
+            let mut restored = tail;
+            restored.append(&mut pending);
+            *pending = restored;
+        }
+        match err {
+            Some(err) => Err(to_py_runtime_error(err)),
+            None => Ok(()),
         }
     }
 
-    serde_yaml_ng::from_value(value).with_context(|| {
-        format!(
-            "No route named '{name}' found, and the config could not be parsed as a single route"
-        )
-    })
-}
-
-fn load_named_publisher(path: &Path, name: &str) -> anyhow::Result<Endpoint> {
-    named_publisher_from_value(load_config_value(path)?, name)
-}
-
-fn named_publisher_from_value(value: serde_yaml_ng::Value, name: &str) -> anyhow::Result<Endpoint> {
-    if let Ok(document) = load_document_from_value(value.clone()) {
-        if let Some(endpoint) = document.publishers.get(name).cloned() {
-            return Ok(endpoint);
-        }
+    /// `True` once the source has signalled end-of-stream (e.g. a fully drained
+    /// file). Streaming brokers never set this.
+    #[getter]
+    fn exhausted(&self) -> bool {
+        self.exhausted.load(Ordering::SeqCst)
     }
 
-    serde_yaml_ng::from_value(value).with_context(|| {
-        format!(
-            "No publisher named '{name}' found, and the config could not be parsed as a single publisher endpoint"
-        )
-    })
-}
-
-fn load_document_from_value(value: serde_yaml_ng::Value) -> anyhow::Result<ConfigDocument> {
-    let section_key = |name: &str| serde_yaml_ng::Value::String(name.to_string());
-    let routes_key = section_key("routes");
-    let publishers_key = section_key("publishers");
-
-    if let Some(map) = value.as_mapping() {
-        if map.contains_key(&routes_key) || map.contains_key(&publishers_key) {
-            let routes = map
-                .get(&routes_key)
-                .map_or_else(
-                    || Ok(HashMap::new()),
-                    |section| serde_yaml_ng::from_value(section.clone()),
-                )
-                .context("failed to parse 'routes' section")?;
-            let publishers = map.get(&publishers_key).map_or_else(
-                || Ok(PublisherConfig::new()),
-                |section| parse_publishers_section(section.clone()),
-            )?;
-            return Ok(ConfigDocument { routes, publishers });
-        }
+    /// Return a status snapshot for the underlying endpoint as a ``dict``:
+    /// ``healthy``, ``target``, optional ``pending`` (broker backlog/lag where
+    /// the transport reports it — e.g. Kafka offset lag, AMQP queue depth, NATS
+    /// JetStream ``num_pending``), optional ``capacity``/``error``, and
+    /// ``details``. ``pending == 0`` is a precise "caught up" signal on those
+    /// transports; it is `null` where the broker exposes no backlog (e.g. core
+    /// NATS, MQTT). The value is a point-in-time snapshot, not a guarantee.
+    fn status(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let runtime = Arc::clone(&self.runtime);
+        let consumer = Arc::clone(&self.consumer);
+        let bytes = py
+            .detach(move || -> anyhow::Result<Vec<u8>> {
+                run_sync_task(&runtime, async move {
+                    let guard = consumer.lock().await;
+                    let consumer = guard
+                        .as_ref()
+                        .ok_or_else(|| anyhow!("consumer is closed"))?;
+                    Ok(serde_json::to_vec(&consumer.status().await)?)
+                })
+            })
+            .map_err(to_py_runtime_error)?;
+        json_bytes_to_python(py, &bytes)
     }
 
-    let routes = serde_yaml_ng::from_value(value).context("failed to parse YAML as a route map")?;
-    Ok(ConfigDocument {
-        routes,
-        publishers: PublisherConfig::new(),
-    })
+    /// Release the underlying consumer connection. Idempotent. After this,
+    /// `poll()` and `status()` raise. Prefer the context-manager form, which
+    /// calls this on exit. GC'd Python has no deterministic drop, so closing
+    /// explicitly is how the broker connection is freed promptly.
+    fn close(&self, py: Python<'_>) -> PyResult<()> {
+        let runtime = Arc::clone(&self.runtime);
+        let consumer = Arc::clone(&self.consumer);
+        py.detach(move || {
+            run_sync_task(&runtime, async move {
+                let taken = consumer.lock().await.take();
+                if let Some(mut consumer) = taken {
+                    consumer.close().await?;
+                }
+                Ok(())
+            })
+        })
+        .map_err(to_py_runtime_error)
+    }
+
+    fn __enter__<'a>(slf: PyRef<'a, Self>) -> PyRef<'a, Self> {
+        slf
+    }
+
+    #[pyo3(signature = (_exc_type=None, _exc_value=None, _traceback=None))]
+    fn __exit__(
+        &self,
+        py: Python<'_>,
+        _exc_type: Option<&Bound<'_, PyAny>>,
+        _exc_value: Option<&Bound<'_, PyAny>>,
+        _traceback: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<bool> {
+        self.close(py)?;
+        Ok(false)
+    }
 }
 
-fn unwrap_config_root(value: serde_yaml_ng::Value) -> serde_yaml_ng::Value {
-    if let Some(map) = value.as_mapping() {
-        let config_key = serde_yaml_ng::Value::String("config".to_string());
-        if let Some(config) = map.get(&config_key) {
-            return config.clone();
-        }
-    }
-    value
-}
-
-fn parse_publishers_section(value: serde_yaml_ng::Value) -> anyhow::Result<PublisherConfig> {
-    match value {
-        serde_yaml_ng::Value::Mapping(_) => {
-            serde_yaml_ng::from_value(value).context("failed to parse 'publishers' section")
-        }
-        serde_yaml_ng::Value::Sequence(_) => {
-            let entries: Vec<NamedPublisher> = serde_yaml_ng::from_value(value)
-                .context("failed to parse 'publishers' array section")?;
-            Ok(entries
-                .into_iter()
-                .map(|entry| (entry.name, entry.endpoint))
-                .collect())
-        }
-        other => Err(anyhow!(
-            "failed to parse 'publishers' section: expected a map or array, got {other:?}"
-        )),
-    }
+/// Emit a Python `DeprecationWarning` from a deprecated constructor alias.
+fn warn_deprecated(py: Python<'_>, message: &str) -> PyResult<()> {
+    // Build the C string at runtime rather than with a `c"..."` literal so the
+    // crate keeps compiling on its MSRV (c-string literals stabilized in 1.77).
+    let message =
+        std::ffi::CString::new(message).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    PyErr::warn(
+        py,
+        &py.get_type::<pyo3::exceptions::PyDeprecationWarning>(),
+        &message,
+        1,
+    )
 }
 
 fn validate_message_id(id: Option<&str>) -> PyResult<()> {
@@ -1006,8 +1241,7 @@ fn validate_message_id(id: Option<&str>) -> PyResult<()> {
 }
 
 fn parse_message_id(id: &str) -> PyResult<u128> {
-    core::canonical_message::deserialize_u128(JsonValue::String(id.to_string()).into_deserializer())
-        .map_err(|err| PyValueError::new_err(format!("invalid message id '{id}': {err}")))
+    core::canonical_message::message_id_from_str(id).map_err(PyValueError::new_err)
 }
 
 fn build_message(
@@ -1052,10 +1286,6 @@ fn json_input_to_canonical(
 ) -> PyResult<CanonicalMessage> {
     validate_message_id(id)?;
     build_message(python_to_json_bytes(data)?, metadata, id)
-}
-
-fn format_message_id(message_id: u128) -> String {
-    fast_uuid_v7::format_uuid(message_id).to_string()
 }
 
 /// Cyclic-GC strategy for the Python handler interpreter.
@@ -1626,6 +1856,7 @@ fn _mq_bridge(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<Message>()?;
     module.add_class::<Route>()?;
     module.add_class::<Publisher>()?;
+    module.add_class::<Consumer>()?;
     module.add_class::<MemoryDrainer>()?;
     module.add("__version__", env!("CARGO_PKG_VERSION"))?;
     module.add_function(wrap_pyfunction!(config_schema, module)?)?;
@@ -1662,7 +1893,7 @@ my_route:
 "#,
         );
 
-        let route = Python::attach(|py| Route::from_yaml(py, &path, "my_route")).unwrap();
+        let route = Python::attach(|py| Route::from_file(py, &path, Some("my_route"))).unwrap();
         assert_eq!(route.name, "my_route");
     }
 
@@ -1679,7 +1910,8 @@ routes:
 "#,
         );
 
-        let route = Python::attach(|py| Route::from_yaml(py, &path, "section_route")).unwrap();
+        let route =
+            Python::attach(|py| Route::from_file(py, &path, Some("section_route"))).unwrap();
         assert_eq!(route.name, "section_route");
     }
 
@@ -1694,8 +1926,23 @@ output:
 "#,
         );
 
-        let route = Python::attach(|py| Route::from_yaml(py, &path, "orders_route")).unwrap();
+        let route = Python::attach(|py| Route::from_file(py, &path, Some("orders_route"))).unwrap();
         assert_eq!(route.name, "orders_route");
+    }
+
+    #[test]
+    fn test_route_from_yaml_without_name_parses_single_route() {
+        let path = write_yaml(
+            r#"
+input:
+  memory: { topic: "nameless-in", capacity: 8 }
+output:
+  memory: { topic: "nameless-out", capacity: 8 }
+"#,
+        );
+
+        let route = Python::attach(|py| Route::from_file(py, &path, None)).unwrap();
+        assert!(route.name.starts_with("route-"));
     }
 
     #[test]
@@ -1708,7 +1955,8 @@ publishers:
 "#,
         );
 
-        let _publisher = Python::attach(|py| Publisher::from_yaml(py, &path, "echo")).unwrap();
+        let _publisher =
+            Python::attach(|py| Publisher::from_file(py, &path, Some("echo"))).unwrap();
     }
 
     #[test]
@@ -1722,7 +1970,7 @@ memory:
         );
 
         let _publisher =
-            Python::attach(|py| Publisher::from_yaml(py, &path, "orders_publisher")).unwrap();
+            Python::attach(|py| Publisher::from_file(py, &path, Some("orders_publisher"))).unwrap();
     }
 
     #[test]
@@ -1763,7 +2011,8 @@ memory:
         );
 
         let document =
-            load_document_from_value(load_config_value(Path::new(&path)).unwrap()).unwrap();
+            common::load_document_from_value(common::load_config_value(Path::new(&path)).unwrap())
+                .unwrap();
         assert!(document.routes.contains_key("orders_route"));
         assert!(document.publishers.contains_key("incoming"));
     }
@@ -1936,7 +2185,7 @@ routes:
         );
 
         let route = Python::attach(|py| {
-            Py::new(py, Route::from_yaml(py, &path, "raw_route").unwrap()).unwrap()
+            Py::new(py, Route::from_file(py, &path, Some("raw_route")).unwrap()).unwrap()
         });
         Python::attach(|py| {
             let module = PyModule::from_code(
@@ -1965,7 +2214,11 @@ routes:
         );
 
         let route = Python::attach(|py| {
-            Py::new(py, Route::from_yaml(py, &path, "typed_route").unwrap()).unwrap()
+            Py::new(
+                py,
+                Route::from_file(py, &path, Some("typed_route")).unwrap(),
+            )
+            .unwrap()
         });
         Python::attach(|py| {
             let module = PyModule::from_code(
@@ -2099,7 +2352,7 @@ publishers:
 "#,
         );
 
-        let publisher = Python::attach(|py| Publisher::from_yaml(py, &path, "echo")).unwrap();
+        let publisher = Python::attach(|py| Publisher::from_file(py, &path, Some("echo"))).unwrap();
         Python::attach(|py| {
             let bytes_arg = PyBytes::new(py, b"hello");
             publisher
@@ -2143,7 +2396,7 @@ publishers:
 "#,
         );
 
-        let publisher = Python::attach(|py| Publisher::from_yaml(py, &path, "echo")).unwrap();
+        let publisher = Python::attach(|py| Publisher::from_file(py, &path, Some("echo"))).unwrap();
         Python::attach(|py| {
             let data = PyDict::new(py);
             data.set_item("order_id", 42).unwrap();
@@ -2202,8 +2455,9 @@ routes:
 "#,
         );
 
-        let route =
-            Arc::new(Python::attach(|py| Route::from_yaml(py, &path, "stoppable_route")).unwrap());
+        let route = Arc::new(
+            Python::attach(|py| Route::from_file(py, &path, Some("stoppable_route"))).unwrap(),
+        );
         let run_route = Arc::clone(&route);
         let thread = std::thread::spawn(move || {
             Python::attach(|py| run_route.run(py)).unwrap();
@@ -2227,9 +2481,11 @@ routes:
 "#,
         );
 
-        let first =
-            Arc::new(Python::attach(|py| Route::from_yaml(py, &path, "shared_route")).unwrap());
-        let second = Python::attach(|py| Route::from_yaml(py, &path, "shared_route")).unwrap();
+        let first = Arc::new(
+            Python::attach(|py| Route::from_file(py, &path, Some("shared_route"))).unwrap(),
+        );
+        let second =
+            Python::attach(|py| Route::from_file(py, &path, Some("shared_route"))).unwrap();
 
         let run_route = Arc::clone(&first);
         let thread = std::thread::spawn(move || {

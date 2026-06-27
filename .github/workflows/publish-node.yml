@@ -10,11 +10,12 @@ name: Publish Node Package
 # RHEL 9 (glibc 2.34), Debian 11/12 and Ubuntu 20.04+ — covering the priority
 # server targets. macOS/Windows build natively.
 #
-# Auth: token-or-OIDC. If the `NPM_TOKEN` secret is set it is used (needed for the
-# one-time bootstrap that creates the 5 platform packages, since npm has no
-# pending-publisher concept). Once all six packages exist and trusted publishing
-# is configured for them, remove the secret and publishing continues via OIDC
-# (id-token) with provenance — no token.
+# Auth: OIDC trusted publishing. The one-time bootstrap (which used an NPM_TOKEN
+# secret to create the 5 platform packages, since npm has no pending-publisher
+# concept) is done; all six packages exist with trusted publishing configured, so
+# publishing runs via OIDC (id-token) with provenance — no token. We deliberately
+# do NOT read NPM_TOKEN: a present-but-expired secret would be sent to the registry
+# and 401 instead of falling back to OIDC, so the credential is left out entirely.
 
 on:
   release:
@@ -67,6 +68,9 @@ jobs:
         env:
           CARGO_NET_RETRY: "5"
           CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+          # curl's HTTP/2 multiplexing flakes on Windows runners ("[55] Failed
+          # sending data to the peer"); force HTTP/1.1 so fetches are reliable.
+          CARGO_HTTP_MULTIPLEXING: "false"
         run: >-
           npx napi build --platform --release --strip
           --target ${{ matrix.target }}
@@ -129,6 +133,9 @@ jobs:
         env:
           CARGO_NET_RETRY: "5"
           CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+          # curl's HTTP/2 multiplexing flakes on Windows runners ("[55] Failed
+          # sending data to the peer"); force HTTP/1.1 so fetches are reliable.
+          CARGO_HTTP_MULTIPLEXING: "false"
         run: >-
           npx napi build --platform --release --strip
           --target ${{ matrix.target }}
@@ -220,8 +227,7 @@ jobs:
       - name: Publish platform packages and root
         working-directory: node/mq-bridge-node
         env:
-          # Empty when the secret is unset -> npm falls back to OIDC.
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          # No NODE_AUTH_TOKEN: publishing is OIDC-only (trusted publishing).
           NPM_CONFIG_PROVENANCE: "true"
         run: |
           set -e

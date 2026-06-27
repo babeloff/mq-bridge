@@ -18,10 +18,10 @@ async-trait.workspace = true
 bytes = { workspace = true, features = ["serde"] }
 fast-uuid-v7.workspace = true
 mq-bridge = { path = "../.." }
+mq-bridge-bindings-common = { path = "../../bindings-common" }
 napi = { version = "3", features = ["serde-json", "async"] }
 napi-derive = "3"
 schemars = { version = "1.2", optional = true }
-serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 serde_yaml_ng.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "sync"] }

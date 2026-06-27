@@ -1,0 +1,19 @@
+[package]
+name = "mq-bridge-bindings-common"
+version.workspace = true
+edition = "2021"
+publish = false
+description = "Shared config-loading and message helpers for the mq-bridge Python and Node bindings"
+license = "MIT"
+repository = "https://github.com/marcomq/mq-bridge"
+
+[lib]
+doctest = false
+
+[dependencies]
+anyhow.workspace = true
+fast-uuid-v7.workspace = true
+mq-bridge = { path = "..", default-features = false }
+serde = { workspace = true, features = ["derive"] }
+serde_yaml_ng.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread"] }

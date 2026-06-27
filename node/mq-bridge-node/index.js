@@ -57,16 +57,26 @@ class Publisher {
     this._native = nativePublisher;
   }
 
-  static fromYaml(path, name) {
-    return new Publisher(native.Publisher.fromYaml(path, name));
+  static fromFile(path, name) {
+    return new Publisher(native.Publisher.fromFile(path, name));
   }
 
-  static fromYamlStr(text, name) {
-    return new Publisher(native.Publisher.fromYamlStr(text, name));
+  static fromStr(text, name) {
+    return new Publisher(native.Publisher.fromStr(text, name));
   }
 
   static fromConfig(config, name) {
     return new Publisher(native.Publisher.fromConfig(config, name));
+  }
+
+  /** @deprecated Use {@link Publisher.fromFile} instead. */
+  static fromYaml(path, name) {
+    return new Publisher(native.Publisher.fromFile(path, name));
+  }
+
+  /** @deprecated Use {@link Publisher.fromStr} instead. */
+  static fromYamlStr(text, name) {
+    return new Publisher(native.Publisher.fromStr(text, name));
   }
 
   send(message) {
@@ -86,21 +96,70 @@ class Publisher {
   }
 }
 
+class Consumer {
+  constructor(nativeConsumer) {
+    this._native = nativeConsumer;
+  }
+
+  static fromFile(path, name) {
+    return new Consumer(native.Consumer.fromFile(path, name));
+  }
+
+  static fromStr(text, name) {
+    return new Consumer(native.Consumer.fromStr(text, name));
+  }
+
+  static fromConfig(config, name) {
+    return new Consumer(native.Consumer.fromConfig(config, name));
+  }
+
+  async poll(max, timeoutMs) {
+    const messages = await this._native.poll(max, timeoutMs);
+    return messages.map((message) => Message._fromNative(message));
+  }
+
+  commit() {
+    return this._native.commit();
+  }
+
+  status() {
+    return this._native.status();
+  }
+
+  close() {
+    return this._native.close();
+  }
+
+  get exhausted() {
+    return this._native.exhausted;
+  }
+}
+
 class Route {
   constructor(nativeRoute) {
     this._native = nativeRoute;
   }
 
-  static fromYaml(path, name) {
-    return new Route(native.Route.fromYaml(path, name));
+  static fromFile(path, name) {
+    return new Route(native.Route.fromFile(path, name));
   }
 
-  static fromYamlStr(text, name) {
-    return new Route(native.Route.fromYamlStr(text, name));
+  static fromStr(text, name) {
+    return new Route(native.Route.fromStr(text, name));
   }
 
   static fromConfig(config, name) {
     return new Route(native.Route.fromConfig(config, name));
+  }
+
+  /** @deprecated Use {@link Route.fromFile} instead. */
+  static fromYaml(path, name) {
+    return new Route(native.Route.fromFile(path, name));
+  }
+
+  /** @deprecated Use {@link Route.fromStr} instead. */
+  static fromYamlStr(text, name) {
+    return new Route(native.Route.fromStr(text, name));
   }
 
   withHandler(handler) {
@@ -148,6 +207,7 @@ function configSchema() {
 module.exports = {
   Message,
   Publisher,
+  Consumer,
   Route,
   configSchema,
   version: native.VERSION,

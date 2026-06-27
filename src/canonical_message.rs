@@ -69,6 +69,21 @@ pub(crate) fn u128_from_json(val: &serde_json::Value) -> Result<u128, String> {
     Err("Invalid u128 format".to_string())
 }
 
+/// Parse a message id from a string, accepting the same formats as the JSON
+/// deserializer: a UUID string, a `0x`-prefixed hex literal, or a decimal
+/// integer. Used by the language bindings so id parsing stays identical across
+/// Rust, Python, and Node.
+pub fn message_id_from_str(id: &str) -> Result<u128, String> {
+    u128_from_json(&serde_json::Value::String(id.to_string()))
+        .map_err(|err| format!("invalid message id '{id}': {err}"))
+}
+
+/// Format a u128 message id as a canonical UUID string (the inverse of
+/// [`message_id_from_str`] for UUID-shaped ids).
+pub fn format_message_id(id: u128) -> String {
+    fast_uuid_v7::format_uuid(id).to_string()
+}
+
 impl CanonicalMessage {
     pub fn new(payload: Vec<u8>, message_id: Option<u128>) -> Self {
         Self {
@@ -316,6 +331,24 @@ mod tests {
         let msg = CanonicalMessage::from_json(json!({ "_id": { "$oid": oid } })).unwrap();
         let expected = u128::from_str_radix(oid, 16).unwrap();
         assert_eq!(msg.message_id, expected);
+    }
+
+    #[test]
+    fn test_message_id_from_str_helper() {
+        // The string helper the bindings call accepts the same formats as the
+        // JSON path: UUID, 0x-hex, and decimal.
+        let uuid = "550e8400-e29b-41d4-a716-446655440000";
+        assert_eq!(
+            message_id_from_str(uuid).unwrap(),
+            113059749145936325402354257176981405696
+        );
+        assert_eq!(message_id_from_str("0xFF").unwrap(), 255);
+        assert_eq!(message_id_from_str("100").unwrap(), 100);
+        assert!(message_id_from_str("not-an-id").is_err());
+
+        // A UUID id round-trips through format_message_id unchanged.
+        let id = message_id_from_str(uuid).unwrap();
+        assert_eq!(format_message_id(id), uuid);
     }
 
     #[test]

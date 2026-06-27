@@ -278,6 +278,21 @@ pub trait MessageConsumer: Send + Sync {
             ..Default::default()
         }
     }
+
+    /// Releases this consumer's broker-side resources. The default awaits
+    /// `on_disconnect_hook()` if one is present; dropping the consumer afterwards
+    /// frees the underlying connection.
+    ///
+    /// Native Rust code rarely calls this directly — scope-based `Drop` already
+    /// cleans up. It exists mainly so the language bindings can expose an explicit
+    /// `close()`, since GC'd hosts (Python/Node) have no deterministic drop point.
+    async fn close(&mut self) -> anyhow::Result<()> {
+        if let Some(hook) = self.on_disconnect_hook() {
+            hook.await?;
+        }
+        Ok(())
+    }
+
     fn as_any(&self) -> &dyn Any;
 }
 

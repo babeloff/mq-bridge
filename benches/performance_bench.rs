@@ -190,7 +190,7 @@ pub mod kafka_helper {
             group_id: Some("perf_test_group_kafka".to_string()),
             topic: Some(topic.to_string()),
             producer_options: Some(vec![
-                ("queue.buffering.max.ms".to_string(), "50".to_string()), // Linger for 50ms to batch messages
+                ("queue.buffering.max.ms".to_string(), "1".to_string()), // Small linger; send_batch already enqueues a burst
                 ("acks".to_string(), "1".to_string()), // Wait for leader ack, a good balance
                 ("compression.type".to_string(), "snappy".to_string()), // Use snappy compression
             ]),

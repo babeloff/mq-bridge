@@ -88,6 +88,39 @@ async fn run_service_ack_once(mut consumer: Box<dyn MessageConsumer>) {
     }
 }
 
+/// Send a NATS request-reply request, retrying on transient "no responders".
+///
+/// The responder's subscription interest is registered on its own connection;
+/// at broker startup it can briefly be invisible to the requester's separate
+/// connection, yielding a 503 "no responders". A 503 means the request reached
+/// nobody, so retrying is safe — the responder still replies to the first
+/// request that lands.
+#[cfg(feature = "nats")]
+async fn nats_request_with_retry(
+    publisher: &mq_bridge::endpoints::nats::NatsPublisher,
+    payload: &[u8],
+) -> mq_bridge::traits::Sent {
+    // Retry "no responders" until a generous deadline rather than a fixed attempt
+    // count, so the request-reply tests absorb slower NATS or responder startup.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let msg = CanonicalMessage::new(payload.to_vec(), None);
+        match tokio::time::timeout(std::time::Duration::from_secs(5), publisher.send(msg))
+            .await
+            .expect("Timed out waiting for NATS request response")
+        {
+            Ok(sent) => return sent,
+            Err(e) if e.to_string().contains("no responders") => {
+                if std::time::Instant::now() >= deadline {
+                    panic!("NATS request kept getting 'no responders' until deadline: {e:?}");
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+            Err(e) => panic!("NATS request failed: {e:?}"),
+        }
+    }
+}
+
 #[cfg(feature = "kafka")]
 pub async fn test_kafka_request_reply() {
     use mq_bridge::endpoints::kafka::{KafkaConsumer, KafkaPublisher};
@@ -336,11 +369,7 @@ pub async fn test_nats_request_reply() {
         service_ready_rx.await.unwrap();
 
         // 4. Send the request and check the response
-        let msg = CanonicalMessage::new(b"ping".to_vec(), None);
-        let result = tokio::time::timeout(std::time::Duration::from_secs(5), publisher.send(msg))
-            .await
-            .expect("Timed out waiting for NATS request response")
-            .unwrap();
+        let result = nats_request_with_retry(&publisher, b"ping").await;
 
         match result {
             Sent::Response(resp) => {
@@ -391,11 +420,7 @@ pub async fn test_nats_core_request_reply() {
         });
         service_ready_rx.await.unwrap();
 
-        let msg = CanonicalMessage::new(b"ping".to_vec(), None);
-        let result = tokio::time::timeout(std::time::Duration::from_secs(5), publisher.send(msg))
-            .await
-            .expect("Timed out waiting for NATS Core request response")
-            .unwrap();
+        let result = nats_request_with_retry(&publisher, b"ping").await;
 
         match result {
             Sent::Response(resp) => {

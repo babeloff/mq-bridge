@@ -1,24 +1,25 @@
 use std::collections::{HashMap, HashSet};
-use std::fs;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
+use std::time::Duration;
 
 use ::mq_bridge as core;
 use anyhow::Context;
 use async_trait::async_trait;
-use core::models::{Endpoint, PublisherConfig};
-use core::traits::Handler;
+use core::models::Endpoint;
+use core::traits::{BatchCommitFunc, Handler, MessageConsumer, MessageDisposition};
 use core::type_handler::TypeHandler;
 use core::{
     CanonicalMessage, Handled, HandlerError, Publisher as CorePublisher, Route as CoreRoute, Sent,
 };
+use mq_bridge_bindings_common as common;
 use napi::bindgen_prelude::*;
 use napi::threadsafe_function::ThreadsafeFunction;
 use napi_derive::napi;
-use serde::de::IntoDeserializer;
 use serde_json::Value as JsonValue;
-use tokio::runtime::{Builder, Runtime};
+use tokio::runtime::Runtime;
 use tokio::sync::oneshot;
 
 #[napi(js_name = "version")]
@@ -45,7 +46,9 @@ impl NativeMessage {
         Self {
             payload: message.payload.to_vec().into(),
             metadata: Some(message.metadata.clone()),
-            id: Some(format_message_id(message.message_id)),
+            id: Some(core::canonical_message::format_message_id(
+                message.message_id,
+            )),
         }
     }
 
@@ -183,36 +186,56 @@ struct RouteRunState {
 
 #[napi]
 impl Route {
+    /// Build a route from a YAML or JSON config file. Accepts a `routes:`
+    /// document, a bare `{name: route}` map, or a single route body. Omit
+    /// `name` (or pass `""`) when the file is a single bare route body.
     #[napi(factory)]
-    pub fn from_yaml(path: String, name: String) -> Result<Self> {
-        Self::build(
-            load_named_route(Path::new(&path), &name).map_err(to_napi_error)?,
-            name,
-        )
+    pub fn from_file(path: String, name: Option<String>) -> Result<Self> {
+        let name = common::normalize_name(name.as_deref()).map(str::to_string);
+        let route =
+            common::load_named_route(Path::new(&path), name.as_deref()).map_err(to_napi_error)?;
+        Self::build(route, name.unwrap_or_else(common::default_route_name))
     }
 
+    /// Deprecated alias for `from_file`.
     #[napi(factory)]
-    pub fn from_yaml_str(text: String, name: String) -> Result<Self> {
-        let value = unwrap_config_root(
-            serde_yaml_ng::from_str(&text)
-                .context("failed to parse YAML config")
-                .map_err(to_napi_error)?,
-        );
-        Self::build(
-            load_route_from_value(value, &name).map_err(to_napi_error)?,
-            name,
-        )
+    pub fn from_yaml(path: String, name: Option<String>) -> Result<Self> {
+        Self::from_file(path, name)
     }
 
+    /// Build a route from an in-memory YAML or JSON string. Accepts the same
+    /// shapes as `from_file`. Omit `name` (or pass `""`) when the string is a
+    /// single bare route body.
     #[napi(factory)]
-    pub fn from_config(config: JsonValue, name: String) -> Result<Self> {
+    pub fn from_str(text: String, name: Option<String>) -> Result<Self> {
+        let name = common::normalize_name(name.as_deref()).map(str::to_string);
+        let value = serde_yaml_ng::from_str(&text)
+            .context("failed to parse YAML config")
+            .map_err(to_napi_error)?;
+        let route =
+            common::named_route_from_value(value, name.as_deref()).map_err(to_napi_error)?;
+        Self::build(route, name.unwrap_or_else(common::default_route_name))
+    }
+
+    /// Deprecated alias for `from_str`.
+    #[napi(factory)]
+    pub fn from_yaml_str(text: String, name: Option<String>) -> Result<Self> {
+        Self::from_str(text, name)
+    }
+
+    /// Build a route from an in-memory mapping (e.g. a JS object). Accepts a
+    /// `routes:` document, a bare `{name: route}` map, or a single route body.
+    /// Omit `name` (or pass `""`) to treat the mapping as a single bare route
+    /// body, in which case a name is generated automatically.
+    #[napi(factory)]
+    pub fn from_config(config: JsonValue, name: Option<String>) -> Result<Self> {
+        let name = common::normalize_name(name.as_deref()).map(str::to_string);
         let value = serde_yaml_ng::to_value(config)
             .context("failed to convert config mapping")
             .map_err(to_napi_error)?;
-        Self::build(
-            load_route_from_value(unwrap_config_root(value), &name).map_err(to_napi_error)?,
-            name,
-        )
+        let route =
+            common::named_route_from_value(value, name.as_deref()).map_err(to_napi_error)?;
+        Self::build(route, name.unwrap_or_else(common::default_route_name))
     }
 
     #[napi]
@@ -341,7 +364,7 @@ impl Route {
 impl Route {
     fn build(route: CoreRoute, name: String) -> Result<Self> {
         Ok(Self {
-            runtime: Arc::new(build_runtime().map_err(to_napi_error)?),
+            runtime: Arc::new(common::build_runtime().map_err(to_napi_error)?),
             route: Arc::new(Mutex::new(route)),
             name,
             run_state: Arc::new(Mutex::new(RouteRunState::default())),
@@ -398,29 +421,47 @@ pub struct Publisher {
 
 #[napi]
 impl Publisher {
+    /// Build a publisher endpoint from a YAML or JSON config file. Omit `name`
+    /// (or pass `""`) when the file is a single bare endpoint body.
     #[napi(factory)]
-    pub fn from_yaml(path: String, name: String) -> Result<Self> {
-        Self::build(load_named_publisher(Path::new(&path), &name).map_err(to_napi_error)?)
+    pub fn from_file(path: String, name: Option<String>) -> Result<Self> {
+        let name = common::normalize_name(name.as_deref());
+        Self::build(common::load_named_publisher(Path::new(&path), name).map_err(to_napi_error)?)
     }
 
+    /// Deprecated alias for `from_file`.
     #[napi(factory)]
-    pub fn from_yaml_str(text: String, name: String) -> Result<Self> {
-        let value = unwrap_config_root(
-            serde_yaml_ng::from_str(&text)
-                .context("failed to parse YAML config")
-                .map_err(to_napi_error)?,
-        );
-        Self::build(named_publisher_from_value(value, &name).map_err(to_napi_error)?)
+    pub fn from_yaml(path: String, name: Option<String>) -> Result<Self> {
+        Self::from_file(path, name)
     }
 
+    /// Build a publisher endpoint from an in-memory YAML or JSON string. Omit
+    /// `name` (or pass `""`) when the string is a single bare endpoint body.
     #[napi(factory)]
-    pub fn from_config(config: JsonValue, name: String) -> Result<Self> {
+    pub fn from_str(text: String, name: Option<String>) -> Result<Self> {
+        let name = common::normalize_name(name.as_deref());
+        let value = serde_yaml_ng::from_str(&text)
+            .context("failed to parse YAML config")
+            .map_err(to_napi_error)?;
+        Self::build(common::named_publisher_from_value(value, name).map_err(to_napi_error)?)
+    }
+
+    /// Deprecated alias for `from_str`.
+    #[napi(factory)]
+    pub fn from_yaml_str(text: String, name: Option<String>) -> Result<Self> {
+        Self::from_str(text, name)
+    }
+
+    /// Build a publisher endpoint from an in-memory mapping (e.g. a JS object).
+    /// Omit `name` (or pass `""`) to treat the mapping as a single bare endpoint
+    /// body.
+    #[napi(factory)]
+    pub fn from_config(config: JsonValue, name: Option<String>) -> Result<Self> {
+        let name = common::normalize_name(name.as_deref());
         let value = serde_yaml_ng::to_value(config)
             .context("failed to convert config mapping")
             .map_err(to_napi_error)?;
-        Self::build(
-            named_publisher_from_value(unwrap_config_root(value), &name).map_err(to_napi_error)?,
-        )
+        Self::build(common::named_publisher_from_value(value, name).map_err(to_napi_error)?)
     }
 
     #[napi]
@@ -458,7 +499,7 @@ impl Publisher {
 
 impl Publisher {
     fn build(endpoint: Endpoint) -> Result<Self> {
-        let runtime = Arc::new(build_runtime().map_err(to_napi_error)?);
+        let runtime = Arc::new(common::build_runtime().map_err(to_napi_error)?);
         let publisher = runtime
             .block_on(CorePublisher::new(endpoint))
             .map_err(to_napi_error)?;
@@ -495,114 +536,238 @@ impl Publisher {
     }
 }
 
-fn build_runtime() -> anyhow::Result<Runtime> {
-    Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .context("failed to build Tokio runtime")
+/// A pull-based consumer over any mq-bridge input endpoint.
+///
+/// `poll()` receives a batch of messages but does **not** acknowledge them;
+/// call `commit()` once they have been durably handled to ack every batch
+/// returned since the previous commit (advancing offsets / removing them from
+/// the source). This manual-commit model gives at-least-once delivery across a
+/// failed downstream load. The endpoint config decides durability (consumer vs
+/// subscriber mode), exactly as it does for a route input.
+///
+/// Relationship to the Rust core: this is a boundary-friendly projection of the
+/// core `MessageConsumer::receive_batch`, which is the low-level primitive. Two
+/// differences are deliberate, both because a Rust commit closure cannot be
+/// handed across the FFI boundary for JS to call later:
+///   - `receive_batch` returns the messages *and* their commit closure together;
+///     `poll()` returns only the messages and keeps the closure on the Rust side,
+///     so committing becomes the separate `commit()` call.
+///   - that closure accepts a per-message disposition vector (ack/nack/reject);
+///     `poll()` + `commit()` only ack the whole batch.
+/// `poll()` additionally layers a `timeoutMs` over `receive_batch` (which has no
+/// timeout of its own). Native Rust code should use `receive_batch` directly — it
+/// is strictly more expressive and needs no deferred-commit state.
+#[napi]
+pub struct Consumer {
+    runtime: Arc<Runtime>,
+    // `None` once `close()` has dropped the underlying consumer.
+    consumer: Arc<tokio::sync::Mutex<Option<Box<dyn MessageConsumer>>>>,
+    pending: Arc<Mutex<Vec<(BatchCommitFunc, usize)>>>,
+    exhausted: Arc<AtomicBool>,
 }
 
-fn load_config_value(path: &Path) -> anyhow::Result<serde_yaml_ng::Value> {
-    let raw = fs::read_to_string(path)
-        .with_context(|| format!("failed to read config '{}'", path.display()))?;
-    serde_yaml_ng::from_str(&raw).context("failed to parse YAML config")
-}
-
-fn load_named_route(path: &Path, name: &str) -> anyhow::Result<CoreRoute> {
-    load_route_from_value(load_config_value(path)?, name)
-}
-
-fn load_route_from_value(value: serde_yaml_ng::Value, name: &str) -> anyhow::Result<CoreRoute> {
-    let config = unwrap_config_root(value);
-    let document = load_document_from_value(config)?;
-    let route = document
-        .routes
-        .get(name)
-        .cloned()
-        .ok_or_else(|| anyhow::anyhow!("route '{name}' not found in config"))?;
-    route
-        .try_into()
-        .with_context(|| format!("failed to build route '{name}'"))
-}
-
-fn load_named_publisher(path: &Path, name: &str) -> anyhow::Result<Endpoint> {
-    named_publisher_from_value(load_config_value(path)?, name)
-}
-
-fn named_publisher_from_value(value: serde_yaml_ng::Value, name: &str) -> anyhow::Result<Endpoint> {
-    if let Ok(document) = load_document_from_value(value.clone()) {
-        if let Some(endpoint) = document.publishers.get(name).cloned() {
-            return Ok(endpoint);
-        }
-    }
-
-    serde_yaml_ng::from_value(value).with_context(|| {
-        format!(
-            "No publisher named '{name}' found, and the config could not be parsed as a single publisher endpoint"
+#[napi]
+impl Consumer {
+    /// Build a consumer from a YAML or JSON config file. Accepts a `consumers:`
+    /// document entry (with `name`) or a single bare endpoint body.
+    #[napi(factory)]
+    pub fn from_file(path: String, name: Option<String>) -> Result<Self> {
+        let resolved = common::normalize_name(name.as_deref()).map(str::to_string);
+        let endpoint = common::load_named_consumer(Path::new(&path), resolved.as_deref())
+            .map_err(to_napi_error)?;
+        Self::build(
+            resolved.unwrap_or_else(common::default_route_name),
+            endpoint,
         )
-    })
-}
+    }
 
-fn load_document_from_value(value: serde_yaml_ng::Value) -> anyhow::Result<ConfigDocument> {
-    let section_key = |name: &str| serde_yaml_ng::Value::String(name.to_string());
-    let routes_key = section_key("routes");
-    let publishers_key = section_key("publishers");
+    /// Build a consumer from an in-memory YAML or JSON string.
+    #[napi(factory)]
+    pub fn from_str(text: String, name: Option<String>) -> Result<Self> {
+        let resolved = common::normalize_name(name.as_deref()).map(str::to_string);
+        let value = serde_yaml_ng::from_str(&text)
+            .context("failed to parse YAML config")
+            .map_err(to_napi_error)?;
+        let endpoint =
+            common::named_consumer_from_value(value, resolved.as_deref()).map_err(to_napi_error)?;
+        Self::build(
+            resolved.unwrap_or_else(common::default_route_name),
+            endpoint,
+        )
+    }
 
-    if let Some(map) = value.as_mapping() {
-        if map.contains_key(&routes_key) || map.contains_key(&publishers_key) {
-            let routes = map
-                .get(&routes_key)
-                .map_or_else(
-                    || Ok(HashMap::new()),
-                    |section| serde_yaml_ng::from_value(section.clone()),
-                )
-                .context("failed to parse 'routes' section")?;
-            let publishers = map.get(&publishers_key).map_or_else(
-                || Ok(PublisherConfig::new()),
-                |section| parse_publishers_section(section.clone()),
-            )?;
-            return Ok(ConfigDocument { routes, publishers });
+    /// Build a consumer from an in-memory mapping (e.g. a JS object). Omit `name`
+    /// to treat the mapping as a single bare endpoint body.
+    #[napi(factory)]
+    pub fn from_config(config: JsonValue, name: Option<String>) -> Result<Self> {
+        let resolved = common::normalize_name(name.as_deref()).map(str::to_string);
+        let value = serde_yaml_ng::to_value(config)
+            .context("failed to convert config mapping")
+            .map_err(to_napi_error)?;
+        let endpoint =
+            common::named_consumer_from_value(value, resolved.as_deref()).map_err(to_napi_error)?;
+        Self::build(
+            resolved.unwrap_or_else(common::default_route_name),
+            endpoint,
+        )
+    }
+
+    /// Receive up to `max` messages without acking. Resolves to an empty array
+    /// if `timeoutMs` milliseconds elapse with nothing received, or the source is
+    /// exhausted (see `exhausted`). Omit `timeoutMs` to block until a message
+    /// arrives. Acked by the next `commit()`.
+    #[napi]
+    pub async fn poll(
+        &self,
+        max: Option<u32>,
+        timeout_ms: Option<u32>,
+    ) -> Result<Vec<NativeMessage>> {
+        let consumer = Arc::clone(&self.consumer);
+        let exhausted = Arc::clone(&self.exhausted);
+        let max = max.unwrap_or(256).max(1) as usize;
+        let handle = self.runtime.spawn(async move {
+            let mut guard = consumer.lock().await;
+            let consumer = guard
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("consumer is closed"))?;
+            let recv = consumer.receive_batch(max);
+            let batch = if let Some(timeout_ms) = timeout_ms {
+                match tokio::time::timeout(Duration::from_millis(timeout_ms as u64), recv).await {
+                    Ok(result) => result,
+                    Err(_) => return Ok(None),
+                }
+            } else {
+                recv.await
+            };
+            match batch {
+                Ok(batch) => Ok(Some(batch)),
+                Err(core::errors::ConsumerError::EndOfStream) => {
+                    exhausted.store(true, Ordering::SeqCst);
+                    Ok(None)
+                }
+                Err(err) => Err(anyhow::Error::from(err)),
+            }
+        });
+        let outcome = handle
+            .await
+            .map_err(to_napi_error)?
+            .map_err(to_napi_error)?;
+        let Some(batch) = outcome else {
+            return Ok(Vec::new());
+        };
+        let messages: Vec<NativeMessage> = batch
+            .messages
+            .iter()
+            .map(NativeMessage::from_canonical)
+            .collect();
+        let count = batch.messages.len();
+        if count > 0 {
+            self.lock_pending()?.push((batch.commit, count));
+        }
+        Ok(messages)
+    }
+
+    /// Acknowledge every batch returned by `poll()` since the last `commit()`,
+    /// advancing the consumer offset.
+    ///
+    /// Calling this is required, not optional. Without it the offset never
+    /// advances (messages are re-delivered on the next run), most brokers stall
+    /// once their unacknowledged/prefetch window fills, and uncommitted batches
+    /// are held in memory so the process grows unbounded. To retry a failed
+    /// batch, simply don't commit it — it will be redelivered.
+    #[napi]
+    pub async fn commit(&self) -> Result<()> {
+        let commits: Vec<(BatchCommitFunc, usize)> = std::mem::take(&mut *self.lock_pending()?);
+        if commits.is_empty() {
+            return Ok(());
+        }
+        let handle = self.runtime.spawn(async move {
+            let mut iter = commits.into_iter();
+            while let Some((commit, len)) = iter.next() {
+                if let Err(err) = commit(vec![MessageDisposition::Ack; len]).await {
+                    // Hand back the batches we never attempted so they can be retried.
+                    return (Some(err), iter.collect::<Vec<_>>());
+                }
+            }
+            (None, Vec::new())
+        });
+        let (err, tail) = handle.await.map_err(to_napi_error)?;
+        if !tail.is_empty() {
+            let mut pending = self.lock_pending()?;
+            let mut restored = tail;
+            restored.append(&mut pending);
+            *pending = restored;
+        }
+        match err {
+            Some(err) => Err(to_napi_error(err)),
+            None => Ok(()),
         }
     }
 
-    let routes = serde_yaml_ng::from_value(value).context("failed to parse YAML as a route map")?;
-    Ok(ConfigDocument {
-        routes,
-        publishers: PublisherConfig::new(),
-    })
-}
-
-fn parse_publishers_section(value: serde_yaml_ng::Value) -> anyhow::Result<PublisherConfig> {
-    serde_yaml_ng::from_value(value.clone()).or_else(|err| {
-        let map = value
-            .as_mapping()
-            .ok_or_else(|| anyhow::anyhow!("failed to parse publishers section: {err}"))?;
-        let mut publishers = PublisherConfig::new();
-        for (key, endpoint_value) in map {
-            let name = key
-                .as_str()
-                .ok_or_else(|| anyhow::anyhow!("publisher names must be strings"))?;
-            let endpoint: Endpoint = serde_yaml_ng::from_value(endpoint_value.clone())
-                .with_context(|| format!("failed to parse publisher '{name}'"))?;
-            publishers.insert(name.to_string(), endpoint);
-        }
-        Ok(publishers)
-    })
-}
-
-struct ConfigDocument {
-    routes: HashMap<String, CoreRoute>,
-    publishers: PublisherConfig,
-}
-
-fn unwrap_config_root(value: serde_yaml_ng::Value) -> serde_yaml_ng::Value {
-    if let Some(map) = value.as_mapping() {
-        let config_key = serde_yaml_ng::Value::String("config".to_string());
-        if let Some(config) = map.get(&config_key) {
-            return config.clone();
-        }
+    /// `true` once the source has signalled end-of-stream (e.g. a fully drained
+    /// file). Streaming brokers never set this.
+    #[napi(getter)]
+    pub fn exhausted(&self) -> bool {
+        self.exhausted.load(Ordering::SeqCst)
     }
-    value
+
+    /// Resolve to a status snapshot for the underlying endpoint: `healthy`,
+    /// `target`, optional `pending` (broker backlog/lag where the transport
+    /// reports it — Kafka offset lag, AMQP queue depth, NATS JetStream
+    /// `numPending`), optional `capacity`/`error`, and `details`. `pending === 0`
+    /// is a precise "caught up" signal on those transports; it is absent where
+    /// the broker exposes no backlog (core NATS, MQTT). Point-in-time snapshot.
+    #[napi]
+    pub async fn status(&self) -> Result<JsonValue> {
+        let consumer = Arc::clone(&self.consumer);
+        let handle = self.runtime.spawn(async move {
+            let guard = consumer.lock().await;
+            let consumer = guard
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("consumer is closed"))?;
+            serde_json::to_value(consumer.status().await).map_err(anyhow::Error::from)
+        });
+        handle.await.map_err(to_napi_error)?.map_err(to_napi_error)
+    }
+
+    /// Release the underlying consumer connection. Idempotent. After this,
+    /// `poll()` and `status()` reject. GC'd JS has no deterministic drop, so
+    /// closing explicitly is how the broker connection is freed promptly.
+    #[napi]
+    pub async fn close(&self) -> Result<()> {
+        let consumer = Arc::clone(&self.consumer);
+        let handle = self.runtime.spawn(async move {
+            let taken = consumer.lock().await.take();
+            if let Some(mut consumer) = taken {
+                consumer.close().await?;
+            }
+            Ok::<(), anyhow::Error>(())
+        });
+        handle.await.map_err(to_napi_error)?.map_err(to_napi_error)
+    }
+}
+
+impl Consumer {
+    fn build(name: String, endpoint: Endpoint) -> Result<Self> {
+        let runtime = Arc::new(common::build_runtime().map_err(to_napi_error)?);
+        let consumer = runtime
+            .block_on(core::endpoints::create_consumer_from_route(
+                &name, &endpoint,
+            ))
+            .map_err(to_napi_error)?;
+        Ok(Self {
+            runtime,
+            consumer: Arc::new(tokio::sync::Mutex::new(Some(consumer))),
+            pending: Arc::new(Mutex::new(Vec::new())),
+            exhausted: Arc::new(AtomicBool::new(false)),
+        })
+    }
+
+    fn lock_pending(&self) -> Result<std::sync::MutexGuard<'_, Vec<(BatchCommitFunc, usize)>>> {
+        self.pending
+            .lock()
+            .map_err(|_| Error::from_reason("Consumer commit lock poisoned"))
+    }
 }
 
 fn build_message(
@@ -631,12 +796,7 @@ fn json_input_to_canonical(
 }
 
 fn parse_message_id(id: &str) -> Result<u128> {
-    core::canonical_message::deserialize_u128(JsonValue::String(id.to_string()).into_deserializer())
-        .map_err(|err| Error::from_reason(format!("invalid message id '{id}': {err}")))
-}
-
-fn format_message_id(message_id: u128) -> String {
-    fast_uuid_v7::format_uuid(message_id).to_string()
+    core::canonical_message::message_id_from_str(id).map_err(Error::from_reason)
 }
 
 fn active_route_names() -> &'static Mutex<HashSet<String>> {

@@ -53,13 +53,23 @@ class Message:
 
 class Route:
     @classmethod
-    def from_yaml(cls, path: str, name: str) -> "Route": ...
+    def from_file(cls, path: str, name: Optional[str] = ...) -> "Route": ...
 
     @classmethod
-    def from_yaml_str(cls, text: str, name: str) -> "Route": ...
+    def from_str(cls, text: str, name: Optional[str] = ...) -> "Route": ...
 
     @classmethod
-    def from_config(cls, config: Mapping[str, Any], name: str) -> "Route": ...
+    def from_config(
+        cls, config: Mapping[str, Any], name: Optional[str] = ...
+    ) -> "Route": ...
+
+    # Deprecated: use from_file (emits DeprecationWarning at runtime).
+    @classmethod
+    def from_yaml(cls, path: str, name: Optional[str] = ...) -> "Route": ...
+
+    # Deprecated: use from_str (emits DeprecationWarning at runtime).
+    @classmethod
+    def from_yaml_str(cls, text: str, name: Optional[str] = ...) -> "Route": ...
 
     def with_handler(self, handler: Callable[[Message], HandlerResult]) -> "Route": ...
 
@@ -93,6 +103,67 @@ class Route:
     ) -> bool: ...
 
 
+class Consumer:
+    @classmethod
+    def from_file(cls, path: str, name: Optional[str] = ...) -> "Consumer": ...
+
+    @classmethod
+    def from_str(cls, text: str, name: Optional[str] = ...) -> "Consumer": ...
+
+    @classmethod
+    def from_config(
+        cls, config: Mapping[str, Any], name: Optional[str] = ...
+    ) -> "Consumer": ...
+
+    def poll(
+        self,
+        max: int = ...,
+        timeout_ms: Optional[int] = ...,
+    ) -> List["Message"]:
+        """Receive up to ``max`` messages without acking. Empty list once
+        ``timeout_ms`` milliseconds elapse with nothing received, or when the
+        source is exhausted; omit ``timeout_ms`` to block until a message
+        arrives. The returned messages are acked by the next ``commit()`` call —
+        you must call it (see ``commit``)."""
+        ...
+
+    def commit(self) -> None:
+        """Ack every batch returned by ``poll()`` since the last ``commit()``,
+        advancing the consumer offset.
+
+        Calling this is required, not optional. Without it the offset never
+        advances (messages are re-delivered on the next run), most brokers stall
+        once their unacknowledged/prefetch window fills, and uncommitted batches
+        are held in memory so the process grows unbounded. To retry a failed
+        batch, simply don't commit it — it will be redelivered."""
+        ...
+
+    def status(self) -> Dict[str, Any]:
+        """Status snapshot for the underlying endpoint: ``healthy``, ``target``,
+        optional ``pending`` (broker backlog/lag where reported — Kafka offset
+        lag, AMQP queue depth, NATS JetStream ``num_pending``), optional
+        ``capacity``/``error``, and ``details``. ``pending == 0`` is a precise
+        "caught up" signal; ``None`` where the broker exposes no backlog."""
+        ...
+
+    def close(self) -> None:
+        """Release the broker connection. Idempotent; ``poll()``/``status()``
+        raise afterwards. The context-manager form calls this on exit."""
+        ...
+
+    @property
+    def exhausted(self) -> bool: ...
+
+    def __enter__(self) -> "Consumer": ...
+
+    def __exit__(
+        self,
+        exc_type: Optional[Type[BaseException]],
+        exc_value: Optional[BaseException],
+        traceback: Optional[TracebackType],
+    ) -> bool: ...
+
+
 class MemoryDrainer:
     @classmethod
     def from_topic(
@@ -111,13 +182,23 @@ class MemoryDrainer:
 
 class Publisher:
     @classmethod
-    def from_yaml(cls, path: str, name: str) -> "Publisher": ...
+    def from_file(cls, path: str, name: Optional[str] = ...) -> "Publisher": ...
 
     @classmethod
-    def from_yaml_str(cls, text: str, name: str) -> "Publisher": ...
+    def from_str(cls, text: str, name: Optional[str] = ...) -> "Publisher": ...
 
     @classmethod
-    def from_config(cls, config: Mapping[str, Any], name: str) -> "Publisher": ...
+    def from_config(
+        cls, config: Mapping[str, Any], name: Optional[str] = ...
+    ) -> "Publisher": ...
+
+    # Deprecated: use from_file (emits DeprecationWarning at runtime).
+    @classmethod
+    def from_yaml(cls, path: str, name: Optional[str] = ...) -> "Publisher": ...
+
+    # Deprecated: use from_str (emits DeprecationWarning at runtime).
+    @classmethod
+    def from_yaml_str(cls, text: str, name: Optional[str] = ...) -> "Publisher": ...
 
     def send(
         self,

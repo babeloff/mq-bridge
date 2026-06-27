@@ -240,6 +240,16 @@ fn default_shared_schema() -> Option<bool> {
     Some(true)
 }
 
+/// Schema default for Kafka `partitions`, whose runtime default is 6.
+#[cfg(feature = "schema")]
+fn default_kafka_partitions_schema() -> Option<i32> {
+    Some(DEFAULT_KAFKA_PARTITIONS)
+}
+
+/// Partition count used when auto-creating a Kafka topic if none is configured.
+/// ordering is per-key (we key by message_id), not global across the topic if > 1
+pub const DEFAULT_KAFKA_PARTITIONS: i32 = 6;
+
 fn default_output_endpoint() -> Endpoint {
     Endpoint::new(EndpointType::Null)
 }
@@ -1136,6 +1146,15 @@ pub struct KafkaConfig {
     #[serde(default)]
     #[cfg_attr(feature = "schema", schemars(default = "default_shared_schema"))]
     pub shared: Option<bool>,
+    /// (Publisher only) Partition count used when auto-creating the topic (default: 6).
+    /// Higher values raise write/consume parallelism; ordering is only guaranteed per
+    /// partition key (message_id), not across the whole topic. Ignored if the topic exists.
+    #[serde(default)]
+    #[cfg_attr(
+        feature = "schema",
+        schemars(default = "default_kafka_partitions_schema")
+    )]
+    pub partitions: Option<i32>,
 }
 
 impl KafkaConfig {

@@ -19,8 +19,8 @@ CONFIG_PATH = os.path.join(
 
 
 def main() -> None:
-    route = Route.from_yaml(CONFIG_PATH, "orders_route").with_handler(handle_order)
-    publisher = Publisher.from_yaml(CONFIG_PATH, "orders_publisher")
+    route = Route.from_file(CONFIG_PATH, "orders_route").with_handler(handle_order)
+    publisher = Publisher.from_file(CONFIG_PATH, "orders_publisher")
 
     # start() deploys the route on a background thread and returns, so the rest
     # of this function keeps running. (Use route.run() instead when you want the

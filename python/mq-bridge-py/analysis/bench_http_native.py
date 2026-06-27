@@ -137,10 +137,15 @@ def mqb_server(executor: str, route_concurrency: int):
               response: {{}}
         """
     ).lstrip()
+    # Route.from_file expects a path, so write the YAML to a temp dir and pass the
+    # path. Track the dir so it can be removed once the child exits.
+    cfg_dir = Path(tempfile.mkdtemp(prefix="mqb-native-"))
+    cfg_path = cfg_dir / "route.yaml"
+    cfg_path.write_text(cfg, encoding="utf-8")
     launcher = textwrap.dedent(
         f"""
         from mq_bridge import Route
-        route = Route.from_yaml({_repr(cfg)}, "http_bench")
+        route = Route.from_file({str(cfg_path)!r}, "http_bench")
         route.add_handler("{KIND}", lambda data: {{"value": data["value"] + 1}})
         route.run()
         """
@@ -160,14 +165,7 @@ def mqb_server(executor: str, route_concurrency: int):
             proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
             proc.kill()
-
-
-def _repr(text: str) -> str:
-    # Embed the YAML as a Python literal; Route.from_yaml expects a path OR text
-    # depending on version, so write to a temp file and pass the path instead.
-    path = Path(tempfile.mkdtemp(prefix="mqb-native-")) / "route.yaml"
-    path.write_text(text, encoding="utf-8")
-    return repr(str(path))
+        shutil.rmtree(cfg_dir, ignore_errors=True)
 
 
 @contextmanager

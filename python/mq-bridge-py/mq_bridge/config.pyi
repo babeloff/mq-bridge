@@ -165,6 +165,7 @@ class KafkaConfig(TypedDict, total=False):
     consumer_options: Optional[List[List[Any]]]
     delayed_ack: bool
     group_id: Optional[str]
+    partitions: Optional[int]
     password: Optional[str]
     producer_options: Optional[List[List[Any]]]
     shared: Optional[bool]
@@ -395,6 +396,6 @@ EndpointConfig = Endpoint
 RoutesConfig = Dict[str, Route]
 
 class ConfigDocument(TypedDict, total=False):
-    """Top-level config accepted by from_config / from_yaml_str."""
+    """Top-level config accepted by from_file / from_str / from_config."""
     routes: Dict[str, Route]
     publishers: Dict[str, Endpoint]

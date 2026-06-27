@@ -15,12 +15,14 @@ Memory and file endpoints are always present in both packages. Use `mq-bridge-py
 
 The public API stays close to mq-bridge itself:
 
-- `Route.from_yaml(path, name)` loads one named route from a YAML file
-- `Route.from_yaml_str(text, name)` / `Route.from_config(mapping, name)` build a route from an in-memory YAML string or a Python `dict`, no file required
+- `Route.from_file(path, name=None)` loads a route from a YAML/JSON file. The three constructors differ only by source: `from_file` (path), `from_str` (in-memory YAML/JSON string), `from_config` (Python `dict`)
+- The `name` is optional: pass it to pick one entry out of a `routes:`/`publishers:` document, or omit it to treat the whole config as a single bare route/endpoint body
 - `Route.with_handler(...)` attaches a raw `Message` handler, with lazy `json()`/`text()` readers and `with_json()`/`with_payload()` response helpers
 - `Route.add_handler(kind, ...)` uses mq-bridge's `kind` dispatch and delivers decoded JSON
 - `RetryableError` and `NonRetryableError` let Python handlers signal retry intent
-- `Publisher.from_yaml(path, name)` (plus `from_yaml_str` / `from_config`) loads one named publisher
+- `Publisher.from_file(path, name=None)` (plus `from_str` / `from_config`) builds a publisher endpoint
+
+`from_yaml` / `from_yaml_str` remain as deprecated aliases for `from_file` / `from_str`.
 - `Publisher.send_json(...)` and `Publisher.request_json(...)` serialize Python JSON values in Rust
 
 The Python surface is synchronous and blocking. Tokio, broker I/O, routing, and batching all stay in Rust.
@@ -30,10 +32,10 @@ The Python surface is synchronous and blocking. Tokio, broker I/O, routing, and 
 `mq-bridge-app` can create and test route and endpoint JSON/YAML through its UI.
 It does not replace your Python code or handlers, but it is useful when you want
 a known-good connection and route shape before pasting the configuration into
-Python. Load the generated config with `Route.from_config`, `Route.from_yaml`,
-`Publisher.from_config`, or `Publisher.from_yaml`.
+Python. Load the generated config with `Route.from_config`, `Route.from_file`,
+`Publisher.from_config`, or `Publisher.from_file`.
 
-For the `from_config` / `from_yaml_str` mappings, `mq_bridge.config` ships
+For the `from_config` / `from_str` mappings, `mq_bridge.config` ships
 `TypedDict` definitions so editors autocomplete the config keys (`input`,
 `output`, `batch_size`, every transport config, middleware, …):
 
@@ -93,6 +95,91 @@ with Route.from_config(config, "orders_route").with_handler(handle):
 
 Configuration/connection errors surface from `start()` itself, not from a
 background thread. `run()` remains available for the blocking single-route case.
+
+## Pull-based consumer
+
+`Route` is push-based: you attach a handler and the route drives it. When you
+instead want to **pull** messages on your own schedule — e.g. to feed a
+generator-style sink such as a [`dlt`](https://dlthub.com) resource — use
+`Consumer`. It wraps any input endpoint and hands batches back to Python:
+
+```python
+from mq_bridge import Consumer
+
+consumer = Consumer.from_config({"nats": {"subject": "orders", "url": "nats://localhost:4222"}})
+
+while not consumer.exhausted:
+    batch = consumer.poll(max=500, timeout_ms=1000)   # [] on timeout
+    if not batch:
+        continue
+    for message in batch:
+        handle(message.json())
+    consumer.commit()                                 # ack only after handling
+```
+
+`poll()` receives up to `max` messages **without** acknowledging them;
+`commit()` acks every batch returned since the last commit, advancing the
+consumer offset (or removing them from the queue). Committing only after the
+downstream write succeeds gives at-least-once delivery: a crash before `commit()`
+re-delivers the batch. `poll()` returns `[]` once `timeout_ms` elapses with
+nothing received (omit it to block until a message arrives), and sets
+`exhausted` once a bounded source (e.g. a file) is fully drained — streaming
+brokers never set it.
+
+> **You must call `commit()` — it is not optional.** It is the only thing that
+> tells the broker a batch is done. If you keep polling without committing:
+> - the consumer offset never advances, so every message is **re-delivered** on
+>   the next run (and you reprocess from the start);
+> - most brokers stop sending once their unacknowledged/prefetch window fills, so
+>   `poll()` eventually **stalls** and returns nothing;
+> - the uncommitted batches are held in memory pending their ack, so the process
+>   **grows unbounded**.
+>
+> Commit after each batch you have durably handled (as in the loops above). If a
+> batch fails downstream, simply *don't* commit it — it will be redelivered.
+
+`consumer.status()` returns a snapshot dict (`healthy`, `target`, `pending`,
+`capacity`, `error`, `details`). `pending` is the broker backlog/lag where the
+transport reports it — Kafka offset lag, AMQP queue depth, NATS JetStream
+`num_pending` — so `pending == 0` is a precise "caught up" check for a bounded
+drain; it is `None` where the broker exposes no backlog (core NATS, MQTT), where
+you fall back to a `timeout_ms` that returns `[]`. It's a point-in-time snapshot,
+not a guarantee.
+
+`consumer.close()` releases the broker connection; it's idempotent, and `poll()`
+/`status()` raise afterwards. Python is garbage-collected, so close explicitly
+(or use the context-manager form, which closes on exit) rather than relying on
+the object being collected:
+
+```python
+with Consumer.from_config(cfg) as consumer:
+    batch = consumer.poll(max=500, timeout_ms=1000)
+    ...
+    consumer.commit()
+# connection released here
+```
+
+The endpoint config decides durability exactly as a route input does: a
+consumer-group config resumes from the last commit, a subscriber config receives
+only new messages. `Consumer.from_file` / `from_str` accept the same shapes,
+plus a named entry under a `consumers:` document section.
+
+As a `dlt` resource this is a few lines:
+
+```python
+import dlt
+from mq_bridge import Consumer
+
+@dlt.resource(name="orders")
+def orders():
+    consumer = Consumer.from_config({"nats": {"subject": "orders", "url": "nats://localhost:4222"}})
+    while not consumer.exhausted:
+        batch = consumer.poll(max=500, timeout_ms=1000)
+        if not batch:
+            break                 # nothing more pending this run
+        yield [m.json() for m in batch]
+        consumer.commit()
+```
 
 ## Tuning (environment variables)
 

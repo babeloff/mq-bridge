@@ -10,7 +10,7 @@ import uuid
 
 import pytest
 
-from mq_bridge import MemoryDrainer, Publisher, Route
+from mq_bridge import Consumer, MemoryDrainer, Publisher, Route
 
 
 def _unique(prefix: str) -> str:
@@ -119,6 +119,70 @@ def test_run_blocks_until_stop() -> None:
     thread.join(timeout=5.0)
 
 
+def test_consumer_poll_and_commit_round_trip() -> None:
+    topic = _unique("pytest.consumer")
+    endpoint = {"memory": {"topic": topic, "capacity": 4096}}
+
+    publisher = Publisher.from_config(endpoint)
+    consumer = Consumer.from_config(endpoint)
+
+    for value in range(5):
+        publisher.send_json({"value": value}, {"kind": "bench.tick"})
+
+    received = []
+    while len(received) < 5:
+        batch = consumer.poll(max=10, timeout_ms=5000)
+        assert batch, "poll timed out before all messages arrived"
+        received.extend(batch)
+    consumer.commit()
+
+    assert [m.json()["value"] for m in received] == list(range(5))
+    assert received[0].metadata["kind"] == "bench.tick"
+
+
+def test_consumer_poll_timeout_returns_empty() -> None:
+    topic = _unique("pytest.consumer.empty")
+    consumer = Consumer.from_config({"memory": {"topic": topic, "capacity": 16}})
+
+    assert consumer.poll(max=4, timeout_ms=200) == []
+    assert consumer.exhausted is False
+
+
+def test_consumer_status_reports_endpoint() -> None:
+    topic = _unique("pytest.consumer.status")
+    consumer = Consumer.from_config({"memory": {"topic": topic, "capacity": 16}})
+
+    status = consumer.status()
+    assert isinstance(status, dict)
+    assert status["healthy"] is True
+    # `pending` is present for the memory backend (channel depth); on transports
+    # without a backlog concept it may be absent/None.
+    assert "pending" in status
+
+
+def test_consumer_close_is_idempotent_and_blocks_use() -> None:
+    topic = _unique("pytest.consumer.close")
+    consumer = Consumer.from_config({"memory": {"topic": topic, "capacity": 16}})
+
+    consumer.close()
+    consumer.close()  # idempotent
+
+    with pytest.raises(RuntimeError):
+        consumer.poll(max=1, timeout_ms=50)
+    with pytest.raises(RuntimeError):
+        consumer.status()
+
+
+def test_consumer_context_manager_closes() -> None:
+    topic = _unique("pytest.consumer.cm")
+    with Consumer.from_config({"memory": {"topic": topic, "capacity": 16}}) as consumer:
+        assert consumer.poll(max=1, timeout_ms=50) == []
+
+    # Closed on exit.
+    with pytest.raises(RuntimeError):
+        consumer.poll(max=1, timeout_ms=50)
+
+
 def test_publisher_request_json_echoes_via_config() -> None:
     publisher = Publisher.from_config({"response": {}}, "echo")
 
@@ -128,8 +192,40 @@ def test_publisher_request_json_echoes_via_config() -> None:
     assert reply.id is not None
 
 
-def test_publisher_from_yaml_str_echoes() -> None:
-    publisher = Publisher.from_yaml_str(
+def test_publisher_from_config_without_name_uses_bare_endpoint() -> None:
+    # No name => the mapping is a single bare endpoint body.
+    publisher = Publisher.from_config({"response": {}})
+
+    reply = publisher.request(b"ping")
+
+    assert reply.payload == b"ping"
+
+
+def test_route_from_config_without_name_uses_bare_route() -> None:
+    in_topic = _unique("pytest.in")
+    out_topic = _unique("pytest.out")
+
+    # No name => the mapping is a single bare route body.
+    route = Route.from_config(
+        {
+            "input": {"memory": {"topic": in_topic, "capacity": 4096}},
+            "output": {"memory": {"topic": out_topic, "capacity": 4096}},
+        }
+    ).with_handler(lambda msg: msg)
+    publisher = Publisher.from_config({"memory": {"topic": in_topic, "capacity": 4096}})
+    drainer = MemoryDrainer.from_topic(out_topic, 4096)
+
+    route.start()
+    try:
+        publisher.send(b"hello")
+        assert drainer.drain(1, timeout=5.0) == 1
+    finally:
+        route.stop()
+        route.join()
+
+
+def test_publisher_from_str_echoes() -> None:
+    publisher = Publisher.from_str(
         """
         publishers:
           echo:
@@ -137,6 +233,15 @@ def test_publisher_from_yaml_str_echoes() -> None:
         """,
         "echo",
     )
+
+    reply = publisher.request(b"ping")
+
+    assert reply.payload == b"ping"
+
+
+def test_from_yaml_str_alias_is_deprecated_but_works() -> None:
+    with pytest.warns(DeprecationWarning):
+        publisher = Publisher.from_yaml_str("response: {}")
 
     reply = publisher.request(b"ping")
 
