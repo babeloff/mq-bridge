@@ -972,7 +972,8 @@ impl MemoryDrainer {
 #[pyclass(module = "mq_bridge")]
 struct Consumer {
     runtime: Arc<Runtime>,
-    consumer: Arc<tokio::sync::Mutex<Box<dyn MessageConsumer>>>,
+    // `None` once `close()` has dropped the underlying consumer.
+    consumer: Arc<tokio::sync::Mutex<Option<Box<dyn MessageConsumer>>>>,
     pending: Arc<Mutex<Vec<(core::traits::BatchCommitFunc, usize)>>>,
     exhausted: Arc<std::sync::atomic::AtomicBool>,
 }
@@ -985,7 +986,7 @@ impl Consumer {
         ))?;
         Ok(Self {
             runtime,
-            consumer: Arc::new(tokio::sync::Mutex::new(consumer)),
+            consumer: Arc::new(tokio::sync::Mutex::new(Some(consumer))),
             pending: Arc::new(Mutex::new(Vec::new())),
             exhausted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
@@ -1074,10 +1075,11 @@ impl Consumer {
         let outcome = py
             .detach(move || {
                 run_sync_task(&runtime, async move {
-                    let recv = async {
-                        let mut consumer = consumer.lock().await;
-                        consumer.receive_batch(max).await
-                    };
+                    let mut guard = consumer.lock().await;
+                    let consumer = guard
+                        .as_mut()
+                        .ok_or_else(|| anyhow!("consumer is closed"))?;
+                    let recv = consumer.receive_batch(max);
                     let batch = if let Some(timeout_ms) = timeout_ms {
                         match tokio::time::timeout(Duration::from_millis(timeout_ms), recv).await {
                             Ok(result) => result,
@@ -1142,6 +1144,49 @@ impl Consumer {
         self.exhausted.load(Ordering::SeqCst)
     }
 
+    /// Return a status snapshot for the underlying endpoint as a ``dict``:
+    /// ``healthy``, ``target``, optional ``pending`` (broker backlog/lag where
+    /// the transport reports it — e.g. Kafka offset lag, AMQP queue depth, NATS
+    /// JetStream ``num_pending``), optional ``capacity``/``error``, and
+    /// ``details``. ``pending == 0`` is a precise "caught up" signal on those
+    /// transports; it is `null` where the broker exposes no backlog (e.g. core
+    /// NATS, MQTT). The value is a point-in-time snapshot, not a guarantee.
+    fn status(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let runtime = Arc::clone(&self.runtime);
+        let consumer = Arc::clone(&self.consumer);
+        let bytes = py
+            .detach(move || -> anyhow::Result<Vec<u8>> {
+                run_sync_task(&runtime, async move {
+                    let guard = consumer.lock().await;
+                    let consumer = guard
+                        .as_ref()
+                        .ok_or_else(|| anyhow!("consumer is closed"))?;
+                    Ok(serde_json::to_vec(&consumer.status().await)?)
+                })
+            })
+            .map_err(to_py_runtime_error)?;
+        json_bytes_to_python(py, &bytes)
+    }
+
+    /// Release the underlying consumer connection. Idempotent. After this,
+    /// `poll()` and `status()` raise. Prefer the context-manager form, which
+    /// calls this on exit. GC'd Python has no deterministic drop, so closing
+    /// explicitly is how the broker connection is freed promptly.
+    fn close(&self, py: Python<'_>) -> PyResult<()> {
+        let runtime = Arc::clone(&self.runtime);
+        let consumer = Arc::clone(&self.consumer);
+        py.detach(move || {
+            run_sync_task(&runtime, async move {
+                let taken = consumer.lock().await.take();
+                if let Some(mut consumer) = taken {
+                    consumer.close().await?;
+                }
+                Ok(())
+            })
+        })
+        .map_err(to_py_runtime_error)
+    }
+
     fn __enter__<'a>(slf: PyRef<'a, Self>) -> PyRef<'a, Self> {
         slf
     }
@@ -1149,11 +1194,13 @@ impl Consumer {
     #[pyo3(signature = (_exc_type=None, _exc_value=None, _traceback=None))]
     fn __exit__(
         &self,
+        py: Python<'_>,
         _exc_type: Option<&Bound<'_, PyAny>>,
         _exc_value: Option<&Bound<'_, PyAny>>,
         _traceback: Option<&Bound<'_, PyAny>>,
-    ) -> bool {
-        false
+    ) -> PyResult<bool> {
+        self.close(py)?;
+        Ok(false)
     }
 }
 

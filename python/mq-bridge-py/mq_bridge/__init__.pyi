@@ -138,6 +138,19 @@ class Consumer:
         batch, simply don't commit it — it will be redelivered."""
         ...
 
+    def status(self) -> Dict[str, Any]:
+        """Status snapshot for the underlying endpoint: ``healthy``, ``target``,
+        optional ``pending`` (broker backlog/lag where reported — Kafka offset
+        lag, AMQP queue depth, NATS JetStream ``num_pending``), optional
+        ``capacity``/``error``, and ``details``. ``pending == 0`` is a precise
+        "caught up" signal; ``None`` where the broker exposes no backlog."""
+        ...
+
+    def close(self) -> None:
+        """Release the broker connection. Idempotent; ``poll()``/``status()``
+        raise afterwards. The context-manager form calls this on exit."""
+        ...
+
     @property
     def exhausted(self) -> bool: ...
 

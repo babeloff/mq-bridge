@@ -80,6 +80,14 @@ turns `true` once a bounded source (e.g. a file) is drained; streaming brokers
 never set it. `Consumer.fromFile` / `fromStr` accept a named entry under a
 `consumers:` section or a single bare endpoint body.
 
+`consumer.status()` resolves to a snapshot (`healthy`, `target`, `pending`,
+`capacity`, `error`, `details`). `pending` is the broker backlog/lag where the
+transport reports it (Kafka offset lag, AMQP queue depth, NATS JetStream
+`numPending`), so `pending === 0` is a precise "caught up" check; it's absent
+where the broker exposes no backlog (core NATS, MQTT). `consumer.close()`
+releases the connection — idempotent, and `poll()`/`status()` reject afterwards.
+Node is garbage-collected, so close explicitly rather than waiting for GC.
+
 > **You must call `commit()` — it is not optional.** It is the only thing that
 > tells the broker a batch is done. If you keep polling without committing, the
 > offset never advances (every message is **re-delivered** on the next run), most

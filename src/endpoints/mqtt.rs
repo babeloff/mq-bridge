@@ -489,13 +489,19 @@ impl MessageConsumer for MqttListener {
         crate::traits::EndpointStatus {
             healthy,
             target: self.topic.clone(),
-            pending: Some(self.message_rx.len()),
-            capacity: Some(self.capacity),
+            // MQTT is push-based: the broker exposes no per-subscriber backlog, so
+            // `pending` (broker lag) is not meaningful and is left unset. The local
+            // receive-buffer depth/capacity are reported in `details` instead, so
+            // they are not mistaken for a "caught up" signal.
             error: if healthy {
                 None
             } else {
                 Some("Disconnected".to_string())
             },
+            details: serde_json::json!({
+                "buffered": self.message_rx.len(),
+                "buffer_capacity": self.capacity,
+            }),
             ..Default::default()
         }
     }

@@ -148,6 +148,41 @@ def test_consumer_poll_timeout_returns_empty() -> None:
     assert consumer.exhausted is False
 
 
+def test_consumer_status_reports_endpoint() -> None:
+    topic = _unique("pytest.consumer.status")
+    consumer = Consumer.from_config({"memory": {"topic": topic, "capacity": 16}})
+
+    status = consumer.status()
+    assert isinstance(status, dict)
+    assert status["healthy"] is True
+    # `pending` is present for the memory backend (channel depth); on transports
+    # without a backlog concept it may be absent/None.
+    assert "pending" in status
+
+
+def test_consumer_close_is_idempotent_and_blocks_use() -> None:
+    topic = _unique("pytest.consumer.close")
+    consumer = Consumer.from_config({"memory": {"topic": topic, "capacity": 16}})
+
+    consumer.close()
+    consumer.close()  # idempotent
+
+    with pytest.raises(RuntimeError):
+        consumer.poll(max=1, timeout_ms=50)
+    with pytest.raises(RuntimeError):
+        consumer.status()
+
+
+def test_consumer_context_manager_closes() -> None:
+    topic = _unique("pytest.consumer.cm")
+    with Consumer.from_config({"memory": {"topic": topic, "capacity": 16}}) as consumer:
+        assert consumer.poll(max=1, timeout_ms=50) == []
+
+    # Closed on exit.
+    with pytest.raises(RuntimeError):
+        consumer.poll(max=1, timeout_ms=50)
+
+
 def test_publisher_request_json_echoes_via_config() -> None:
     publisher = Publisher.from_config({"response": {}}, "echo")
 

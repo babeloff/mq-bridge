@@ -560,7 +560,8 @@ impl Publisher {
 #[napi]
 pub struct Consumer {
     runtime: Arc<Runtime>,
-    consumer: Arc<tokio::sync::Mutex<Box<dyn MessageConsumer>>>,
+    // `None` once `close()` has dropped the underlying consumer.
+    consumer: Arc<tokio::sync::Mutex<Option<Box<dyn MessageConsumer>>>>,
     pending: Arc<Mutex<Vec<(BatchCommitFunc, usize)>>>,
     exhausted: Arc<AtomicBool>,
 }
@@ -625,10 +626,11 @@ impl Consumer {
         let exhausted = Arc::clone(&self.exhausted);
         let max = max.unwrap_or(256).max(1) as usize;
         let handle = self.runtime.spawn(async move {
-            let recv = async {
-                let mut consumer = consumer.lock().await;
-                consumer.receive_batch(max).await
-            };
+            let mut guard = consumer.lock().await;
+            let consumer = guard
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("consumer is closed"))?;
+            let recv = consumer.receive_batch(max);
             let batch = if let Some(timeout_ms) = timeout_ms {
                 match tokio::time::timeout(Duration::from_millis(timeout_ms as u64), recv).await {
                     Ok(result) => result,
@@ -694,6 +696,41 @@ impl Consumer {
     pub fn exhausted(&self) -> bool {
         self.exhausted.load(Ordering::SeqCst)
     }
+
+    /// Resolve to a status snapshot for the underlying endpoint: `healthy`,
+    /// `target`, optional `pending` (broker backlog/lag where the transport
+    /// reports it — Kafka offset lag, AMQP queue depth, NATS JetStream
+    /// `numPending`), optional `capacity`/`error`, and `details`. `pending === 0`
+    /// is a precise "caught up" signal on those transports; it is absent where
+    /// the broker exposes no backlog (core NATS, MQTT). Point-in-time snapshot.
+    #[napi]
+    pub async fn status(&self) -> Result<JsonValue> {
+        let consumer = Arc::clone(&self.consumer);
+        let handle = self.runtime.spawn(async move {
+            let guard = consumer.lock().await;
+            let consumer = guard
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("consumer is closed"))?;
+            serde_json::to_value(consumer.status().await).map_err(anyhow::Error::from)
+        });
+        handle.await.map_err(to_napi_error)?.map_err(to_napi_error)
+    }
+
+    /// Release the underlying consumer connection. Idempotent. After this,
+    /// `poll()` and `status()` reject. GC'd JS has no deterministic drop, so
+    /// closing explicitly is how the broker connection is freed promptly.
+    #[napi]
+    pub async fn close(&self) -> Result<()> {
+        let consumer = Arc::clone(&self.consumer);
+        let handle = self.runtime.spawn(async move {
+            let taken = consumer.lock().await.take();
+            if let Some(mut consumer) = taken {
+                consumer.close().await?;
+            }
+            Ok::<(), anyhow::Error>(())
+        });
+        handle.await.map_err(to_napi_error)?.map_err(to_napi_error)
+    }
 }
 
 impl Consumer {
@@ -706,7 +743,7 @@ impl Consumer {
             .map_err(to_napi_error)?;
         Ok(Self {
             runtime,
-            consumer: Arc::new(tokio::sync::Mutex::new(consumer)),
+            consumer: Arc::new(tokio::sync::Mutex::new(Some(consumer))),
             pending: Arc::new(Mutex::new(Vec::new())),
             exhausted: Arc::new(AtomicBool::new(false)),
         })

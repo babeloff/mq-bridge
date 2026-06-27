@@ -138,6 +138,27 @@ brokers never set it.
 > Commit after each batch you have durably handled (as in the loops above). If a
 > batch fails downstream, simply *don't* commit it — it will be redelivered.
 
+`consumer.status()` returns a snapshot dict (`healthy`, `target`, `pending`,
+`capacity`, `error`, `details`). `pending` is the broker backlog/lag where the
+transport reports it — Kafka offset lag, AMQP queue depth, NATS JetStream
+`num_pending` — so `pending == 0` is a precise "caught up" check for a bounded
+drain; it is `None` where the broker exposes no backlog (core NATS, MQTT), where
+you fall back to a `timeout_ms` that returns `[]`. It's a point-in-time snapshot,
+not a guarantee.
+
+`consumer.close()` releases the broker connection; it's idempotent, and `poll()`
+/`status()` raise afterwards. Python is garbage-collected, so close explicitly
+(or use the context-manager form, which closes on exit) rather than relying on
+the object being collected:
+
+```python
+with Consumer.from_config(cfg) as consumer:
+    batch = consumer.poll(max=500, timeout_ms=1000)
+    ...
+    consumer.commit()
+# connection released here
+```
+
 The endpoint config decides durability exactly as a route input does: a
 consumer-group config resumes from the last commit, a subscriber config receives
 only new messages. `Consumer.from_file` / `from_str` accept the same shapes,

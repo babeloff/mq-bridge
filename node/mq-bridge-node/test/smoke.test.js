@@ -122,8 +122,16 @@ test("Consumer.poll returns messages and commit acks them", async () => {
   assert.equal(received[0].metadata.kind, "node.tick");
   assert.equal(consumer.exhausted, false);
 
+  const status = await consumer.status();
+  assert.equal(status.healthy, true);
+
   const empty = await consumer.poll(4, 200);
   assert.deepEqual(empty, []);
+
+  await consumer.close();
+  await consumer.close(); // idempotent
+  await assert.rejects(() => consumer.poll(1, 50));
+  await assert.rejects(() => consumer.status());
 });
 
 test("Route.withHandler serves an HTTP response", async () => {

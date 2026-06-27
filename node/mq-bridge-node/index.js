@@ -122,6 +122,14 @@ class Consumer {
     return this._native.commit();
   }
 
+  status() {
+    return this._native.status();
+  }
+
+  close() {
+    return this._native.close();
+  }
+
   get exhausted() {
     return this._native.exhausted;
   }

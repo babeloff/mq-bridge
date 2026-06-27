@@ -35,6 +35,16 @@ export class Publisher {
   requestJson(data: JsonValue, metadata?: Metadata | null, id?: string | null): Promise<Message>;
 }
 
+export interface ConsumerStatus {
+  healthy: boolean;
+  target: string;
+  /** Broker backlog/lag where the transport reports it; absent otherwise. */
+  pending?: number;
+  capacity?: number;
+  error?: string;
+  details: JsonValue;
+}
+
 export class Consumer {
   static fromFile(path: string, name?: string | null): Consumer;
   static fromStr(text: string, name?: string | null): Consumer;
@@ -58,6 +68,14 @@ export class Consumer {
    * don't commit it — it will be redelivered.
    */
   commit(): Promise<void>;
+  /**
+   * Status snapshot for the underlying endpoint. `pending === 0` is a precise
+   * "caught up" signal on transports that report backlog (Kafka, AMQP, NATS
+   * JetStream); `pending` is absent where the broker exposes none.
+   */
+  status(): Promise<ConsumerStatus>;
+  /** Release the broker connection. Idempotent; `poll()`/`status()` reject after. */
+  close(): Promise<void>;
   /** `true` once the source has signalled end-of-stream (e.g. a drained file). */
   get exhausted(): boolean;
 }
