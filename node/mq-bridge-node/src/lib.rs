@@ -682,12 +682,26 @@ impl Consumer {
             return Ok(());
         }
         let handle = self.runtime.spawn(async move {
-            for (commit, len) in commits {
-                commit(vec![MessageDisposition::Ack; len]).await?;
+            let mut iter = commits.into_iter();
+            while let Some((commit, len)) = iter.next() {
+                if let Err(err) = commit(vec![MessageDisposition::Ack; len]).await {
+                    // Hand back the batches we never attempted so they can be retried.
+                    return (Some(err), iter.collect::<Vec<_>>());
+                }
             }
-            Ok::<(), anyhow::Error>(())
+            (None, Vec::new())
         });
-        handle.await.map_err(to_napi_error)?.map_err(to_napi_error)
+        let (err, tail) = handle.await.map_err(to_napi_error)?;
+        if !tail.is_empty() {
+            let mut pending = self.lock_pending()?;
+            let mut restored = tail;
+            restored.append(&mut pending);
+            *pending = restored;
+        }
+        match err {
+            Some(err) => Err(to_napi_error(err)),
+            None => Ok(()),
+        }
     }
 
     /// `true` once the source has signalled end-of-stream (e.g. a fully drained

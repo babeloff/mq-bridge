@@ -1126,15 +1126,30 @@ impl Consumer {
             return Ok(());
         }
         let runtime = Arc::clone(&self.runtime);
-        py.detach(move || {
-            run_sync_task(&runtime, async move {
-                for (commit, len) in commits {
-                    commit(vec![MessageDisposition::Ack; len]).await?;
-                }
-                Ok(())
+        let (err, tail) = py
+            .detach(move || {
+                run_sync_task(&runtime, async move {
+                    let mut iter = commits.into_iter();
+                    while let Some((commit, len)) = iter.next() {
+                        if let Err(err) = commit(vec![MessageDisposition::Ack; len]).await {
+                            // Hand back the batches we never attempted so they can be retried.
+                            return Ok((Some(err), iter.collect::<Vec<_>>()));
+                        }
+                    }
+                    Ok((None, Vec::new()))
+                })
             })
-        })
-        .map_err(to_py_runtime_error)
+            .map_err(to_py_runtime_error)?;
+        if !tail.is_empty() {
+            let mut pending = self.lock_pending()?;
+            let mut restored = tail;
+            restored.append(&mut pending);
+            *pending = restored;
+        }
+        match err {
+            Some(err) => Err(to_py_runtime_error(err)),
+            None => Ok(()),
+        }
     }
 
     /// `True` once the source has signalled end-of-stream (e.g. a fully drained
