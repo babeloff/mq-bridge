@@ -947,6 +947,216 @@ impl MemoryDrainer {
     }
 }
 
+/// A pull-based consumer over any mq-bridge input endpoint.
+///
+/// `poll()` receives a batch of messages but does **not** acknowledge them;
+/// call `commit()` once the messages have been durably handled to ack every
+/// batch returned since the previous commit (advancing offsets / removing them
+/// from the source). This manual-commit model gives at-least-once delivery
+/// across a failed downstream load (e.g. feeding a `dlt` resource). The endpoint
+/// config decides durability (consumer vs subscriber mode), exactly as it does
+/// for a route input.
+///
+/// Relationship to the Rust core: this is a boundary-friendly projection of the
+/// core `MessageConsumer::receive_batch`, which is the low-level primitive. Two
+/// differences are deliberate, both because a Rust commit closure cannot be
+/// handed across the FFI boundary for Python to call later:
+///   - `receive_batch` returns the messages *and* their commit closure together;
+///     `poll()` returns only the messages and keeps the closure on the Rust side,
+///     so committing becomes the separate `commit()` call.
+///   - that closure accepts a per-message disposition vector (ack/nack/reject);
+///     `poll()` + `commit()` only ack the whole batch.
+/// `poll()` additionally layers a `timeout_ms` over `receive_batch` (which has no
+/// timeout of its own). Native Rust code should use `receive_batch` directly — it
+/// is strictly more expressive and needs no deferred-commit state.
+#[pyclass(module = "mq_bridge")]
+struct Consumer {
+    runtime: Arc<Runtime>,
+    consumer: Arc<tokio::sync::Mutex<Box<dyn MessageConsumer>>>,
+    pending: Arc<Mutex<Vec<(core::traits::BatchCommitFunc, usize)>>>,
+    exhausted: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Consumer {
+    fn build(name: String, endpoint: Endpoint) -> anyhow::Result<Self> {
+        let runtime = Arc::new(common::build_runtime()?);
+        let consumer = runtime.block_on(core::endpoints::create_consumer_from_route(
+            &name, &endpoint,
+        ))?;
+        Ok(Self {
+            runtime,
+            consumer: Arc::new(tokio::sync::Mutex::new(consumer)),
+            pending: Arc::new(Mutex::new(Vec::new())),
+            exhausted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        })
+    }
+
+    fn lock_pending(
+        &self,
+    ) -> PyResult<std::sync::MutexGuard<'_, Vec<(core::traits::BatchCommitFunc, usize)>>> {
+        self.pending
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("Consumer commit lock poisoned"))
+    }
+}
+
+#[pymethods]
+impl Consumer {
+    /// Build a consumer from a YAML or JSON config file. Accepts a
+    /// `consumers:` document entry (with `name`) or a single bare endpoint body.
+    #[staticmethod]
+    #[pyo3(signature = (path, name=None))]
+    fn from_file(py: Python<'_>, path: &str, name: Option<&str>) -> PyResult<Self> {
+        let path = path.to_string();
+        let resolved = common::normalize_name(name).map(str::to_string);
+        py.detach(move || -> anyhow::Result<Self> {
+            let endpoint = common::load_named_consumer(Path::new(&path), resolved.as_deref())?;
+            Self::build(
+                resolved.unwrap_or_else(common::default_route_name),
+                endpoint,
+            )
+        })
+        .map_err(to_py_runtime_error)
+    }
+
+    /// Build a consumer from an in-memory YAML or JSON string.
+    #[staticmethod]
+    #[pyo3(signature = (text, name=None))]
+    fn from_str(py: Python<'_>, text: &str, name: Option<&str>) -> PyResult<Self> {
+        let text = text.to_string();
+        let resolved = common::normalize_name(name).map(str::to_string);
+        py.detach(move || -> anyhow::Result<Self> {
+            let value = serde_yaml_ng::from_str(&text).context("failed to parse YAML config")?;
+            let endpoint = common::named_consumer_from_value(value, resolved.as_deref())?;
+            Self::build(
+                resolved.unwrap_or_else(common::default_route_name),
+                endpoint,
+            )
+        })
+        .map_err(to_py_runtime_error)
+    }
+
+    /// Build a consumer from an in-memory mapping (e.g. a Python ``dict``).
+    /// Omit ``name`` to treat the mapping as a single bare endpoint body, e.g.
+    /// ``Consumer.from_config({"nats": {"subject": "orders", "url": ...}})``.
+    #[staticmethod]
+    #[pyo3(signature = (config, name=None))]
+    fn from_config(
+        py: Python<'_>,
+        config: &Bound<'_, PyAny>,
+        name: Option<&str>,
+    ) -> PyResult<Self> {
+        let bytes = python_to_json_bytes(config)?;
+        let resolved = common::normalize_name(name).map(str::to_string);
+        py.detach(move || -> anyhow::Result<Self> {
+            let text = std::str::from_utf8(&bytes).context("config is not valid UTF-8")?;
+            let value = serde_yaml_ng::from_str(text).context("failed to parse config mapping")?;
+            let endpoint = common::named_consumer_from_value(value, resolved.as_deref())?;
+            Self::build(
+                resolved.unwrap_or_else(common::default_route_name),
+                endpoint,
+            )
+        })
+        .map_err(to_py_runtime_error)
+    }
+
+    /// Receive up to `max` messages without acknowledging them. Returns an empty
+    /// list if `timeout_ms` milliseconds elapse with nothing received, or if the
+    /// source is exhausted (see `exhausted`). Omit `timeout_ms` to block until a
+    /// message arrives. The returned messages are committed by the next
+    /// `commit()` call.
+    #[pyo3(signature = (max=256, timeout_ms=None))]
+    fn poll(&self, py: Python<'_>, max: usize, timeout_ms: Option<u64>) -> PyResult<Vec<Message>> {
+        let runtime = Arc::clone(&self.runtime);
+        let consumer = Arc::clone(&self.consumer);
+        let exhausted = Arc::clone(&self.exhausted);
+        let max = max.max(1);
+        let outcome = py
+            .detach(move || {
+                run_sync_task(&runtime, async move {
+                    let recv = async {
+                        let mut consumer = consumer.lock().await;
+                        consumer.receive_batch(max).await
+                    };
+                    let batch = if let Some(timeout_ms) = timeout_ms {
+                        match tokio::time::timeout(Duration::from_millis(timeout_ms), recv).await {
+                            Ok(result) => result,
+                            Err(_) => return Ok(None),
+                        }
+                    } else {
+                        recv.await
+                    };
+                    match batch {
+                        Ok(batch) => Ok(Some(batch)),
+                        Err(core::errors::ConsumerError::EndOfStream) => {
+                            exhausted.store(true, Ordering::SeqCst);
+                            Ok(None)
+                        }
+                        Err(err) => Err(err.into()),
+                    }
+                })
+            })
+            .map_err(to_py_runtime_error)?;
+
+        let Some(batch) = outcome else {
+            return Ok(Vec::new());
+        };
+        let messages: Vec<Message> = batch.messages.iter().map(Message::from_canonical).collect();
+        let count = batch.messages.len();
+        if count > 0 {
+            self.lock_pending()?.push((batch.commit, count));
+        }
+        Ok(messages)
+    }
+
+    /// Acknowledge every batch returned by `poll()` since the last `commit()`,
+    /// advancing the consumer offset.
+    ///
+    /// Calling this is required, not optional. Without it the offset never
+    /// advances (messages are re-delivered on the next run), most brokers stall
+    /// once their unacknowledged/prefetch window fills, and uncommitted batches
+    /// are held in memory so the process grows unbounded. To retry a failed
+    /// batch, simply don't commit it — it will be redelivered.
+    fn commit(&self, py: Python<'_>) -> PyResult<()> {
+        let commits: Vec<(core::traits::BatchCommitFunc, usize)> =
+            std::mem::take(&mut *self.lock_pending()?);
+        if commits.is_empty() {
+            return Ok(());
+        }
+        let runtime = Arc::clone(&self.runtime);
+        py.detach(move || {
+            run_sync_task(&runtime, async move {
+                for (commit, len) in commits {
+                    commit(vec![MessageDisposition::Ack; len]).await?;
+                }
+                Ok(())
+            })
+        })
+        .map_err(to_py_runtime_error)
+    }
+
+    /// `True` once the source has signalled end-of-stream (e.g. a fully drained
+    /// file). Streaming brokers never set this.
+    #[getter]
+    fn exhausted(&self) -> bool {
+        self.exhausted.load(Ordering::SeqCst)
+    }
+
+    fn __enter__<'a>(slf: PyRef<'a, Self>) -> PyRef<'a, Self> {
+        slf
+    }
+
+    #[pyo3(signature = (_exc_type=None, _exc_value=None, _traceback=None))]
+    fn __exit__(
+        &self,
+        _exc_type: Option<&Bound<'_, PyAny>>,
+        _exc_value: Option<&Bound<'_, PyAny>>,
+        _traceback: Option<&Bound<'_, PyAny>>,
+    ) -> bool {
+        false
+    }
+}
+
 /// Emit a Python `DeprecationWarning` from a deprecated constructor alias.
 fn warn_deprecated(py: Python<'_>, message: &str) -> PyResult<()> {
     // Build the C string at runtime rather than with a `c"..."` literal so the
@@ -1584,6 +1794,7 @@ fn _mq_bridge(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<Message>()?;
     module.add_class::<Route>()?;
     module.add_class::<Publisher>()?;
+    module.add_class::<Consumer>()?;
     module.add_class::<MemoryDrainer>()?;
     module.add("__version__", env!("CARGO_PKG_VERSION"))?;
     module.add_function(wrap_pyfunction!(config_schema, module)?)?;

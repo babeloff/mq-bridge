@@ -35,6 +35,33 @@ export class Publisher {
   requestJson(data: JsonValue, metadata?: Metadata | null, id?: string | null): Promise<Message>;
 }
 
+export class Consumer {
+  static fromFile(path: string, name?: string | null): Consumer;
+  static fromStr(text: string, name?: string | null): Consumer;
+  static fromConfig(config: JsonValue, name?: string | null): Consumer;
+  /**
+   * Receive up to `max` messages (default 256) without acking. Resolves to an
+   * empty array if `timeoutMs` milliseconds elapse with nothing received, or the
+   * source is exhausted. Omit `timeoutMs` to block until a message arrives. The
+   * returned messages are acked by the next `commit()` call — which you must
+   * call (see {@link Consumer.commit}).
+   */
+  poll(max?: number | null, timeoutMs?: number | null): Promise<Message[]>;
+  /**
+   * Acknowledge every batch returned by `poll()` since the last `commit()`,
+   * advancing the consumer offset.
+   *
+   * Calling this is required, not optional. Without it the offset never advances
+   * (messages are re-delivered on the next run), most brokers stall once their
+   * unacknowledged/prefetch window fills, and uncommitted batches are held in
+   * memory so the process grows unbounded. To retry a failed batch, simply
+   * don't commit it — it will be redelivered.
+   */
+  commit(): Promise<void>;
+  /** `true` once the source has signalled end-of-stream (e.g. a drained file). */
+  get exhausted(): boolean;
+}
+
 export class Route {
   static fromFile(path: string, name?: string | null): Route;
   static fromStr(text: string, name?: string | null): Route;

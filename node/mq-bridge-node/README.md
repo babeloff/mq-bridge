@@ -54,6 +54,40 @@ The `name` is optional: pass it to pick one entry out of a `routes:`/`publishers
 document, or omit it to treat the whole config as a single bare route/endpoint body.
 `fromYaml` / `fromYamlStr` remain as deprecated aliases for `fromFile` / `fromStr`.
 
+## Pull-based consumer
+
+`Route` is push-based. To pull messages on your own schedule, use `Consumer`,
+which wraps any input endpoint:
+
+```js
+import { Consumer } from "mq-bridge";
+
+const consumer = Consumer.fromConfig({ nats: { subject: "orders", url: "nats://localhost:4222" } });
+
+while (!consumer.exhausted) {
+  const batch = await consumer.poll(500, 1000); // [] on timeout
+  if (batch.length === 0) continue;
+  for (const message of batch) handle(message.json());
+  await consumer.commit(); // ack only after handling
+}
+```
+
+`poll(max?, timeoutMs?)` returns up to `max` messages (default 256) without
+acking, waiting up to `timeoutMs` milliseconds (omit it to block until a message
+arrives); `commit()` acks every batch returned since the last commit. Committing
+only after the downstream write succeeds gives at-least-once delivery. `exhausted`
+turns `true` once a bounded source (e.g. a file) is drained; streaming brokers
+never set it. `Consumer.fromFile` / `fromStr` accept a named entry under a
+`consumers:` section or a single bare endpoint body.
+
+> **You must call `commit()` — it is not optional.** It is the only thing that
+> tells the broker a batch is done. If you keep polling without committing, the
+> offset never advances (every message is **re-delivered** on the next run), most
+> brokers **stall** once their unacknowledged/prefetch window fills, and the
+> uncommitted batches are held in memory so the process **grows unbounded**.
+> Commit after each batch you have durably handled; to retry a failed batch,
+> simply don't commit it.
+
 ## Analysis
 
 HTTP comparison benchmark, driven by a native load generator (`wrk`) so the

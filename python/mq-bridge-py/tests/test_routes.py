@@ -10,7 +10,7 @@ import uuid
 
 import pytest
 
-from mq_bridge import MemoryDrainer, Publisher, Route
+from mq_bridge import Consumer, MemoryDrainer, Publisher, Route
 
 
 def _unique(prefix: str) -> str:
@@ -117,6 +117,35 @@ def test_run_blocks_until_stop() -> None:
     route.stop()
     assert returned.wait(timeout=5.0)
     thread.join(timeout=5.0)
+
+
+def test_consumer_poll_and_commit_round_trip() -> None:
+    topic = _unique("pytest.consumer")
+    endpoint = {"memory": {"topic": topic, "capacity": 4096}}
+
+    publisher = Publisher.from_config(endpoint)
+    consumer = Consumer.from_config(endpoint)
+
+    for value in range(5):
+        publisher.send_json({"value": value}, {"kind": "bench.tick"})
+
+    received = []
+    while len(received) < 5:
+        batch = consumer.poll(max=10, timeout_ms=5000)
+        assert batch, "poll timed out before all messages arrived"
+        received.extend(batch)
+    consumer.commit()
+
+    assert [m.json()["value"] for m in received] == list(range(5))
+    assert received[0].metadata["kind"] == "bench.tick"
+
+
+def test_consumer_poll_timeout_returns_empty() -> None:
+    topic = _unique("pytest.consumer.empty")
+    consumer = Consumer.from_config({"memory": {"topic": topic, "capacity": 16}})
+
+    assert consumer.poll(max=4, timeout_ms=200) == []
+    assert consumer.exhausted is False
 
 
 def test_publisher_request_json_echoes_via_config() -> None:

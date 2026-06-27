@@ -107,6 +107,42 @@ pub fn named_publisher_from_value(
     })
 }
 
+/// Load a named consumer endpoint from a config file.
+pub fn load_named_consumer(path: &Path, name: Option<&str>) -> anyhow::Result<Endpoint> {
+    named_consumer_from_value(load_config_value(path)?, name)
+}
+
+/// Resolve a consumer (input) endpoint from a config value. Mirrors
+/// [`named_publisher_from_value`]: when `name` is `Some`, look it up in a
+/// `consumers:` section; otherwise (or on a miss) parse the value as a single
+/// bare endpoint body. A `config:` export root is unwrapped first.
+pub fn named_consumer_from_value(
+    value: serde_yaml_ng::Value,
+    name: Option<&str>,
+) -> anyhow::Result<Endpoint> {
+    let value = unwrap_config_root(value);
+    if let Some(name) = name {
+        if let Some(map) = value.as_mapping() {
+            if let Some(section) = map.get(serde_yaml_ng::Value::String("consumers".to_string())) {
+                if let Ok(consumers) =
+                    serde_yaml_ng::from_value::<HashMap<String, Endpoint>>(section.clone())
+                {
+                    if let Some(endpoint) = consumers.get(name) {
+                        return Ok(endpoint.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    serde_yaml_ng::from_value(value).with_context(|| match name {
+        Some(name) => format!(
+            "No consumer named '{name}' found, and the config could not be parsed as a single consumer endpoint"
+        ),
+        None => "config could not be parsed as a single endpoint body".to_string(),
+    })
+}
+
 /// Parse a value that may be a `{routes, publishers}` document, a bare
 /// `{name: route}` map, or (without those sections) a plain route map.
 pub fn load_document_from_value(value: serde_yaml_ng::Value) -> anyhow::Result<ConfigDocument> {
@@ -244,6 +280,23 @@ config:
         let doc = load_document_from_value(unwrap_config_root(yaml(EXPORT))).unwrap();
         assert!(doc.routes.contains_key("orders_route"));
         assert!(doc.publishers.contains_key("incoming"));
+    }
+
+    #[test]
+    fn named_consumer_resolves_section_and_bare_body() {
+        // Named lookup in a `consumers:` section.
+        let doc = yaml("consumers:\n  orders:\n    memory:\n      topic: t\n      capacity: 16\n");
+        assert!(named_consumer_from_value(doc, Some("orders")).is_ok());
+
+        // Bare single-endpoint body (no name).
+        let bare = yaml("memory:\n  topic: t\n  capacity: 16\n");
+        assert!(named_consumer_from_value(bare, None).is_ok());
+
+        // A `config:` export root is unwrapped before the `consumers:` lookup.
+        let export = yaml(
+            "config:\n  consumers:\n    orders:\n      memory:\n        topic: t\n        capacity: 16\n",
+        );
+        assert!(named_consumer_from_value(export, Some("orders")).is_ok());
     }
 
     #[test]

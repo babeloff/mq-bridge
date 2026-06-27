@@ -1,4 +1,5 @@
 from ._mq_bridge import (
+    Consumer,
     MemoryDrainer,
     Message,
     NonRetryableError,
@@ -10,6 +11,7 @@ from ._mq_bridge import (
 )
 
 __all__ = [
+    "Consumer",
     "MemoryDrainer",
     "Message",
     "NonRetryableError",

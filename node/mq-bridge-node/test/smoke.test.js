@@ -3,7 +3,7 @@
 const assert = require("node:assert/strict");
 const net = require("node:net");
 const test = require("node:test");
-const { Message, Publisher, Route } = require("..");
+const { Consumer, Message, Publisher, Route } = require("..");
 
 async function freePort() {
   return new Promise((resolve, reject) => {
@@ -94,6 +94,36 @@ publishers:
   );
   const aliasResponse = await aliased.requestJson({ orderId: 8 });
   assert.deepEqual(aliasResponse.json(), { orderId: 8 });
+});
+
+test("Consumer.poll returns messages and commit acks them", async () => {
+  const topic = `node.consumer.${Date.now()}`;
+  const endpoint = { memory: { topic, capacity: 4096 } };
+
+  const publisher = Publisher.fromConfig(endpoint);
+  const consumer = Consumer.fromConfig(endpoint);
+
+  for (let value = 0; value < 5; value += 1) {
+    await publisher.sendJson({ value }, { kind: "node.tick" });
+  }
+
+  const received = [];
+  while (received.length < 5) {
+    const batch = await consumer.poll(10, 5000);
+    assert.ok(batch.length > 0, "poll timed out before all messages arrived");
+    received.push(...batch);
+  }
+  await consumer.commit();
+
+  assert.deepEqual(
+    received.map((message) => message.json().value),
+    [0, 1, 2, 3, 4],
+  );
+  assert.equal(received[0].metadata.kind, "node.tick");
+  assert.equal(consumer.exhausted, false);
+
+  const empty = await consumer.poll(4, 200);
+  assert.deepEqual(empty, []);
 });
 
 test("Route.withHandler serves an HTTP response", async () => {

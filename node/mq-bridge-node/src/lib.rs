@@ -1,13 +1,15 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
+use std::time::Duration;
 
 use ::mq_bridge as core;
 use anyhow::Context;
 use async_trait::async_trait;
 use core::models::Endpoint;
-use core::traits::Handler;
+use core::traits::{BatchCommitFunc, Handler, MessageConsumer, MessageDisposition};
 use core::type_handler::TypeHandler;
 use core::{
     CanonicalMessage, Handled, HandlerError, Publisher as CorePublisher, Route as CoreRoute, Sent,
@@ -531,6 +533,189 @@ impl Publisher {
             .map_err(to_napi_error)?
             .map_err(to_napi_error)?;
         Ok(NativeMessage::from_canonical(&response))
+    }
+}
+
+/// A pull-based consumer over any mq-bridge input endpoint.
+///
+/// `poll()` receives a batch of messages but does **not** acknowledge them;
+/// call `commit()` once they have been durably handled to ack every batch
+/// returned since the previous commit (advancing offsets / removing them from
+/// the source). This manual-commit model gives at-least-once delivery across a
+/// failed downstream load. The endpoint config decides durability (consumer vs
+/// subscriber mode), exactly as it does for a route input.
+///
+/// Relationship to the Rust core: this is a boundary-friendly projection of the
+/// core `MessageConsumer::receive_batch`, which is the low-level primitive. Two
+/// differences are deliberate, both because a Rust commit closure cannot be
+/// handed across the FFI boundary for JS to call later:
+///   - `receive_batch` returns the messages *and* their commit closure together;
+///     `poll()` returns only the messages and keeps the closure on the Rust side,
+///     so committing becomes the separate `commit()` call.
+///   - that closure accepts a per-message disposition vector (ack/nack/reject);
+///     `poll()` + `commit()` only ack the whole batch.
+/// `poll()` additionally layers a `timeoutMs` over `receive_batch` (which has no
+/// timeout of its own). Native Rust code should use `receive_batch` directly — it
+/// is strictly more expressive and needs no deferred-commit state.
+#[napi]
+pub struct Consumer {
+    runtime: Arc<Runtime>,
+    consumer: Arc<tokio::sync::Mutex<Box<dyn MessageConsumer>>>,
+    pending: Arc<Mutex<Vec<(BatchCommitFunc, usize)>>>,
+    exhausted: Arc<AtomicBool>,
+}
+
+#[napi]
+impl Consumer {
+    /// Build a consumer from a YAML or JSON config file. Accepts a `consumers:`
+    /// document entry (with `name`) or a single bare endpoint body.
+    #[napi(factory)]
+    pub fn from_file(path: String, name: Option<String>) -> Result<Self> {
+        let resolved = common::normalize_name(name.as_deref()).map(str::to_string);
+        let endpoint = common::load_named_consumer(Path::new(&path), resolved.as_deref())
+            .map_err(to_napi_error)?;
+        Self::build(
+            resolved.unwrap_or_else(common::default_route_name),
+            endpoint,
+        )
+    }
+
+    /// Build a consumer from an in-memory YAML or JSON string.
+    #[napi(factory)]
+    pub fn from_str(text: String, name: Option<String>) -> Result<Self> {
+        let resolved = common::normalize_name(name.as_deref()).map(str::to_string);
+        let value = serde_yaml_ng::from_str(&text)
+            .context("failed to parse YAML config")
+            .map_err(to_napi_error)?;
+        let endpoint =
+            common::named_consumer_from_value(value, resolved.as_deref()).map_err(to_napi_error)?;
+        Self::build(
+            resolved.unwrap_or_else(common::default_route_name),
+            endpoint,
+        )
+    }
+
+    /// Build a consumer from an in-memory mapping (e.g. a JS object). Omit `name`
+    /// to treat the mapping as a single bare endpoint body.
+    #[napi(factory)]
+    pub fn from_config(config: JsonValue, name: Option<String>) -> Result<Self> {
+        let resolved = common::normalize_name(name.as_deref()).map(str::to_string);
+        let value = serde_yaml_ng::to_value(config)
+            .context("failed to convert config mapping")
+            .map_err(to_napi_error)?;
+        let endpoint =
+            common::named_consumer_from_value(value, resolved.as_deref()).map_err(to_napi_error)?;
+        Self::build(
+            resolved.unwrap_or_else(common::default_route_name),
+            endpoint,
+        )
+    }
+
+    /// Receive up to `max` messages without acking. Resolves to an empty array
+    /// if `timeoutMs` milliseconds elapse with nothing received, or the source is
+    /// exhausted (see `exhausted`). Omit `timeoutMs` to block until a message
+    /// arrives. Acked by the next `commit()`.
+    #[napi]
+    pub async fn poll(
+        &self,
+        max: Option<u32>,
+        timeout_ms: Option<u32>,
+    ) -> Result<Vec<NativeMessage>> {
+        let consumer = Arc::clone(&self.consumer);
+        let exhausted = Arc::clone(&self.exhausted);
+        let max = max.unwrap_or(256).max(1) as usize;
+        let handle = self.runtime.spawn(async move {
+            let recv = async {
+                let mut consumer = consumer.lock().await;
+                consumer.receive_batch(max).await
+            };
+            let batch = if let Some(timeout_ms) = timeout_ms {
+                match tokio::time::timeout(Duration::from_millis(timeout_ms as u64), recv).await {
+                    Ok(result) => result,
+                    Err(_) => return Ok(None),
+                }
+            } else {
+                recv.await
+            };
+            match batch {
+                Ok(batch) => Ok(Some(batch)),
+                Err(core::errors::ConsumerError::EndOfStream) => {
+                    exhausted.store(true, Ordering::SeqCst);
+                    Ok(None)
+                }
+                Err(err) => Err(anyhow::Error::from(err)),
+            }
+        });
+        let outcome = handle
+            .await
+            .map_err(to_napi_error)?
+            .map_err(to_napi_error)?;
+        let Some(batch) = outcome else {
+            return Ok(Vec::new());
+        };
+        let messages: Vec<NativeMessage> = batch
+            .messages
+            .iter()
+            .map(NativeMessage::from_canonical)
+            .collect();
+        let count = batch.messages.len();
+        if count > 0 {
+            self.lock_pending()?.push((batch.commit, count));
+        }
+        Ok(messages)
+    }
+
+    /// Acknowledge every batch returned by `poll()` since the last `commit()`,
+    /// advancing the consumer offset.
+    ///
+    /// Calling this is required, not optional. Without it the offset never
+    /// advances (messages are re-delivered on the next run), most brokers stall
+    /// once their unacknowledged/prefetch window fills, and uncommitted batches
+    /// are held in memory so the process grows unbounded. To retry a failed
+    /// batch, simply don't commit it — it will be redelivered.
+    #[napi]
+    pub async fn commit(&self) -> Result<()> {
+        let commits: Vec<(BatchCommitFunc, usize)> = std::mem::take(&mut *self.lock_pending()?);
+        if commits.is_empty() {
+            return Ok(());
+        }
+        let handle = self.runtime.spawn(async move {
+            for (commit, len) in commits {
+                commit(vec![MessageDisposition::Ack; len]).await?;
+            }
+            Ok::<(), anyhow::Error>(())
+        });
+        handle.await.map_err(to_napi_error)?.map_err(to_napi_error)
+    }
+
+    /// `true` once the source has signalled end-of-stream (e.g. a fully drained
+    /// file). Streaming brokers never set this.
+    #[napi(getter)]
+    pub fn exhausted(&self) -> bool {
+        self.exhausted.load(Ordering::SeqCst)
+    }
+}
+
+impl Consumer {
+    fn build(name: String, endpoint: Endpoint) -> Result<Self> {
+        let runtime = Arc::new(common::build_runtime().map_err(to_napi_error)?);
+        let consumer = runtime
+            .block_on(core::endpoints::create_consumer_from_route(
+                &name, &endpoint,
+            ))
+            .map_err(to_napi_error)?;
+        Ok(Self {
+            runtime,
+            consumer: Arc::new(tokio::sync::Mutex::new(consumer)),
+            pending: Arc::new(Mutex::new(Vec::new())),
+            exhausted: Arc::new(AtomicBool::new(false)),
+        })
+    }
+
+    fn lock_pending(&self) -> Result<std::sync::MutexGuard<'_, Vec<(BatchCommitFunc, usize)>>> {
+        self.pending
+            .lock()
+            .map_err(|_| Error::from_reason("Consumer commit lock poisoned"))
     }
 }
 

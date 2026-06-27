@@ -96,6 +96,37 @@ class Publisher {
   }
 }
 
+class Consumer {
+  constructor(nativeConsumer) {
+    this._native = nativeConsumer;
+  }
+
+  static fromFile(path, name) {
+    return new Consumer(native.Consumer.fromFile(path, name));
+  }
+
+  static fromStr(text, name) {
+    return new Consumer(native.Consumer.fromStr(text, name));
+  }
+
+  static fromConfig(config, name) {
+    return new Consumer(native.Consumer.fromConfig(config, name));
+  }
+
+  async poll(max, timeoutMs) {
+    const messages = await this._native.poll(max, timeoutMs);
+    return messages.map((message) => Message._fromNative(message));
+  }
+
+  commit() {
+    return this._native.commit();
+  }
+
+  get exhausted() {
+    return this._native.exhausted;
+  }
+}
+
 class Route {
   constructor(nativeRoute) {
     this._native = nativeRoute;
@@ -168,6 +199,7 @@ function configSchema() {
 module.exports = {
   Message,
   Publisher,
+  Consumer,
   Route,
   configSchema,
   version: native.VERSION,

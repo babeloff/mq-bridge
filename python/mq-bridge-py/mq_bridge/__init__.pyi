@@ -103,6 +103,54 @@ class Route:
     ) -> bool: ...
 
 
+class Consumer:
+    @classmethod
+    def from_file(cls, path: str, name: Optional[str] = ...) -> "Consumer": ...
+
+    @classmethod
+    def from_str(cls, text: str, name: Optional[str] = ...) -> "Consumer": ...
+
+    @classmethod
+    def from_config(
+        cls, config: Mapping[str, Any], name: Optional[str] = ...
+    ) -> "Consumer": ...
+
+    def poll(
+        self,
+        max: int = ...,
+        timeout_ms: Optional[int] = ...,
+    ) -> List["Message"]:
+        """Receive up to ``max`` messages without acking. Empty list once
+        ``timeout_ms`` milliseconds elapse with nothing received, or when the
+        source is exhausted; omit ``timeout_ms`` to block until a message
+        arrives. The returned messages are acked by the next ``commit()`` call —
+        you must call it (see ``commit``)."""
+        ...
+
+    def commit(self) -> None:
+        """Ack every batch returned by ``poll()`` since the last ``commit()``,
+        advancing the consumer offset.
+
+        Calling this is required, not optional. Without it the offset never
+        advances (messages are re-delivered on the next run), most brokers stall
+        once their unacknowledged/prefetch window fills, and uncommitted batches
+        are held in memory so the process grows unbounded. To retry a failed
+        batch, simply don't commit it — it will be redelivered."""
+        ...
+
+    @property
+    def exhausted(self) -> bool: ...
+
+    def __enter__(self) -> "Consumer": ...
+
+    def __exit__(
+        self,
+        exc_type: Optional[Type[BaseException]],
+        exc_value: Optional[BaseException],
+        traceback: Optional[TracebackType],
+    ) -> bool: ...
+
+
 class MemoryDrainer:
     @classmethod
     def from_topic(
