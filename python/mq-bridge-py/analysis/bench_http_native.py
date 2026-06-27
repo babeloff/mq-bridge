@@ -145,7 +145,7 @@ def mqb_server(executor: str, route_concurrency: int):
     launcher = textwrap.dedent(
         f"""
         from mq_bridge import Route
-        route = Route.from_file({repr(str(cfg_path))}, "http_bench")
+        route = Route.from_file({str(cfg_path)!r}, "http_bench")
         route.add_handler("{KIND}", lambda data: {{"value": data["value"] + 1}})
         route.run()
         """
