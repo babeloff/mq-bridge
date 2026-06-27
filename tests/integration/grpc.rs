@@ -1,7 +1,7 @@
 #![allow(dead_code, unused)]
 
 use mq_bridge::test_utils::{
-    run_performance_pipeline_test, setup_logging, PERF_TEST_MESSAGE_COUNT,
+    run_performance_pipeline_test_named, setup_logging, PERF_TEST_MESSAGE_COUNT,
 };
 use std::env;
 use std::time::Duration;
@@ -182,7 +182,7 @@ async fn test_grpc_client_mode() {
     let (tx, _rx) = broadcast::channel(PERF_TEST_MESSAGE_COUNT + 1000);
     let bridge = MockBridge { tx };
     let incoming = TcpListenerStream::new(listener);
-    tracing::info!(mock = "server", grpc_url = %grpc_url, "starting mock gRPC server");
+    tracing::info!(mock = "server", grpc_url = %grpc_url, "starting mock gRPC server (client mode)");
     let grpc_url_clone = grpc_url.clone();
     let _server_handle = tokio::spawn(async move {
         if let Err(e) = tonic::transport::Server::builder()
@@ -202,7 +202,7 @@ async fn test_grpc_client_mode() {
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(PERF_TEST_MESSAGE_COUNT);
-    run_performance_pipeline_test("grpc", &config_yaml, msg_count).await;
+    run_performance_pipeline_test_named("grpc", "grpc client", &config_yaml, msg_count).await;
 }
 
 async fn test_grpc_server_mode() {
@@ -344,5 +344,5 @@ async fn test_grpc_server_mode() {
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(PERF_TEST_MESSAGE_COUNT);
-    run_performance_pipeline_test("grpc", &config_yaml, msg_count).await;
+    run_performance_pipeline_test_named("grpc", "grpc server", &config_yaml, msg_count).await;
 }

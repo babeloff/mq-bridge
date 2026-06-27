@@ -346,7 +346,7 @@ impl TestHarness {
 }
 
 pub async fn run_pipeline_test(broker_name: &str, config_yaml: &str) {
-    run_pipeline_test_internal(broker_name, config_yaml, 5, false, None, 0).await;
+    run_pipeline_test_internal(broker_name, broker_name, config_yaml, 5, false, None, 0).await;
 }
 
 pub async fn run_performance_pipeline_test(
@@ -354,7 +354,29 @@ pub async fn run_performance_pipeline_test(
     config_yaml: &str,
     num_messages: usize,
 ) {
-    run_pipeline_test_internal(broker_name, config_yaml, num_messages, true, None, 0).await;
+    run_performance_pipeline_test_named(broker_name, broker_name, config_yaml, num_messages).await;
+}
+
+/// Like [`run_performance_pipeline_test`], but uses `display_name` for the summary
+/// label while still resolving routes by `broker_name`. Lets backends that share a
+/// route key (e.g. the `sqlx` postgres/mysql/mariadb pipelines, or grpc client/server
+/// modes) report distinct rows in the performance summary.
+pub async fn run_performance_pipeline_test_named(
+    broker_name: &str,
+    display_name: &str,
+    config_yaml: &str,
+    num_messages: usize,
+) {
+    run_pipeline_test_internal(
+        broker_name,
+        display_name,
+        config_yaml,
+        num_messages,
+        true,
+        None,
+        0,
+    )
+    .await;
 }
 
 pub async fn run_chaos_pipeline_test(
@@ -396,6 +418,7 @@ pub async fn run_chaos_pipeline_test(
 
     run_pipeline_test_internal(
         broker_name,
+        broker_name,
         config_yaml,
         num_messages,
         false,
@@ -407,6 +430,7 @@ pub async fn run_chaos_pipeline_test(
 
 async fn run_pipeline_test_internal(
     broker_name: &str,
+    display_name: &str,
     config_yaml: &str,
     num_messages: usize,
     is_performance_test: bool,
@@ -545,7 +569,7 @@ async fn run_pipeline_test_internal(
 
     if is_performance_test {
         let messages_per_second = received.len() as f64 / duration.as_secs_f64();
-        println!("\n--- {} Performance Test Results ---", broker_name);
+        println!("\n--- {} Performance Test Results ---", display_name);
         println!(
             "Processed {} messages in {:.3} seconds.",
             received.len(),
@@ -555,7 +579,7 @@ async fn run_pipeline_test_internal(
         println!("--------------------------------\n");
 
         add_performance_result(PerformanceResult {
-            test_name: format!("{} Pipeline", broker_name),
+            test_name: format!("{} Pipeline", display_name),
             write_performance: messages_per_second,
             read_performance: messages_per_second,
             single_write_performance: 0.0,
@@ -566,7 +590,7 @@ async fn run_pipeline_test_internal(
             received.len(),
             num_messages,
             "TEST FAILED for [{}]: Expected {} messages, but found {}.",
-            broker_name,
+            display_name,
             num_messages,
             received.len()
         );
@@ -595,7 +619,7 @@ async fn run_pipeline_test_internal(
         }
     }
 
-    println!("Successfully verified {} route!", broker_name);
+    println!("Successfully verified {} route!", display_name);
 }
 
 static LOG_GUARD: Mutex<Option<WorkerGuard>> = Mutex::new(None);

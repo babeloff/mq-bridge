@@ -107,35 +107,74 @@ jobs:
       - name: Memory leak soak (route commit-task JoinSet)
         run: cargo test --test memory_leak_test --features=full -- --ignored --nocapture
 
-  # Integration tests (requires Docker) split into parallel jobs
+  # Compile the integration test binaries ONCE (release, full,test-utils) and
+  # publish them as a nextest archive. The three run jobs below download this
+  # archive instead of each recompiling the same binaries.
+  integration-build:
+    name: Integration — Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          # Shared with the benchmark job so the full-feature dependency compile
+          # is reused across jobs/runs.
+          shared-key: release-full
+
+      - name: Build nextest archive
+        run: |
+          cargo nextest archive \
+            --release --features full,test-utils \
+            --test integration_test --test armature_integration \
+            --archive-file nextest-archive.tar.zst
+
+      - name: Upload nextest archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-nextest-archive
+          path: nextest-archive.tar.zst
+          retention-days: 1
+
+  # Integration tests (requires Docker) split into parallel jobs. Each runs the
+  # prebuilt nextest archive from integration-build — no recompilation.
   integration-others:
     name: Integration — Others
     runs-on: ubuntu-latest
+    needs: integration-build
     services:
       docker:
         image: docker:dind
         options: --privileged
     steps:
       - uses: actions/checkout@v4
-      
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
-      
-      - name: Cache cargo build
-        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
         with:
-          # Differentiates the matrix `check` job per feature set; evaluates to an
-          # empty string (no-op) in non-matrix jobs. rust-cache already keys on the
-          # job id, OS, rustc version, and lockfiles automatically.
-          key: ${{ matrix.features }}
-      
+          tool: nextest
+
+      - name: Download nextest archive
+        uses: actions/download-artifact@v4
+        with:
+          name: integration-nextest-archive
+
       - name: Pre-pull docker images
         run: |
           find tests/integration/docker-compose -name "*.yml" | xargs -P 5 -I {} docker compose -f {} pull -q
-      - name: Install JDK (for keytool)
+      - name: Install JRE (for keytool)
         run: |
           sudo apt-get update
-          sudo apt-get install -y default-jdk
+          sudo apt-get install -y default-jre-headless
 
       - name: Generate TLS certs for integration services
         run: |
@@ -146,15 +185,20 @@ jobs:
 
       - name: Run chaos/stability tests
         run: |
-          cargo test --test integration_test --release --features full,test-utils -- --ignored --nocapture --test-threads=1 --exact test_all_chaos
+          cargo nextest run --archive-file nextest-archive.tar.zst \
+            --run-ignored all --no-capture \
+            -E 'binary(integration_test) & test(=test_all_chaos)'
 
       - name: Run remaining integration tests (excluding chaos & performance)
         run: |
-          cargo test --test integration_test --release --features full,test-utils -- --ignored --nocapture --test-threads=1 --skip test_all_chaos --skip test_all_performance_pipeline --skip test_all_performance_direct
+          cargo nextest run --archive-file nextest-archive.tar.zst \
+            --run-ignored all --no-capture \
+            -E 'binary(integration_test) & not test(=test_all_chaos) & not test(=test_all_performance_pipeline) & not test(=test_all_performance_direct)'
 
   integration-performance:
     name: Integration — Performance
     runs-on: ubuntu-latest
+    needs: integration-build
     services:
       docker:
         image: docker:dind
@@ -162,24 +206,23 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
-
-      - name: Cache cargo build
-        uses: Swatinem/rust-cache@v2
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
         with:
-          # Differentiates the matrix `check` job per feature set; evaluates to an
-          # empty string (no-op) in non-matrix jobs. rust-cache already keys on the
-          # job id, OS, rustc version, and lockfiles automatically.
-          key: ${{ matrix.features }}
+          tool: nextest
+
+      - name: Download nextest archive
+        uses: actions/download-artifact@v4
+        with:
+          name: integration-nextest-archive
 
       - name: Pre-pull docker images
         run: |
           find tests/integration/docker-compose -name "*.yml" | xargs -P 5 -I {} docker compose -f {} pull -q
-      - name: Install JDK (for keytool)
+      - name: Install JRE (for keytool)
         run: |
           sudo apt-get update
-          sudo apt-get install -y default-jdk
+          sudo apt-get install -y default-jre-headless
 
       - name: Generate TLS certs for integration services
         run: |
@@ -190,15 +233,20 @@ jobs:
 
       - name: Run pipeline performance tests
         run: |
-          cargo test --test integration_test --release --features full,test-utils -- --ignored --nocapture --test-threads=1 --exact test_all_performance_pipeline
+          cargo nextest run --archive-file nextest-archive.tar.zst \
+            --run-ignored all --no-capture \
+            -E 'binary(integration_test) & test(=test_all_performance_pipeline)'
 
       - name: Run other performance tests
         run: |
-          cargo test --test integration_test --release --features full,test-utils -- --ignored --nocapture --test-threads=1 --exact test_all_performance_direct
+          cargo nextest run --archive-file nextest-archive.tar.zst \
+            --run-ignored all --no-capture \
+            -E 'binary(integration_test) & test(=test_all_performance_direct)'
 
   integration-armature:
     name: Integration — Armature
     runs-on: ubuntu-latest
+    needs: integration-build
     services:
       docker:
         image: docker:dind
@@ -206,24 +254,23 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
-
-      - name: Cache cargo build
-        uses: Swatinem/rust-cache@v2
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
         with:
-          # Differentiates the matrix `check` job per feature set; evaluates to an
-          # empty string (no-op) in non-matrix jobs. rust-cache already keys on the
-          # job id, OS, rustc version, and lockfiles automatically.
-          key: ${{ matrix.features }}
+          tool: nextest
+
+      - name: Download nextest archive
+        uses: actions/download-artifact@v4
+        with:
+          name: integration-nextest-archive
 
       - name: Pre-pull docker images
         run: |
           find tests/integration/docker-compose -name "*.yml" | xargs -P 5 -I {} docker compose -f {} pull -q
-      - name: Install JDK (for keytool)
+      - name: Install JRE (for keytool)
         run: |
           sudo apt-get update
-          sudo apt-get install -y default-jdk
+          sudo apt-get install -y default-jre-headless
 
       - name: Generate TLS certs for integration services
         run: |
@@ -234,7 +281,9 @@ jobs:
 
       - name: Run armature integration tests
         run: |
-          cargo test --test armature_integration --release --features full,test-utils -- --ignored --nocapture --test-threads=1
+          cargo nextest run --archive-file nextest-archive.tar.zst \
+            --run-ignored all --no-capture \
+            -E 'binary(armature_integration)'
 
   # Documentation
   docs:
