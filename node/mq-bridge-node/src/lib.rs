@@ -1,6 +1,6 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
@@ -39,6 +39,14 @@ pub struct NativeMessage {
     pub payload: Buffer,
     pub metadata: Option<HashMap<String, String>>,
     pub id: Option<String>,
+}
+
+/// Result of `pollBatch()`: the messages plus the token used to `ack`/`nack` them.
+#[napi(object)]
+pub struct PollBatch {
+    pub messages: Vec<NativeMessage>,
+    /// `null` when the poll timed out or the source is exhausted.
+    pub token: Option<u32>,
 }
 
 impl NativeMessage {
@@ -562,8 +570,14 @@ pub struct Consumer {
     runtime: Arc<Runtime>,
     // `None` once `close()` has dropped the underlying consumer.
     consumer: Arc<tokio::sync::Mutex<Option<Box<dyn MessageConsumer>>>>,
-    pending: Arc<Mutex<Vec<(BatchCommitFunc, usize)>>>,
+    // Polled-but-uncommitted batches, keyed by a monotonic token. Ordered so
+    // `commit()` acks them oldest-first; `ack(token)`/`nack(token)` address one.
+    pending: Arc<Mutex<BTreeMap<u32, (BatchCommitFunc, usize)>>>,
+    next_token: Arc<AtomicU32>,
     exhausted: Arc<AtomicBool>,
+    // `true` for cumulative-ack transports (Kafka, …) where acking a later batch
+    // implicitly acks earlier ones, so token acks must stay oldest-first.
+    requires_order: bool,
 }
 
 #[napi]
@@ -622,49 +636,78 @@ impl Consumer {
         max: Option<u32>,
         timeout_ms: Option<u32>,
     ) -> Result<Vec<NativeMessage>> {
-        let consumer = Arc::clone(&self.consumer);
-        let exhausted = Arc::clone(&self.exhausted);
-        let max = max.unwrap_or(256).max(1) as usize;
-        let handle = self.runtime.spawn(async move {
-            let mut guard = consumer.lock().await;
-            let consumer = guard
-                .as_mut()
-                .ok_or_else(|| anyhow::anyhow!("consumer is closed"))?;
-            let recv = consumer.receive_batch(max);
-            let batch = if let Some(timeout_ms) = timeout_ms {
-                match tokio::time::timeout(Duration::from_millis(timeout_ms as u64), recv).await {
-                    Ok(result) => result,
-                    Err(_) => return Ok(None),
-                }
-            } else {
-                recv.await
-            };
-            match batch {
-                Ok(batch) => Ok(Some(batch)),
-                Err(core::errors::ConsumerError::EndOfStream) => {
-                    exhausted.store(true, Ordering::SeqCst);
-                    Ok(None)
-                }
-                Err(err) => Err(anyhow::Error::from(err)),
-            }
-        });
-        let outcome = handle
-            .await
-            .map_err(to_napi_error)?
-            .map_err(to_napi_error)?;
-        let Some(batch) = outcome else {
-            return Ok(Vec::new());
-        };
-        let messages: Vec<NativeMessage> = batch
-            .messages
-            .iter()
-            .map(NativeMessage::from_canonical)
-            .collect();
-        let count = batch.messages.len();
-        if count > 0 {
-            self.lock_pending()?.push((batch.commit, count));
+        match self.receive(max, timeout_ms).await? {
+            Some((messages, _token)) => Ok(messages),
+            None => Ok(Vec::new()),
         }
-        Ok(messages)
+    }
+
+    /// Like `poll()`, but also return the batch's token so it can be acked or
+    /// nacked individually with `ack(token)` / `nack(token)` — the shape a `dlt`
+    /// resource wants (`poll → yield → commit load package → ack(token)`).
+    /// Resolves to `{ messages, token }`, with `token === null` on timeout or
+    /// end-of-stream. Tokens stay outstanding until acked/nacked; `commit()`
+    /// still acks every outstanding batch at once, so don't mix the two styles
+    /// on one consumer.
+    #[napi]
+    pub async fn poll_batch(&self, max: Option<u32>, timeout_ms: Option<u32>) -> Result<PollBatch> {
+        match self.receive(max, timeout_ms).await? {
+            Some((messages, token)) => Ok(PollBatch {
+                messages,
+                token: Some(token),
+            }),
+            None => Ok(PollBatch {
+                messages: Vec::new(),
+                token: None,
+            }),
+        }
+    }
+
+    /// Acknowledge a single batch by the token from `pollBatch()`, advancing the
+    /// consumer offset for just that batch. Rejects if the token is unknown
+    /// (already acked/nacked, or never polled).
+    #[napi]
+    pub async fn ack(&self, token: u32) -> Result<()> {
+        self.commit_one(token, MessageDisposition::Ack).await
+    }
+
+    /// Negatively acknowledge so the broker can redeliver. With a `token`, nacks
+    /// just that batch; without one, nacks every outstanding batch (oldest
+    /// first). On Kafka there is no per-message nack — this leaves the offset
+    /// unadvanced, so redelivery happens on the next run/rebalance, not at once.
+    #[napi]
+    pub async fn nack(&self, token: Option<u32>) -> Result<()> {
+        if let Some(token) = token {
+            return self.commit_one(token, MessageDisposition::Nack).await;
+        }
+        // Nack all outstanding batches, oldest first.
+        let pending: Vec<(u32, (BatchCommitFunc, usize))> =
+            std::mem::take(&mut *self.lock_pending()?)
+                .into_iter()
+                .collect();
+        if pending.is_empty() {
+            return Ok(());
+        }
+        let handle = self.runtime.spawn(async move {
+            let mut iter = pending.into_iter();
+            while let Some((_token, (commit, len))) = iter.next() {
+                if let Err(err) = commit(vec![MessageDisposition::Nack; len]).await {
+                    return (Some(err), iter.collect::<Vec<_>>());
+                }
+            }
+            (None, Vec::new())
+        });
+        let (err, tail) = handle.await.map_err(to_napi_error)?;
+        if !tail.is_empty() {
+            let mut pending = self.lock_pending()?;
+            for (token, entry) in tail {
+                pending.insert(token, entry);
+            }
+        }
+        match err {
+            Some(err) => Err(to_napi_error(err)),
+            None => Ok(()),
+        }
     }
 
     /// Acknowledge every batch returned by `poll()` since the last `commit()`,
@@ -677,13 +720,17 @@ impl Consumer {
     /// batch, simply don't commit it — it will be redelivered.
     #[napi]
     pub async fn commit(&self) -> Result<()> {
-        let commits: Vec<(BatchCommitFunc, usize)> = std::mem::take(&mut *self.lock_pending()?);
+        // Drain oldest-first; `BTreeMap` iterates in token order.
+        let commits: Vec<(u32, (BatchCommitFunc, usize))> =
+            std::mem::take(&mut *self.lock_pending()?)
+                .into_iter()
+                .collect();
         if commits.is_empty() {
             return Ok(());
         }
         let handle = self.runtime.spawn(async move {
             let mut iter = commits.into_iter();
-            while let Some((commit, len)) = iter.next() {
+            while let Some((_token, (commit, len))) = iter.next() {
                 if let Err(err) = commit(vec![MessageDisposition::Ack; len]).await {
                     // Hand back the batches we never attempted so they can be retried.
                     return (Some(err), iter.collect::<Vec<_>>());
@@ -693,10 +740,11 @@ impl Consumer {
         });
         let (err, tail) = handle.await.map_err(to_napi_error)?;
         if !tail.is_empty() {
+            // Re-insert the un-attempted batches under their original tokens.
             let mut pending = self.lock_pending()?;
-            let mut restored = tail;
-            restored.append(&mut pending);
-            *pending = restored;
+            for (token, entry) in tail {
+                pending.insert(token, entry);
+            }
         }
         match err {
             Some(err) => Err(to_napi_error(err)),
@@ -755,18 +803,125 @@ impl Consumer {
                 &name, &endpoint,
             ))
             .map_err(to_napi_error)?;
+        let requires_order = consumer.commit_requires_order();
         Ok(Self {
             runtime,
             consumer: Arc::new(tokio::sync::Mutex::new(Some(consumer))),
-            pending: Arc::new(Mutex::new(Vec::new())),
+            pending: Arc::new(Mutex::new(BTreeMap::new())),
+            next_token: Arc::new(AtomicU32::new(0)),
             exhausted: Arc::new(AtomicBool::new(false)),
+            requires_order,
         })
     }
 
-    fn lock_pending(&self) -> Result<std::sync::MutexGuard<'_, Vec<(BatchCommitFunc, usize)>>> {
+    fn lock_pending(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, BTreeMap<u32, (BatchCommitFunc, usize)>>> {
         self.pending
             .lock()
             .map_err(|_| Error::from_reason("Consumer commit lock poisoned"))
+    }
+
+    /// Receive up to `max` messages, registering the batch's commit closure under
+    /// a fresh token. Resolves to `None` on timeout or end-of-stream, otherwise
+    /// the messages and their token. Shared by `poll()` and `pollBatch()`.
+    async fn receive(
+        &self,
+        max: Option<u32>,
+        timeout_ms: Option<u32>,
+    ) -> Result<Option<(Vec<NativeMessage>, u32)>> {
+        let consumer = Arc::clone(&self.consumer);
+        let exhausted = Arc::clone(&self.exhausted);
+        let pending = Arc::clone(&self.pending);
+        let next_token = Arc::clone(&self.next_token);
+        let max = max.unwrap_or(256).max(1) as usize;
+        // The token is allocated and the batch registered while still holding the
+        // consumer lock, so token order matches receive order even when several
+        // polls are in flight concurrently.
+        let handle = self.runtime.spawn(async move {
+            let mut guard = consumer.lock().await;
+            let consumer = guard
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("consumer is closed"))?;
+            let recv = consumer.receive_batch(max);
+            let batch = if let Some(timeout_ms) = timeout_ms {
+                match tokio::time::timeout(Duration::from_millis(timeout_ms as u64), recv).await {
+                    Ok(result) => result,
+                    Err(_) => return Ok(None),
+                }
+            } else {
+                recv.await
+            };
+            match batch {
+                Ok(batch) => {
+                    let count = batch.messages.len();
+                    if count == 0 {
+                        return Ok(None);
+                    }
+                    let token = next_token.fetch_add(1, Ordering::SeqCst);
+                    let mut pending = pending
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("Consumer commit lock poisoned"))?;
+                    // `u32` tokens stay JS-number friendly; fail fast if the
+                    // counter wraps onto a batch that is still outstanding rather
+                    // than silently overwriting its commit closure.
+                    if pending.contains_key(&token) {
+                        return Err(anyhow::anyhow!(
+                            "batch token space exhausted (u32 token counter wrapped with batches still outstanding)"
+                        ));
+                    }
+                    pending.insert(token, (batch.commit, count));
+                    drop(pending);
+                    Ok(Some((batch.messages, token)))
+                }
+                Err(core::errors::ConsumerError::EndOfStream) => {
+                    exhausted.store(true, Ordering::SeqCst);
+                    Ok(None)
+                }
+                Err(err) => Err(anyhow::Error::from(err)),
+            }
+        });
+        let outcome = handle
+            .await
+            .map_err(to_napi_error)?
+            .map_err(to_napi_error)?;
+        let Some((messages, token)) = outcome else {
+            return Ok(None);
+        };
+        let messages: Vec<NativeMessage> =
+            messages.iter().map(NativeMessage::from_canonical).collect();
+        Ok(Some((messages, token)))
+    }
+
+    /// Run one batch's commit closure with a uniform disposition, removing it from
+    /// `pending`. Used by `ack(token)` and `nack(token)`.
+    async fn commit_one(&self, token: u32, disposition: MessageDisposition) -> Result<()> {
+        let entry = {
+            let mut pending = self.lock_pending()?;
+            // On cumulative-ack transports, acking a later batch implicitly acks
+            // the earlier ones, so an out-of-order ack would silently drop them.
+            // Reject it (the token stays outstanding) instead of committing.
+            if matches!(disposition, MessageDisposition::Ack) && self.requires_order {
+                if let Some((&oldest, _)) = pending.iter().next() {
+                    if token != oldest && pending.contains_key(&token) {
+                        return Err(Error::from_reason(format!(
+                            "cannot ack batch token {token} before older outstanding token {oldest}: this transport commits cumulatively, so acks must follow receive order (ack older batches first, or use commit())"
+                        )));
+                    }
+                }
+            }
+            pending.remove(&token)
+        };
+        let Some((commit, len)) = entry else {
+            return Err(Error::from_reason(format!(
+                "unknown batch token {token} (already committed, or never polled)"
+            )));
+        };
+        let handle = self
+            .runtime
+            .spawn(async move { commit(vec![disposition; len]).await });
+        // On failure the closure consumed the batch; it cannot be retried by token.
+        handle.await.map_err(to_napi_error)?.map_err(to_napi_error)
     }
 }
 

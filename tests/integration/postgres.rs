@@ -77,8 +77,13 @@ pub async fn test_postgres_performance_pipeline() {
             "{out_capacity}",
             &(PERF_TEST_MESSAGE_COUNT + 1000).to_string(),
         );
-        run_performance_pipeline_test_named("sqlx", "postgres", &config_yaml, PERF_TEST_MESSAGE_COUNT)
-            .await;
+        run_performance_pipeline_test_named(
+            "sqlx",
+            "postgres",
+            &config_yaml,
+            PERF_TEST_MESSAGE_COUNT,
+        )
+        .await;
     })
     .await;
 }

@@ -20,6 +20,23 @@ pub struct CanonicalMessage {
     pub metadata: HashMap<String, String>,
 }
 
+/// Reserved prefix for framework-injected **source/provenance** metadata — the
+/// per-message position a consumer read from (e.g. `mqb.src.kafka_offset`,
+/// `mqb.src.nats_subject`). These keys describe where a message came from on the
+/// *current* hop and are deliberately **not** forwarded: every publisher strips
+/// keys with this prefix when serializing metadata to the wire/store, so they do
+/// not accumulate across chained endpoints (http → nats → kafka → mongodb).
+/// Application metadata (user headers, `reply_to`, `correlation_id`, …) is not
+/// prefixed and propagates as before.
+pub const SOURCE_METADATA_PREFIX: &str = "mqb.src.";
+
+/// Whether `key` is framework-injected source metadata that must not be forwarded.
+/// See [`SOURCE_METADATA_PREFIX`].
+#[inline]
+pub fn is_source_metadata_key(key: &str) -> bool {
+    key.starts_with(SOURCE_METADATA_PREFIX)
+}
+
 pub fn print_uuidv7<S>(value: &u128, serializer: S) -> Result<S::Ok, S::Error>
 where
     S: serde::Serializer,
@@ -306,6 +323,17 @@ macro_rules! msg {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn source_metadata_key_detection() {
+        assert!(is_source_metadata_key("mqb.src.kafka_offset"));
+        assert!(is_source_metadata_key("mqb.src.nats_subject"));
+        assert!(!is_source_metadata_key("kind"));
+        assert!(!is_source_metadata_key("reply_to"));
+        assert!(!is_source_metadata_key("correlation_id"));
+        // The reserved prefix itself is the boundary.
+        assert_eq!(SOURCE_METADATA_PREFIX, "mqb.src.");
+    }
 
     #[test]
     fn test_message_id_parsing() {

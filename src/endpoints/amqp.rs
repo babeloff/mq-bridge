@@ -232,6 +232,9 @@ impl MessagePublisher for AmqpPublisher {
                 if key == "reply_to" || key == "correlation_id" {
                     continue;
                 }
+                if crate::canonical_message::is_source_metadata_key(key) {
+                    continue; // source/provenance keys must not be forwarded
+                }
                 table.insert(
                     ShortString::from(key.as_str()),
                     lapin::types::AMQPValue::LongString(value.clone().into()),
@@ -337,6 +340,9 @@ impl MessagePublisher for AmqpPublisher {
                     // Skip reply_to and correlation_id since they are already set as native properties
                     if key == "reply_to" || key == "correlation_id" {
                         continue;
+                    }
+                    if crate::canonical_message::is_source_metadata_key(key) {
+                        continue; // source/provenance keys must not be forwarded
                     }
                     table.insert(
                         ShortString::from(key.clone()),
@@ -694,8 +700,27 @@ fn delivery_to_canonical_message(delivery: &lapin::message::Delivery) -> Canonic
             .insert("reply_to".to_string(), reply_to.to_string());
     }
 
+    // Source-position cursor keys (useful for dlt-style pull consumers).
+    canonical_message.metadata.insert(
+        "mqb.src.amqp_routing_key".to_string(),
+        delivery.routing_key.to_string(),
+    );
+    canonical_message.metadata.insert(
+        "mqb.src.amqp_exchange".to_string(),
+        delivery.exchange.to_string(),
+    );
+    canonical_message.metadata.insert(
+        "mqb.src.amqp_delivery_tag".to_string(),
+        delivery.delivery_tag.to_string(),
+    );
+
     if let Some(headers) = delivery.properties.headers().as_ref() {
         for (key, value) in headers.inner().iter() {
+            // Keep the framework-generated cursor keys above authoritative: never
+            // let an inbound header spoof a reserved `mqb.src.*` value.
+            if crate::canonical_message::is_source_metadata_key(key.as_str()) {
+                continue;
+            }
             let value_str = match value {
                 lapin::types::AMQPValue::LongString(s) => s.to_string(),
                 lapin::types::AMQPValue::ShortString(s) => s.to_string(),

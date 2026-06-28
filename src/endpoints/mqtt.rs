@@ -53,8 +53,21 @@ impl Client {
         &self,
         topic: &str,
         qos: QoS,
-        message: CanonicalMessage,
+        mut message: CanonicalMessage,
     ) -> anyhow::Result<()> {
+        // Whether the message carried per-hop source/provenance keys. In v3 the
+        // message_id rides only in the JSON envelope, which is emitted when
+        // metadata is non-empty; if stripping the source keys empties metadata we
+        // must still keep the envelope, or the message_id would be lost.
+        let had_source_metadata = message
+            .metadata
+            .keys()
+            .any(|key| crate::canonical_message::is_source_metadata_key(key));
+        // Drop source/provenance keys so they are not forwarded (v5 user
+        // properties or the v3 JSON envelope below).
+        message
+            .metadata
+            .retain(|key, _| !crate::canonical_message::is_source_metadata_key(key));
         match self {
             Client::V5(client) => {
                 let mut props = PublishProperties::default();
@@ -77,7 +90,7 @@ impl Client {
                     .map_err(|e| e.into())
             }
             Client::V3(client) => {
-                let payload = if !message.metadata.is_empty() {
+                let payload = if !message.metadata.is_empty() || had_source_metadata {
                     serde_json::to_vec(&message)?
                 } else {
                     message.payload.into()
@@ -780,14 +793,24 @@ fn publish_to_canonical_message_v5(p: &PublishV5) -> CanonicalMessage {
             canonical_message.metadata = metadata;
         }
     }
+    // Per-message topic — the only source cursor MQTT offers.
+    canonical_message.metadata.insert(
+        "mqb.src.mqtt_topic".to_string(),
+        String::from_utf8_lossy(&p.topic).into_owned(),
+    );
     canonical_message
 }
 
 fn publish_to_canonical_message_v3(p: &rumqttc::Publish) -> CanonicalMessage {
-    if let Ok(msg) = serde_json::from_slice::<CanonicalMessage>(&p.payload) {
-        return msg;
-    }
-    CanonicalMessage::new(p.payload.to_vec(), None)
+    let mut msg = match serde_json::from_slice::<CanonicalMessage>(&p.payload) {
+        Ok(msg) => msg,
+        Err(_) => CanonicalMessage::new(p.payload.to_vec(), None),
+    };
+    // Per-message topic — the only source cursor MQTT offers (and the only way to
+    // recover it under a wildcard subscription). No durable offset/sequence.
+    msg.metadata
+        .insert("mqb.src.mqtt_topic".to_string(), p.topic.clone());
+    msg
 }
 
 /// Sanitizes a string to be used as part of an MQTT client ID.

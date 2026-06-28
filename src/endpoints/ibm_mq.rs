@@ -522,7 +522,16 @@ async fn spawn_consumer_thread(
                             match res {
                                 Ok(opt) => {
                                     if let Some((data, _format)) = opt {
-                                        messages.push(CanonicalMessage::new(data.to_vec(), None));
+                                        let mut canonical =
+                                            CanonicalMessage::new(data.to_vec(), None);
+                                        // Source cursor: the queue this was read from.
+                                        if let Some(queue) = config.queue.as_deref() {
+                                            canonical.metadata.insert(
+                                                "mqb.src.ibmmq_queue".to_string(),
+                                                queue.to_string(),
+                                            );
+                                        }
+                                        messages.push(canonical);
                                         // zeroing buffer to avoid leaking sensitive data
                                         let buffer_len = data.len();
                                         buffer[..buffer_len].fill(0);

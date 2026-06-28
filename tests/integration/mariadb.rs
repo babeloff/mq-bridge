@@ -63,8 +63,13 @@ pub async fn test_mariadb_pipeline() {
 
 pub async fn test_mariadb_performance_pipeline() {
     run_mariadb_test(|config_yaml| async move {
-        run_performance_pipeline_test_named("sqlx", "mariadb", &config_yaml, PERF_TEST_MESSAGE_COUNT)
-            .await;
+        run_performance_pipeline_test_named(
+            "sqlx",
+            "mariadb",
+            &config_yaml,
+            PERF_TEST_MESSAGE_COUNT,
+        )
+        .await;
     })
     .await;
 }

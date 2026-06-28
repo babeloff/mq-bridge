@@ -131,6 +131,9 @@ impl MessagePublisher for NatsPublisher {
         let mut headers = if !message.metadata.is_empty() {
             let mut headers = HeaderMap::new();
             for (key, value) in &message.metadata {
+                if crate::canonical_message::is_source_metadata_key(key) {
+                    continue; // source/provenance keys must not be forwarded
+                }
                 headers.insert(key.as_str(), value.as_str());
             }
             headers
@@ -784,6 +787,19 @@ fn create_nats_canonical_message(
                 .or_insert_with(|| reply.to_string());
         }
     }
+    // Source-position cursor keys (useful for dlt-style pull consumers; the
+    // per-message subject is the only way to recover it under a wildcard
+    // subscription). `nats_stream_sequence` is absent for core NATS.
+    canonical_message.metadata.insert(
+        "mqb.src.nats_subject".to_string(),
+        message.subject.to_string(),
+    );
+    if let Some(sequence) = sequence {
+        canonical_message.metadata.insert(
+            "mqb.src.nats_stream_sequence".to_string(),
+            sequence.to_string(),
+        );
+    }
     canonical_message
 }
 
@@ -902,6 +918,34 @@ mod tests {
         let canonical = create_nats_canonical_message(&message, Some(1), false);
 
         assert!(!canonical.metadata.contains_key("reply_to"));
+    }
+
+    #[test]
+    fn jetstream_exposes_source_cursor_metadata() {
+        let message = nats_message(None, None);
+
+        let canonical = create_nats_canonical_message(&message, Some(42), false);
+
+        assert_eq!(
+            canonical
+                .metadata
+                .get("mqb.src.nats_subject")
+                .map(String::as_str),
+            Some("test.subject")
+        );
+        assert_eq!(
+            canonical
+                .metadata
+                .get("mqb.src.nats_stream_sequence")
+                .map(String::as_str),
+            Some("42")
+        );
+        // Core NATS (no sequence) omits the sequence key.
+        let core = create_nats_canonical_message(&message, None, false);
+        assert!(!core.metadata.contains_key("mqb.src.nats_stream_sequence"));
+        assert!(crate::canonical_message::is_source_metadata_key(
+            "mqb.src.nats_subject"
+        ));
     }
 
     #[test]

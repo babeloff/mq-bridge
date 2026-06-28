@@ -154,10 +154,16 @@ impl MessagePublisher for FilePublisher {
 
         // Iterate over messages, consuming them
         for msg in messages {
+            // Sanitize only the outbound copy: source/provenance keys are per-hop
+            // context and not persisted, but the original `msg` is preserved so a
+            // failed serialize/write reports the message with its fields intact.
+            let mut out = msg.clone();
+            out.metadata
+                .retain(|key, _| !crate::canonical_message::is_source_metadata_key(key));
             let serialized_msg = match self.format {
-                FileFormat::Raw => Ok(msg.payload.to_vec()),
+                FileFormat::Raw => Ok(out.payload.to_vec()),
                 FileFormat::Normal => {
-                    if msg
+                    if out
                         .metadata
                         .get("mq_bridge.original_format")
                         .map(|s| s.as_str())
@@ -165,13 +171,13 @@ impl MessagePublisher for FilePublisher {
                     {
                         // If the message was originally raw, pass its payload through directly
                         // to support raw file-to-file copies without re-wrapping.
-                        Ok(msg.payload.to_vec())
+                        Ok(out.payload.to_vec())
                     } else {
-                        serde_json::to_vec(&msg)
+                        serde_json::to_vec(&out)
                     }
                 }
                 FileFormat::Json => {
-                    if let Ok(json_val) = serde_json::from_slice::<serde_json::Value>(&msg.payload)
+                    if let Ok(json_val) = serde_json::from_slice::<serde_json::Value>(&out.payload)
                     {
                         #[derive(serde::Serialize)]
                         struct JsonWrapper<'a> {
@@ -181,16 +187,16 @@ impl MessagePublisher for FilePublisher {
                             metadata: &'a HashMap<String, String>,
                         }
                         serde_json::to_vec(&JsonWrapper {
-                            message_id: msg.message_id,
+                            message_id: out.message_id,
                             payload: json_val,
-                            metadata: &msg.metadata,
+                            metadata: &out.metadata,
                         })
                     } else {
-                        serde_json::to_vec(&msg)
+                        serde_json::to_vec(&out)
                     }
                 }
                 FileFormat::Text => {
-                    if let Ok(text) = std::str::from_utf8(&msg.payload) {
+                    if let Ok(text) = std::str::from_utf8(&out.payload) {
                         #[derive(serde::Serialize)]
                         struct TextWrapper<'a> {
                             #[serde(serialize_with = "crate::canonical_message::print_uuidv7")]
@@ -199,12 +205,12 @@ impl MessagePublisher for FilePublisher {
                             metadata: &'a HashMap<String, String>,
                         }
                         serde_json::to_vec(&TextWrapper {
-                            message_id: msg.message_id,
+                            message_id: out.message_id,
                             payload: text,
-                            metadata: &msg.metadata,
+                            metadata: &out.metadata,
                         })
                     } else {
-                        serde_json::to_vec(&msg)
+                        serde_json::to_vec(&out)
                     }
                 }
             };

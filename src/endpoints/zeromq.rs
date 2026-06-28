@@ -118,9 +118,15 @@ impl ZeroMqPublisher {
 impl MessagePublisher for ZeroMqPublisher {
     async fn send_batch(
         &self,
-        messages: Vec<CanonicalMessage>,
+        mut messages: Vec<CanonicalMessage>,
     ) -> Result<SentBatch, PublisherError> {
         trace!(count = messages.len(), message_ids = ?LazyMessageIds(&messages), "Publishing batch of ZeroMQ messages");
+        // Source/provenance keys are per-hop context and must not be forwarded.
+        for message in &mut messages {
+            message
+                .metadata
+                .retain(|key, _| !crate::canonical_message::is_source_metadata_key(key));
+        }
         let payload =
             serde_json::to_vec(&messages).map_err(|e| PublisherError::NonRetryable(anyhow!(e)))?;
         let zmq_msg = ZmqMessage::from(bytes::Bytes::from(payload));
@@ -135,7 +141,8 @@ impl MessagePublisher for ZeroMqPublisher {
                 .await
                 .map_err(|_| PublisherError::Retryable(anyhow!("ZeroMQ reply channel closed")))?
                 .map_err(|e| PublisherError::Retryable(anyhow!(e)))?;
-            let responses = ZeroMqConsumer::decode_batch(response_zmq)
+            // REQ/REP replies are never SUB traffic, so no topic cursor applies.
+            let responses = ZeroMqConsumer::decode_batch(response_zmq, false)
                 .map_err(|e| PublisherError::NonRetryable(anyhow!(e)))?;
             Ok(SentBatch::Partial {
                 responses: Some(responses),
@@ -208,11 +215,15 @@ struct BatchReplyState {
 pub struct ZeroMqConsumer {
     rx: Receiver<Result<ConsumerItem, ConsumerError>>,
     buffer: VecDeque<BufferedMessage>,
+    // Only SUB sockets prepend a subscription-topic frame; for PULL/REP a leading
+    // frame is payload, not a topic, so the cursor must not be attached there.
+    is_sub: bool,
 }
 
 impl ZeroMqConsumer {
     pub async fn new(config: &ZeroMqConfig) -> anyhow::Result<Self> {
         let socket_type = config.socket_type.clone().unwrap_or(ZeroMqSocketType::Pull);
+        let is_sub = matches!(socket_type, ZeroMqSocketType::Sub);
         let mut socket = match socket_type {
             ZeroMqSocketType::Pull => {
                 let mut s = zeromq::PullSocket::new();
@@ -315,22 +326,43 @@ impl ZeroMqConsumer {
         Ok(Self {
             rx,
             buffer: VecDeque::new(),
+            is_sub,
         })
     }
 
-    pub(crate) fn decode_batch(zmq_msg: ZmqMessage) -> anyhow::Result<Vec<CanonicalMessage>> {
+    pub(crate) fn decode_batch(
+        zmq_msg: ZmqMessage,
+        is_sub: bool,
+    ) -> anyhow::Result<Vec<CanonicalMessage>> {
         let frames = zmq_msg.into_vec();
         let payload = frames.last().cloned().unwrap_or_default();
         if payload.is_empty() {
             return Ok(vec![]);
         }
-        if let Ok(messages) = serde_json::from_slice::<Vec<CanonicalMessage>>(&payload) {
-            return Ok(messages);
+        // Only SUB traffic prepends the subscription topic as a leading frame;
+        // PUSH/PULL and REP carry payload frames only, so a leading frame there is
+        // not a topic. Attach the source cursor for SUB sockets only.
+        let topic = if is_sub && frames.len() > 1 {
+            Some(String::from_utf8_lossy(frames[0].as_ref()).into_owned())
+        } else {
+            None
+        };
+        let mut messages =
+            if let Ok(messages) = serde_json::from_slice::<Vec<CanonicalMessage>>(&payload) {
+                messages
+            } else if let Ok(message) = serde_json::from_slice::<CanonicalMessage>(&payload) {
+                vec![message]
+            } else {
+                vec![CanonicalMessage::new(payload.to_vec(), None)]
+            };
+        if let Some(topic) = topic {
+            for message in &mut messages {
+                message
+                    .metadata
+                    .insert("mqb.src.zeromq_topic".to_string(), topic.clone());
+            }
         }
-        if let Ok(message) = serde_json::from_slice::<CanonicalMessage>(&payload) {
-            return Ok(vec![message]);
-        }
-        Ok(vec![CanonicalMessage::new(payload.to_vec(), None)])
+        Ok(messages)
     }
 
     async fn fill_buffer(&mut self) -> Result<(), ConsumerError> {
@@ -339,8 +371,8 @@ impl ZeroMqConsumer {
             .recv()
             .await
             .map_err(|_| ConsumerError::EndOfStream)??;
-        let msgs =
-            Self::decode_batch(item.msg).map_err(|e| ConsumerError::Connection(anyhow!(e)))?;
+        let msgs = Self::decode_batch(item.msg, self.is_sub)
+            .map_err(|e| ConsumerError::Connection(anyhow!(e)))?;
 
         if let Some(tx) = item.reply_tx {
             let count = msgs.len();
@@ -417,8 +449,13 @@ impl MessageConsumer for ZeroMqConsumer {
 
                         if state.pending == 0 {
                             if let Some(tx) = state.tx.take() {
-                                let final_resps: Vec<CanonicalMessage> =
+                                let mut final_resps: Vec<CanonicalMessage> =
                                     state.responses.iter().filter_map(|r| r.clone()).collect();
+                                for resp in &mut final_resps {
+                                    resp.metadata.retain(|key, _| {
+                                        !crate::canonical_message::is_source_metadata_key(key)
+                                    });
+                                }
 
                                 let payload = serde_json::to_vec(&final_resps).unwrap_or_default();
                                 let _ = tx.send(ZmqMessage::from(bytes::Bytes::from(payload)));

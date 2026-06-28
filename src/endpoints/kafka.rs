@@ -183,6 +183,9 @@ impl MessagePublisher for KafkaPublisher {
 
         if !message.metadata.is_empty() {
             for (key, value) in &message.metadata {
+                if crate::canonical_message::is_source_metadata_key(key) {
+                    continue; // source/provenance keys must not be forwarded
+                }
                 headers = headers.insert(rdkafka::message::Header {
                     key,
                     value: Some(value.as_bytes()),
@@ -247,6 +250,9 @@ impl MessagePublisher for KafkaPublisher {
 
             if !message.metadata.is_empty() {
                 for (key, value) in &message.metadata {
+                    if crate::canonical_message::is_source_metadata_key(key) {
+                        continue; // source/provenance keys must not be forwarded
+                    }
                     headers = headers.insert(rdkafka::message::Header {
                         key,
                         value: Some(value.as_bytes()),
@@ -683,6 +689,21 @@ fn process_message<M: Message>(
             canonical_message.metadata = metadata;
         }
     }
+
+    // Source-position cursor keys (useful for dlt-style pull consumers; the
+    // per-message topic is the only way to recover it under a topic pattern).
+    canonical_message.metadata.insert(
+        "mqb.src.kafka_topic".to_string(),
+        message.topic().to_string(),
+    );
+    canonical_message.metadata.insert(
+        "mqb.src.kafka_partition".to_string(),
+        message.partition().to_string(),
+    );
+    canonical_message.metadata.insert(
+        "mqb.src.kafka_offset".to_string(),
+        message.offset().to_string(),
+    );
 
     messages.push(canonical_message);
 

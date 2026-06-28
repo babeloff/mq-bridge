@@ -138,6 +138,47 @@ brokers never set it.
 > Commit after each batch you have durably handled (as in the loops above). If a
 > batch fails downstream, simply *don't* commit it — it will be redelivered.
 
+### Per-batch tokens: `poll_batch` / `ack` / `nack`
+
+When you need to ack or release **specific** batches (rather than everything since
+the last commit), use the token form. `poll_batch(max, timeout_ms)` returns
+`(messages, token)`; `ack(token)` commits just that batch, and `nack(token)`
+releases it for redelivery (`nack()` with no argument nacks every outstanding
+batch). This is the shape a [`dlt`](https://dlthub.com) resource wants — poll →
+yield records → load package commits → `ack(token)` — and is demonstrated in
+[`examples/dlt_source.py`](examples/dlt_source.py) with the wiring brief in
+[`examples/OMNILOAD_INTEGRATION.md`](examples/OMNILOAD_INTEGRATION.md).
+
+```python
+messages, token = consumer.poll_batch(max=500, timeout_ms=1000)  # ([], None) on timeout
+if token is not None:                  # nothing returned on an idle timeout
+    # ... persist the batch downstream ...
+    consumer.ack(token)                # or consumer.nack(token) to redeliver
+```
+
+Tokens stay outstanding until acked/nacked; `commit()` still acks every
+outstanding batch at once, so don't mix the two styles on one consumer. On
+cumulative-ack transports (Kafka), acking a later batch would implicitly ack the
+earlier ones, so `ack(token)` must follow receive order — acking out of order
+raises; ack the oldest outstanding batch first, or use `commit()`. Transports
+that ack each batch individually (NATS JetStream, AMQP, MQTT) accept any order.
+
+> **At-least-once + idempotent merge.** Redelivery (after a nack, a missed
+> `commit()`, or an expired broker ack deadline) means a record can arrive twice.
+> A downstream loader must dedup on a stable key — `message.id` is globally unique
+> per source position (Kafka `partition:offset`, NATS `stream_sequence`, AMQP
+> delivery tag) and makes a natural primary key. Source cursor fields are also in
+> `message.metadata` (`mqb.src.kafka_topic`/`mqb.src.kafka_offset`, `mqb.src.nats_subject`/`mqb.src.nats_stream_sequence`,
+> `mqb.src.amqp_routing_key`/`mqb.src.amqp_delivery_tag`).
+>
+> **Ack deadlines vs slow loads.** JetStream `AckWait` (default 30s), AMQP
+> prefetch/consumer-timeout and MQTT inflight windows each bound how long a batch
+> may stay un-acked. Keep `batch_size × per-record handling cost` under the
+> smallest deadline (or raise it in the endpoint config); past it the broker
+> redelivers — correctness is preserved by idempotent merge, but reload work is
+> wasted. **Kafka has no per-message nack:** `nack` there leaves the offset
+> unadvanced, so redelivery happens on the next run/rebalance, not immediately.
+
 `consumer.status()` returns a snapshot dict (`healthy`, `target`, `pending`,
 `capacity`, `error`, `details`). `pending` is the broker backlog/lag where the
 transport reports it — Kafka offset lag, AMQP queue depth, NATS JetStream

@@ -64,7 +64,11 @@ impl SledPublisher {
 
 #[async_trait]
 impl MessagePublisher for SledPublisher {
-    async fn send(&self, message: CanonicalMessage) -> Result<Sent, PublisherError> {
+    async fn send(&self, mut message: CanonicalMessage) -> Result<Sent, PublisherError> {
+        // Source/provenance keys are per-hop context, not persisted fields.
+        message
+            .metadata
+            .retain(|key, _| !crate::canonical_message::is_source_metadata_key(key));
         let id = self
             .db
             .generate_id()
@@ -90,7 +94,11 @@ impl MessagePublisher for SledPublisher {
     ) -> Result<SentBatch, PublisherError> {
         trace!(count = messages.len(), message_ids = ?LazyMessageIds(&messages), "Publishing batch to Sled");
         let mut batch = sled::Batch::default();
-        for message in messages {
+        for mut message in messages {
+            // Source/provenance keys are per-hop context, not persisted fields.
+            message
+                .metadata
+                .retain(|key, _| !crate::canonical_message::is_source_metadata_key(key));
             let id = self
                 .db
                 .generate_id()

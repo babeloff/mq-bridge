@@ -408,6 +408,7 @@ impl MessagePublisher for AwsPublisher {
         );
 
         let mut message_attrs = message.metadata.clone();
+        message_attrs.retain(|key, _| !crate::canonical_message::is_source_metadata_key(key));
         let body = encode_aws_payload(
             &message.payload,
             &mut message_attrs,
@@ -491,6 +492,8 @@ impl MessagePublisher for AwsPublisher {
                 let mut valid_indices = Vec::with_capacity(chunk.len());
                 for (i, msg) in chunk.iter().enumerate() {
                     let mut message_attrs = msg.metadata.clone();
+                    message_attrs
+                        .retain(|key, _| !crate::canonical_message::is_source_metadata_key(key));
                     let body = match encode_aws_payload(
                         &msg.payload,
                         &mut message_attrs,
