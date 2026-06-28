@@ -65,9 +65,7 @@ impl Client {
             .any(|key| crate::canonical_message::is_source_metadata_key(key));
         // Drop source/provenance keys so they are not forwarded (v5 user
         // properties or the v3 JSON envelope below).
-        message
-            .metadata
-            .retain(|key, _| !crate::canonical_message::is_source_metadata_key(key));
+        message.strip_source_metadata();
         match self {
             Client::V5(client) => {
                 let mut props = PublishProperties::default();
@@ -777,6 +775,11 @@ fn publish_to_canonical_message_v5(p: &PublishV5) -> CanonicalMessage {
                     canonical_message.message_id = id;
                 }
             }
+            // Never let an inbound property spoof a reserved `mqb.src.*` value; the
+            // authoritative topic cursor is injected below.
+            if crate::canonical_message::is_source_metadata_key(key) {
+                continue;
+            }
             metadata.insert(key.clone(), value.clone());
         }
         if let Some(rt) = &props.response_topic {
@@ -806,8 +809,11 @@ fn publish_to_canonical_message_v3(p: &rumqttc::Publish) -> CanonicalMessage {
         Ok(msg) => msg,
         Err(_) => CanonicalMessage::new(p.payload.to_vec(), None),
     };
-    // Per-message topic — the only source cursor MQTT offers (and the only way to
-    // recover it under a wildcard subscription). No durable offset/sequence.
+    // Never let a spoofed `mqb.src.*` key in the inbound envelope survive; the
+    // authoritative topic cursor is injected below. (No durable offset/sequence —
+    // the per-message topic is the only source cursor MQTT offers, and the only way
+    // to recover it under a wildcard subscription.)
+    msg.strip_source_metadata();
     msg.metadata
         .insert("mqb.src.mqtt_topic".to_string(), p.topic.clone());
     msg
@@ -943,5 +949,39 @@ fn parse_qos(qos: u8) -> QoS {
         1 => QoS::AtLeastOnce,
         2 => QoS::ExactlyOnce,
         _ => QoS::AtLeastOnce,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::CanonicalMessage;
+
+    #[test]
+    fn v3_strips_spoofed_source_metadata_and_injects_topic() {
+        // A v3 JSON envelope carries a reserved `mqb.src.*` key. It must be dropped,
+        // and the authoritative per-message topic cursor injected.
+        let mut msg = CanonicalMessage::from_vec("body");
+        msg.metadata
+            .insert("mqb.src.kafka_offset".to_string(), "999".to_string());
+        msg.metadata
+            .insert("user_key".to_string(), "kept".to_string());
+        let envelope = serde_json::to_vec(&msg).unwrap();
+        let publish = PublishV3::new("orders/new", QoS::AtLeastOnce, envelope);
+
+        let canonical = publish_to_canonical_message_v3(&publish);
+
+        assert!(!canonical.metadata.contains_key("mqb.src.kafka_offset"));
+        assert_eq!(
+            canonical.metadata.get("user_key").map(String::as_str),
+            Some("kept")
+        );
+        assert_eq!(
+            canonical
+                .metadata
+                .get("mqb.src.mqtt_topic")
+                .map(String::as_str),
+            Some("orders/new")
+        );
     }
 }

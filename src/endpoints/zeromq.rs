@@ -123,9 +123,7 @@ impl MessagePublisher for ZeroMqPublisher {
         trace!(count = messages.len(), message_ids = ?LazyMessageIds(&messages), "Publishing batch of ZeroMQ messages");
         // Source/provenance keys are per-hop context and must not be forwarded.
         for message in &mut messages {
-            message
-                .metadata
-                .retain(|key, _| !crate::canonical_message::is_source_metadata_key(key));
+            message.strip_source_metadata();
         }
         let payload =
             serde_json::to_vec(&messages).map_err(|e| PublisherError::NonRetryable(anyhow!(e)))?;
@@ -355,6 +353,11 @@ impl ZeroMqConsumer {
             } else {
                 vec![CanonicalMessage::new(payload.to_vec(), None)]
             };
+        for message in &mut messages {
+            // Never let a spoofed `mqb.src.*` key in the inbound payload survive;
+            // the authoritative topic cursor (SUB only) is injected below.
+            message.strip_source_metadata();
+        }
         if let Some(topic) = topic {
             for message in &mut messages {
                 message
@@ -452,9 +455,7 @@ impl MessageConsumer for ZeroMqConsumer {
                                 let mut final_resps: Vec<CanonicalMessage> =
                                     state.responses.iter().filter_map(|r| r.clone()).collect();
                                 for resp in &mut final_resps {
-                                    resp.metadata.retain(|key, _| {
-                                        !crate::canonical_message::is_source_metadata_key(key)
-                                    });
+                                    resp.strip_source_metadata();
                                 }
 
                                 let payload = serde_json::to_vec(&final_resps).unwrap_or_default();
@@ -525,5 +526,26 @@ mod tests {
             .expect("Timed out waiting for message")
             .unwrap();
         assert_eq!(received.message.get_payload_str(), "hello zeromq");
+    }
+
+    #[test]
+    fn decode_batch_strips_spoofed_source_metadata() {
+        // A wire payload carries a reserved `mqb.src.*` key. decode_batch must drop
+        // it so it can't masquerade as a framework-injected cursor downstream.
+        let mut msg = CanonicalMessage::from_vec("body");
+        msg.metadata
+            .insert("mqb.src.kafka_offset".to_string(), "999".to_string());
+        msg.metadata
+            .insert("user_key".to_string(), "kept".to_string());
+        let payload = serde_json::to_vec(&vec![msg]).unwrap();
+        let zmq_msg = ZmqMessage::from(bytes::Bytes::from(payload));
+
+        let decoded = ZeroMqConsumer::decode_batch(zmq_msg, false).unwrap();
+        assert_eq!(decoded.len(), 1);
+        assert!(!decoded[0].metadata.contains_key("mqb.src.kafka_offset"));
+        assert_eq!(
+            decoded[0].metadata.get("user_key").map(String::as_str),
+            Some("kept")
+        );
     }
 }

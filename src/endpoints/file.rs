@@ -153,17 +153,16 @@ impl MessagePublisher for FilePublisher {
         let mut failed_messages = Vec::new();
 
         // Iterate over messages, consuming them
-        for msg in messages {
-            // Sanitize only the outbound copy: source/provenance keys are per-hop
-            // context and not persisted, but the original `msg` is preserved so a
-            // failed serialize/write reports the message with its fields intact.
-            let mut out = msg.clone();
-            out.metadata
-                .retain(|key, _| !crate::canonical_message::is_source_metadata_key(key));
+        for mut msg in messages {
+            // Strip per-hop source/provenance keys in place — they are not
+            // persisted. Done on the owned message (no payload clone); a message
+            // pushed to `failed_messages` keeps its remaining fields, and the
+            // dropped `mqb.src.*` keys are irrelevant to a retry on the next hop.
+            msg.strip_source_metadata();
             let serialized_msg = match self.format {
-                FileFormat::Raw => Ok(out.payload.to_vec()),
+                FileFormat::Raw => Ok(msg.payload.to_vec()),
                 FileFormat::Normal => {
-                    if out
+                    if msg
                         .metadata
                         .get("mq_bridge.original_format")
                         .map(|s| s.as_str())
@@ -171,13 +170,13 @@ impl MessagePublisher for FilePublisher {
                     {
                         // If the message was originally raw, pass its payload through directly
                         // to support raw file-to-file copies without re-wrapping.
-                        Ok(out.payload.to_vec())
+                        Ok(msg.payload.to_vec())
                     } else {
-                        serde_json::to_vec(&out)
+                        serde_json::to_vec(&msg)
                     }
                 }
                 FileFormat::Json => {
-                    if let Ok(json_val) = serde_json::from_slice::<serde_json::Value>(&out.payload)
+                    if let Ok(json_val) = serde_json::from_slice::<serde_json::Value>(&msg.payload)
                     {
                         #[derive(serde::Serialize)]
                         struct JsonWrapper<'a> {
@@ -187,16 +186,16 @@ impl MessagePublisher for FilePublisher {
                             metadata: &'a HashMap<String, String>,
                         }
                         serde_json::to_vec(&JsonWrapper {
-                            message_id: out.message_id,
+                            message_id: msg.message_id,
                             payload: json_val,
-                            metadata: &out.metadata,
+                            metadata: &msg.metadata,
                         })
                     } else {
-                        serde_json::to_vec(&out)
+                        serde_json::to_vec(&msg)
                     }
                 }
                 FileFormat::Text => {
-                    if let Ok(text) = std::str::from_utf8(&out.payload) {
+                    if let Ok(text) = std::str::from_utf8(&msg.payload) {
                         #[derive(serde::Serialize)]
                         struct TextWrapper<'a> {
                             #[serde(serialize_with = "crate::canonical_message::print_uuidv7")]
@@ -205,12 +204,12 @@ impl MessagePublisher for FilePublisher {
                             metadata: &'a HashMap<String, String>,
                         }
                         serde_json::to_vec(&TextWrapper {
-                            message_id: out.message_id,
+                            message_id: msg.message_id,
                             payload: text,
-                            metadata: &out.metadata,
+                            metadata: &msg.metadata,
                         })
                     } else {
-                        serde_json::to_vec(&out)
+                        serde_json::to_vec(&msg)
                     }
                 }
             };

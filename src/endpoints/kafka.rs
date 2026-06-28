@@ -681,6 +681,11 @@ fn process_message<M: Message>(
         if headers.count() > 0 {
             let mut metadata = std::collections::HashMap::new();
             for header in headers.iter() {
+                // Never let an inbound header spoof a reserved `mqb.src.*` value;
+                // the authoritative cursor keys are injected below.
+                if crate::canonical_message::is_source_metadata_key(header.key) {
+                    continue;
+                }
                 metadata.insert(
                     header.key.to_string(),
                     String::from_utf8_lossy(header.value.unwrap_or_default()).to_string(),

@@ -24,8 +24,10 @@ pub struct CanonicalMessage {
 /// per-message position a consumer read from (e.g. `mqb.src.kafka_offset`,
 /// `mqb.src.nats_subject`). These keys describe where a message came from on the
 /// *current* hop and are deliberately **not** forwarded: every publisher strips
-/// keys with this prefix when serializing metadata to the wire/store, so they do
-/// not accumulate across chained endpoints (http → nats → kafka → mongodb).
+/// keys with this prefix when serializing metadata to the wire/store (via
+/// [`CanonicalMessage::strip_source_metadata`] or [`is_source_metadata_key`]), so
+/// they do not accumulate across chained endpoints (http → nats → kafka → mongodb).
+/// **Any new metadata-serializing publisher must do the same.**
 /// Application metadata (user headers, `reply_to`, `correlation_id`, …) is not
 /// prefixed and propagates as before.
 pub const SOURCE_METADATA_PREFIX: &str = "mqb.src.";
@@ -129,6 +131,14 @@ impl CanonicalMessage {
 
     pub fn set_id(&mut self, id: u128) {
         self.message_id = id;
+    }
+
+    /// Remove framework-injected source/provenance metadata (`mqb.src.*`) in place.
+    /// Call before serializing an outbound message to the wire/store so per-hop
+    /// cursor keys don't accumulate across endpoints. See [`SOURCE_METADATA_PREFIX`].
+    #[inline]
+    pub fn strip_source_metadata(&mut self) {
+        self.metadata.retain(|key, _| !is_source_metadata_key(key));
     }
 
     pub fn from_json(payload: serde_json::Value) -> Result<Self, serde_json::Error> {

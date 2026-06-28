@@ -766,6 +766,12 @@ fn create_nats_canonical_message(
         if !headers.is_empty() {
             let mut metadata = std::collections::HashMap::new();
             for (key, value) in headers.iter() {
+                let key = key.to_string();
+                // Never let an inbound header spoof a reserved `mqb.src.*` value;
+                // the authoritative cursor keys are injected below.
+                if crate::canonical_message::is_source_metadata_key(&key) {
+                    continue;
+                }
                 // Join multiple values with comma to avoid data loss
                 let joined_value = value
                     .iter()
@@ -773,7 +779,7 @@ fn create_nats_canonical_message(
                     .collect::<Vec<_>>()
                     .join(",");
                 if !joined_value.is_empty() {
-                    metadata.insert(key.to_string(), joined_value);
+                    metadata.insert(key, joined_value);
                 }
             }
             canonical_message.metadata = metadata;
@@ -946,6 +952,33 @@ mod tests {
         assert!(crate::canonical_message::is_source_metadata_key(
             "mqb.src.nats_subject"
         ));
+    }
+
+    #[test]
+    fn inbound_source_metadata_header_cannot_spoof_cursor() {
+        // An upstream producer sets a reserved `mqb.src.*` header. It must be
+        // dropped, and the authoritative subject cursor must win.
+        let mut headers = HeaderMap::new();
+        headers.insert("mqb.src.kafka_offset", "999");
+        headers.insert("mqb.src.nats_subject", "evil.subject");
+        headers.insert("user_key", "kept");
+        let message = nats_message(None, Some(headers));
+
+        let canonical = create_nats_canonical_message(&message, Some(7), false);
+
+        assert!(!canonical.metadata.contains_key("mqb.src.kafka_offset"));
+        assert_eq!(
+            canonical
+                .metadata
+                .get("mqb.src.nats_subject")
+                .map(String::as_str),
+            Some("test.subject"),
+            "spoofed subject must be overwritten by the real one"
+        );
+        assert_eq!(
+            canonical.metadata.get("user_key").map(String::as_str),
+            Some("kept")
+        );
     }
 
     #[test]
