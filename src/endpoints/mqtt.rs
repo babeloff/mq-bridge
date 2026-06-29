@@ -164,6 +164,8 @@ impl PublishConfirm {
     /// which rumqttc discards any in-flight publishes. Wakes waiters so in-progress
     /// confirmations fail fast and the publishes are retried.
     fn reset_session(&self) {
+        let submitted = self.submitted.load(Ordering::Acquire);
+        self.confirmed.fetch_max(submitted, Ordering::AcqRel);
         self.epoch.fetch_add(1, Ordering::AcqRel);
         self.notify.notify_waiters();
     }
@@ -185,19 +187,20 @@ impl PublishConfirm {
     /// sleep is only a backstop against a missed wakeup.
     async fn wait_for(&self, target: u64, start_epoch: u64, deadline: Instant) -> bool {
         loop {
+            if self.current_epoch() != start_epoch {
+                return false;
+            }
             // Register for notification BEFORE loading `confirmed`, so a confirmation
             // that lands between the check and the await is not missed.
             let notified = self.notify.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
 
-            if self.confirmed.load(Ordering::Acquire) >= target {
-                return true;
-            }
-            // A session reset may have dropped our in-flight publishes; fail so they
-            // are retried rather than falsely confirmed by later messages' PUBACKs.
             if self.current_epoch() != start_epoch {
                 return false;
+            }
+            if self.confirmed.load(Ordering::Acquire) >= target {
+                return true;
             }
             let now = Instant::now();
             if now >= deadline {
@@ -206,7 +209,8 @@ impl PublishConfirm {
             tokio::select! {
                 _ = &mut notified => {}
                 _ = tokio::time::sleep(deadline - now) => {
-                    return self.confirmed.load(Ordering::Acquire) >= target;
+                    return self.current_epoch() == start_epoch
+                        && self.confirmed.load(Ordering::Acquire) >= target;
                 }
             }
         }
@@ -1205,7 +1209,7 @@ mod tests {
     fn v3_strips_spoofed_source_metadata_and_injects_topic() {
         // A v3 JSON envelope carries a reserved `mqb.src.*` key. It must be dropped,
         // and the authoritative per-message topic cursor injected.
-        crate::canonical_message::force_source_metadata_for_test(Some(true));
+        let _source_metadata = crate::canonical_message::force_source_metadata_for_test(Some(true));
         let mut msg = CanonicalMessage::from_vec("body");
         msg.metadata
             .insert("mqb.src.kafka_offset".to_string(), "999".to_string());

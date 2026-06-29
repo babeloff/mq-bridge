@@ -931,7 +931,7 @@ mod tests {
 
     #[test]
     fn jetstream_exposes_source_cursor_metadata() {
-        crate::canonical_message::force_source_metadata_for_test(Some(true));
+        let _source_metadata = crate::canonical_message::force_source_metadata_for_test(Some(true));
         let message = nats_message(None, None);
 
         let canonical = create_nats_canonical_message(&message, Some(42), false);
@@ -962,7 +962,7 @@ mod tests {
     fn inbound_source_metadata_header_cannot_spoof_cursor() {
         // An upstream producer sets a reserved `mqb.src.*` header. It must be
         // dropped, and the authoritative subject cursor must win.
-        crate::canonical_message::force_source_metadata_for_test(Some(true));
+        let _source_metadata = crate::canonical_message::force_source_metadata_for_test(Some(true));
         let mut headers = HeaderMap::new();
         headers.insert("mqb.src.kafka_offset", "999");
         headers.insert("mqb.src.nats_subject", "evil.subject");

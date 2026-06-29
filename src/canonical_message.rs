@@ -77,10 +77,29 @@ thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
+/// Guard that restores the test-only per-thread source metadata override.
+#[cfg(test)]
+pub(crate) struct SourceMetadataTestOverride {
+    previous: Option<bool>,
+}
+
+#[cfg(test)]
+impl Drop for SourceMetadataTestOverride {
+    fn drop(&mut self) {
+        TEST_FORCE_SOURCE_METADATA.with(|c| c.set(self.previous));
+    }
+}
+
 /// Force [`source_metadata_enabled`] to a value on the current thread (test-only).
 #[cfg(test)]
-pub(crate) fn force_source_metadata_for_test(value: Option<bool>) {
-    TEST_FORCE_SOURCE_METADATA.with(|c| c.set(value));
+#[must_use]
+pub(crate) fn force_source_metadata_for_test(value: Option<bool>) -> SourceMetadataTestOverride {
+    let previous = TEST_FORCE_SOURCE_METADATA.with(|c| {
+        let prev = c.get();
+        c.set(value);
+        prev
+    });
+    SourceMetadataTestOverride { previous }
 }
 
 pub fn print_uuidv7<S>(value: &u128, serializer: S) -> Result<S::Ok, S::Error>
