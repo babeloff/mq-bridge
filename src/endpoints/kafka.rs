@@ -697,18 +697,21 @@ fn process_message<M: Message>(
 
     // Source-position cursor keys (useful for dlt-style pull consumers; the
     // per-message topic is the only way to recover it under a topic pattern).
-    canonical_message.metadata.insert(
-        "mqb.src.kafka_topic".to_string(),
-        message.topic().to_string(),
-    );
-    canonical_message.metadata.insert(
-        "mqb.src.kafka_partition".to_string(),
-        message.partition().to_string(),
-    );
-    canonical_message.metadata.insert(
-        "mqb.src.kafka_offset".to_string(),
-        message.offset().to_string(),
-    );
+    // Opt-in via the MQB_SOURCE_METADATA env var; off by default.
+    if crate::canonical_message::source_metadata_enabled() {
+        canonical_message.metadata.insert(
+            "mqb.src.kafka_topic".to_string(),
+            message.topic().to_string(),
+        );
+        canonical_message.metadata.insert(
+            "mqb.src.kafka_partition".to_string(),
+            message.partition().to_string(),
+        );
+        canonical_message.metadata.insert(
+            "mqb.src.kafka_offset".to_string(),
+            message.offset().to_string(),
+        );
+    }
 
     messages.push(canonical_message);
 

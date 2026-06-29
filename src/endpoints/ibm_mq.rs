@@ -525,11 +525,14 @@ async fn spawn_consumer_thread(
                                         let mut canonical =
                                             CanonicalMessage::new(data.to_vec(), None);
                                         // Source cursor: the queue this was read from.
-                                        if let Some(queue) = config.queue.as_deref() {
-                                            canonical.metadata.insert(
-                                                "mqb.src.ibmmq_queue".to_string(),
-                                                queue.to_string(),
-                                            );
+                                        // Opt-in via MQB_SOURCE_METADATA; off by default.
+                                        if crate::canonical_message::source_metadata_enabled() {
+                                            if let Some(queue) = config.queue.as_deref() {
+                                                canonical.metadata.insert(
+                                                    "mqb.src.ibmmq_queue".to_string(),
+                                                    queue.to_string(),
+                                                );
+                                            }
                                         }
                                         messages.push(canonical);
                                         // zeroing buffer to avoid leaking sensitive data

@@ -167,9 +167,10 @@ that ack each batch individually (NATS JetStream, AMQP, MQTT) accept any order.
 > `commit()`, or an expired broker ack deadline) means a record can arrive twice.
 > A downstream loader must dedup on a stable key — `message.id` is globally unique
 > per source position (Kafka `partition:offset`, NATS `stream_sequence`, AMQP
-> delivery tag) and makes a natural primary key. Source cursor fields are also in
-> `message.metadata` (`mqb.src.kafka_topic`/`mqb.src.kafka_offset`, `mqb.src.nats_subject`/`mqb.src.nats_stream_sequence`,
-> `mqb.src.amqp_routing_key`/`mqb.src.amqp_delivery_tag`).
+> delivery tag) and makes a natural primary key. Source cursor fields are also
+> available in `message.metadata` (`mqb.src.kafka_topic`/`mqb.src.kafka_offset`, `mqb.src.nats_subject`/`mqb.src.nats_stream_sequence`,
+> `mqb.src.amqp_routing_key`/`mqb.src.amqp_delivery_tag`) when you opt in by setting
+> the `MQB_SOURCE_METADATA=1` environment variable (off by default).
 >
 > **Ack deadlines vs slow loads.** JetStream `AckWait` (default 30s), AMQP
 > prefetch/consumer-timeout and MQTT inflight windows each bound how long a batch

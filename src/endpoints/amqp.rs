@@ -701,18 +701,21 @@ fn delivery_to_canonical_message(delivery: &lapin::message::Delivery) -> Canonic
     }
 
     // Source-position cursor keys (useful for dlt-style pull consumers).
-    canonical_message.metadata.insert(
-        "mqb.src.amqp_routing_key".to_string(),
-        delivery.routing_key.to_string(),
-    );
-    canonical_message.metadata.insert(
-        "mqb.src.amqp_exchange".to_string(),
-        delivery.exchange.to_string(),
-    );
-    canonical_message.metadata.insert(
-        "mqb.src.amqp_delivery_tag".to_string(),
-        delivery.delivery_tag.to_string(),
-    );
+    // Opt-in via the MQB_SOURCE_METADATA env var; off by default.
+    if crate::canonical_message::source_metadata_enabled() {
+        canonical_message.metadata.insert(
+            "mqb.src.amqp_routing_key".to_string(),
+            delivery.routing_key.to_string(),
+        );
+        canonical_message.metadata.insert(
+            "mqb.src.amqp_exchange".to_string(),
+            delivery.exchange.to_string(),
+        );
+        canonical_message.metadata.insert(
+            "mqb.src.amqp_delivery_tag".to_string(),
+            delivery.delivery_tag.to_string(),
+        );
+    }
 
     if let Some(headers) = delivery.properties.headers().as_ref() {
         for (key, value) in headers.inner().iter() {

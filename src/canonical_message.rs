@@ -39,6 +39,50 @@ pub fn is_source_metadata_key(key: &str) -> bool {
     key.starts_with(SOURCE_METADATA_PREFIX)
 }
 
+/// Whether consumers should inject source/provenance metadata (`mqb.src.*`).
+///
+/// Off by default — the per-message origin (topic/subject/queue, offset, …) is only
+/// needed when consuming a wildcard/pattern subscription and you must recover where
+/// each message actually came from (e.g. dead-letter routing). Opt in by setting the
+/// `MQB_SOURCE_METADATA` env var to a truthy value (`1`, `true`, `yes`, `on`). The
+/// value is read once and cached. Stripping/anti-spoofing of `mqb.src.*` stays active
+/// regardless, so these keys never propagate downstream. See [`SOURCE_METADATA_PREFIX`].
+pub fn source_metadata_enabled() -> bool {
+    #[cfg(test)]
+    {
+        if let Some(forced) = TEST_FORCE_SOURCE_METADATA.with(|c| c.get()) {
+            return forced;
+        }
+    }
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("MQB_SOURCE_METADATA")
+            .map(|v| {
+                matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+            .unwrap_or(false)
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Per-thread override for [`source_metadata_enabled`] in unit tests, so tests can
+    /// exercise the enabled/disabled paths deterministically without touching the
+    /// process-global env var. `None` falls back to the env-derived default.
+    static TEST_FORCE_SOURCE_METADATA: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Force [`source_metadata_enabled`] to a value on the current thread (test-only).
+#[cfg(test)]
+pub(crate) fn force_source_metadata_for_test(value: Option<bool>) {
+    TEST_FORCE_SOURCE_METADATA.with(|c| c.set(value));
+}
+
 pub fn print_uuidv7<S>(value: &u128, serializer: S) -> Result<S::Ok, S::Error>
 where
     S: serde::Serializer,

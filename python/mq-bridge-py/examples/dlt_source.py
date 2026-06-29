@@ -39,7 +39,9 @@ def record_from_message(message) -> dict:
     `message.id` is globally unique per source position (Kafka partition/offset,
     NATS stream sequence, AMQP delivery tag), which makes it a natural merge key
     for at-least-once + idempotent-merge. Source cursor fields are also exposed in
-    `metadata` (e.g. mqb.src.kafka_topic/mqb.src.kafka_offset, mqb.src.nats_subject/mqb.src.nats_stream_sequence).
+    `metadata` (e.g. mqb.src.kafka_topic/mqb.src.kafka_offset, mqb.src.nats_subject/mqb.src.nats_stream_sequence)
+    when you opt in by setting the MQB_SOURCE_METADATA=1 environment variable; it is
+    off by default.
     """
     record = dict(message.json())
     record["_mqb_id"] = message.id

@@ -796,15 +796,18 @@ fn create_nats_canonical_message(
     // Source-position cursor keys (useful for dlt-style pull consumers; the
     // per-message subject is the only way to recover it under a wildcard
     // subscription). `nats_stream_sequence` is absent for core NATS.
-    canonical_message.metadata.insert(
-        "mqb.src.nats_subject".to_string(),
-        message.subject.to_string(),
-    );
-    if let Some(sequence) = sequence {
+    // Opt-in via the MQB_SOURCE_METADATA env var; off by default.
+    if crate::canonical_message::source_metadata_enabled() {
         canonical_message.metadata.insert(
-            "mqb.src.nats_stream_sequence".to_string(),
-            sequence.to_string(),
+            "mqb.src.nats_subject".to_string(),
+            message.subject.to_string(),
         );
+        if let Some(sequence) = sequence {
+            canonical_message.metadata.insert(
+                "mqb.src.nats_stream_sequence".to_string(),
+                sequence.to_string(),
+            );
+        }
     }
     canonical_message
 }
@@ -928,6 +931,7 @@ mod tests {
 
     #[test]
     fn jetstream_exposes_source_cursor_metadata() {
+        crate::canonical_message::force_source_metadata_for_test(Some(true));
         let message = nats_message(None, None);
 
         let canonical = create_nats_canonical_message(&message, Some(42), false);
@@ -958,6 +962,7 @@ mod tests {
     fn inbound_source_metadata_header_cannot_spoof_cursor() {
         // An upstream producer sets a reserved `mqb.src.*` header. It must be
         // dropped, and the authoritative subject cursor must win.
+        crate::canonical_message::force_source_metadata_for_test(Some(true));
         let mut headers = HeaderMap::new();
         headers.insert("mqb.src.kafka_offset", "999");
         headers.insert("mqb.src.nats_subject", "evil.subject");

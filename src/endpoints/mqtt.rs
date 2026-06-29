@@ -371,7 +371,9 @@ impl MessagePublisher for MqttPublisher {
         let confirmation_failed = if let Some(confirm) = &self.confirm {
             if confirm_target > 0 {
                 let deadline = Instant::now() + CONFIRMATION_TIMEOUT;
-                !confirm.wait_for(confirm_target, start_epoch, deadline).await
+                !confirm
+                    .wait_for(confirm_target, start_epoch, deadline)
+                    .await
             } else {
                 false
             }
@@ -1033,10 +1035,13 @@ fn publish_to_canonical_message_v5(p: &PublishV5) -> CanonicalMessage {
         }
     }
     // Per-message topic — the only source cursor MQTT offers.
-    canonical_message.metadata.insert(
-        "mqb.src.mqtt_topic".to_string(),
-        String::from_utf8_lossy(&p.topic).into_owned(),
-    );
+    // Opt-in via the MQB_SOURCE_METADATA env var; off by default.
+    if crate::canonical_message::source_metadata_enabled() {
+        canonical_message.metadata.insert(
+            "mqb.src.mqtt_topic".to_string(),
+            String::from_utf8_lossy(&p.topic).into_owned(),
+        );
+    }
     canonical_message
 }
 
@@ -1050,8 +1055,11 @@ fn publish_to_canonical_message_v3(p: &rumqttc::Publish) -> CanonicalMessage {
     // the per-message topic is the only source cursor MQTT offers, and the only way
     // to recover it under a wildcard subscription.)
     msg.strip_source_metadata();
-    msg.metadata
-        .insert("mqb.src.mqtt_topic".to_string(), p.topic.clone());
+    // Opt-in via the MQB_SOURCE_METADATA env var; off by default.
+    if crate::canonical_message::source_metadata_enabled() {
+        msg.metadata
+            .insert("mqb.src.mqtt_topic".to_string(), p.topic.clone());
+    }
     msg
 }
 
@@ -1197,6 +1205,7 @@ mod tests {
     fn v3_strips_spoofed_source_metadata_and_injects_topic() {
         // A v3 JSON envelope carries a reserved `mqb.src.*` key. It must be dropped,
         // and the authoritative per-message topic cursor injected.
+        crate::canonical_message::force_source_metadata_for_test(Some(true));
         let mut msg = CanonicalMessage::from_vec("body");
         msg.metadata
             .insert("mqb.src.kafka_offset".to_string(), "999".to_string());

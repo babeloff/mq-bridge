@@ -358,11 +358,14 @@ impl ZeroMqConsumer {
             // the authoritative topic cursor (SUB only) is injected below.
             message.strip_source_metadata();
         }
-        if let Some(topic) = topic {
-            for message in &mut messages {
-                message
-                    .metadata
-                    .insert("mqb.src.zeromq_topic".to_string(), topic.clone());
+        // Opt-in via the MQB_SOURCE_METADATA env var; off by default.
+        if crate::canonical_message::source_metadata_enabled() {
+            if let Some(topic) = topic {
+                for message in &mut messages {
+                    message
+                        .metadata
+                        .insert("mqb.src.zeromq_topic".to_string(), topic.clone());
+                }
             }
         }
         Ok(messages)
