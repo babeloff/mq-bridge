@@ -3,13 +3,22 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 
-fn replace_optional(content: &str, from: &str, to: &str, label: &str, source_path: &Path) -> String {
+fn replace_optional(
+    content: &str,
+    from: &str,
+    to: &str,
+    label: &str,
+    source_path: &Path,
+) -> String {
     let count = content.matches(from).count();
     if count == 0 {
         println!("No patch target found for {} in {:?}", label, source_path);
         content.to_string()
     } else {
-        println!("Patching {} occurrence(s) of {} in {:?}", count, label, source_path);
+        println!(
+            "Patching {} occurrence(s) of {} in {:?}",
+            count, label, source_path
+        );
         content.replacen(from, to, count)
     }
 }
@@ -179,4 +188,3 @@ fn armature_messaging_test() {
         "armature-messaging tests failed with local mq-bridge changes"
     );
 }
-
