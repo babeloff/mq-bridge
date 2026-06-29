@@ -402,19 +402,13 @@ pub async fn run_chaos_pipeline_test(
     };
 
     // Chaos restarts the broker mid-stream. Every broker here is expected to redeliver all
-    // in-flight messages on reconnect, so non-MQTT brokers must deliver 100% (zero loss).
+    // in-flight messages on reconnect, so all brokers must deliver 100% (zero loss).
     //
-    // MQTT is the sole exception: rumqttc reports a publish as sent once it is enqueued in the
-    // client->eventloop channel, not once the broker PUBACKs it. On an abrupt broker restart,
-    // enqueued-but-unconfirmed QoS 1 publishes can be dropped on the session reset without
-    // surfacing an error, so the retry middleware never re-sends them. This residual loss is
-    // structural (true prevention needs PUBACK-confirmed publishing, which costs throughput),
-    // so allow a 0.5% tolerance for MQTT only.
-    let allowed_loss = if broker_name.eq_ignore_ascii_case("mqtt") {
-        num_messages / 200
-    } else {
-        0
-    };
+    // MQTT used to be an exception (rumqttc acks a publish on enqueue, not on PUBACK, so
+    // publishes in flight at an abrupt broker restart were silently dropped), but the MQTT
+    // publisher now waits for broker confirmation (PUBACK/PUBCOMP) and retries any publish
+    // dropped by a session reset, so it too must deliver every message.
+    let allowed_loss = 0;
 
     run_pipeline_test_internal(
         broker_name,
