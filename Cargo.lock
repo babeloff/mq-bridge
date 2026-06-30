@@ -1577,6 +1577,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "dlopen2"
+version = "0.8.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5e2c5bd4158e66d1e215c49b837e11d62f3267b30c92f1d171c4d3105e3dc4d4"
+dependencies = [
+ "dlopen2_derive",
+ "libc",
+ "once_cell",
+ "winapi",
+]
+
+[[package]]
+name = "dlopen2_derive"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0fbbb781877580993a8707ec48672673ec7b81eeba04cfd2310bd28c08e47c8f"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
 name = "dlv-list"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2775,6 +2798,10 @@ name = "libmqm-sys"
 version = "0.10.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d888946090ed1e149d6978906143db293b9232c9a8cca0b369a1dc4668d9082a"
+dependencies = [
+ "dlopen2",
+ "libc",
+]
 
 [[package]]
 name = "libsqlite3-sys"
@@ -3107,6 +3134,7 @@ dependencies = [
  "hyper-rustls 0.27.9",
  "hyper-util",
  "lapin",
+ "libmqm-sys",
  "metrics",
  "metrics-util",
  "mongodb",
@@ -3206,6 +3234,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "298bea58d1259df694242dc973b07ce156660c897a7b3a421e324b1f37905cdc"
 dependencies = [
  "derive_more",
+ "dlopen2",
  "libmqm-constants",
  "libmqm-default",
  "libmqm-sys",

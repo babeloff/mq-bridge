@@ -15,7 +15,7 @@ pub mod grpc;
 pub mod http;
 #[cfg(feature = "http")]
 mod http_stream;
-#[cfg(feature = "ibm-mq")]
+#[cfg(any(feature = "ibm-mq", feature = "ibm-mq-dlopen"))]
 pub mod ibm_mq;
 #[cfg(feature = "kafka")]
 pub mod kafka;
@@ -355,7 +355,7 @@ fn check_consumer_recursive(
         }
         #[cfg(feature = "zeromq")]
         EndpointType::ZeroMq(_) => Ok(warnings),
-        #[cfg(feature = "ibm-mq")]
+        #[cfg(any(feature = "ibm-mq", feature = "ibm-mq-dlopen"))]
         EndpointType::IbmMq(_) => Ok(warnings),
         #[cfg(feature = "mongodb")]
         EndpointType::MongoDb(cfg) => {
@@ -769,7 +769,7 @@ async fn create_base_consumer(
             }
             Ok(boxed(mqtt::MqttConsumer::new(&config).await?))
         }
-        #[cfg(feature = "ibm-mq")]
+        #[cfg(any(feature = "ibm-mq", feature = "ibm-mq-dlopen"))]
         EndpointType::IbmMq(cfg) => {
             let mut config = cfg.clone();
             if config.queue.is_none() && config.topic.is_none() {
@@ -1051,7 +1051,7 @@ fn check_publisher_recursive(
             }
             Ok(warnings)
         }
-        #[cfg(feature = "ibm-mq")]
+        #[cfg(any(feature = "ibm-mq", feature = "ibm-mq-dlopen"))]
         EndpointType::IbmMq(cfg) => {
             if cfg.wait_timeout_ms != 1000 {
                 warnings.push(
@@ -1368,7 +1368,7 @@ async fn create_base_publisher(
         EndpointType::Sled(cfg) => {
             Ok(Box::new(sled::SledPublisher::new(cfg)?) as Box<dyn MessagePublisher>)
         }
-        #[cfg(feature = "ibm-mq")]
+        #[cfg(any(feature = "ibm-mq", feature = "ibm-mq-dlopen"))]
         EndpointType::IbmMq(cfg) => {
             Ok(Box::new(ibm_mq::IbmMqPublisher::new(cfg).await?) as Box<dyn MessagePublisher>)
         }

@@ -58,7 +58,7 @@ async fn test_all_subscriber_logic() {
     println!("--- Running All Subscriber and Request-Reply Logic Tests ---");
 
     // --- Subscriber Logic ---
-    #[cfg(feature = "ibm-mq")]
+    #[cfg(any(feature = "ibm-mq", feature = "ibm-mq-dlopen"))]
     {
         if should_run("ibm-mq") {
             println!("\n\n>>> Starting IBM MQ Subscriber Logic Test...");
@@ -154,7 +154,7 @@ async fn test_all_chaos() {
         }
     }
 
-    #[cfg(feature = "ibm-mq")]
+    #[cfg(any(feature = "ibm-mq", feature = "ibm-mq-dlopen"))]
     {
         if should_run("ibm-mq") {
             println!("\n\n>>> Starting IBM MQ Chaos Test...");
@@ -223,7 +223,7 @@ async fn test_all_status() {
         }
     }
 
-    #[cfg(feature = "ibm-mq")]
+    #[cfg(any(feature = "ibm-mq", feature = "ibm-mq-dlopen"))]
     {
         if should_run("ibm-mq") {
             println!("\n\n>>> Starting IBM MQ Status Test...");
@@ -307,7 +307,7 @@ async fn test_all_performance_pipeline() {
             integration::mongodb::test_mongodb_replica_set_pipeline().await;
         }
     }
-    #[cfg(feature = "ibm-mq")]
+    #[cfg(any(feature = "ibm-mq", feature = "ibm-mq-dlopen"))]
     {
         if should_run("ibm-mq") {
             println!("\n\n>>> Starting IBM MQ Performance Pipeline Test...");
@@ -414,7 +414,7 @@ async fn test_all_performance_direct() {
             integration::amqp::test_amqp_performance_direct().await;
         }
     }
-    #[cfg(feature = "ibm-mq")]
+    #[cfg(any(feature = "ibm-mq", feature = "ibm-mq-dlopen"))]
     {
         if should_run("ibm-mq") {
             println!("\n\n>>> Starting IBM MQ Direct Performance Test...");

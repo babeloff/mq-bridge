@@ -57,7 +57,7 @@ For implementation details and quick start examples for each usage type, see the
 ## Features
 
 *   **Supported Backends**: Kafka, NATS, AMQP (RabbitMQ), MQTT, MongoDB, SQL Databases (PostgreSQL, MySQL, SQLite via sqlx), HTTP, WebSocket, ZeroMQ, Files, AWS (SQS/SNS), IBM MQ, and in-memory channels.
-    > **Note**: IBM MQ is not included in the `full` feature set. It requires the `ibm-mq` feature and the IBM MQ Client library. See [mqi crate](https://crates.io/crates/mqi/) for installation details.
+    > **Note**: IBM MQ is included in the `full` feature set via `ibm-mq-dlopen`, which loads the IBM MQ client library at runtime — **no IBM SDK is needed to build**. The IBM MQ redistributable client only has to be present at runtime, and only if you actually use an IBM MQ endpoint (it is loaded lazily on first connect). If the client is missing, the affected route fails fast with a non-retryable error instead of reconnecting forever. The loader finds the client via the platform default name, `MQ_INSTALLATION_PATH` (e.g. `/opt/mqm`), or an explicit `MQB_IBM_MQ_LIB` path. To link the client statically at build time instead, use the `ibm-mq` feature (requires the IBM MQ SDK). See the [mqi crate](https://crates.io/crates/mqi/) for details.
 *   **Configuration**: Routes can be defined via YAML, JSON or environment variables.
 *   **Programmable Logic**: Inject custom Rust handlers to transform or filter messages in-flight.
 *   **Batching**: Every endpoint uses the same `send_batch` / `receive_batch` shape. Routes default to single-message batches, but can switch to larger batches with `batch_size`.

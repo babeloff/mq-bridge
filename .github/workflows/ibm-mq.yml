@@ -156,13 +156,18 @@ jobs:
 
       - name: Run IBM MQ integration tests
         if: steps.mqclient.outputs.available == 'true'
+        env:
+          MQB_TEST_BACKEND: ibm-mq
         run: |
+          # The test fns are named test_all_* (filtered to ibm-mq via
+          # MQB_TEST_BACKEND). The previous test_ibm_mq_* filters matched no
+          # test, so this job silently ran zero tests.
           cargo test --test integration_test --features ibm-mq,test-utils,rustls-ring -- \
             --ignored --nocapture --test-threads=1 \
-            test_ibm_mq_subscriber_logic \
-            test_ibm_mq_performance_pipeline \
-            test_ibm_mq_chaos \
-            test_ibm_mq_status
+            test_all_subscriber_logic \
+            test_all_performance_pipeline \
+            test_all_chaos \
+            test_all_status
 
       - name: Run IBM MQ TLS tests
         if: steps.mqclient.outputs.available == 'true'

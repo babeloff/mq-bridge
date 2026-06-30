@@ -41,14 +41,21 @@ default = ["full"]
 # Testing-only middleware hooks; do not include this feature in production wheels.
 middleware = ["mq-bridge/middleware"]
 full = ["mq-bridge/full", "rustls-aws-lc"]
-# Lean set for the `mq-bridge-py-basic` wheel (~14M stripped): the pure-Rust
-# transports (no kafka/rdkafka C toolchain; no heavy datastore drivers) on the
-# `ring` crypto provider so it stays free of aws-lc-sys. memory + file
-# endpoints are always compiled. amqp is excluded too (its lapin/rustls-connector
-# chain is the heaviest dep and forces aws-lc); use the full wheel for AMQP.
+# All-platform set for the `mq-bridge-py-basic` wheel: endpoints that build on
+# every target incl. musl/Alpine. amqp + aws pull aws-lc-sys (BoringSSL C), so
+# the whole wheel uses the aws-lc crypto provider (same as `full`); aws-lc-sys
+# compiles fine natively on musl given cmake + gcc in the build container (see
+# before-script-linux in publish-python.yml). The old "ring-only / no aws-lc"
+# split was a cross-compile concern, not a native-musl one. memory + file
+# endpoints are always compiled.
+# Deliberately excluded (full wheel only) — genuinely hard native deps:
+#   - kafka   -> rdkafka/librdkafka C toolchain (SASL/SSL/zstd)
+#   - sqlx    -> libsqlite3-sys (C, needs bundled sqlite)
+#   - grpc    -> build-time protoc binary (glibc-only, fails under musl) + slow build
+#   - ibm-mq  -> IBM MQ proprietary C client
 # `middleware` is intentionally excluded (metrics + sled dedup are not needed in
 # production wheels; retry/DLQ are not feature-gated and remain available).
-basic = ["http", "nats", "mqtt", "websocket", "zeromq", "rustls-ring"]
+basic = ["http", "nats", "mqtt", "websocket", "zeromq", "mongodb", "amqp", "aws", "rustls-aws-lc"]
 dedup = ["mq-bridge/dedup"]
 metrics = ["mq-bridge/metrics"]
 # Compatibility alias: config_schema is part of the public Python API and is
@@ -64,6 +71,10 @@ http = ["mq-bridge/http"]
 websocket = ["mq-bridge/websocket"]
 aws = ["mq-bridge/aws"]
 ibm-mq = ["mq-bridge/ibm-mq"]
+# Runtime-loaded IBM MQ client (dlopen): wheel builds without the IBM SDK; the
+# redistributable client is only needed at runtime. Already pulled in by `full`;
+# exposed here for explicit opt-in.
+ibm-mq-dlopen = ["mq-bridge/ibm-mq-dlopen"]
 zeromq = ["mq-bridge/zeromq"]
 grpc = ["mq-bridge/grpc"]
 sqlx = ["mq-bridge/sqlx"]
