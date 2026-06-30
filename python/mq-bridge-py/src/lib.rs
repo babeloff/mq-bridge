@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 #[cfg(test)]
 use std::fs;
@@ -974,8 +974,14 @@ struct Consumer {
     runtime: Arc<Runtime>,
     // `None` once `close()` has dropped the underlying consumer.
     consumer: Arc<tokio::sync::Mutex<Option<Box<dyn MessageConsumer>>>>,
-    pending: Arc<Mutex<Vec<(core::traits::BatchCommitFunc, usize)>>>,
+    // Polled-but-uncommitted batches, keyed by a monotonic token. Ordered so
+    // `commit()` acks them oldest-first; `ack(token)`/`nack(token)` address one.
+    pending: Arc<Mutex<BTreeMap<u64, (core::traits::BatchCommitFunc, usize)>>>,
+    next_token: Arc<AtomicU64>,
     exhausted: Arc<std::sync::atomic::AtomicBool>,
+    // `true` for cumulative-ack transports (Kafka, …) where acking a later batch
+    // implicitly acks earlier ones, so token acks must stay oldest-first.
+    requires_order: bool,
 }
 
 impl Consumer {
@@ -984,20 +990,137 @@ impl Consumer {
         let consumer = runtime.block_on(core::endpoints::create_consumer_from_route(
             &name, &endpoint,
         ))?;
+        let requires_order = consumer.commit_requires_order();
         Ok(Self {
             runtime,
             consumer: Arc::new(tokio::sync::Mutex::new(Some(consumer))),
-            pending: Arc::new(Mutex::new(Vec::new())),
+            pending: Arc::new(Mutex::new(BTreeMap::new())),
+            next_token: Arc::new(AtomicU64::new(0)),
             exhausted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            requires_order,
         })
     }
 
     fn lock_pending(
         &self,
-    ) -> PyResult<std::sync::MutexGuard<'_, Vec<(core::traits::BatchCommitFunc, usize)>>> {
+    ) -> PyResult<std::sync::MutexGuard<'_, BTreeMap<u64, (core::traits::BatchCommitFunc, usize)>>>
+    {
         self.pending
             .lock()
             .map_err(|_| PyRuntimeError::new_err("Consumer commit lock poisoned"))
+    }
+
+    /// Receive up to `max` messages, registering the batch's commit closure under
+    /// a fresh token. Returns `None` on timeout or end-of-stream, otherwise the
+    /// messages and their token. Shared by `poll()` and `poll_batch()`.
+    fn receive(
+        &self,
+        py: Python<'_>,
+        max: usize,
+        timeout_ms: Option<u64>,
+    ) -> PyResult<Option<(Vec<Message>, u64)>> {
+        let runtime = Arc::clone(&self.runtime);
+        let consumer = Arc::clone(&self.consumer);
+        let exhausted = Arc::clone(&self.exhausted);
+        let pending = Arc::clone(&self.pending);
+        let next_token = Arc::clone(&self.next_token);
+        let max = max.max(1);
+        // Returns the raw canonical messages and the token they were registered
+        // under. The token is allocated and the batch registered while still
+        // holding the consumer lock, so token order matches receive order even
+        // when several threads poll concurrently.
+        let outcome = py
+            .detach(move || {
+                run_sync_task(&runtime, async move {
+                    let mut guard = consumer.lock().await;
+                    let consumer = guard
+                        .as_mut()
+                        .ok_or_else(|| anyhow!("consumer is closed"))?;
+                    let recv = consumer.receive_batch(max);
+                    let batch = if let Some(timeout_ms) = timeout_ms {
+                        match tokio::time::timeout(Duration::from_millis(timeout_ms), recv).await {
+                            Ok(result) => result,
+                            Err(_) => return Ok(None),
+                        }
+                    } else {
+                        recv.await
+                    };
+                    match batch {
+                        Ok(batch) => {
+                            let count = batch.messages.len();
+                            if count == 0 {
+                                return Ok(None);
+                            }
+                            let token = next_token.fetch_add(1, Ordering::SeqCst);
+                            let mut pending = pending
+                                .lock()
+                                .map_err(|_| anyhow!("Consumer commit lock poisoned"))?;
+                            if pending.contains_key(&token) {
+                                return Err(anyhow!(
+                                    "batch token space exhausted (token counter wrapped with batches still outstanding)"
+                                ));
+                            }
+                            pending.insert(token, (batch.commit, count));
+                            drop(pending);
+                            Ok(Some((batch.messages, token)))
+                        }
+                        Err(core::errors::ConsumerError::EndOfStream) => {
+                            exhausted.store(true, Ordering::SeqCst);
+                            Ok(None)
+                        }
+                        Err(err) => Err(err.into()),
+                    }
+                })
+            })
+            .map_err(to_py_runtime_error)?;
+
+        let Some((messages, token)) = outcome else {
+            return Ok(None);
+        };
+        let messages: Vec<Message> = messages.iter().map(Message::from_canonical).collect();
+        Ok(Some((messages, token)))
+    }
+
+    /// Run one batch's commit closure with a uniform disposition, removing it from
+    /// `pending`. Used by `ack(token)` and `nack(token)`.
+    fn commit_one(
+        &self,
+        py: Python<'_>,
+        token: u64,
+        disposition: MessageDisposition,
+    ) -> PyResult<()> {
+        let entry = {
+            let mut pending = self.lock_pending()?;
+            // On cumulative-ack transports, acking a later batch implicitly acks
+            // the earlier ones, so an out-of-order ack would silently drop them.
+            // Reject it (the token stays outstanding) instead of committing.
+            if matches!(disposition, MessageDisposition::Ack) && self.requires_order {
+                if let Some((&oldest, _)) = pending.iter().next() {
+                    if token != oldest && pending.contains_key(&token) {
+                        return Err(PyValueError::new_err(format!(
+                            "cannot ack batch token {token} before older outstanding token {oldest}: this transport commits cumulatively, so acks must follow receive order (ack older batches first, or use commit())"
+                        )));
+                    }
+                }
+            }
+            pending.remove(&token)
+        };
+        let Some((commit, len)) = entry else {
+            return Err(PyValueError::new_err(format!(
+                "unknown batch token {token} (already committed, or never polled)"
+            )));
+        };
+        let runtime = Arc::clone(&self.runtime);
+        let result = py
+            .detach(move || {
+                run_sync_task(
+                    &runtime,
+                    async move { Ok(commit(vec![disposition; len]).await) },
+                )
+            })
+            .map_err(to_py_runtime_error)?;
+        // On failure the closure consumed the batch; it cannot be retried by token.
+        result.map_err(to_py_runtime_error)
     }
 }
 
@@ -1068,47 +1191,79 @@ impl Consumer {
     /// `commit()` call.
     #[pyo3(signature = (max=256, timeout_ms=None))]
     fn poll(&self, py: Python<'_>, max: usize, timeout_ms: Option<u64>) -> PyResult<Vec<Message>> {
+        match self.receive(py, max, timeout_ms)? {
+            Some((messages, _token)) => Ok(messages),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// Like `poll()`, but also return the batch's token so it can be acked or
+    /// nacked individually with `ack(token)` / `nack(token)` — the shape a `dlt`
+    /// resource wants (`poll → yield → commit load package → ack(token)`).
+    /// Returns `(messages, token)`, or `([], None)` on timeout or end-of-stream.
+    /// Tokens stay outstanding until acked/nacked; `commit()` still acks every
+    /// outstanding batch at once, so don't mix the two styles on one consumer.
+    #[pyo3(signature = (max=256, timeout_ms=None))]
+    fn poll_batch(
+        &self,
+        py: Python<'_>,
+        max: usize,
+        timeout_ms: Option<u64>,
+    ) -> PyResult<(Vec<Message>, Option<u64>)> {
+        match self.receive(py, max, timeout_ms)? {
+            Some((messages, token)) => Ok((messages, Some(token))),
+            None => Ok((Vec::new(), None)),
+        }
+    }
+
+    /// Acknowledge a single batch by the token from `poll_batch()`, advancing the
+    /// consumer offset for just that batch. Raises if the token is unknown
+    /// (already acked/nacked, or never polled).
+    fn ack(&self, py: Python<'_>, token: u64) -> PyResult<()> {
+        self.commit_one(py, token, MessageDisposition::Ack)
+    }
+
+    /// Negatively acknowledge so the broker can redeliver. With a `token`, nacks
+    /// just that batch; without one, nacks every outstanding batch (oldest
+    /// first). On Kafka there is no per-message nack — this leaves the offset
+    /// unadvanced, so redelivery happens on the next run/rebalance, not at once.
+    #[pyo3(signature = (token=None))]
+    fn nack(&self, py: Python<'_>, token: Option<u64>) -> PyResult<()> {
+        if let Some(token) = token {
+            return self.commit_one(py, token, MessageDisposition::Nack);
+        }
+        // Nack all outstanding batches, oldest first.
+        let pending: Vec<(u64, (core::traits::BatchCommitFunc, usize))> =
+            std::mem::take(&mut *self.lock_pending()?)
+                .into_iter()
+                .collect();
+        if pending.is_empty() {
+            return Ok(());
+        }
         let runtime = Arc::clone(&self.runtime);
-        let consumer = Arc::clone(&self.consumer);
-        let exhausted = Arc::clone(&self.exhausted);
-        let max = max.max(1);
-        let outcome = py
+        let (err, tail) = py
             .detach(move || {
                 run_sync_task(&runtime, async move {
-                    let mut guard = consumer.lock().await;
-                    let consumer = guard
-                        .as_mut()
-                        .ok_or_else(|| anyhow!("consumer is closed"))?;
-                    let recv = consumer.receive_batch(max);
-                    let batch = if let Some(timeout_ms) = timeout_ms {
-                        match tokio::time::timeout(Duration::from_millis(timeout_ms), recv).await {
-                            Ok(result) => result,
-                            Err(_) => return Ok(None),
+                    let mut iter = pending.into_iter();
+                    while let Some((_token, (commit, len))) = iter.next() {
+                        if let Err(err) = commit(vec![MessageDisposition::Nack; len]).await {
+                            return Ok((Some(err), iter.collect::<Vec<_>>()));
                         }
-                    } else {
-                        recv.await
-                    };
-                    match batch {
-                        Ok(batch) => Ok(Some(batch)),
-                        Err(core::errors::ConsumerError::EndOfStream) => {
-                            exhausted.store(true, Ordering::SeqCst);
-                            Ok(None)
-                        }
-                        Err(err) => Err(err.into()),
                     }
+                    Ok((None, Vec::new()))
                 })
             })
             .map_err(to_py_runtime_error)?;
-
-        let Some(batch) = outcome else {
-            return Ok(Vec::new());
-        };
-        let messages: Vec<Message> = batch.messages.iter().map(Message::from_canonical).collect();
-        let count = batch.messages.len();
-        if count > 0 {
-            self.lock_pending()?.push((batch.commit, count));
+        if !tail.is_empty() {
+            let mut pending = self.lock_pending()?;
+            for (token, entry) in tail {
+                pending.insert(token, entry);
+            }
         }
-        Ok(messages)
+        match err {
+            Some(err) => Err(to_py_runtime_error(err)),
+            None => Ok(()),
+        }
     }
 
     /// Acknowledge every batch returned by `poll()` since the last `commit()`,
@@ -1120,8 +1275,11 @@ impl Consumer {
     /// are held in memory so the process grows unbounded. To retry a failed
     /// batch, simply don't commit it — it will be redelivered.
     fn commit(&self, py: Python<'_>) -> PyResult<()> {
-        let commits: Vec<(core::traits::BatchCommitFunc, usize)> =
-            std::mem::take(&mut *self.lock_pending()?);
+        // Drain oldest-first; `BTreeMap` iterates in token order.
+        let commits: Vec<(u64, (core::traits::BatchCommitFunc, usize))> =
+            std::mem::take(&mut *self.lock_pending()?)
+                .into_iter()
+                .collect();
         if commits.is_empty() {
             return Ok(());
         }
@@ -1130,7 +1288,7 @@ impl Consumer {
             .detach(move || {
                 run_sync_task(&runtime, async move {
                     let mut iter = commits.into_iter();
-                    while let Some((commit, len)) = iter.next() {
+                    while let Some((_token, (commit, len))) = iter.next() {
                         if let Err(err) = commit(vec![MessageDisposition::Ack; len]).await {
                             // Hand back the batches we never attempted so they can be retried.
                             return Ok((Some(err), iter.collect::<Vec<_>>()));
@@ -1141,10 +1299,11 @@ impl Consumer {
             })
             .map_err(to_py_runtime_error)?;
         if !tail.is_empty() {
+            // Re-insert the un-attempted batches under their original tokens.
             let mut pending = self.lock_pending()?;
-            let mut restored = tail;
-            restored.append(&mut pending);
-            *pending = restored;
+            for (token, entry) in tail {
+                pending.insert(token, entry);
+            }
         }
         match err {
             Some(err) => Err(to_py_runtime_error(err)),

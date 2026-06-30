@@ -1,4 +1,4 @@
-#![cfg(feature = "ibm-mq")]
+#![cfg(any(feature = "ibm-mq-static", feature = "ibm-mq"))]
 use anyhow::Context;
 use mq_bridge::endpoints::ibm_mq::{IbmMqConsumer, IbmMqPublisher};
 use mq_bridge::models::IbmMqConfig;

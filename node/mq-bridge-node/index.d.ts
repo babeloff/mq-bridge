@@ -58,6 +58,18 @@ export class Consumer {
    */
   poll(max?: number | null, timeoutMs?: number | null): Promise<Message[]>;
   /**
+   * Like {@link Consumer.poll}, but also returns the batch's `token` so it can be
+   * acked or nacked individually with {@link Consumer.ack} / {@link Consumer.nack}
+   * — the shape a `dlt` resource wants (`poll → yield → commit load package →
+   * ack(token)`). `token` is `null` on timeout or end-of-stream. Tokens stay
+   * outstanding until acked/nacked; `commit()` still acks every outstanding batch
+   * at once, so don't mix the two styles on one consumer.
+   */
+  pollBatch(
+    max?: number | null,
+    timeoutMs?: number | null,
+  ): Promise<{ messages: Message[]; token: number | null }>;
+  /**
    * Acknowledge every batch returned by `poll()` since the last `commit()`,
    * advancing the consumer offset.
    *
@@ -68,6 +80,19 @@ export class Consumer {
    * don't commit it — it will be redelivered.
    */
   commit(): Promise<void>;
+  /**
+   * Acknowledge a single batch by the `token` from {@link Consumer.pollBatch},
+   * advancing the consumer offset for just that batch. Rejects if the token is
+   * unknown (already acked/nacked, or never polled).
+   */
+  ack(token: number): Promise<void>;
+  /**
+   * Negatively acknowledge so the broker can redeliver. With a `token`, nacks
+   * just that batch; omit it to nack every outstanding batch (oldest first). On
+   * Kafka there is no per-message nack — this leaves the offset unadvanced, so
+   * redelivery happens on the next run/rebalance, not at once.
+   */
+  nack(token?: number | null): Promise<void>;
   /**
    * Status snapshot for the underlying endpoint. `pending === 0` is a precise
    * "caught up" signal on transports that report backlog (Kafka, AMQP, NATS

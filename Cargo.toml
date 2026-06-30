@@ -16,7 +16,7 @@ members = ["bindings-common", "python/mq-bridge-py", "node/mq-bridge-node"]
 resolver = "2"
 
 [workspace.package]
-version = "0.3.1"
+version = "0.3.2"
 
 [workspace.dependencies]
 anyhow = "1.0"
@@ -106,8 +106,13 @@ async-nats = { version = "0.49", optional = true }
 # or `tokio-rustls?/aws_lc_rs` from the crypto features below.
 rumqttc = { version = "0.25", default-features = false, features = ["use-rustls-no-provider"], optional = true }
 
-# IBM MQ
-mqi = { version = "0.3", optional = true }
+# IBM MQ. default-features off so the version/provider features are chosen per
+# feature below: `ibm-mq` loads the client at runtime via dlopen (no SDK at
+# build), `ibm-mq-static` links the IBM C client at build (needs the SDK).
+mqi = { version = "0.3", optional = true, default-features = false }
+# Direct dep only for the dlopen path, so we can name MqmContainer to load the
+# client at runtime. Features are unified from mqi/dlopen2.
+libmqm-sys = { version = "0.10", optional = true, default-features = false }
 
 # HTTP
 arc-swap = { version = "1", optional = true }
@@ -154,7 +159,11 @@ protoc-bin-vendored = { version = "3.0", optional = true }
 [features]
 default = []
 middleware = ["metrics", "dedup"]
-full = ["middleware", "mongodb", "kafka", "amqp", "nats", "mqtt", "http", "aws", "zeromq", "sled", "grpc", "sqlx", "websocket", "rustls-aws-lc"]
+# ibm-mq (dlopen) is safe to include: it needs no IBM SDK at build, and at
+# runtime the client is loaded lazily only when an ibm-mq endpoint is opened
+# (clear error if the client isn't installed). Use `ibm-mq-static` instead for
+# static linking.
+full = ["middleware", "mongodb", "kafka", "amqp", "nats", "mqtt", "http", "aws", "zeromq", "sled", "grpc", "sqlx", "websocket", "rustls-aws-lc", "ibm-mq"]
 
 # Functionality features
 dedup = ["sled"]
@@ -183,7 +192,16 @@ mqtt = ["rumqttc", "rustls", "tokio-rustls", "rustls-pemfile", "url"]
 http = ["dep:arc-swap", "hyper", "hyper-util", "hyper-rustls", "http-body-util", "dep:http-body", "rustls", "tokio-rustls", "rustls-pemfile", "webpki-roots", "h2", "dep:flate2", "dep:base64"]
 websocket = ["dep:tokio-websockets"]
 aws = ["aws-config", "aws-sdk-sqs", "aws-sdk-sns", "dep:base64"]
-ibm-mq = ["mqi"]
+# Runtime-loaded IBM MQ client via dlopen: builds with no SDK present; the IBM
+# redistributable client is only needed at runtime, and only if an ibm-mq
+# endpoint is actually used.
+# mqi/mqai is required because mqi's always-compiled (doc-hidden) test module
+# references MqaiLibrary on the dlopen2 path; it adds only pregen bindings, no SDK.
+ibm-mq = ["dep:mqi", "mqi/dlopen2", "mqi/mqai", "mqi/mqc_9_2_0_0", "dep:libmqm-sys", "libmqm-sys/dlopen2"]
+# Static-link IBM MQ client (needs the IBM SDK at build time). mqc_9_2_0_0 matches
+# the crate's previous default so behavior is unchanged. Enabling this alongside
+# `ibm-mq` (dlopen) forces static linking — the SDK is then required at build.
+ibm-mq-static = ["dep:mqi", "mqi/link", "mqi/mqc_9_2_0_0"]
 zeromq = ["dep:zeromq"]
 # Note: The grpc feature requires protobuf-src which can significantly increase build times.
 grpc = ["tonic", "prost", "tokio-stream", "tonic-prost", "tonic-prost-build", "protoc-bin-vendored", "rustls"]

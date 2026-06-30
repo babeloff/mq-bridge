@@ -1820,6 +1820,9 @@ fn make_response(
             // pass, so the body is never double-encoded.
             let mut preset_encoding: Option<String> = None;
             for (key, value) in &msg.metadata {
+                if crate::canonical_message::is_source_metadata_key(key) {
+                    continue; // source/provenance keys must not leak as response headers
+                }
                 let is_content_type = key.eq_ignore_ascii_case("content-type");
                 // Request-echo suppression drops reply metadata that byte-matches the
                 // incoming request header of the same name, so pure passthrough/echo
@@ -2093,6 +2096,7 @@ impl MessagePublisher for HttpPublisher {
                 || key == HTTP_VERSION
                 || key == "tls_cipher_suite"
                 || key == "tls_protocol_version"
+                || crate::canonical_message::is_source_metadata_key(key)
             {
                 continue;
             }

@@ -134,6 +134,56 @@ test("Consumer.poll returns messages and commit acks them", async () => {
   await assert.rejects(() => consumer.status());
 });
 
+test("Consumer.pollBatch returns a token and ack advances by batch", async () => {
+  const topic = `node.consumer.pollbatch.${Date.now()}`;
+  const endpoint = { memory: { topic, capacity: 4096 } };
+
+  const publisher = Publisher.fromConfig(endpoint);
+  const consumer = Consumer.fromConfig(endpoint);
+
+  for (let value = 0; value < 3; value += 1) {
+    await publisher.sendJson({ value });
+  }
+
+  const received = [];
+  while (received.length < 3) {
+    const { messages, token } = await consumer.pollBatch(10, 5000);
+    assert.ok(messages.length > 0, "pollBatch timed out before all messages arrived");
+    assert.notEqual(token, null);
+    received.push(...messages);
+    await consumer.ack(token); // ack just this batch by token
+  }
+
+  assert.deepEqual(received.map((m) => m.json().value), [0, 1, 2]);
+
+  const empty = await consumer.pollBatch(4, 200);
+  assert.deepEqual(empty.messages, []);
+  assert.equal(empty.token, null);
+
+  await assert.rejects(() => consumer.ack(9999)); // unknown token
+  await consumer.close();
+});
+
+test("Consumer.nack redelivers a batch by token", async () => {
+  const topic = `node.consumer.nack.${Date.now()}`;
+  // enable_nack makes the in-memory endpoint requeue nacked messages.
+  const endpoint = { memory: { topic, capacity: 4096, enable_nack: true } };
+
+  const publisher = Publisher.fromConfig(endpoint);
+  const consumer = Consumer.fromConfig(endpoint);
+
+  await publisher.sendJson({ value: 1 });
+
+  let { messages, token } = await consumer.pollBatch(10, 5000);
+  assert.deepEqual(messages.map((m) => m.json().value), [1]);
+  await consumer.nack(token); // release for redelivery instead of acking
+
+  ({ messages, token } = await consumer.pollBatch(10, 5000));
+  assert.deepEqual(messages.map((m) => m.json().value), [1], "nacked batch was not redelivered");
+  await consumer.ack(token);
+  await consumer.close();
+});
+
 test("Route.withHandler serves an HTTP response", async () => {
   const port = await freePort();
   const routeName = `node_with_handler_${port}`;

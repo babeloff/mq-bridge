@@ -4,7 +4,7 @@
 use mq_bridge::endpoints::sqlx::{SqlxConsumer, SqlxPublisher};
 use mq_bridge::test_utils::{
     add_performance_result, run_chaos_pipeline_test, run_direct_perf_test,
-    run_performance_pipeline_test, run_pipeline_test, run_test_with_docker,
+    run_performance_pipeline_test_named, run_pipeline_test, run_test_with_docker,
     run_test_with_docker_controller, setup_logging, PERF_TEST_MESSAGE_COUNT,
 };
 use std::future::Future;
@@ -63,7 +63,13 @@ pub async fn test_mariadb_pipeline() {
 
 pub async fn test_mariadb_performance_pipeline() {
     run_mariadb_test(|config_yaml| async move {
-        run_performance_pipeline_test("sqlx", &config_yaml, PERF_TEST_MESSAGE_COUNT).await;
+        run_performance_pipeline_test_named(
+            "sqlx",
+            "mariadb",
+            &config_yaml,
+            PERF_TEST_MESSAGE_COUNT,
+        )
+        .await;
     })
     .await;
 }

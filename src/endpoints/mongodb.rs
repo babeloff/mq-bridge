@@ -102,6 +102,8 @@ fn message_to_document(
     let id_uuid = mongodb::bson::Uuid::from_bytes(message.message_id.to_be_bytes());
 
     let mut metadata = message.metadata.clone();
+    // Source/provenance keys are per-hop context, not stored document fields.
+    metadata.retain(|key, _| !crate::canonical_message::is_source_metadata_key(key));
     let payload_bson = if matches!(format, MongoDbFormat::Json) {
         if let Ok(json_val) = serde_json::from_slice::<serde_json::Value>(&message.payload) {
             if let Ok(bson_val) = mongodb::bson::to_bson(&json_val) {
@@ -1547,4 +1549,27 @@ async fn create_client(config: &MongoDbConfig) -> anyhow::Result<Client> {
         client_options.tls = Some(mongodb::options::Tls::Enabled(tls_options));
     }
     Ok(Client::with_options(client_options)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::CanonicalMessage;
+
+    #[test]
+    fn message_to_document_strips_source_metadata_but_keeps_user_keys() {
+        let mut msg = CanonicalMessage::new(b"hello".to_vec(), None);
+        msg.metadata.insert("kind".to_string(), "order".to_string());
+        msg.metadata
+            .insert("mqb.src.kafka_offset".to_string(), "42".to_string());
+
+        let doc = message_to_document(&msg, &MongoDbFormat::Text).unwrap();
+        let metadata = doc.get_document("metadata").unwrap();
+
+        assert_eq!(metadata.get_str("kind").unwrap(), "order");
+        assert!(
+            !metadata.contains_key("mqb.src.kafka_offset"),
+            "source/provenance keys must not be persisted to the document"
+        );
+    }
 }

@@ -20,6 +20,88 @@ pub struct CanonicalMessage {
     pub metadata: HashMap<String, String>,
 }
 
+/// Reserved prefix for framework-injected **source/provenance** metadata — the
+/// per-message position a consumer read from (e.g. `mqb.src.kafka_offset`,
+/// `mqb.src.nats_subject`). These keys describe where a message came from on the
+/// *current* hop and are deliberately **not** forwarded: every publisher strips
+/// keys with this prefix when serializing metadata to the wire/store (via
+/// [`CanonicalMessage::strip_source_metadata`] or [`is_source_metadata_key`]), so
+/// they do not accumulate across chained endpoints (http → nats → kafka → mongodb).
+/// **Any new metadata-serializing publisher must do the same.**
+/// Application metadata (user headers, `reply_to`, `correlation_id`, …) is not
+/// prefixed and propagates as before.
+pub const SOURCE_METADATA_PREFIX: &str = "mqb.src.";
+
+/// Whether `key` is framework-injected source metadata that must not be forwarded.
+/// See [`SOURCE_METADATA_PREFIX`].
+#[inline]
+pub fn is_source_metadata_key(key: &str) -> bool {
+    key.starts_with(SOURCE_METADATA_PREFIX)
+}
+
+/// Whether consumers should inject source/provenance metadata (`mqb.src.*`).
+///
+/// Off by default — the per-message origin (topic/subject/queue, offset, …) is only
+/// needed when consuming a wildcard/pattern subscription and you must recover where
+/// each message actually came from (e.g. dead-letter routing). Opt in by setting the
+/// `MQB_SOURCE_METADATA` env var to a truthy value (`1`, `true`, `yes`, `on`). The
+/// value is read once and cached. Stripping/anti-spoofing of `mqb.src.*` stays active
+/// regardless, so these keys never propagate downstream. See [`SOURCE_METADATA_PREFIX`].
+pub fn source_metadata_enabled() -> bool {
+    #[cfg(test)]
+    {
+        if let Some(forced) = TEST_FORCE_SOURCE_METADATA.with(|c| c.get()) {
+            return forced;
+        }
+    }
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("MQB_SOURCE_METADATA")
+            .map(|v| {
+                matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+            .unwrap_or(false)
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Per-thread override for [`source_metadata_enabled`] in unit tests, so tests can
+    /// exercise the enabled/disabled paths deterministically without touching the
+    /// process-global env var. `None` falls back to the env-derived default.
+    static TEST_FORCE_SOURCE_METADATA: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Guard that restores the test-only per-thread source metadata override.
+#[cfg(test)]
+pub(crate) struct SourceMetadataTestOverride {
+    previous: Option<bool>,
+}
+
+#[cfg(test)]
+impl Drop for SourceMetadataTestOverride {
+    fn drop(&mut self) {
+        TEST_FORCE_SOURCE_METADATA.with(|c| c.set(self.previous));
+    }
+}
+
+/// Force [`source_metadata_enabled`] to a value on the current thread (test-only).
+#[cfg(test)]
+#[must_use]
+pub(crate) fn force_source_metadata_for_test(value: Option<bool>) -> SourceMetadataTestOverride {
+    let previous = TEST_FORCE_SOURCE_METADATA.with(|c| {
+        let prev = c.get();
+        c.set(value);
+        prev
+    });
+    SourceMetadataTestOverride { previous }
+}
+
 pub fn print_uuidv7<S>(value: &u128, serializer: S) -> Result<S::Ok, S::Error>
 where
     S: serde::Serializer,
@@ -112,6 +194,14 @@ impl CanonicalMessage {
 
     pub fn set_id(&mut self, id: u128) {
         self.message_id = id;
+    }
+
+    /// Remove framework-injected source/provenance metadata (`mqb.src.*`) in place.
+    /// Call before serializing an outbound message to the wire/store so per-hop
+    /// cursor keys don't accumulate across endpoints. See [`SOURCE_METADATA_PREFIX`].
+    #[inline]
+    pub fn strip_source_metadata(&mut self) {
+        self.metadata.retain(|key, _| !is_source_metadata_key(key));
     }
 
     pub fn from_json(payload: serde_json::Value) -> Result<Self, serde_json::Error> {
@@ -306,6 +396,17 @@ macro_rules! msg {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn source_metadata_key_detection() {
+        assert!(is_source_metadata_key("mqb.src.kafka_offset"));
+        assert!(is_source_metadata_key("mqb.src.nats_subject"));
+        assert!(!is_source_metadata_key("kind"));
+        assert!(!is_source_metadata_key("reply_to"));
+        assert!(!is_source_metadata_key("correlation_id"));
+        // The reserved prefix itself is the boundary.
+        assert_eq!(SOURCE_METADATA_PREFIX, "mqb.src.");
+    }
 
     #[test]
     fn test_message_id_parsing() {

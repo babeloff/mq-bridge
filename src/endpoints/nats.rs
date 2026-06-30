@@ -131,6 +131,9 @@ impl MessagePublisher for NatsPublisher {
         let mut headers = if !message.metadata.is_empty() {
             let mut headers = HeaderMap::new();
             for (key, value) in &message.metadata {
+                if crate::canonical_message::is_source_metadata_key(key) {
+                    continue; // source/provenance keys must not be forwarded
+                }
                 headers.insert(key.as_str(), value.as_str());
             }
             headers
@@ -763,6 +766,12 @@ fn create_nats_canonical_message(
         if !headers.is_empty() {
             let mut metadata = std::collections::HashMap::new();
             for (key, value) in headers.iter() {
+                let key = key.to_string();
+                // Never let an inbound header spoof a reserved `mqb.src.*` value;
+                // the authoritative cursor keys are injected below.
+                if crate::canonical_message::is_source_metadata_key(&key) {
+                    continue;
+                }
                 // Join multiple values with comma to avoid data loss
                 let joined_value = value
                     .iter()
@@ -770,7 +779,7 @@ fn create_nats_canonical_message(
                     .collect::<Vec<_>>()
                     .join(",");
                 if !joined_value.is_empty() {
-                    metadata.insert(key.to_string(), joined_value);
+                    metadata.insert(key, joined_value);
                 }
             }
             canonical_message.metadata = metadata;
@@ -782,6 +791,22 @@ fn create_nats_canonical_message(
                 .metadata
                 .entry("reply_to".to_string())
                 .or_insert_with(|| reply.to_string());
+        }
+    }
+    // Source-position cursor keys (useful for dlt-style pull consumers; the
+    // per-message subject is the only way to recover it under a wildcard
+    // subscription). `nats_stream_sequence` is absent for core NATS.
+    // Opt-in via the MQB_SOURCE_METADATA env var; off by default.
+    if crate::canonical_message::source_metadata_enabled() {
+        canonical_message.metadata.insert(
+            "mqb.src.nats_subject".to_string(),
+            message.subject.to_string(),
+        );
+        if let Some(sequence) = sequence {
+            canonical_message.metadata.insert(
+                "mqb.src.nats_stream_sequence".to_string(),
+                sequence.to_string(),
+            );
         }
     }
     canonical_message
@@ -902,6 +927,63 @@ mod tests {
         let canonical = create_nats_canonical_message(&message, Some(1), false);
 
         assert!(!canonical.metadata.contains_key("reply_to"));
+    }
+
+    #[test]
+    fn jetstream_exposes_source_cursor_metadata() {
+        let _source_metadata = crate::canonical_message::force_source_metadata_for_test(Some(true));
+        let message = nats_message(None, None);
+
+        let canonical = create_nats_canonical_message(&message, Some(42), false);
+
+        assert_eq!(
+            canonical
+                .metadata
+                .get("mqb.src.nats_subject")
+                .map(String::as_str),
+            Some("test.subject")
+        );
+        assert_eq!(
+            canonical
+                .metadata
+                .get("mqb.src.nats_stream_sequence")
+                .map(String::as_str),
+            Some("42")
+        );
+        // Core NATS (no sequence) omits the sequence key.
+        let core = create_nats_canonical_message(&message, None, false);
+        assert!(!core.metadata.contains_key("mqb.src.nats_stream_sequence"));
+        assert!(crate::canonical_message::is_source_metadata_key(
+            "mqb.src.nats_subject"
+        ));
+    }
+
+    #[test]
+    fn inbound_source_metadata_header_cannot_spoof_cursor() {
+        // An upstream producer sets a reserved `mqb.src.*` header. It must be
+        // dropped, and the authoritative subject cursor must win.
+        let _source_metadata = crate::canonical_message::force_source_metadata_for_test(Some(true));
+        let mut headers = HeaderMap::new();
+        headers.insert("mqb.src.kafka_offset", "999");
+        headers.insert("mqb.src.nats_subject", "evil.subject");
+        headers.insert("user_key", "kept");
+        let message = nats_message(None, Some(headers));
+
+        let canonical = create_nats_canonical_message(&message, Some(7), false);
+
+        assert!(!canonical.metadata.contains_key("mqb.src.kafka_offset"));
+        assert_eq!(
+            canonical
+                .metadata
+                .get("mqb.src.nats_subject")
+                .map(String::as_str),
+            Some("test.subject"),
+            "spoofed subject must be overwritten by the real one"
+        );
+        assert_eq!(
+            canonical.metadata.get("user_key").map(String::as_str),
+            Some("kept")
+        );
     }
 
     #[test]

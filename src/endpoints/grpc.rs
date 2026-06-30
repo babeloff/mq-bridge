@@ -814,8 +814,11 @@ impl MessagePublisher for GrpcPublisher {
             .iter()
             .cloned()
             .map(|msg| {
-                let mut md: std::collections::HashMap<String, String> =
-                    msg.metadata.into_iter().collect();
+                let mut md: std::collections::HashMap<String, String> = msg
+                    .metadata
+                    .into_iter()
+                    .filter(|(key, _)| !crate::canonical_message::is_source_metadata_key(key))
+                    .collect();
                 if let Some(topic) = &self.topic {
                     md.entry("mq_bridge.topic".to_string())
                         .or_insert_with(|| topic.clone());

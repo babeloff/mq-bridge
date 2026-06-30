@@ -96,6 +96,42 @@ Node is garbage-collected, so close explicitly rather than waiting for GC.
 > Commit after each batch you have durably handled; to retry a failed batch,
 > simply don't commit it.
 
+### Per-batch tokens: `pollBatch` / `ack` / `nack`
+
+When you need to ack or release **specific** batches (rather than everything since
+the last commit), use the token form. `pollBatch(max, timeoutMs)` resolves to
+`{ messages, token }`; `ack(token)` commits just that batch, and `nack(token)`
+releases it for redelivery (`nack()` with no argument nacks every outstanding
+batch). This is the shape a [`dlt`](https://dlthub.com)-style loader wants — poll →
+yield → load package commits → `ack(token)`.
+
+```js
+const { messages, token } = await consumer.pollBatch(500, 1000); // token === null on timeout
+if (token !== null) {            // nothing returned on an idle timeout
+  // ... persist the batch downstream ...
+  await consumer.ack(token);     // or consumer.nack(token) to redeliver
+}
+```
+
+Tokens stay outstanding until acked/nacked; `commit()` still acks every
+outstanding batch at once, so don't mix the two styles on one consumer. On
+cumulative-ack transports (Kafka), acking a later batch would implicitly ack the
+earlier ones, so `ack(token)` must follow receive order — acking out of order
+rejects; ack the oldest outstanding batch first, or use `commit()`. Transports
+that ack each batch individually (NATS JetStream, AMQP, MQTT) accept any order.
+
+> **At-least-once + idempotent merge.** Redelivery (after a nack, a missed
+> `commit()`, or an expired broker ack deadline) means a record can arrive twice; a
+> downstream loader must dedup on a stable key. `message.id` is globally unique per
+> source position (Kafka `partition:offset`, NATS `stream_sequence`, AMQP delivery
+> tag) and makes a natural primary key; source cursor fields are also available in
+> `message.metadata` (`mqb.src.kafka_topic`/`mqb.src.kafka_offset`, `mqb.src.nats_subject`/`mqb.src.nats_stream_sequence`,
+> `mqb.src.amqp_routing_key`/`mqb.src.amqp_delivery_tag`) when you opt in via the
+> `MQB_SOURCE_METADATA=1` environment variable (off by default). Keep `batchSize × per-record cost` under
+> the smallest broker ack deadline (JetStream `AckWait`, AMQP prefetch/timeout, MQTT
+> inflight) or raise it in config. **Kafka has no per-message nack:** `nack` there
+> leaves the offset unadvanced, so redelivery happens on the next run/rebalance.
+
 ## Analysis
 
 HTTP comparison benchmark, driven by a native load generator (`wrk`) so the

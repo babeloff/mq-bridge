@@ -6,7 +6,7 @@ build-backend = "maturin"
 name = "mq-bridge-py-basic"
 # Version is read from Cargo.toml by maturin
 dynamic = ["version"]
-description = "Python bindings for mq-bridge (basic: all-platform messaging set)"
+description = "Python bindings for mq-bridge (basic: all-platform set — HTTP, NATS, MQTT, WebSocket, ZeroMQ, MongoDB, AMQP, AWS SQS/SNS)"
 readme = "README.md"
 requires-python = ">=3.9"
 dependencies = [

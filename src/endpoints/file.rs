@@ -153,7 +153,12 @@ impl MessagePublisher for FilePublisher {
         let mut failed_messages = Vec::new();
 
         // Iterate over messages, consuming them
-        for msg in messages {
+        for mut msg in messages {
+            // Strip per-hop source/provenance keys in place — they are not
+            // persisted. Done on the owned message (no payload clone); a message
+            // pushed to `failed_messages` keeps its remaining fields, and the
+            // dropped `mqb.src.*` keys are irrelevant to a retry on the next hop.
+            msg.strip_source_metadata();
             let serialized_msg = match self.format {
                 FileFormat::Raw => Ok(msg.payload.to_vec()),
                 FileFormat::Normal => {

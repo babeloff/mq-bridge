@@ -357,7 +357,7 @@ pub mod zeromq_helper {
     }
 }
 
-#[cfg(feature = "ibm-mq")]
+#[cfg(any(feature = "ibm-mq-static", feature = "ibm-mq"))]
 pub mod ibm_mq_helper {
     use mq_bridge::endpoints::ibm_mq::{IbmMqConsumer, IbmMqPublisher};
     use mq_bridge::models::IbmMqConfig;
@@ -1027,18 +1027,30 @@ fn performance_benchmarks(c: &mut Criterion) {
         PERF_TEST_CONCURRENCY,
         std::time::Duration::from_millis(10)
     );
-    bench_backend!(
-        "ibm-mq",
-        "ibm-mq",
-        "tests/integration/docker-compose/ibm_mq.yml",
-        ibm_mq_helper,
-        group,
-        &rt,
-        &BENCH_RESULTS,
-        PERF_TEST_MESSAGE_COUNT,
-        PERF_TEST_CONCURRENCY,
-        std::time::Duration::from_millis(100)
-    );
+    #[cfg(any(feature = "ibm-mq-static", feature = "ibm-mq"))]
+    {
+        // Skip when the IBM MQ client library isn't loadable (dlopen build with no
+        // client installed); otherwise the helper would panic on first connect.
+        if mq_bridge::endpoints::ibm_mq::ibm_mq_client_available() {
+            bench_backend!(
+                "",
+                "ibm-mq",
+                "tests/integration/docker-compose/ibm_mq.yml",
+                ibm_mq_helper,
+                group,
+                &rt,
+                &BENCH_RESULTS,
+                PERF_TEST_MESSAGE_COUNT,
+                PERF_TEST_CONCURRENCY,
+                std::time::Duration::from_millis(100)
+            );
+        } else {
+            eprintln!(
+                "Skipping IBM MQ benchmark: client library not found. \
+                 Install the IBM MQ redistributable client or set MQB_IBM_MQ_LIB."
+            );
+        }
+    }
     bench_backend!(
         "memory",
         memory_helper,

@@ -96,6 +96,97 @@ async fn handle_status_request<T>(
     }
 }
 
+/// Marker error: the IBM MQ client library could not be loaded at runtime.
+/// Classified as non-retryable so a route fails fast instead of reconnecting
+/// forever for a dependency that will not appear without operator action.
+#[cfg(all(feature = "ibm-mq", not(feature = "ibm-mq-static")))]
+#[derive(Debug)]
+struct IbmMqLibraryUnavailable(String);
+
+#[cfg(all(feature = "ibm-mq", not(feature = "ibm-mq-static")))]
+impl std::fmt::Display for IbmMqLibraryUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+#[cfg(all(feature = "ibm-mq", not(feature = "ibm-mq-static")))]
+impl std::error::Error for IbmMqLibraryUnavailable {}
+
+/// True if the IBM MQ client can actually be used in this build: always for the
+/// static link (it is bound at build time), or — on the dlopen build — only if
+/// the runtime client library is present and loads. Tests use this to skip IBM MQ
+/// where no client is installed (e.g. the generic `full` CI job), instead of
+/// failing on the first connect attempt.
+#[cfg(feature = "ibm-mq-static")]
+pub fn ibm_mq_client_available() -> bool {
+    true
+}
+#[cfg(all(feature = "ibm-mq", not(feature = "ibm-mq-static")))]
+pub fn ibm_mq_client_available() -> bool {
+    load_ibm_mq_library().is_ok()
+}
+
+/// True if the connect error is a missing-client-library failure (dlopen build).
+fn is_library_unavailable(_e: &anyhow::Error) -> bool {
+    #[cfg(all(feature = "ibm-mq", not(feature = "ibm-mq-static")))]
+    {
+        _e.downcast_ref::<IbmMqLibraryUnavailable>().is_some()
+    }
+    #[cfg(not(all(feature = "ibm-mq", not(feature = "ibm-mq-static"))))]
+    {
+        false
+    }
+}
+
+// Runtime-load the IBM MQ client via dlopen. mqi's load_mqm_default hardcodes
+// "libmqm_r.so", which is wrong on macOS (libmqm_r.dylib); this tries the
+// platform-correct name plus MQ_INSTALLATION_PATH and an explicit override.
+#[cfg(all(feature = "ibm-mq", not(feature = "ibm-mq-static")))]
+fn load_ibm_mq_library() -> anyhow::Result<Arc<libmqm_sys::dlopen2::MqmContainer>> {
+    use libmqm_sys::dlopen2::MqmContainer;
+
+    let default_name = if cfg!(windows) {
+        "mqm.dll"
+    } else if cfg!(target_os = "macos") {
+        "libmqm_r.dylib"
+    } else {
+        "libmqm_r.so"
+    };
+
+    // Candidates in priority order: explicit override, install dir, bare name.
+    let mut candidates: Vec<String> = Vec::new();
+    if let Ok(p) = std::env::var("MQB_IBM_MQ_LIB") {
+        if !p.is_empty() {
+            candidates.push(p);
+        }
+    }
+    if let Ok(base) = std::env::var("MQ_INSTALLATION_PATH") {
+        if !base.is_empty() {
+            candidates.push(format!("{base}/lib64/{default_name}"));
+            candidates.push(format!("{base}/lib/{default_name}"));
+        }
+    }
+    candidates.push(default_name.to_string());
+
+    let mut last_err = None;
+    for name in &candidates {
+        // Safety: loading a dynamic library is inherently unsafe.
+        match unsafe { MqmContainer::load(name) } {
+            // Arc so the handle is cheaply Clone (required by connection_ref);
+            // the Container itself is not Clone.
+            Ok(c) => return Ok(Arc::new(c)),
+            Err(e) => last_err = Some(format!("{name}: {e}")),
+        }
+    }
+    Err(anyhow::Error::new(IbmMqLibraryUnavailable(format!(
+        "failed to load IBM MQ client library (tried {candidates:?}; last error: {}). \
+         Install the IBM MQ redistributable client and ensure it is on the library \
+         search path, or set MQB_IBM_MQ_LIB to the full path of the libmqm_r library.",
+        last_err.unwrap_or_default()
+    ))))
+}
+
 macro_rules! connect_mq {
     ($config:expr) => {
         (|| -> anyhow::Result<_> {
@@ -174,9 +265,20 @@ macro_rules! connect_mq {
             mq_server,
         );
 
-        mqi::connect::<ThreadNone>(&opts)
+        // Link path: client is statically linked at build time.
+        #[cfg(feature = "ibm-mq-static")]
+        let connected = mqi::connect::<ThreadNone>(&opts)
             .discard_warning()
-            .context("MQ connect failed")
+            .context("MQ connect failed");
+        // dlopen path: load the IBM client at runtime (no SDK needed at build).
+        #[cfg(all(feature = "ibm-mq", not(feature = "ibm-mq-static")))]
+        let connected = {
+            let lib = load_ibm_mq_library()?;
+            mqi::connect_lib::<ThreadNone, _>(lib, &opts)
+                .discard_warning()
+                .context("MQ connect failed")
+        };
+        connected
         })()
     };
 }
@@ -214,7 +316,13 @@ impl IbmMqPublisher {
                     Ok(q) => q,
                     Err(e) => {
                         if let Some(tx) = init_tx.take() {
-                            let _ = tx.send(Err(PublisherError::Retryable(e)));
+                            // A missing client library will not fix itself; fail fast.
+                            let err = if is_library_unavailable(&e) {
+                                PublisherError::NonRetryable(e)
+                            } else {
+                                PublisherError::Retryable(e)
+                            };
+                            let _ = tx.send(Err(err));
                             return;
                         }
                         thread::sleep(Duration::from_secs(RECONNECT_DELAY_SECS));
@@ -225,18 +333,21 @@ impl IbmMqPublisher {
                 let queue = match (|| -> anyhow::Result<_> {
                     let mut open_options =
                         constants::MQOO_OUTPUT | constants::MQOO_FAIL_IF_QUIESCING;
-                    if !config.disable_status_inq {
-                        open_options |= constants::MQOO_INQUIRE;
-                    }
                     let qm_ref = qm.connection_ref();
 
                     if let Some(topic) = &config.topic {
+                        // MQOO_INQUIRE is invalid for a topic opened for output
+                        // (MQRC_OPTIONS_ERROR); status checks tolerate
+                        // MQRC_NOT_OPEN_FOR_INQUIRE, so it is only set for queues.
                         let topic_str = MqStr::<1024>::try_from(topic.as_str())
                             .context("Invalid topic string")?;
                         let od = open::ObjectString(&topic_str);
                         Object::open(qm_ref, &(od, open_options))
                             .map_err(|e| anyhow::anyhow!("MQ open topic failed: {}", e))
                     } else {
+                        if !config.disable_status_inq {
+                            open_options |= constants::MQOO_INQUIRE;
+                        }
                         let q_name_str = config.queue.as_deref().ok_or_else(|| {
                             anyhow::anyhow!("Queue name is required for IBM MQ publisher")
                         })?;
@@ -454,9 +565,10 @@ async fn spawn_consumer_thread(
                 if let Some(topic) = &config.topic {
                     let topic_str =
                         MqStr::<1024>::try_from(topic.as_str()).context("Invalid topic string")?;
+                    // Ephemeral managed subscription: no MQSO_RESUME, which would
+                    // require a subscription name (MQRC_SUB_NAME_ERROR otherwise).
                     let sub_opts = (
                         constants::MQSO_CREATE
-                            | constants::MQSO_RESUME
                             | constants::MQSO_MANAGED
                             | constants::MQSO_NON_DURABLE,
                         open::ObjectString(&topic_str),
@@ -512,7 +624,10 @@ async fn spawn_consumer_thread(
                             let gmo = (
                                 constants::MQGMO_WAIT
                                     | constants::MQGMO_SYNCPOINT
-                                    | constants::MQGMO_FAIL_IF_QUIESCING,
+                                    | constants::MQGMO_FAIL_IF_QUIESCING
+                                    // Strip pub/sub RFH2 so the clean body is
+                                    // delivered (otherwise topic gets yield empty data).
+                                    | constants::MQGMO_NO_PROPERTIES,
                                 get::GetWait::Wait(config.wait_timeout_ms),
                             );
 
@@ -522,7 +637,19 @@ async fn spawn_consumer_thread(
                             match res {
                                 Ok(opt) => {
                                     if let Some((data, _format)) = opt {
-                                        messages.push(CanonicalMessage::new(data.to_vec(), None));
+                                        let mut canonical =
+                                            CanonicalMessage::new(data.to_vec(), None);
+                                        // Source cursor: the queue this was read from.
+                                        // Opt-in via MQB_SOURCE_METADATA; off by default.
+                                        if crate::canonical_message::source_metadata_enabled() {
+                                            if let Some(queue) = config.queue.as_deref() {
+                                                canonical.metadata.insert(
+                                                    "mqb.src.ibmmq_queue".to_string(),
+                                                    queue.to_string(),
+                                                );
+                                            }
+                                        }
+                                        messages.push(canonical);
                                         // zeroing buffer to avoid leaking sensitive data
                                         let buffer_len = data.len();
                                         buffer[..buffer_len].fill(0);
@@ -772,8 +899,18 @@ impl MessageConsumer for IbmMqConsumer {
 }
 
 impl IbmMqConsumer {
-    pub async fn new(config: &IbmMqConfig) -> Result<Self, ConsumerError> {
-        let tx = spawn_consumer_thread(config.clone()).await?;
+    pub async fn new(config: &IbmMqConfig) -> anyhow::Result<Self> {
+        let tx = spawn_consumer_thread(config.clone())
+            .await
+            .map_err(|ce| match ce {
+                // A missing client library will not fix itself; mark it
+                // non-retryable so the route fails fast instead of
+                // reconnecting forever.
+                ConsumerError::Connection(inner) if is_library_unavailable(&inner) => {
+                    anyhow::Error::new(crate::errors::ProcessingError::NonRetryable(inner))
+                }
+                other => anyhow::Error::new(other),
+            })?;
         Ok(Self {
             tx,
             permit: Arc::new(Semaphore::new(1)),
@@ -783,5 +920,60 @@ impl IbmMqConsumer {
                 .or(config.topic.clone())
                 .unwrap_or_default(),
         })
+    }
+}
+
+#[cfg(all(test, feature = "ibm-mq", not(feature = "ibm-mq-static")))]
+mod dlopen_tests {
+    use super::*;
+
+    // Proves the runtime dlopen of the IBM client succeeds where it is installed.
+    // Ignored by default (needs the client present); run with:
+    //   MQ_INSTALLATION_PATH=/opt/mqm cargo test -p mq-bridge \
+    //     --no-default-features --features ibm-mq -- --ignored loads_client
+    #[test]
+    #[ignore]
+    fn loads_client() {
+        load_ibm_mq_library().expect("IBM MQ client library should load");
+    }
+
+    // A failed library load must be classified non-retryable so routes fail
+    // fast instead of reconnecting forever.
+    #[test]
+    fn missing_library_is_non_retryable() {
+        // Save & restore the env we mutate so this test can't leak into sibling
+        // dlopen tests (e.g. loads_client reads MQ_INSTALLATION_PATH). Drop runs
+        // even if the assertions below panic.
+        struct EnvRestore {
+            lib: Option<String>,
+            path: Option<String>,
+        }
+        impl Drop for EnvRestore {
+            fn drop(&mut self) {
+                match &self.lib {
+                    Some(v) => std::env::set_var("MQB_IBM_MQ_LIB", v),
+                    None => std::env::remove_var("MQB_IBM_MQ_LIB"),
+                }
+                match &self.path {
+                    Some(v) => std::env::set_var("MQ_INSTALLATION_PATH", v),
+                    None => std::env::remove_var("MQ_INSTALLATION_PATH"),
+                }
+            }
+        }
+        let _restore = EnvRestore {
+            lib: std::env::var("MQB_IBM_MQ_LIB").ok(),
+            path: std::env::var("MQ_INSTALLATION_PATH").ok(),
+        };
+
+        std::env::set_var("MQB_IBM_MQ_LIB", "/nonexistent/path/libmqm_r");
+        std::env::remove_var("MQ_INSTALLATION_PATH");
+        let err = match load_ibm_mq_library() {
+            Ok(_) => panic!("load must fail without a client"),
+            Err(e) => e,
+        };
+        assert!(
+            is_library_unavailable(&err),
+            "missing-library error must be classified non-retryable: {err:?}"
+        );
     }
 }

@@ -140,6 +140,92 @@ def test_consumer_poll_and_commit_round_trip() -> None:
     assert received[0].metadata["kind"] == "bench.tick"
 
 
+def test_consumer_poll_batch_ack_round_trip() -> None:
+    topic = _unique("pytest.consumer.pollbatch")
+    endpoint = {"memory": {"topic": topic, "capacity": 4096}}
+
+    publisher = Publisher.from_config(endpoint)
+    consumer = Consumer.from_config(endpoint)
+
+    for value in range(3):
+        publisher.send_json({"value": value})
+
+    received = []
+    while len(received) < 3:
+        messages, token = consumer.poll_batch(max=10, timeout_ms=5000)
+        assert messages, "poll_batch timed out before all messages arrived"
+        assert token is not None
+        received.extend(messages)
+        consumer.ack(token)  # ack just this batch by token
+
+    assert [m.json()["value"] for m in received] == list(range(3))
+
+
+def test_consumer_poll_batch_timeout_returns_none_token() -> None:
+    topic = _unique("pytest.consumer.pollbatch.empty")
+    consumer = Consumer.from_config({"memory": {"topic": topic, "capacity": 16}})
+
+    messages, token = consumer.poll_batch(max=4, timeout_ms=200)
+    assert messages == []
+    assert token is None
+
+
+def test_consumer_nack_token_redelivers_batch() -> None:
+    topic = _unique("pytest.consumer.nack")
+    # enable_nack makes the in-memory endpoint requeue nacked messages (brokers
+    # redeliver natively); without it nack is a no-op on memory.
+    endpoint = {"memory": {"topic": topic, "capacity": 4096, "enable_nack": True}}
+
+    publisher = Publisher.from_config(endpoint)
+    consumer = Consumer.from_config(endpoint)
+
+    publisher.send_json({"value": 1})
+
+    messages, token = consumer.poll_batch(max=10, timeout_ms=5000)
+    assert [m.json()["value"] for m in messages] == [1]
+    consumer.nack(token)  # release for redelivery instead of acking
+
+    messages, token = consumer.poll_batch(max=10, timeout_ms=5000)
+    assert [m.json()["value"] for m in messages] == [1], "nacked batch was not redelivered"
+    consumer.ack(token)
+
+
+def test_consumer_nack_all_redelivers() -> None:
+    topic = _unique("pytest.consumer.nackall")
+    endpoint = {"memory": {"topic": topic, "capacity": 4096, "enable_nack": True}}
+
+    publisher = Publisher.from_config(endpoint)
+    consumer = Consumer.from_config(endpoint)
+
+    publisher.send_json({"value": 1})
+    publisher.send_json({"value": 2})
+
+    # Two separate outstanding batches, neither acked.
+    first, _ = consumer.poll_batch(max=1, timeout_ms=5000)
+    second, _ = consumer.poll_batch(max=1, timeout_ms=5000)
+    assert {m.json()["value"] for m in first + second} == {1, 2}
+
+    consumer.nack()  # nack every outstanding batch
+
+    redelivered = []
+    while len(redelivered) < 2:
+        messages, token = consumer.poll_batch(max=10, timeout_ms=5000)
+        assert messages, "nack-all batch was not redelivered"
+        redelivered.extend(messages)
+        consumer.ack(token)
+    assert {m.json()["value"] for m in redelivered} == {1, 2}
+
+
+def test_consumer_ack_unknown_token_raises() -> None:
+    topic = _unique("pytest.consumer.badtoken")
+    consumer = Consumer.from_config({"memory": {"topic": topic, "capacity": 16}})
+
+    with pytest.raises(ValueError):
+        consumer.ack(123)
+    with pytest.raises(ValueError):
+        consumer.nack(123)
+
+
 def test_consumer_poll_timeout_returns_empty() -> None:
     topic = _unique("pytest.consumer.empty")
     consumer = Consumer.from_config({"memory": {"topic": topic, "capacity": 16}})

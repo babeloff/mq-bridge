@@ -1,5 +1,5 @@
 from types import TracebackType
-from typing import Any, Callable, Dict, List, Mapping, Optional, Type, Union
+from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple, Type, Union
 
 __version__: str
 
@@ -125,6 +125,34 @@ class Consumer:
         source is exhausted; omit ``timeout_ms`` to block until a message
         arrives. The returned messages are acked by the next ``commit()`` call —
         you must call it (see ``commit``)."""
+        ...
+
+    def poll_batch(
+        self,
+        max: int = ...,
+        timeout_ms: Optional[int] = ...,
+    ) -> Tuple[List["Message"], Optional[int]]:
+        """Like ``poll()``, but also return the batch's token so it can be acked
+        or nacked individually with ``ack(token)`` / ``nack(token)`` — the shape a
+        ``dlt`` resource wants (``poll → yield → commit load package →
+        ack(token)``). Returns ``(messages, token)``, or ``([], None)`` on timeout
+        or end-of-stream. Tokens stay outstanding until acked/nacked; ``commit()``
+        still acks every outstanding batch at once, so don't mix the two styles on
+        one consumer."""
+        ...
+
+    def ack(self, token: int) -> None:
+        """Ack a single batch by the token from ``poll_batch()``, advancing the
+        consumer offset for just that batch. Raises if the token is unknown
+        (already acked/nacked, or never polled)."""
+        ...
+
+    def nack(self, token: Optional[int] = ...) -> None:
+        """Negatively acknowledge so the broker can redeliver. With a ``token``,
+        nacks just that batch; without one, nacks every outstanding batch (oldest
+        first). On Kafka there is no per-message nack — this leaves the offset
+        unadvanced, so redelivery happens on the next run/rebalance, not at
+        once."""
         ...
 
     def commit(self) -> None:

@@ -346,7 +346,7 @@ impl TestHarness {
 }
 
 pub async fn run_pipeline_test(broker_name: &str, config_yaml: &str) {
-    run_pipeline_test_internal(broker_name, config_yaml, 5, false, None, 0).await;
+    run_pipeline_test_internal(broker_name, broker_name, config_yaml, 5, false, None, 0).await;
 }
 
 pub async fn run_performance_pipeline_test(
@@ -354,7 +354,29 @@ pub async fn run_performance_pipeline_test(
     config_yaml: &str,
     num_messages: usize,
 ) {
-    run_pipeline_test_internal(broker_name, config_yaml, num_messages, true, None, 0).await;
+    run_performance_pipeline_test_named(broker_name, broker_name, config_yaml, num_messages).await;
+}
+
+/// Like [`run_performance_pipeline_test`], but uses `display_name` for the summary
+/// label while still resolving routes by `broker_name`. Lets backends that share a
+/// route key (e.g. the `sqlx` postgres/mysql/mariadb pipelines, or grpc client/server
+/// modes) report distinct rows in the performance summary.
+pub async fn run_performance_pipeline_test_named(
+    broker_name: &str,
+    display_name: &str,
+    config_yaml: &str,
+    num_messages: usize,
+) {
+    run_pipeline_test_internal(
+        broker_name,
+        display_name,
+        config_yaml,
+        num_messages,
+        true,
+        None,
+        0,
+    )
+    .await;
 }
 
 pub async fn run_chaos_pipeline_test(
@@ -379,22 +401,27 @@ pub async fn run_chaos_pipeline_test(
         PERF_TEST_MESSAGE_COUNT / 2
     };
 
-    // Chaos restarts the broker mid-stream. Every broker here is expected to redeliver all
-    // in-flight messages on reconnect, so non-MQTT brokers must deliver 100% (zero loss).
+    // Chaos restarts the broker mid-stream. Most brokers redeliver all in-flight messages on
+    // reconnect, so they must deliver 100% (zero loss).
     //
-    // MQTT is the sole exception: rumqttc reports a publish as sent once it is enqueued in the
-    // client->eventloop channel, not once the broker PUBACKs it. On an abrupt broker restart,
-    // enqueued-but-unconfirmed QoS 1 publishes can be dropped on the session reset without
-    // surfacing an error, so the retry middleware never re-sends them. This residual loss is
-    // structural (true prevention needs PUBACK-confirmed publishing, which costs throughput),
-    // so allow a 0.5% tolerance for MQTT only.
+    // MQTT is the exception, and this is within the MQTT spec rather than a bug. QoS 1/2
+    // redelivery is only guaranteed across a *persistent session that survives*; the protocol
+    // makes no durability guarantee across a broker crash/restart, and Mosquitto can drop a few
+    // in-flight QoS 1/2 messages when its session state doesn't fully resume after restart. The
+    // consumer has no recourse for these — the message simply never arrives, so there is nothing
+    // to retry or redeliver. (The publisher side still reaches 0 because it re-publishes on
+    // confirmation failure; this tolerance covers consumer-side restart loss only.) The loss is
+    // bounded by the in-flight window of a single ~2s restart, not by message count, so a small
+    // absolute tolerance is correct here. The old enqueue-ack bug lost ~5000, so 5 still catches
+    // any real regression.
     let allowed_loss = if broker_name.eq_ignore_ascii_case("mqtt") {
-        num_messages / 200
+        5
     } else {
         0
     };
 
     run_pipeline_test_internal(
+        broker_name,
         broker_name,
         config_yaml,
         num_messages,
@@ -407,6 +434,7 @@ pub async fn run_chaos_pipeline_test(
 
 async fn run_pipeline_test_internal(
     broker_name: &str,
+    display_name: &str,
     config_yaml: &str,
     num_messages: usize,
     is_performance_test: bool,
@@ -545,7 +573,7 @@ async fn run_pipeline_test_internal(
 
     if is_performance_test {
         let messages_per_second = received.len() as f64 / duration.as_secs_f64();
-        println!("\n--- {} Performance Test Results ---", broker_name);
+        println!("\n--- {} Performance Test Results ---", display_name);
         println!(
             "Processed {} messages in {:.3} seconds.",
             received.len(),
@@ -555,7 +583,7 @@ async fn run_pipeline_test_internal(
         println!("--------------------------------\n");
 
         add_performance_result(PerformanceResult {
-            test_name: format!("{} Pipeline", broker_name),
+            test_name: format!("{} Pipeline", display_name),
             write_performance: messages_per_second,
             read_performance: messages_per_second,
             single_write_performance: 0.0,
@@ -566,7 +594,7 @@ async fn run_pipeline_test_internal(
             received.len(),
             num_messages,
             "TEST FAILED for [{}]: Expected {} messages, but found {}.",
-            broker_name,
+            display_name,
             num_messages,
             received.len()
         );
@@ -595,7 +623,7 @@ async fn run_pipeline_test_internal(
         }
     }
 
-    println!("Successfully verified {} route!", broker_name);
+    println!("Successfully verified {} route!", display_name);
 }
 
 static LOG_GUARD: Mutex<Option<WorkerGuard>> = Mutex::new(None);

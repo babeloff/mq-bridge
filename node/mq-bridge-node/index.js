@@ -118,8 +118,25 @@ class Consumer {
     return messages.map((message) => Message._fromNative(message));
   }
 
+  async pollBatch(max, timeoutMs) {
+    const { messages, token } = await this._native.pollBatch(max, timeoutMs);
+    return {
+      messages: messages.map((message) => Message._fromNative(message)),
+      // Normalize the native `undefined` (no batch) to `null` per the typed API.
+      token: token ?? null,
+    };
+  }
+
   commit() {
     return this._native.commit();
+  }
+
+  ack(token) {
+    return this._native.ack(token);
+  }
+
+  nack(token) {
+    return this._native.nack(token);
   }
 
   status() {

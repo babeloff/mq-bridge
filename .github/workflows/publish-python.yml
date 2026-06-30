@@ -39,6 +39,25 @@ jobs:
             os: linux
             target: aarch64
             args: --release --out dist --find-interpreter --no-default-features
+          # musl/Alpine wheels for the basic package. basic uses the aws-lc-sys
+          # crypto provider (amqp + aws pull it in, same as full); aws-lc-sys
+          # compiles its C natively under musl given cmake + gcc, which
+          # before-script-linux installs in the musllinux container. The full
+          # wheel has no musl build (rdkafka makes it a separate effort).
+          - package: mq-bridge-py-basic
+            pyproject: pyproject-basic.toml
+            runner: ubuntu-latest
+            os: linux
+            target: x86_64
+            manylinux: musllinux_1_2
+            args: --release --out dist --find-interpreter --no-default-features
+          - package: mq-bridge-py-basic
+            pyproject: pyproject-basic.toml
+            runner: ubuntu-24.04-arm
+            os: linux
+            target: aarch64
+            manylinux: musllinux_1_2
+            args: --release --out dist --find-interpreter --no-default-features
           - package: mq-bridge-py-basic
             pyproject: pyproject-basic.toml
             runner: macos-15-intel
@@ -126,12 +145,18 @@ jobs:
           target: ${{ matrix.target }}
           args: ${{ matrix.args }}
           sccache: "true"
-          manylinux: auto
+          manylinux: ${{ matrix.manylinux || 'auto' }}
+          # amqp/aws (and full's kafka) pull aws-lc-sys, which compiles its C with
+          # cmake. manylinux containers already ship it; the musllinux (Alpine)
+          # container does not, so install it there. Guarded so it's a no-op
+          # wherever cmake is already present. Only runs for linux builds.
+          before-script-linux: |
+            command -v cmake >/dev/null 2>&1 || apk add --no-cache cmake gcc g++ make musl-dev perl
 
       - name: Upload wheels
         uses: actions/upload-artifact@v4
         with:
-          name: wheels-${{ matrix.package }}-${{ matrix.os }}-${{ matrix.target }}
+          name: wheels-${{ matrix.package }}-${{ matrix.os }}-${{ matrix.target }}-${{ matrix.manylinux || 'auto' }}
           path: python/mq-bridge-py/dist
 
   build-sdists:

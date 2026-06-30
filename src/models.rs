@@ -2346,7 +2346,10 @@ impl WebSocketConfig {
 // --- IBM MQ Specific Configuration ---
 
 /// Connection settings for the IBM MQ Queue Manager.
-#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+// Default is implemented manually (not derived): the numeric fields must match
+// the serde defaults, otherwise `IbmMqConfig::new()` / `..Default::default()`
+// would yield max_message_size=0 (zero-length receive buffer) and wait_timeout=0.
+#[derive(Debug, Deserialize, Serialize, Clone)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct IbmMqConfig {
@@ -2419,6 +2422,26 @@ impl IbmMqConfig {
         self.username = Some(username.into());
         self.password = Some(password.into());
         self
+    }
+}
+
+impl Default for IbmMqConfig {
+    fn default() -> Self {
+        Self {
+            url: String::new(),
+            queue: None,
+            topic: None,
+            queue_manager: String::new(),
+            channel: String::new(),
+            username: None,
+            password: None,
+            cipher_spec: None,
+            tls: TlsConfig::default(),
+            max_message_size: default_max_message_size(),
+            wait_timeout_ms: default_wait_timeout_ms(),
+            internal_buffer_size: None,
+            disable_status_inq: false,
+        }
     }
 }
 

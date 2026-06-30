@@ -2,9 +2,10 @@ name: Benchmark
 
 on:
   push:
-    branches: [main]
-  pull_request:
-    branches: [main]
+    branches: [main, dev]
+  schedule:
+    # Nightly full benchmark run (04:00 UTC)
+    - cron: '0 4 * * *'
   workflow_dispatch:
 
 env:
@@ -24,17 +25,12 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
       
-      - name: Cache cargo registry
-        uses: actions/cache@v4
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
+          # Shared with the release-mode integration jobs so the full-feature
+          # dependency compile is reused across jobs/runs instead of rebuilt.
+          shared-key: release-full
       
       - name: Pre-pull docker images
         run: |
