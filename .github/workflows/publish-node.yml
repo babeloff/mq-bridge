@@ -59,6 +59,12 @@ jobs:
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
+      # Regenerate package.json/lock from the Cargo workspace version (source of
+      # truth) BEFORE npm ci, so a drifted committed lock can't fail the build.
+      - name: Sync version from Cargo workspace
+        working-directory: node/mq-bridge-node
+        run: npm run sync-version
+
       - name: Install Node dependencies
         working-directory: node/mq-bridge-node
         run: npm ci
@@ -124,6 +130,12 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      # Regenerate package.json/lock from the Cargo workspace version (source of
+      # truth) BEFORE npm ci, so a drifted committed lock can't fail the build.
+      - name: Sync version from Cargo workspace
+        working-directory: node/mq-bridge-node
+        run: npm run sync-version
+
       - name: Install Node dependencies
         working-directory: node/mq-bridge-node
         run: npm ci
@@ -170,13 +182,15 @@ jobs:
       - name: Update npm
         run: npm install -g npm@11.5.1
 
-      - name: Install Node dependencies
-        working-directory: node/mq-bridge-node
-        run: npm ci
-
+      # Regenerate package.json/lock from the Cargo workspace version (source of
+      # truth) BEFORE npm ci, so a drifted committed lock can't fail the publish.
       - name: Sync version from Cargo workspace
         working-directory: node/mq-bridge-node
         run: npm run sync-version
+
+      - name: Install Node dependencies
+        working-directory: node/mq-bridge-node
+        run: npm ci
 
       - name: Download loader into package root
         uses: actions/download-artifact@v4

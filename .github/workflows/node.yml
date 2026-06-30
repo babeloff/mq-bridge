@@ -2,7 +2,7 @@ name: Node
 
 on:
   push:
-    branches: [main]
+    branches: [main, dev]
     paths:
       - ".github/workflows/node.yml"
       - "node/mq-bridge-node/**"
@@ -23,6 +23,28 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Fast guard: catches package.json/package-lock.json drift (e.g. a version
+  # bump that only half-updates the lock) before it reaches the publish flow,
+  # where `npm ci` fails after all the native builds have already run.
+  lock-sync:
+    name: package-lock in sync
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: node/mq-bridge-node/package-lock.json
+
+      - name: Verify lock is in sync
+        working-directory: node/mq-bridge-node
+        run: npm ci --ignore-scripts
+
   test:
     name: Node binding smoke test
     runs-on: ubuntu-latest
