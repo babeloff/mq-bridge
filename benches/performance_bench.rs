@@ -357,7 +357,7 @@ pub mod zeromq_helper {
     }
 }
 
-#[cfg(feature = "ibm-mq-static")]
+#[cfg(any(feature = "ibm-mq-static", feature = "ibm-mq"))]
 pub mod ibm_mq_helper {
     use mq_bridge::endpoints::ibm_mq::{IbmMqConsumer, IbmMqPublisher};
     use mq_bridge::models::IbmMqConfig;
@@ -1027,18 +1027,21 @@ fn performance_benchmarks(c: &mut Criterion) {
         PERF_TEST_CONCURRENCY,
         std::time::Duration::from_millis(10)
     );
-    bench_backend!(
-        "ibm-mq-static",
-        "ibm-mq",
-        "tests/integration/docker-compose/ibm_mq.yml",
-        ibm_mq_helper,
-        group,
-        &rt,
-        &BENCH_RESULTS,
-        PERF_TEST_MESSAGE_COUNT,
-        PERF_TEST_CONCURRENCY,
-        std::time::Duration::from_millis(100)
-    );
+    #[cfg(any(feature = "ibm-mq-static", feature = "ibm-mq"))]
+    {
+        bench_backend!(
+            "",
+            "ibm-mq",
+            "tests/integration/docker-compose/ibm_mq.yml",
+            ibm_mq_helper,
+            group,
+            &rt,
+            &BENCH_RESULTS,
+            PERF_TEST_MESSAGE_COUNT,
+            PERF_TEST_CONCURRENCY,
+            std::time::Duration::from_millis(100)
+        );
+    }
     bench_backend!(
         "memory",
         memory_helper,
