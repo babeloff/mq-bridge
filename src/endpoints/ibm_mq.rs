@@ -941,6 +941,30 @@ mod dlopen_tests {
     // fast instead of reconnecting forever.
     #[test]
     fn missing_library_is_non_retryable() {
+        // Save & restore the env we mutate so this test can't leak into sibling
+        // dlopen tests (e.g. loads_client reads MQ_INSTALLATION_PATH). Drop runs
+        // even if the assertions below panic.
+        struct EnvRestore {
+            lib: Option<String>,
+            path: Option<String>,
+        }
+        impl Drop for EnvRestore {
+            fn drop(&mut self) {
+                match &self.lib {
+                    Some(v) => std::env::set_var("MQB_IBM_MQ_LIB", v),
+                    None => std::env::remove_var("MQB_IBM_MQ_LIB"),
+                }
+                match &self.path {
+                    Some(v) => std::env::set_var("MQ_INSTALLATION_PATH", v),
+                    None => std::env::remove_var("MQ_INSTALLATION_PATH"),
+                }
+            }
+        }
+        let _restore = EnvRestore {
+            lib: std::env::var("MQB_IBM_MQ_LIB").ok(),
+            path: std::env::var("MQ_INSTALLATION_PATH").ok(),
+        };
+
         std::env::set_var("MQB_IBM_MQ_LIB", "/nonexistent/path/libmqm_r");
         std::env::remove_var("MQ_INSTALLATION_PATH");
         let err = match load_ibm_mq_library() {

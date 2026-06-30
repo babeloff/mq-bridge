@@ -39,10 +39,11 @@ jobs:
             os: linux
             target: aarch64
             args: --release --out dist --find-interpreter --no-default-features
-          # musl/Alpine wheels for the basic package. basic is pure-Rust on the
-          # ring provider (no aws-lc-sys / no -sys C libs), so it builds cleanly
-          # in the musllinux container. The full wheel has no musl build (rdkafka
-          # + aws-lc-sys make it a separate effort).
+          # musl/Alpine wheels for the basic package. basic uses the aws-lc-sys
+          # crypto provider (amqp + aws pull it in, same as full); aws-lc-sys
+          # compiles its C natively under musl given cmake + gcc, which
+          # before-script-linux installs in the musllinux container. The full
+          # wheel has no musl build (rdkafka makes it a separate effort).
           - package: mq-bridge-py-basic
             pyproject: pyproject-basic.toml
             runner: ubuntu-latest
