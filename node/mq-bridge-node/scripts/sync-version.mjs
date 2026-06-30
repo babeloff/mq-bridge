@@ -33,12 +33,25 @@ if (existsSync(lockPath)) {
   const lock = JSON.parse(readFileSync(lockPath, "utf8"));
   lock.version = version;
   const rootPackage = lock.packages?.[""];
+  const optionalNames = rootPackage?.optionalDependencies
+    ? Object.keys(rootPackage.optionalDependencies)
+    : [];
   if (rootPackage) {
     rootPackage.version = version;
-    if (rootPackage.optionalDependencies) {
-      for (const name of Object.keys(rootPackage.optionalDependencies)) {
-        rootPackage.optionalDependencies[name] = version;
-      }
+    for (const name of optionalNames) {
+      rootPackage.optionalDependencies[name] = version;
+    }
+  }
+  // The resolved `node_modules/<platform>` entries must move in lockstep too,
+  // otherwise `npm ci` rejects the lock ("X@<old> does not satisfy X@<new>").
+  // The new version's tarball isn't published yet, so point at its future URL
+  // and drop the integrity hash (recomputed on the next real `npm install`).
+  for (const name of optionalNames) {
+    const entry = lock.packages?.[`node_modules/${name}`];
+    if (entry) {
+      entry.version = version;
+      entry.resolved = `https://registry.npmjs.org/${name}/-/${name}-${version}.tgz`;
+      delete entry.integrity;
     }
   }
   writeFileSync(lockPath, `${JSON.stringify(lock, null, 2)}\n`);
