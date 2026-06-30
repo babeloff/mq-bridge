@@ -113,6 +113,20 @@ impl std::fmt::Display for IbmMqLibraryUnavailable {
 #[cfg(all(feature = "ibm-mq", not(feature = "ibm-mq-static")))]
 impl std::error::Error for IbmMqLibraryUnavailable {}
 
+/// True if the IBM MQ client can actually be used in this build: always for the
+/// static link (it is bound at build time), or — on the dlopen build — only if
+/// the runtime client library is present and loads. Tests use this to skip IBM MQ
+/// where no client is installed (e.g. the generic `full` CI job), instead of
+/// failing on the first connect attempt.
+#[cfg(feature = "ibm-mq-static")]
+pub fn ibm_mq_client_available() -> bool {
+    true
+}
+#[cfg(all(feature = "ibm-mq", not(feature = "ibm-mq-static")))]
+pub fn ibm_mq_client_available() -> bool {
+    load_ibm_mq_library().is_ok()
+}
+
 /// True if the connect error is a missing-client-library failure (dlopen build).
 fn is_library_unavailable(_e: &anyhow::Error) -> bool {
     #[cfg(all(feature = "ibm-mq", not(feature = "ibm-mq-static")))]

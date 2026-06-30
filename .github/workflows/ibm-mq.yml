@@ -82,13 +82,19 @@ jobs:
           ls -la /opt/mqm/lib64/ || echo "MQ lib64 directory not found"
           echo "LD_LIBRARY_PATH=$LD_LIBRARY_PATH"
 
-      - name: Build with IBM MQ feature
+      # `ibm-mq` (dlopen) is the shipping path and needs no SDK at build; the
+      # redist install above only provides headers for the static compile-check.
+      - name: Build with IBM MQ feature (dlopen)
+        if: steps.mqclient.outputs.available == 'true'
+        run: cargo build --features ibm-mq
+
+      - name: Build with IBM MQ feature (static link)
         if: steps.mqclient.outputs.available == 'true'
         run: cargo build --features ibm-mq-static
 
       - name: Run clippy on IBM MQ code
         if: steps.mqclient.outputs.available == 'true'
-        run: cargo clippy --features ibm-mq-static -- -D warnings
+        run: cargo clippy --features ibm-mq -- -D warnings
 
   # Integration tests with Docker
   integration-ibm-mq:
@@ -162,7 +168,7 @@ jobs:
           # The test fns are named test_all_* (filtered to ibm-mq via
           # MQB_TEST_BACKEND). The previous test_ibm_mq_* filters matched no
           # test, so this job silently ran zero tests.
-          cargo test --test integration_test --features ibm-mq-static,test-utils,rustls-ring -- \
+          cargo test --test integration_test --features ibm-mq,test-utils,rustls-ring -- \
             --ignored --nocapture --test-threads=1 \
             test_all_subscriber_logic \
             test_all_performance_pipeline \
@@ -172,7 +178,7 @@ jobs:
       - name: Run IBM MQ TLS tests
         if: steps.mqclient.outputs.available == 'true'
         run: |
-          cargo test --test integration_test --features ibm-mq-static,test-utils,rustls-ring -- \
+          cargo test --test integration_test --features ibm-mq,test-utils,rustls-ring -- \
             --ignored --nocapture --test-threads=1 \
             test_ibm_mq_tls_roundtrip
 
@@ -213,6 +219,6 @@ jobs:
           echo "MQ_INSTALLATION_PATH=/opt/mqm" >> $GITHUB_ENV
       
       - name: Build documentation
-        run: cargo doc --features ibm-mq-static --no-deps
+        run: cargo doc --features ibm-mq --no-deps
 
 # Made with Bob

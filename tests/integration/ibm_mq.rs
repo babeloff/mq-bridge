@@ -34,6 +34,13 @@ use mq_bridge::traits::{MessageConsumer, MessagePublisher};
 use std::sync::Arc;
 use std::time::Instant;
 
+/// Whether the IBM MQ client is usable here (always for static link; for the
+/// dlopen build, only if the runtime client library loads). Lets the `test_all_*`
+/// runners skip IBM MQ where no client is installed instead of failing on connect.
+pub fn client_available() -> bool {
+    mq_bridge::endpoints::ibm_mq::ibm_mq_client_available()
+}
+
 fn get_config() -> IbmMqConfig {
     IbmMqConfig {
         username: Some("app".to_string()),
@@ -112,14 +119,31 @@ pub async fn test_ibm_mq_performance_pipeline() {
             let _ = route.run_until_err("ibm_mq_pipe", None, None).await;
         });
 
-        // Wait for messages
+        // Wait for messages. The channel holds Vec<CanonicalMessage> *batches*, so
+        // out_channel.len() counts batches, not messages — draining and summing the
+        // batch lengths is the only correct count, and it also relieves backpressure
+        // so the bounded output channel never blocks the route.
+        let timeout_secs: u64 = std::env::var("MQB_TEST_DRAIN_TIMEOUT_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(60);
         let start = Instant::now();
-        loop {
-            if out_channel.len() >= num_messages {
+        let mut received = 0;
+        let mut last_logged = 0;
+        while received < num_messages {
+            received += out_channel.drain_messages().len();
+            if received >= last_logged + 100 {
+                println!("IBM MQ pipeline: {received}/{num_messages} received");
+                last_logged = received;
+            }
+            if received >= num_messages {
                 break;
             }
-            if start.elapsed().as_secs() > 30 {
-                panic!("Timeout waiting for messages in pipeline");
+            if start.elapsed().as_secs() > timeout_secs {
+                panic!(
+                    "Timeout waiting for messages in pipeline: {received}/{num_messages} \
+                     received after {timeout_secs}s"
+                );
             }
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
@@ -218,13 +242,20 @@ pub async fn test_ibm_mq_performance_direct2() {
         publisher.send_batch(messages).await.unwrap();
         let send_time = start.elapsed();
 
+        let timeout_secs: u64 = std::env::var("MQB_TEST_DRAIN_TIMEOUT_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(180);
         let mut received_count = 0;
         let recv_start = Instant::now();
         while received_count < num_messages {
             let batch = consumer.receive_batch(100).await.unwrap();
             received_count += batch.messages.len();
-            if recv_start.elapsed().as_secs() > 30 {
-                panic!("Timeout receiving messages");
+            if recv_start.elapsed().as_secs() > timeout_secs {
+                panic!(
+                    "Timeout receiving messages: {received_count}/{num_messages} \
+                     received after {timeout_secs}s"
+                );
             }
         }
         let recv_time = recv_start.elapsed();

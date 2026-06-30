@@ -60,7 +60,7 @@ async fn test_all_subscriber_logic() {
     // --- Subscriber Logic ---
     #[cfg(any(feature = "ibm-mq-static", feature = "ibm-mq"))]
     {
-        if should_run("ibm-mq") {
+        if should_run("ibm-mq") && integration::ibm_mq::client_available() {
             println!("\n\n>>> Starting IBM MQ Subscriber Logic Test...");
             integration::ibm_mq::test_ibm_mq_subscriber_logic().await;
         }
@@ -156,7 +156,7 @@ async fn test_all_chaos() {
 
     #[cfg(any(feature = "ibm-mq-static", feature = "ibm-mq"))]
     {
-        if should_run("ibm-mq") {
+        if should_run("ibm-mq") && integration::ibm_mq::client_available() {
             println!("\n\n>>> Starting IBM MQ Chaos Test...");
             integration::ibm_mq::test_ibm_mq_chaos().await;
         }
@@ -225,7 +225,7 @@ async fn test_all_status() {
 
     #[cfg(any(feature = "ibm-mq-static", feature = "ibm-mq"))]
     {
-        if should_run("ibm-mq") {
+        if should_run("ibm-mq") && integration::ibm_mq::client_available() {
             println!("\n\n>>> Starting IBM MQ Status Test...");
             integration::ibm_mq::test_ibm_mq_status().await;
         }
@@ -309,7 +309,7 @@ async fn test_all_performance_pipeline() {
     }
     #[cfg(any(feature = "ibm-mq-static", feature = "ibm-mq"))]
     {
-        if should_run("ibm-mq") {
+        if should_run("ibm-mq") && integration::ibm_mq::client_available() {
             println!("\n\n>>> Starting IBM MQ Performance Pipeline Test...");
             integration::ibm_mq::test_ibm_mq_performance_pipeline().await;
         }
@@ -416,7 +416,7 @@ async fn test_all_performance_direct() {
     }
     #[cfg(any(feature = "ibm-mq-static", feature = "ibm-mq"))]
     {
-        if should_run("ibm-mq") {
+        if should_run("ibm-mq") && integration::ibm_mq::client_available() {
             println!("\n\n>>> Starting IBM MQ Direct Performance Test...");
             integration::ibm_mq::test_ibm_mq_performance_direct().await;
         }
