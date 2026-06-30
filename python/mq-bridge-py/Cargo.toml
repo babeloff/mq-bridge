@@ -52,7 +52,7 @@ full = ["mq-bridge/full", "rustls-aws-lc"]
 #   - kafka   -> rdkafka/librdkafka C toolchain (SASL/SSL/zstd)
 #   - sqlx    -> libsqlite3-sys (C, needs bundled sqlite)
 #   - grpc    -> build-time protoc binary (glibc-only, fails under musl) + slow build
-#   - ibm-mq  -> IBM MQ proprietary C client
+#   - ibm-mq-static -> IBM MQ proprietary C client linked at build (SDK needed)
 # `middleware` is intentionally excluded (metrics + sled dedup are not needed in
 # production wheels; retry/DLQ are not feature-gated and remain available).
 basic = ["http", "nats", "mqtt", "websocket", "zeromq", "mongodb", "amqp", "aws", "rustls-aws-lc"]
@@ -70,11 +70,12 @@ mqtt = ["mq-bridge/mqtt"]
 http = ["mq-bridge/http"]
 websocket = ["mq-bridge/websocket"]
 aws = ["mq-bridge/aws"]
-ibm-mq = ["mq-bridge/ibm-mq"]
 # Runtime-loaded IBM MQ client (dlopen): wheel builds without the IBM SDK; the
 # redistributable client is only needed at runtime. Already pulled in by `full`;
 # exposed here for explicit opt-in.
-ibm-mq-dlopen = ["mq-bridge/ibm-mq-dlopen"]
+ibm-mq = ["mq-bridge/ibm-mq"]
+# Static-link IBM MQ client (needs the IBM SDK at build time).
+ibm-mq-static = ["mq-bridge/ibm-mq-static"]
 zeromq = ["mq-bridge/zeromq"]
 grpc = ["mq-bridge/grpc"]
 sqlx = ["mq-bridge/sqlx"]

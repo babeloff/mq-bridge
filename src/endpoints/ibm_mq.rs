@@ -99,27 +99,27 @@ async fn handle_status_request<T>(
 /// Marker error: the IBM MQ client library could not be loaded at runtime.
 /// Classified as non-retryable so a route fails fast instead of reconnecting
 /// forever for a dependency that will not appear without operator action.
-#[cfg(all(feature = "ibm-mq-dlopen", not(feature = "ibm-mq")))]
+#[cfg(all(feature = "ibm-mq", not(feature = "ibm-mq-static")))]
 #[derive(Debug)]
 struct IbmMqLibraryUnavailable(String);
 
-#[cfg(all(feature = "ibm-mq-dlopen", not(feature = "ibm-mq")))]
+#[cfg(all(feature = "ibm-mq", not(feature = "ibm-mq-static")))]
 impl std::fmt::Display for IbmMqLibraryUnavailable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.0)
     }
 }
 
-#[cfg(all(feature = "ibm-mq-dlopen", not(feature = "ibm-mq")))]
+#[cfg(all(feature = "ibm-mq", not(feature = "ibm-mq-static")))]
 impl std::error::Error for IbmMqLibraryUnavailable {}
 
 /// True if the connect error is a missing-client-library failure (dlopen build).
 fn is_library_unavailable(_e: &anyhow::Error) -> bool {
-    #[cfg(all(feature = "ibm-mq-dlopen", not(feature = "ibm-mq")))]
+    #[cfg(all(feature = "ibm-mq", not(feature = "ibm-mq-static")))]
     {
         _e.downcast_ref::<IbmMqLibraryUnavailable>().is_some()
     }
-    #[cfg(not(all(feature = "ibm-mq-dlopen", not(feature = "ibm-mq"))))]
+    #[cfg(not(all(feature = "ibm-mq", not(feature = "ibm-mq-static"))))]
     {
         false
     }
@@ -128,7 +128,7 @@ fn is_library_unavailable(_e: &anyhow::Error) -> bool {
 // Runtime-load the IBM MQ client via dlopen. mqi's load_mqm_default hardcodes
 // "libmqm_r.so", which is wrong on macOS (libmqm_r.dylib); this tries the
 // platform-correct name plus MQ_INSTALLATION_PATH and an explicit override.
-#[cfg(all(feature = "ibm-mq-dlopen", not(feature = "ibm-mq")))]
+#[cfg(all(feature = "ibm-mq", not(feature = "ibm-mq-static")))]
 fn load_ibm_mq_library() -> anyhow::Result<Arc<libmqm_sys::dlopen2::MqmContainer>> {
     use libmqm_sys::dlopen2::MqmContainer;
 
@@ -252,12 +252,12 @@ macro_rules! connect_mq {
         );
 
         // Link path: client is statically linked at build time.
-        #[cfg(feature = "ibm-mq")]
+        #[cfg(feature = "ibm-mq-static")]
         let connected = mqi::connect::<ThreadNone>(&opts)
             .discard_warning()
             .context("MQ connect failed");
         // dlopen path: load the IBM client at runtime (no SDK needed at build).
-        #[cfg(all(feature = "ibm-mq-dlopen", not(feature = "ibm-mq")))]
+        #[cfg(all(feature = "ibm-mq", not(feature = "ibm-mq-static")))]
         let connected = {
             let lib = load_ibm_mq_library()?;
             mqi::connect_lib::<ThreadNone, _>(lib, &opts)
@@ -909,14 +909,14 @@ impl IbmMqConsumer {
     }
 }
 
-#[cfg(all(test, feature = "ibm-mq-dlopen", not(feature = "ibm-mq")))]
+#[cfg(all(test, feature = "ibm-mq", not(feature = "ibm-mq-static")))]
 mod dlopen_tests {
     use super::*;
 
     // Proves the runtime dlopen of the IBM client succeeds where it is installed.
     // Ignored by default (needs the client present); run with:
     //   MQ_INSTALLATION_PATH=/opt/mqm cargo test -p mq-bridge \
-    //     --no-default-features --features ibm-mq-dlopen -- --ignored loads_client
+    //     --no-default-features --features ibm-mq -- --ignored loads_client
     #[test]
     #[ignore]
     fn loads_client() {

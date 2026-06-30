@@ -84,11 +84,11 @@ jobs:
 
       - name: Build with IBM MQ feature
         if: steps.mqclient.outputs.available == 'true'
-        run: cargo build --features ibm-mq
+        run: cargo build --features ibm-mq-static
 
       - name: Run clippy on IBM MQ code
         if: steps.mqclient.outputs.available == 'true'
-        run: cargo clippy --features ibm-mq -- -D warnings
+        run: cargo clippy --features ibm-mq-static -- -D warnings
 
   # Integration tests with Docker
   integration-ibm-mq:
@@ -162,7 +162,7 @@ jobs:
           # The test fns are named test_all_* (filtered to ibm-mq via
           # MQB_TEST_BACKEND). The previous test_ibm_mq_* filters matched no
           # test, so this job silently ran zero tests.
-          cargo test --test integration_test --features ibm-mq,test-utils,rustls-ring -- \
+          cargo test --test integration_test --features ibm-mq-static,test-utils,rustls-ring -- \
             --ignored --nocapture --test-threads=1 \
             test_all_subscriber_logic \
             test_all_performance_pipeline \
@@ -172,7 +172,7 @@ jobs:
       - name: Run IBM MQ TLS tests
         if: steps.mqclient.outputs.available == 'true'
         run: |
-          cargo test --test integration_test --features ibm-mq,test-utils,rustls-ring -- \
+          cargo test --test integration_test --features ibm-mq-static,test-utils,rustls-ring -- \
             --ignored --nocapture --test-threads=1 \
             test_ibm_mq_tls_roundtrip
 
@@ -213,6 +213,6 @@ jobs:
           echo "MQ_INSTALLATION_PATH=/opt/mqm" >> $GITHUB_ENV
       
       - name: Build documentation
-        run: cargo doc --features ibm-mq --no-deps
+        run: cargo doc --features ibm-mq-static --no-deps
 
 # Made with Bob

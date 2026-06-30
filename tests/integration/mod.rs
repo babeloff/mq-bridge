@@ -8,9 +8,9 @@ pub mod grpc;
 pub mod http;
 #[cfg(feature = "http")]
 pub mod http_tls;
-#[cfg(any(feature = "ibm-mq", feature = "ibm-mq-dlopen"))]
+#[cfg(any(feature = "ibm-mq-static", feature = "ibm-mq"))]
 pub mod ibm_mq;
-#[cfg(any(feature = "ibm-mq", feature = "ibm-mq-dlopen"))]
+#[cfg(any(feature = "ibm-mq-static", feature = "ibm-mq"))]
 pub mod ibm_mq_tls;
 #[cfg(feature = "kafka")]
 pub mod kafka;

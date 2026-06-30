@@ -357,7 +357,7 @@ pub mod zeromq_helper {
     }
 }
 
-#[cfg(feature = "ibm-mq")]
+#[cfg(feature = "ibm-mq-static")]
 pub mod ibm_mq_helper {
     use mq_bridge::endpoints::ibm_mq::{IbmMqConsumer, IbmMqPublisher};
     use mq_bridge::models::IbmMqConfig;
@@ -1028,7 +1028,7 @@ fn performance_benchmarks(c: &mut Criterion) {
         std::time::Duration::from_millis(10)
     );
     bench_backend!(
-        "ibm-mq",
+        "ibm-mq-static",
         "ibm-mq",
         "tests/integration/docker-compose/ibm_mq.yml",
         ibm_mq_helper,

@@ -1,5 +1,5 @@
 #![allow(unused_imports)]
-#![cfg(feature = "ibm-mq")]
+#![cfg(feature = "ibm-mq-static")]
 
 use std::sync::Arc;
 
