@@ -1352,9 +1352,11 @@ pub struct NatsConfig {
     /// Comma-separated list of NATS server URLs (e.g., "nats://localhost:4222,nats://localhost:4223"). If it contains userinfo, it will be treated as a secret.
     #[cfg_attr(feature = "schema", schemars(extend("format"="password")))]
     pub url: String,
-    /// The NATS subject to publish to or subscribe to.
+    /// The NATS subject to publish to or subscribe to. If a stream is
+    /// auto-created, it's scoped to `{stream}.>`, so prefix accordingly.
     pub subject: Option<String>,
-    /// (Consumer only). The JetStream stream name. Required for Consumers.
+    /// The JetStream stream name. Required for Consumers, even with
+    /// `no_jetstream: true` (unused there, but still validated).
     pub stream: Option<String>,
     /// Optional username for authentication.
     pub username: Option<String>,

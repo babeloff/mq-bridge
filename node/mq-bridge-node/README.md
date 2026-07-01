@@ -19,6 +19,33 @@ npm run build:ci
 npm run example
 ```
 
+## Quick start: publish a message with no route/config file
+
+For ad hoc testing (e.g. seeding a topic by hand) you don't need a route, a
+handler, or a config file — `Publisher.fromConfig` takes a plain object and
+`sendJson` resolves once the broker acks it:
+
+```js
+const { Publisher } = require("mq-bridge");
+
+(async () => {
+  const endpoint = { kafka: { brokers: "localhost:9092", topic: "orders" } };
+  const pub = Publisher.fromConfig(endpoint);
+  for (let i = 0; i < 5; i++) {
+    await pub.sendJson({ orderId: i, amount: i * 10 });
+  }
+  console.log("published 5 messages");
+})();
+```
+
+For a truly file-free one-off, paste the same lines into `node -e "..."`.
+
+Swap the `endpoint` object for any other transport (`nats`, `amqp`, `mqtt`,
+`mongodb`, `memory`, `file`, ...). `sendJson(data, metadata?, id?)` takes an
+optional metadata object as its second argument (e.g. `{ kind: 'order.created' }`).
+`Publisher` has no `close()`, so let the script exit once sends finish rather
+than reusing a long-lived instance across many short runs.
+
 ## Handler shape
 
 ```ts

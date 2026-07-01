@@ -24,7 +24,7 @@ kafka_to_nats:
   output:
     nats:
       url: "nats://localhost:4222"
-      subject: "orders.processed"
+      subject: "orders_stream.processed"
       stream: "orders_stream"
 
 # Route 2: HTTP Webhook to MongoDB with Middleware
@@ -139,6 +139,22 @@ For example, to set the Kafka topic for the `kafka_to_nats` route:
 ```sh
 export MQB__KAFKA_TO_NATS__INPUT__KAFKA__TOPIC="my-other-topic"
 ```
+
+### NATS JetStream Notes
+
+Two gotchas worth knowing before wiring up a `nats` endpoint:
+
+- **Subject must be prefixed with the stream name.** When mq-bridge auto-creates
+  a JetStream stream (no existing stream already covers the subject), it scopes
+  the stream to `{stream}.>`. So `stream: "orders_stream"` requires a subject
+  like `orders_stream.foo` — a subject such as `orders.foo` will fail to publish
+  with "no stream found for given subject". This only applies to
+  auto-creation; publishing to a stream that already exists with a wider
+  subject filter works regardless of naming.
+- **`stream` is required even in Core NATS mode.** Consumer validation requires
+  a `stream` value even when `no_jetstream: true`. It's unused for the actual
+  Core NATS subscribe, but validation still rejects a missing value — pass any
+  placeholder string.
 
 ### Middleware Configuration
 Middleware is defined as a list under an endpoint.

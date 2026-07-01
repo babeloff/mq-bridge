@@ -4,14 +4,14 @@ Thin Python bindings for the Rust `mq-bridge` core.
 
 ## Install
 
-Pick exactly one distribution. Both install the same import path: `mq_bridge`.
+`pip install mq-bridge-py` is all you need. Both packages install the same import path: `mq_bridge`.
 
 | Package | Install | Includes |
 | :--- | :--- | :--- |
-| Full | `pip install mq-bridge-py` | Basic set plus Kafka, AWS, gRPC, MongoDB, SQLx |
-| Basic | `pip install mq-bridge-py-basic` | HTTP, NATS, MQTT, AMQP, WebSocket, ZeroMQ, middleware |
+| Default | `pip install mq-bridge-py` | Full set on glibc-Linux/macOS/Windows-x64 (Kafka, AWS, gRPC, MongoDB, SQLx + basic); reduced set automatically on musl/Alpine and Windows arm64 (no Kafka/SQLx/gRPC) |
+| Basic | `pip install mq-bridge-py-basic` | HTTP, NATS, MQTT, AMQP, WebSocket, ZeroMQ, MongoDB, AWS — the lean set on **every** platform |
 
-Memory and file endpoints are always present in both packages. Use `mq-bridge-py-basic` when you want the lean all-platform wheel set. Use `mq-bridge-py` when you need Kafka or the heavier non-messaging backends.
+`mq-bridge-py` resolves by platform automatically: pip installs the full wheel on glibc-Linux/macOS/Windows-x64 and the reduced (basic-feature) wheel on musl/Alpine and Windows arm64 — no marker or manual choice needed. Kafka/SQLx/gRPC/static-IBM-MQ don't build on those targets, so calling them there raises a clear runtime error; everything else works identically. Install `mq-bridge-py-basic` only if you explicitly want the lean build on a full-support system too. Memory and file endpoints are always present.
 
 The public API stays close to mq-bridge itself:
 
@@ -26,6 +26,31 @@ The public API stays close to mq-bridge itself:
 - `Publisher.send_json(...)` and `Publisher.request_json(...)` serialize Python JSON values in Rust
 
 The Python surface is synchronous and blocking. Tokio, broker I/O, routing, and batching all stay in Rust.
+
+## Quick start: publish a message with no route/config file
+
+For ad hoc testing (e.g. seeding a topic by hand) you don't need a route, a
+handler, or a config file — `Publisher.from_config` takes a plain dict and
+`send_json` blocks until the broker acks it:
+
+```python
+from mq_bridge import Publisher
+
+endpoint = {"kafka": {"brokers": "localhost:9092", "topic": "orders"}}
+pub = Publisher.from_config(endpoint)
+for i in range(5):
+    pub.send_json({"order_id": i, "amount": i * 10})
+print("published 5 messages")
+```
+
+For a truly file-free one-off, paste the same lines into `python -c "..."`.
+
+Swap the `endpoint` dict for any other transport (`nats`, `amqp`, `mqtt`,
+`mongodb`, `memory`, `file`, ...) — see [Config types and schema](#config-types-and-schema)
+below for the full shape of each. `send_json` accepts an optional `metadata`
+dict as a second positional argument (e.g. `{'kind': 'order.created'}`) and
+`Publisher` has no `close()`/context-manager form, so let the script exit once
+sends finish rather than reusing a long-lived instance across many short runs.
 
 ## Config types and schema
 
