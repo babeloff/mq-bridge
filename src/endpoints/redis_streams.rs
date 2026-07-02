@@ -86,7 +86,11 @@ fn url_with_credentials(config: &RedisStreamsConfig) -> String {
         // Userinfo already present in the URL; leave it as the source of truth.
         return config.url.clone();
     }
-    let user = config.username.as_deref().map(encode_userinfo).unwrap_or_default();
+    let user = config
+        .username
+        .as_deref()
+        .map(encode_userinfo)
+        .unwrap_or_default();
     let userinfo = match &config.password {
         Some(password) => format!("{}:{}@", user, encode_userinfo(password)),
         None => format!("{}@", user),
