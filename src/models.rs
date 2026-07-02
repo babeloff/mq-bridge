@@ -2347,6 +2347,31 @@ impl WebSocketConfig {
 
 // --- IBM MQ Specific Configuration ---
 
+/// TLS configuration for the IBM MQ native client.
+///
+/// The IBM MQ client doesn't consume PEM files, so this uses MQ-native field
+/// names rather than the generic [`TlsConfig`] used by the other endpoints.
+#[derive(Debug, Deserialize, Serialize, Clone, Default, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct IbmTlsConfig {
+    /// If true, enable TLS/SSL.
+    #[serde(default, deserialize_with = "deserialize_null_as_false")]
+    pub required: bool,
+    /// TLS CipherSpec (e.g., `ANY_TLS12`). Required for encrypted connections.
+    pub cipher_spec: Option<String>,
+    /// Path to the CMS key repository (e.g. `/path/to/tls` for `tls.kdb`/`tls.sth`).
+    #[serde(alias = "cert_file")]
+    pub key_repository: Option<String>,
+    /// Password unlocking the key repository. Requires an IBM MQ client/server at 9.3.0.0+.
+    #[serde(alias = "cert_password")]
+    #[cfg_attr(feature = "schema", schemars(extend("format"="password")))]
+    pub key_repository_password: Option<String>,
+    /// If true, disable server certificate verification (insecure).
+    #[serde(default)]
+    pub accept_invalid_certs: bool,
+}
+
 /// Connection settings for the IBM MQ Queue Manager.
 // Default is implemented manually (not derived): the numeric fields must match
 // the serde defaults, otherwise `IbmMqConfig::new()` / `..Default::default()`
@@ -2371,11 +2396,9 @@ pub struct IbmMqConfig {
     /// Password for authentication. Optional; required if the channel enforces authentication.
     #[cfg_attr(feature = "schema", schemars(extend("format"="password")))]
     pub password: Option<String>,
-    /// TLS CipherSpec (e.g., `ANY_TLS12`). Optional; required for encrypted connections.
-    pub cipher_spec: Option<String>,
     /// TLS configuration settings (e.g., keystore paths). Optional.
     #[serde(default)]
-    pub tls: TlsConfig,
+    pub tls: IbmTlsConfig,
     /// Maximum message size in bytes (default: 4MB). Optional.
     #[serde(default = "default_max_message_size")]
     pub max_message_size: usize,
@@ -2437,8 +2460,7 @@ impl Default for IbmMqConfig {
             channel: String::new(),
             username: None,
             password: None,
-            cipher_spec: None,
-            tls: TlsConfig::default(),
+            tls: IbmTlsConfig::default(),
             max_message_size: default_max_message_size(),
             wait_timeout_ms: default_wait_timeout_ms(),
             internal_buffer_size: None,
@@ -2976,6 +2998,14 @@ impl SecretExtractor for TlsConfig {
     fn extract_secrets(&mut self, prefix: &str, secrets: &mut HashMap<String, String>) {
         if let Some(val) = self.cert_password.take() {
             secrets.insert(format!("{}__{}", prefix, "CERT_PASSWORD"), val);
+        }
+    }
+}
+
+impl SecretExtractor for IbmTlsConfig {
+    fn extract_secrets(&mut self, prefix: &str, secrets: &mut HashMap<String, String>) {
+        if let Some(val) = self.key_repository_password.take() {
+            secrets.insert(format!("{}__{}", prefix, "KEY_REPOSITORY_PASSWORD"), val);
         }
     }
 }

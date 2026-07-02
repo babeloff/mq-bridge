@@ -197,11 +197,13 @@ aws = ["aws-config", "aws-sdk-sqs", "aws-sdk-sns", "dep:base64"]
 # endpoint is actually used.
 # mqi/mqai is required because mqi's always-compiled (doc-hidden) test module
 # references MqaiLibrary on the dlopen2 path; it adds only pregen bindings, no SDK.
-ibm-mq = ["dep:mqi", "mqi/dlopen2", "mqi/mqai", "mqi/mqc_9_2_0_0", "dep:libmqm-sys", "libmqm-sys/dlopen2"]
-# Static-link IBM MQ client (needs the IBM SDK at build time). mqc_9_2_0_0 matches
-# the crate's previous default so behavior is unchanged. Enabling this alongside
-# `ibm-mq` (dlopen) forces static linking — the SDK is then required at build.
-ibm-mq-static = ["dep:mqi", "mqi/link", "mqi/mqc_9_2_0_0"]
+# Capability level is pinned at mqc_9_3_0_0 (9.2 is EOL); this also unlocks
+# `tls.cert_password` support for password-protected CMS key repositories.
+ibm-mq = ["dep:mqi", "mqi/dlopen2", "mqi/mqai", "mqi/mqc_9_3_0_0", "dep:libmqm-sys", "libmqm-sys/dlopen2"]
+# Static-link IBM MQ client (needs the IBM SDK at build time). Enabling this
+# alongside `ibm-mq` (dlopen) forces static linking — the SDK is then required
+# at build.
+ibm-mq-static = ["dep:mqi", "mqi/link", "mqi/mqc_9_3_0_0"]
 zeromq = ["dep:zeromq"]
 # Note: The grpc feature requires protobuf-src which can significantly increase build times.
 grpc = ["tonic", "prost", "tokio-stream", "tonic-prost", "tonic-prost-build", "protoc-bin-vendored", "rustls"]
