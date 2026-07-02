@@ -482,6 +482,17 @@
         {
           "type": "object",
           "properties": {
+            "redis_streams": {
+              "$ref": "#/$defs/RedisStreamsConfig"
+            }
+          },
+          "required": [
+            "redis_streams"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
             "grpc": {
               "$ref": "#/$defs/GrpcConfig"
             }
@@ -1240,7 +1251,8 @@
             "null"
           ],
           "format": "int32",
-          "default": 6
+          "default": 6,
+          "minimum": 1
         },
         "password": {
           "description": "Optional password for SASL authentication.",
@@ -1994,6 +2006,110 @@
         }
       },
       "additionalProperties": false
+    },
+    "RedisStreamsConfig": {
+      "description": "Configuration for a Redis Streams endpoint.\n\nPublishers `XADD` to the stream; consumers read via a consumer group\n(`XREADGROUP` + `XACK`) by default, or ephemerally via `XREAD` from new\nmessages when `subscriber_mode` is set.",
+      "type": "object",
+      "properties": {
+        "approx_trim": {
+          "description": "(Publisher) Use approximate (`~`) trimming when `maxlen` is set. Defaults to true.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "block_ms": {
+          "description": "(Consumer) Block timeout in milliseconds for each read. Defaults to 5000ms.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "consumer_name": {
+          "description": "(Consumer) Consumer name within the group. Defaults to a unique per-instance id.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "group": {
+          "description": "(Consumer) Group name. Defaults to `{APP_NAME}-{stream}`; ignored in `subscriber_mode`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "internal_buffer_size": {
+          "description": "Internal buffer size for the consumer channel. Defaults to 128.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0
+        },
+        "maxlen": {
+          "description": "(Publisher) If set, cap the stream length with `XADD MAXLEN`.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0
+        },
+        "password": {
+          "description": "Optional password for authentication.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "password"
+        },
+        "read_from_start": {
+          "description": "(Consumer) On group creation, start from the stream beginning (\"0\") not \"$\". Default false.",
+          "type": "boolean",
+          "default": false
+        },
+        "redelivery_timeout_ms": {
+          "description": "(Consumer) Redeliver entries pending ≥ this long via `XAUTOCLAIM`; 0 disables. Default 60000ms.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "stream": {
+          "description": "The stream key to publish to or read from. Defaults to the route name.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "subscriber_mode": {
+          "description": "(Consumer) Read ephemerally via `XREAD` from new messages (no group/acks). Default false.",
+          "type": "boolean",
+          "default": false
+        },
+        "url": {
+          "description": "Redis URL, `redis://` or `rediss://` for TLS. Userinfo is treated as a secret.",
+          "type": "string",
+          "format": "password"
+        },
+        "username": {
+          "description": "Optional username for authentication (Redis ACL).",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "url"
+      ]
     },
     "ResponseConfig": {
       "type": "object",

@@ -1087,6 +1087,18 @@ fn check_publisher_recursive(
                     .to_string()
                 );
             }
+            if cfg.redelivery_timeout_ms.is_some() {
+                warnings.push(
+                    "Endpoint 'redis_streams' is used as a publisher, but 'redelivery_timeout_ms' is a consumer-only option and will be ignored."
+                    .to_string()
+                );
+            }
+            if cfg.internal_buffer_size.is_some() {
+                warnings.push(
+                    "Endpoint 'redis_streams' is used as a publisher, but 'internal_buffer_size' is a consumer-only option and will be ignored."
+                    .to_string()
+                );
+            }
             Ok(warnings)
         }
         #[cfg(feature = "grpc")]

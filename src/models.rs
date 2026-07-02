@@ -1155,7 +1155,7 @@ pub struct KafkaConfig {
     #[serde(default)]
     #[cfg_attr(
         feature = "schema",
-        schemars(default = "default_kafka_partitions_schema")
+        schemars(default = "default_kafka_partitions_schema", range(min = 1))
     )]
     pub partitions: Option<i32>,
 }

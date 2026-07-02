@@ -54,10 +54,25 @@ fn open_client(config: &RedisStreamsConfig) -> anyhow::Result<redis::Client> {
     redis::Client::open(info).map_err(|e| anyhow!("Failed to open Redis client: {}", e))
 }
 
+/// Percent-encodes a userinfo component per RFC 3986, escaping every character
+/// outside the unreserved set so reserved characters (`@`, `:`, `/`, ...) in
+/// credentials can't corrupt URL parsing.
+fn encode_userinfo(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{:02X}", b));
+        }
+    }
+    out
+}
+
 /// Injects `config.username`/`config.password` into the URL's userinfo. If the
 /// URL already carries userinfo, or no credentials are configured, it is
-/// returned unchanged. Credentials with URL-reserved characters (`@`, `:`, `/`)
-/// should be percent-encoded in the URL directly rather than set as fields.
+/// returned unchanged. Credentials are percent-encoded so reserved characters
+/// don't break URL parsing.
 fn url_with_credentials(config: &RedisStreamsConfig) -> String {
     if config.username.is_none() && config.password.is_none() {
         return config.url.clone();
@@ -71,9 +86,9 @@ fn url_with_credentials(config: &RedisStreamsConfig) -> String {
         // Userinfo already present in the URL; leave it as the source of truth.
         return config.url.clone();
     }
-    let user = config.username.as_deref().unwrap_or("");
+    let user = config.username.as_deref().map(encode_userinfo).unwrap_or_default();
     let userinfo = match &config.password {
-        Some(password) => format!("{}:{}@", user, password),
+        Some(password) => format!("{}:{}@", user, encode_userinfo(password)),
         None => format!("{}@", user),
     };
     format!("{}{}{}", scheme, userinfo, rest)
@@ -261,6 +276,9 @@ impl RedisStreamsConsumer {
             let reclaim_interval =
                 Duration::from_millis(redelivery_ms.min(block_ms as u64).max(1000));
             let mut last_reclaim: Option<Instant> = None;
+            // XAUTOCLAIM cursor, carried across passes so we don't rescan the
+            // same pending entries each time; "0-0" restarts a full scan.
+            let mut reclaim_cursor = String::from("0-0");
             loop {
                 // Redeliver entries left pending past redelivery_ms (Nacked, or
                 // orphaned by a crashed/renamed consumer) via XAUTOCLAIM.
@@ -275,12 +293,15 @@ impl RedisStreamsConsumer {
                                 group,
                                 &consumer_name,
                                 redelivery_ms as usize,
-                                "0-0",
+                                &reclaim_cursor,
                                 claim_opts,
                             )
                             .await;
                         match claimed {
                             Ok(reply) => {
+                                // Advance the cursor; the server returns "0-0"
+                                // once the pending set has been fully scanned.
+                                reclaim_cursor = reply.next_stream_id;
                                 for entry in reply.claimed {
                                     let stream_entry = parse_entry(entry.id, entry.map);
                                     if tx.send(Ok(stream_entry)).await.is_err() {
