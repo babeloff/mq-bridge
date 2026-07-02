@@ -93,6 +93,13 @@ async fn test_all_subscriber_logic() {
             integration::nats::test_nats_subscriber_logic().await;
         }
     }
+    #[cfg(feature = "redis-streams")]
+    {
+        if should_run("redis_streams") {
+            println!("\n\n>>> Starting Redis Streams Subscriber Logic Test...");
+            integration::redis_streams::test_redis_subscriber_logic().await;
+        }
+    }
     #[cfg(feature = "amqp")]
     {
         if should_run("amqp") {
@@ -196,6 +203,14 @@ async fn test_all_status() {
         if should_run("nats") {
             println!("\n\n>>> Starting NATS Status Test...");
             integration::nats::test_nats_status().await;
+        }
+    }
+
+    #[cfg(feature = "redis-streams")]
+    {
+        if should_run("redis_streams") {
+            println!("\n\n>>> Starting Redis Streams Status Test...");
+            integration::redis_streams::test_redis_status().await;
         }
     }
 
@@ -319,6 +334,13 @@ async fn test_all_performance_pipeline() {
         if should_run("zeromq") {
             println!("\n\n>>> Starting ZeroMQ Performance Pipeline Test...");
             integration::zeromq::test_zeromq_performance_pipeline().await;
+        }
+    }
+    #[cfg(feature = "redis-streams")]
+    {
+        if should_run("redis_streams") {
+            println!("\n\n>>> Starting Redis Streams Performance Pipeline Test...");
+            integration::redis_streams::test_redis_performance_pipeline().await;
         }
     }
     #[cfg(feature = "grpc")]

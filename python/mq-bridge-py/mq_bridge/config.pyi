@@ -85,6 +85,7 @@ class Endpoint(TypedDict, total=False):
     nats: NatsConfig
     null: Any
     reader: Endpoint
+    redis_streams: RedisStreamsConfig
     ref: str
     response: ResponseConfig
     sled: SledConfig
@@ -284,6 +285,23 @@ class RandomPanicMiddleware(TypedDict, total=False):
     enabled: bool
     mode: FaultMode
     trigger_on_message: Optional[int]
+
+
+class RedisStreamsConfig(TypedDict, total=False):
+    """Configuration for a Redis Streams endpoint."""
+    approx_trim: Optional[bool]
+    block_ms: Optional[int]
+    consumer_name: Optional[str]
+    group: Optional[str]
+    internal_buffer_size: Optional[int]
+    maxlen: Optional[int]
+    password: Optional[str]
+    read_from_start: bool
+    redelivery_timeout_ms: Optional[int]
+    stream: Optional[str]
+    subscriber_mode: bool
+    url: Required[str]
+    username: Optional[str]
 
 
 class ResponseConfig(TypedDict, total=False):

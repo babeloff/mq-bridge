@@ -25,6 +25,7 @@ MongoDbConfig = dict
 MqttConfig = dict
 NatsConfig = dict
 RandomPanicMiddleware = dict
+RedisStreamsConfig = dict
 ResponseConfig = dict
 RetryMiddleware = dict
 Route = dict
@@ -81,6 +82,7 @@ __all__ = [
     "NatsConfig",
     "NatsDeliverPolicy",
     "RandomPanicMiddleware",
+    "RedisStreamsConfig",
     "ResponseConfig",
     "RetryMiddleware",
     "Route",

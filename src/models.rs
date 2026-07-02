@@ -706,6 +706,8 @@ pub enum EndpointType {
     WebSocket(WebSocketConfig),
     IbmMq(IbmMqConfig),
     ZeroMq(ZeroMqConfig),
+    #[serde(rename = "redis_streams", alias = "redis")]
+    RedisStreams(RedisStreamsConfig),
     Grpc(GrpcConfig),
     Sqlx(SqlxConfig),
     Fanout(Vec<Endpoint>),
@@ -740,6 +742,7 @@ impl EndpointType {
             EndpointType::WebSocket(_) => "websocket",
             EndpointType::IbmMq(_) => "ibmmq",
             EndpointType::ZeroMq(_) => "zeromq",
+            EndpointType::RedisStreams(_) => "redis_streams",
             EndpointType::Grpc(_) => "grpc",
             EndpointType::Sqlx(_) => "sqlx",
             EndpointType::Fanout(_) => "fanout",
@@ -2025,6 +2028,74 @@ pub enum ZeroMqSocketType {
     Rep,
 }
 
+// --- Redis Streams Specific Configuration ---
+
+/// Configuration for a Redis Streams endpoint.
+///
+/// Publishers `XADD` to the stream; consumers read via a consumer group
+/// (`XREADGROUP` + `XACK`) by default, or ephemerally via `XREAD` from new
+/// messages when `subscriber_mode` is set.
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct RedisStreamsConfig {
+    /// Redis URL, `redis://` or `rediss://` for TLS. Userinfo is treated as a secret.
+    #[cfg_attr(feature = "schema", schemars(extend("format"="password")))]
+    pub url: String,
+    /// The stream key to publish to or read from. Defaults to the route name.
+    pub stream: Option<String>,
+    /// (Consumer) Group name. Defaults to `{APP_NAME}-{stream}`; ignored in `subscriber_mode`.
+    pub group: Option<String>,
+    /// (Consumer) Consumer name within the group. Defaults to a unique per-instance id.
+    pub consumer_name: Option<String>,
+    /// (Consumer) Read ephemerally via `XREAD` from new messages (no group/acks). Default false.
+    #[serde(default)]
+    pub subscriber_mode: bool,
+    /// (Consumer) Block timeout in milliseconds for each read. Defaults to 5000ms.
+    pub block_ms: Option<u64>,
+    /// (Consumer) On group creation, start from the stream beginning ("0") not "$". Default false.
+    #[serde(default)]
+    pub read_from_start: bool,
+    /// (Consumer) Redeliver entries pending ≥ this long via `XAUTOCLAIM`; 0 disables. Default 60000ms.
+    pub redelivery_timeout_ms: Option<u64>,
+    /// (Publisher) If set, cap the stream length with `XADD MAXLEN`.
+    pub maxlen: Option<usize>,
+    /// (Publisher) Use approximate (`~`) trimming when `maxlen` is set. Defaults to true.
+    pub approx_trim: Option<bool>,
+    /// Optional username for authentication (Redis ACL).
+    pub username: Option<String>,
+    /// Optional password for authentication.
+    #[cfg_attr(feature = "schema", schemars(extend("format"="password")))]
+    pub password: Option<String>,
+    /// Internal buffer size for the consumer channel. Defaults to 128.
+    pub internal_buffer_size: Option<usize>,
+}
+
+impl RedisStreamsConfig {
+    /// Creates a new Redis Streams configuration with the specified URL.
+    pub fn new(url: impl Into<String>) -> Self {
+        Self {
+            url: url.into(),
+            ..Default::default()
+        }
+    }
+
+    pub fn with_stream(mut self, stream: impl Into<String>) -> Self {
+        self.stream = Some(stream.into());
+        self
+    }
+
+    pub fn with_group(mut self, group: impl Into<String>) -> Self {
+        self.group = Some(group.into());
+        self
+    }
+
+    pub fn with_subscriber(mut self, subscriber: bool) -> Self {
+        self.subscriber_mode = subscriber;
+        self
+    }
+}
+
 // --- gRPC Specific Configuration ---
 
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
@@ -2792,6 +2863,9 @@ impl SecretExtractor for EndpointType {
             EndpointType::ZeroMq(cfg) => {
                 cfg.extract_secrets(&format!("{}__{}", prefix, "ZEROMQ"), secrets)
             }
+            EndpointType::RedisStreams(cfg) => {
+                cfg.extract_secrets(&format!("{}__{}", prefix, "REDIS_STREAMS"), secrets)
+            }
             EndpointType::Sqlx(cfg) => {
                 cfg.extract_secrets(&format!("{}__{}", prefix, "SQLX"), secrets)
             }
@@ -2969,6 +3043,18 @@ impl SecretExtractor for IbmMqConfig {
 impl SecretExtractor for ZeroMqConfig {
     fn extract_secrets(&mut self, prefix: &str, secrets: &mut HashMap<String, String>) {
         extract_sensitive_url(&mut self.url, prefix, "URL", secrets);
+    }
+}
+
+impl SecretExtractor for RedisStreamsConfig {
+    fn extract_secrets(&mut self, prefix: &str, secrets: &mut HashMap<String, String>) {
+        extract_sensitive_url(&mut self.url, prefix, "URL", secrets);
+        if let Some(val) = self.username.take() {
+            secrets.insert(format!("{}__{}", prefix, "USERNAME"), val);
+        }
+        if let Some(val) = self.password.take() {
+            secrets.insert(format!("{}__{}", prefix, "PASSWORD"), val);
+        }
     }
 }
 

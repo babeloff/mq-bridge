@@ -77,6 +77,7 @@ ibm-mq = ["mq-bridge/ibm-mq"]
 # Static-link IBM MQ client (needs the IBM SDK at build time).
 ibm-mq-static = ["mq-bridge/ibm-mq-static"]
 zeromq = ["mq-bridge/zeromq"]
+redis-streams = ["mq-bridge/redis-streams"]
 grpc = ["mq-bridge/grpc"]
 sqlx = ["mq-bridge/sqlx"]
 rustls-ring = ["dep:rustls", "rustls/ring", "mq-bridge/rustls-ring"]

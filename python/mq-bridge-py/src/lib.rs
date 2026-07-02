@@ -1569,15 +1569,15 @@ fn invoke_python_handler_many(
                             message.metadata,
                         )
                         .map_err(|err| {
-                            python_error_to_handler_error(py_err_context(&label, message_id), err)
+                            python_error_to_handler_error(py_err_context(label, message_id), err)
                         }),
                         Err(err) => Err(python_error_to_handler_error(
-                            py_err_context(&label, message_id),
+                            py_err_context(label, message_id),
                             err,
                         )),
                     },
                     Err(err) => Err(python_error_to_handler_error(
-                        py_err_context(&label, message_id),
+                        py_err_context(label, message_id),
                         err,
                     )),
                 }
@@ -1605,10 +1605,10 @@ fn python_error_to_handler_error(ctx: PyErrorContext<'_>, err: PyErr) -> Handler
             "Python handler raised an exception: {err}"
         );
         let message = anyhow!("Python handler failed for '{}': {}", ctx.label, err);
+        // RetryableError requests a retry; every other exception (including
+        // NonRetryableError) is non-retryable.
         if err.is_instance_of::<RetryableError>(py) {
             HandlerError::Retryable(message)
-        } else if err.is_instance_of::<NonRetryableError>(py) {
-            HandlerError::NonRetryable(message)
         } else {
             HandlerError::NonRetryable(message)
         }

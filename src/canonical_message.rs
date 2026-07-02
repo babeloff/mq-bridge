@@ -78,7 +78,10 @@ thread_local! {
 }
 
 /// Guard that restores the test-only per-thread source metadata override.
+// Only referenced by endpoint test modules (nats/mqtt), so it looks unused under
+// feature sets that exclude them.
 #[cfg(test)]
+#[allow(dead_code)]
 pub(crate) struct SourceMetadataTestOverride {
     previous: Option<bool>,
 }
@@ -93,6 +96,7 @@ impl Drop for SourceMetadataTestOverride {
 /// Force [`source_metadata_enabled`] to a value on the current thread (test-only).
 #[cfg(test)]
 #[must_use]
+#[allow(dead_code)]
 pub(crate) fn force_source_metadata_for_test(value: Option<bool>) -> SourceMetadataTestOverride {
     let previous = TEST_FORCE_SOURCE_METADATA.with(|c| {
         let prev = c.get();
