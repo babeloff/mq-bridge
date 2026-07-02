@@ -16,8 +16,8 @@
 use crate::canonical_message::tracing_support::LazyMessageIds;
 use crate::models::RedisStreamsConfig;
 use crate::traits::{
-    BoxFuture, ConsumerError, EndpointStatus, MessageConsumer, MessageDisposition, MessagePublisher,
-    PublisherError, ReceivedBatch, SentBatch,
+    BoxFuture, ConsumerError, EndpointStatus, MessageConsumer, MessageDisposition,
+    MessagePublisher, PublisherError, ReceivedBatch, SentBatch,
 };
 use crate::CanonicalMessage;
 use crate::APP_NAME;
@@ -25,7 +25,9 @@ use anyhow::anyhow;
 use async_channel::{bounded, Receiver};
 use async_trait::async_trait;
 use redis::aio::MultiplexedConnection;
-use redis::streams::{StreamAutoClaimOptions, StreamAutoClaimReply, StreamReadOptions, StreamReadReply};
+use redis::streams::{
+    StreamAutoClaimOptions, StreamAutoClaimReply, StreamReadOptions, StreamReadReply,
+};
 use redis::{AsyncCommands, IntoConnectionInfo};
 use std::any::Any;
 use std::collections::{HashMap, VecDeque};
@@ -243,16 +245,9 @@ impl RedisStreamsConsumer {
         // A unique per-instance name by default. Entries stranded under an old
         // name (e.g. after a restart) are recovered by the XAUTOCLAIM pass below,
         // which reclaims idle pending entries across the whole group.
-        let consumer_name = config
-            .consumer_name
-            .clone()
-            .unwrap_or_else(|| {
-                format!(
-                    "{}-{:032x}",
-                    APP_NAME,
-                    fast_uuid_v7::gen_id_with_sub_ms_4()
-                )
-            });
+        let consumer_name = config.consumer_name.clone().unwrap_or_else(|| {
+            format!("{}-{:032x}", APP_NAME, fast_uuid_v7::gen_id_with_sub_ms_4())
+        });
 
         let (tx, rx) = bounded::<Result<StreamEntry, ConsumerError>>(count);
         let task_stream = stream.clone();
@@ -269,8 +264,7 @@ impl RedisStreamsConsumer {
             loop {
                 // Redeliver entries left pending past redelivery_ms (Nacked, or
                 // orphaned by a crashed/renamed consumer) via XAUTOCLAIM.
-                if reclaim_enabled
-                    && last_reclaim.map_or(true, |t| t.elapsed() >= reclaim_interval)
+                if reclaim_enabled && last_reclaim.map_or(true, |t| t.elapsed() >= reclaim_interval)
                 {
                     last_reclaim = Some(Instant::now());
                     if let Some(group) = &task_group {
@@ -295,7 +289,9 @@ impl RedisStreamsConsumer {
                                 }
                             }
                             // Transient; a hard error surfaces on the read below.
-                            Err(e) => trace!(stream = %task_stream, error = %e, "Redis XAUTOCLAIM failed"),
+                            Err(e) => {
+                                trace!(stream = %task_stream, error = %e, "Redis XAUTOCLAIM failed")
+                            }
                         }
                     }
                 }

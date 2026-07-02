@@ -1376,8 +1376,10 @@ async fn create_base_publisher(
             if config.stream.is_none() {
                 config.stream = Some(route_name.to_string());
             }
-            Ok(Box::new(redis_streams::RedisStreamsPublisher::new(&config).await?)
-                as Box<dyn MessagePublisher>)
+            Ok(
+                Box::new(redis_streams::RedisStreamsPublisher::new(&config).await?)
+                    as Box<dyn MessagePublisher>,
+            )
         }
         #[cfg(feature = "grpc")]
         EndpointType::Grpc(cfg) => {
