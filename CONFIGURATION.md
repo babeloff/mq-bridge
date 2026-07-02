@@ -211,8 +211,10 @@ tls:
      producer_options: [["ssl.cipher.suites", "ECDHE-RSA-AES256-GCM-SHA384"]]
      consumer_options: [["ssl.cipher.suites", "ECDHE-RSA-AES256-GCM-SHA384"]]
    ```
-5. **IBM MQ** (native stack): set a strong `cipher_spec` (a TLS 1.2/1.3 CipherSpec) — it is
-   required for encrypted connections.
+5. **IBM MQ** (native stack): set a strong `tls.cipher_spec` (a TLS 1.2/1.3 CipherSpec) — it
+   is required for encrypted connections. Note `cipher_spec` lives under `tls`, not at the
+   top level of the `ibmmq` config (a breaking rename from earlier releases, where it was
+   `ibmmq.cipher_spec`).
 6. **Keep sensitive payloads out of logs.** Message payloads are emitted at `trace` level;
    run production above `trace` and confirm no cardholder data (PAN) reaches logs or traces.
 7. **Do not commit secrets.** Source passwords and tokens from a secrets manager or env vars

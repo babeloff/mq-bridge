@@ -1072,13 +1072,6 @@
           "description": "Required. Server Connection (SVRCONN) Channel name defined on the QM.",
           "type": "string"
         },
-        "cipher_spec": {
-          "description": "TLS CipherSpec (e.g., `ANY_TLS12`). Optional; required for encrypted connections.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
         "disable_status_inq": {
           "description": "If false, attempt to open the queue with INQUIRE permissions to fetch queue depth for status checks. Defaults to false.",
           "type": "boolean",
@@ -1122,13 +1115,12 @@
         },
         "tls": {
           "description": "TLS configuration settings (e.g., keystore paths). Optional.",
-          "$ref": "#/$defs/TlsConfig",
+          "$ref": "#/$defs/IbmTlsConfig",
           "default": {
             "accept_invalid_certs": false,
-            "ca_file": null,
-            "cert_file": null,
-            "cert_password": null,
-            "key_file": null,
+            "cipher_spec": null,
+            "key_repository": null,
+            "key_repository_password": null,
             "required": false
           }
         },
@@ -1164,6 +1156,45 @@
         "queue_manager",
         "channel"
       ]
+    },
+    "IbmTlsConfig": {
+      "description": "TLS configuration for the IBM MQ native client.\n\nThe IBM MQ client doesn't consume PEM files, so this uses MQ-native field\nnames rather than the generic [`TlsConfig`] used by the other endpoints.",
+      "type": "object",
+      "properties": {
+        "accept_invalid_certs": {
+          "description": "If true, disable server certificate verification (insecure).",
+          "type": "boolean",
+          "default": false
+        },
+        "cipher_spec": {
+          "description": "TLS CipherSpec (e.g., `ANY_TLS12`). Required for encrypted connections.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "key_repository": {
+          "description": "Path to the CMS key repository (e.g. `/path/to/tls` for `tls.kdb`/`tls.sth`).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "key_repository_password": {
+          "description": "Password unlocking the key repository. Requires an IBM MQ client/server at 9.3.0.0+.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "password"
+        },
+        "required": {
+          "description": "If true, enable TLS/SSL.",
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "additionalProperties": false
     },
     "KafkaConfig": {
       "description": "General Kafka connection configuration.",
@@ -1201,6 +1232,15 @@
             "string",
             "null"
           ]
+        },
+        "partitions": {
+          "description": "(Publisher only) Partition count used when auto-creating the topic (default: 6).\nHigher values raise write/consume parallelism; ordering is only guaranteed per\npartition key (message_id), not across the whole topic. Ignored if the topic exists.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int32",
+          "default": 6
         },
         "password": {
           "description": "Optional password for SASL authentication.",
@@ -1847,7 +1887,7 @@
           "default": true
         },
         "stream": {
-          "description": "(Consumer only). The JetStream stream name. Required for Consumers.",
+          "description": "The JetStream stream name. Required for Consumers, even with\n`no_jetstream: true` (unused there, but still validated).",
           "type": [
             "string",
             "null"
@@ -1870,7 +1910,7 @@
           "format": "int64"
         },
         "subject": {
-          "description": "The NATS subject to publish to or subscribe to.",
+          "description": "The NATS subject to publish to or subscribe to. If a stream is\nauto-created, it's scoped to `{stream}.>`, so prefix accordingly.",
           "type": [
             "string",
             "null"

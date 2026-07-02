@@ -146,18 +146,26 @@ class HttpConfig(TypedDict, total=False):
 class IbmMqConfig(TypedDict, total=False):
     """Connection settings for the IBM MQ Queue Manager."""
     channel: Required[str]
-    cipher_spec: Optional[str]
     disable_status_inq: bool
     internal_buffer_size: Optional[int]
     max_message_size: int
     password: Optional[str]
     queue: Optional[str]
     queue_manager: Required[str]
-    tls: TlsConfig
+    tls: IbmTlsConfig
     topic: Optional[str]
     url: Required[str]
     username: Optional[str]
     wait_timeout_ms: int
+
+
+class IbmTlsConfig(TypedDict, total=False):
+    """TLS configuration for the IBM MQ native client."""
+    accept_invalid_certs: bool
+    cipher_spec: Optional[str]
+    key_repository: Optional[str]
+    key_repository_password: Optional[str]
+    required: bool
 
 
 class KafkaConfig(TypedDict, total=False):

@@ -15,6 +15,7 @@ FileConfig = dict
 GrpcConfig = dict
 HttpConfig = dict
 IbmMqConfig = dict
+IbmTlsConfig = dict
 KafkaConfig = dict
 LimiterMiddleware = dict
 MemoryConfig = dict
@@ -67,6 +68,7 @@ __all__ = [
     "HttpConfig",
     "HttpServerProtocol",
     "IbmMqConfig",
+    "IbmTlsConfig",
     "KafkaConfig",
     "LimiterMiddleware",
     "MemoryConfig",
