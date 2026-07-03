@@ -2429,13 +2429,16 @@ pub struct IbmTlsConfig {
     /// If true, enable TLS/SSL.
     #[serde(default, deserialize_with = "deserialize_null_as_false")]
     pub required: bool,
-    /// TLS CipherSpec (e.g., `ANY_TLS12`). Required for encrypted connections.
+    /// TLS CipherSpec (e.g., `ANY_TLS12`). Required for encrypted connections. IBM MQ-specific.
     pub cipher_spec: Option<String>,
-    /// Path to the CMS key repository (e.g. `/path/to/tls` for `tls.kdb`/`tls.sth`).
-    #[serde(alias = "cert_file")]
+    /// For IBM MQ this is the CMS key repository stem (e.g. `/path/to/tls` for `tls.kdb`/`tls.sth`),
+    /// not a PEM file. Exposed as `cert_file` for config parity with the generic `TlsConfig`;
+    /// the MQ-native name `key_repository` is still accepted.
+    #[serde(rename = "cert_file", alias = "key_repository")]
     pub key_repository: Option<String>,
     /// Password unlocking the key repository. Requires an IBM MQ client/server at 9.3.0.0+.
-    #[serde(alias = "cert_password")]
+    /// Exposed as `cert_password` for parity with `TlsConfig`; alias `key_repository_password`.
+    #[serde(rename = "cert_password", alias = "key_repository_password")]
     #[cfg_attr(feature = "schema", schemars(extend("format"="password")))]
     pub key_repository_password: Option<String>,
     /// If true, disable server certificate verification (insecure).
@@ -3091,7 +3094,9 @@ impl SecretExtractor for TlsConfig {
 impl SecretExtractor for IbmTlsConfig {
     fn extract_secrets(&mut self, prefix: &str, secrets: &mut HashMap<String, String>) {
         if let Some(val) = self.key_repository_password.take() {
-            secrets.insert(format!("{}__{}", prefix, "KEY_REPOSITORY_PASSWORD"), val);
+            // Wire/env name matches the serde rename (`cert_password`), so the config
+            // crate's env override resolves back to this field.
+            secrets.insert(format!("{}__{}", prefix, "CERT_PASSWORD"), val);
         }
     }
 }

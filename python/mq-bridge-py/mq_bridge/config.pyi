@@ -163,9 +163,9 @@ class IbmMqConfig(TypedDict, total=False):
 class IbmTlsConfig(TypedDict, total=False):
     """TLS configuration for the IBM MQ native client."""
     accept_invalid_certs: bool
+    cert_file: Optional[str]
+    cert_password: Optional[str]
     cipher_spec: Optional[str]
-    key_repository: Optional[str]
-    key_repository_password: Optional[str]
     required: bool
 
 
