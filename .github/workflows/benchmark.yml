@@ -11,46 +11,179 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
-permissions:
-  contents: write
-  deployments: write
-
 jobs:
-  benchmark:
-    name: Performance Benchmarks
+  # Compile the bench binary once (release, --features full) and hand the
+  # executable to the shard jobs below so none of them need to recompile.
+  benchmark-build:
+    name: Build Benchmark Binary
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
-      
+
       - name: Cache cargo build
         uses: Swatinem/rust-cache@v2
         with:
-          # Shared with the release-mode integration jobs so the full-feature
-          # dependency compile is reused across jobs/runs instead of rebuilt.
           shared-key: release-full
-      
+
+      - name: Build bench binary
+        run: |
+          set -o pipefail
+          cargo bench --bench performance_bench --features full --no-run --message-format=json | tee build-output.json
+          BIN_PATH=$(jq -r 'select(.reason == "compiler-artifact" and (.target.kind // [] | index("bench")) and .executable != null) | .executable' build-output.json | tail -n1)
+          if [ -z "$BIN_PATH" ]; then
+            echo "Could not locate performance_bench executable in cargo build output" >&2
+            exit 1
+          fi
+          cp "$BIN_PATH" ./performance_bench_bin
+
+      - name: Upload bench binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: performance-bench-bin
+          path: performance_bench_bin
+          retention-days: 1
+
+  # Three independent shards of the same binary, filtered via the
+  # MQB_TEST_BACKEND env var that test_utils::should_run_benchmark() already
+  # supports. Each only pre-pulls the Docker images it actually needs.
+  benchmark-streams:
+    name: Benchmark (streams)
+    needs: benchmark-build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download bench binary
+        uses: actions/download-artifact@v4
+        with:
+          name: performance-bench-bin
+
       - name: Pre-pull docker images
         run: |
-          find tests/integration/docker-compose -name "*.yml" | xargs -P 4 -I {} docker compose -f {} pull -q
+          for f in aws kafka amqp nats mqtt_performance; do
+            docker compose -f "tests/integration/docker-compose/${f}.yml" pull -q
+          done
 
       - name: Run benchmarks
         shell: bash
+        env:
+          MQB_TEST_BACKEND: "aws,kafka,amqp,nats,mqtt,ibm-mq"
         run: |
           set -o pipefail
+          chmod +x ./performance_bench_bin
           export CARGO_TERM_COLOR=never
-          cargo bench --bench performance_bench --features full -- --output-format bencher | tee raw_output.txt
-          # Filter output to only include benchmark results, removing Docker logs and custom prints
-          awk '/^test / { if ($0 ~ /bench:/) { print $0; name="" } else { name=$2 } } /^bench:/ { if (name != "") { print "test " name " ... " $0; name="" } }' raw_output.txt > output.txt
-      
+          ./performance_bench_bin --bench --output-format bencher | tee raw_output_streams.txt
+          awk '/^test / { if ($0 ~ /bench:/) { print $0; name="" } else { name=$2 } } /^bench:/ { if (name != "") { print "test " name " ... " $0; name="" } }' raw_output_streams.txt > output_streams.txt
+
+      - name: Upload shard output
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-output-streams
+          path: |
+            raw_output_streams.txt
+            output_streams.txt
+          retention-days: 1
+
+  benchmark-database:
+    name: Benchmark (database)
+    needs: benchmark-build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download bench binary
+        uses: actions/download-artifact@v4
+        with:
+          name: performance-bench-bin
+
+      - name: Pre-pull docker images
+        run: docker compose -f tests/integration/docker-compose/mongodb.yml pull -q
+
+      - name: Run benchmarks
+        shell: bash
+        env:
+          MQB_TEST_BACKEND: "mongodb"
+        run: |
+          set -o pipefail
+          chmod +x ./performance_bench_bin
+          export CARGO_TERM_COLOR=never
+          ./performance_bench_bin --bench --output-format bencher | tee raw_output_database.txt
+          awk '/^test / { if ($0 ~ /bench:/) { print $0; name="" } else { name=$2 } } /^bench:/ { if (name != "") { print "test " name " ... " $0; name="" } }' raw_output_database.txt > output_database.txt
+
+      - name: Upload shard output
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-output-database
+          path: |
+            raw_output_database.txt
+            output_database.txt
+          retention-days: 1
+
+  benchmark-dockerless:
+    name: Benchmark (dockerless)
+    needs: benchmark-build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download bench binary
+        uses: actions/download-artifact@v4
+        with:
+          name: performance-bench-bin
+
+      - name: Run benchmarks
+        shell: bash
+        env:
+          MQB_TEST_BACKEND: "zeromq,memory,file,http,websocket,grpc"
+        run: |
+          set -o pipefail
+          chmod +x ./performance_bench_bin
+          export CARGO_TERM_COLOR=never
+          ./performance_bench_bin --bench --output-format bencher | tee raw_output_dockerless.txt
+          awk '/^test / { if ($0 ~ /bench:/) { print $0; name="" } else { name=$2 } } /^bench:/ { if (name != "") { print "test " name " ... " $0; name="" } }' raw_output_dockerless.txt > output_dockerless.txt
+
+      - name: Upload shard output
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-output-dockerless
+          path: |
+            raw_output_dockerless.txt
+            output_dockerless.txt
+          retention-days: 1
+
+  # Merge the three shard outputs back into the single combined report the
+  # gh-pages benchmark history / dashboard has always tracked.
+  benchmark-collect:
+    name: Collect Benchmark Results
+    needs: [benchmark-streams, benchmark-database, benchmark-dockerless]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      deployments: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download shard outputs
+        uses: actions/download-artifact@v4
+        with:
+          pattern: bench-output-*
+          merge-multiple: true
+          path: bench-outputs
+
+      - name: Merge shard outputs
+        run: |
+          cat bench-outputs/raw_output_*.txt > raw_output.txt
+          cat bench-outputs/output_*.txt > output.txt
+
       - name: Generate Throughput Summary
         run: |
           python3 -c '
           import re
           import os
-          
+
           data = {}
           try:
               with open("raw_output.txt", "r") as f:
@@ -63,7 +196,7 @@ jobs:
                           if name not in data:
                               data[name] = []
                           data[name].append(rate)
-              
+
               if data:
                   with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
                       f.write("### Benchmark Throughput Results\n")
