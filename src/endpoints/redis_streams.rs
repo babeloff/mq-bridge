@@ -278,9 +278,8 @@ impl RedisStreamsConsumer {
         };
         // Give each reader room to stage a full COUNT batch without stalling on a
         // slow drain, so the connections actually make progress in parallel.
-        let (tx, rx) = bounded::<Result<StreamEntry, ConsumerError>>(
-            count.saturating_mul(readers).max(count),
-        );
+        let (tx, rx) =
+            bounded::<Result<StreamEntry, ConsumerError>>(count.saturating_mul(readers).max(count));
 
         for i in 0..readers {
             // Reader 0 reuses the connection the group was created on; the rest get
