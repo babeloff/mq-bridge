@@ -30,7 +30,7 @@ routes:
     concurrency: 4
     batch_size: 128
     input:
-      redis_streams: { url: "redis://localhost:6379", stream: "test-redis-pipeline", group: "itest-pipeline" }
+      redis_streams: { url: "redis://localhost:6379", stream: "test-redis-pipeline", group: "itest-pipeline", reader_connections: 4 }
     output:
       memory: { topic: "test-out-redis", capacity: {out_capacity} }
 "#;

@@ -2069,6 +2069,9 @@ pub struct RedisStreamsConfig {
     pub password: Option<String>,
     /// Internal buffer size for the consumer channel. Defaults to 128.
     pub internal_buffer_size: Option<usize>,
+    /// (Consumer) Parallel `XREADGROUP` reader connections fanned out across the group. Default 1.
+    /// Ignored in `subscriber_mode`.
+    pub reader_connections: Option<usize>,
 }
 
 impl RedisStreamsConfig {
@@ -2092,6 +2095,11 @@ impl RedisStreamsConfig {
 
     pub fn with_subscriber(mut self, subscriber: bool) -> Self {
         self.subscriber_mode = subscriber;
+        self
+    }
+
+    pub fn with_reader_connections(mut self, connections: usize) -> Self {
+        self.reader_connections = Some(connections);
         self
     }
 }

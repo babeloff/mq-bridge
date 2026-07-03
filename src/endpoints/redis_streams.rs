@@ -22,7 +22,7 @@ use crate::traits::{
 use crate::CanonicalMessage;
 use crate::APP_NAME;
 use anyhow::anyhow;
-use async_channel::{bounded, Receiver};
+use async_channel::{bounded, Receiver, Sender};
 use async_trait::async_trait;
 use redis::aio::ConnectionManager;
 use redis::streams::{
@@ -221,11 +221,12 @@ impl RedisStreamsConsumer {
         let client = open_client(config)?;
 
         // A dedicated connection for the (blocking) reads, plus a separate one for
-        // acks so an in-flight XREAD BLOCK never stalls XACK.
+        // acks so an in-flight XREAD BLOCK never stalls XACK. Extra reader
+        // connections (see `reader_connections`) are opened below from `client`.
         let mut read_conn = ConnectionManager::new(client.clone())
             .await
             .map_err(|e| anyhow!("Failed to connect to Redis: {}", e))?;
-        let ack_conn = ConnectionManager::new(client)
+        let ack_conn = ConnectionManager::new(client.clone())
             .await
             .map_err(|e| anyhow!("Failed to connect to Redis: {}", e))?;
 
@@ -265,105 +266,52 @@ impl RedisStreamsConsumer {
             format!("{}-{:032x}", APP_NAME, fast_uuid_v7::gen_id_with_sub_ms_4())
         });
 
-        let (tx, rx) = bounded::<Result<StreamEntry, ConsumerError>>(count);
-        let task_stream = stream.clone();
-        let task_group = group.clone();
-        tokio::spawn(async move {
-            // In subscriber mode we track the last delivered id ("$" = new only).
-            let mut last_id = String::from("$");
-            let reclaim_enabled = task_group.is_some() && redelivery_ms > 0;
-            // Check for reclaimable entries on the read cadence; eligibility is
-            // still gated by redelivery_ms of idleness on the server side.
-            let reclaim_interval =
-                Duration::from_millis(redelivery_ms.min(block_ms as u64).max(1000));
-            let mut last_reclaim: Option<Instant> = None;
-            // XAUTOCLAIM cursor, carried across passes so we don't rescan the
-            // same pending entries each time; "0-0" restarts a full scan.
-            let mut reclaim_cursor = String::from("0-0");
-            loop {
-                // Redeliver entries left pending past redelivery_ms (Nacked, or
-                // orphaned by a crashed/renamed consumer) via XAUTOCLAIM.
-                if reclaim_enabled && last_reclaim.map_or(true, |t| t.elapsed() >= reclaim_interval)
-                {
-                    last_reclaim = Some(Instant::now());
-                    if let Some(group) = &task_group {
-                        let claim_opts = StreamAutoClaimOptions::default().count(count);
-                        let claimed: redis::RedisResult<StreamAutoClaimReply> = read_conn
-                            .xautoclaim_options(
-                                &task_stream,
-                                group,
-                                &consumer_name,
-                                redelivery_ms as usize,
-                                &reclaim_cursor,
-                                claim_opts,
-                            )
-                            .await;
-                        match claimed {
-                            Ok(reply) => {
-                                // Advance the cursor; the server returns "0-0"
-                                // once the pending set has been fully scanned.
-                                reclaim_cursor = reply.next_stream_id;
-                                for entry in reply.claimed {
-                                    let stream_entry = parse_entry(entry.id, entry.map);
-                                    if tx.send(Ok(stream_entry)).await.is_err() {
-                                        return; // consumer dropped
-                                    }
-                                }
-                            }
-                            // Transient; a hard error surfaces on the read below.
-                            Err(e) => {
-                                trace!(stream = %task_stream, error = %e, "Redis XAUTOCLAIM failed")
-                            }
-                        }
-                    }
-                }
+        // Consumer-group mode can fan the reads out across several connections in
+        // the same group: Redis load-balances `>` deliveries across the distinct
+        // per-connection consumer names, and per-entry XACK stays order-independent.
+        // Subscriber mode reads via XREAD from a shared cursor, which every
+        // connection would see identically, so it stays single-connection.
+        let readers = if group.is_some() {
+            config.reader_connections.unwrap_or(1).max(1)
+        } else {
+            1
+        };
+        // Give each reader room to stage a full COUNT batch without stalling on a
+        // slow drain, so the connections actually make progress in parallel.
+        let (tx, rx) = bounded::<Result<StreamEntry, ConsumerError>>(
+            count.saturating_mul(readers).max(count),
+        );
 
-                let mut opts = StreamReadOptions::default().count(count).block(block_ms);
-                let read_ids: Vec<&str> = match &task_group {
-                    Some(group) => {
-                        opts = opts.group(group, &consumer_name);
-                        vec![">"]
-                    }
-                    None => vec![last_id.as_str()],
-                };
-
-                let reply: redis::RedisResult<Option<StreamReadReply>> = read_conn
-                    .xread_options(&[&task_stream], read_ids.as_slice(), &opts)
-                    .await;
-
-                match reply {
-                    Ok(Some(reply)) => {
-                        for key in reply.keys {
-                            for entry in key.ids {
-                                if task_group.is_none() {
-                                    last_id = entry.id.clone();
-                                }
-                                let stream_entry = parse_entry(entry.id, entry.map);
-                                if tx.send(Ok(stream_entry)).await.is_err() {
-                                    return; // consumer dropped
-                                }
-                            }
-                        }
-                    }
-                    // BLOCK timeout with no data — just poll again.
-                    Ok(None) => {}
-                    Err(e) => {
-                        if tx
-                            .send(Err(ConsumerError::Connection(anyhow!(
-                                "Redis XREAD failed: {}",
-                                e
-                            ))))
-                            .await
-                            .is_err()
-                        {
-                            return;
-                        }
-                        // Avoid a hot error loop while disconnected.
-                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                    }
-                }
-            }
-        });
+        for i in 0..readers {
+            // Reader 0 reuses the connection the group was created on; the rest get
+            // their own so one reader's blocking XREAD never stalls a sibling.
+            let read_conn = if i == 0 {
+                read_conn.clone()
+            } else {
+                ConnectionManager::new(client.clone())
+                    .await
+                    .map_err(|e| anyhow!("Failed to connect to Redis: {}", e))?
+            };
+            // Distinct names per connection so the group load-balances across them.
+            let consumer_name = if readers == 1 {
+                consumer_name.clone()
+            } else {
+                format!("{}-{}", consumer_name, i)
+            };
+            spawn_stream_reader(ReaderCtx {
+                read_conn,
+                stream: stream.clone(),
+                group: group.clone(),
+                consumer_name,
+                count,
+                block_ms,
+                redelivery_ms,
+                // Only one reader runs the reclaim pass, to avoid N-way XAUTOCLAIM contention.
+                reclaim: i == 0,
+                tx: tx.clone(),
+            });
+        }
+        drop(tx);
 
         Ok(Self {
             rx,
@@ -373,6 +321,131 @@ impl RedisStreamsConsumer {
             buffer: VecDeque::new(),
         })
     }
+}
+
+/// Parameters for a single background stream-reader task.
+struct ReaderCtx {
+    read_conn: ConnectionManager,
+    stream: String,
+    /// `Some` in consumer-group mode; `None` in subscriber mode.
+    group: Option<String>,
+    consumer_name: String,
+    count: usize,
+    block_ms: usize,
+    redelivery_ms: u64,
+    /// Whether this reader runs the XAUTOCLAIM reclaim pass (only one should).
+    reclaim: bool,
+    tx: Sender<Result<StreamEntry, ConsumerError>>,
+}
+
+/// Spawns a background task that reads stream entries (via `XREADGROUP` in group
+/// mode, or `XREAD` in subscriber mode) and forwards them to the consumer channel.
+fn spawn_stream_reader(ctx: ReaderCtx) {
+    let ReaderCtx {
+        mut read_conn,
+        stream: task_stream,
+        group: task_group,
+        consumer_name,
+        count,
+        block_ms,
+        redelivery_ms,
+        reclaim,
+        tx,
+    } = ctx;
+    tokio::spawn(async move {
+        // In subscriber mode we track the last delivered id ("$" = new only).
+        let mut last_id = String::from("$");
+        let reclaim_enabled = reclaim && task_group.is_some() && redelivery_ms > 0;
+        // Check for reclaimable entries on the read cadence; eligibility is
+        // still gated by redelivery_ms of idleness on the server side.
+        let reclaim_interval = Duration::from_millis(redelivery_ms.min(block_ms as u64).max(1000));
+        let mut last_reclaim: Option<Instant> = None;
+        // XAUTOCLAIM cursor, carried across passes so we don't rescan the
+        // same pending entries each time; "0-0" restarts a full scan.
+        let mut reclaim_cursor = String::from("0-0");
+        loop {
+            // Redeliver entries left pending past redelivery_ms (Nacked, or
+            // orphaned by a crashed/renamed consumer) via XAUTOCLAIM.
+            if reclaim_enabled && last_reclaim.map_or(true, |t| t.elapsed() >= reclaim_interval) {
+                last_reclaim = Some(Instant::now());
+                if let Some(group) = &task_group {
+                    let claim_opts = StreamAutoClaimOptions::default().count(count);
+                    let claimed: redis::RedisResult<StreamAutoClaimReply> = read_conn
+                        .xautoclaim_options(
+                            &task_stream,
+                            group,
+                            &consumer_name,
+                            redelivery_ms as usize,
+                            &reclaim_cursor,
+                            claim_opts,
+                        )
+                        .await;
+                    match claimed {
+                        Ok(reply) => {
+                            // Advance the cursor; the server returns "0-0"
+                            // once the pending set has been fully scanned.
+                            reclaim_cursor = reply.next_stream_id;
+                            for entry in reply.claimed {
+                                let stream_entry = parse_entry(entry.id, entry.map);
+                                if tx.send(Ok(stream_entry)).await.is_err() {
+                                    return; // consumer dropped
+                                }
+                            }
+                        }
+                        // Transient; a hard error surfaces on the read below.
+                        Err(e) => {
+                            trace!(stream = %task_stream, error = %e, "Redis XAUTOCLAIM failed")
+                        }
+                    }
+                }
+            }
+
+            let mut opts = StreamReadOptions::default().count(count).block(block_ms);
+            let read_ids: Vec<&str> = match &task_group {
+                Some(group) => {
+                    opts = opts.group(group, &consumer_name);
+                    vec![">"]
+                }
+                None => vec![last_id.as_str()],
+            };
+
+            let reply: redis::RedisResult<Option<StreamReadReply>> = read_conn
+                .xread_options(&[&task_stream], read_ids.as_slice(), &opts)
+                .await;
+
+            match reply {
+                Ok(Some(reply)) => {
+                    for key in reply.keys {
+                        for entry in key.ids {
+                            if task_group.is_none() {
+                                last_id = entry.id.clone();
+                            }
+                            let stream_entry = parse_entry(entry.id, entry.map);
+                            if tx.send(Ok(stream_entry)).await.is_err() {
+                                return; // consumer dropped
+                            }
+                        }
+                    }
+                }
+                // BLOCK timeout with no data — just poll again.
+                Ok(None) => {}
+                Err(e) => {
+                    if tx
+                        .send(Err(ConsumerError::Connection(anyhow!(
+                            "Redis XREAD failed: {}",
+                            e
+                        ))))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                    // Avoid a hot error loop while disconnected.
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                }
+            }
+        }
+    });
 }
 
 /// Reconstructs a [`CanonicalMessage`] from a Redis stream entry's field map.
