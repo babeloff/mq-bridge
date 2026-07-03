@@ -12,7 +12,7 @@ const CONFIG_YAML: &str = r#"
 routes:
   memory_to_nats:
     concurrency: 4
-    batch_size: 128
+    batch_size: 512
     input:
       memory: { topic: "test-in-nats" }
     output:
@@ -25,7 +25,7 @@ routes:
 
   nats_to_memory:
     concurrency: 4
-    batch_size: 128
+    batch_size: 512
     input:
       nats: { url: "nats://localhost:4222", subject: "test-stream.pipeline", stream: "test-stream" }
     output:

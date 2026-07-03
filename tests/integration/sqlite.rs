@@ -67,7 +67,7 @@ const CONFIG_YAML: &str = r#"
 routes:
     memory_to_sqlite:
         concurrency: 4
-        batch_size: 128
+        batch_size: 1024
         input:
             memory: { topic: "sqlx-sqlite-in", enable_nack: true }
         output:
@@ -82,7 +82,7 @@ routes:
 
     sqlite_to_memory:
         concurrency: 4
-        batch_size: 128
+        batch_size: 1024
         input:
             middlewares:
                 - retry:

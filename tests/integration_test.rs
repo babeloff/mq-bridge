@@ -17,6 +17,20 @@ pub fn should_run(test_name: &str) -> bool {
     mq_bridge::test_utils::should_run(test_name)
 }
 
+#[cfg(all(feature = "kafka", feature = "perf-diagnostics"))]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "diagnostic: consume-only isolation"]
+async fn test_kafka_consume_only() {
+    integration::kafka::test_kafka_consume_only_bench().await;
+}
+
+#[cfg(all(feature = "kafka", feature = "perf-diagnostics"))]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "diagnostic: produce-only isolation"]
+async fn test_kafka_produce_only() {
+    integration::kafka::test_kafka_produce_only_bench().await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires docker compose"]
 async fn test_all_request_reply() {

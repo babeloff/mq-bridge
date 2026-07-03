@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 const CONFIG_YAML: &str = r#"
 routes:
   memory_to_http:
-    concurrency: 4
+    concurrency: 1
     batch_size: 128
     input:
       memory: { topic: "test-in-http" }
@@ -25,7 +25,7 @@ routes:
         batch_concurrency: 4
 
   http_to_memory:
-    concurrency: 4
+    concurrency: 1
     batch_size: 128
     input:
       http:
