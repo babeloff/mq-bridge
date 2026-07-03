@@ -7,6 +7,8 @@
 //! `#[pyo3]` / `#[napi]` wrappers and maps these `anyhow::Result`s to its native
 //! error type at the boundary.
 
+pub mod logging;
+
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;

@@ -27,6 +27,7 @@ serde_json.workspace = true
 serde_yaml_ng.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "sync"] }
 tracing.workspace = true
+tracing-subscriber = { version = "0.3", default-features = false, features = ["registry", "env-filter"] }
 
 # `auto-initialize` is only needed to embed the interpreter for the in-crate
 # `cargo test` unit tests (`Python::attach`). It must NOT be enabled for the
