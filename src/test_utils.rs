@@ -379,6 +379,67 @@ pub async fn run_performance_pipeline_test_named(
     .await;
 }
 
+/// TEMP diagnostic: measures the consume+commit route in isolation. Produces `num_messages`
+/// into the broker first (untimed), stops the producer, then deploys the consume route and
+/// times the pure drain (first-received -> last-received). Comparing this against the coupled
+/// pipeline number tells us whether the consume side is the real bottleneck.
+pub async fn run_consume_only_bench(broker_name: &str, config_yaml: &str, num_messages: usize) {
+    let yaml_val: serde_yaml_ng::Value =
+        serde_yaml_ng::from_str(config_yaml).expect("Failed to parse YAML config");
+    let routes_val = yaml_val.get("routes").expect("YAML must have 'routes' key");
+    let routes: std::collections::HashMap<String, Route> =
+        serde_yaml_ng::from_value(routes_val.clone()).expect("Failed to parse routes");
+
+    let in_route_name = format!("memory_to_{}", broker_name.to_lowercase());
+    let out_route_name = format!("{}_to_memory", broker_name.to_lowercase());
+    let in_route = routes.get(&in_route_name).unwrap().clone();
+    let out_route = routes.get(&out_route_name).unwrap().clone();
+
+    let in_channel = in_route.input.channel().unwrap();
+    let out_channel = out_route.output.channel().unwrap();
+
+    // --- Produce phase (untimed) ---
+    in_route.deploy(&in_route_name).await.expect("deploy in_route");
+    in_channel
+        .fill_messages(generate_test_messages(num_messages))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_secs(6)).await; // let it drain to the broker
+    Route::stop(&in_route_name).await; // drop producer -> flush
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    // --- Consume phase (timed: first-received -> last-received) ---
+    out_route.deploy(&out_route_name).await.expect("deploy out_route");
+
+    let mut received = 0usize;
+    let mut first: Option<Instant> = None;
+    let mut last = Instant::now();
+    let deadline = Instant::now() + Duration::from_secs(180);
+    while received < num_messages && Instant::now() < deadline {
+        let batch = out_channel.drain_messages();
+        if batch.is_empty() {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        } else {
+            if first.is_none() {
+                first = Some(Instant::now());
+            }
+            received += batch.len();
+            last = Instant::now();
+        }
+    }
+    Route::stop(&out_route_name).await;
+
+    let first = first.expect("consume-only: no messages received");
+    let secs = last.duration_since(first).as_secs_f64().max(1e-9);
+    println!(
+        "\n=== CONSUME-ONLY [{}]: {} msgs drained in {:.3}s => {:.0} msg/s ===\n",
+        broker_name,
+        received,
+        secs,
+        received as f64 / secs
+    );
+}
+
 pub async fn run_chaos_pipeline_test(
     broker_name: &str,
     config_yaml: &str,
@@ -492,8 +553,21 @@ async fn run_pipeline_test_internal(
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
         }
-        // All probes received => pipeline is live; clear the channel so probes don't count.
-        harness.out_channel.drain_messages();
+        // All probes received => pipeline is live; drain repeatedly until channel is empty
+        // to ensure no late-arriving warmup messages pollute the test count.
+        let mut empty_iterations = 0;
+        let drain_deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < drain_deadline {
+            if harness.out_channel.drain_messages().is_empty() {
+                empty_iterations += 1;
+                if empty_iterations >= 5 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            } else {
+                empty_iterations = 0;
+            }
+        }
     }
 
     let start_time = Instant::now();
