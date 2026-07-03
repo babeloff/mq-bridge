@@ -112,12 +112,15 @@ jobs:
           name: performance-bench-bin
 
       - name: Pre-pull docker images
-        run: docker compose -f tests/integration/docker-compose/mongodb.yml pull -q
+        run: |
+          for f in mongodb postgres; do
+            docker compose -f "tests/integration/docker-compose/${f}.yml" pull -q
+          done
 
       - name: Run benchmarks
         shell: bash
         env:
-          MQB_TEST_BACKEND: "mongodb"
+          MQB_TEST_BACKEND: "mongodb,postgres"
         run: |
           set -o pipefail
           chmod +x ./performance_bench_bin
