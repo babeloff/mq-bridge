@@ -299,6 +299,7 @@ class RedisStreamsConfig(TypedDict, total=False):
     maxlen: Optional[int]
     password: Optional[str]
     read_from_start: bool
+    reader_connections: Optional[int]
     redelivery_timeout_ms: Optional[int]
     stream: Optional[str]
     subscriber_mode: bool
