@@ -248,6 +248,26 @@ def orders():
         consumer.commit()
 ```
 
+## Logging
+
+By default the Rust core's internal `tracing` events go nowhere. Call
+`init_logging` once at startup to route them into the standard `logging`
+module, then configure output as usual:
+
+```python
+import logging
+from mq_bridge import init_logging
+
+logging.basicConfig(level=logging.INFO)
+init_logging()  # or init_logging("debug")
+```
+
+Events land on a logger named after the emitting Rust module, `::` mapped to
+`.` (e.g. `mq_bridge.route`). `level` seeds the Rust-side filter (default
+`"warn"`); the `MQ_BRIDGE_LOG` / `RUST_LOG` environment variables take
+precedence over it. Filtering happens in Rust, so suppressed events never
+cross into Python. Call it once per process — a second call raises.
+
 ## Tuning (environment variables)
 
 These knobs are read from the environment at startup:

@@ -159,6 +159,28 @@ that ack each batch individually (NATS JetStream, AMQP, MQTT) accept any order.
 > inflight) or raise it in config. **Kafka has no per-message nack:** `nack` there
 > leaves the offset unadvanced, so redelivery happens on the next run/rebalance.
 
+## Logging
+
+By default the Rust core's internal `tracing` events go nowhere. Call
+`initLogging` once at startup to route them into your own logger (console,
+pino, winston, …):
+
+```js
+import { initLogging } from "mq-bridge";
+
+initLogging((record) => {
+  // record: { level, target, message }
+  console.log(`[${record.level}] ${record.target}: ${record.message}`);
+}, "debug"); // level is optional, defaults to "warn"
+```
+
+`target` is the emitting Rust module (e.g. `mq_bridge::route`). `level` seeds
+the Rust-side filter (default `"warn"`); the `MQ_BRIDGE_LOG` / `RUST_LOG`
+environment variables take precedence over it. Filtering happens in Rust, so
+suppressed events never cross the FFI boundary. The callback is held weakly
+and won't keep the process alive. Call it once per process — a second call
+throws.
+
 ## Analysis
 
 HTTP comparison benchmark, driven by a native load generator (`wrk`) so the
