@@ -13,7 +13,7 @@ const URL: &str = "redis://localhost:6379";
 
 const CONFIG_YAML: &str = r#"
 routes:
-  memory_to_redis:
+  memory_to_redis_streams:
     concurrency: 4
     batch_size: 128
     input:
@@ -26,7 +26,7 @@ routes:
             max_interval_ms: 2000
       redis_streams: { url: "redis://localhost:6379", stream: "test-redis-pipeline" }
 
-  redis_to_memory:
+  redis_streams_to_memory:
     concurrency: 4
     batch_size: 128
     input:

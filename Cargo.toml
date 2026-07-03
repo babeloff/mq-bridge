@@ -140,7 +140,7 @@ zeromq = { version = "0.6", optional = true }
 # Redis Streams. Pure-Rust client (no C bindings). TLS via rustls (ring), so
 # `rediss://` URLs work; webpki-roots ships the CA bundle so there's no system
 # cert dependency. redis-rs wires its own ring-backed rustls config.
-redis = { version = "1.3", default-features = false, features = ["tokio-comp", "tokio-rustls-comp", "tls-rustls-webpki-roots", "streams"], optional = true }
+redis = { version = "1.3", default-features = false, features = ["tokio-comp", "tokio-rustls-comp", "tls-rustls-webpki-roots", "streams", "connection-manager"], optional = true }
 
 # gRPC
 tonic = { version = "0.14", optional = true, default-features = false, features = ["codegen", "transport", "tls-webpki-roots"] }

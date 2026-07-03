@@ -24,7 +24,7 @@ use crate::APP_NAME;
 use anyhow::anyhow;
 use async_channel::{bounded, Receiver};
 use async_trait::async_trait;
-use redis::aio::MultiplexedConnection;
+use redis::aio::ConnectionManager;
 use redis::streams::{
     StreamAutoClaimOptions, StreamAutoClaimReply, StreamReadOptions, StreamReadReply,
 };
@@ -101,7 +101,7 @@ fn url_with_credentials(config: &RedisStreamsConfig) -> String {
 // --- Publisher ---
 
 pub struct RedisStreamsPublisher {
-    conn: MultiplexedConnection,
+    conn: ConnectionManager,
     stream: String,
     maxlen: Option<usize>,
     approx_trim: bool,
@@ -114,8 +114,7 @@ impl RedisStreamsPublisher {
             .clone()
             .ok_or_else(|| anyhow!("Stream key is required for Redis Streams publisher"))?;
         let client = open_client(config)?;
-        let conn = client
-            .get_multiplexed_async_connection()
+        let conn = ConnectionManager::new(client)
             .await
             .map_err(|e| anyhow!("Failed to connect to Redis: {}", e))?;
         Ok(Self {
@@ -206,7 +205,7 @@ struct StreamEntry {
 
 pub struct RedisStreamsConsumer {
     rx: Receiver<Result<StreamEntry, ConsumerError>>,
-    ack_conn: MultiplexedConnection,
+    ack_conn: ConnectionManager,
     stream: String,
     /// `Some` in consumer-group mode (entries are acked); `None` in subscriber mode.
     group: Option<String>,
@@ -223,12 +222,10 @@ impl RedisStreamsConsumer {
 
         // A dedicated connection for the (blocking) reads, plus a separate one for
         // acks so an in-flight XREAD BLOCK never stalls XACK.
-        let mut read_conn = client
-            .get_multiplexed_async_connection()
+        let mut read_conn = ConnectionManager::new(client.clone())
             .await
             .map_err(|e| anyhow!("Failed to connect to Redis: {}", e))?;
-        let ack_conn = client
-            .get_multiplexed_async_connection()
+        let ack_conn = ConnectionManager::new(client)
             .await
             .map_err(|e| anyhow!("Failed to connect to Redis: {}", e))?;
 
