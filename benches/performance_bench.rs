@@ -146,6 +146,49 @@ pub mod mongodb_subscriber_helper {
     }
 }
 
+#[cfg(feature = "sqlx")]
+pub mod sqlx_helper {
+    use mq_bridge::endpoints::sqlx::{SqlxConsumer, SqlxPublisher};
+    use mq_bridge::models::SqlxConfig;
+    use mq_bridge::traits::{MessageConsumer, MessagePublisher};
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
+    fn get_config() -> SqlxConfig {
+        SqlxConfig {
+            url: "postgres://testuser:testpass@localhost:5432/testdb".to_string(),
+            table: "perf_sqlx_direct".to_string(),
+            auto_create_table: true,
+            min_connections: Some(2),
+            ..Default::default()
+        }
+    }
+
+    pub async fn create_publisher() -> Arc<dyn MessagePublisher> {
+        let config = get_config();
+        Arc::new(SqlxPublisher::new(&config).await.unwrap())
+    }
+
+    pub async fn create_consumer() -> Arc<Mutex<dyn MessageConsumer>> {
+        let config = get_config();
+
+        // Ensure the table exists and is empty before the run.
+        let publisher = SqlxPublisher::new(&config).await.unwrap();
+        drop(publisher);
+        sqlx::any::install_default_drivers();
+        let pool = sqlx::any::AnyPoolOptions::new()
+            .connect(&config.url)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM perf_sqlx_direct")
+            .execute(&pool)
+            .await
+            .ok();
+
+        Arc::new(Mutex::new(SqlxConsumer::new(&config).await.unwrap()))
+    }
+}
+
 #[cfg(feature = "amqp")]
 pub mod amqp_helper {
     use mq_bridge::endpoints::amqp::{AmqpConsumer, AmqpPublisher};
@@ -996,6 +1039,18 @@ fn performance_benchmarks(c: &mut Criterion) {
         "mongodb_subscriber",
         "tests/integration/docker-compose/mongodb.yml",
         mongodb_subscriber_helper,
+        group,
+        &rt,
+        &BENCH_RESULTS,
+        PERF_TEST_MESSAGE_COUNT,
+        PERF_TEST_CONCURRENCY,
+        std::time::Duration::from_millis(100)
+    );
+    bench_backend!(
+        "sqlx",
+        "postgres",
+        "tests/integration/docker-compose/postgres.yml",
+        sqlx_helper,
         group,
         &rt,
         &BENCH_RESULTS,
