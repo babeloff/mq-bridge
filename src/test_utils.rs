@@ -476,7 +476,7 @@ pub async fn run_produce_only_bench(broker_name: &str, config_yaml: &str, num_me
     let warmup = 500.min(num_messages);
     fill_chunks(&in_channel, warmup, CHUNK).await;
     let wdl = Instant::now() + Duration::from_secs(60);
-    while in_channel.len() > 0 && Instant::now() < wdl {
+    while !in_channel.is_empty() && Instant::now() < wdl {
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -485,7 +485,7 @@ pub async fn run_produce_only_bench(broker_name: &str, config_yaml: &str, num_me
     fill_chunks(&in_channel, num_messages, CHUNK).await;
     let start = Instant::now();
     let deadline = start + Duration::from_secs(180);
-    while in_channel.len() > 0 && Instant::now() < deadline {
+    while !in_channel.is_empty() && Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(2)).await;
     }
     let secs = start.elapsed().as_secs_f64().max(1e-9);
