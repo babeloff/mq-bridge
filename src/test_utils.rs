@@ -470,6 +470,32 @@ async fn run_pipeline_test_internal(
         .await
         .expect("Failed to deploy out_route");
 
+    // Warm up before timing: push a small probe batch and wait until it has traversed the
+    // whole path, forcing the one-time broker connect / consumer-group join / topic creation
+    // / partition assignment to complete. Without this the clock would start on a cold route
+    // and the first messages would pay that startup, understating sustained throughput. The
+    // direct perf tests and criterion both warm up the same way; this brings the pipeline
+    // test in line. Perf tests only — chaos/functional runs assert exact delivery counts.
+    if is_performance_test {
+        let warmup_count = 500.min(num_messages);
+        harness
+            .in_channel
+            .fill_messages(generate_test_messages(warmup_count))
+            .await
+            .unwrap();
+
+        let warmup_deadline = Instant::now() + Duration::from_secs(60);
+        let mut warmed = 0usize;
+        while warmed < warmup_count && Instant::now() < warmup_deadline {
+            warmed += harness.out_channel.drain_messages().len();
+            if warmed < warmup_count {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+        // All probes received => pipeline is live; clear the channel so probes don't count.
+        harness.out_channel.drain_messages();
+    }
+
     let start_time = Instant::now();
 
     harness.send_messages().await;
