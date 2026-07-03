@@ -400,7 +400,10 @@ pub async fn run_consume_only_bench(broker_name: &str, config_yaml: &str, num_me
     let out_channel = out_route.output.channel().unwrap();
 
     // --- Produce phase (untimed) ---
-    in_route.deploy(&in_route_name).await.expect("deploy in_route");
+    in_route
+        .deploy(&in_route_name)
+        .await
+        .expect("deploy in_route");
     in_channel
         .fill_messages(generate_test_messages(num_messages))
         .await
@@ -410,7 +413,10 @@ pub async fn run_consume_only_bench(broker_name: &str, config_yaml: &str, num_me
     tokio::time::sleep(Duration::from_secs(1)).await;
 
     // --- Consume phase (timed: first-received -> last-received) ---
-    out_route.deploy(&out_route_name).await.expect("deploy out_route");
+    out_route
+        .deploy(&out_route_name)
+        .await
+        .expect("deploy out_route");
 
     let mut received = 0usize;
     let mut first: Option<Instant> = None;
@@ -461,7 +467,10 @@ pub async fn run_produce_only_bench(broker_name: &str, config_yaml: &str, num_me
         }
     }
 
-    in_route.deploy(&in_route_name).await.expect("deploy in_route");
+    in_route
+        .deploy(&in_route_name)
+        .await
+        .expect("deploy in_route");
 
     // --- Warmup (untimed): pay producer connect/metadata cost ---
     let warmup = 500.min(num_messages);
