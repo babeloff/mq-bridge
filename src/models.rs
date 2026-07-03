@@ -2424,6 +2424,7 @@ impl WebSocketConfig {
 /// names rather than the generic [`TlsConfig`] used by the other endpoints.
 #[derive(Debug, Deserialize, Serialize, Clone, Default, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[cfg_attr(feature = "schema", schemars(transform = ibm_tls_config_schema_transform))]
 #[serde(deny_unknown_fields)]
 pub struct IbmTlsConfig {
     /// If true, enable TLS/SSL.
@@ -2444,6 +2445,39 @@ pub struct IbmTlsConfig {
     /// If true, disable server certificate verification (insecure).
     #[serde(default)]
     pub accept_invalid_certs: bool,
+}
+
+// schemars ignores serde `alias`, so the MQ-native names accepted at runtime
+// (`key_repository`, `key_repository_password`) must be added to the schema by
+// hand, otherwise `additionalProperties: false` rejects otherwise-valid configs.
+#[cfg(feature = "schema")]
+fn ibm_tls_config_schema_transform(schema: &mut schemars::Schema) {
+    let Some(properties) = schema
+        .as_object_mut()
+        .and_then(|schema_obj| schema_obj.get_mut("properties"))
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return;
+    };
+
+    properties.insert(
+        "key_repository".to_string(),
+        serde_json::json!({
+            "description": "MQ-native alias for `cert_file`: the CMS key repository stem \
+                (e.g. `/path/to/tls` for `tls.kdb`/`tls.sth`).",
+            "type": ["string", "null"]
+        }),
+    );
+
+    properties.insert(
+        "key_repository_password".to_string(),
+        serde_json::json!({
+            "description": "MQ-native alias for `cert_password`: password unlocking the key \
+                repository. Requires an IBM MQ client/server at 9.3.0.0+.",
+            "type": ["string", "null"],
+            "format": "password"
+        }),
+    );
 }
 
 /// Connection settings for the IBM MQ Queue Manager.

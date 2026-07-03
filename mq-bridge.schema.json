@@ -1199,6 +1199,21 @@
             "null"
           ]
         },
+        "key_repository": {
+          "description": "MQ-native alias for `cert_file`: the CMS key repository stem (e.g. `/path/to/tls` for `tls.kdb`/`tls.sth`).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "key_repository_password": {
+          "description": "MQ-native alias for `cert_password`: password unlocking the key repository. Requires an IBM MQ client/server at 9.3.0.0+.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "password"
+        },
         "required": {
           "description": "If true, enable TLS/SSL.",
           "type": "boolean",

@@ -166,6 +166,8 @@ class IbmTlsConfig(TypedDict, total=False):
     cert_file: Optional[str]
     cert_password: Optional[str]
     cipher_spec: Optional[str]
+    key_repository: Optional[str]
+    key_repository_password: Optional[str]
     required: bool
 
 
