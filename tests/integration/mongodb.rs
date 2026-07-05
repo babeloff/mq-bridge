@@ -13,7 +13,7 @@ const CONFIG_YAML: &str = r#"
 routes:
   memory_to_mongodb:
     concurrency: 4
-    batch_size: 128
+    batch_size: 1024
     input:
       memory: { topic: "test-in-mongodb" }
     output:
@@ -26,7 +26,7 @@ routes:
 
   mongodb_to_memory:
     concurrency: 4
-    batch_size: 128
+    batch_size: 1024
     input:
       mongodb: { url: "mongodb://localhost:27017", database: "mq_bridge_test", collection: "test_collection" }
     output:

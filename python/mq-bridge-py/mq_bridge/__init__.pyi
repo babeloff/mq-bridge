@@ -7,6 +7,17 @@ def config_schema() -> Dict[str, Any]:
     """Return the route-config JSON Schema, generated from the Rust models."""
     ...
 
+def init_logging(level: Optional[str] = ...) -> None:
+    """Route the library's internal ``tracing`` events into the standard
+    ``logging`` module. Call once at startup, then configure output with
+    ``logging`` as usual (``logging.basicConfig``, handlers, formatters).
+
+    ``level`` seeds the Rust-side filter (default ``"warn"``); the
+    ``MQ_BRIDGE_LOG`` / ``RUST_LOG`` environment variables override it.
+    Filtering happens in Rust, so suppressed events never cross into Python.
+    Raises if logging was already initialized."""
+    ...
+
 JsonValue = Any
 HandlerResult = Optional[Union["Message", bytes, str, Dict[str, JsonValue], List[JsonValue], int, float, bool]]
 

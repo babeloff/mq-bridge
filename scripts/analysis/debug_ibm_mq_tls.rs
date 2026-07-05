@@ -18,8 +18,9 @@ async fn main() -> anyhow::Result<()> {
     cfg.password = Some("adminpass".to_string());
     cfg.queue = Some("DEV.QUEUE.1".to_string());
     cfg.tls.required = true;
-    cfg.tls.cert_file = Some("tests/integration/docker-compose/ibm-mq-certs/client".to_string());
-    cfg.cipher_spec = Some("ANY_TLS12".to_string());
+    cfg.tls.key_repository =
+        Some("tests/integration/docker-compose/ibm-mq-certs/client".to_string());
+    cfg.tls.cipher_spec = Some("ANY_TLS12".to_string());
 
     let publisher = IbmMqPublisher::new(&cfg).await?;
     publisher.send("hello-wrapper".into()).await?;
@@ -43,10 +44,10 @@ async fn main() -> anyhow::Result<()> {
         cfg.password.as_deref().unwrap_or("").into(),
     );
     let key_repo = KeyRepo(MqStr::<256>::try_from(
-        cfg.tls.cert_file.as_deref().context("missing key repo")?,
+        cfg.tls.key_repository.as_deref().context("missing key repo")?,
     )?);
     let cipher = CipherSpec(MqStr::<32>::try_from(
-        cfg.cipher_spec.as_deref().context("missing cipher")?,
+        cfg.tls.cipher_spec.as_deref().context("missing cipher")?,
     )?);
     let tls = Tls::new(&key_repo, None, &cipher);
     let qm = mqi::connect::<ThreadNone>(&(

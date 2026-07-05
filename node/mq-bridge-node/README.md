@@ -19,6 +19,33 @@ npm run build:ci
 npm run example
 ```
 
+## Quick start: publish a message with no route/config file
+
+For ad hoc testing (e.g. seeding a topic by hand) you don't need a route, a
+handler, or a config file — `Publisher.fromConfig` takes a plain object and
+`sendJson` resolves once the broker acks it:
+
+```js
+const { Publisher } = require("mq-bridge");
+
+(async () => {
+  const endpoint = { kafka: { brokers: "localhost:9092", topic: "orders" } };
+  const pub = Publisher.fromConfig(endpoint);
+  for (let i = 0; i < 5; i++) {
+    await pub.sendJson({ orderId: i, amount: i * 10 });
+  }
+  console.log("published 5 messages");
+})();
+```
+
+For a truly file-free one-off, paste the same lines into `node -e "..."`.
+
+Swap the `endpoint` object for any other transport (`nats`, `amqp`, `mqtt`,
+`mongodb`, `memory`, `file`, ...). `sendJson(data, metadata?, id?)` takes an
+optional metadata object as its second argument (e.g. `{ kind: 'order.created' }`).
+`Publisher` has no `close()`, so let the script exit once sends finish rather
+than reusing a long-lived instance across many short runs.
+
 ## Handler shape
 
 ```ts
@@ -131,6 +158,28 @@ that ack each batch individually (NATS JetStream, AMQP, MQTT) accept any order.
 > the smallest broker ack deadline (JetStream `AckWait`, AMQP prefetch/timeout, MQTT
 > inflight) or raise it in config. **Kafka has no per-message nack:** `nack` there
 > leaves the offset unadvanced, so redelivery happens on the next run/rebalance.
+
+## Logging
+
+By default the Rust core's internal `tracing` events go nowhere. Call
+`initLogging` once at startup to route them into your own logger (console,
+pino, winston, …):
+
+```js
+import { initLogging } from "mq-bridge";
+
+initLogging((record) => {
+  // record: { level, target, message }
+  console.log(`[${record.level}] ${record.target}: ${record.message}`);
+}, "debug"); // level is optional, defaults to "warn"
+```
+
+`target` is the emitting Rust module (e.g. `mq_bridge::route`). `level` seeds
+the Rust-side filter (default `"warn"`); the `MQ_BRIDGE_LOG` / `RUST_LOG`
+environment variables take precedence over it. Filtering happens in Rust, so
+suppressed events never cross the FFI boundary. The callback is held weakly
+and won't keep the process alive. Call it once per process — a second call
+throws.
 
 ## Analysis
 

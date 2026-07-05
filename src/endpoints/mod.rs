@@ -28,6 +28,8 @@ pub mod mqtt;
 pub mod nats;
 pub mod null;
 pub mod reader;
+#[cfg(feature = "redis-streams")]
+pub mod redis_streams;
 pub mod response;
 #[cfg(feature = "sled")]
 pub mod sled;
@@ -355,6 +357,22 @@ fn check_consumer_recursive(
         }
         #[cfg(feature = "zeromq")]
         EndpointType::ZeroMq(_) => Ok(warnings),
+        #[cfg(feature = "redis-streams")]
+        EndpointType::RedisStreams(cfg) => {
+            if cfg.maxlen.is_some() {
+                warnings.push(
+                    "Endpoint 'redis_streams' is used as a consumer, but 'maxlen' is a publisher-only option and will be ignored."
+                    .to_string()
+                );
+            }
+            if cfg.approx_trim.is_some() {
+                warnings.push(
+                    "Endpoint 'redis_streams' is used as a consumer, but 'approx_trim' is a publisher-only option and will be ignored."
+                    .to_string()
+                );
+            }
+            Ok(warnings)
+        }
         #[cfg(any(feature = "ibm-mq-static", feature = "ibm-mq"))]
         EndpointType::IbmMq(_) => Ok(warnings),
         #[cfg(feature = "mongodb")]
@@ -779,6 +797,16 @@ async fn create_base_consumer(
         }
         #[cfg(feature = "zeromq")]
         EndpointType::ZeroMq(cfg) => Ok(boxed(zeromq::ZeroMqConsumer::new(cfg).await?)),
+        #[cfg(feature = "redis-streams")]
+        EndpointType::RedisStreams(cfg) => {
+            let mut config = cfg.clone();
+            if config.stream.is_none() {
+                config.stream = Some(route_name.to_string());
+            }
+            Ok(boxed(
+                redis_streams::RedisStreamsConsumer::new(&config).await?,
+            ))
+        }
         EndpointType::File(cfg) => Ok(boxed(file::FileConsumer::new(cfg).await?)),
         #[cfg(feature = "grpc")]
         EndpointType::Grpc(cfg) => {
@@ -1022,6 +1050,52 @@ fn check_publisher_recursive(
             if _cfg.receive_streamable {
                 warnings.push(
                     "Endpoint 'http' is used as a publisher, but 'receive_streamable' is a consumer-only option and will be ignored."
+                    .to_string()
+                );
+            }
+            Ok(warnings)
+        }
+        #[cfg(feature = "redis-streams")]
+        EndpointType::RedisStreams(cfg) => {
+            if cfg.group.is_some() {
+                warnings.push(
+                    "Endpoint 'redis_streams' is used as a publisher, but 'group' is a consumer-only option and will be ignored."
+                    .to_string()
+                );
+            }
+            if cfg.consumer_name.is_some() {
+                warnings.push(
+                    "Endpoint 'redis_streams' is used as a publisher, but 'consumer_name' is a consumer-only option and will be ignored."
+                    .to_string()
+                );
+            }
+            if cfg.subscriber_mode {
+                warnings.push(
+                    "Endpoint 'redis_streams' is used as a publisher, but 'subscriber_mode' is a consumer-only option and will be ignored."
+                    .to_string()
+                );
+            }
+            if cfg.block_ms.is_some() {
+                warnings.push(
+                    "Endpoint 'redis_streams' is used as a publisher, but 'block_ms' is a consumer-only option and will be ignored."
+                    .to_string()
+                );
+            }
+            if cfg.read_from_start {
+                warnings.push(
+                    "Endpoint 'redis_streams' is used as a publisher, but 'read_from_start' is a consumer-only option and will be ignored."
+                    .to_string()
+                );
+            }
+            if cfg.redelivery_timeout_ms.is_some() {
+                warnings.push(
+                    "Endpoint 'redis_streams' is used as a publisher, but 'redelivery_timeout_ms' is a consumer-only option and will be ignored."
+                    .to_string()
+                );
+            }
+            if cfg.internal_buffer_size.is_some() {
+                warnings.push(
+                    "Endpoint 'redis_streams' is used as a publisher, but 'internal_buffer_size' is a consumer-only option and will be ignored."
                     .to_string()
                 );
             }
@@ -1307,6 +1381,17 @@ async fn create_base_publisher(
         #[cfg(feature = "zeromq")]
         EndpointType::ZeroMq(cfg) => {
             Ok(Box::new(zeromq::ZeroMqPublisher::new(cfg).await?) as Box<dyn MessagePublisher>)
+        }
+        #[cfg(feature = "redis-streams")]
+        EndpointType::RedisStreams(cfg) => {
+            let mut config = cfg.clone();
+            if config.stream.is_none() {
+                config.stream = Some(route_name.to_string());
+            }
+            Ok(
+                Box::new(redis_streams::RedisStreamsPublisher::new(&config).await?)
+                    as Box<dyn MessagePublisher>,
+            )
         }
         #[cfg(feature = "grpc")]
         EndpointType::Grpc(cfg) => {

@@ -706,6 +706,8 @@ pub enum EndpointType {
     WebSocket(WebSocketConfig),
     IbmMq(IbmMqConfig),
     ZeroMq(ZeroMqConfig),
+    #[serde(rename = "redis_streams", alias = "redis")]
+    RedisStreams(RedisStreamsConfig),
     Grpc(GrpcConfig),
     Sqlx(SqlxConfig),
     Fanout(Vec<Endpoint>),
@@ -740,6 +742,7 @@ impl EndpointType {
             EndpointType::WebSocket(_) => "websocket",
             EndpointType::IbmMq(_) => "ibmmq",
             EndpointType::ZeroMq(_) => "zeromq",
+            EndpointType::RedisStreams(_) => "redis_streams",
             EndpointType::Grpc(_) => "grpc",
             EndpointType::Sqlx(_) => "sqlx",
             EndpointType::Fanout(_) => "fanout",
@@ -1152,7 +1155,7 @@ pub struct KafkaConfig {
     #[serde(default)]
     #[cfg_attr(
         feature = "schema",
-        schemars(default = "default_kafka_partitions_schema")
+        schemars(default = "default_kafka_partitions_schema", range(min = 1))
     )]
     pub partitions: Option<i32>,
 }
@@ -1352,9 +1355,11 @@ pub struct NatsConfig {
     /// Comma-separated list of NATS server URLs (e.g., "nats://localhost:4222,nats://localhost:4223"). If it contains userinfo, it will be treated as a secret.
     #[cfg_attr(feature = "schema", schemars(extend("format"="password")))]
     pub url: String,
-    /// The NATS subject to publish to or subscribe to.
+    /// The NATS subject to publish to or subscribe to. If a stream is
+    /// auto-created, it's scoped to `{stream}.>`, so prefix accordingly.
     pub subject: Option<String>,
-    /// (Consumer only). The JetStream stream name. Required for Consumers.
+    /// The JetStream stream name. Required for Consumers, even with
+    /// `no_jetstream: true` (unused there, but still validated).
     pub stream: Option<String>,
     /// Optional username for authentication.
     pub username: Option<String>,
@@ -2023,6 +2028,82 @@ pub enum ZeroMqSocketType {
     Rep,
 }
 
+// --- Redis Streams Specific Configuration ---
+
+/// Configuration for a Redis Streams endpoint.
+///
+/// Publishers `XADD` to the stream; consumers read via a consumer group
+/// (`XREADGROUP` + `XACK`) by default, or ephemerally via `XREAD` from new
+/// messages when `subscriber_mode` is set.
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct RedisStreamsConfig {
+    /// Redis URL, `redis://` or `rediss://` for TLS. Userinfo is treated as a secret.
+    #[cfg_attr(feature = "schema", schemars(extend("format"="password")))]
+    pub url: String,
+    /// The stream key to publish to or read from. Defaults to the route name.
+    pub stream: Option<String>,
+    /// (Consumer) Group name. Defaults to `{APP_NAME}-{stream}`; ignored in `subscriber_mode`.
+    pub group: Option<String>,
+    /// (Consumer) Consumer name within the group. Defaults to a unique per-instance id.
+    pub consumer_name: Option<String>,
+    /// (Consumer) Read ephemerally via `XREAD` from new messages (no group/acks). Default false.
+    #[serde(default)]
+    pub subscriber_mode: bool,
+    /// (Consumer) Block timeout in milliseconds for each read. Defaults to 5000ms.
+    pub block_ms: Option<u64>,
+    /// (Consumer) On group creation, start from the stream beginning ("0") not "$". Default false.
+    #[serde(default)]
+    pub read_from_start: bool,
+    /// (Consumer) Redeliver entries pending ≥ this long via `XAUTOCLAIM`; 0 disables. Default 60000ms.
+    pub redelivery_timeout_ms: Option<u64>,
+    /// (Publisher) If set, cap the stream length with `XADD MAXLEN`.
+    pub maxlen: Option<usize>,
+    /// (Publisher) Use approximate (`~`) trimming when `maxlen` is set. Defaults to true.
+    pub approx_trim: Option<bool>,
+    /// Optional username for authentication (Redis ACL).
+    pub username: Option<String>,
+    /// Optional password for authentication.
+    #[cfg_attr(feature = "schema", schemars(extend("format"="password")))]
+    pub password: Option<String>,
+    /// Internal buffer size for the consumer channel. Defaults to 128.
+    pub internal_buffer_size: Option<usize>,
+    /// (Consumer) Parallel `XREADGROUP` reader connections fanned out across the group. Default 1.
+    /// Ignored in `subscriber_mode`.
+    pub reader_connections: Option<usize>,
+}
+
+impl RedisStreamsConfig {
+    /// Creates a new Redis Streams configuration with the specified URL.
+    pub fn new(url: impl Into<String>) -> Self {
+        Self {
+            url: url.into(),
+            ..Default::default()
+        }
+    }
+
+    pub fn with_stream(mut self, stream: impl Into<String>) -> Self {
+        self.stream = Some(stream.into());
+        self
+    }
+
+    pub fn with_group(mut self, group: impl Into<String>) -> Self {
+        self.group = Some(group.into());
+        self
+    }
+
+    pub fn with_subscriber(mut self, subscriber: bool) -> Self {
+        self.subscriber_mode = subscriber;
+        self
+    }
+
+    pub fn with_reader_connections(mut self, connections: usize) -> Self {
+        self.reader_connections = Some(connections);
+        self
+    }
+}
+
 // --- gRPC Specific Configuration ---
 
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
@@ -2345,6 +2426,68 @@ impl WebSocketConfig {
 
 // --- IBM MQ Specific Configuration ---
 
+/// TLS configuration for the IBM MQ native client.
+///
+/// The IBM MQ client doesn't consume PEM files, so this uses MQ-native field
+/// names rather than the generic [`TlsConfig`] used by the other endpoints.
+#[derive(Debug, Deserialize, Serialize, Clone, Default, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[cfg_attr(feature = "schema", schemars(transform = ibm_tls_config_schema_transform))]
+#[serde(deny_unknown_fields)]
+pub struct IbmTlsConfig {
+    /// If true, enable TLS/SSL.
+    #[serde(default, deserialize_with = "deserialize_null_as_false")]
+    pub required: bool,
+    /// TLS CipherSpec (e.g., `ANY_TLS12`). Required for encrypted connections. IBM MQ-specific.
+    pub cipher_spec: Option<String>,
+    /// For IBM MQ this is the CMS key repository stem (e.g. `/path/to/tls` for `tls.kdb`/`tls.sth`),
+    /// not a PEM file. Exposed as `cert_file` for config parity with the generic `TlsConfig`;
+    /// the MQ-native name `key_repository` is still accepted.
+    #[serde(rename = "cert_file", alias = "key_repository")]
+    pub key_repository: Option<String>,
+    /// Password unlocking the key repository. Requires an IBM MQ client/server at 9.3.0.0+.
+    /// Exposed as `cert_password` for parity with `TlsConfig`; alias `key_repository_password`.
+    #[serde(rename = "cert_password", alias = "key_repository_password")]
+    #[cfg_attr(feature = "schema", schemars(extend("format"="password")))]
+    pub key_repository_password: Option<String>,
+    /// If true, disable server certificate verification (insecure).
+    #[serde(default)]
+    pub accept_invalid_certs: bool,
+}
+
+// schemars ignores serde `alias`, so the MQ-native names accepted at runtime
+// (`key_repository`, `key_repository_password`) must be added to the schema by
+// hand, otherwise `additionalProperties: false` rejects otherwise-valid configs.
+#[cfg(feature = "schema")]
+fn ibm_tls_config_schema_transform(schema: &mut schemars::Schema) {
+    let Some(properties) = schema
+        .as_object_mut()
+        .and_then(|schema_obj| schema_obj.get_mut("properties"))
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return;
+    };
+
+    properties.insert(
+        "key_repository".to_string(),
+        serde_json::json!({
+            "description": "MQ-native alias for `cert_file`: the CMS key repository stem \
+                (e.g. `/path/to/tls` for `tls.kdb`/`tls.sth`).",
+            "type": ["string", "null"]
+        }),
+    );
+
+    properties.insert(
+        "key_repository_password".to_string(),
+        serde_json::json!({
+            "description": "MQ-native alias for `cert_password`: password unlocking the key \
+                repository. Requires an IBM MQ client/server at 9.3.0.0+.",
+            "type": ["string", "null"],
+            "format": "password"
+        }),
+    );
+}
+
 /// Connection settings for the IBM MQ Queue Manager.
 // Default is implemented manually (not derived): the numeric fields must match
 // the serde defaults, otherwise `IbmMqConfig::new()` / `..Default::default()`
@@ -2369,11 +2512,9 @@ pub struct IbmMqConfig {
     /// Password for authentication. Optional; required if the channel enforces authentication.
     #[cfg_attr(feature = "schema", schemars(extend("format"="password")))]
     pub password: Option<String>,
-    /// TLS CipherSpec (e.g., `ANY_TLS12`). Optional; required for encrypted connections.
-    pub cipher_spec: Option<String>,
     /// TLS configuration settings (e.g., keystore paths). Optional.
     #[serde(default)]
-    pub tls: TlsConfig,
+    pub tls: IbmTlsConfig,
     /// Maximum message size in bytes (default: 4MB). Optional.
     #[serde(default = "default_max_message_size")]
     pub max_message_size: usize,
@@ -2435,8 +2576,7 @@ impl Default for IbmMqConfig {
             channel: String::new(),
             username: None,
             password: None,
-            cipher_spec: None,
-            tls: TlsConfig::default(),
+            tls: IbmTlsConfig::default(),
             max_message_size: default_max_message_size(),
             wait_timeout_ms: default_wait_timeout_ms(),
             internal_buffer_size: None,
@@ -2768,6 +2908,9 @@ impl SecretExtractor for EndpointType {
             EndpointType::ZeroMq(cfg) => {
                 cfg.extract_secrets(&format!("{}__{}", prefix, "ZEROMQ"), secrets)
             }
+            EndpointType::RedisStreams(cfg) => {
+                cfg.extract_secrets(&format!("{}__{}", prefix, "REDIS_STREAMS"), secrets)
+            }
             EndpointType::Sqlx(cfg) => {
                 cfg.extract_secrets(&format!("{}__{}", prefix, "SQLX"), secrets)
             }
@@ -2948,6 +3091,18 @@ impl SecretExtractor for ZeroMqConfig {
     }
 }
 
+impl SecretExtractor for RedisStreamsConfig {
+    fn extract_secrets(&mut self, prefix: &str, secrets: &mut HashMap<String, String>) {
+        extract_sensitive_url(&mut self.url, prefix, "URL", secrets);
+        if let Some(val) = self.username.take() {
+            secrets.insert(format!("{}__{}", prefix, "USERNAME"), val);
+        }
+        if let Some(val) = self.password.take() {
+            secrets.insert(format!("{}__{}", prefix, "PASSWORD"), val);
+        }
+    }
+}
+
 impl SecretExtractor for SqlxConfig {
     fn extract_secrets(&mut self, prefix: &str, secrets: &mut HashMap<String, String>) {
         extract_sensitive_url(&mut self.url, prefix, "URL", secrets);
@@ -2973,6 +3128,16 @@ impl SecretExtractor for GrpcConfig {
 impl SecretExtractor for TlsConfig {
     fn extract_secrets(&mut self, prefix: &str, secrets: &mut HashMap<String, String>) {
         if let Some(val) = self.cert_password.take() {
+            secrets.insert(format!("{}__{}", prefix, "CERT_PASSWORD"), val);
+        }
+    }
+}
+
+impl SecretExtractor for IbmTlsConfig {
+    fn extract_secrets(&mut self, prefix: &str, secrets: &mut HashMap<String, String>) {
+        if let Some(val) = self.key_repository_password.take() {
+            // Wire/env name matches the serde rename (`cert_password`), so the config
+            // crate's env override resolves back to this field.
             secrets.insert(format!("{}__{}", prefix, "CERT_PASSWORD"), val);
         }
     }

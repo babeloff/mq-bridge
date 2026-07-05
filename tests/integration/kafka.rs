@@ -12,8 +12,8 @@ use std::sync::Arc;
 const CONFIG_YAML: &str = r#"
 routes:
   memory_to_kafka:
-    concurrency: 4
-    batch_size: 128
+    concurrency: 2
+    batch_size: 1024
     input:
       memory: { topic: "kafka-test-in" }
     output:
@@ -31,8 +31,8 @@ routes:
             - ["compression.type", "snappy"]
 
   kafka_to_memory:
-    concurrency: 4
-    batch_size: 128
+    concurrency: 2
+    batch_size: 1024
     input:
       kafka:
         url: "localhost:9092"
@@ -77,6 +77,98 @@ pub async fn test_kafka_performance_pipeline() {
             &(PERF_TEST_MESSAGE_COUNT + 1000).to_string(),
         );
         run_performance_pipeline_test("kafka", &config_yaml, PERF_TEST_MESSAGE_COUNT).await;
+    })
+    .await;
+}
+
+#[cfg(feature = "perf-diagnostics")]
+pub async fn test_kafka_consume_only_bench() {
+    setup_logging();
+    run_test_with_docker("tests/integration/docker-compose/kafka.yml", || async {
+        let s = fast_uuid_v7::gen_id();
+        let cap = PERF_TEST_MESSAGE_COUNT + 1000;
+        let cfg = format!(
+            r#"
+routes:
+  memory_to_kafka:
+    concurrency: 8
+    batch_size: 128
+    input:
+      memory: {{ topic: "co-in-{s}", capacity: {cap} }}
+    output:
+      kafka:
+        url: "localhost:9092"
+        topic: "co-topic-{s}"
+        partitions: 4
+        delayed_ack: true
+        producer_options:
+          - ["queue.buffering.max.ms", "5"]
+          - ["acks", "1"]
+          - ["compression.type", "snappy"]
+  kafka_to_memory:
+    concurrency: 4
+    batch_size: 128
+    input:
+      kafka:
+        url: "localhost:9092"
+        topic: "co-topic-{s}"
+        group_id: "co-grp-{s}"
+        consumer_options:
+          - ["auto.offset.reset", "earliest"]
+    output:
+      memory: {{ topic: "co-out-{s}", capacity: {cap} }}
+"#,
+            s = s,
+            cap = cap
+        );
+        mq_bridge::test_utils::run_consume_only_bench("kafka", &cfg, PERF_TEST_MESSAGE_COUNT).await;
+    })
+    .await;
+}
+
+#[cfg(feature = "perf-diagnostics")]
+pub async fn test_kafka_produce_only_bench() {
+    setup_logging();
+    run_test_with_docker("tests/integration/docker-compose/kafka.yml", || async {
+        let s = fast_uuid_v7::gen_id();
+        let cap = PERF_TEST_MESSAGE_COUNT + 1000;
+        let env = |k: &str, d: &str| std::env::var(k).unwrap_or_else(|_| d.to_string());
+        let concurrency = env("PO_CONCURRENCY", "4");
+        let batch_size = env("PO_BATCH", "128");
+        let linger = env("PO_LINGER_MS", "1");
+        let batch_num_messages = env("PO_BATCH_NUM_MESSAGES", "10000"); // librdkafka default
+        println!(
+            "--- PRODUCE-ONLY params: concurrency={concurrency} batch_size={batch_size} linger_ms={linger} batch.num.messages={batch_num_messages}"
+        );
+        // Mirrors the committed coupled produce route (CONFIG_YAML memory_to_kafka):
+        // retry middleware, delayed_ack default (false = await delivery).
+        let cfg = format!(
+            r#"
+routes:
+  memory_to_kafka:
+    concurrency: {concurrency}
+    batch_size: {batch_size}
+    input:
+      memory: {{ topic: "po-in-{s}", capacity: {cap} }}
+    output:
+      middlewares:
+        - retry:
+            max_attempts: 20
+            initial_interval_ms: 500
+            max_interval_ms: 2000
+      kafka:
+        url: "localhost:9092"
+        topic: "po-topic-{s}"
+        producer_options:
+          - ["queue.buffering.max.ms", "{linger}"]
+          - ["batch.num.messages", "{batch_num_messages}"]
+          - ["acks", "1"]
+          - ["compression.type", "snappy"]
+"#,
+            s = s,
+            cap = cap
+        );
+        mq_bridge::test_utils::run_produce_only_bench("kafka", &cfg, PERF_TEST_MESSAGE_COUNT).await;
     })
     .await;
 }

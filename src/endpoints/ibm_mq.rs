@@ -196,8 +196,6 @@ macro_rules! connect_mq {
         let qm_name = MqStr::<48>::try_from($config.queue_manager.as_str())
             .context("Invalid queue manager name")?;
 
-        let cipher_spec_str = $config.cipher_spec.as_deref().unwrap_or("");
-
         let mq_server_string = format!("{}/TCP/{}", $config.channel, $config.url);
         let mq_server =
             MqServer::try_from(mq_server_string.as_str()).context("Invalid MQSERVER")?;
@@ -209,10 +207,11 @@ macro_rules! connect_mq {
         };
 
         let (tls_opt, cipher_opt) = if $config.tls.required {
+            let cipher_spec_str = $config.tls.cipher_spec.as_deref().unwrap_or("");
             let cipher =
                 CipherSpec(MqStr::<32>::try_from(cipher_spec_str).context("Invalid cipher spec")?);
 
-            if let Some(key_repo_str) = $config.tls.cert_file.as_deref() {
+            if let Some(key_repo_str) = $config.tls.key_repository.as_deref() {
                 let key_repo =
                     KeyRepo(MqStr::<256>::try_from(key_repo_str).context("Invalid Key Repo")?);
                 let mut tls = Tls::new(&key_repo, None, &cipher);
@@ -221,8 +220,8 @@ macro_rules! connect_mq {
                     tls.cert_val_policy(MQ_CERT_VAL_POLICY_NONE);
                 }
 
-                if let Some(_pass) = &$config.tls.cert_password {
-                    warn!("IBM MQ key repository password is not supported in this build (requires mqc_9_3_0_0 feature)");
+                if let Some(pass) = $config.tls.key_repository_password.as_deref() {
+                    tls.key_repo_password(Some(mqi::types::ProtectedSecret::new(pass)));
                 }
 
                 (Some(tls), None)
@@ -231,29 +230,22 @@ macro_rules! connect_mq {
 
                 if $config.tls.accept_invalid_certs {
                     tls.cert_val_policy(MQ_CERT_VAL_POLICY_NONE);
-                } else if $config.tls.ca_file.is_some() {
-                    anyhow::bail!(
-                        "IBM MQ TLS does not consume tls.ca_file directly; provide tls.cert_file as an MQ key repository or set tls.accept_invalid_certs=true"
-                    );
                 } else {
                     anyhow::bail!(
-                        "TLS required but neither tls.cert_file (MQ key repository) nor tls.accept_invalid_certs was provided"
+                        "TLS required but neither tls.key_repository (MQ key repository) nor tls.accept_invalid_certs was provided"
                     );
                 }
 
-                if let Some(_pass) = &$config.tls.cert_password {
-                    warn!("IBM MQ key repository password is not supported in this build (requires mqc_9_3_0_0 feature)");
+                if $config.tls.key_repository_password.is_some() {
+                    anyhow::bail!(
+                        "tls.key_repository_password requires tls.key_repository to be set (the MQ key repository whose password it unlocks)"
+                    );
                 }
 
                 (Some(tls), Some(cipher))
             }
         } else {
-            (
-                None,
-                Some(CipherSpec(
-                    MqStr::<32>::try_from(cipher_spec_str).context("Invalid cipher spec")?,
-                )),
-            )
+            (None, None)
         };
 
         let opts = (

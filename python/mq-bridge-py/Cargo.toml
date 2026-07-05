@@ -27,6 +27,7 @@ serde_json.workspace = true
 serde_yaml_ng.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "sync"] }
 tracing.workspace = true
+tracing-subscriber = { version = "0.3", default-features = false, features = ["registry", "env-filter"] }
 
 # `auto-initialize` is only needed to embed the interpreter for the in-crate
 # `cargo test` unit tests (`Python::attach`). It must NOT be enabled for the
@@ -77,6 +78,7 @@ ibm-mq = ["mq-bridge/ibm-mq"]
 # Static-link IBM MQ client (needs the IBM SDK at build time).
 ibm-mq-static = ["mq-bridge/ibm-mq-static"]
 zeromq = ["mq-bridge/zeromq"]
+redis-streams = ["mq-bridge/redis-streams"]
 grpc = ["mq-bridge/grpc"]
 sqlx = ["mq-bridge/sqlx"]
 rustls-ring = ["dep:rustls", "rustls/ring", "mq-bridge/rustls-ring"]

@@ -79,10 +79,10 @@ pub fn ibm_mq_config_with_tls(
         queue_manager.into(),
         channel.into(),
     );
-    // The IBM MQ client path expects `tls.cert_file` to carry an MQ key repository stem.
-    cfg.tls.cert_file = Some(cert_dir.join("client").to_string_lossy().into_owned());
+    // The IBM MQ client path expects `tls.key_repository` to carry an MQ key repository stem.
+    cfg.tls.key_repository = Some(cert_dir.join("client").to_string_lossy().into_owned());
     cfg.tls.required = true;
-    cfg.cipher_spec = Some("ANY_TLS12".to_string());
+    cfg.tls.cipher_spec = Some("ANY_TLS12".to_string());
     // The default 4MB buffer yields empty payload reads in this TLS test setup.
     cfg.max_message_size = 1024;
     cfg
