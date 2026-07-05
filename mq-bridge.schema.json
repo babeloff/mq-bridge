@@ -482,6 +482,17 @@
         {
           "type": "object",
           "properties": {
+            "redis_streams": {
+              "$ref": "#/$defs/RedisStreamsConfig"
+            }
+          },
+          "required": [
+            "redis_streams"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
             "grpc": {
               "$ref": "#/$defs/GrpcConfig"
             }
@@ -1072,13 +1083,6 @@
           "description": "Required. Server Connection (SVRCONN) Channel name defined on the QM.",
           "type": "string"
         },
-        "cipher_spec": {
-          "description": "TLS CipherSpec (e.g., `ANY_TLS12`). Optional; required for encrypted connections.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
         "disable_status_inq": {
           "description": "If false, attempt to open the queue with INQUIRE permissions to fetch queue depth for status checks. Defaults to false.",
           "type": "boolean",
@@ -1122,13 +1126,12 @@
         },
         "tls": {
           "description": "TLS configuration settings (e.g., keystore paths). Optional.",
-          "$ref": "#/$defs/TlsConfig",
+          "$ref": "#/$defs/IbmTlsConfig",
           "default": {
             "accept_invalid_certs": false,
-            "ca_file": null,
             "cert_file": null,
             "cert_password": null,
-            "key_file": null,
+            "cipher_spec": null,
             "required": false
           }
         },
@@ -1164,6 +1167,60 @@
         "queue_manager",
         "channel"
       ]
+    },
+    "IbmTlsConfig": {
+      "description": "TLS configuration for the IBM MQ native client.\n\nThe IBM MQ client doesn't consume PEM files, so this uses MQ-native field\nnames rather than the generic [`TlsConfig`] used by the other endpoints.",
+      "type": "object",
+      "properties": {
+        "accept_invalid_certs": {
+          "description": "If true, disable server certificate verification (insecure).",
+          "type": "boolean",
+          "default": false
+        },
+        "cert_file": {
+          "description": "For IBM MQ this is the CMS key repository stem (e.g. `/path/to/tls` for `tls.kdb`/`tls.sth`),\nnot a PEM file. Exposed as `cert_file` for config parity with the generic `TlsConfig`;\nthe MQ-native name `key_repository` is still accepted.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "cert_password": {
+          "description": "Password unlocking the key repository. Requires an IBM MQ client/server at 9.3.0.0+.\nExposed as `cert_password` for parity with `TlsConfig`; alias `key_repository_password`.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "password"
+        },
+        "cipher_spec": {
+          "description": "TLS CipherSpec (e.g., `ANY_TLS12`). Required for encrypted connections. IBM MQ-specific.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "key_repository": {
+          "description": "MQ-native alias for `cert_file`: the CMS key repository stem (e.g. `/path/to/tls` for `tls.kdb`/`tls.sth`).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "key_repository_password": {
+          "description": "MQ-native alias for `cert_password`: password unlocking the key repository. Requires an IBM MQ client/server at 9.3.0.0+.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "password"
+        },
+        "required": {
+          "description": "If true, enable TLS/SSL.",
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "additionalProperties": false
     },
     "KafkaConfig": {
       "description": "General Kafka connection configuration.",
@@ -1201,6 +1258,16 @@
             "string",
             "null"
           ]
+        },
+        "partitions": {
+          "description": "(Publisher only) Partition count used when auto-creating the topic (default: 6).\nHigher values raise write/consume parallelism; ordering is only guaranteed per\npartition key (message_id), not across the whole topic. Ignored if the topic exists.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int32",
+          "default": 6,
+          "minimum": 1
         },
         "password": {
           "description": "Optional password for SASL authentication.",
@@ -1847,7 +1914,7 @@
           "default": true
         },
         "stream": {
-          "description": "(Consumer only). The JetStream stream name. Required for Consumers.",
+          "description": "The JetStream stream name. Required for Consumers, even with\n`no_jetstream: true` (unused there, but still validated).",
           "type": [
             "string",
             "null"
@@ -1870,7 +1937,7 @@
           "format": "int64"
         },
         "subject": {
-          "description": "The NATS subject to publish to or subscribe to.",
+          "description": "The NATS subject to publish to or subscribe to. If a stream is\nauto-created, it's scoped to `{stream}.>`, so prefix accordingly.",
           "type": [
             "string",
             "null"
@@ -1954,6 +2021,110 @@
         }
       },
       "additionalProperties": false
+    },
+    "RedisStreamsConfig": {
+      "description": "Configuration for a Redis Streams endpoint.\n\nPublishers `XADD` to the stream; consumers read via a consumer group\n(`XREADGROUP` + `XACK`) by default, or ephemerally via `XREAD` from new\nmessages when `subscriber_mode` is set.",
+      "type": "object",
+      "properties": {
+        "approx_trim": {
+          "description": "(Publisher) Use approximate (`~`) trimming when `maxlen` is set. Defaults to true.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "block_ms": {
+          "description": "(Consumer) Block timeout in milliseconds for each read. Defaults to 5000ms.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "consumer_name": {
+          "description": "(Consumer) Consumer name within the group. Defaults to a unique per-instance id.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "group": {
+          "description": "(Consumer) Group name. Defaults to `{APP_NAME}-{stream}`; ignored in `subscriber_mode`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "internal_buffer_size": {
+          "description": "Internal buffer size for the consumer channel. Defaults to 128.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0
+        },
+        "maxlen": {
+          "description": "(Publisher) If set, cap the stream length with `XADD MAXLEN`.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0
+        },
+        "password": {
+          "description": "Optional password for authentication.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "password"
+        },
+        "read_from_start": {
+          "description": "(Consumer) On group creation, start from the stream beginning (\"0\") not \"$\". Default false.",
+          "type": "boolean",
+          "default": false
+        },
+        "redelivery_timeout_ms": {
+          "description": "(Consumer) Redeliver entries pending ≥ this long via `XAUTOCLAIM`; 0 disables. Default 60000ms.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "stream": {
+          "description": "The stream key to publish to or read from. Defaults to the route name.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "subscriber_mode": {
+          "description": "(Consumer) Read ephemerally via `XREAD` from new messages (no group/acks). Default false.",
+          "type": "boolean",
+          "default": false
+        },
+        "url": {
+          "description": "Redis URL, `redis://` or `rediss://` for TLS. Userinfo is treated as a secret.",
+          "type": "string",
+          "format": "password"
+        },
+        "username": {
+          "description": "Optional username for authentication (Redis ACL).",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "url"
+      ]
     },
     "ResponseConfig": {
       "type": "object",

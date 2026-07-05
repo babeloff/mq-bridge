@@ -15,6 +15,7 @@ FileConfig = dict
 GrpcConfig = dict
 HttpConfig = dict
 IbmMqConfig = dict
+IbmTlsConfig = dict
 KafkaConfig = dict
 LimiterMiddleware = dict
 MemoryConfig = dict
@@ -24,6 +25,7 @@ MongoDbConfig = dict
 MqttConfig = dict
 NatsConfig = dict
 RandomPanicMiddleware = dict
+RedisStreamsConfig = dict
 ResponseConfig = dict
 RetryMiddleware = dict
 Route = dict
@@ -67,6 +69,7 @@ __all__ = [
     "HttpConfig",
     "HttpServerProtocol",
     "IbmMqConfig",
+    "IbmTlsConfig",
     "KafkaConfig",
     "LimiterMiddleware",
     "MemoryConfig",
@@ -79,6 +82,7 @@ __all__ = [
     "NatsConfig",
     "NatsDeliverPolicy",
     "RandomPanicMiddleware",
+    "RedisStreamsConfig",
     "ResponseConfig",
     "RetryMiddleware",
     "Route",

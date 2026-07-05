@@ -26,6 +26,7 @@ serde_json.workspace = true
 serde_yaml_ng.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "sync"] }
 tracing.workspace = true
+tracing-subscriber = { version = "0.3", default-features = false, features = ["registry", "env-filter"] }
 
 [build-dependencies]
 napi-build = "2"
@@ -50,6 +51,7 @@ aws = ["mq-bridge/aws"]
 ibm-mq = ["mq-bridge/ibm-mq"]
 ibm-mq-static = ["mq-bridge/ibm-mq-static"]
 zeromq = ["mq-bridge/zeromq"]
+redis-streams = ["mq-bridge/redis-streams"]
 grpc = ["mq-bridge/grpc"]
 sqlx = ["mq-bridge/sqlx"]
 rustls-ring = ["mq-bridge/rustls-ring"]

@@ -28,7 +28,7 @@ const CONFIG_YAML: &str = r#"
 routes:
   memory_to_sqlx:
     concurrency: 4
-    batch_size: 128
+    batch_size: 1024
     input:
       memory: { topic: "sqlx-mysql-in" }
     output:
@@ -43,7 +43,7 @@ routes:
 
   sqlx_to_memory:
     concurrency: 4
-    batch_size: 128
+    batch_size: 1024
     input:
       sqlx:
         url: "mysql://testuser:testpass@localhost:3306/testdb"

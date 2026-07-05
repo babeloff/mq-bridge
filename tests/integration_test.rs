@@ -17,6 +17,20 @@ pub fn should_run(test_name: &str) -> bool {
     mq_bridge::test_utils::should_run(test_name)
 }
 
+#[cfg(all(feature = "kafka", feature = "perf-diagnostics"))]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "diagnostic: consume-only isolation"]
+async fn test_kafka_consume_only() {
+    integration::kafka::test_kafka_consume_only_bench().await;
+}
+
+#[cfg(all(feature = "kafka", feature = "perf-diagnostics"))]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "diagnostic: produce-only isolation"]
+async fn test_kafka_produce_only() {
+    integration::kafka::test_kafka_produce_only_bench().await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires docker compose"]
 async fn test_all_request_reply() {
@@ -91,6 +105,13 @@ async fn test_all_subscriber_logic() {
         if should_run("nats") {
             println!("\n\n>>> Starting NATS Subscriber Logic Test...");
             integration::nats::test_nats_subscriber_logic().await;
+        }
+    }
+    #[cfg(feature = "redis-streams")]
+    {
+        if should_run("redis_streams") {
+            println!("\n\n>>> Starting Redis Streams Subscriber Logic Test...");
+            integration::redis_streams::test_redis_subscriber_logic().await;
         }
     }
     #[cfg(feature = "amqp")]
@@ -196,6 +217,14 @@ async fn test_all_status() {
         if should_run("nats") {
             println!("\n\n>>> Starting NATS Status Test...");
             integration::nats::test_nats_status().await;
+        }
+    }
+
+    #[cfg(feature = "redis-streams")]
+    {
+        if should_run("redis_streams") {
+            println!("\n\n>>> Starting Redis Streams Status Test...");
+            integration::redis_streams::test_redis_status().await;
         }
     }
 
@@ -319,6 +348,13 @@ async fn test_all_performance_pipeline() {
         if should_run("zeromq") {
             println!("\n\n>>> Starting ZeroMQ Performance Pipeline Test...");
             integration::zeromq::test_zeromq_performance_pipeline().await;
+        }
+    }
+    #[cfg(feature = "redis-streams")]
+    {
+        if should_run("redis_streams") {
+            println!("\n\n>>> Starting Redis Streams Performance Pipeline Test...");
+            integration::redis_streams::test_redis_performance_pipeline().await;
         }
     }
     #[cfg(feature = "grpc")]

@@ -126,4 +126,27 @@ export class Route {
  */
 export function configSchema(): JsonValue;
 
+/** One library log event delivered to the {@link initLogging} callback. */
+export interface LogRecord {
+  /** `error` | `warn` | `info` | `debug` | `trace`. */
+  level: string;
+  /** Emitting module, e.g. `mq_bridge::route`. */
+  target: string;
+  message: string;
+}
+
+/**
+ * Route the library's internal `tracing` events into `callback` so your host
+ * logger (console, pino, winston, …) owns output. Call once at startup.
+ *
+ * `level` seeds the Rust-side filter (default `"warn"`); the `MQ_BRIDGE_LOG` /
+ * `RUST_LOG` environment variables override it. Filtering happens in Rust, so
+ * suppressed events never reach JS. The callback is held weakly and will not
+ * keep the process alive. Throws if logging was already initialized.
+ */
+export function initLogging(
+  callback: (record: LogRecord) => void,
+  level?: string | null,
+): void;
+
 export const version: string;

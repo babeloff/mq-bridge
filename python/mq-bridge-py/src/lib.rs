@@ -37,6 +37,8 @@ use serde_json::Value as JsonValue;
 use tokio::runtime::Runtime;
 use tokio::sync::{oneshot, OwnedSemaphorePermit, Semaphore};
 use tracing::error;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 
 const MAX_JSON_DEPTH: usize = 64;
 
@@ -1569,15 +1571,15 @@ fn invoke_python_handler_many(
                             message.metadata,
                         )
                         .map_err(|err| {
-                            python_error_to_handler_error(py_err_context(&label, message_id), err)
+                            python_error_to_handler_error(py_err_context(label, message_id), err)
                         }),
                         Err(err) => Err(python_error_to_handler_error(
-                            py_err_context(&label, message_id),
+                            py_err_context(label, message_id),
                             err,
                         )),
                     },
                     Err(err) => Err(python_error_to_handler_error(
-                        py_err_context(&label, message_id),
+                        py_err_context(label, message_id),
                         err,
                     )),
                 }
@@ -1605,10 +1607,10 @@ fn python_error_to_handler_error(ctx: PyErrorContext<'_>, err: PyErr) -> Handler
             "Python handler raised an exception: {err}"
         );
         let message = anyhow!("Python handler failed for '{}': {}", ctx.label, err);
+        // RetryableError requests a retry; every other exception (including
+        // NonRetryableError) is non-retryable.
         if err.is_instance_of::<RetryableError>(py) {
             HandlerError::Retryable(message)
-        } else if err.is_instance_of::<NonRetryableError>(py) {
-            HandlerError::NonRetryable(message)
         } else {
             HandlerError::NonRetryable(message)
         }
@@ -2008,6 +2010,63 @@ fn config_schema(py: Python<'_>) -> PyResult<Py<PyAny>> {
     json_bytes_to_python(py, &json)
 }
 
+/// Forward one library log event into Python's `logging` module.
+fn emit_to_python_logging(py: Python<'_>, record: &common::logging::LogEvent) -> PyResult<()> {
+    let logging = py.import("logging")?;
+    let logger = logging.call_method1("getLogger", (record.python_logger_name(),))?;
+    let levelno = record.python_levelno();
+    // Let Python's per-logger level/config decide before we pay for the call.
+    if logger
+        .call_method1("isEnabledFor", (levelno,))?
+        .extract::<bool>()?
+    {
+        logger.call_method1("log", (levelno, record.message.as_str()))?;
+    }
+    Ok(())
+}
+
+/// A `tracing` layer that delivers events to Python's `logging` module.
+struct PyLogLayer;
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for PyLogLayer {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        // Background transport threads can emit events during/after interpreter
+        // shutdown; touching a torn-down interpreter would segfault.
+        if unsafe { pyo3::ffi::Py_IsInitialized() } == 0 {
+            return;
+        }
+        let record = common::logging::record_from_event(event);
+        Python::attach(|py| {
+            // A logging failure must never propagate out of the event path.
+            let _ = emit_to_python_logging(py, &record);
+        });
+    }
+}
+
+/// Route the library's `tracing` events into Python's standard `logging`
+/// module. Call once at startup; configure output with `logging` as usual
+/// (`logging.basicConfig(level=...)`, handlers, formatters). `level` seeds the
+/// Rust-side filter (default `"warn"`); the `MQ_BRIDGE_LOG` / `RUST_LOG` env
+/// vars override it. Filtering happens in Rust, so suppressed events never
+/// cross into Python.
+#[pyfunction]
+#[pyo3(signature = (level=None))]
+fn init_logging(level: Option<String>) -> PyResult<()> {
+    let filter = common::logging::env_filter(level.as_deref());
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(PyLogLayer)
+        .try_init()
+        .map_err(|err| {
+            PyRuntimeError::new_err(format!("mq_bridge logging is already initialized: {err}"))
+        })?;
+    Ok(())
+}
+
 #[pymodule(gil_used = true)]
 #[pyo3(name = "_mq_bridge")]
 fn _mq_bridge(module: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -2019,6 +2078,7 @@ fn _mq_bridge(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<MemoryDrainer>()?;
     module.add("__version__", env!("CARGO_PKG_VERSION"))?;
     module.add_function(wrap_pyfunction!(config_schema, module)?)?;
+    module.add_function(wrap_pyfunction!(init_logging, module)?)?;
     module.add("RetryableError", module.py().get_type::<RetryableError>())?;
     module.add(
         "NonRetryableError",

@@ -8,6 +8,7 @@ from ._mq_bridge import (
     Route,
     __version__,
     config_schema,
+    init_logging,
 )
 
 __all__ = [
@@ -20,4 +21,5 @@ __all__ = [
     "Route",
     "__version__",
     "config_schema",
+    "init_logging",
 ]

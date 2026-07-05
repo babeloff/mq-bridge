@@ -221,11 +221,16 @@ function configSchema() {
   return native.configSchema();
 }
 
+function initLogging(callback, level = null) {
+  return native.initLogging(callback, level);
+}
+
 module.exports = {
   Message,
   Publisher,
   Consumer,
   Route,
   configSchema,
+  initLogging,
   version: native.VERSION,
 };

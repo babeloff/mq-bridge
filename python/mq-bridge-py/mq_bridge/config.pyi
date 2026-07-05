@@ -85,6 +85,7 @@ class Endpoint(TypedDict, total=False):
     nats: NatsConfig
     null: Any
     reader: Endpoint
+    redis_streams: RedisStreamsConfig
     ref: str
     response: ResponseConfig
     sled: SledConfig
@@ -146,18 +147,28 @@ class HttpConfig(TypedDict, total=False):
 class IbmMqConfig(TypedDict, total=False):
     """Connection settings for the IBM MQ Queue Manager."""
     channel: Required[str]
-    cipher_spec: Optional[str]
     disable_status_inq: bool
     internal_buffer_size: Optional[int]
     max_message_size: int
     password: Optional[str]
     queue: Optional[str]
     queue_manager: Required[str]
-    tls: TlsConfig
+    tls: IbmTlsConfig
     topic: Optional[str]
     url: Required[str]
     username: Optional[str]
     wait_timeout_ms: int
+
+
+class IbmTlsConfig(TypedDict, total=False):
+    """TLS configuration for the IBM MQ native client."""
+    accept_invalid_certs: bool
+    cert_file: Optional[str]
+    cert_password: Optional[str]
+    cipher_spec: Optional[str]
+    key_repository: Optional[str]
+    key_repository_password: Optional[str]
+    required: bool
 
 
 class KafkaConfig(TypedDict, total=False):
@@ -276,6 +287,24 @@ class RandomPanicMiddleware(TypedDict, total=False):
     enabled: bool
     mode: FaultMode
     trigger_on_message: Optional[int]
+
+
+class RedisStreamsConfig(TypedDict, total=False):
+    """Configuration for a Redis Streams endpoint."""
+    approx_trim: Optional[bool]
+    block_ms: Optional[int]
+    consumer_name: Optional[str]
+    group: Optional[str]
+    internal_buffer_size: Optional[int]
+    maxlen: Optional[int]
+    password: Optional[str]
+    read_from_start: bool
+    reader_connections: Optional[int]
+    redelivery_timeout_ms: Optional[int]
+    stream: Optional[str]
+    subscriber_mode: bool
+    url: Required[str]
+    username: Optional[str]
 
 
 class ResponseConfig(TypedDict, total=False):

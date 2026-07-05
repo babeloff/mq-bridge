@@ -28,6 +28,8 @@ pub mod mysql;
 pub mod nats;
 #[cfg(feature = "sqlx")]
 pub mod postgres;
+#[cfg(feature = "redis-streams")]
+pub mod redis_streams;
 #[cfg(feature = "sqlx")]
 pub mod sqlite;
 pub mod tls_helpers;

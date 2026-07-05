@@ -21,6 +21,8 @@ use napi_derive::napi;
 use serde_json::Value as JsonValue;
 use tokio::runtime::Runtime;
 use tokio::sync::oneshot;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 
 #[napi(js_name = "version")]
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -32,6 +34,69 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub fn config_schema() -> Result<JsonValue> {
     let schema = schemars::schema_for!(core::models::Config);
     serde_json::to_value(schema).map_err(to_napi_error)
+}
+
+/// One library log event, delivered to the `initLogging` callback.
+#[napi(object)]
+pub struct LogRecord {
+    /// `error` / `warn` / `info` / `debug` / `trace`.
+    pub level: String,
+    /// Emitting module, e.g. `mq_bridge::route`.
+    pub target: String,
+    pub message: String,
+}
+
+/// A `tracing` layer that hands each event to the JS logging callback.
+struct NodeLogLayer {
+    callback: ThreadsafeFunction<LogRecord, (), LogRecord, Status, false, true>,
+}
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for NodeLogLayer {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        let record = common::logging::record_from_event(event);
+        let entry = LogRecord {
+            level: record.level_str().to_string(),
+            target: record.target,
+            message: record.message,
+        };
+        let _ = self.callback.call(
+            entry,
+            napi::threadsafe_function::ThreadsafeFunctionCallMode::NonBlocking,
+        );
+    }
+}
+
+/// Route the library's internal `tracing` events into a JS callback so the host
+/// logger (console, pino, winston, …) owns output. Call once at startup. `level`
+/// seeds the Rust-side filter (default `"warn"`); `MQ_BRIDGE_LOG` / `RUST_LOG`
+/// override it. Filtering happens in Rust, so suppressed events never reach JS.
+/// The callback is held with a weak reference, so it will not keep the process
+/// alive. Throws if logging was already initialized.
+#[napi(js_name = "initLogging")]
+pub fn init_logging(
+    #[napi(ts_arg_type = "(record: LogRecord) => void")] callback: ThreadsafeFunction<
+        LogRecord,
+        (),
+        LogRecord,
+        Status,
+        false,
+        true,
+    >,
+    level: Option<String>,
+) -> Result<()> {
+    let filter = common::logging::env_filter(level.as_deref());
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(NodeLogLayer { callback })
+        .try_init()
+        .map_err(|err| {
+            Error::from_reason(format!("mq_bridge logging is already initialized: {err}"))
+        })?;
+    Ok(())
 }
 
 #[napi(object)]
