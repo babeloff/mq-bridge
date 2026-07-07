@@ -2636,6 +2636,15 @@ pub struct SqlxConfig {
     pub table: String,
     /// (Publisher only) Optional. A custom SQL INSERT query. Use `?` as a placeholder for the payload.
     /// If not provided, a default `INSERT INTO {table} (payload) VALUES (?)` is used.
+    ///
+    /// For multi-column inserts, embed explicit source tokens directly in the query:
+    /// `${metadata:<key>}` binds `message.metadata["<key>"]`, and `${payload:<field>}`
+    /// binds the top-level JSON field `<field>` of the payload (types preserved:
+    /// numbers/bools stay numeric/bool). There is no fallback between the two: an
+    /// absent metadata key, non-JSON payload, or missing/non-scalar field binds SQL NULL.
+    /// Example: `INSERT INTO orders (customer_id, sku, qty) VALUES (${metadata:customer_id}, ${payload:sku}, ${payload:qty})`.
+    /// A query with no `${...}` tokens behaves exactly as before (whole payload bound once).
+    /// `auto_create_table` is not supported together with a token-based query.
     pub insert_query: Option<String>,
     /// (Consumer only) Optional. A custom SQL SELECT query to fetch messages. This is only supported for PostgreSQL and Microsoft SQL Server.
     /// The query must include a placeholder for the batch size (`$1` for PostgreSQL, `@p1` for SQL Server).

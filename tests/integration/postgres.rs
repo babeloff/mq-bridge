@@ -134,6 +134,80 @@ pub async fn test_postgres_performance_direct() {
     .await;
 }
 
+pub async fn test_postgres_multicolumn() {
+    use mq_bridge::traits::MessagePublisher;
+    use mq_bridge::CanonicalMessage;
+    use sqlx::{AnyPool, Row};
+
+    setup_logging();
+    run_test_with_docker(DOCKER_COMPOSE_FILE, || async {
+        sqlx::any::install_default_drivers();
+        let pool = AnyPool::connect(DATABASE_URL).await.unwrap();
+        sqlx::query("DROP TABLE IF EXISTS orders")
+            .execute(&pool)
+            .await
+            .unwrap();
+        // Typed columns: string-binding everything would fail on `qty INTEGER` / `price DOUBLE PRECISION`.
+        sqlx::query(
+            "CREATE TABLE orders (sku TEXT, qty INTEGER, price DOUBLE PRECISION, cust TEXT)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let config = mq_bridge::models::SqlxConfig {
+            url: DATABASE_URL.to_string(),
+            table: "orders".to_string(),
+            insert_query: Some(
+                "INSERT INTO orders (sku, qty, price, cust) VALUES (${payload:sku}, ${payload:qty}, ${payload:price}, ${metadata:cust})"
+                    .to_string(),
+            ),
+            ..Default::default()
+        };
+        let publisher = SqlxPublisher::new(&config).await.unwrap();
+
+        let mut msg =
+            CanonicalMessage::new(br#"{"sku":"abc","qty":7,"price":1.5}"#.to_vec(), None);
+        msg.metadata.insert("cust".to_string(), "c1".to_string());
+        publisher.send(msg).await.unwrap();
+
+        // Batch of 2 with typed columns and per-row metadata.
+        let mut batch = Vec::new();
+        for i in 0..2 {
+            let mut m = CanonicalMessage::new(
+                format!(r#"{{"sku":"s{i}","qty":{},"price":{}}}"#, i * 10, i as f64 + 0.5)
+                    .into_bytes(),
+                None,
+            );
+            m.metadata.insert("cust".to_string(), format!("b{i}"));
+            batch.push(m);
+        }
+        publisher.send_batch(batch).await.unwrap();
+
+        let row = sqlx::query("SELECT sku, qty, price, cust FROM orders WHERE sku = 'abc'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let sku: String = row.get("sku");
+        let qty: i32 = row.get("qty");
+        let price: f64 = row.get("price");
+        let cust: String = row.get("cust");
+        assert_eq!(sku, "abc");
+        assert_eq!(qty, 7);
+        assert_eq!(price, 1.5);
+        assert_eq!(cust, "c1");
+
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM orders")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 3, "1 single + 2 batch rows expected");
+
+        println!("[Postgres] Multi-column typed insert test successful.");
+    })
+    .await;
+}
+
 pub async fn test_postgres_status() {
     use mq_bridge::traits::{MessageConsumer, MessagePublisher};
     use tokio::time::{sleep, Duration};

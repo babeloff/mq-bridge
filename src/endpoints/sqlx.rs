@@ -68,6 +68,151 @@ fn audited_sql(sql: &str) -> AssertSqlSafe<&str> {
     AssertSqlSafe(sql)
 }
 
+/// Where a single bound value in a token-based `insert_query` comes from.
+/// Resolved per-row; never falls back between the two sources.
+#[derive(Debug, Clone, PartialEq)]
+enum ColumnSource {
+    /// `${metadata:<key>}` — `message.metadata.get(key)`, else NULL.
+    Metadata(String),
+    /// `${payload:<field>}` — top-level JSON field of the payload, else NULL.
+    Payload(String),
+}
+
+/// A value ready to be bound, preserving JSON scalar type so strict dialects
+/// (Postgres/MSSQL) accept numeric/bool columns instead of erroring on text.
+#[derive(Debug, Clone, PartialEq)]
+enum BindValue {
+    Null,
+    Int(i64),
+    Float(f64),
+    Bool(bool),
+    Text(String),
+}
+
+/// Driver-specific positional placeholder for the given 1-based index.
+fn positional_placeholder(driver_name: &str, index: usize) -> String {
+    match driver_name {
+        "PostgreSQL" => format!("${}", index),
+        "Microsoft SQL Server" => format!("@p{}", index),
+        _ => "?".to_string(),
+    }
+}
+
+/// Parse `${metadata:<key>}` / `${payload:<field>}` tokens out of an `insert_query`,
+/// rewriting each into a driver-appropriate positional placeholder assigned a running
+/// 1-based index in encounter order. Returns the rewritten query and the ordered
+/// sources (`sources[i]` resolves the value for the i-th placeholder). An empty
+/// `Vec` means the query had no tokens → legacy single-payload-bind mode.
+fn parse_insert_template(
+    query: &str,
+    driver_name: &str,
+) -> anyhow::Result<(String, Vec<ColumnSource>)> {
+    let mut out = String::with_capacity(query.len());
+    let mut sources: Vec<ColumnSource> = Vec::new();
+    let bytes = query.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'$' && i + 1 < bytes.len() && bytes[i + 1] == b'{' {
+            // Find the closing brace.
+            let close = query[i + 2..].find('}').map(|off| i + 2 + off);
+            let close = close.ok_or_else(|| {
+                anyhow!(
+                    "Malformed token in insert_query: unclosed '${{' near '{}'",
+                    &query[i..]
+                )
+            })?;
+            let inner = &query[i + 2..close];
+            let (prefix, name) = inner.split_once(':').ok_or_else(|| {
+                anyhow!("Malformed token in insert_query: '${{{}}}' is missing a ':' separator (expected ${{metadata:key}} or ${{payload:field}})", inner)
+            })?;
+            let name = name.trim();
+            if name.is_empty() {
+                return Err(anyhow!(
+                    "Malformed token in insert_query: '${{{}}}' has an empty key/field name",
+                    inner
+                ));
+            }
+            let source = match prefix.trim() {
+                "metadata" => ColumnSource::Metadata(name.to_string()),
+                "payload" => ColumnSource::Payload(name.to_string()),
+                other => {
+                    return Err(anyhow!(
+                        "Malformed token in insert_query: unknown prefix '{}' in '${{{}}}' (expected 'metadata' or 'payload')",
+                        other,
+                        inner
+                    ))
+                }
+            };
+            sources.push(source);
+            out.push_str(&positional_placeholder(driver_name, sources.len()));
+            i = close + 1;
+        } else {
+            // Copy this UTF-8 char verbatim.
+            let ch = query[i..].chars().next().unwrap();
+            out.push(ch);
+            i += ch.len_utf8();
+        }
+    }
+    Ok((out, sources))
+}
+
+/// Resolve a `ColumnSource` for one message into a typed `BindValue`. `payload_json`
+/// is the payload parsed once as JSON (`None` if not valid JSON). No fallback: a
+/// `Payload` source never consults metadata and vice versa; an unresolvable source
+/// yields `Null`.
+fn resolve_source(
+    msg: &CanonicalMessage,
+    source: &ColumnSource,
+    payload_json: &Option<serde_json::Value>,
+) -> BindValue {
+    match source {
+        ColumnSource::Metadata(key) => match msg.metadata.get(key) {
+            Some(v) => BindValue::Text(v.clone()),
+            None => BindValue::Null,
+        },
+        ColumnSource::Payload(field) => match payload_json.as_ref().and_then(|v| v.get(field)) {
+            Some(serde_json::Value::String(s)) => BindValue::Text(s.clone()),
+            Some(serde_json::Value::Bool(b)) => BindValue::Bool(*b),
+            Some(serde_json::Value::Number(n)) => {
+                if let Some(i) = n.as_i64() {
+                    BindValue::Int(i)
+                } else if let Some(f) = n.as_f64() {
+                    BindValue::Float(f)
+                } else {
+                    BindValue::Null
+                }
+            }
+            _ => BindValue::Null,
+        },
+    }
+}
+
+type AnyQuery<'q> = sqlx::query::Query<'q, sqlx::Any, sqlx::any::AnyArguments>;
+
+/// Bind one typed value, mapping `Null` to a typed SQL NULL.
+fn bind_value(query: AnyQuery<'_>, value: BindValue) -> AnyQuery<'_> {
+    match value {
+        BindValue::Null => query.bind(None::<String>),
+        BindValue::Int(i) => query.bind(i),
+        BindValue::Float(f) => query.bind(f),
+        BindValue::Bool(b) => query.bind(b),
+        BindValue::Text(s) => query.bind(s),
+    }
+}
+
+/// Parse the payload as JSON once, then resolve+bind every column source for one row.
+fn bind_message_sources<'q>(
+    mut query: AnyQuery<'q>,
+    msg: &CanonicalMessage,
+    sources: &[ColumnSource],
+) -> AnyQuery<'q> {
+    let payload_json: Option<serde_json::Value> = serde_json::from_slice(&msg.payload).ok();
+    for source in sources {
+        query = bind_value(query, resolve_source(msg, source, &payload_json));
+    }
+    query
+}
+
 fn build_sqlx_url_with_tls(config: &SqlxConfig) -> anyhow::Result<String> {
     let mut url = url::Url::parse(&config.url)?;
 
@@ -188,6 +333,9 @@ pub struct SqlxPublisher {
     // Retains the shared registry entry so concurrent publishers reuse this pool.
     _shared_pool: std::sync::Arc<AnyPool>,
     insert_query: String,
+    /// Ordered value sources for token-based multi-column inserts. Empty = legacy
+    /// single-payload-bind mode (query has no `${...}` tokens).
+    column_sources: Vec<ColumnSource>,
     driver_name: String,
     table: String,
 }
@@ -211,6 +359,28 @@ impl SqlxPublisher {
         drop(conn);
 
         info!(table = %config.table, driver = %driver_name, "SQLx publisher connected");
+
+        // Resolve the insert query and parse any `${metadata:...}`/`${payload:...}`
+        // tokens into ordered value sources, rewriting them to positional placeholders.
+        let raw_insert_query =
+            config
+                .insert_query
+                .clone()
+                .unwrap_or_else(|| match driver_name.as_str() {
+                    "PostgreSQL" => format!("INSERT INTO {} (payload) VALUES ($1)", config.table),
+                    "Microsoft SQL Server" => {
+                        format!("INSERT INTO {} (payload) VALUES (@p1)", config.table)
+                    }
+                    _ => format!("INSERT INTO {} (payload) VALUES (?)", config.table),
+                });
+        let (insert_query, column_sources) =
+            parse_insert_template(&raw_insert_query, &driver_name)?;
+
+        if config.auto_create_table && !column_sources.is_empty() {
+            return Err(anyhow!(
+                "auto_create_table is not supported with a multi-column insert_query; create the table manually."
+            ));
+        }
 
         if config.auto_create_table {
             // --- Auto-create table and index ---
@@ -292,22 +462,11 @@ impl SqlxPublisher {
             }
         }
 
-        let insert_query =
-            config
-                .insert_query
-                .clone()
-                .unwrap_or_else(|| match driver_name.as_str() {
-                    "PostgreSQL" => format!("INSERT INTO {} (payload) VALUES ($1)", config.table),
-                    "Microsoft SQL Server" => {
-                        format!("INSERT INTO {} (payload) VALUES (@p1)", config.table)
-                    }
-                    _ => format!("INSERT INTO {} (payload) VALUES (?)", config.table),
-                });
-
         Ok(Self {
             pool,
             _shared_pool: shared_pool,
             insert_query,
+            column_sources,
             driver_name,
             table,
         })
@@ -318,8 +477,13 @@ impl SqlxPublisher {
 impl MessagePublisher for SqlxPublisher {
     async fn send(&self, message: CanonicalMessage) -> Result<Sent, PublisherError> {
         trace!(message_id = %format!("{:032x}", message.message_id), table = %self.table, "Publishing to SQL");
-        sqlx::query(audited_sql(&self.insert_query))
-            .bind(message.payload.to_vec())
+        let query = sqlx::query(audited_sql(&self.insert_query));
+        let query = if self.column_sources.is_empty() {
+            query.bind(message.payload.to_vec())
+        } else {
+            bind_message_sources(query, &message, &self.column_sources)
+        };
+        query
             .execute(&self.pool)
             .await
             .map_err(|e| PublisherError::Retryable(anyhow!(e)))?;
@@ -346,21 +510,29 @@ impl MessagePublisher for SqlxPublisher {
             }
         };
 
-        if !contains_payload_clause(base_query) {
+        // The `(payload)` single-column guard only applies to legacy mode; a
+        // token-based query is already known-correct from `parse_insert_template`.
+        if self.column_sources.is_empty() && !contains_payload_clause(base_query) {
             warn!("Could not optimize batch insert due to custom query format. Falling back to iterative inserts.");
             return self.send_batch_iterative(messages).await;
         }
 
+        // Placeholders per row: N tokens in token mode, 1 (the payload) in legacy mode.
+        // A running global 1-based index spans the whole batch.
+        let per_row = self.column_sources.len().max(1);
         let mut placeholders = String::new();
+        let mut param_idx = 1;
         for i in 0..messages.len() {
             if i > 0 {
                 placeholders.push_str(", ");
             }
             placeholders.push('(');
-            match self.driver_name.as_str() {
-                "PostgreSQL" => placeholders.push_str(&format!("${}", i + 1)),
-                "Microsoft SQL Server" => placeholders.push_str(&format!("@p{}", i + 1)),
-                _ => placeholders.push('?'),
+            for j in 0..per_row {
+                if j > 0 {
+                    placeholders.push_str(", ");
+                }
+                placeholders.push_str(&positional_placeholder(&self.driver_name, param_idx));
+                param_idx += 1;
             }
             placeholders.push(')');
         }
@@ -368,8 +540,12 @@ impl MessagePublisher for SqlxPublisher {
         let sql = format!("{} VALUES {}", base_query, placeholders);
 
         let mut query = sqlx::query(audited_sql(&sql));
-        for msg in messages {
-            query = query.bind(msg.payload.to_vec());
+        for msg in &messages {
+            if self.column_sources.is_empty() {
+                query = query.bind(msg.payload.to_vec());
+            } else {
+                query = bind_message_sources(query, msg, &self.column_sources);
+            }
         }
 
         query
@@ -411,9 +587,14 @@ impl SqlxPublisher {
             .begin()
             .await
             .map_err(|e| PublisherError::Retryable(anyhow!(e)))?;
-        for msg in messages {
-            sqlx::query(audited_sql(&self.insert_query))
-                .bind(msg.payload.to_vec())
+        for msg in &messages {
+            let query = sqlx::query(audited_sql(&self.insert_query));
+            let query = if self.column_sources.is_empty() {
+                query.bind(msg.payload.to_vec())
+            } else {
+                bind_message_sources(query, msg, &self.column_sources)
+            };
+            query
                 .execute(&mut *tx)
                 .await
                 .map_err(|e| PublisherError::Retryable(anyhow!(e)))?;
@@ -973,6 +1154,221 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn test_parse_insert_template_no_tokens() {
+        let (q, sources) =
+            parse_insert_template("INSERT INTO t (payload) VALUES (?)", "SQLite").unwrap();
+        assert_eq!(q, "INSERT INTO t (payload) VALUES (?)");
+        assert!(sources.is_empty());
+    }
+
+    #[test]
+    fn test_parse_insert_template_single_metadata() {
+        let (q, sources) =
+            parse_insert_template("INSERT INTO t (a) VALUES (${metadata:x})", "PostgreSQL")
+                .unwrap();
+        assert_eq!(q, "INSERT INTO t (a) VALUES ($1)");
+        assert_eq!(sources, vec![ColumnSource::Metadata("x".to_string())]);
+    }
+
+    #[test]
+    fn test_parse_insert_template_mixed_dialects() {
+        let tpl = "INSERT INTO t (a, b) VALUES (${metadata:a}, ${payload:b})";
+        let expected = vec![
+            ColumnSource::Metadata("a".to_string()),
+            ColumnSource::Payload("b".to_string()),
+        ];
+
+        let (q, s) = parse_insert_template(tpl, "PostgreSQL").unwrap();
+        assert_eq!(q, "INSERT INTO t (a, b) VALUES ($1, $2)");
+        assert_eq!(s, expected);
+
+        let (q, s) = parse_insert_template(tpl, "Microsoft SQL Server").unwrap();
+        assert_eq!(q, "INSERT INTO t (a, b) VALUES (@p1, @p2)");
+        assert_eq!(s, expected);
+
+        let (q, s) = parse_insert_template(tpl, "MySQL").unwrap();
+        assert_eq!(q, "INSERT INTO t (a, b) VALUES (?, ?)");
+        assert_eq!(s, expected);
+    }
+
+    #[test]
+    fn test_parse_insert_template_malformed() {
+        assert!(parse_insert_template("VALUES (${metadata:x)", "SQLite").is_err()); // unclosed
+        assert!(parse_insert_template("VALUES (${bogus:x})", "SQLite").is_err()); // bad prefix
+        assert!(parse_insert_template("VALUES (${metadata})", "SQLite").is_err()); // no ':'
+        assert!(parse_insert_template("VALUES (${payload:})", "SQLite").is_err());
+        // empty field
+    }
+
+    #[test]
+    fn test_resolve_source_metadata() {
+        let mut msg = CanonicalMessage::new(b"{}".to_vec(), None);
+        msg.metadata.insert("k".to_string(), "v".to_string());
+        let json = serde_json::from_slice(&msg.payload).ok();
+        assert_eq!(
+            resolve_source(&msg, &ColumnSource::Metadata("k".to_string()), &json),
+            BindValue::Text("v".to_string())
+        );
+        assert_eq!(
+            resolve_source(&msg, &ColumnSource::Metadata("nope".to_string()), &json),
+            BindValue::Null
+        );
+    }
+
+    #[test]
+    fn test_resolve_source_payload_types() {
+        let msg = CanonicalMessage::new(
+            br#"{"s":"x","i":5,"f":1.5,"b":true,"arr":[1],"n":null}"#.to_vec(),
+            None,
+        );
+        let json = serde_json::from_slice(&msg.payload).ok();
+        let p = |f: &str| resolve_source(&msg, &ColumnSource::Payload(f.to_string()), &json);
+        assert_eq!(p("s"), BindValue::Text("x".to_string()));
+        assert_eq!(p("i"), BindValue::Int(5));
+        assert_eq!(p("f"), BindValue::Float(1.5));
+        assert_eq!(p("b"), BindValue::Bool(true));
+        assert_eq!(p("arr"), BindValue::Null);
+        assert_eq!(p("n"), BindValue::Null);
+        assert_eq!(p("missing"), BindValue::Null);
+    }
+
+    #[test]
+    fn test_resolve_source_no_fallback() {
+        // Payload source must NOT fall back to metadata and vice versa.
+        let mut msg = CanonicalMessage::new(b"not json".to_vec(), None);
+        msg.metadata.insert("k".to_string(), "meta".to_string());
+        let json: Option<serde_json::Value> = serde_json::from_slice(&msg.payload).ok();
+        assert!(json.is_none());
+        // payload:k -> Null even though metadata has "k"
+        assert_eq!(
+            resolve_source(&msg, &ColumnSource::Payload("k".to_string()), &json),
+            BindValue::Null
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sqlx_multicolumn_insert() {
+        let (_dir, url) = setup_db_file().await;
+        let pool = AnyPool::connect(&url).await.unwrap();
+        sqlx::query("CREATE TABLE orders (sku TEXT, qty INTEGER, cust TEXT)")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let config = SqlxConfig {
+            url: url.clone(),
+            table: "orders".to_string(),
+            insert_query: Some(
+                "INSERT INTO orders (sku, qty, cust) VALUES (${payload:sku}, ${payload:qty}, ${metadata:cust})"
+                    .to_string(),
+            ),
+            ..Default::default()
+        };
+        let publisher = SqlxPublisher::new(&config).await.unwrap();
+
+        let mut msg = CanonicalMessage::new(br#"{"sku":"abc","qty":7}"#.to_vec(), None);
+        msg.metadata.insert("cust".to_string(), "c1".to_string());
+        publisher.send(msg).await.unwrap();
+
+        let row = sqlx::query("SELECT sku, qty, cust FROM orders")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let sku: String = row.get("sku");
+        let qty: i64 = row.get("qty");
+        let cust: String = row.get("cust");
+        assert_eq!(sku, "abc");
+        assert_eq!(qty, 7);
+        assert_eq!(cust, "c1");
+    }
+
+    #[tokio::test]
+    async fn test_sqlx_multicolumn_non_json_payload_nulls() {
+        let (_dir, url) = setup_db_file().await;
+        let pool = AnyPool::connect(&url).await.unwrap();
+        sqlx::query("CREATE TABLE t (a TEXT, b TEXT)")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let config = SqlxConfig {
+            url: url.clone(),
+            table: "t".to_string(),
+            insert_query: Some(
+                "INSERT INTO t (a, b) VALUES (${metadata:a}, ${payload:b})".to_string(),
+            ),
+            ..Default::default()
+        };
+        let publisher = SqlxPublisher::new(&config).await.unwrap();
+
+        let mut msg = CanonicalMessage::new(b"raw non-json".to_vec(), None);
+        msg.metadata.insert("a".to_string(), "meta_a".to_string());
+        publisher.send(msg).await.unwrap();
+
+        let row = sqlx::query("SELECT a, b FROM t")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let a: String = row.get("a");
+        let b: Option<String> = row.get("b");
+        assert_eq!(a, "meta_a");
+        assert_eq!(b, None); // payload not JSON -> NULL, no fallback to metadata
+    }
+
+    #[tokio::test]
+    async fn test_sqlx_multicolumn_batch() {
+        let (_dir, url) = setup_db_file().await;
+        let pool = AnyPool::connect(&url).await.unwrap();
+        sqlx::query("CREATE TABLE t (a TEXT, b INTEGER)")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let config = SqlxConfig {
+            url: url.clone(),
+            table: "t".to_string(),
+            insert_query: Some(
+                "INSERT INTO t (a, b) VALUES (${metadata:a}, ${payload:b})".to_string(),
+            ),
+            ..Default::default()
+        };
+        let publisher = SqlxPublisher::new(&config).await.unwrap();
+
+        let mut msgs = Vec::new();
+        for i in 0..3 {
+            let mut m = CanonicalMessage::new(format!("{{\"b\":{}}}", i * 10).into_bytes(), None);
+            m.metadata.insert("a".to_string(), format!("row{}", i));
+            msgs.push(m);
+        }
+        publisher.send_batch(msgs).await.unwrap();
+
+        let rows = sqlx::query("SELECT a, b FROM t ORDER BY b")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 3);
+        for (i, row) in rows.iter().enumerate() {
+            let a: String = row.get("a");
+            let b: i64 = row.get("b");
+            assert_eq!(a, format!("row{}", i));
+            assert_eq!(b, (i as i64) * 10);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_sqlx_auto_create_rejects_tokens() {
+        let (_dir, url) = setup_db_file().await;
+        let config = SqlxConfig {
+            url,
+            table: "t".to_string(),
+            auto_create_table: true,
+            insert_query: Some("INSERT INTO t (a) VALUES (${payload:a})".to_string()),
+            ..Default::default()
+        };
+        assert!(SqlxPublisher::new(&config).await.is_err());
     }
 
     #[tokio::test]

@@ -285,6 +285,15 @@ async fn test_all_status() {
     }
 }
 
+#[cfg(feature = "sqlx")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires docker compose"]
+async fn test_sqlx_multicolumn() {
+    if should_run("sqlx") || should_run("postgres") {
+        integration::postgres::test_postgres_multicolumn().await;
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires docker compose, takes long time to run"]
 async fn test_all_performance_pipeline() {
