@@ -179,6 +179,11 @@ jobs:
     name: Collect Benchmark Results
     needs: [benchmark-streams, benchmark-database, benchmark-dockerless]
     runs-on: ubuntu-latest
+    # Serialize gh-pages pushes so overlapping runs don't race the Pages build
+    # (concurrent pushes make GitHub cancel the superseded deployment -> "failed").
+    concurrency:
+      group: gh-pages-publish
+      cancel-in-progress: false
     permissions:
       contents: write
       deployments: write
@@ -248,7 +253,8 @@ jobs:
           tool: 'cargo'
           output-file-path: output.txt
           github-token: ${{ secrets.GITHUB_TOKEN }}
-          auto-push: true
+          # Only publish history (and thus mint a gh-pages deployment) on main.
+          auto-push: ${{ github.ref == 'refs/heads/main' }}
           alert-threshold: '40000%'
           comment-on-alert: true
           fail-on-alert: false
