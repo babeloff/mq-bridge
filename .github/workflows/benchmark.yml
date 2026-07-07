@@ -253,8 +253,9 @@ jobs:
           tool: 'cargo'
           output-file-path: output.txt
           github-token: ${{ secrets.GITHUB_TOKEN }}
-          # Only publish history (and thus mint a gh-pages deployment) on main.
-          auto-push: ${{ github.ref == 'refs/heads/main' }}
+          # Push on both main and dev so dev commits appear in the benchmark graph.
+          # This mints a gh-pages deployment per run; prune old ones periodically.
+          auto-push: true
           alert-threshold: '40000%'
           comment-on-alert: true
           fail-on-alert: false
