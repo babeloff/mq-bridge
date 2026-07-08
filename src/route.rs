@@ -3076,4 +3076,72 @@ mod tests {
             .expect("collector task panicked");
         assert_eq!(received.len(), N);
     }
+
+    // A file -> memory route with exit_on_empty must drain the file and then stop
+    // on its own. Parameterized over the two watcher-backed consumer modes:
+    // Consume{delete:false} (Tail backend) and Consume{delete:true} (Queue backend).
+    async fn run_file_exit_on_empty(delete: bool) {
+        use crate::models::{FileConfig, FileConsumerMode};
+
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("drain.log");
+        const N: usize = 25;
+        let contents: String = (0..N).map(|i| format!("row-{i}\n")).collect();
+        tokio::fs::write(&file_path, contents.as_bytes())
+            .await
+            .unwrap();
+
+        let input = Endpoint::new(EndpointType::File(FileConfig {
+            path: file_path.to_str().unwrap().to_string(),
+            mode: Some(FileConsumerMode::Consume { delete }),
+            ..Default::default()
+        }));
+        let out_topic = format!("file_drain_out_{}", fast_uuid_v7::gen_id());
+        let output = Endpoint::new_memory(&out_topic, 10);
+
+        let route = Route::new(input, output)
+            .with_batch_size(10)
+            .with_exit_on_empty(true);
+
+        let mut verifier = route
+            .connect_to_output("file_drain_verifier")
+            .await
+            .unwrap();
+        let collector = tokio::spawn(async move {
+            let mut received = Vec::new();
+            while received.len() < N {
+                let item = tokio::time::timeout(Duration::from_secs(5), verifier.receive())
+                    .await
+                    .expect("timed out draining output")
+                    .expect("output stream closed early");
+                received.push(item.message.get_payload_str().to_string());
+                (item.commit)(MessageDisposition::Ack).await.unwrap();
+            }
+            received
+        });
+
+        let handle = route.run("file_drain_test").await.unwrap();
+
+        // The route future must complete on its own once the file is drained.
+        tokio::time::timeout(Duration::from_secs(10), handle.join())
+            .await
+            .expect("file route did not exit on its own after draining")
+            .expect("route task panicked");
+
+        let received = tokio::time::timeout(Duration::from_secs(5), collector)
+            .await
+            .expect("timed out collecting output")
+            .expect("collector task panicked");
+        assert_eq!(received.len(), N);
+    }
+
+    #[tokio::test]
+    async fn test_route_exit_on_empty_file_tail() {
+        run_file_exit_on_empty(false).await;
+    }
+
+    #[tokio::test]
+    async fn test_route_exit_on_empty_file_queue() {
+        run_file_exit_on_empty(true).await;
+    }
 }

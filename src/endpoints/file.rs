@@ -486,6 +486,10 @@ struct FileTailConsumer {
     buffer: Vec<CanonicalMessage>,
     offset_file: Option<Arc<Mutex<tokio::fs::File>>>,
     ready: Arc<AtomicBool>,
+    /// Set when a greedy fill consumed the watcher's end-of-file marker after
+    /// data; the next `receive_batch` surfaces it as an empty batch so a route
+    /// with `exit_on_empty` can drain-then-exit.
+    pending_eof: bool,
 }
 
 fn read_until_bytes_sync<R: std::io::BufRead>(
@@ -524,6 +528,10 @@ fn run_file_tail_task_sync(
     let mut current_sleep = std::time::Duration::from_millis(1);
     const MAX_SLEEP: std::time::Duration = std::time::Duration::from_millis(50);
     let mut initialized = false;
+    // Tracks whether we've already emitted the empty end-of-file marker for the
+    // current drained state, so we signal it once per EOF transition rather than
+    // on every idle poll.
+    let mut signaled_eof = false;
     const BATCH_SIZE: usize = 1024;
     let mut buf = Vec::with_capacity(1024);
 
@@ -600,10 +608,18 @@ fn run_file_tail_task_sync(
                 break; // Consumer dropped, exit thread
             }
             current_sleep = std::time::Duration::from_millis(1);
+            signaled_eof = false; // data flowed; re-arm the EOF marker
         }
 
         if lines_read_in_batch == 0 {
-            // EOF reached, sleep
+            // EOF reached. Emit an empty batch once so a drained route can pause
+            // or, with exit_on_empty, terminate. Re-armed when new data arrives.
+            if !signaled_eof {
+                if msg_tx.send_blocking(Vec::new()).is_err() {
+                    break; // Consumer dropped, exit thread
+                }
+                signaled_eof = true;
+            }
             std::thread::sleep(current_sleep);
             current_sleep = std::cmp::min(current_sleep * 2, MAX_SLEEP);
             // Invalidate reader to check for file changes (like rotation) on next poll
@@ -620,6 +636,8 @@ struct FileQueueConsumer {
     buffer: Arc<Mutex<Vec<CanonicalMessage>>>,
     delimiter: Vec<u8>,
     ready: Arc<AtomicBool>,
+    /// See [`FileTailConsumer::pending_eof`].
+    pending_eof: bool,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -636,6 +654,8 @@ fn run_file_queue_task(
     let mut current_sleep = std::time::Duration::from_millis(1);
     const MAX_SLEEP: std::time::Duration = std::time::Duration::from_millis(100);
     let mut initialized = false;
+    // Emit the empty end-of-file marker once per drained state; see the tail task.
+    let mut signaled_eof = false;
     let mut buf = Vec::new();
 
     loop {
@@ -707,7 +727,16 @@ fn run_file_queue_task(
                 break;
             }
             current_sleep = std::time::Duration::from_millis(1);
+            signaled_eof = false; // data flowed; re-arm the EOF marker
         } else {
+            // EOF: emit an empty batch once so a drained route can pause or,
+            // with exit_on_empty, terminate. Re-armed when new data arrives.
+            if !signaled_eof {
+                if msg_tx.send_blocking(Vec::new()).is_err() {
+                    break;
+                }
+                signaled_eof = true;
+            }
             std::thread::sleep(current_sleep);
             current_sleep = std::cmp::min(current_sleep * 2, MAX_SLEEP);
         }
@@ -786,6 +815,7 @@ impl FileConsumer {
                         buffer: Arc::new(Mutex::new(Vec::new())),
                         delimiter,
                         ready,
+                        pending_eof: false,
                     }),
                 })
             }
@@ -886,6 +916,7 @@ impl FileConsumer {
                 buffer: Vec::new(),
                 offset_file,
                 ready,
+                pending_eof: false,
             }),
         })
     }
@@ -909,8 +940,20 @@ impl MessageConsumer for FileConsumer {
         match &mut self.backend {
             ConsumerBackend::EventStore(c) => c.receive_batch(max_messages).await,
             ConsumerBackend::Tail(c) => {
+                // A previous greedy fill saw the end-of-file marker trailing the
+                // data it returned; surface it now as an empty batch.
+                if c.pending_eof {
+                    c.pending_eof = false;
+                    return Ok(ReceivedBatch {
+                        messages: Vec::new(),
+                        commit: Box::new(|_| Box::pin(async { Ok(()) })),
+                    });
+                }
+
                 if c.buffer.is_empty() {
                     match c.msg_rx.recv().await {
+                        // An empty batch is the watcher's end-of-file marker; fall
+                        // through to return it as an empty batch.
                         Ok(batch) => c.buffer = batch,
                         Err(_) => return Err(ConsumerError::EndOfStream),
                     }
@@ -919,6 +962,12 @@ impl MessageConsumer for FileConsumer {
                 // Greedily fill buffer from channel if more messages are available
                 while c.buffer.len() < max_messages {
                     match c.msg_rx.try_recv() {
+                        // Stop at the end-of-file marker; remember it so the next
+                        // call surfaces the empty batch after this data is served.
+                        Ok(next_batch) if next_batch.is_empty() => {
+                            c.pending_eof = true;
+                            break;
+                        }
                         Ok(mut next_batch) => c.buffer.append(&mut next_batch),
                         Err(_) => break, // Channel is empty or disconnected
                     }
@@ -979,11 +1028,23 @@ impl MessageConsumer for FileConsumer {
                 Ok(ReceivedBatch { messages, commit })
             }
             ConsumerBackend::Queue(c) => {
+                // A previous greedy fill saw the watcher's end-of-file marker
+                // after data; surface it now as an empty batch.
+                if c.pending_eof {
+                    c.pending_eof = false;
+                    return Ok(ReceivedBatch {
+                        messages: Vec::new(),
+                        commit: Box::new(|_| Box::pin(async { Ok(()) })),
+                    });
+                }
+
                 {
                     let buffer = c.buffer.lock().await;
                     if buffer.is_empty() {
                         drop(buffer);
                         match c.msg_rx.recv().await {
+                            // An empty batch is the watcher's end-of-file marker;
+                            // fall through to return it as an empty batch.
                             Ok(b) => c.buffer.lock().await.extend(b),
                             Err(_) => return Err(ConsumerError::EndOfStream),
                         }
@@ -993,6 +1054,12 @@ impl MessageConsumer for FileConsumer {
 
                 while buffer.len() < max_messages {
                     match c.msg_rx.try_recv() {
+                        // Stop at the end-of-file marker; remember it so the next
+                        // call surfaces the empty batch after this data is served.
+                        Ok(b) if b.is_empty() => {
+                            c.pending_eof = true;
+                            break;
+                        }
                         Ok(mut b) => buffer.append(&mut b),
                         Err(_) => break,
                     }
@@ -1184,7 +1251,16 @@ mod tests {
         assert_eq!(received_msg2.message_id, msg2.message_id);
         assert_eq!(received_msg2.payload, msg2.payload);
 
-        // 6. Verify that reading again waits for new data (timeout)
+        // 6. After draining, the consumer surfaces a one-shot empty batch (the
+        //    drain marker) so a route can pause or exit_on_empty can fire.
+        let drained = source.receive_batch(1).await.unwrap();
+        assert!(
+            drained.messages.is_empty(),
+            "Expected an empty drain marker after the file was drained"
+        );
+
+        // 7. With the marker already emitted and no new data, a further read
+        //    blocks (times out) until new data arrives.
         let result = tokio::time::timeout(
             std::time::Duration::from_millis(200),
             source.receive_batch(1),
@@ -1383,8 +1459,18 @@ mod tests {
             file.write_all(b"line2\n").await.unwrap();
         }
 
-        // Receive new line
-        let received2 = consumer.receive_batch(2).await.unwrap();
+        // Receive new line, skipping any empty drain marker emitted while the
+        // subscriber was caught up to the end of the file at startup.
+        let received2 = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let batch = consumer.receive_batch(2).await.unwrap();
+                if !batch.messages.is_empty() {
+                    break batch;
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for appended line");
         assert_eq!(received2.messages.len(), 1);
         assert_eq!(received2.messages[0].payload.as_ref(), b"line2");
         (received2.commit)(vec![crate::traits::MessageDisposition::Ack])
