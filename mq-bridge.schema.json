@@ -2087,6 +2087,15 @@
           "type": "boolean",
           "default": false
         },
+        "reader_connections": {
+          "description": "(Consumer) Parallel `XREADGROUP` reader connections fanned out across the group. Default 1.\nIgnored in `subscriber_mode`.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0
+        },
         "redelivery_timeout_ms": {
           "description": "(Consumer) Redeliver entries pending ≥ this long via `XAUTOCLAIM`; 0 disables. Default 60000ms.",
           "type": [
@@ -2205,6 +2214,10 @@
           "default": 10,
           "minimum": 0
         },
+        "exit_on_empty": {
+          "description": "If true, the route exits gracefully once the source yields an empty batch\n(drain-then-exit). Off by default — routes normally poll indefinitely.",
+          "type": "boolean"
+        },
         "input": {
           "description": "The input/source endpoint for the route.",
           "$ref": "#/$defs/Endpoint"
@@ -2301,7 +2314,7 @@
           "minimum": 0
         },
         "insert_query": {
-          "description": "(Publisher only) Optional. A custom SQL INSERT query. Use `?` as a placeholder for the payload.\nIf not provided, a default `INSERT INTO {table} (payload) VALUES (?)` is used.",
+          "description": "(Publisher only) Optional. A custom SQL INSERT query. Use `?` as a placeholder for the payload.\nIf not provided, a default `INSERT INTO {table} (payload) VALUES (?)` is used.\n\nFor multi-column inserts, embed explicit source tokens directly in the query:\n`${metadata:<key>}` binds `message.metadata[\"<key>\"]`, and `${payload:<field>}`\nbinds the top-level JSON field `<field>` of the payload (types preserved:\nnumbers/bools stay numeric/bool). There is no fallback between the two: an\nabsent metadata key, non-JSON payload, or missing/non-scalar field binds SQL NULL.\nExample: `INSERT INTO orders (customer_id, sku, qty) VALUES (${metadata:customer_id}, ${payload:sku}, ${payload:qty})`.\nA query with no `${...}` tokens behaves exactly as before (whole payload bound once).\n`auto_create_table` is not supported together with a token-based query.",
           "type": [
             "string",
             "null"

@@ -163,6 +163,11 @@ pub struct RouteOptions {
     #[serde(default = "default_false", skip_serializing_if = "is_false")]
     #[cfg_attr(feature = "schema", schemars(default = "default_false"))]
     pub allow_fault_injection: bool,
+    /// If true, the route exits gracefully once the source yields an empty batch
+    /// (drain-then-exit). Off by default — routes normally poll indefinitely.
+    #[serde(default = "default_false", skip_serializing_if = "is_false")]
+    #[cfg_attr(feature = "schema", schemars(default = "default_false"))]
+    pub exit_on_empty: bool,
 }
 
 impl Default for RouteOptions {
@@ -176,6 +181,7 @@ impl Default for RouteOptions {
             reconnect_interval_ms: default_reconnect_interval_ms(),
             empty_batch_delay_ms: default_empty_batch_delay_ms(),
             allow_fault_injection: false,
+            exit_on_empty: false,
         }
     }
 }

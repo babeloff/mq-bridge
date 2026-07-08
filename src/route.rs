@@ -759,6 +759,10 @@ impl Route {
                     let received_batch = match res {
                         Ok(batch) => {
                             if batch.messages.is_empty() {
+                                if self.options.exit_on_empty {
+                                    info!("Consumer for route '{}' drained (empty batch, exit_on_empty). Shutting down.", name);
+                                    break Ok(false); // Graceful drain-then-exit
+                                }
                                 pause_after_empty_batch(self.options.empty_batch_delay_ms).await;
                                 continue; // No messages, loop to select! again
                             }
@@ -903,6 +907,9 @@ impl Route {
         let mut seq_counter = 0u64;
         // Holds an error that caused the loop to break, to be returned after graceful shutdown.
         let mut loop_error: Option<anyhow::Error> = None;
+        // Set when the loop breaks because the source drained with exit_on_empty,
+        // so we report a graceful stop rather than a shutdown-driven exit.
+        let mut exited_on_empty = false;
         loop {
             select! {
                 biased; // Prioritize checking for errors
@@ -936,6 +943,11 @@ impl Route {
                     let (messages, commit) = match res {
                         Ok(batch) => {
                             if batch.messages.is_empty() {
+                                if self.options.exit_on_empty {
+                                    info!("Consumer for route '{}' drained (empty batch, exit_on_empty). Shutting down.", name);
+                                    exited_on_empty = true;
+                                    break; // Graceful drain-then-exit
+                                }
                                 pause_after_empty_batch(self.options.empty_batch_delay_ms).await;
                                 continue; // No messages, loop to select! again
                             }
@@ -1005,6 +1017,11 @@ impl Route {
             return Err(err);
         }
 
+        // A drain-then-exit is a graceful completion, not a shutdown-driven exit.
+        if exited_on_empty {
+            return Ok(false);
+        }
+
         // Return true if shutdown was requested (channel is empty means it was closed/consumed),
         // false if we reached end-of-stream naturally.
         Ok(shutdown_rx.is_empty())
@@ -1040,6 +1057,13 @@ impl Route {
 
     pub fn with_empty_batch_delay_ms(mut self, delay_ms: u64) -> Self {
         self.options.empty_batch_delay_ms = delay_ms;
+        self
+    }
+
+    /// If true, the route exits gracefully once the source yields an empty
+    /// batch (drain-then-exit). Off by default — routes normally poll forever.
+    pub fn with_exit_on_empty(mut self, exit_on_empty: bool) -> Self {
+        self.options.exit_on_empty = exit_on_empty;
         self
     }
 
@@ -2855,5 +2879,201 @@ mod tests {
     #[test]
     fn test_map_responses_to_dispositions_unit() {
         test_map_responses_to_dispositions_logic();
+    }
+
+    // Creates a temporary SQLite file with a `messages` table, mirroring the
+    // setup used by the sqlx endpoint tests.
+    #[cfg(feature = "sqlx")]
+    async fn setup_drain_db() -> (tempfile::TempDir, String) {
+        use sqlx::Connection;
+        sqlx::any::install_default_drivers();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("drain.db");
+
+        #[cfg(windows)]
+        let url = format!("sqlite:///{}", path.to_string_lossy().replace('\\', "/"));
+        #[cfg(not(windows))]
+        let url = format!("sqlite://{}", path.to_str().unwrap());
+
+        drop(tokio::fs::File::create(&path).await.unwrap());
+
+        let mut conn = sqlx::AnyConnection::connect(&url).await.unwrap();
+        sqlx::query(
+            "CREATE TABLE messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                payload BLOB NOT NULL,
+                locked_until DATETIME,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )",
+        )
+        .execute(&mut conn)
+        .await
+        .unwrap();
+        conn.close().await.unwrap();
+        (dir, url)
+    }
+
+    // A sqlx -> memory route with exit_on_empty drains the source table and then
+    // completes on its own; all rows must arrive at the output.
+    #[cfg(feature = "sqlx")]
+    #[tokio::test]
+    async fn test_route_exit_on_empty_drains_and_stops() {
+        use crate::endpoints::sqlx::SqlxPublisher;
+        use crate::models::SqlxConfig;
+
+        let (_dir, url) = setup_drain_db().await;
+        let config = SqlxConfig {
+            url: url.clone(),
+            table: "messages".to_string(),
+            delete_after_read: true,
+            ..Default::default()
+        };
+
+        const N: usize = 25;
+        let publisher = SqlxPublisher::new(&config).await.unwrap();
+        for i in 0..N {
+            let msg = CanonicalMessage::new(format!("row-{i}").into_bytes(), None);
+            publisher.send(msg).await.unwrap();
+        }
+
+        let out_topic = format!("drain_out_{}", fast_uuid_v7::gen_id());
+        let input = Endpoint::new(EndpointType::Sqlx(config));
+        let output = Endpoint::new_memory(&out_topic, 10);
+
+        let route = Route::new(input, output)
+            .with_batch_size(10)
+            .with_exit_on_empty(true);
+
+        // Drain the output concurrently so the route is never blocked on
+        // memory-channel backpressure while it forwards rows.
+        let mut verifier = route.connect_to_output("drain_verifier").await.unwrap();
+        let collector = tokio::spawn(async move {
+            let mut received = Vec::new();
+            while received.len() < N {
+                let item = tokio::time::timeout(Duration::from_secs(5), verifier.receive())
+                    .await
+                    .expect("timed out draining output")
+                    .expect("output stream closed early");
+                received.push(item.message.get_payload_str().to_string());
+                (item.commit)(MessageDisposition::Ack).await.unwrap();
+            }
+            received
+        });
+
+        let handle = route.run("drain_test").await.unwrap();
+
+        // The route future must complete on its own once the table is drained.
+        tokio::time::timeout(Duration::from_secs(10), handle.join())
+            .await
+            .expect("route did not exit on its own after draining")
+            .expect("route task panicked");
+
+        // All N rows must have been forwarded to the memory output.
+        let received = tokio::time::timeout(Duration::from_secs(5), collector)
+            .await
+            .expect("timed out collecting output")
+            .expect("collector task panicked");
+        assert_eq!(received.len(), N);
+    }
+
+    // Regression: without exit_on_empty, a drained route keeps polling and does
+    // not terminate on an empty batch.
+    #[cfg(feature = "sqlx")]
+    #[tokio::test]
+    async fn test_route_without_exit_on_empty_keeps_running() {
+        use crate::models::SqlxConfig;
+
+        let (_dir, url) = setup_drain_db().await;
+        let config = SqlxConfig {
+            url: url.clone(),
+            table: "messages".to_string(),
+            delete_after_read: true,
+            ..Default::default()
+        };
+
+        let out_topic = format!("drain_out_running_{}", fast_uuid_v7::gen_id());
+        let input = Endpoint::new(EndpointType::Sqlx(config));
+        let output = Endpoint::new_memory(&out_topic, 10);
+
+        let route = Route::new(input, output).with_batch_size(10);
+        let handle = route.run("no_drain_test").await.unwrap();
+
+        // Give the route time to poll past the drained (empty) table.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        // The route must still be running after the source is empty.
+        assert!(
+            !handle.0 .0.is_finished(),
+            "route exited on empty batch without exit_on_empty set"
+        );
+
+        handle.stop().await;
+        Route::stop("no_drain_test").await;
+    }
+
+    // Regression: exit_on_empty must also terminate the route in concurrent mode
+    // (concurrency > 1). The concurrent runner previously reported the drain as
+    // `Ok(true)`, which the reconnect loop treats as "keep running", so the route
+    // busy-reconnected forever instead of stopping.
+    #[cfg(feature = "sqlx")]
+    #[tokio::test]
+    async fn test_route_exit_on_empty_drains_and_stops_concurrent() {
+        use crate::endpoints::sqlx::SqlxPublisher;
+        use crate::models::SqlxConfig;
+
+        let (_dir, url) = setup_drain_db().await;
+        let config = SqlxConfig {
+            url: url.clone(),
+            table: "messages".to_string(),
+            delete_after_read: true,
+            ..Default::default()
+        };
+
+        const N: usize = 25;
+        let publisher = SqlxPublisher::new(&config).await.unwrap();
+        for i in 0..N {
+            let msg = CanonicalMessage::new(format!("row-{i}").into_bytes(), None);
+            publisher.send(msg).await.unwrap();
+        }
+
+        let out_topic = format!("drain_out_conc_{}", fast_uuid_v7::gen_id());
+        let input = Endpoint::new(EndpointType::Sqlx(config));
+        let output = Endpoint::new_memory(&out_topic, 10);
+
+        let route = Route::new(input, output)
+            .with_batch_size(10)
+            .with_concurrency(4)
+            .with_exit_on_empty(true);
+
+        let mut verifier = route
+            .connect_to_output("drain_verifier_conc")
+            .await
+            .unwrap();
+        let collector = tokio::spawn(async move {
+            let mut received = Vec::new();
+            while received.len() < N {
+                let item = tokio::time::timeout(Duration::from_secs(5), verifier.receive())
+                    .await
+                    .expect("timed out draining output")
+                    .expect("output stream closed early");
+                received.push(item.message.get_payload_str().to_string());
+                (item.commit)(MessageDisposition::Ack).await.unwrap();
+            }
+            received
+        });
+
+        let handle = route.run("drain_test_conc").await.unwrap();
+
+        // The route future must complete on its own once the table is drained.
+        tokio::time::timeout(Duration::from_secs(10), handle.join())
+            .await
+            .expect("concurrent route did not exit on its own after draining")
+            .expect("route task panicked");
+
+        let received = tokio::time::timeout(Duration::from_secs(5), collector)
+            .await
+            .expect("timed out collecting output")
+            .expect("collector task panicked");
+        assert_eq!(received.len(), N);
     }
 }

@@ -890,136 +890,132 @@ impl MessageConsumer for SqlxConsumer {
                 commit: Box::new(|_| Box::pin(async { Ok(()) })),
             });
         }
-        loop {
-            let rows = match self.driver_name.as_str() {
-                "PostgreSQL" | "Microsoft SQL Server" => {
-                    sqlx::query(audited_sql(&self.select_query))
-                        .bind(max_messages as i64)
-                        .fetch_all(&self.pool)
-                        .await
-                        .map_err(|e| ConsumerError::Connection(anyhow!(e)))?
-                }
-                "MySQL" | "MariaDB" => self.fetch_and_lock_mysql(max_messages).await?,
-                "SQLite" => self.fetch_and_lock_sqlite(max_messages).await?,
-                _ => {
-                    // Fallback for unknown drivers with a simple, non-locking read.
-                    warn!("SQLx consumer for driver '{}' is using a non-locking read strategy. This is not safe for concurrent consumers.", self.driver_name);
-                    let final_query = format!("{} LIMIT ?", self.select_query);
-                    sqlx::query(audited_sql(&final_query))
-                        .bind(max_messages as i64)
-                        .fetch_all(&self.pool)
-                        .await
-                        .map_err(|e| ConsumerError::Connection(anyhow!(e)))?
-                }
-            };
-
-            if !rows.is_empty() {
-                let mut messages = Vec::new();
-                let mut ids_to_delete = Vec::new();
-
-                for row in rows.into_iter().take(max_messages) {
-                    let payload: Vec<u8> = row
-                        .try_get("payload")
-                        .context("Failed to get 'payload' column")?;
-                    let id: i64 = row.try_get("id").context("Failed to get 'id' column")?;
-                    messages.push(CanonicalMessage::new(payload, None));
-                    ids_to_delete.push(id);
-                }
-                trace!(count = messages.len(), "Received batch of SQLx messages");
-
-                let pool = self.pool.clone();
-                let table = self.table.clone();
-                let delete = self.delete_after_read;
-                let driver_name = self.driver_name.clone();
-
-                let commit = Box::new(move |dispositions: Vec<MessageDisposition>| {
-                    let pool = pool.clone();
-                    let table = table.clone();
-                    let ids = ids_to_delete.clone();
-                    let driver_name = driver_name.clone();
-                    Box::pin(async move {
-                        if !delete {
-                            return Ok(());
-                        }
-                        let mut ids_to_ack = Vec::new();
-                        for (i, disp) in dispositions.iter().enumerate() {
-                            let should_ack = match disp {
-                                MessageDisposition::Ack => true,
-                                MessageDisposition::Reply(_) => {
-                                    tracing::warn!("SQLx consumer received a Reply/StreamReply, but replying is not supported by this endpoint. The reply payload is dropped, and the original message is acknowledged.");
-                                    true
-                                }
-                                MessageDisposition::Nack => false,
-                            };
-
-                            if should_ack {
-                                if let Some(id) = ids.get(i) {
-                                    ids_to_ack.push(*id);
-                                }
-                            }
-                        }
-
-                        if !ids_to_ack.is_empty() {
-                            // Manually construct the query with appropriate placeholders
-                            // because sqlx::QueryBuilder with the `Any` driver does not
-                            // correctly rewrite `?` to `$N` for PostgreSQL in this context.
-                            let mut placeholders = String::new();
-                            for i in 0..ids_to_ack.len() {
-                                if i > 0 {
-                                    placeholders.push_str(", ");
-                                }
-                                match driver_name.as_str() {
-                                    "PostgreSQL" => placeholders.push_str(&format!("${}", i + 1)),
-                                    "Microsoft SQL Server" => {
-                                        placeholders.push_str(&format!("@p{}", i + 1))
-                                    }
-                                    _ => placeholders.push('?'),
-                                }
-                            }
-
-                            let sql =
-                                format!("DELETE FROM {} WHERE id IN ({})", table, placeholders);
-
-                            let mut attempts = 0;
-                            loop {
-                                let mut query = sqlx::query(audited_sql(&sql));
-                                for id in &ids_to_ack {
-                                    query = query.bind(*id);
-                                }
-
-                                match query.execute(&pool).await {
-                                    Ok(_) => break,
-                                    Err(e) => {
-                                        if is_deadlock_error(&e) && attempts < 5 {
-                                            attempts += 1;
-                                            warn!(
-                                                attempts,
-                                                error = %e,
-                                                "Deadlock detected during SQLx commit, retrying..."
-                                            );
-                                            tokio::time::sleep(Duration::from_millis(
-                                                attempts * 50,
-                                            ))
-                                            .await;
-                                            continue;
-                                        }
-                                        return Err(anyhow!(
-                                            "Failed to delete acked messages: {}",
-                                            e
-                                        ));
-                                    }
-                                }
-                            }
-                        }
-                        Ok(())
-                    }) as BoxFuture<'static, anyhow::Result<()>>
-                });
-
-                return Ok(ReceivedBatch { messages, commit });
+        let rows = match self.driver_name.as_str() {
+            "PostgreSQL" | "Microsoft SQL Server" => sqlx::query(audited_sql(&self.select_query))
+                .bind(max_messages as i64)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| ConsumerError::Connection(anyhow!(e)))?,
+            "MySQL" | "MariaDB" => self.fetch_and_lock_mysql(max_messages).await?,
+            "SQLite" => self.fetch_and_lock_sqlite(max_messages).await?,
+            _ => {
+                // Fallback for unknown drivers with a simple, non-locking read.
+                warn!("SQLx consumer for driver '{}' is using a non-locking read strategy. This is not safe for concurrent consumers.", self.driver_name);
+                let final_query = format!("{} LIMIT ?", self.select_query);
+                sqlx::query(audited_sql(&final_query))
+                    .bind(max_messages as i64)
+                    .fetch_all(&self.pool)
+                    .await
+                    .map_err(|e| ConsumerError::Connection(anyhow!(e)))?
             }
+        };
 
+        if rows.is_empty() {
+            // Source is drained: sleep to preserve the DB polling cadence, then
+            // surface an empty batch so the route can pause (empty_batch_delay_ms)
+            // or, when exit_on_empty is set, terminate gracefully.
             tokio::time::sleep(self.polling_interval).await;
+            return Ok(ReceivedBatch {
+                messages: Vec::new(),
+                commit: Box::new(|_| Box::pin(async { Ok(()) })),
+            });
         }
+
+        let mut messages = Vec::new();
+        let mut ids_to_delete = Vec::new();
+
+        for row in rows.into_iter().take(max_messages) {
+            let payload: Vec<u8> = row
+                .try_get("payload")
+                .context("Failed to get 'payload' column")?;
+            let id: i64 = row.try_get("id").context("Failed to get 'id' column")?;
+            messages.push(CanonicalMessage::new(payload, None));
+            ids_to_delete.push(id);
+        }
+        trace!(count = messages.len(), "Received batch of SQLx messages");
+
+        let pool = self.pool.clone();
+        let table = self.table.clone();
+        let delete = self.delete_after_read;
+        let driver_name = self.driver_name.clone();
+
+        let commit = Box::new(move |dispositions: Vec<MessageDisposition>| {
+            let pool = pool.clone();
+            let table = table.clone();
+            let ids = ids_to_delete.clone();
+            let driver_name = driver_name.clone();
+            Box::pin(async move {
+                if !delete {
+                    return Ok(());
+                }
+                let mut ids_to_ack = Vec::new();
+                for (i, disp) in dispositions.iter().enumerate() {
+                    let should_ack = match disp {
+                        MessageDisposition::Ack => true,
+                        MessageDisposition::Reply(_) => {
+                            tracing::warn!("SQLx consumer received a Reply/StreamReply, but replying is not supported by this endpoint. The reply payload is dropped, and the original message is acknowledged.");
+                            true
+                        }
+                        MessageDisposition::Nack => false,
+                    };
+
+                    if should_ack {
+                        if let Some(id) = ids.get(i) {
+                            ids_to_ack.push(*id);
+                        }
+                    }
+                }
+
+                if !ids_to_ack.is_empty() {
+                    // Manually construct the query with appropriate placeholders
+                    // because sqlx::QueryBuilder with the `Any` driver does not
+                    // correctly rewrite `?` to `$N` for PostgreSQL in this context.
+                    let mut placeholders = String::new();
+                    for i in 0..ids_to_ack.len() {
+                        if i > 0 {
+                            placeholders.push_str(", ");
+                        }
+                        match driver_name.as_str() {
+                            "PostgreSQL" => placeholders.push_str(&format!("${}", i + 1)),
+                            "Microsoft SQL Server" => {
+                                placeholders.push_str(&format!("@p{}", i + 1))
+                            }
+                            _ => placeholders.push('?'),
+                        }
+                    }
+
+                    let sql = format!("DELETE FROM {} WHERE id IN ({})", table, placeholders);
+
+                    let mut attempts = 0;
+                    loop {
+                        let mut query = sqlx::query(audited_sql(&sql));
+                        for id in &ids_to_ack {
+                            query = query.bind(*id);
+                        }
+
+                        match query.execute(&pool).await {
+                            Ok(_) => break,
+                            Err(e) => {
+                                if is_deadlock_error(&e) && attempts < 5 {
+                                    attempts += 1;
+                                    warn!(
+                                        attempts,
+                                        error = %e,
+                                        "Deadlock detected during SQLx commit, retrying..."
+                                    );
+                                    tokio::time::sleep(Duration::from_millis(attempts * 50)).await;
+                                    continue;
+                                }
+                                return Err(anyhow!("Failed to delete acked messages: {}", e));
+                            }
+                        }
+                    }
+                }
+                Ok(())
+            }) as BoxFuture<'static, anyhow::Result<()>>
+        });
+
+        Ok(ReceivedBatch { messages, commit })
     }
 
     async fn status(&self) -> EndpointStatus {
