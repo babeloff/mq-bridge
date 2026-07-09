@@ -13,7 +13,8 @@ use crate::CanonicalMessage;
 use anyhow::{anyhow, Context};
 use async_trait::async_trait;
 use sqlx::any::AnyPoolOptions;
-use sqlx::{AnyPool, AssertSqlSafe, Row};
+use sqlx::{AnyPool, AssertSqlSafe, Column, Row};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tracing::{info, trace, warn};
 
@@ -1050,6 +1051,448 @@ impl MessageConsumer for SqlxConsumer {
     }
 }
 
+// --- Non-destructive `cursor_column` reader (arbitrary tables) ---
+
+/// A cursor value, tracked per column and persisted as a tagged string.
+#[derive(Clone, Debug, PartialEq)]
+enum SqlCursor {
+    Int(i64),
+    Text(String),
+}
+
+impl SqlCursor {
+    fn encode(&self) -> String {
+        match self {
+            SqlCursor::Int(n) => format!("int:{}", n),
+            SqlCursor::Text(s) => format!("str:{}", s),
+        }
+    }
+
+    fn decode(s: &str) -> Option<SqlCursor> {
+        let (tag, val) = s.split_once(':')?;
+        match tag {
+            "int" => val.parse::<i64>().ok().map(SqlCursor::Int),
+            "str" => Some(SqlCursor::Text(val.to_string())),
+            _ => None,
+        }
+    }
+}
+
+/// Serialize a full row into a JSON object payload (`{column: value, ...}`), trying the
+/// value types the `Any` driver supports. Unknown/unsupported types bind to JSON null.
+fn row_to_json(row: &sqlx::any::AnyRow) -> serde_json::Value {
+    let mut map = serde_json::Map::new();
+    for col in row.columns() {
+        map.insert(
+            col.name().to_string(),
+            extract_json_value(row, col.ordinal()),
+        );
+    }
+    serde_json::Value::Object(map)
+}
+
+fn extract_json_value(row: &sqlx::any::AnyRow, idx: usize) -> serde_json::Value {
+    use serde_json::Value;
+    if let Ok(v) = row.try_get::<Option<i64>, _>(idx) {
+        return v.map(Value::from).unwrap_or(Value::Null);
+    }
+    if let Ok(v) = row.try_get::<Option<f64>, _>(idx) {
+        return v.map(Value::from).unwrap_or(Value::Null);
+    }
+    if let Ok(v) = row.try_get::<Option<bool>, _>(idx) {
+        return v.map(Value::from).unwrap_or(Value::Null);
+    }
+    if let Ok(v) = row.try_get::<Option<String>, _>(idx) {
+        return v.map(Value::from).unwrap_or(Value::Null);
+    }
+    if let Ok(v) = row.try_get::<Option<Vec<u8>>, _>(idx) {
+        // Bytes have no JSON scalar; expose as a base16 string so the copy is lossless-ish.
+        return v
+            .map(|b| Value::from(b.iter().map(|x| format!("{:02x}", x)).collect::<String>()))
+            .unwrap_or(Value::Null);
+    }
+    Value::Null
+}
+
+fn extract_cursor(row: &sqlx::any::AnyRow, column: &str) -> Option<SqlCursor> {
+    if let Ok(Some(n)) = row.try_get::<Option<i64>, _>(column) {
+        return Some(SqlCursor::Int(n));
+    }
+    if let Ok(Some(s)) = row.try_get::<Option<String>, _>(column) {
+        return Some(SqlCursor::Text(s));
+    }
+    None
+}
+
+/// Checkpoint store backed by a `mqb_cursors` table in the source database.
+struct SqlTableCheckpointStore {
+    pool: AnyPool,
+    driver_name: String,
+    meta_table: String,
+    cursor_id: String,
+}
+
+impl SqlTableCheckpointStore {
+    async fn ensure_table(&self) -> anyhow::Result<()> {
+        let sql = format!(
+            "CREATE TABLE IF NOT EXISTS {} (cursor_id VARCHAR(255) PRIMARY KEY, last_value TEXT)",
+            self.meta_table
+        );
+        sqlx::query(audited_sql(&sql))
+            .execute(&self.pool)
+            .await
+            .with_context(|| format!("Failed to create meta table '{}'", self.meta_table))?;
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl crate::checkpoint::CheckpointStore for SqlTableCheckpointStore {
+    async fn load(&self) -> anyhow::Result<Option<String>> {
+        let sql = format!(
+            "SELECT last_value FROM {} WHERE cursor_id = {}",
+            self.meta_table,
+            positional_placeholder(&self.driver_name, 1)
+        );
+        let row = sqlx::query(audited_sql(&sql))
+            .bind(self.cursor_id.clone())
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.and_then(|r| r.try_get::<Option<String>, _>("last_value").ok().flatten()))
+    }
+
+    async fn save(&self, value: &str) -> anyhow::Result<()> {
+        let p1 = positional_placeholder(&self.driver_name, 1);
+        let p2 = positional_placeholder(&self.driver_name, 2);
+        let sql = match self.driver_name.as_str() {
+            "MySQL" | "MariaDB" => format!(
+                "INSERT INTO {0} (cursor_id, last_value) VALUES ({1}, {2}) \
+                 ON DUPLICATE KEY UPDATE last_value = VALUES(last_value)",
+                self.meta_table, p1, p2
+            ),
+            _ => format!(
+                "INSERT INTO {0} (cursor_id, last_value) VALUES ({1}, {2}) \
+                 ON CONFLICT (cursor_id) DO UPDATE SET last_value = excluded.last_value",
+                self.meta_table, p1, p2
+            ),
+        };
+        sqlx::query(audited_sql(&sql))
+            .bind(self.cursor_id.clone())
+            .bind(value.to_string())
+            .execute(&self.pool)
+            .await
+            .with_context(|| format!("Failed to persist cursor to '{}'", self.meta_table))?;
+        Ok(())
+    }
+}
+
+/// Build a checkpoint store on an **external** SQL database (its own pool), creating the meta
+/// table if needed. Used when `checkpoint_store` is a `postgres|mysql|sqlite://…` URL.
+pub(crate) async fn build_sql_checkpoint_store(
+    url: &str,
+    table: Option<String>,
+    source_name: &str,
+    cursor_id: &str,
+) -> anyhow::Result<Arc<dyn crate::checkpoint::CheckpointStore>> {
+    sqlx::any::install_default_drivers();
+    let pool = AnyPool::connect(url)
+        .await
+        .with_context(|| format!("Failed to connect checkpoint store at '{}'", url))?;
+    let driver_name = {
+        let conn = pool.acquire().await?;
+        let name = conn.backend_name().to_string();
+        drop(conn);
+        name
+    };
+    let meta_table = table.unwrap_or_else(|| crate::checkpoint::default_meta_name(source_name));
+    source_sql_checkpoint_store(pool, driver_name, meta_table, source_name, cursor_id).await
+}
+
+/// Build a checkpoint store on an already-connected pool (typically the source's own datastore),
+/// creating the meta table if needed.
+async fn source_sql_checkpoint_store(
+    pool: AnyPool,
+    driver_name: String,
+    meta_table: String,
+    source_name: &str,
+    cursor_id: &str,
+) -> anyhow::Result<Arc<dyn crate::checkpoint::CheckpointStore>> {
+    if !is_valid_table_name(&meta_table) {
+        return Err(anyhow!("Invalid checkpoint table name: '{}'.", meta_table));
+    }
+    let store = SqlTableCheckpointStore {
+        pool,
+        driver_name,
+        meta_table,
+        cursor_id: crate::checkpoint::checkpoint_key(source_name, cursor_id),
+    };
+    store.ensure_table().await?;
+    Ok(Arc::new(store))
+}
+
+/// A non-destructive, resumable reader over an **arbitrary** SQL table. Pages by a
+/// monotonic `cursor_column` (`SELECT * ... WHERE col > $last ORDER BY col ASC LIMIT n`),
+/// never deletes/locks source rows, and persists the last successfully-sunk value (keyed
+/// by `cursor_id`) to a pluggable checkpoint store (a `mqb_cursors` table by default, or a
+/// local file). At-least-once. Supported drivers: PostgreSQL, MySQL/MariaDB, SQLite.
+pub struct SqlxCursorReader {
+    pool: AnyPool,
+    table: String,
+    cursor_column: String,
+    driver_name: String,
+    polling_interval: Duration,
+    checkpoint: Option<Arc<dyn crate::checkpoint::CheckpointStore>>,
+    last_value: Arc<Mutex<Option<SqlCursor>>>,
+}
+
+impl SqlxCursorReader {
+    pub async fn new(config: &SqlxConfig) -> anyhow::Result<Self> {
+        sqlx::any::install_default_drivers();
+        if config.delete_after_read {
+            return Err(anyhow!(
+                "SQLx `cursor_column` (non-destructive) and `delete_after_read` are mutually exclusive"
+            ));
+        }
+        if !is_valid_table_name(&config.table) {
+            return Err(anyhow!("Invalid table name: '{}'.", config.table));
+        }
+        let cursor_column = config
+            .cursor_column
+            .clone()
+            .ok_or_else(|| anyhow!("cursor_column is required for the SQLx cursor reader"))?;
+        if !is_valid_table_name(&cursor_column) {
+            return Err(anyhow!("Invalid cursor_column name: '{}'.", cursor_column));
+        }
+
+        let pool = create_sqlx_pool(config).await?;
+        let conn = pool.acquire().await?;
+        let driver_name = conn.backend_name().to_string();
+        drop(conn);
+
+        if driver_name == "Microsoft SQL Server" {
+            return Err(anyhow!(
+                "cursor_column mode is not supported for Microsoft SQL Server"
+            ));
+        }
+        info!(table = %config.table, column = %cursor_column, driver = %driver_name, "SQLx cursor reader connected");
+
+        let checkpoint: Option<Arc<dyn crate::checkpoint::CheckpointStore>> = if let Some(cid) =
+            &config.cursor_id
+        {
+            use crate::checkpoint::CheckpointBackend;
+            let backend = match &config.checkpoint_store {
+                // Absent: source datastore with an auto-unique meta table.
+                None => CheckpointBackend::Source {
+                    name: crate::checkpoint::default_meta_name(&config.table),
+                },
+                Some(spec) => crate::checkpoint::parse_checkpoint_store(spec)?,
+            };
+            let store = match backend {
+                CheckpointBackend::Source { name } => {
+                    source_sql_checkpoint_store(
+                        pool.clone(),
+                        driver_name.clone(),
+                        name,
+                        &config.table,
+                        cid,
+                    )
+                    .await?
+                }
+                external => {
+                    crate::checkpoint::build_external_store(external, &config.table, cid).await?
+                }
+            };
+            Some(store)
+        } else {
+            warn!(
+                table = %config.table,
+                "SQLx cursor reader has no cursor_id; resume is disabled and every restart re-copies from the beginning. Set cursor_id to persist progress."
+            );
+            None
+        };
+
+        let last_value = match &checkpoint {
+            Some(cp) => cp.load().await?.and_then(|s| {
+                let decoded = SqlCursor::decode(&s);
+                if decoded.is_none() {
+                    warn!(value = %s, "Ignoring unparseable sql cursor; starting from beginning");
+                }
+                decoded
+            }),
+            None => None,
+        };
+        info!(table = %config.table, cursor_id = ?config.cursor_id, has_checkpoint = %last_value.is_some(), "SQLx cursor reader initialized");
+
+        Ok(Self {
+            pool,
+            table: config.table.clone(),
+            cursor_column,
+            driver_name,
+            polling_interval: Duration::from_millis(config.polling_interval_ms.unwrap_or(100)),
+            checkpoint,
+            last_value: Arc::new(Mutex::new(last_value)),
+        })
+    }
+}
+
+#[async_trait]
+impl MessageConsumer for SqlxCursorReader {
+    async fn receive_batch(&mut self, max_messages: usize) -> Result<ReceivedBatch, ConsumerError> {
+        if max_messages == 0 {
+            return Ok(ReceivedBatch {
+                messages: Vec::new(),
+                commit: Box::new(|_| Box::pin(async { Ok(()) })),
+            });
+        }
+
+        let last = self.last_value.lock().unwrap().clone();
+        let sql = match &last {
+            Some(_) => format!(
+                "SELECT * FROM {0} WHERE {1} > {2} ORDER BY {1} ASC LIMIT {3}",
+                self.table,
+                self.cursor_column,
+                positional_placeholder(&self.driver_name, 1),
+                positional_placeholder(&self.driver_name, 2),
+            ),
+            None => format!(
+                "SELECT * FROM {0} ORDER BY {1} ASC LIMIT {2}",
+                self.table,
+                self.cursor_column,
+                positional_placeholder(&self.driver_name, 1),
+            ),
+        };
+
+        let mut query = sqlx::query(audited_sql(&sql));
+        if let Some(c) = &last {
+            query = match c {
+                SqlCursor::Int(n) => query.bind(*n),
+                SqlCursor::Text(s) => query.bind(s.clone()),
+            };
+        }
+        // Peek one extra row beyond the batch so we can detect a run of equal cursor
+        // values split across the LIMIT boundary; `col > last` would otherwise skip the
+        // remainder of that run (silent row loss for a non-unique cursor_column).
+        let fetch_limit = (max_messages as i64).saturating_add(1);
+        query = query.bind(fetch_limit);
+
+        let rows = query
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| ConsumerError::Connection(anyhow!(e)))?;
+
+        if rows.is_empty() {
+            // Drained: preserve polling cadence, then surface an empty batch so the route
+            // can pause or terminate.
+            tokio::time::sleep(self.polling_interval).await;
+            return Ok(ReceivedBatch {
+                messages: Vec::new(),
+                commit: Box::new(|_| Box::pin(async { Ok(()) })),
+            });
+        }
+
+        // Extract (cursor, message) for every fetched row.
+        let mut fetched: Vec<(SqlCursor, CanonicalMessage)> = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let cursor = extract_cursor(row, &self.cursor_column).ok_or_else(|| {
+                ConsumerError::Connection(anyhow!(
+                    "cursor_column '{}' missing or of unsupported type in result row",
+                    self.cursor_column
+                ))
+            })?;
+            let payload = serde_json::to_vec(&row_to_json(row)).unwrap_or_default();
+            fetched.push((cursor, CanonicalMessage::new(payload, None)));
+        }
+
+        // If we fetched the peek row, more rows exist beyond this page. Drop the trailing
+        // run whose value equals the peek row's value so a group of equal cursor values is
+        // never split across pages; the trimmed rows are re-read next poll via `col > last`.
+        let had_more = fetched.len() > max_messages;
+        let mut emit_len = fetched.len().min(max_messages);
+        if had_more {
+            let peek_val = fetched[max_messages].0.clone();
+            while emit_len > 0 && fetched[emit_len - 1].0 == peek_val {
+                emit_len -= 1;
+            }
+            if emit_len == 0 {
+                // A single cursor value fills the whole batch: it cannot be split safely.
+                // Emit the batch and advance past the value, warning that any further rows
+                // sharing this exact value may be skipped.
+                warn!(
+                    column = %self.cursor_column,
+                    "cursor_column has a group of equal values larger than the batch size; increase batch_size to avoid skipping rows at this value"
+                );
+                emit_len = max_messages;
+            }
+        }
+        fetched.truncate(emit_len);
+
+        let mut messages = Vec::with_capacity(fetched.len());
+        let mut cursors: Vec<SqlCursor> = Vec::with_capacity(fetched.len());
+        for (cursor, msg) in fetched {
+            cursors.push(cursor.clone());
+            messages.push(msg);
+            // Advance optimistically so the next page continues past this row; rolled back
+            // in commit if a row is not acked.
+            *self.last_value.lock().unwrap() = Some(cursor);
+        }
+        trace!(count = messages.len(), "Received batch of SQLx cursor rows");
+
+        let checkpoint = self.checkpoint.clone();
+        let last_value = self.last_value.clone();
+        let resume_from = last; // cursor value before this batch (for rollback on nack)
+        let commit = Box::new(move |dispositions: Vec<MessageDisposition>| {
+            Box::pin(async move {
+                // Count the contiguous run of Acks from the front (stop at first Nack).
+                let mut acked = 0usize;
+                for disp in dispositions.iter().take(cursors.len()) {
+                    if matches!(disp, MessageDisposition::Ack | MessageDisposition::Reply(_)) {
+                        acked += 1;
+                    } else {
+                        break;
+                    }
+                }
+                let boundary = if acked == 0 {
+                    resume_from
+                } else {
+                    Some(cursors[acked - 1].clone())
+                };
+                // If any row was not acked, roll the in-memory read cursor back to the
+                // committed boundary so nacked/unprocessed rows are re-read next poll
+                // (at-least-once) instead of being skipped until a restart.
+                if acked < cursors.len() {
+                    *last_value.lock().unwrap() = boundary.clone();
+                }
+                if let (Some(cur), Some(cp)) = (boundary, checkpoint) {
+                    if let Err(e) = cp.save(&cur.encode()).await {
+                        tracing::warn!(error = %e, "Failed to persist sql cursor. Rows may be reprocessed on restart.");
+                    }
+                }
+                Ok(())
+            }) as BoxFuture<'static, anyhow::Result<()>>
+        });
+
+        Ok(ReceivedBatch { messages, commit })
+    }
+
+    async fn status(&self) -> EndpointStatus {
+        let (healthy, error) = match self.pool.acquire().await {
+            Ok(_) => (true, None),
+            Err(e) => (false, Some(e.to_string())),
+        };
+        EndpointStatus {
+            healthy,
+            target: self.table.clone(),
+            error,
+            details: serde_json::json!({ "driver": self.driver_name, "mode": "cursor_column", "cursor_column": self.cursor_column }),
+            ..Default::default()
+        }
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1085,6 +1528,320 @@ mod tests {
         .unwrap();
         conn.close().await.unwrap();
         (dir, url)
+    }
+
+    /// Creates an arbitrary (non mq-bridge) table `orders(id, sku, qty)` seeded with `n` rows.
+    async fn setup_arbitrary_table(n: i64) -> (tempfile::TempDir, String, AnyPool) {
+        sqlx::any::install_default_drivers();
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("arb.db");
+        let url = format!("sqlite://{}", path.to_str().unwrap());
+        drop(tokio::fs::File::create(&path).await.unwrap());
+        let pool = AnyPool::connect(&url).await.unwrap();
+        sqlx::query("CREATE TABLE orders (id INTEGER PRIMARY KEY, sku TEXT, qty INTEGER)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        for i in 1..=n {
+            sqlx::query("INSERT INTO orders (id, sku, qty) VALUES (?, ?, ?)")
+                .bind(i)
+                .bind(format!("sku{}", i))
+                .bind(i * 10)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        (dir, url, pool)
+    }
+
+    #[test]
+    fn test_sql_cursor_encode_decode_roundtrip() {
+        for c in [SqlCursor::Int(42), SqlCursor::Text("abc:def".into())] {
+            assert_eq!(SqlCursor::decode(&c.encode()), Some(c));
+        }
+        assert_eq!(SqlCursor::decode("garbage"), None);
+    }
+
+    // Regression: a non-unique cursor_column must not lose rows that share the value at a
+    // page boundary. `ts` has a duplicate (20) straddling a batch of 2; all 5 rows must be
+    // emitted exactly once. The naive `col > last` + LIMIT would drop the second ts=20.
+    #[tokio::test]
+    async fn test_sqlx_cursor_reader_non_unique_column_no_loss() {
+        sqlx::any::install_default_drivers();
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("dup.db");
+        let url = format!("sqlite://{}", path.to_str().unwrap());
+        drop(tokio::fs::File::create(&path).await.unwrap());
+        let pool = AnyPool::connect(&url).await.unwrap();
+        sqlx::query("CREATE TABLE events (id INTEGER PRIMARY KEY, ts INTEGER)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        for (id, ts) in [(1, 10), (2, 20), (3, 20), (4, 30), (5, 40)] {
+            sqlx::query("INSERT INTO events (id, ts) VALUES (?, ?)")
+                .bind(id)
+                .bind(ts)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+
+        let config = SqlxConfig {
+            url: url.clone(),
+            table: "events".to_string(),
+            cursor_column: Some("ts".to_string()),
+            ..Default::default()
+        };
+        let mut reader = SqlxCursorReader::new(&config).await.unwrap();
+
+        let mut ids = Vec::new();
+        loop {
+            let b = reader.receive_batch(2).await.unwrap();
+            if b.messages.is_empty() {
+                break;
+            }
+            for m in &b.messages {
+                let v: serde_json::Value = serde_json::from_slice(&m.payload).unwrap();
+                ids.push(v["id"].as_i64().unwrap());
+            }
+            let n = b.messages.len();
+            (b.commit)(vec![MessageDisposition::Ack; n]).await.unwrap();
+        }
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            vec![1, 2, 3, 4, 5],
+            "no row lost at the duplicate boundary"
+        );
+    }
+
+    // Regression: a mid-batch Nack must make the nacked (and following) rows re-read by the
+    // same running reader, not skipped until a restart. Rows 1..4 are read; row 3 is nacked,
+    // so the next receive_batch on the same reader resumes at row 3.
+    #[tokio::test]
+    async fn test_sqlx_cursor_reader_nack_redelivers_in_process() {
+        let (_dir, url, _pool) = setup_arbitrary_table(5).await;
+        let config = SqlxConfig {
+            url: url.clone(),
+            table: "orders".to_string(),
+            cursor_column: Some("id".to_string()),
+            ..Default::default()
+        };
+        let mut reader = SqlxCursorReader::new(&config).await.unwrap();
+
+        let b = reader.receive_batch(4).await.unwrap();
+        assert_eq!(b.messages.len(), 4);
+        (b.commit)(vec![
+            MessageDisposition::Ack,
+            MessageDisposition::Ack,
+            MessageDisposition::Nack,
+            MessageDisposition::Ack,
+        ])
+        .await
+        .unwrap();
+
+        // Same reader (no restart): must re-read from row 3 (the first nacked row).
+        let b2 = reader.receive_batch(4).await.unwrap();
+        let ids: Vec<i64> = b2
+            .messages
+            .iter()
+            .map(|m| {
+                serde_json::from_slice::<serde_json::Value>(&m.payload).unwrap()["id"]
+                    .as_i64()
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(
+            ids,
+            vec![3, 4, 5],
+            "nacked rows must be redelivered in-process"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sqlx_cursor_reader_resumes_and_is_nondestructive() {
+        let (_dir, url, pool) = setup_arbitrary_table(5).await;
+        let config = SqlxConfig {
+            url: url.clone(),
+            table: "orders".to_string(),
+            cursor_column: Some("id".to_string()),
+            cursor_id: Some("copy-1".to_string()),
+            ..Default::default()
+        };
+
+        let mut reader = SqlxCursorReader::new(&config).await.unwrap();
+        let b1 = reader.receive_batch(3).await.unwrap();
+        assert_eq!(b1.messages.len(), 3);
+        // Payload is the full row serialized to JSON.
+        let v: serde_json::Value = serde_json::from_slice(&b1.messages[0].payload).unwrap();
+        assert_eq!(v["id"], 1);
+        assert_eq!(v["sku"], "sku1");
+        assert_eq!(v["qty"], 10);
+        (b1.commit)(vec![MessageDisposition::Ack; 3]).await.unwrap();
+
+        let b2 = reader.receive_batch(3).await.unwrap();
+        assert_eq!(b2.messages.len(), 2);
+        (b2.commit)(vec![MessageDisposition::Ack; 2]).await.unwrap();
+
+        // Drained -> empty batch, independent of how the route handles empty batches.
+        let b3 = reader.receive_batch(3).await.unwrap();
+        assert!(b3.messages.is_empty());
+
+        // Source table is untouched.
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM orders")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 5);
+
+        // Checkpoint persisted in the auto-unique default meta table, keyed by <source>:<id>.
+        let last: String = sqlx::query_scalar(
+            "SELECT last_value FROM mqb_cursors_orders WHERE cursor_id = 'orders:copy-1'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(last, "int:5");
+
+        // Restart from a fresh reader: resumes past the checkpoint -> nothing re-emitted.
+        let mut reader2 = SqlxCursorReader::new(&config).await.unwrap();
+        let again = reader2.receive_batch(10).await.unwrap();
+        assert!(again.messages.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_sqlx_cursor_reader_partial_ack_resumes_at_boundary() {
+        let (_dir, url, _pool) = setup_arbitrary_table(5).await;
+        let config = SqlxConfig {
+            url: url.clone(),
+            table: "orders".to_string(),
+            cursor_column: Some("id".to_string()),
+            cursor_id: Some("copy-1".to_string()),
+            ..Default::default()
+        };
+
+        let mut reader = SqlxCursorReader::new(&config).await.unwrap();
+        let b = reader.receive_batch(4).await.unwrap();
+        assert_eq!(b.messages.len(), 4);
+        // Ack the first two, nack the rest: checkpoint must stop at the contiguous boundary.
+        (b.commit)(vec![
+            MessageDisposition::Ack,
+            MessageDisposition::Ack,
+            MessageDisposition::Nack,
+            MessageDisposition::Nack,
+        ])
+        .await
+        .unwrap();
+
+        // A restart resumes at row 3 (ids 3,4,5), never skipping the nacked rows.
+        let mut reader2 = SqlxCursorReader::new(&config).await.unwrap();
+        let b2 = reader2.receive_batch(10).await.unwrap();
+        assert_eq!(b2.messages.len(), 3);
+        let first: serde_json::Value = serde_json::from_slice(&b2.messages[0].payload).unwrap();
+        assert_eq!(first["id"], 3);
+    }
+
+    #[tokio::test]
+    async fn test_sqlx_cursor_reader_text_column_with_file_checkpoint() {
+        sqlx::any::install_default_drivers();
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("ev.db");
+        let url = format!("sqlite://{}", path.to_str().unwrap());
+        drop(tokio::fs::File::create(&path).await.unwrap());
+        let pool = AnyPool::connect(&url).await.unwrap();
+        sqlx::query("CREATE TABLE events (k TEXT PRIMARY KEY, data TEXT)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        for k in ["a", "b", "c"] {
+            sqlx::query("INSERT INTO events (k, data) VALUES (?, ?)")
+                .bind(k)
+                .bind(format!("data-{}", k))
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+
+        let ckpt = dir.path().join("cursors.json");
+        // Absolute tempdir path -> `file:///abs/path` (three-slash form).
+        let config = SqlxConfig {
+            url: url.clone(),
+            table: "events".to_string(),
+            cursor_column: Some("k".to_string()),
+            cursor_id: Some("c1".to_string()),
+            checkpoint_store: Some(format!("file://{}", ckpt.to_str().unwrap())),
+            ..Default::default()
+        };
+
+        let mut reader = SqlxCursorReader::new(&config).await.unwrap();
+        let b = reader.receive_batch(10).await.unwrap();
+        assert_eq!(b.messages.len(), 3);
+        (b.commit)(vec![MessageDisposition::Ack; 3]).await.unwrap();
+
+        // File checkpoint written; source DB has NO meta table (read-only-source path).
+        assert!(ckpt.exists());
+        let meta_tables: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name LIKE 'mqb_cursors%'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(meta_tables, 0);
+
+        // Restart resumes from the file checkpoint -> nothing re-emitted.
+        let mut reader2 = SqlxCursorReader::new(&config).await.unwrap();
+        let again = reader2.receive_batch(10).await.unwrap();
+        assert!(again.messages.is_empty());
+    }
+
+    // checkpoint_store pointing at a *different* database persists the cursor there, leaves the
+    // source DB untouched, and still resumes across a restart.
+    #[tokio::test]
+    async fn test_sqlx_cursor_reader_external_db_checkpoint() {
+        let (_dir_a, url_a, pool_a) = setup_arbitrary_table(3).await;
+
+        // A separate SQLite database used only for checkpoints.
+        let dir_b = tempdir().unwrap();
+        let path_b = dir_b.path().join("ckpt.db");
+        let url_b = format!("sqlite://{}", path_b.to_str().unwrap());
+        drop(tokio::fs::File::create(&path_b).await.unwrap());
+        let pool_b = AnyPool::connect(&url_b).await.unwrap();
+
+        let config = SqlxConfig {
+            url: url_a.clone(),
+            table: "orders".to_string(),
+            cursor_column: Some("id".to_string()),
+            cursor_id: Some("copy-1".to_string()),
+            checkpoint_store: Some(url_b.clone()),
+            ..Default::default()
+        };
+
+        let mut reader = SqlxCursorReader::new(&config).await.unwrap();
+        let b = reader.receive_batch(10).await.unwrap();
+        assert_eq!(b.messages.len(), 3);
+        (b.commit)(vec![MessageDisposition::Ack; 3]).await.unwrap();
+
+        // Cursor landed in the external DB, in the auto-unique table keyed by <source>:<id>.
+        let last: String = sqlx::query_scalar(
+            "SELECT last_value FROM mqb_cursors_orders WHERE cursor_id = 'orders:copy-1'",
+        )
+        .fetch_one(&pool_b)
+        .await
+        .unwrap();
+        assert_eq!(last, "int:3");
+
+        // The source DB was never written to (no meta table).
+        let n: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name LIKE 'mqb_cursors%'",
+        )
+        .fetch_one(&pool_a)
+        .await
+        .unwrap();
+        assert_eq!(n, 0);
+
+        // Restart resumes from the external checkpoint -> nothing re-emitted.
+        let mut reader2 = SqlxCursorReader::new(&config).await.unwrap();
+        assert!(reader2.receive_batch(10).await.unwrap().messages.is_empty());
     }
 
     #[tokio::test]

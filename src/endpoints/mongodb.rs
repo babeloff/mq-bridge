@@ -1495,6 +1495,338 @@ impl MessageConsumer for MongoDbSubscriber {
     }
 }
 
+// --- Non-destructive `_id`-cursor reader (arbitrary collections) ---
+
+/// Encodes a BSON `_id` into a portable, tagged string for checkpoint persistence.
+/// Supports the homogeneous `_id` types a real collection uses: ObjectId, BSON UUID
+/// (subtype 4, as mq-bridge's own publisher writes), and integers. Returns `None` for
+/// unsupported types (cursor is then not persisted).
+fn encode_id(id: &Bson) -> Option<String> {
+    match id {
+        Bson::ObjectId(oid) => Some(format!("oid:{}", oid.to_hex())),
+        Bson::Binary(bin)
+            if bin.subtype == mongodb::bson::spec::BinarySubtype::Uuid
+                || bin.subtype == mongodb::bson::spec::BinarySubtype::UuidOld =>
+        {
+            bin.to_uuid().ok().map(|u| format!("uuid:{}", u))
+        }
+        Bson::Int64(n) => Some(format!("int:{}", n)),
+        Bson::Int32(n) => Some(format!("int:{}", n)),
+        Bson::String(s) => Some(format!("str:{}", s)),
+        _ => None,
+    }
+}
+
+/// Decodes a tagged string produced by [`encode_id`] back into a BSON `_id` for the
+/// `$gt` query. Returns `None` on a malformed/unknown value (reader then starts from the
+/// beginning rather than silently skipping).
+fn decode_id(s: &str) -> Option<Bson> {
+    let (tag, val) = s.split_once(':')?;
+    match tag {
+        "oid" => mongodb::bson::oid::ObjectId::parse_str(val)
+            .ok()
+            .map(Bson::ObjectId),
+        "uuid" => mongodb::bson::Uuid::parse_str(val).ok().map(Bson::from),
+        "int" => val.parse::<i64>().ok().map(Bson::Int64),
+        "str" => Some(Bson::String(val.to_string())),
+        _ => None,
+    }
+}
+
+/// Checkpoint store backed by a `mqb_cursors` collection in the source database.
+struct MongoCollectionCheckpointStore {
+    meta: Collection<Document>,
+    doc_id: String,
+}
+
+#[async_trait]
+impl crate::checkpoint::CheckpointStore for MongoCollectionCheckpointStore {
+    async fn load(&self) -> anyhow::Result<Option<String>> {
+        let doc = self
+            .meta
+            .find_one(doc! { "_id": self.doc_id.clone() })
+            .await?;
+        Ok(doc.and_then(|d| d.get_str("last_value").ok().map(|s| s.to_string())))
+    }
+
+    async fn save(&self, value: &str) -> anyhow::Result<()> {
+        self.meta
+            .update_one(
+                doc! { "_id": self.doc_id.clone() },
+                doc! { "$set": { "last_value": value } },
+            )
+            .with_options(UpdateOptions::builder().upsert(true).build())
+            .await?;
+        Ok(())
+    }
+}
+
+/// Build a checkpoint store on an **external** MongoDB deployment (its own client), used when
+/// `checkpoint_store` is a `mongodb://host/db[/collection]` URL.
+pub(crate) async fn build_mongo_checkpoint_store(
+    url: &str,
+    database: &str,
+    collection: Option<String>,
+    source_name: &str,
+    cursor_id: &str,
+) -> anyhow::Result<Arc<dyn crate::checkpoint::CheckpointStore>> {
+    let client = Client::with_uri_str(url)
+        .await
+        .with_context(|| format!("Failed to connect checkpoint store at '{}'", url))?;
+    let db = client.database(database);
+    let meta_name = collection.unwrap_or_else(|| crate::checkpoint::default_meta_name(source_name));
+    Ok(Arc::new(MongoCollectionCheckpointStore {
+        meta: db.collection::<Document>(&meta_name),
+        doc_id: crate::checkpoint::checkpoint_key(source_name, cursor_id),
+    }))
+}
+
+/// A non-destructive, resumable reader over an **arbitrary** MongoDB collection. Pages by
+/// `_id` (`find({_id:{$gt:last}}).sort({_id:1})`), never mutates the source, and persists
+/// the last successfully-sunk `_id` (keyed by `cursor_id`) to a pluggable checkpoint store
+/// (a separate `mqb_cursors` collection by default, or a local file). At-least-once.
+pub struct MongoDbIdReader {
+    collection: Collection<Document>,
+    db: Database,
+    checkpoint: Option<Arc<dyn crate::checkpoint::CheckpointStore>>,
+    cursor_id: Option<String>,
+    last_id: Arc<Mutex<Option<Bson>>>,
+    receive_query: Option<Document>,
+}
+
+impl MongoDbIdReader {
+    pub async fn new(config: &MongoDbConfig) -> anyhow::Result<Self> {
+        if config.change_stream {
+            return Err(anyhow!(
+                "MongoDB `resumable` and `change_stream` are mutually exclusive"
+            ));
+        }
+        let collection_name = config
+            .collection
+            .as_deref()
+            .ok_or_else(|| anyhow!("Collection name is required for MongoDB id-cursor reader"))?;
+        let client = create_client(config).await?;
+        let db = client.database(&config.database);
+        let collection: Collection<Document> = db.collection(collection_name);
+
+        let receive_query = if let Some(q) = &config.receive_query {
+            let doc: Document = serde_json::from_str(q)
+                .context("Failed to parse 'receive_query' from configuration as a JSON document")?;
+            Some(doc)
+        } else {
+            None
+        };
+
+        let checkpoint: Option<Arc<dyn crate::checkpoint::CheckpointStore>> = if let Some(cid) =
+            &config.cursor_id
+        {
+            use crate::checkpoint::CheckpointBackend;
+            let backend = match &config.checkpoint_store {
+                // Absent: a dedicated per-source collection so the source is never written.
+                None => CheckpointBackend::Source {
+                    name: crate::checkpoint::default_meta_name(collection_name),
+                },
+                Some(spec) => crate::checkpoint::parse_checkpoint_store(spec)?,
+            };
+            let store: Arc<dyn crate::checkpoint::CheckpointStore> = match backend {
+                CheckpointBackend::Source { name } => Arc::new(MongoCollectionCheckpointStore {
+                    meta: db.collection::<Document>(&name),
+                    doc_id: crate::checkpoint::checkpoint_key(collection_name, cid),
+                }),
+                external => {
+                    crate::checkpoint::build_external_store(external, collection_name, cid).await?
+                }
+            };
+            Some(store)
+        } else {
+            warn!(
+                collection = %collection_name,
+                "MongoDB resumable reader has no cursor_id; resume is disabled and every restart re-copies from the beginning. Set cursor_id to persist progress."
+            );
+            None
+        };
+
+        let last_id = match &checkpoint {
+            Some(cp) => cp.load().await?.and_then(|s| {
+                let decoded = decode_id(&s);
+                if decoded.is_none() {
+                    warn!(value = %s, "Ignoring unparseable mongo id cursor; starting from beginning");
+                }
+                decoded
+            }),
+            None => None,
+        };
+        info!(collection = %collection_name, cursor_id = ?config.cursor_id, has_checkpoint = %last_id.is_some(), "MongoDB id-cursor reader initialized");
+
+        Ok(Self {
+            collection,
+            db,
+            checkpoint,
+            cursor_id: config.cursor_id.clone(),
+            last_id: Arc::new(Mutex::new(last_id)),
+            receive_query,
+        })
+    }
+}
+
+#[async_trait]
+impl MessageConsumer for MongoDbIdReader {
+    async fn receive_batch(&mut self, max_messages: usize) -> Result<ReceivedBatch, ConsumerError> {
+        // `_id` before this batch, for rollback on nack (see the commit closure).
+        let resume_from = self.last_id.lock().unwrap().clone();
+
+        let mut messages = Vec::new();
+        let mut ids: Vec<Bson> = Vec::new();
+
+        // Page until we collect at least one message or a query returns no documents (truly
+        // drained). This keeps an empty batch meaning "drained": a whole page of unreadable
+        // docs is skipped-with-progress rather than stalling the reader or exiting early.
+        loop {
+            let last = self.last_id.lock().unwrap().clone();
+            let mut filter = match &last {
+                Some(v) => doc! { "_id": { "$gt": v.clone() } },
+                None => doc! {},
+            };
+            if let Some(extra) = &self.receive_query {
+                filter = if filter.is_empty() {
+                    extra.clone()
+                } else {
+                    doc! { "$and": [filter, extra.clone()] }
+                };
+            }
+
+            let find_options = FindOptions::builder()
+                .sort(doc! { "_id": 1 })
+                .limit(max_messages as i64)
+                .build();
+
+            let mut cursor = self
+                .collection
+                .find(filter)
+                .with_options(find_options)
+                .await
+                .map_err(|e| ConsumerError::Connection(e.into()))?;
+
+            let mut docs_in_page = 0usize;
+            while let Some(result) = cursor.next().await {
+                // A cursor error mid-page is a real failure; surface it instead of treating the
+                // truncated page as "drained".
+                let doc = result.map_err(|e| ConsumerError::Connection(e.into()))?;
+                docs_in_page += 1;
+                let Some(id) = doc.get("_id").cloned() else {
+                    warn!("MongoDB document without an `_id`; skipping");
+                    continue;
+                };
+                match parse_mongodb_document(doc) {
+                    Ok(msg) => {
+                        messages.push(msg);
+                        ids.push(id.clone());
+                    }
+                    Err(e) => warn!(error = %e, "Skipping unparseable MongoDB document"),
+                }
+                // Advance past this `_id` whether or not it parsed, so a bad doc can't stall paging.
+                *self.last_id.lock().unwrap() = Some(id);
+            }
+
+            // Got messages, or the collection is exhausted -> stop; otherwise the whole page was
+            // skipped and more may follow, so page again.
+            if !messages.is_empty() || docs_in_page == 0 {
+                break;
+            }
+        }
+
+        if messages.is_empty() {
+            // Exhausted: surface an empty batch so the route can pause or terminate.
+            return Ok(ReceivedBatch {
+                messages: Vec::new(),
+                commit: Box::new(|_| Box::pin(async { Ok(()) })),
+            });
+        }
+
+        let checkpoint = self.checkpoint.clone();
+        let last_id = self.last_id.clone();
+        let commit = Box::new(move |dispositions: Vec<MessageDisposition>| {
+            Box::pin(async move {
+                // Highest `_id` of a contiguous run of Acks from the front (stop at first Nack).
+                let mut acked = 0usize;
+                for disp in dispositions.iter().take(ids.len()) {
+                    if matches!(disp, MessageDisposition::Ack | MessageDisposition::Reply(_)) {
+                        acked += 1;
+                    } else {
+                        break;
+                    }
+                }
+                let boundary: Option<Bson> = if acked == 0 {
+                    resume_from
+                } else {
+                    Some(ids[acked - 1].clone())
+                };
+                // If any doc was not acked, roll the in-memory read cursor back to the
+                // committed boundary so nacked/unprocessed docs are re-read on the next
+                // page (at-least-once) instead of being skipped until a restart.
+                if acked < ids.len() {
+                    *last_id.lock().unwrap() = boundary.clone();
+                }
+                if let (Some(id), Some(cp)) = (boundary, checkpoint) {
+                    match encode_id(&id) {
+                        Some(s) => {
+                            if let Err(e) = cp.save(&s).await {
+                                tracing::warn!(error = %e, "Failed to persist mongo id cursor. Messages may be reprocessed on restart.");
+                            }
+                        }
+                        None => tracing::warn!(
+                            "Unsupported _id type for cursor persistence; not checkpointing"
+                        ),
+                    }
+                }
+                Ok(())
+            }) as BoxFuture<'static, anyhow::Result<()>>
+        });
+
+        Ok(ReceivedBatch { messages, commit })
+    }
+
+    async fn status(&self) -> EndpointStatus {
+        let mut error = None;
+        let healthy = match self.db.run_command(doc! { "ping": 1 }).await {
+            Ok(_) => true,
+            Err(e) => {
+                error = Some(e.to_string());
+                false
+            }
+        };
+        let pending = if healthy {
+            let last = self.last_id.lock().unwrap().clone();
+            let filter = match &last {
+                Some(v) => doc! { "_id": { "$gt": v.clone() } },
+                None => doc! {},
+            };
+            match self.collection.count_documents(filter).await {
+                Ok(c) => Some(c as usize),
+                Err(e) => {
+                    error = Some(format!("Failed to count pending: {}", e));
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        EndpointStatus {
+            healthy,
+            target: self.collection.name().to_string(),
+            pending,
+            capacity: None,
+            details: serde_json::json!({ "cursor_id": self.cursor_id, "mode": "resumable" }),
+            error,
+        }
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
 /// Returns a shared MongoDB client for this connection, building one on first use.
 /// The collection/database are handles off the client, so a single client serves all.
 async fn create_shared_client(config: &MongoDbConfig) -> anyhow::Result<std::sync::Arc<Client>> {
@@ -1555,6 +1887,27 @@ async fn create_client(config: &MongoDbConfig) -> anyhow::Result<Client> {
 mod tests {
     use super::*;
     use crate::CanonicalMessage;
+
+    #[test]
+    fn resumable_encode_decode_roundtrips_supported_types() {
+        let oid = mongodb::bson::oid::ObjectId::new();
+        let uuid = mongodb::bson::Uuid::new();
+        let cases = [
+            Bson::ObjectId(oid),
+            Bson::from(uuid),
+            Bson::Int64(123),
+            Bson::String("k1".to_string()),
+        ];
+        for id in cases {
+            let encoded = encode_id(&id).expect("supported type encodes");
+            assert_eq!(decode_id(&encoded), Some(id), "roundtrip for {}", encoded);
+        }
+        // Int32 encodes as an int and decodes back as Int64 (BSON `$gt` compares numerically).
+        assert_eq!(encode_id(&Bson::Int32(7)).as_deref(), Some("int:7"));
+        // Unsupported types are not persisted.
+        assert_eq!(encode_id(&Bson::Boolean(true)), None);
+        assert_eq!(decode_id("bogus"), None);
+    }
 
     #[test]
     fn message_to_document_strips_source_metadata_but_keeps_user_keys() {

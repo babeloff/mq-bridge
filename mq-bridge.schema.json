@@ -1588,6 +1588,14 @@
           "type": "boolean",
           "default": false
         },
+        "checkpoint_store": {
+          "description": "(Consumer only) Where to persist the resume cursor in `resumable` mode. A URL selects the\nbackend; a bare name (or `/name`) reuses the **source** database with that collection name:\n- absent → source database, collection `mqb_cursors_<source_collection>` (auto-unique)\n- `/my_cursors` → source database, collection `my_cursors`\n- `file:///var/lib/mqb/cursors.json` → local JSON file (read-only / write-restricted sources)\n- `mongodb://host/db/collection` → external MongoDB collection (collection optional)\n- `postgres://user@host/db/table` or `mysql://host/db/table` → external SQL table (table optional)\n\nWhen no collection/table is named, it defaults to `mqb_cursors_<source_collection>`.\nMay embed connection credentials, so it is treated as a secret.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "password"
+        },
         "collection": {
           "description": "The MongoDB collection name.",
           "type": [
@@ -1664,6 +1672,11 @@
           ],
           "format": "uint64",
           "minimum": 0
+        },
+        "resumable": {
+          "description": "(Consumer only) Read an existing collection **non-destructively** and resumably, paging by `_id`\n(`find({_id:{$gt:last}}).sort({_id:1})`) and persisting the last read `_id` under `cursor_id`.\nSupports ObjectId / UUID / integer `_id`. Does not modify the source collection.\nMutually exclusive with `change_stream`. Defaults to false.",
+          "type": "boolean",
+          "default": false
         },
         "shared": {
           "description": "Share one MongoDB client per connection (default: true); false forces a dedicated client.",
@@ -2298,6 +2311,28 @@
           "description": "(Publisher only) If true, automatically create the table and indexes if they don't exist. Defaults to false.",
           "type": "boolean",
           "default": false
+        },
+        "checkpoint_store": {
+          "description": "(Consumer only) Where to persist the resume cursor in `cursor_column` mode. A URL selects the\nbackend; a bare name (or `/name`) reuses the **source** datastore with that table name:\n- absent → source datastore, table `mqb_cursors_<source_table>` (auto-unique)\n- `/my_cursors` → source datastore, table `my_cursors`\n- `file:///var/lib/mqb/cursors.json` → local JSON file (read-only / write-restricted sources)\n- `postgres://user@host/db/table` or `mysql://host/db/table` → external SQL table (table optional)\n- `mongodb://host/db/collection` → external MongoDB collection (collection optional)\n\nWhen no table/collection is named, it defaults to `mqb_cursors_<source_table>`.\nMay embed connection credentials, so it is treated as a secret.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "password"
+        },
+        "cursor_column": {
+          "description": "(Consumer only) Read an existing table **non-destructively** and resumably, paging by this\nmonotonic column (`SELECT * FROM {table} WHERE {cursor_column} > $last ORDER BY {cursor_column} ASC LIMIT n`)\nand persisting the last read value under `cursor_id`. Does not delete/lock source rows.\nMutually exclusive with `delete_after_read`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "cursor_id": {
+          "description": "(Consumer only) Cursor id used to key the persisted resume position. Recommended when\n`cursor_column` is set: without it, progress is not persisted and every restart re-copies\nfrom the beginning.",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "delete_after_read": {
           "description": "(Consumer only) If true, delete messages after processing.",

@@ -1835,6 +1835,24 @@ pub struct MongoDbConfig {
     /// (Consumer only) If true, use Change Streams (**Subscriber mode**). Defaults to false (polling/consumer mode).
     #[serde(default)]
     pub change_stream: bool,
+    /// (Consumer only) Read an existing collection **non-destructively** and resumably, paging by `_id`
+    /// (`find({_id:{$gt:last}}).sort({_id:1})`) and persisting the last read `_id` under `cursor_id`.
+    /// Supports ObjectId / UUID / integer `_id`. Does not modify the source collection.
+    /// Mutually exclusive with `change_stream`. Defaults to false.
+    #[serde(default)]
+    pub resumable: bool,
+    /// (Consumer only) Where to persist the resume cursor in `resumable` mode. A URL selects the
+    /// backend; a bare name (or `/name`) reuses the **source** database with that collection name:
+    /// - absent → source database, collection `mqb_cursors_<source_collection>` (auto-unique)
+    /// - `/my_cursors` → source database, collection `my_cursors`
+    /// - `file:///var/lib/mqb/cursors.json` → local JSON file (read-only / write-restricted sources)
+    /// - `mongodb://host/db/collection` → external MongoDB collection (collection optional)
+    /// - `postgres://user@host/db/table` or `mysql://host/db/table` → external SQL table (table optional)
+    ///
+    /// When no collection/table is named, it defaults to `mqb_cursors_<source_collection>`.
+    /// May embed connection credentials, so it is treated as a secret.
+    #[cfg_attr(feature = "schema", schemars(extend("format"="password")))]
+    pub checkpoint_store: Option<String>,
     /// (Publisher only) Timeout for request-reply operations in milliseconds. Defaults to 30000ms.
     pub request_timeout_ms: Option<u64>,
     /// (Publisher only) TTL in seconds for documents created by the publisher. If set, a TTL index is created.
@@ -2659,6 +2677,27 @@ pub struct SqlxConfig {
     /// (Consumer only) If true, delete messages after processing.
     #[serde(default)]
     pub delete_after_read: bool,
+    /// (Consumer only) Read an existing table **non-destructively** and resumably, paging by this
+    /// monotonic column (`SELECT * FROM {table} WHERE {cursor_column} > $last ORDER BY {cursor_column} ASC LIMIT n`)
+    /// and persisting the last read value under `cursor_id`. Does not delete/lock source rows.
+    /// Mutually exclusive with `delete_after_read`.
+    pub cursor_column: Option<String>,
+    /// (Consumer only) Cursor id used to key the persisted resume position. Recommended when
+    /// `cursor_column` is set: without it, progress is not persisted and every restart re-copies
+    /// from the beginning.
+    pub cursor_id: Option<String>,
+    /// (Consumer only) Where to persist the resume cursor in `cursor_column` mode. A URL selects the
+    /// backend; a bare name (or `/name`) reuses the **source** datastore with that table name:
+    /// - absent → source datastore, table `mqb_cursors_<source_table>` (auto-unique)
+    /// - `/my_cursors` → source datastore, table `my_cursors`
+    /// - `file:///var/lib/mqb/cursors.json` → local JSON file (read-only / write-restricted sources)
+    /// - `postgres://user@host/db/table` or `mysql://host/db/table` → external SQL table (table optional)
+    /// - `mongodb://host/db/collection` → external MongoDB collection (collection optional)
+    ///
+    /// When no table/collection is named, it defaults to `mqb_cursors_<source_table>`.
+    /// May embed connection credentials, so it is treated as a secret.
+    #[cfg_attr(feature = "schema", schemars(extend("format"="password")))]
+    pub checkpoint_store: Option<String>,
     /// (Publisher only) If true, automatically create the table and indexes if they don't exist. Defaults to false.
     #[serde(default)]
     pub auto_create_table: bool,

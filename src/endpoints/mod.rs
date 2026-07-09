@@ -817,7 +817,14 @@ async fn create_base_consumer(
             Ok(boxed(grpc::GrpcConsumer::new(&config).await?))
         }
         #[cfg(feature = "sqlx")]
-        EndpointType::Sqlx(cfg) => Ok(boxed(sqlx::SqlxConsumer::new(cfg).await?)),
+        EndpointType::Sqlx(cfg) => {
+            if cfg.cursor_column.is_some() {
+                // Non-destructive, resumable cursor read of an arbitrary table.
+                Ok(boxed(sqlx::SqlxCursorReader::new(cfg).await?))
+            } else {
+                Ok(boxed(sqlx::SqlxConsumer::new(cfg).await?))
+            }
+        }
         #[cfg(feature = "http")]
         EndpointType::Http(cfg) => Ok(boxed(http::HttpConsumer::new(cfg).await?)),
         #[cfg(feature = "websocket")]
@@ -835,7 +842,10 @@ async fn create_base_consumer(
             if config.collection.is_none() {
                 config.collection = Some(route_name.to_string());
             }
-            if config.change_stream {
+            if config.resumable {
+                // Non-destructive, resumable `_id`-cursor read of an arbitrary collection.
+                Ok(boxed(mongodb::MongoDbIdReader::new(&config).await?))
+            } else if config.change_stream {
                 if config.ttl_seconds.is_none() {
                     config.ttl_seconds = Some(86400); // Remove events by default after 24 hours
                 }

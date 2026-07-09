@@ -3,6 +3,8 @@
 //  Licensed under MIT License, see License file for more details
 //  git clone https://github.com/marcomq/mq-bridge
 pub mod canonical_message;
+#[cfg(any(feature = "mongodb", feature = "sqlx"))]
+pub mod checkpoint;
 pub mod command_handler;
 pub mod connection_registry;
 pub mod endpoints;
