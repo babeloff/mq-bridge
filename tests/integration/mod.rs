@@ -2,6 +2,8 @@
 pub mod amqp;
 #[cfg(feature = "aws")]
 pub mod aws;
+#[cfg(feature = "clickhouse")]
+pub mod clickhouse;
 #[cfg(feature = "grpc")]
 pub mod grpc;
 #[cfg(feature = "http")]

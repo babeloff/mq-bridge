@@ -7,6 +7,8 @@
 pub mod amqp;
 #[cfg(feature = "aws")]
 pub mod aws;
+#[cfg(feature = "clickhouse")]
+pub mod clickhouse;
 pub mod fanout;
 pub mod file;
 #[cfg(feature = "grpc")]
@@ -436,6 +438,16 @@ fn check_consumer_recursive(
             }
             Ok(warnings)
         }
+        #[cfg(feature = "clickhouse")]
+        EndpointType::ClickHouse(cfg) => {
+            if cfg.columns.is_some() {
+                warnings.push("Endpoint 'clickhouse' is used as a consumer, but 'columns' is a publisher-only option and will be ignored.".to_string());
+            }
+            if cfg.async_insert {
+                warnings.push("Endpoint 'clickhouse' is used as a consumer, but 'async_insert' is a publisher-only option and will be ignored.".to_string());
+            }
+            Ok(warnings)
+        }
         #[cfg(feature = "sqlx")]
         EndpointType::Sqlx(cfg) => {
             if cfg.insert_query.is_some() {
@@ -825,6 +837,17 @@ async fn create_base_consumer(
                 Ok(boxed(sqlx::SqlxConsumer::new(cfg).await?))
             }
         }
+        #[cfg(feature = "clickhouse")]
+        EndpointType::ClickHouse(cfg) => {
+            if cfg.cursor_column.is_some() {
+                // ClickHouse has no native queue; only non-destructive cursor reads are supported.
+                Ok(boxed(clickhouse::ClickHouseCursorReader::new(cfg).await?))
+            } else {
+                Err(anyhow::anyhow!(
+                    "ClickHouse endpoint used as a consumer requires 'cursor_column' (ClickHouse has no native queue; only non-destructive cursor reads are supported)."
+                ))
+            }
+        }
         #[cfg(feature = "http")]
         EndpointType::Http(cfg) => Ok(boxed(http::HttpConsumer::new(cfg).await?)),
         #[cfg(feature = "websocket")]
@@ -1135,6 +1158,19 @@ fn check_publisher_recursive(
             }
             Ok(warnings)
         }
+        #[cfg(feature = "clickhouse")]
+        EndpointType::ClickHouse(cfg) => {
+            if cfg.cursor_column.is_some() {
+                warnings.push("Endpoint 'clickhouse' is used as a publisher, but 'cursor_column' is a consumer-only option and will be ignored.".to_string());
+            }
+            if cfg.checkpoint_store.is_some() {
+                warnings.push("Endpoint 'clickhouse' is used as a publisher, but 'checkpoint_store' is a consumer-only option and will be ignored.".to_string());
+            }
+            if cfg.polling_interval_ms.is_some() {
+                warnings.push("Endpoint 'clickhouse' is used as a publisher, but 'polling_interval_ms' is a consumer-only option and will be ignored.".to_string());
+            }
+            Ok(warnings)
+        }
         #[cfg(any(feature = "ibm-mq-static", feature = "ibm-mq"))]
         EndpointType::IbmMq(cfg) => {
             if cfg.wait_timeout_ms != 1000 {
@@ -1410,6 +1446,11 @@ async fn create_base_publisher(
         #[cfg(feature = "sqlx")]
         EndpointType::Sqlx(cfg) => {
             Ok(Box::new(sqlx::SqlxPublisher::new(cfg).await?) as Box<dyn MessagePublisher>)
+        }
+        #[cfg(feature = "clickhouse")]
+        EndpointType::ClickHouse(cfg) => {
+            Ok(Box::new(clickhouse::ClickHousePublisher::new(cfg).await?)
+                as Box<dyn MessagePublisher>)
         }
         #[cfg(feature = "http")]
         EndpointType::Http(cfg) => {

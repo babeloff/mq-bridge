@@ -283,6 +283,14 @@ async fn test_all_status() {
             integration::aws::test_aws_status().await;
         }
     }
+
+    #[cfg(feature = "clickhouse")]
+    {
+        if should_run("clickhouse") {
+            println!("\n\n>>> Starting ClickHouse Status Test...");
+            integration::clickhouse::test_clickhouse_status().await;
+        }
+    }
 }
 
 #[cfg(feature = "sqlx")]
@@ -291,6 +299,15 @@ async fn test_all_status() {
 async fn test_sqlx_multicolumn() {
     if should_run("sqlx") || should_run("postgres") {
         integration::postgres::test_postgres_multicolumn().await;
+    }
+}
+
+#[cfg(feature = "clickhouse")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires docker compose"]
+async fn test_clickhouse() {
+    if should_run("clickhouse") {
+        integration::clickhouse::test_clickhouse_roundtrip().await;
     }
 }
 

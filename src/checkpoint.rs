@@ -350,7 +350,7 @@ mod tests {
 
     #[tokio::test]
     async fn file_store_round_trips_and_overwrites() {
-        let dir = std::env::temp_dir().join(format!("mqb_ckpt_{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("mqb_ckpt_{}", fast_uuid_v7::gen_id()));
         let path = dir.join("cursors.json");
         let store = FileCheckpointStore::new(path.clone(), "coll:cursor:c1");
 
@@ -486,7 +486,7 @@ mod tests {
     // lose any update (unsynchronized read-modify-write + a shared temp name would).
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn file_store_concurrent_saves_do_not_lose_updates() {
-        let dir = std::env::temp_dir().join(format!("mqb_ckpt_conc_{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("mqb_ckpt_conc_{}", fast_uuid_v7::gen_id()));
         let path = dir.join("cursors.json");
         const N: usize = 50;
 

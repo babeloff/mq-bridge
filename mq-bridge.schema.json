@@ -200,6 +200,115 @@
         "max_delay_ms"
       ]
     },
+    "ClickHouseConfig": {
+      "description": "ClickHouse endpoint configuration (talks the ClickHouse HTTP interface).\n\nAs a **publisher** it batch-inserts messages using `FORMAT JSONEachRow` — by default the whole\nmessage payload (which must be a JSON object) becomes one row; set `columns` to build each row\nfrom explicit `${payload:<field>}` / `${metadata:<key>}` tokens instead. As a **consumer** it\nreads an existing table **non-destructively** by paging over a monotonic `cursor_column`\n(ClickHouse has no native queue/pub-sub), serializing each row to a JSON payload.",
+      "type": "object",
+      "properties": {
+        "async_insert": {
+          "description": "(Publisher only) If true, set the ClickHouse `async_insert=1` server setting so inserts are\nbuffered server-side. Defaults to false.",
+          "type": "boolean",
+          "default": false
+        },
+        "checkpoint_store": {
+          "description": "(Consumer only) Where to persist the resume cursor. Because ClickHouse is unsuited to per-row\ncursor upserts, a durable checkpoint requires an **external** store URL:\n- `file:///var/lib/mqb/cursors.json` → local JSON file\n- `postgres://user@host/db/table` / `mysql://host/db/table` → external SQL table (table optional)\n- `mongodb://host/db/collection` → external MongoDB collection (collection optional)\n\nMay embed connection credentials, so it is treated as a secret.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "password"
+        },
+        "columns": {
+          "description": "(Publisher only) Optional per-column mapping. Each entry maps a target column name to a value\ntoken: `${payload:<field>}` takes the top-level JSON field `<field>` of the payload (JSON type\npreserved), `${metadata:<key>}` takes `message.metadata[\"<key>\"]` (as a string), and any other\nvalue is inserted literally. When omitted, the whole payload JSON object is inserted as one row.",
+          "type": [
+            "object",
+            "null"
+          ],
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "cursor_column": {
+          "description": "(Consumer only) Read an existing table **non-destructively** and resumably, paging by this\nmonotonic column (`SELECT … WHERE {cursor_column} > {last} ORDER BY {cursor_column} ASC LIMIT n`)\nand persisting the last read value under `cursor_id`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "cursor_id": {
+          "description": "(Consumer only) Cursor id used to key the persisted resume position. Without it, progress is not\npersisted and every restart re-copies from the beginning.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "database": {
+          "description": "Database name. Defaults to `default`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "password": {
+          "description": "Optional password. Takes precedence over any credentials embedded in the `url`.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "password",
+          "default": null
+        },
+        "polling_interval_ms": {
+          "description": "(Consumer only) Polling interval in milliseconds when the table is drained. Defaults to 100ms.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "select_columns": {
+          "description": "(Consumer only) Columns to select in `cursor_column` mode. Defaults to `*`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "table": {
+          "description": "The table to read from / write to. May be schema-qualified (`db.table`).",
+          "type": "string"
+        },
+        "tls": {
+          "description": "TLS configuration for `https://` connections.",
+          "$ref": "#/$defs/TlsConfig",
+          "default": {
+            "accept_invalid_certs": false,
+            "ca_file": null,
+            "cert_file": null,
+            "cert_password": null,
+            "key_file": null,
+            "required": false
+          }
+        },
+        "url": {
+          "description": "ClickHouse HTTP endpoint URL, e.g. `http://localhost:8123` (or `https://…`). If it contains\nuserinfo, it will be treated as a secret.",
+          "type": "string",
+          "format": "password"
+        },
+        "username": {
+          "description": "Optional username. Takes precedence over any credentials embedded in the `url`. Defaults to `default`.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "url",
+        "table"
+      ]
+    },
     "CookieJarMiddleware": {
       "description": "Cookie/session jar middleware configuration.\n\nOptimized for HTTP by default: it can read `cookie` and `set-cookie` metadata,\npersist session cookies, and inject them into later outgoing requests.\n\nThe middleware can also capture arbitrary metadata values into the same session store\nand optionally expose stored values back into message metadata.",
       "type": "object",
@@ -510,6 +619,17 @@
           },
           "required": [
             "sqlx"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "clickhouse": {
+              "$ref": "#/$defs/ClickHouseConfig"
+            }
+          },
+          "required": [
+            "clickhouse"
           ]
         },
         {

@@ -716,6 +716,8 @@ pub enum EndpointType {
     RedisStreams(RedisStreamsConfig),
     Grpc(GrpcConfig),
     Sqlx(SqlxConfig),
+    #[serde(rename = "clickhouse", alias = "click_house")]
+    ClickHouse(ClickHouseConfig),
     Fanout(Vec<Endpoint>),
     #[serde(rename = "stream_buffer")]
     StreamBuffer(StreamBufferConfig),
@@ -751,6 +753,7 @@ impl EndpointType {
             EndpointType::RedisStreams(_) => "redis_streams",
             EndpointType::Grpc(_) => "grpc",
             EndpointType::Sqlx(_) => "sqlx",
+            EndpointType::ClickHouse(_) => "clickhouse",
             EndpointType::Fanout(_) => "fanout",
             EndpointType::StreamBuffer(_) => "stream_buffer",
             EndpointType::Switch(_) => "switch",
@@ -2722,6 +2725,68 @@ pub struct SqlxConfig {
     pub shared: Option<bool>,
 }
 
+// --- ClickHouse Specific Configuration ---
+
+/// ClickHouse endpoint configuration (talks the ClickHouse HTTP interface).
+///
+/// As a **publisher** it batch-inserts messages using `FORMAT JSONEachRow` — by default the whole
+/// message payload (which must be a JSON object) becomes one row; set `columns` to build each row
+/// from explicit `${payload:<field>}` / `${metadata:<key>}` tokens instead. As a **consumer** it
+/// reads an existing table **non-destructively** by paging over a monotonic `cursor_column`
+/// (ClickHouse has no native queue/pub-sub), serializing each row to a JSON payload.
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct ClickHouseConfig {
+    /// ClickHouse HTTP endpoint URL, e.g. `http://localhost:8123` (or `https://…`). If it contains
+    /// userinfo, it will be treated as a secret.
+    #[cfg_attr(feature = "schema", schemars(extend("format"="password")))]
+    pub url: String,
+    /// Optional username. Takes precedence over any credentials embedded in the `url`. Defaults to `default`.
+    #[serde(default)]
+    pub username: Option<String>,
+    /// Optional password. Takes precedence over any credentials embedded in the `url`.
+    #[cfg_attr(feature = "schema", schemars(extend("format"="password")))]
+    #[serde(default)]
+    pub password: Option<String>,
+    /// Database name. Defaults to `default`.
+    pub database: Option<String>,
+    /// The table to read from / write to. May be schema-qualified (`db.table`).
+    pub table: String,
+    /// (Publisher only) Optional per-column mapping. Each entry maps a target column name to a value
+    /// token: `${payload:<field>}` takes the top-level JSON field `<field>` of the payload (JSON type
+    /// preserved), `${metadata:<key>}` takes `message.metadata["<key>"]` (as a string), and any other
+    /// value is inserted literally. When omitted, the whole payload JSON object is inserted as one row.
+    pub columns: Option<std::collections::BTreeMap<String, String>>,
+    /// (Publisher only) If true, set the ClickHouse `async_insert=1` server setting so inserts are
+    /// buffered server-side. Defaults to false.
+    #[serde(default)]
+    pub async_insert: bool,
+    /// (Consumer only) Read an existing table **non-destructively** and resumably, paging by this
+    /// monotonic column (`SELECT … WHERE {cursor_column} > {last} ORDER BY {cursor_column} ASC LIMIT n`)
+    /// and persisting the last read value under `cursor_id`.
+    pub cursor_column: Option<String>,
+    /// (Consumer only) Cursor id used to key the persisted resume position. Without it, progress is not
+    /// persisted and every restart re-copies from the beginning.
+    pub cursor_id: Option<String>,
+    /// (Consumer only) Where to persist the resume cursor. Because ClickHouse is unsuited to per-row
+    /// cursor upserts, a durable checkpoint requires an **external** store URL:
+    /// - `file:///var/lib/mqb/cursors.json` → local JSON file
+    /// - `postgres://user@host/db/table` / `mysql://host/db/table` → external SQL table (table optional)
+    /// - `mongodb://host/db/collection` → external MongoDB collection (collection optional)
+    ///
+    /// May embed connection credentials, so it is treated as a secret.
+    #[cfg_attr(feature = "schema", schemars(extend("format"="password")))]
+    pub checkpoint_store: Option<String>,
+    /// (Consumer only) Columns to select in `cursor_column` mode. Defaults to `*`.
+    pub select_columns: Option<String>,
+    /// (Consumer only) Polling interval in milliseconds when the table is drained. Defaults to 100ms.
+    pub polling_interval_ms: Option<u64>,
+    /// TLS configuration for `https://` connections.
+    #[serde(default)]
+    pub tls: TlsConfig,
+}
+
 // --- Common Configuration ---
 
 /// TLS configuration for secure connections.
@@ -2968,6 +3033,9 @@ impl SecretExtractor for EndpointType {
             EndpointType::Sqlx(cfg) => {
                 cfg.extract_secrets(&format!("{}__{}", prefix, "SQLX"), secrets)
             }
+            EndpointType::ClickHouse(cfg) => {
+                cfg.extract_secrets(&format!("{}__{}", prefix, "CLICKHOUSE"), secrets)
+            }
             EndpointType::Grpc(cfg) => {
                 cfg.extract_secrets(&format!("{}__{}", prefix, "GRPC"), secrets)
             }
@@ -3165,6 +3233,23 @@ impl SecretExtractor for SqlxConfig {
         }
         if let Some(val) = self.password.take() {
             secrets.insert(format!("{}__{}", prefix, "PASSWORD"), val);
+        }
+        self.tls
+            .extract_secrets(&format!("{}__{}", prefix, "TLS"), secrets);
+    }
+}
+
+impl SecretExtractor for ClickHouseConfig {
+    fn extract_secrets(&mut self, prefix: &str, secrets: &mut HashMap<String, String>) {
+        extract_sensitive_url(&mut self.url, prefix, "URL", secrets);
+        if let Some(val) = self.username.take() {
+            secrets.insert(format!("{}__{}", prefix, "USERNAME"), val);
+        }
+        if let Some(val) = self.password.take() {
+            secrets.insert(format!("{}__{}", prefix, "PASSWORD"), val);
+        }
+        if let Some(val) = self.checkpoint_store.take() {
+            secrets.insert(format!("{}__{}", prefix, "CHECKPOINT_STORE"), val);
         }
         self.tls
             .extract_secrets(&format!("{}__{}", prefix, "TLS"), secrets);

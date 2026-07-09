@@ -134,6 +134,11 @@ aws-sdk-sns = { version = "1.93", optional = true, default-features = false, fea
 # SQLx
 sqlx = { version = "0.9", features = ["runtime-tokio", "tls-rustls", "postgres", "mysql", "sqlite", "any"], optional = true }
 
+# ClickHouse — talks the ClickHouse HTTP interface directly (JSONEachRow in/out).
+# reqwest is used rather than the typed `clickhouse` crate because that crate is
+# RowBinary/`Row`-derive only and cannot round-trip arbitrary dynamic JSON payloads.
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "http2", "charset", "query", "gzip"], optional = true }
+
 # ZeroMQ
 zeromq = { version = "0.6", optional = true }
 
@@ -168,7 +173,7 @@ middleware = ["metrics", "dedup"]
 # runtime the client is loaded lazily only when an ibm-mq endpoint is opened
 # (clear error if the client isn't installed). Use `ibm-mq-static` instead for
 # static linking.
-full = ["middleware", "mongodb", "kafka", "amqp", "nats", "mqtt", "http", "aws", "zeromq", "redis-streams", "sled", "grpc", "sqlx", "websocket", "rustls-aws-lc", "ibm-mq"]
+full = ["middleware", "mongodb", "kafka", "amqp", "nats", "mqtt", "http", "aws", "zeromq", "redis-streams", "sled", "grpc", "sqlx", "clickhouse", "websocket", "rustls-aws-lc", "ibm-mq"]
 
 # Functionality features
 dedup = ["sled"]
@@ -216,6 +221,7 @@ redis-streams = ["dep:redis"]
 # Note: The grpc feature requires protobuf-src which can significantly increase build times.
 grpc = ["tonic", "prost", "tokio-stream", "tonic-prost", "tonic-prost-build", "protoc-bin-vendored", "rustls"]
 sqlx = ["dep:sqlx", "url"]
+clickhouse = ["dep:reqwest", "dep:flate2", "url"]
 
 [dev-dependencies]
 config = { version = "0.15" }
