@@ -1414,6 +1414,14 @@
             "null"
           ]
         },
+        "partition_key": {
+          "description": "(Publisher only) Name of a metadata field whose value is used as the Kafka record\nkey (drives partitioning/ordering). Unset, or absent on a given message, falls back\nto the message id. Default unset.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
         "partitions": {
           "description": "(Publisher only) Partition count used when auto-creating the topic (default: 6).\nHigher values raise write/consume parallelism; ordering is only guaranteed per\npartition key (message_id), not across the whole topic. Ignored if the topic exists.",
           "type": [
@@ -2052,6 +2060,11 @@
       "description": "General NATS connection configuration.",
       "type": "object",
       "properties": {
+        "deduplicate": {
+          "description": "(Publisher only, JetStream) If true, publish a `Nats-Msg-Id` header (from the message id) so\nJetStream deduplicates redeliveries within the stream's duplicate window. Defaults to false.",
+          "type": "boolean",
+          "default": false
+        },
         "delayed_ack": {
           "description": "(Publisher only) If true, do not wait for an acknowledgement when sending to broker. Defaults to false.",
           "type": "boolean",

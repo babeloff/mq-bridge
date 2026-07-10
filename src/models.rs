@@ -3206,6 +3206,13 @@ impl SecretExtractor for MongoDbConfig {
         if let Some(val) = self.password.take() {
             secrets.insert(format!("{}__{}", prefix, "PASSWORD"), val);
         }
+        // The checkpoint store URL may embed connection credentials.
+        extract_sensitive_optional_url(
+            &mut self.checkpoint_store,
+            prefix,
+            "CHECKPOINT_STORE",
+            secrets,
+        );
         self.tls
             .extract_secrets(&format!("{}__{}", prefix, "TLS"), secrets);
     }

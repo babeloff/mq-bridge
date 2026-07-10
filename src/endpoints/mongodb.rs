@@ -1862,9 +1862,7 @@ async fn open_change_stream(
     watch.await.map_err(|e| {
         // Preserve the source `mongodb::error::Error` (via `.context`, not stringified) so callers
         // can downcast it — `capture_all` only falls back to the `_id` reader for code 40573.
-        anyhow::Error::new(e).context(format!(
-            "Failed to open MongoDB change stream for '{name}' (requires a replica set)"
-        ))
+        anyhow::Error::new(e).context(format!("Failed to open MongoDB change stream for '{name}'"))
     })
 }
 

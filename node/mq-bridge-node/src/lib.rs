@@ -13,6 +13,7 @@ use core::traits::{BatchCommitFunc, Handler, MessageConsumer, MessageDisposition
 use core::type_handler::TypeHandler;
 use core::{
     CanonicalMessage, Handled, HandlerError, Publisher as CorePublisher, Route as CoreRoute, Sent,
+    SentBatch,
 };
 use mq_bridge_bindings_common as common;
 use napi::bindgen_prelude::*;
@@ -607,14 +608,24 @@ impl Publisher {
 
     async fn send_batch_on_runtime(&self, messages: Vec<CanonicalMessage>) -> Result<()> {
         let publisher = self.publisher.clone();
+        let count = messages.len();
         let handle = self
             .runtime
             .spawn(async move { publisher.send_batch(messages).await });
-        handle
+        match handle
             .await
             .map_err(to_napi_error)?
-            .map_err(to_napi_error)?;
-        Ok(())
+            .map_err(to_napi_error)?
+        {
+            SentBatch::Ack => Ok(()),
+            // A `Partial` with no failures (e.g. request-reply responses) is a full success.
+            SentBatch::Partial { failed, .. } if failed.is_empty() => Ok(()),
+            SentBatch::Partial { failed, .. } => Err(to_napi_error(format!(
+                "sendBatch: {} of {count} message(s) failed to publish. First error: {}",
+                failed.len(),
+                failed[0].1
+            ))),
+        }
     }
 
     async fn request_on_runtime(&self, message: CanonicalMessage) -> Result<NativeMessage> {

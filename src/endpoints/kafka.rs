@@ -645,11 +645,11 @@ fn process_message<M: Message>(
                     if let Ok(uuid) = Uuid::parse_str(&id_str) {
                         message_id = Some(uuid.as_u128());
                         break;
-                    } else if id_str.starts_with("0x") || id_str.starts_with("0X") {
-                        if let Ok(n) = u128::from_str_radix(
-                            id_str.trim_start_matches("0x").trim_start_matches("0X"),
-                            16,
-                        ) {
+                    } else if let Some(hex) = id_str
+                        .strip_prefix("0x")
+                        .or_else(|| id_str.strip_prefix("0X"))
+                    {
+                        if let Ok(n) = u128::from_str_radix(hex, 16) {
                             message_id = Some(n);
                             break;
                         }

@@ -22,6 +22,7 @@ use core::traits::{Handler, MessageConsumer, MessageDisposition};
 use core::type_handler::TypeHandler;
 use core::{
     CanonicalMessage, Handled, HandlerError, Publisher as CorePublisher, Route as CoreRoute, Sent,
+    SentBatch,
 };
 use mq_bridge_bindings_common as common;
 use pyo3::conversion::IntoPyObjectExt;
@@ -821,8 +822,17 @@ impl Publisher {
         let runtime = Arc::clone(&self.runtime);
         py.detach(move || {
             run_sync_task(&runtime, async move {
-                publisher.send_batch(batch).await?;
-                Ok(())
+                let count = batch.len();
+                match publisher.send_batch(batch).await? {
+                    SentBatch::Ack => Ok(()),
+                    // A `Partial` with no failures (e.g. request-reply responses) is a full success.
+                    SentBatch::Partial { failed, .. } if failed.is_empty() => Ok(()),
+                    SentBatch::Partial { failed, .. } => Err(anyhow::anyhow!(
+                        "send_batch: {} of {count} message(s) failed to publish. First error: {}",
+                        failed.len(),
+                        failed[0].1
+                    )),
+                }
             })
         })
         .map_err(to_py_runtime_error)
