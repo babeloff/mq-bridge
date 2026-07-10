@@ -198,6 +198,7 @@ class KafkaConfig(TypedDict, total=False):
     consumer_options: Optional[List[List[Any]]]
     delayed_ack: bool
     group_id: Optional[str]
+    partition_key: Optional[str]
     partitions: Optional[int]
     password: Optional[str]
     producer_options: Optional[List[List[Any]]]
@@ -287,6 +288,7 @@ class MqttConfig(TypedDict, total=False):
 
 class NatsConfig(TypedDict, total=False):
     """General NATS connection configuration."""
+    deduplicate: bool
     delayed_ack: bool
     deliver_policy: Optional[NatsDeliverPolicy]
     no_jetstream: bool
