@@ -503,12 +503,39 @@ impl MessagePublisher for SqlxPublisher {
 
         // Manually construct the query with appropriate placeholders because
         // sqlx::QueryBuilder with the `Any` driver does not correctly rewrite `?` to `$N`.
-        let base_query = match self.insert_query.to_uppercase().rfind("VALUES") {
-            Some(pos) => &self.insert_query[..pos],
+        let values_pos = match self.insert_query.to_uppercase().rfind("VALUES") {
+            Some(pos) => pos,
             None => {
                 warn!("Could not optimize batch insert due to custom query format. Falling back to iterative inserts.");
                 return self.send_batch_iterative(messages).await;
             }
+        };
+        let base_query = &self.insert_query[..values_pos];
+        // Preserve any clause after the VALUES tuple (e.g. ON CONFLICT … DO UPDATE, ON DUPLICATE
+        // KEY UPDATE, RETURNING). Single-row send() keeps it verbatim; without this the batch
+        // rebuild would silently drop it, making batched inserts non-idempotent.
+        let after_values = values_pos + "VALUES".len();
+        let values_suffix = match self.insert_query[after_values..].find('(') {
+            Some(rel_open) => {
+                let open = after_values + rel_open;
+                let mut depth = 0usize;
+                let mut end = None;
+                for (idx, ch) in self.insert_query[open..].char_indices() {
+                    match ch {
+                        '(' => depth += 1,
+                        ')' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                end = Some(open + idx + ch.len_utf8());
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                end.map(|e| &self.insert_query[e..]).unwrap_or("")
+            }
+            None => "",
         };
 
         // The `(payload)` single-column guard only applies to legacy mode; a
@@ -538,7 +565,7 @@ impl MessagePublisher for SqlxPublisher {
             placeholders.push(')');
         }
 
-        let sql = format!("{} VALUES {}", base_query, placeholders);
+        let sql = format!("{} VALUES {}{}", base_query, placeholders, values_suffix);
 
         let mut query = sqlx::query(audited_sql(&sql));
         for msg in &messages {
@@ -1395,7 +1422,9 @@ impl MessageConsumer for SqlxCursorReader {
         for row in &rows {
             let cursor = extract_cursor(row, &self.cursor_column).ok_or_else(|| {
                 ConsumerError::Connection(anyhow!(
-                    "cursor_column '{}' missing or of unsupported type in result row",
+                    "cursor_column '{}' is missing or of a type the SQL `Any` driver cannot decode \
+                     (only integer and text cursors are supported). CAST it to BIGINT/TEXT in a view, \
+                     or point cursor_column at an integer or text column.",
                     self.cursor_column
                 ))
             })?;
@@ -1414,14 +1443,16 @@ impl MessageConsumer for SqlxCursorReader {
                 emit_len -= 1;
             }
             if emit_len == 0 {
-                // A single cursor value fills the whole batch: it cannot be split safely.
-                // Emit the batch and advance past the value, warning that any further rows
-                // sharing this exact value may be skipped.
-                warn!(
-                    column = %self.cursor_column,
-                    "cursor_column has a group of equal values larger than the batch size; increase batch_size to avoid skipping rows at this value"
-                );
-                emit_len = max_messages;
+                // A single cursor value fills the whole batch and more rows with that value exist
+                // beyond it. Advancing past the value would silently skip the remainder, so fail
+                // loudly instead of losing rows.
+                return Err(ConsumerError::Connection(anyhow!(
+                    "cursor_column '{}' has a group of equal values larger than batch_size ({}); \
+                     cannot page without skipping rows. Increase batch_size above the size of the \
+                     largest equal-value group.",
+                    self.cursor_column,
+                    max_messages
+                )));
             }
         }
         fetched.truncate(emit_len);

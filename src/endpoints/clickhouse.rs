@@ -266,6 +266,7 @@ impl MessagePublisher for ClickHousePublisher {
 #[derive(Debug, Clone, PartialEq)]
 enum ChCursor {
     Int(i64),
+    Uint(u64),
     Text(String),
 }
 
@@ -273,6 +274,7 @@ impl ChCursor {
     fn encode(&self) -> String {
         match self {
             ChCursor::Int(n) => format!("int:{}", n),
+            ChCursor::Uint(n) => format!("uint:{}", n),
             ChCursor::Text(s) => format!("str:{}", s),
         }
     }
@@ -281,6 +283,7 @@ impl ChCursor {
         let (tag, val) = s.split_once(':')?;
         match tag {
             "int" => val.parse::<i64>().ok().map(ChCursor::Int),
+            "uint" => val.parse::<u64>().ok().map(ChCursor::Uint),
             "str" => Some(ChCursor::Text(val.to_string())),
             _ => None,
         }
@@ -290,15 +293,20 @@ impl ChCursor {
     fn param(&self) -> (&'static str, String) {
         match self {
             ChCursor::Int(n) => ("Int64", n.to_string()),
+            ChCursor::Uint(n) => ("UInt64", n.to_string()),
             ChCursor::Text(s) => ("String", s.clone()),
         }
     }
 }
 
-/// Extract the cursor value from a JSONEachRow row object.
+/// Extract the cursor value from a JSONEachRow row object. Numbers prefer `Int64`, falling back to
+/// `UInt64` for values above `i64::MAX` (ClickHouse's common full-range UInt64 ids).
 fn extract_cursor(row: &serde_json::Value, column: &str) -> Option<ChCursor> {
     match row.get(column) {
-        Some(serde_json::Value::Number(n)) => n.as_i64().map(ChCursor::Int),
+        Some(serde_json::Value::Number(n)) => n
+            .as_i64()
+            .map(ChCursor::Int)
+            .or_else(|| n.as_u64().map(ChCursor::Uint)),
         Some(serde_json::Value::String(s)) => Some(ChCursor::Text(s.clone())),
         _ => None,
     }
@@ -376,16 +384,40 @@ impl ClickHouseCursorReader {
             }),
             None => None,
         };
+        // Validate select_columns for the same injection-safe invariant as table/cursor_column, and
+        // require the cursor_column to be present so `extract_cursor` can page (a `*` covers it).
+        let select_columns = config
+            .select_columns
+            .clone()
+            .unwrap_or_else(|| "*".to_string());
+        if select_columns.trim() != "*" {
+            let cols: Vec<String> = select_columns
+                .split(',')
+                .map(|c| c.trim().to_string())
+                .collect();
+            for c in &cols {
+                if !is_valid_ident(c, false) {
+                    return Err(anyhow!(
+                        "Invalid column '{}' in select_columns: only simple identifiers or '*' are allowed.",
+                        c
+                    ));
+                }
+            }
+            if !cols.iter().any(|c| c == &cursor_column) {
+                return Err(anyhow!(
+                    "select_columns must include the cursor_column '{}' so the reader can page by it.",
+                    cursor_column
+                ));
+            }
+        }
+
         info!(table = %config.table, column = %cursor_column, has_checkpoint = %last_value.is_some(), "ClickHouse cursor reader connected");
 
         Ok(Self {
             client,
             table: config.table.clone(),
             cursor_column,
-            select_columns: config
-                .select_columns
-                .clone()
-                .unwrap_or_else(|| "*".to_string()),
+            select_columns,
             polling_interval: Duration::from_millis(config.polling_interval_ms.unwrap_or(100)),
             checkpoint,
             last_value: Arc::new(Mutex::new(last_value)),
@@ -483,11 +515,16 @@ impl MessageConsumer for ClickHouseCursorReader {
                 emit_len -= 1;
             }
             if emit_len == 0 {
-                warn!(
-                    column = %self.cursor_column,
-                    "cursor_column has a group of equal values larger than the batch size; increase batch_size to avoid skipping rows at this value"
-                );
-                emit_len = max_messages;
+                // The whole page shares one cursor value and more rows with that value exist beyond
+                // it. Advancing past the value would silently skip the remainder, so fail loudly
+                // instead of losing rows.
+                return Err(ConsumerError::Connection(anyhow!(
+                    "cursor_column '{}' has a group of equal values larger than batch_size ({}); \
+                     cannot page without skipping rows. Increase batch_size above the size of the \
+                     largest equal-value group.",
+                    self.cursor_column,
+                    max_messages
+                )));
             }
         }
         fetched.truncate(emit_len);
