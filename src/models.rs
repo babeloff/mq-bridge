@@ -1803,6 +1803,25 @@ pub enum MongoDbFormat {
     Raw,
 }
 
+/// How a MongoDB endpoint consumes a collection. One intent-named selector — the bridge picks the
+/// underlying mechanism (change stream vs. polling) automatically. Defaults to `consumer`.
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum MongoConsume {
+    /// **Queue** — durably drain a queue collection: claim, process, resume after restart. Default.
+    #[default]
+    Consumer,
+    /// **Queue, ephemeral** — receive only new messages, no durable position (fan-out subscriber).
+    Subscriber,
+    /// **Watch existing collection** — capture changes from now on (insert/update/delete), resuming
+    /// under `cursor_id`. Reads an existing collection non-destructively.
+    CaptureNew,
+    /// **Watch existing collection** — read the existing documents first, then capture changes.
+    /// Reads an existing collection non-destructively.
+    CaptureAll,
+}
+
 // --- MongoDB Specific Configuration ---
 
 /// General MongoDB connection configuration.
@@ -1835,17 +1854,17 @@ pub struct MongoDbConfig {
     /// (Publisher only) If true, the publisher will wait for a response in a dedicated collection. Defaults to false.
     #[serde(default)]
     pub request_reply: bool,
-    /// (Consumer only) If true, use Change Streams (**Subscriber mode**). Defaults to false (polling/consumer mode).
+    /// (Consumer only) How to consume the collection: `consumer` (default, durable queue),
+    /// `subscriber` (ephemeral queue), `capture_new` (watch an existing collection for changes), or
+    /// `capture_all` (read existing documents first, then watch for changes). The bridge selects the
+    /// underlying mechanism automatically. If unset, the deprecated `change_stream` boolean is
+    /// honored for backward compatibility.
+    pub consume: Option<MongoConsume>,
+    /// (Consumer only) **Deprecated** — use `consume: subscriber`. Kept for compatibility.
     #[serde(default)]
     pub change_stream: bool,
-    /// (Consumer only) Read an existing collection **non-destructively** and resumably, paging by `_id`
-    /// (`find({_id:{$gt:last}}).sort({_id:1})`) and persisting the last read `_id` under `cursor_id`.
-    /// Supports ObjectId / UUID / integer `_id`. Does not modify the source collection.
-    /// Mutually exclusive with `change_stream`. Defaults to false.
-    #[serde(default)]
-    pub resumable: bool,
-    /// (Consumer only) Where to persist the resume cursor in `resumable` mode. A URL selects the
-    /// backend; a bare name (or `/name`) reuses the **source** database with that collection name:
+    /// (Consumer only) Where to persist the resume cursor in `capture_new`/`capture_all` mode. A URL
+    /// selects the backend; a bare name (or `/name`) reuses the **source** database with that name:
     /// - absent → source database, collection `mqb_cursors_<source_collection>` (auto-unique)
     /// - `/my_cursors` → source database, collection `my_cursors`
     /// - `file:///var/lib/mqb/cursors.json` → local JSON file (read-only / write-restricted sources)
@@ -1905,6 +1924,19 @@ impl MongoDbConfig {
     pub fn with_change_stream(mut self, change_stream: bool) -> Self {
         self.change_stream = change_stream;
         self
+    }
+
+    /// The effective consume mode: the explicit `consume` field if set, otherwise derived from the
+    /// deprecated `change_stream` boolean.
+    pub fn resolved_consume(&self) -> MongoConsume {
+        if let Some(mode) = self.consume {
+            return mode;
+        }
+        if self.change_stream {
+            MongoConsume::Subscriber
+        } else {
+            MongoConsume::Consumer
+        }
     }
 }
 
@@ -2704,6 +2736,9 @@ pub struct SqlxConfig {
     /// (Publisher only) If true, automatically create the table and indexes if they don't exist. Defaults to false.
     #[serde(default)]
     pub auto_create_table: bool,
+    /// (Publisher only) PostgreSQL only. Bulk-load batches via `COPY FROM STDIN` (much faster than multi-row INSERT). Requires a token-based `insert_query`; no `ON CONFLICT`/`RETURNING`.
+    #[serde(default)]
+    pub bulk_copy: bool,
     /// (Consumer only) Polling interval in milliseconds. Defaults to 100ms.
     pub polling_interval_ms: Option<u64>,
     /// (Consumer only) If set, the poll interval backs off exponentially from `polling_interval_ms`

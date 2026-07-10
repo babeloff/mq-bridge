@@ -3,6 +3,7 @@
 //  Licensed under MIT License, see License file for more details
 //  git clone https://github.com/marcomq/mq-bridge
 
+use super::poll::PollBackoff;
 use crate::canonical_message::tracing_support::LazyMessageIds;
 use crate::models::SqlxConfig;
 use crate::traits::{
@@ -13,6 +14,7 @@ use crate::CanonicalMessage;
 use anyhow::{anyhow, Context};
 use async_trait::async_trait;
 use sqlx::any::AnyPoolOptions;
+use sqlx::postgres::{PgPool, PgPoolCopyExt, PgPoolOptions};
 use sqlx::{AnyPool, AssertSqlSafe, Column, Row};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -339,6 +341,114 @@ pub struct SqlxPublisher {
     column_sources: Vec<ColumnSource>,
     driver_name: String,
     table: String,
+    /// Present when `bulk_copy` is enabled (PostgreSQL, token-based query). When set,
+    /// `send_batch` streams rows via `COPY FROM STDIN` instead of a multi-row INSERT.
+    copy: Option<PgCopySink>,
+}
+
+/// Bulk-load sink using PostgreSQL `COPY FROM STDIN`. `columns[i]` receives the value
+/// resolved from `sources[i]` — positional, mirroring the token-based INSERT.
+struct PgCopySink {
+    pool: PgPool,
+    table: String,
+    columns: Vec<String>,
+    sources: Vec<ColumnSource>,
+}
+
+/// Escape one text value for the PostgreSQL COPY *text* format (tab-separated, NL-terminated).
+fn copy_escape_text(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '\t' => out.push_str("\\t"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+/// Validate that `raw_query` is COPY-compatible and return its ordered column names.
+///
+/// COPY is positional and cannot evaluate expressions or run `ON CONFLICT`/`RETURNING`,
+/// so we require the exact shape `INSERT INTO <table> (c1, .., cn) VALUES (t1, .., tn)`
+/// where each `ti` is a `${...}` token and nothing else — guaranteeing `columns[i]`
+/// lines up with the i-th resolved value. `token_count` is the number of parsed sources.
+/// Classify a `COPY` failure. A database-reported error (bad data, constraint violation, unknown
+/// column/table) is deterministic — retrying the identical payload fails the same way — so surface
+/// it as non-retryable (dead-letterable) instead of looping forever. Connection/pool/IO failures
+/// are transient and stay retryable (at-least-once).
+fn classify_copy_error(e: sqlx::Error) -> PublisherError {
+    if matches!(e, sqlx::Error::Database(_)) {
+        PublisherError::NonRetryable(anyhow!(e))
+    } else {
+        PublisherError::Retryable(anyhow!(e))
+    }
+}
+
+fn extract_copy_columns(raw_query: &str, token_count: usize) -> anyhow::Result<Vec<String>> {
+    let upper = raw_query.to_uppercase();
+    if upper.contains("ON CONFLICT")
+        || upper.contains("RETURNING")
+        || upper.contains("ON DUPLICATE")
+    {
+        return Err(anyhow!(
+            "bulk_copy cannot be used with ON CONFLICT/RETURNING/ON DUPLICATE clauses (COPY does not support them)."
+        ));
+    }
+    let values_pos = upper.rfind("VALUES").ok_or_else(|| {
+        anyhow!("bulk_copy requires an INSERT ... VALUES query with a column list.")
+    })?;
+
+    // Column list: the parenthesised group in the prefix before VALUES.
+    let prefix = &raw_query[..values_pos];
+    let open = prefix.find('(').ok_or_else(|| {
+        anyhow!(
+            "bulk_copy requires an explicit column list, e.g. INSERT INTO t (a, b) VALUES (...)."
+        )
+    })?;
+    let close = prefix[open..]
+        .find(')')
+        .map(|off| open + off)
+        .ok_or_else(|| anyhow!("bulk_copy: unbalanced parentheses in the column list."))?;
+    let columns: Vec<String> = prefix[open + 1..close]
+        .split(',')
+        .map(|c| c.trim().to_string())
+        .collect();
+    if columns.iter().any(|c| c.is_empty()) || columns.len() != token_count {
+        return Err(anyhow!(
+            "bulk_copy: the column list ({} columns) must match the {} `${{...}}` value token(s), one token per column.",
+            columns.len(),
+            token_count
+        ));
+    }
+
+    // VALUES tuple must contain only tokens/commas/whitespace so column[i] ↔ value[i] holds.
+    let after = &raw_query[values_pos + "VALUES".len()..];
+    let vopen = after
+        .find('(')
+        .ok_or_else(|| anyhow!("bulk_copy: could not find the VALUES tuple."))?;
+    let vclose = after[vopen..]
+        .find(')')
+        .map(|off| vopen + off)
+        .ok_or_else(|| anyhow!("bulk_copy: unbalanced parentheses in the VALUES tuple."))?;
+    let mut residue = after[vopen + 1..vclose].to_string();
+    // Remove every ${...} token, then the remainder must be only commas/whitespace.
+    while let Some(s) = residue.find("${") {
+        match residue[s..].find('}') {
+            Some(e) => residue.replace_range(s..s + e + 1, ""),
+            None => break,
+        }
+    }
+    if residue.chars().any(|c| c != ',' && !c.is_whitespace()) {
+        return Err(anyhow!(
+            "bulk_copy requires every VALUES entry to be a single `${{...}}` token (no literals, expressions, or functions)."
+        ));
+    }
+
+    Ok(columns)
 }
 
 impl SqlxPublisher {
@@ -463,6 +573,36 @@ impl SqlxPublisher {
             }
         }
 
+        let copy = if config.bulk_copy {
+            if driver_name != "PostgreSQL" {
+                return Err(anyhow!(
+                    "bulk_copy is only supported for PostgreSQL (driver: {}).",
+                    driver_name
+                ));
+            }
+            if column_sources.is_empty() {
+                return Err(anyhow!(
+                    "bulk_copy requires a token-based insert_query (e.g. INSERT INTO t (a, b) VALUES (${{payload:a}}, ${{payload:b}})); single-payload COPY is not supported."
+                ));
+            }
+            let columns = extract_copy_columns(&raw_insert_query, column_sources.len())?;
+            // Dedicated native Postgres pool: COPY needs the typed pg protocol, not the `Any` layer.
+            let url = build_sqlx_url_with_tls(config)?;
+            let pg_pool = PgPoolOptions::new()
+                .max_connections(config.max_connections.unwrap_or(5))
+                .connect(&url)
+                .await
+                .context("bulk_copy: failed to open native PostgreSQL pool")?;
+            Some(PgCopySink {
+                pool: pg_pool,
+                table: table.clone(),
+                columns,
+                sources: column_sources.clone(),
+            })
+        } else {
+            None
+        };
+
         Ok(Self {
             pool,
             _shared_pool: shared_pool,
@@ -470,6 +610,7 @@ impl SqlxPublisher {
             column_sources,
             driver_name,
             table,
+            copy,
         })
     }
 }
@@ -497,6 +638,10 @@ impl MessagePublisher for SqlxPublisher {
     ) -> Result<SentBatch, PublisherError> {
         if messages.is_empty() {
             return Ok(SentBatch::Ack);
+        }
+
+        if let Some(sink) = &self.copy {
+            return self.send_batch_copy(sink, messages).await;
         }
 
         trace!(count = messages.len(), message_ids = ?LazyMessageIds(&messages), "Publishing batch to SQLx");
@@ -604,6 +749,53 @@ impl MessagePublisher for SqlxPublisher {
 }
 
 impl SqlxPublisher {
+    /// Bulk-load a batch via PostgreSQL `COPY FROM STDIN` (text format). Each row is a
+    /// tab-separated line of the resolved token values, `\N` for NULL. Far faster than a
+    /// multi-row INSERT for large batches; retryable on transport errors (at-least-once).
+    async fn send_batch_copy(
+        &self,
+        sink: &PgCopySink,
+        messages: Vec<CanonicalMessage>,
+    ) -> Result<SentBatch, PublisherError> {
+        let stmt = format!(
+            "COPY {} ({}) FROM STDIN WITH (FORMAT text)",
+            sink.table,
+            sink.columns.join(", ")
+        );
+
+        let mut buf = String::new();
+        for msg in &messages {
+            let payload_json: Option<serde_json::Value> = serde_json::from_slice(&msg.payload).ok();
+            for (i, source) in sink.sources.iter().enumerate() {
+                if i > 0 {
+                    buf.push('\t');
+                }
+                match resolve_source(msg, source, &payload_json) {
+                    BindValue::Null => buf.push_str("\\N"),
+                    BindValue::Int(n) => buf.push_str(&n.to_string()),
+                    BindValue::Float(f) => buf.push_str(&f.to_string()),
+                    BindValue::Bool(b) => buf.push_str(if b { "t" } else { "f" }),
+                    BindValue::Text(s) => buf.push_str(&copy_escape_text(&s)),
+                }
+            }
+            buf.push('\n');
+        }
+
+        let mut copier = sink
+            .pool
+            .copy_in_raw(&stmt)
+            .await
+            .map_err(classify_copy_error)?;
+        copier
+            .send(buf.as_bytes())
+            .await
+            .map_err(classify_copy_error)?;
+        copier.finish().await.map_err(classify_copy_error)?;
+
+        trace!(count = messages.len(), table = %sink.table, "Bulk-copied batch to PostgreSQL");
+        Ok(SentBatch::Ack)
+    }
+
     /// Fallback implementation that inserts messages one by one within a transaction.
     /// This is less performant than a single multi-row insert statement.
     async fn send_batch_iterative(
@@ -1267,38 +1459,6 @@ async fn source_sql_checkpoint_store(
 /// never deletes/locks source rows, and persists the last successfully-sunk value (keyed
 /// by `cursor_id`) to a pluggable checkpoint store (a `mqb_cursors` table by default, or a
 /// local file). At-least-once. Supported drivers: PostgreSQL, MySQL/MariaDB, SQLite.
-/// Exponential poll backoff between a base and a max interval. When `max <= base` the delay stays
-/// constant at `base` (backoff disabled); otherwise each idle poll doubles the delay up to `max`,
-/// and `reset` returns to `base` after a non-empty poll.
-struct PollBackoff {
-    base: Duration,
-    max: Duration,
-    current: Duration,
-}
-
-impl PollBackoff {
-    fn new(base: Duration, max: Option<Duration>) -> Self {
-        let max = max.unwrap_or(base).max(base);
-        Self {
-            base,
-            max,
-            current: base,
-        }
-    }
-
-    /// The delay to sleep for this idle poll, then grow toward `max` for the next one.
-    fn idle_delay(&mut self) -> Duration {
-        let delay = self.current;
-        self.current = (self.current * 2).min(self.max);
-        delay
-    }
-
-    /// Return to the base interval after a non-empty poll.
-    fn reset(&mut self) {
-        self.current = self.base;
-    }
-}
-
 pub struct SqlxCursorReader {
     pool: AnyPool,
     table: String,
@@ -1573,24 +1733,36 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
-    fn poll_backoff_disabled_when_no_max() {
-        let base = Duration::from_millis(100);
-        let mut b = PollBackoff::new(base, None);
-        assert_eq!(b.idle_delay(), base);
-        assert_eq!(b.idle_delay(), base); // stays constant without a max
+    fn copy_escape_text_escapes_control_chars() {
+        assert_eq!(copy_escape_text("plain"), "plain");
+        assert_eq!(copy_escape_text("a\tb\nc\r\\d"), "a\\tb\\nc\\r\\\\d");
     }
 
     #[test]
-    fn poll_backoff_doubles_up_to_max_and_resets() {
-        let base = Duration::from_millis(100);
-        let mut b = PollBackoff::new(base, Some(Duration::from_millis(500)));
-        assert_eq!(b.idle_delay(), Duration::from_millis(100));
-        assert_eq!(b.idle_delay(), Duration::from_millis(200));
-        assert_eq!(b.idle_delay(), Duration::from_millis(400));
-        assert_eq!(b.idle_delay(), Duration::from_millis(500)); // capped at max
-        assert_eq!(b.idle_delay(), Duration::from_millis(500));
-        b.reset();
-        assert_eq!(b.idle_delay(), Duration::from_millis(100)); // back to base
+    fn extract_copy_columns_accepts_token_only_tuple() {
+        let cols = extract_copy_columns(
+            "INSERT INTO orders (sku, qty, cust) VALUES (${payload:sku}, ${payload:qty}, ${metadata:cust})",
+            3,
+        )
+        .unwrap();
+        assert_eq!(cols, vec!["sku", "qty", "cust"]);
+    }
+
+    #[test]
+    fn extract_copy_columns_rejects_on_conflict_and_literals() {
+        // ON CONFLICT is not expressible via COPY.
+        assert!(extract_copy_columns(
+            "INSERT INTO t (a) VALUES (${payload:a}) ON CONFLICT DO NOTHING",
+            1,
+        )
+        .is_err());
+        // A non-token literal in the VALUES tuple breaks positional mapping. token_count matches the
+        // two columns so the count check passes and the literal-residue check is what rejects it.
+        assert!(
+            extract_copy_columns("INSERT INTO t (a, b) VALUES (${payload:a}, now())", 2,).is_err()
+        );
+        // Column count must match the token count.
+        assert!(extract_copy_columns("INSERT INTO t (a, b) VALUES (${payload:a})", 1).is_err());
     }
 
     async fn setup_db_file() -> (tempfile::TempDir, String) {

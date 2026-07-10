@@ -29,6 +29,8 @@ pub mod mqtt;
 #[cfg(feature = "nats")]
 pub mod nats;
 pub mod null;
+#[cfg(any(feature = "sqlx", feature = "clickhouse"))]
+mod poll;
 pub mod reader;
 #[cfg(feature = "redis-streams")]
 pub mod redis_streams;
@@ -379,11 +381,26 @@ fn check_consumer_recursive(
         EndpointType::IbmMq(_) => Ok(warnings),
         #[cfg(feature = "mongodb")]
         EndpointType::MongoDb(cfg) => {
-            if cfg.change_stream && matches!(cfg.format, crate::models::MongoDbFormat::Raw) {
+            use crate::models::MongoConsume;
+            let mode = cfg.resolved_consume();
+            if mode == MongoConsume::Subscriber
+                && matches!(cfg.format, crate::models::MongoDbFormat::Raw)
+            {
                 return Err(anyhow!(
-                    "[route:{}] MongoDB raw format cannot be used with change_stream/subscriber mode because raw documents do not include the seq ordering field",
+                    "[route:{}] MongoDB raw format cannot be used with subscriber mode because raw documents do not include the seq ordering field",
                     route_name
                 ));
+            }
+            if cfg.consume.is_some() && cfg.change_stream {
+                warnings.push(
+                    "Endpoint 'mongodb' sets 'consume'; the deprecated 'change_stream' boolean is ignored and should be removed."
+                    .to_string(),
+                );
+            } else if cfg.change_stream {
+                warnings.push(
+                    "Endpoint 'mongodb' option 'change_stream' is deprecated; use 'consume: subscriber'."
+                    .to_string(),
+                );
             }
             if cfg.reply_polling_ms.is_some() {
                 warnings.push(
@@ -861,20 +878,41 @@ async fn create_base_consumer(
         EndpointType::Sled(cfg) => Ok(boxed(sled::SledConsumer::new(cfg)?)),
         #[cfg(feature = "mongodb")]
         EndpointType::MongoDb(cfg) => {
+            use crate::models::MongoConsume;
             let mut config = cfg.clone();
             if config.collection.is_none() {
                 config.collection = Some(route_name.to_string());
             }
-            if config.resumable {
-                // Non-destructive, resumable `_id`-cursor read of an arbitrary collection.
-                Ok(boxed(mongodb::MongoDbIdReader::new(&config).await?))
-            } else if config.change_stream {
-                if config.ttl_seconds.is_none() {
-                    config.ttl_seconds = Some(86400); // Remove events by default after 24 hours
+            match config.resolved_consume() {
+                MongoConsume::Consumer => {
+                    // Durable queue drain (auto-uses a change stream when available, else polls).
+                    Ok(boxed(mongodb::MongoDbConsumer::new(&config).await?))
                 }
-                Ok(boxed(mongodb::MongoDbSubscriber::new(&config).await?))
-            } else {
-                Ok(boxed(mongodb::MongoDbConsumer::new(&config).await?))
+                MongoConsume::Subscriber => {
+                    if config.ttl_seconds.is_none() {
+                        config.ttl_seconds = Some(86400); // Remove events by default after 24 hours
+                    }
+                    Ok(boxed(mongodb::MongoDbSubscriber::new(&config).await?))
+                }
+                MongoConsume::CaptureNew => {
+                    // Watch an existing collection for changes from now on (needs a replica set;
+                    // otherwise the change-stream open returns a clear error).
+                    Ok(boxed(
+                        mongodb::MongoDbChangeStreamReader::new(&config, false).await?,
+                    ))
+                }
+                MongoConsume::CaptureAll => {
+                    // Read existing documents first, then capture changes. Prefer a change stream
+                    // (captures updates/deletes); on a standalone server change streams are
+                    // unavailable, so fall back to a non-destructive `_id` read (inserts only).
+                    match mongodb::MongoDbChangeStreamReader::new(&config, true).await {
+                        Ok(reader) => Ok(boxed(reader)),
+                        Err(e) => {
+                            tracing::warn!(error = %e, "MongoDB change streams unavailable (needs a replica set); 'capture_all' falling back to an insert-only read");
+                            Ok(boxed(mongodb::MongoDbIdReader::new(&config).await?))
+                        }
+                    }
+                }
             }
         }
         EndpointType::Custom { name, config } => {

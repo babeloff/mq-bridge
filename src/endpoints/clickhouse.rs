@@ -16,6 +16,7 @@
 //! RowBinary/`Row`-derive only and cannot round-trip arbitrary dynamic JSON. Raw HTTP also avoids the
 //! crate's `?`-as-bind-placeholder quirk that would corrupt JSON payloads containing `?`.
 
+use super::poll::PollBackoff;
 use crate::checkpoint::{self, CheckpointBackend, CheckpointStore};
 use crate::models::ClickHouseConfig;
 use crate::traits::{
@@ -315,38 +316,6 @@ fn extract_cursor(row: &serde_json::Value, column: &str) -> Option<ChCursor> {
             .or_else(|| n.as_u64().map(ChCursor::Uint)),
         Some(serde_json::Value::String(s)) => Some(ChCursor::Text(s.clone())),
         _ => None,
-    }
-}
-
-/// Exponential poll backoff between a base and a max interval. When `max <= base` the delay stays
-/// constant at `base` (backoff disabled); otherwise each idle poll doubles the delay up to `max`,
-/// and `reset` returns to `base` after a non-empty poll.
-struct PollBackoff {
-    base: Duration,
-    max: Duration,
-    current: Duration,
-}
-
-impl PollBackoff {
-    fn new(base: Duration, max: Option<Duration>) -> Self {
-        let max = max.unwrap_or(base).max(base);
-        Self {
-            base,
-            max,
-            current: base,
-        }
-    }
-
-    /// The delay to sleep for this idle poll, then grow toward `max` for the next one.
-    fn idle_delay(&mut self) -> Duration {
-        let delay = self.current;
-        self.current = (self.current * 2).min(self.max);
-        delay
-    }
-
-    /// Return to the base interval after a non-empty poll.
-    fn reset(&mut self) {
-        self.current = self.base;
     }
 }
 

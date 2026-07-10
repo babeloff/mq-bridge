@@ -12,14 +12,19 @@ use mongodb::{
     bson::{doc, to_document, Bson, Document},
     change_stream::ChangeStream,
     error::ErrorKind,
-    options::{FindOneAndUpdateOptions, FindOptions, ReturnDocument, UpdateOptions},
+    options::{
+        FindOneAndUpdateOptions, FindOptions, FullDocumentType, ReturnDocument, UpdateOptions,
+    },
 };
-use mongodb::{change_stream::event::ChangeStreamEvent, IndexModel};
+use mongodb::{
+    change_stream::event::{ChangeStreamEvent, OperationType, ResumeToken},
+    IndexModel,
+};
 use mongodb::{Client, Collection, Database};
 use serde::{Deserialize, Serialize};
 use std::any::Any;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 use tracing::{info, trace, warn};
@@ -1596,11 +1601,6 @@ pub struct MongoDbIdReader {
 
 impl MongoDbIdReader {
     pub async fn new(config: &MongoDbConfig) -> anyhow::Result<Self> {
-        if config.change_stream {
-            return Err(anyhow!(
-                "MongoDB `resumable` and `change_stream` are mutually exclusive"
-            ));
-        }
         let collection_name = config
             .collection
             .as_deref()
@@ -1827,6 +1827,564 @@ impl MessageConsumer for MongoDbIdReader {
     }
 }
 
+/// Serializes a change-stream resume token to a canonical extended-JSON string for durable
+/// checkpointing. Canonical extJSON preserves the token's BSON types (including any `_typeBits`
+/// binary) so it round-trips exactly through [`decode_resume_token`].
+fn encode_resume_token(token: &ResumeToken) -> anyhow::Result<String> {
+    let doc = to_document(token).context("Failed to serialize resume token")?;
+    let value = Bson::Document(doc).into_canonical_extjson();
+    serde_json::to_string(&value).context("Failed to encode resume token")
+}
+
+/// Parses a resume token previously produced by [`encode_resume_token`]. Returns `None` on a
+/// malformed value so the reader starts from the current stream position rather than failing.
+fn decode_resume_token(s: &str) -> Option<ResumeToken> {
+    let value: serde_json::Value = serde_json::from_str(s).ok()?;
+    let bson = Bson::try_from(value).ok()?;
+    mongodb::bson::from_bson::<ResumeToken>(bson).ok()
+}
+
+/// Opens a change stream on `collection` with an optional resume position, using `updateLookup`
+/// so update/replace events carry the full post-image.
+async fn open_change_stream(
+    collection: &Collection<Document>,
+    pipeline: &[Document],
+    resume_after: Option<ResumeToken>,
+) -> anyhow::Result<ChangeStream<ChangeStreamEvent<Document>>> {
+    let mut watch = collection
+        .watch()
+        .pipeline(pipeline.to_vec())
+        .full_document(FullDocumentType::UpdateLookup);
+    if let Some(token) = resume_after {
+        watch = watch.resume_after(token);
+    }
+    watch.await.map_err(|e| {
+        anyhow!(
+            "Failed to open MongoDB change stream for '{}' (requires a replica set): {}",
+            collection.name(),
+            e
+        )
+    })
+}
+
+/// While idle (no matching changes), the CDC reader periodically advances its durable checkpoint to
+/// the change stream's `postBatchResumeToken` so a long-idle stream's saved token can't age out of
+/// the oplog window. This interval bounds how stale that saved position can get.
+const IDLE_RESUME_REFRESH: Duration = Duration::from_secs(10);
+
+/// A real change-data-capture reader over an arbitrary MongoDB collection. Tails the collection's
+/// change stream (requires a replica set), emitting insert/update/replace/delete events with the
+/// full post-image (`updateLookup`), and persists the resume token (keyed by `cursor_id`) to a
+/// pluggable checkpoint store so a restart resumes exactly after the last acked change.
+/// At-least-once. Backs the `capture_new`/`capture_all` modes; unlike the insert-only `_id` reader
+/// it captures updates and deletes, not just appends.
+pub struct MongoDbChangeStreamReader {
+    collection: Collection<Document>,
+    db: Database,
+    collection_name: String,
+    checkpoint: Option<Arc<dyn crate::checkpoint::CheckpointStore>>,
+    cursor_id: Option<String>,
+    receive_query: Option<Document>,
+    pipeline: Vec<Document>,
+    // Wrapped in a Mutex so the reader is `Sync` (a bare `ChangeStream` is `Send` but not `Sync`),
+    // which the `MessageConsumer` trait's `&self` methods require. `None` while the initial
+    // snapshot is draining; opened (at `pending_resume`) when the snapshot completes.
+    stream: tokio::sync::Mutex<Option<ChangeStream<ChangeStreamEvent<Document>>>>,
+    // Stream start position captured before the snapshot; the stream is opened here after it drains.
+    pending_resume: Mutex<Option<ResumeToken>>,
+    // Snapshot paging position (`_id > last`), shared with the commit closure for nack rollback.
+    snapshot_last_id: Arc<Mutex<Option<Bson>>>,
+    // Idle resume-token refresh state. `inflight` counts delivered-but-not-yet-committed batches;
+    // `refresh_clean` is cleared for the session's remainder once a streaming batch is nacked (a
+    // redelivery gap then exists). Idle refresh only persists the postBatchResumeToken when nothing
+    // is in flight AND clean — so it can never advance past an un-acked change. `last_saved_token`
+    // dedupes redundant writes when the token hasn't moved.
+    inflight: Arc<AtomicUsize>,
+    refresh_clean: Arc<AtomicBool>,
+    last_saved_token: Arc<Mutex<Option<String>>>,
+}
+
+impl MongoDbChangeStreamReader {
+    /// `snapshot` = read the existing documents before streaming changes (`capture_all`); when false
+    /// only new changes are streamed (`capture_new`).
+    pub async fn new(config: &MongoDbConfig, snapshot: bool) -> anyhow::Result<Self> {
+        let collection_name = config
+            .collection
+            .as_deref()
+            .ok_or_else(|| anyhow!("Collection name is required for MongoDB CDC reader"))?;
+        let client = create_client(config).await?;
+        let db = client.database(&config.database);
+        let collection: Collection<Document> = db.collection(collection_name);
+
+        // Optional filter: a `$match` stage on the change stream, and the equivalent `find` filter
+        // for the snapshot phase.
+        let receive_query = if let Some(q) = &config.receive_query {
+            let doc: Document = serde_json::from_str(q)
+                .context("Failed to parse 'receive_query' from configuration as a JSON document")?;
+            Some(doc)
+        } else {
+            None
+        };
+        // A change stream sees event *envelopes*, not raw documents, so a `receive_query` on
+        // document fields must target the `fullDocument` namespace or it would match nothing and
+        // silently drop every event. The snapshot phase keeps the raw predicate (it queries the
+        // collection directly). Note: delete events carry no `fullDocument`, so document-field
+        // filters exclude deletes.
+        let pipeline: Vec<Document> = receive_query
+            .as_ref()
+            .map(|q| vec![doc! { "$match": full_document_match(q) }])
+            .unwrap_or_default();
+
+        let checkpoint: Option<Arc<dyn crate::checkpoint::CheckpointStore>> = if let Some(cid) =
+            &config.cursor_id
+        {
+            use crate::checkpoint::CheckpointBackend;
+            let backend = match &config.checkpoint_store {
+                None => CheckpointBackend::Source {
+                    name: crate::checkpoint::default_meta_name(collection_name),
+                },
+                Some(spec) => crate::checkpoint::parse_checkpoint_store(spec)?,
+            };
+            let store: Arc<dyn crate::checkpoint::CheckpointStore> = match backend {
+                CheckpointBackend::Source { name } => Arc::new(MongoCollectionCheckpointStore {
+                    meta: db.collection::<Document>(&name),
+                    doc_id: crate::checkpoint::checkpoint_key(collection_name, cid),
+                }),
+                external => {
+                    crate::checkpoint::build_external_store(external, collection_name, cid).await?
+                }
+            };
+            Some(store)
+        } else {
+            warn!(
+                collection = %collection_name,
+                "MongoDB CDC reader has no cursor_id; resume is disabled and every restart starts from the current stream position. Set cursor_id to persist progress."
+            );
+            None
+        };
+
+        let resume_token = match &checkpoint {
+            Some(cp) => cp.load().await?.and_then(|s| {
+                let decoded = decode_resume_token(&s);
+                if decoded.is_none() {
+                    warn!(value = %s, "Ignoring unparseable mongo resume token; starting from current stream position");
+                }
+                decoded
+            }),
+            None => None,
+        };
+
+        // Cold start with `capture_all`: capture the current stream position, then snapshot the
+        // existing documents before streaming from that position (no gap; at-least-once). The
+        // stream is opened later, when the snapshot drains, so no change-stream cursor is held open
+        // during a potentially long snapshot.
+        let take_snapshot = resume_token.is_none() && snapshot;
+        let (stream, pending_resume) = if take_snapshot {
+            let probe = open_change_stream(&collection, &pipeline, None).await?;
+            match probe.resume_token() {
+                Some(token) => {
+                    info!(collection = %collection_name, "MongoDB CDC reader starting initial snapshot");
+                    (None, Some(token))
+                }
+                None => {
+                    warn!(collection = %collection_name, "Server did not provide a resume token; skipping snapshot and streaming new changes only");
+                    (Some(probe), None)
+                }
+            }
+        } else {
+            (
+                Some(open_change_stream(&collection, &pipeline, resume_token.clone()).await?),
+                None,
+            )
+        };
+
+        info!(collection = %collection_name, cursor_id = ?config.cursor_id, resumed = %resume_token.is_some(), snapshot = %pending_resume.is_some(), "MongoDB CDC reader initialized");
+
+        Ok(Self {
+            collection,
+            db,
+            collection_name: collection_name.to_string(),
+            checkpoint,
+            cursor_id: config.cursor_id.clone(),
+            receive_query,
+            pipeline,
+            stream: tokio::sync::Mutex::new(stream),
+            pending_resume: Mutex::new(pending_resume),
+            snapshot_last_id: Arc::new(Mutex::new(None)),
+            inflight: Arc::new(AtomicUsize::new(0)),
+            refresh_clean: Arc::new(AtomicBool::new(true)),
+            last_saved_token: Arc::new(Mutex::new(
+                resume_token
+                    .as_ref()
+                    .and_then(|t| encode_resume_token(t).ok()),
+            )),
+        })
+    }
+
+    /// Pages the initial snapshot by `_id` (like the resumable reader), returning `None` once the
+    /// collection is exhausted so the caller can hand off to the change stream.
+    async fn snapshot_batch(
+        &self,
+        max_messages: usize,
+    ) -> Result<Option<ReceivedBatch>, ConsumerError> {
+        let resume_from = self.snapshot_last_id.lock().unwrap().clone();
+        let last = resume_from.clone();
+        let mut filter = match &last {
+            Some(v) => doc! { "_id": { "$gt": v.clone() } },
+            None => doc! {},
+        };
+        if let Some(extra) = &self.receive_query {
+            filter = if filter.is_empty() {
+                extra.clone()
+            } else {
+                doc! { "$and": [filter, extra.clone()] }
+            };
+        }
+        let find_options = FindOptions::builder()
+            .sort(doc! { "_id": 1 })
+            .limit(max_messages as i64)
+            .build();
+        let mut cursor = self
+            .collection
+            .find(filter)
+            .with_options(find_options)
+            .await
+            .map_err(|e| ConsumerError::Connection(e.into()))?;
+
+        let mut messages = Vec::new();
+        let mut ids: Vec<Bson> = Vec::new();
+        while let Some(result) = cursor.next().await {
+            let doc = result.map_err(|e| ConsumerError::Connection(e.into()))?;
+            let Some(id) = doc.get("_id").cloned() else {
+                warn!("MongoDB snapshot document without an `_id`; skipping");
+                continue;
+            };
+            match serde_json::to_vec(&doc) {
+                Ok(payload) => {
+                    let mut msg = CanonicalMessage::new(payload, None);
+                    msg.metadata
+                        .insert("mongodb.operation".to_string(), "insert".to_string());
+                    msg.metadata
+                        .insert("mongodb.snapshot".to_string(), "true".to_string());
+                    if let Some(enc) = encode_id(&id) {
+                        msg.metadata.insert("mongodb.document_id".to_string(), enc);
+                    }
+                    messages.push(msg);
+                    ids.push(id.clone());
+                }
+                Err(e) => warn!(error = %e, "Skipping unserializable MongoDB snapshot document"),
+            }
+            *self.snapshot_last_id.lock().unwrap() = Some(id);
+        }
+
+        // Exhausted: no more snapshot documents. The caller hands off to the change stream.
+        if messages.is_empty() {
+            return Ok(None);
+        }
+
+        let last_id = self.snapshot_last_id.clone();
+        // Gate idle refresh: an un-acked snapshot batch still in flight when streaming begins must
+        // block the postBatchResumeToken from being persisted, or its docs would be lost on restart.
+        let inflight = self.inflight.clone();
+        let refresh_clean = self.refresh_clean.clone();
+        let commit = Box::new(move |dispositions: Vec<MessageDisposition>| {
+            Box::pin(async move {
+                let mut acked = 0usize;
+                for disp in dispositions.iter().take(ids.len()) {
+                    if matches!(disp, MessageDisposition::Ack | MessageDisposition::Reply(_)) {
+                        acked += 1;
+                    } else {
+                        break;
+                    }
+                }
+                // Roll the snapshot cursor back to the last acked `_id` so nacked docs are re-read.
+                if acked < ids.len() {
+                    let boundary = if acked == 0 {
+                        resume_from
+                    } else {
+                        Some(ids[acked - 1].clone())
+                    };
+                    *last_id.lock().unwrap() = boundary;
+                    // Latch the gap: once the stream opens, snapshot docs can only be recovered by
+                    // re-snapshotting from the start, so no resume token may be persisted this
+                    // session. Blocks both idle refresh and later streaming-batch commits.
+                    refresh_clean.store(false, Ordering::Release);
+                }
+                inflight.fetch_sub(1, Ordering::AcqRel);
+                Ok(())
+            }) as BoxFuture<'static, anyhow::Result<()>>
+        });
+        self.inflight.fetch_add(1, Ordering::AcqRel);
+        Ok(Some(ReceivedBatch { messages, commit }))
+    }
+
+    /// Maps a change event into a canonical message, tagging the operation and document `_id`.
+    /// Returns `None` for events carrying no usable payload (e.g. an update whose post-image was
+    /// already deleted by the time of the lookup).
+    fn event_to_message(event: &ChangeStreamEvent<Document>) -> Option<CanonicalMessage> {
+        let (op, payload) = match event.operation_type {
+            OperationType::Insert | OperationType::Update | OperationType::Replace => {
+                let doc = event.full_document.as_ref()?;
+                (op_str(&event.operation_type), serde_json::to_vec(doc).ok()?)
+            }
+            OperationType::Delete => {
+                // No post-image on delete; carry the document key so the sink can act on the `_id`.
+                let key = event.document_key.clone().unwrap_or_default();
+                ("delete", serde_json::to_vec(&key).ok()?)
+            }
+            _ => return None, // drop/rename/invalidate/other: not row-level data changes
+        };
+
+        let mut msg = CanonicalMessage::new(payload, None);
+        msg.metadata
+            .insert("mongodb.operation".to_string(), op.to_string());
+        if let Some(id) = event.document_key.as_ref().and_then(|k| k.get("_id")) {
+            if let Some(enc) = encode_id(id) {
+                msg.metadata.insert("mongodb.document_id".to_string(), enc);
+            }
+        }
+        Some(msg)
+    }
+
+    /// Called while the stream is idle: persist the change stream's postBatchResumeToken so the
+    /// durable checkpoint tracks the oplog even with no matching changes. Only advances when no
+    /// batch is in flight (`inflight == 0`) and no un-acked gap exists (`refresh_clean`), so the
+    /// persisted token is always a safe resume point that can't skip a delivered-but-un-acked
+    /// change. During idle there are no matching changes, so the token only moves past irrelevant
+    /// oplog entries — nothing is lost.
+    /// `token` is the stream's postBatchResumeToken, extracted by the caller *before* any await (a
+    /// shared `&ChangeStream` is not `Send`, so it can't be held across the checkpoint write).
+    async fn refresh_idle_checkpoint(&self, token: Option<ResumeToken>) {
+        let Some(cp) = &self.checkpoint else { return };
+        if !self.refresh_clean.load(Ordering::Acquire) {
+            return;
+        }
+        if self.inflight.load(Ordering::Acquire) != 0 {
+            return;
+        }
+        let Some(token) = token else {
+            return;
+        };
+        let encoded = match encode_resume_token(&token) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        // Skip the write if the position hasn't moved since the last persist.
+        if self.last_saved_token.lock().unwrap().as_deref() == Some(encoded.as_str()) {
+            return;
+        }
+        if let Err(e) = cp.save(&encoded).await {
+            tracing::warn!(error = %e, "Failed to persist idle mongo resume token");
+            return;
+        }
+        *self.last_saved_token.lock().unwrap() = Some(encoded);
+    }
+}
+
+/// Rewrite a document-field filter so it targets a change event's `fullDocument` namespace.
+/// Field keys are prefixed with `fullDocument.`; top-level logical operators (`$and`/`$or`/`$nor`/
+/// `$not`) are preserved and their nested sub-filters rewritten recursively. Field-level operators
+/// (`$gt`, `$in`, …) inside a value are left untouched. Delete events have no `fullDocument`, so
+/// such filters naturally exclude them.
+fn full_document_match(query: &Document) -> Document {
+    let mut out = Document::new();
+    for (key, value) in query {
+        if key.starts_with('$') {
+            out.insert(key.clone(), rewrite_operator_value(value));
+        } else {
+            out.insert(format!("fullDocument.{key}"), value.clone());
+        }
+    }
+    out
+}
+
+/// Recurse into the value of a logical operator: `$and`/`$or`/`$nor` take an array of sub-filters,
+/// `$not` a single one. Nested document-field predicates are rewritten; everything else is copied.
+fn rewrite_operator_value(value: &Bson) -> Bson {
+    match value {
+        Bson::Array(items) => Bson::Array(
+            items
+                .iter()
+                .map(|item| match item {
+                    Bson::Document(d) => Bson::Document(full_document_match(d)),
+                    other => other.clone(),
+                })
+                .collect(),
+        ),
+        Bson::Document(d) => Bson::Document(full_document_match(d)),
+        other => other.clone(),
+    }
+}
+
+/// The change-event operation name stored in message metadata.
+fn op_str(op: &OperationType) -> &'static str {
+    match op {
+        OperationType::Insert => "insert",
+        OperationType::Update => "update",
+        OperationType::Replace => "replace",
+        OperationType::Delete => "delete",
+        _ => "other",
+    }
+}
+
+#[async_trait]
+impl MessageConsumer for MongoDbChangeStreamReader {
+    async fn receive_batch(&mut self, max_messages: usize) -> Result<ReceivedBatch, ConsumerError> {
+        if max_messages == 0 {
+            return Ok(ReceivedBatch {
+                messages: Vec::new(),
+                commit: Box::new(|_| Box::pin(async { Ok(()) })),
+            });
+        }
+
+        let mut stream_guard = self.stream.lock().await;
+        // Snapshot phase (opt-in cold start): drain existing documents, then open the stream at the
+        // pre-snapshot position and fall through to streaming.
+        if stream_guard.is_none() {
+            if let Some(batch) = self.snapshot_batch(max_messages).await? {
+                return Ok(batch);
+            }
+            let token = self.pending_resume.lock().unwrap().take();
+            let opened = open_change_stream(&self.collection, &self.pipeline, token)
+                .await
+                .map_err(ConsumerError::Connection)?;
+            info!(collection = %self.collection_name, "MongoDB CDC snapshot complete; streaming changes");
+            *stream_guard = Some(opened);
+        }
+        let stream = stream_guard.as_mut().expect("stream opened above");
+
+        let mut messages = Vec::new();
+        // Per-message resume token: resuming `after` the last acked event's token gives
+        // at-least-once (un-acked events are re-delivered on restart).
+        let mut tokens: Vec<ResumeToken> = Vec::new();
+
+        // Block for the first change (the route cancels this future on shutdown), then coalesce any
+        // immediately-available events into the batch with a short timeout. While idle, periodically
+        // advance the durable checkpoint to the stream's postBatchResumeToken so it can't age out of
+        // the oplog (guarded so it never skips an un-acked change).
+        loop {
+            match tokio::time::timeout(IDLE_RESUME_REFRESH, stream.next()).await {
+                Ok(Some(Ok(event))) => {
+                    let token = event.id.clone();
+                    if let Some(msg) = Self::event_to_message(&event) {
+                        messages.push(msg);
+                        tokens.push(token);
+                    }
+                    if !messages.is_empty() {
+                        break;
+                    }
+                    // Event carried no payload (e.g. a drop); keep waiting for a real change.
+                }
+                Ok(Some(Err(e))) => return Err(ConsumerError::Connection(e.into())),
+                Ok(None) => return Err(anyhow!("MongoDB change stream ended unexpectedly").into()),
+                Err(_) => {
+                    // Extract the token synchronously (stream ref isn't `Send`), then persist.
+                    let token = stream.resume_token();
+                    self.refresh_idle_checkpoint(token).await;
+                }
+            }
+        }
+
+        while messages.len() < max_messages {
+            match tokio::time::timeout(Duration::from_millis(10), stream.next()).await {
+                Ok(Some(Ok(event))) => {
+                    let token = event.id.clone();
+                    if let Some(msg) = Self::event_to_message(&event) {
+                        messages.push(msg);
+                        tokens.push(token);
+                    }
+                }
+                Ok(Some(Err(e))) => return Err(ConsumerError::Connection(e.into())),
+                Ok(None) => return Err(anyhow!("MongoDB change stream ended unexpectedly").into()),
+                Err(_) => break, // no more events ready right now
+            }
+        }
+
+        trace!(count = messages.len(), collection = %self.collection_name, "Received batch of MongoDB change events");
+
+        let checkpoint = self.checkpoint.clone();
+        let inflight = self.inflight.clone();
+        let refresh_clean = self.refresh_clean.clone();
+        let last_saved_token = self.last_saved_token.clone();
+        let commit = Box::new(move |dispositions: Vec<MessageDisposition>| {
+            Box::pin(async move {
+                // Resume token of the last contiguous Ack from the front (stop at first Nack).
+                let mut acked = 0usize;
+                for disp in dispositions.iter().take(tokens.len()) {
+                    if matches!(disp, MessageDisposition::Ack | MessageDisposition::Reply(_)) {
+                        acked += 1;
+                    } else {
+                        break;
+                    }
+                }
+                // An earlier batch (a snapshot batch, or a prior streaming batch) left an un-acked
+                // redelivery gap and latched `refresh_clean` off. Commits run in delivery order
+                // (ordered sequencer), so a token from this batch would sit past that gap: do not
+                // persist it even when this batch is itself fully acked.
+                let prior_gap = !refresh_clean.load(Ordering::Acquire);
+                if acked > 0 && !prior_gap {
+                    if let Some(cp) = checkpoint {
+                        match encode_resume_token(&tokens[acked - 1]) {
+                            Ok(s) => {
+                                if let Err(e) = cp.save(&s).await {
+                                    tracing::warn!(error = %e, "Failed to persist mongo resume token. Changes may be reprocessed on restart.");
+                                } else {
+                                    *last_saved_token.lock().unwrap() = Some(s);
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, "Failed to encode mongo resume token; not checkpointing")
+                            }
+                        }
+                    }
+                }
+                // This batch's own nack opens a gap (checkpoint deliberately behind delivered
+                // events); latch idle refresh and all later commits off for the session so nothing
+                // can skip past it.
+                if acked < tokens.len() {
+                    refresh_clean.store(false, Ordering::Release);
+                }
+                inflight.fetch_sub(1, Ordering::AcqRel);
+                Ok(())
+            }) as BoxFuture<'static, anyhow::Result<()>>
+        });
+
+        self.inflight.fetch_add(1, Ordering::AcqRel);
+        Ok(ReceivedBatch { messages, commit })
+    }
+
+    async fn status(&self) -> EndpointStatus {
+        let (healthy, error) = match self.db.run_command(doc! { "ping": 1 }).await {
+            Ok(_) => (true, None),
+            Err(e) => (false, Some(e.to_string())),
+        };
+        // "snapshot" until the initial snapshot drains and the change stream opens, then "streaming".
+        let phase = match self.stream.try_lock() {
+            Ok(g) if g.is_none() => "snapshot",
+            Ok(_) => "streaming",
+            Err(_) => "streaming", // stream in use by receive_batch → past the snapshot phase
+        };
+        let resume_token = self.last_saved_token.lock().unwrap().clone();
+        EndpointStatus {
+            healthy,
+            target: self.collection_name.clone(),
+            error,
+            details: serde_json::json!({
+                "cursor_id": self.cursor_id,
+                "mode": "cdc",
+                "phase": phase,
+                "in_flight_batches": self.inflight.load(Ordering::Acquire),
+                "resume_token": resume_token,
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
 /// Returns a shared MongoDB client for this connection, building one on first use.
 /// The collection/database are handles off the client, so a single client serves all.
 async fn create_shared_client(config: &MongoDbConfig) -> anyhow::Result<std::sync::Arc<Client>> {
@@ -1889,6 +2447,42 @@ mod tests {
     use crate::CanonicalMessage;
 
     #[test]
+    fn resolved_consume_defaults_and_change_stream_alias() {
+        use crate::models::{MongoConsume, MongoDbConfig};
+        // Default: durable queue consumer.
+        let cfg = MongoDbConfig::new("mongodb://localhost", "db");
+        assert_eq!(cfg.resolved_consume(), MongoConsume::Consumer);
+        // Deprecated `change_stream: true` (no `consume`) still maps to the subscriber mode.
+        let mut legacy = MongoDbConfig::new("mongodb://localhost", "db");
+        legacy.change_stream = true;
+        assert_eq!(legacy.resolved_consume(), MongoConsume::Subscriber);
+        // Explicit `consume` wins over the deprecated boolean.
+        let mut explicit = MongoDbConfig::new("mongodb://localhost", "db");
+        explicit.change_stream = true;
+        explicit.consume = Some(MongoConsume::CaptureAll);
+        assert_eq!(explicit.resolved_consume(), MongoConsume::CaptureAll);
+    }
+
+    #[test]
+    fn full_document_match_prefixes_fields_and_preserves_operators() {
+        // Plain field predicates (incl. field-level operators and dotted paths) get the
+        // `fullDocument.` prefix; the operator value is left untouched.
+        assert_eq!(
+            full_document_match(&doc! { "type": "notification", "n": { "$gt": 5 } }),
+            doc! { "fullDocument.type": "notification", "fullDocument.n": { "$gt": 5 } }
+        );
+        assert_eq!(
+            full_document_match(&doc! { "address.city": "NYC" }),
+            doc! { "fullDocument.address.city": "NYC" }
+        );
+        // Top-level logical operators are preserved and their nested predicates rewritten.
+        assert_eq!(
+            full_document_match(&doc! { "$or": [ { "a": 1 }, { "b": 2 } ] }),
+            doc! { "$or": [ { "fullDocument.a": 1 }, { "fullDocument.b": 2 } ] }
+        );
+    }
+
+    #[test]
     fn resumable_encode_decode_roundtrips_supported_types() {
         let oid = mongodb::bson::oid::ObjectId::new();
         let uuid = mongodb::bson::Uuid::new();
@@ -1907,6 +2501,21 @@ mod tests {
         // Unsupported types are not persisted.
         assert_eq!(encode_id(&Bson::Boolean(true)), None);
         assert_eq!(decode_id("bogus"), None);
+    }
+
+    #[test]
+    fn resume_token_encode_decode_roundtrips() {
+        // A resume token is an opaque `{ "_data": <hex string> }` document; build one directly.
+        let token: ResumeToken =
+            mongodb::bson::from_document(doc! { "_data": "826553F1A0000000012B02" })
+                .expect("token deserializes");
+
+        let encoded = encode_resume_token(&token).expect("token encodes");
+        let decoded = decode_resume_token(&encoded).expect("token decodes");
+        // Re-encoding the decoded token yields the same string (stable round-trip).
+        assert_eq!(encode_resume_token(&decoded).unwrap(), encoded);
+        // A malformed value decodes to None so the reader restarts cleanly instead of failing.
+        assert!(decode_resume_token("not-json").is_none());
     }
 
     #[test]
