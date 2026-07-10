@@ -47,6 +47,8 @@ pub struct KafkaPublisher {
     producer: Arc<SharedKafkaProducer>,
     topic: String,
     delayed_ack: bool,
+    // Metadata field whose value is used as the record key; falls back to message_id.
+    partition_key: Option<String>,
 }
 
 impl KafkaPublisher {
@@ -160,6 +162,7 @@ impl KafkaPublisher {
             producer,
             topic: topic.to_string(),
             delayed_ack: config.delayed_ack,
+            partition_key: config.partition_key.clone(),
         })
     }
 }
@@ -184,7 +187,7 @@ impl MessagePublisher for KafkaPublisher {
         if !message.metadata.is_empty() {
             for (key, value) in &message.metadata {
                 if crate::canonical_message::is_source_metadata_key(key) {
-                    continue; // source/provenance keys must not be forwarded
+                    continue; // source/provenance keys are not forwarded
                 }
                 headers = headers.insert(rdkafka::message::Header {
                     key,
@@ -194,7 +197,10 @@ impl MessagePublisher for KafkaPublisher {
         }
         record = record.headers(headers);
 
-        let key = message.message_id.to_be_bytes().to_vec();
+        // Key on the configured metadata field when set (and present on this message);
+        // otherwise fall back to message_id, which the consumer also recovers from the
+        // mq_bridge.message_id header set above.
+        let key = record_key(self.partition_key.as_deref(), &message);
         record = record.key(&key);
 
         if !self.delayed_ack {
@@ -239,7 +245,10 @@ impl MessagePublisher for KafkaPublisher {
         let mut iter = messages.into_iter();
         while let Some(message) = iter.next() {
             let mut record = FutureRecord::to(&self.topic).payload(&message.payload[..]);
-            let key_bytes = message.message_id.to_be_bytes();
+            // Key on the configured metadata field when set (and present on this message);
+            // otherwise fall back to message_id, which the consumer also recovers from the
+            // mq_bridge.message_id header set below.
+            let key_bytes = record_key(self.partition_key.as_deref(), &message);
             record = record.key(&key_bytes);
 
             let mut headers = OwnedHeaders::new();
@@ -251,7 +260,7 @@ impl MessagePublisher for KafkaPublisher {
             if !message.metadata.is_empty() {
                 for (key, value) in &message.metadata {
                     if crate::canonical_message::is_source_metadata_key(key) {
-                        continue; // source/provenance keys must not be forwarded
+                        continue; // source/provenance keys are not forwarded
                     }
                     headers = headers.insert(rdkafka::message::Header {
                         key,
@@ -604,6 +613,15 @@ impl MessageConsumer for KafkaConsumer {
     }
 }
 
+/// Choose the Kafka record key for a message: the value of the configured metadata field
+/// when set and present, otherwise the message_id as big-endian bytes.
+fn record_key(partition_key: Option<&str>, message: &CanonicalMessage) -> Vec<u8> {
+    partition_key
+        .and_then(|f| message.metadata.get(f))
+        .map(|v| v.as_bytes().to_vec())
+        .unwrap_or_else(|| message.message_id.to_be_bytes().to_vec())
+}
+
 /// Helper function to process a Kafka message and add it to the batch.
 fn process_message<M: Message>(
     message: &M,
@@ -614,54 +632,52 @@ fn process_message<M: Message>(
         .payload()
         .ok_or_else(|| anyhow!("Kafka message has no payload"))?;
 
-    // Try to extract message_id from the Kafka key first (where we store it when publishing).
-    // The key is set to message_id.to_be_bytes() which is 16 bytes for a u128.
+    // Recover message_id, preferring the mq_bridge.message_id header (always written by this
+    // publisher). Checking the header before the key means an explicit partition key that
+    // happens to be 16 bytes is never mistaken for an id.
     let mut message_id: Option<u128> = None;
-    if let Some(key) = message.key() {
-        if key.len() == 16 {
-            // Parse the key as a u128 (big-endian bytes)
-            // unwrap is safe: length check guarantees exactly 16 bytes
-            let bytes: [u8; 16] = key.try_into().unwrap();
-            message_id = Some(u128::from_be_bytes(bytes));
-        }
-    }
-
-    // If no message_id from key, check headers for a message_id
-    if message_id.is_none() {
-        if let Some(headers) = message.headers() {
-            for header in headers.iter() {
-                if header.key == "message_id" || header.key == "mq_bridge.message_id" {
-                    if let Some(value) = header.value {
-                        let id_str = String::from_utf8_lossy(value);
-                        // Try to parse as UUID first
-                        if let Ok(uuid) = Uuid::parse_str(&id_str) {
-                            message_id = Some(uuid.as_u128());
-                            break;
-                        } else if id_str.starts_with("0x") || id_str.starts_with("0X") {
-                            if let Ok(n) = u128::from_str_radix(
-                                id_str.trim_start_matches("0x").trim_start_matches("0X"),
-                                16,
-                            ) {
-                                message_id = Some(n);
-                                break;
-                            }
-                        }
-                        // Try to parse as legacy 32-char hex string
-                        else if id_str.len() == 32
-                            && id_str.chars().all(|c| c.is_ascii_hexdigit())
-                        {
-                            if let Ok(n) = u128::from_str_radix(&id_str, 16) {
-                                message_id = Some(n);
-                                break;
-                            }
-                        }
-                        // Try to parse as decimal string
-                        else if let Ok(n) = id_str.parse::<u128>() {
+    if let Some(headers) = message.headers() {
+        for header in headers.iter() {
+            if header.key == "message_id" || header.key == "mq_bridge.message_id" {
+                if let Some(value) = header.value {
+                    let id_str = String::from_utf8_lossy(value);
+                    // Try to parse as UUID first
+                    if let Ok(uuid) = Uuid::parse_str(&id_str) {
+                        message_id = Some(uuid.as_u128());
+                        break;
+                    } else if id_str.starts_with("0x") || id_str.starts_with("0X") {
+                        if let Ok(n) = u128::from_str_radix(
+                            id_str.trim_start_matches("0x").trim_start_matches("0X"),
+                            16,
+                        ) {
                             message_id = Some(n);
                             break;
                         }
                     }
+                    // Try to parse as legacy 32-char hex string
+                    else if id_str.len() == 32 && id_str.chars().all(|c| c.is_ascii_hexdigit()) {
+                        if let Ok(n) = u128::from_str_radix(&id_str, 16) {
+                            message_id = Some(n);
+                            break;
+                        }
+                    }
+                    // Try to parse as decimal string
+                    else if let Ok(n) = id_str.parse::<u128>() {
+                        message_id = Some(n);
+                        break;
+                    }
                 }
+            }
+        }
+    }
+
+    // Legacy fallback: older messages carried the id as a 16-byte big-endian Kafka key.
+    if message_id.is_none() {
+        if let Some(key) = message.key() {
+            if key.len() == 16 {
+                // unwrap is safe: length check guarantees exactly 16 bytes
+                let bytes: [u8; 16] = key.try_into().unwrap();
+                message_id = Some(u128::from_be_bytes(bytes));
             }
         }
     }
@@ -933,5 +949,25 @@ mod tests {
         // Check that the TPL was updated correctly
         let committed_offset = tpl.find_partition("test_topic", 4).unwrap().offset();
         assert_eq!(committed_offset, Offset::Offset(124));
+    }
+
+    #[test]
+    fn test_record_key_selector() {
+        let mut msg = CanonicalMessage::new(b"payload".to_vec(), None);
+        msg.metadata
+            .insert("pk".to_string(), "public.orders".to_string());
+
+        // Configured field present: its value is the key.
+        assert_eq!(record_key(Some("pk"), &msg), b"public.orders".to_vec());
+        // Configured field absent on this message: fall back to message_id.
+        assert_eq!(
+            record_key(Some("missing"), &msg),
+            msg.message_id.to_be_bytes().to_vec()
+        );
+        // No selector configured: fall back to message_id.
+        assert_eq!(
+            record_key(None, &msg),
+            msg.message_id.to_be_bytes().to_vec()
+        );
     }
 }

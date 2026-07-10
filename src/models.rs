@@ -1167,6 +1167,11 @@ pub struct KafkaConfig {
         schemars(default = "default_kafka_partitions_schema", range(min = 1))
     )]
     pub partitions: Option<i32>,
+    /// (Publisher only) Name of a metadata field whose value is used as the Kafka record
+    /// key (drives partitioning/ordering). Unset, or absent on a given message, falls back
+    /// to the message id. Default unset.
+    #[serde(default)]
+    pub partition_key: Option<String>,
 }
 
 impl KafkaConfig {
@@ -1391,6 +1396,10 @@ pub struct NatsConfig {
     /// (Publisher only) If true, do not wait for an acknowledgement when sending to broker. Defaults to false.
     #[serde(default)]
     pub delayed_ack: bool,
+    /// (Publisher only, JetStream) If true, publish a `Nats-Msg-Id` header (from the message id) so
+    /// JetStream deduplicates redeliveries within the stream's duplicate window. Defaults to false.
+    #[serde(default)]
+    pub deduplicate: bool,
     /// If no_jetstream: true, use Core NATS (fire-and-forget) instead of JetStream. Defaults to false.
     #[serde(default)]
     pub no_jetstream: bool,

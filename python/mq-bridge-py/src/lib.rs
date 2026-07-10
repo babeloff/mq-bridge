@@ -810,6 +810,24 @@ impl Publisher {
         .map_err(to_py_runtime_error)
     }
 
+    #[pyo3(signature = (messages))]
+    fn send_batch(&self, py: Python<'_>, messages: &Bound<'_, PyAny>) -> PyResult<()> {
+        // Convert each item (Message or bytes) up front, on the Python thread.
+        let mut batch = Vec::new();
+        for item in messages.try_iter()? {
+            batch.push(message_input_to_canonical(&item?, None)?);
+        }
+        let publisher = self.publisher.clone();
+        let runtime = Arc::clone(&self.runtime);
+        py.detach(move || {
+            run_sync_task(&runtime, async move {
+                publisher.send_batch(batch).await?;
+                Ok(())
+            })
+        })
+        .map_err(to_py_runtime_error)
+    }
+
     #[pyo3(signature = (message, metadata=None))]
     fn request(
         &self,
@@ -2603,6 +2621,38 @@ publishers:
             );
             assert!(response.id.is_some());
         });
+    }
+
+    #[test]
+    fn test_publisher_send_batch_publishes_all() {
+        let path = write_yaml(
+            r#"
+publishers:
+  mem:
+    memory:
+      topic: send_batch_topic
+"#,
+        );
+
+        let publisher = Python::attach(|py| Publisher::from_file(py, &path, Some("mem"))).unwrap();
+        Python::attach(|py| {
+            let msg = Py::new(py, Message::new(b"one".to_vec(), None, None).unwrap()).unwrap();
+            let items = PyList::new(
+                py,
+                [
+                    msg.bind(py).as_any().clone(),
+                    PyBytes::new(py, b"two").into_any(),
+                    PyBytes::new(py, b"three").into_any(),
+                ],
+            )
+            .unwrap();
+            publisher.send_batch(py, items.as_any()).unwrap();
+        });
+
+        let drainer =
+            Python::attach(|py| MemoryDrainer::from_topic(py, "send_batch_topic", 65536)).unwrap();
+        let drained = Python::attach(|py| drainer.drain(py, 3, Some(5.0), 256)).unwrap();
+        assert_eq!(drained, 3);
     }
 
     #[test]

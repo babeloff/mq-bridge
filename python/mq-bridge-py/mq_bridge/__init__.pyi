@@ -1,5 +1,5 @@
 from types import TracebackType
-from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple, Type, Union
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Tuple, Type, Union
 
 __version__: str
 
@@ -243,6 +243,11 @@ class Publisher:
         self,
         message: Union[Message, bytes],
         metadata: Optional[Mapping[str, str]] = ...,
+    ) -> None: ...
+
+    def send_batch(
+        self,
+        messages: Iterable[Union[Message, bytes]],
     ) -> None: ...
 
     def request(

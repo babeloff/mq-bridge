@@ -30,6 +30,8 @@ export class Publisher {
   /** @deprecated Use {@link Publisher.fromStr} instead. */
   static fromYamlStr(text: string, name?: string | null): Publisher;
   send(message: Message): Promise<void>;
+  /** Publish many messages in one call (each carries its own metadata/id). */
+  sendBatch(messages: Message[]): Promise<void>;
   request(message: Message): Promise<Message>;
   sendJson(data: JsonValue, metadata?: Metadata | null, id?: string | null): Promise<void>;
   requestJson(data: JsonValue, metadata?: Metadata | null, id?: string | null): Promise<Message>;

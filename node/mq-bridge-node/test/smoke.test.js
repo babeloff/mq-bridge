@@ -134,6 +134,36 @@ test("Consumer.poll returns messages and commit acks them", async () => {
   await assert.rejects(() => consumer.status());
 });
 
+test("Publisher.sendBatch publishes every message", async () => {
+  const topic = `node.sendbatch.${Date.now()}`;
+  const endpoint = { memory: { topic, capacity: 4096 } };
+
+  const publisher = Publisher.fromConfig(endpoint);
+  const consumer = Consumer.fromConfig(endpoint);
+
+  await publisher.sendBatch([
+    Message.fromJson({ value: 0 }, { kind: "node.batch" }),
+    Message.fromJson({ value: 1 }, { kind: "node.batch" }),
+    Message.fromJson({ value: 2 }, { kind: "node.batch" }),
+  ]);
+
+  const received = [];
+  while (received.length < 3) {
+    const batch = await consumer.poll(10, 5000);
+    assert.ok(batch.length > 0, "poll timed out before all messages arrived");
+    received.push(...batch);
+  }
+  await consumer.commit();
+
+  assert.deepEqual(
+    received.map((message) => message.json().value),
+    [0, 1, 2],
+  );
+  assert.equal(received[0].metadata.kind, "node.batch");
+
+  await consumer.close();
+});
+
 test("Consumer.pollBatch returns a token and ack advances by batch", async () => {
   const topic = `node.consumer.pollbatch.${Date.now()}`;
   const endpoint = { memory: { topic, capacity: 4096 } };

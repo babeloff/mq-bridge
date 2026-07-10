@@ -22,6 +22,17 @@ impl Publisher {
         Ok(Self { publisher })
     }
 
+    /// Creates a publisher from a JSON endpoint configuration.
+    ///
+    /// Convenience over [`Publisher::new`] for callers that hold a
+    /// `serde_json::Value` (e.g. loaded from a config file or built at runtime),
+    /// mirroring the `from_config` constructor exposed by the language bindings.
+    /// The value is the endpoint body keyed by type, e.g. `{"kafka": { ... }}`.
+    pub async fn from_config(config: serde_json::Value) -> anyhow::Result<Self> {
+        let endpoint: models::Endpoint = serde_json::from_value(config)?;
+        Self::new(endpoint).await
+    }
+
     /// Sends a message and expects a response message from the endpoint.
     /// Returns an error if the endpoint does not support responses (e.g. returns a simple Ack).
     pub async fn request(&self, message: CanonicalMessage) -> anyhow::Result<CanonicalMessage> {

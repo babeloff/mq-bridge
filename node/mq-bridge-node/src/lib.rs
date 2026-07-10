@@ -543,6 +543,15 @@ impl Publisher {
     }
 
     #[napi]
+    pub async fn send_batch(&self, messages: Vec<NativeMessage>) -> Result<()> {
+        let batch = messages
+            .into_iter()
+            .map(NativeMessage::into_canonical)
+            .collect::<Result<Vec<_>>>()?;
+        self.send_batch_on_runtime(batch).await
+    }
+
+    #[napi]
     pub async fn request(&self, message: NativeMessage) -> Result<NativeMessage> {
         self.request_on_runtime(message.into_canonical()?).await
     }
@@ -594,6 +603,18 @@ impl Publisher {
         {
             Sent::Ack | Sent::Response(_) => Ok(()),
         }
+    }
+
+    async fn send_batch_on_runtime(&self, messages: Vec<CanonicalMessage>) -> Result<()> {
+        let publisher = self.publisher.clone();
+        let handle = self
+            .runtime
+            .spawn(async move { publisher.send_batch(messages).await });
+        handle
+            .await
+            .map_err(to_napi_error)?
+            .map_err(to_napi_error)?;
+        Ok(())
     }
 
     async fn request_on_runtime(&self, message: CanonicalMessage) -> Result<NativeMessage> {
