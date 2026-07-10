@@ -179,6 +179,7 @@ pub struct ClickHousePublisher {
     table: String,
     columns: Option<std::collections::BTreeMap<String, String>>,
     async_insert: bool,
+    wait_for_async_insert: bool,
 }
 
 impl ClickHousePublisher {
@@ -207,6 +208,7 @@ impl ClickHousePublisher {
             table: config.table.clone(),
             columns: config.columns.clone(),
             async_insert: config.async_insert,
+            wait_for_async_insert: config.wait_for_async_insert.unwrap_or(true),
         })
     }
 }
@@ -230,7 +232,11 @@ impl MessagePublisher for ClickHousePublisher {
             body.push('\n');
         }
         let extra: &[(&str, &str)] = if self.async_insert {
-            &[("async_insert", "1"), ("wait_for_async_insert", "1")]
+            if self.wait_for_async_insert {
+                &[("async_insert", "1"), ("wait_for_async_insert", "1")]
+            } else {
+                &[("async_insert", "1"), ("wait_for_async_insert", "0")]
+            }
         } else {
             &[]
         };
@@ -312,12 +318,44 @@ fn extract_cursor(row: &serde_json::Value, column: &str) -> Option<ChCursor> {
     }
 }
 
+/// Exponential poll backoff between a base and a max interval. When `max <= base` the delay stays
+/// constant at `base` (backoff disabled); otherwise each idle poll doubles the delay up to `max`,
+/// and `reset` returns to `base` after a non-empty poll.
+struct PollBackoff {
+    base: Duration,
+    max: Duration,
+    current: Duration,
+}
+
+impl PollBackoff {
+    fn new(base: Duration, max: Option<Duration>) -> Self {
+        let max = max.unwrap_or(base).max(base);
+        Self {
+            base,
+            max,
+            current: base,
+        }
+    }
+
+    /// The delay to sleep for this idle poll, then grow toward `max` for the next one.
+    fn idle_delay(&mut self) -> Duration {
+        let delay = self.current;
+        self.current = (self.current * 2).min(self.max);
+        delay
+    }
+
+    /// Return to the base interval after a non-empty poll.
+    fn reset(&mut self) {
+        self.current = self.base;
+    }
+}
+
 pub struct ClickHouseCursorReader {
     client: ChClient,
     table: String,
     cursor_column: String,
     select_columns: String,
-    polling_interval: Duration,
+    backoff: PollBackoff,
     checkpoint: Option<Arc<dyn CheckpointStore>>,
     last_value: Arc<Mutex<Option<ChCursor>>>,
 }
@@ -418,7 +456,10 @@ impl ClickHouseCursorReader {
             table: config.table.clone(),
             cursor_column,
             select_columns,
-            polling_interval: Duration::from_millis(config.polling_interval_ms.unwrap_or(100)),
+            backoff: PollBackoff::new(
+                Duration::from_millis(config.polling_interval_ms.unwrap_or(100)),
+                config.max_polling_interval_ms.map(Duration::from_millis),
+            ),
             checkpoint,
             last_value: Arc::new(Mutex::new(last_value)),
         })
@@ -497,13 +538,15 @@ impl MessageConsumer for ClickHouseCursorReader {
         }
 
         if fetched.is_empty() {
-            // Drained: keep polling cadence, then surface an empty batch.
-            tokio::time::sleep(self.polling_interval).await;
+            // Drained: keep polling cadence (backing off if configured), then surface an empty batch.
+            tokio::time::sleep(self.backoff.idle_delay()).await;
             return Ok(ReceivedBatch {
                 messages: Vec::new(),
                 commit: Box::new(|_| Box::pin(async { Ok(()) })),
             });
         }
+        // Rows arrived: return to the base polling interval.
+        self.backoff.reset();
 
         // Drop the trailing run equal to the peek row's value so a group of equal cursor values is
         // never split across pages; trimmed rows are re-read next poll via `col > last`.

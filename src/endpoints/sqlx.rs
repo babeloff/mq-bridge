@@ -639,7 +639,7 @@ pub struct SqlxConsumer {
     select_query: String,
     delete_after_read: bool,
     table: String,
-    polling_interval: Duration,
+    backoff: PollBackoff,
     driver_name: String,
 }
 
@@ -724,7 +724,10 @@ WHERE id IN (SELECT TOP (@p1) id FROM {0} WITH (UPDLOCK, READPAST) WHERE locked_
             select_query,
             delete_after_read: config.delete_after_read,
             table: config.table.clone(),
-            polling_interval: Duration::from_millis(config.polling_interval_ms.unwrap_or(100)),
+            backoff: PollBackoff::new(
+                Duration::from_millis(config.polling_interval_ms.unwrap_or(100)),
+                config.max_polling_interval_ms.map(Duration::from_millis),
+            ),
             driver_name,
         })
     }
@@ -939,15 +942,17 @@ impl MessageConsumer for SqlxConsumer {
         };
 
         if rows.is_empty() {
-            // Source is drained: sleep to preserve the DB polling cadence, then
-            // surface an empty batch so the route can pause (empty_batch_delay_ms)
-            // or, when exit_on_empty is set, terminate gracefully.
-            tokio::time::sleep(self.polling_interval).await;
+            // Source is drained: sleep to preserve the DB polling cadence (backing off if
+            // configured), then surface an empty batch so the route can pause
+            // (empty_batch_delay_ms) or, when exit_on_empty is set, terminate gracefully.
+            tokio::time::sleep(self.backoff.idle_delay()).await;
             return Ok(ReceivedBatch {
                 messages: Vec::new(),
                 commit: Box::new(|_| Box::pin(async { Ok(()) })),
             });
         }
+        // Rows arrived: return to the base polling interval.
+        self.backoff.reset();
 
         let mut messages = Vec::new();
         let mut ids_to_delete = Vec::new();
@@ -1262,12 +1267,44 @@ async fn source_sql_checkpoint_store(
 /// never deletes/locks source rows, and persists the last successfully-sunk value (keyed
 /// by `cursor_id`) to a pluggable checkpoint store (a `mqb_cursors` table by default, or a
 /// local file). At-least-once. Supported drivers: PostgreSQL, MySQL/MariaDB, SQLite.
+/// Exponential poll backoff between a base and a max interval. When `max <= base` the delay stays
+/// constant at `base` (backoff disabled); otherwise each idle poll doubles the delay up to `max`,
+/// and `reset` returns to `base` after a non-empty poll.
+struct PollBackoff {
+    base: Duration,
+    max: Duration,
+    current: Duration,
+}
+
+impl PollBackoff {
+    fn new(base: Duration, max: Option<Duration>) -> Self {
+        let max = max.unwrap_or(base).max(base);
+        Self {
+            base,
+            max,
+            current: base,
+        }
+    }
+
+    /// The delay to sleep for this idle poll, then grow toward `max` for the next one.
+    fn idle_delay(&mut self) -> Duration {
+        let delay = self.current;
+        self.current = (self.current * 2).min(self.max);
+        delay
+    }
+
+    /// Return to the base interval after a non-empty poll.
+    fn reset(&mut self) {
+        self.current = self.base;
+    }
+}
+
 pub struct SqlxCursorReader {
     pool: AnyPool,
     table: String,
     cursor_column: String,
     driver_name: String,
-    polling_interval: Duration,
+    backoff: PollBackoff,
     checkpoint: Option<Arc<dyn crate::checkpoint::CheckpointStore>>,
     last_value: Arc<Mutex<Option<SqlCursor>>>,
 }
@@ -1355,7 +1392,10 @@ impl SqlxCursorReader {
             table: config.table.clone(),
             cursor_column,
             driver_name,
-            polling_interval: Duration::from_millis(config.polling_interval_ms.unwrap_or(100)),
+            backoff: PollBackoff::new(
+                Duration::from_millis(config.polling_interval_ms.unwrap_or(100)),
+                config.max_polling_interval_ms.map(Duration::from_millis),
+            ),
             checkpoint,
             last_value: Arc::new(Mutex::new(last_value)),
         })
@@ -1408,14 +1448,16 @@ impl MessageConsumer for SqlxCursorReader {
             .map_err(|e| ConsumerError::Connection(anyhow!(e)))?;
 
         if rows.is_empty() {
-            // Drained: preserve polling cadence, then surface an empty batch so the route
-            // can pause or terminate.
-            tokio::time::sleep(self.polling_interval).await;
+            // Drained: preserve polling cadence (backing off if configured), then surface an empty
+            // batch so the route can pause or terminate.
+            tokio::time::sleep(self.backoff.idle_delay()).await;
             return Ok(ReceivedBatch {
                 messages: Vec::new(),
                 commit: Box::new(|_| Box::pin(async { Ok(()) })),
             });
         }
+        // Rows arrived: return to the base polling interval.
+        self.backoff.reset();
 
         // Extract (cursor, message) for every fetched row.
         let mut fetched: Vec<(SqlCursor, CanonicalMessage)> = Vec::with_capacity(rows.len());
@@ -1529,6 +1571,27 @@ mod tests {
     use super::*;
     use crate::traits::{MessageConsumer, MessagePublisher};
     use tempfile::tempdir;
+
+    #[test]
+    fn poll_backoff_disabled_when_no_max() {
+        let base = Duration::from_millis(100);
+        let mut b = PollBackoff::new(base, None);
+        assert_eq!(b.idle_delay(), base);
+        assert_eq!(b.idle_delay(), base); // stays constant without a max
+    }
+
+    #[test]
+    fn poll_backoff_doubles_up_to_max_and_resets() {
+        let base = Duration::from_millis(100);
+        let mut b = PollBackoff::new(base, Some(Duration::from_millis(500)));
+        assert_eq!(b.idle_delay(), Duration::from_millis(100));
+        assert_eq!(b.idle_delay(), Duration::from_millis(200));
+        assert_eq!(b.idle_delay(), Duration::from_millis(400));
+        assert_eq!(b.idle_delay(), Duration::from_millis(500)); // capped at max
+        assert_eq!(b.idle_delay(), Duration::from_millis(500));
+        b.reset();
+        assert_eq!(b.idle_delay(), Duration::from_millis(100)); // back to base
+    }
 
     async fn setup_db_file() -> (tempfile::TempDir, String) {
         use sqlx::Connection;

@@ -2706,6 +2706,9 @@ pub struct SqlxConfig {
     pub auto_create_table: bool,
     /// (Consumer only) Polling interval in milliseconds. Defaults to 100ms.
     pub polling_interval_ms: Option<u64>,
+    /// (Consumer only) If set, the poll interval backs off exponentially from `polling_interval_ms`
+    /// up to this value while drained, resetting on new rows. Unset = constant interval.
+    pub max_polling_interval_ms: Option<u64>,
     /// TLS configuration for the database connection.
     #[serde(default)]
     pub tls: TlsConfig,
@@ -2762,6 +2765,10 @@ pub struct ClickHouseConfig {
     /// buffered server-side. Defaults to false.
     #[serde(default)]
     pub async_insert: bool,
+    /// (Publisher only) With `async_insert`, wait for the server to flush before acking. Defaults to
+    /// true (durable). False = fire-and-forget: faster, but a crash before flush can drop the batch.
+    #[serde(default)]
+    pub wait_for_async_insert: Option<bool>,
     /// (Consumer only) Read an existing table **non-destructively** and resumably, paging by this
     /// monotonic column (`SELECT … WHERE {cursor_column} > {last} ORDER BY {cursor_column} ASC LIMIT n`)
     /// and persisting the last read value under `cursor_id`.
@@ -2782,6 +2789,9 @@ pub struct ClickHouseConfig {
     pub select_columns: Option<String>,
     /// (Consumer only) Polling interval in milliseconds when the table is drained. Defaults to 100ms.
     pub polling_interval_ms: Option<u64>,
+    /// (Consumer only) If set, the poll interval backs off exponentially from `polling_interval_ms`
+    /// up to this value while drained, resetting on new rows. Unset = constant interval.
+    pub max_polling_interval_ms: Option<u64>,
     /// TLS configuration for `https://` connections.
     #[serde(default)]
     pub tls: TlsConfig,
