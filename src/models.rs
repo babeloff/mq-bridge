@@ -2827,6 +2827,11 @@ pub struct ClickHouseConfig {
     /// (Consumer only) If set, the poll interval backs off exponentially from `polling_interval_ms`
     /// up to this value while drained, resetting on new rows. Unset = constant interval.
     pub max_polling_interval_ms: Option<u64>,
+    /// Request timeout in milliseconds for ClickHouse HTTP calls (inserts, cursor reads, status).
+    /// Unset = no timeout (wait indefinitely), which suits very large batch inserts.
+    pub request_timeout_ms: Option<u64>,
+    /// Connection (TCP + TLS handshake) timeout in milliseconds. Defaults to 10000ms.
+    pub connect_timeout_ms: Option<u64>,
     /// TLS configuration for `https://` connections.
     #[serde(default)]
     pub tls: TlsConfig,

@@ -107,7 +107,12 @@ struct ChClient {
 
 impl ChClient {
     fn from_config(config: &ClickHouseConfig) -> anyhow::Result<Self> {
-        let mut builder = reqwest::Client::builder();
+        let mut builder = reqwest::Client::builder().connect_timeout(Duration::from_millis(
+            config.connect_timeout_ms.unwrap_or(10_000),
+        ));
+        if let Some(ms) = config.request_timeout_ms {
+            builder = builder.timeout(Duration::from_millis(ms));
+        }
         if config.tls.accept_invalid_certs {
             builder = builder.danger_accept_invalid_certs(true);
         }

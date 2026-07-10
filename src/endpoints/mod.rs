@@ -457,6 +457,11 @@ fn check_consumer_recursive(
         }
         #[cfg(feature = "clickhouse")]
         EndpointType::ClickHouse(cfg) => {
+            if cfg.cursor_column.is_none() {
+                return Err(anyhow!(
+                    "ClickHouse endpoint used as a consumer requires 'cursor_column' (ClickHouse has no native queue; only non-destructive cursor reads are supported)."
+                ));
+            }
             if cfg.columns.is_some() {
                 warnings.push("Endpoint 'clickhouse' is used as a consumer, but 'columns' is a publisher-only option and will be ignored.".to_string());
             }
@@ -907,10 +912,13 @@ async fn create_base_consumer(
                     // unavailable, so fall back to a non-destructive `_id` read (inserts only).
                     match mongodb::MongoDbChangeStreamReader::new(&config, true).await {
                         Ok(reader) => Ok(boxed(reader)),
-                        Err(e) => {
+                        // Only fall back for the "change streams need a replica set" error (40573);
+                        // auth/network/config and other startup errors propagate untouched.
+                        Err(e) if mongodb::is_change_stream_unsupported(&e) => {
                             tracing::warn!(error = %e, "MongoDB change streams unavailable (needs a replica set); 'capture_all' falling back to an insert-only read");
                             Ok(boxed(mongodb::MongoDbIdReader::new(&config).await?))
                         }
+                        Err(e) => Err(e),
                     }
                 }
             }

@@ -227,6 +227,15 @@
             "type": "string"
           }
         },
+        "connect_timeout_ms": {
+          "description": "Connection (TCP + TLS handshake) timeout in milliseconds. Defaults to 10000ms.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
         "cursor_column": {
           "description": "(Consumer only) Read an existing table **non-destructively** and resumably, paging by this\nmonotonic column (`SELECT … WHERE {cursor_column} > {last} ORDER BY {cursor_column} ASC LIMIT n`)\nand persisting the last read value under `cursor_id`.",
           "type": [
@@ -248,6 +257,15 @@
             "null"
           ]
         },
+        "max_polling_interval_ms": {
+          "description": "(Consumer only) If set, the poll interval backs off exponentially from `polling_interval_ms`\nup to this value while drained, resetting on new rows. Unset = constant interval.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
         "password": {
           "description": "Optional password. Takes precedence over any credentials embedded in the `url`.",
           "type": [
@@ -259,6 +277,15 @@
         },
         "polling_interval_ms": {
           "description": "(Consumer only) Polling interval in milliseconds when the table is drained. Defaults to 100ms.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "request_timeout_ms": {
+          "description": "Request timeout in milliseconds for ClickHouse HTTP calls (inserts, cursor reads, status).\nUnset = no timeout (wait indefinitely), which suits very large batch inserts.",
           "type": [
             "integer",
             "null"
@@ -298,6 +325,14 @@
           "description": "Optional username. Takes precedence over any credentials embedded in the `url`. Defaults to `default`.",
           "type": [
             "string",
+            "null"
+          ],
+          "default": null
+        },
+        "wait_for_async_insert": {
+          "description": "(Publisher only) With `async_insert`, wait for the server to flush before acking. Defaults to\ntrue (durable). False = fire-and-forget: faster, but a crash before flush can drop the batch.",
+          "type": [
+            "boolean",
             "null"
           ],
           "default": null
@@ -1691,6 +1726,31 @@
         }
       ]
     },
+    "MongoConsume": {
+      "description": "How a MongoDB endpoint consumes a collection. One intent-named selector — the bridge picks the\nunderlying mechanism (change stream vs. polling) automatically. Defaults to `consumer`.",
+      "oneOf": [
+        {
+          "description": "**Queue** — durably drain a queue collection: claim, process, resume after restart. Default.",
+          "type": "string",
+          "const": "consumer"
+        },
+        {
+          "description": "**Queue, ephemeral** — receive only new messages, no durable position (fan-out subscriber).",
+          "type": "string",
+          "const": "subscriber"
+        },
+        {
+          "description": "**Watch existing collection** — capture changes from now on (insert/update/delete), resuming\nunder `cursor_id`. Reads an existing collection non-destructively.",
+          "type": "string",
+          "const": "capture_new"
+        },
+        {
+          "description": "**Watch existing collection** — read the existing documents first, then capture changes.\nReads an existing collection non-destructively.",
+          "type": "string",
+          "const": "capture_all"
+        }
+      ]
+    },
     "MongoDbConfig": {
       "description": "General MongoDB connection configuration.",
       "type": "object",
@@ -1704,12 +1764,12 @@
           "format": "int64"
         },
         "change_stream": {
-          "description": "(Consumer only) If true, use Change Streams (**Subscriber mode**). Defaults to false (polling/consumer mode).",
+          "description": "(Consumer only) **Deprecated** — use `consume: subscriber`. Kept for compatibility.",
           "type": "boolean",
           "default": false
         },
         "checkpoint_store": {
-          "description": "(Consumer only) Where to persist the resume cursor in `resumable` mode. A URL selects the\nbackend; a bare name (or `/name`) reuses the **source** database with that collection name:\n- absent → source database, collection `mqb_cursors_<source_collection>` (auto-unique)\n- `/my_cursors` → source database, collection `my_cursors`\n- `file:///var/lib/mqb/cursors.json` → local JSON file (read-only / write-restricted sources)\n- `mongodb://host/db/collection` → external MongoDB collection (collection optional)\n- `postgres://user@host/db/table` or `mysql://host/db/table` → external SQL table (table optional)\n\nWhen no collection/table is named, it defaults to `mqb_cursors_<source_collection>`.\nMay embed connection credentials, so it is treated as a secret.",
+          "description": "(Consumer only) Where to persist the resume cursor in `capture_new`/`capture_all` mode. A URL\nselects the backend; a bare name (or `/name`) reuses the **source** database with that name:\n- absent → source database, collection `mqb_cursors_<source_collection>` (auto-unique)\n- `/my_cursors` → source database, collection `my_cursors`\n- `file:///var/lib/mqb/cursors.json` → local JSON file (read-only / write-restricted sources)\n- `mongodb://host/db/collection` → external MongoDB collection (collection optional)\n- `postgres://user@host/db/table` or `mysql://host/db/table` → external SQL table (table optional)\n\nWhen no collection/table is named, it defaults to `mqb_cursors_<source_collection>`.\nMay embed connection credentials, so it is treated as a secret.",
           "type": [
             "string",
             "null"
@@ -1721,6 +1781,17 @@
           "type": [
             "string",
             "null"
+          ]
+        },
+        "consume": {
+          "description": "(Consumer only) How to consume the collection: `consumer` (default, durable queue),\n`subscriber` (ephemeral queue), `capture_new` (watch an existing collection for changes), or\n`capture_all` (read existing documents first, then watch for changes). The bridge selects the\nunderlying mechanism automatically. If unset, the deprecated `change_stream` boolean is\nhonored for backward compatibility.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MongoConsume"
+            },
+            {
+              "type": "null"
+            }
           ]
         },
         "cursor_id": {
@@ -1792,11 +1863,6 @@
           ],
           "format": "uint64",
           "minimum": 0
-        },
-        "resumable": {
-          "description": "(Consumer only) Read an existing collection **non-destructively** and resumably, paging by `_id`\n(`find({_id:{$gt:last}}).sort({_id:1})`) and persisting the last read `_id` under `cursor_id`.\nSupports ObjectId / UUID / integer `_id`. Does not modify the source collection.\nMutually exclusive with `change_stream`. Defaults to false.",
-          "type": "boolean",
-          "default": false
         },
         "shared": {
           "description": "Share one MongoDB client per connection (default: true); false forces a dedicated client.",
@@ -2432,6 +2498,11 @@
           "type": "boolean",
           "default": false
         },
+        "bulk_copy": {
+          "description": "(Publisher only) PostgreSQL only. Bulk-load batches via `COPY FROM STDIN` (much faster than multi-row INSERT). Requires a token-based `insert_query`; no `ON CONFLICT`/`RETURNING`.",
+          "type": "boolean",
+          "default": false
+        },
         "checkpoint_store": {
           "description": "(Consumer only) Where to persist the resume cursor in `cursor_column` mode. A URL selects the\nbackend; a bare name (or `/name`) reuses the **source** datastore with that table name:\n- absent → source datastore, table `mqb_cursors_<source_table>` (auto-unique)\n- `/my_cursors` → source datastore, table `my_cursors`\n- `file:///var/lib/mqb/cursors.json` → local JSON file (read-only / write-restricted sources)\n- `postgres://user@host/db/table` or `mysql://host/db/table` → external SQL table (table optional)\n- `mongodb://host/db/collection` → external MongoDB collection (collection optional)\n\nWhen no table/collection is named, it defaults to `mqb_cursors_<source_table>`.\nMay embed connection credentials, so it is treated as a secret.",
           "type": [
@@ -2486,6 +2557,15 @@
         },
         "max_lifetime_ms": {
           "description": "Maximum lifetime of a connection in milliseconds. Defaults to 1800000ms (30 minutes).",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "max_polling_interval_ms": {
+          "description": "(Consumer only) If set, the poll interval backs off exponentially from `polling_interval_ms`\nup to this value while drained, resetting on new rows. Unset = constant interval.",
           "type": [
             "integer",
             "null"

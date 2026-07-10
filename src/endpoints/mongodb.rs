@@ -1858,13 +1858,22 @@ async fn open_change_stream(
     if let Some(token) = resume_after {
         watch = watch.resume_after(token);
     }
+    let name = collection.name().to_string();
     watch.await.map_err(|e| {
-        anyhow!(
-            "Failed to open MongoDB change stream for '{}' (requires a replica set): {}",
-            collection.name(),
-            e
-        )
+        // Preserve the source `mongodb::error::Error` (via `.context`, not stringified) so callers
+        // can downcast it — `capture_all` only falls back to the `_id` reader for code 40573.
+        anyhow::Error::new(e).context(format!(
+            "Failed to open MongoDB change stream for '{name}' (requires a replica set)"
+        ))
     })
+}
+
+/// True only for the MongoDB "change streams require a replica set" error (code 40573) — the one
+/// case where `capture_all` may fall back to the insert-only `_id` reader. Auth, network, and
+/// configuration failures return false so they propagate instead of being silently downgraded.
+pub(crate) fn is_change_stream_unsupported(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<mongodb::error::Error>()
+        .is_some_and(|e| matches!(&*e.kind, ErrorKind::Command(cmd) if cmd.code == 40573))
 }
 
 /// While idle (no matching changes), the CDC reader periodically advances its durable checkpoint to

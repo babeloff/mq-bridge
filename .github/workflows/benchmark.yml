@@ -270,6 +270,7 @@ jobs:
           gh api "repos/${{ github.repository }}/deployments?environment=github-pages&per_page=100" --paginate -q '.[].id' \
             | tail -n +$((KEEP + 1)) \
             | while read -r id; do
-                gh api -X POST "repos/${{ github.repository }}/deployments/$id/statuses" -f state=inactive >/dev/null 2>&1
+                gh api -X POST "repos/${{ github.repository }}/deployments/$id/statuses" -f state=inactive >/dev/null 2>&1 \
+                  || echo "::warning::failed to mark deployment $id inactive; attempting delete anyway"
                 gh api -X DELETE "repos/${{ github.repository }}/deployments/$id" >/dev/null 2>&1 && echo "pruned $id"
               done
