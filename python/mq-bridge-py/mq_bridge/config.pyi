@@ -41,6 +41,27 @@ class BufferMiddleware(TypedDict, total=False):
     max_messages: Required[int]
 
 
+class ClickHouseConfig(TypedDict, total=False):
+    """ClickHouse endpoint configuration (talks the ClickHouse HTTP interface)."""
+    async_insert: bool
+    checkpoint_store: Optional[str]
+    columns: Optional[Dict[str, str]]
+    connect_timeout_ms: Optional[int]
+    cursor_column: Optional[str]
+    cursor_id: Optional[str]
+    database: Optional[str]
+    max_polling_interval_ms: Optional[int]
+    password: Optional[str]
+    polling_interval_ms: Optional[int]
+    request_timeout_ms: Optional[int]
+    select_columns: Optional[str]
+    table: Required[str]
+    tls: TlsConfig
+    url: Required[str]
+    username: Optional[str]
+    wait_for_async_insert: Optional[bool]
+
+
 class CookieJarMiddleware(TypedDict, total=False):
     """Cookie/session jar middleware configuration."""
     capture_metadata_keys: List[str]
@@ -71,6 +92,7 @@ class Endpoint(TypedDict, total=False):
     """Represents a connection point for messages, which can be a source (input) or a sink (output)."""
     amqp: AmqpConfig
     aws: AwsConfig
+    clickhouse: ClickHouseConfig
     custom: Dict[str, Any]
     fanout: List[Endpoint]
     file: FileConfig
@@ -225,7 +247,9 @@ class MongoDbConfig(TypedDict, total=False):
     """General MongoDB connection configuration."""
     capped_size_bytes: Optional[int]
     change_stream: bool
+    checkpoint_store: Optional[str]
     collection: Optional[str]
+    consume: Optional[MongoConsume]
     cursor_id: Optional[str]
     database: Required[str]
     format: MongoDbFormat
@@ -327,6 +351,7 @@ class Route(TypedDict, total=False):
     concurrency: int
     description: str
     empty_batch_delay_ms: int
+    exit_on_empty: bool
     input: Required[Endpoint]
     output: Endpoint
     reconnect_interval_ms: int
@@ -345,11 +370,16 @@ class SqlxConfig(TypedDict, total=False):
     """General SQLx connection configuration."""
     acquire_timeout_ms: Optional[int]
     auto_create_table: bool
+    bulk_copy: bool
+    checkpoint_store: Optional[str]
+    cursor_column: Optional[str]
+    cursor_id: Optional[str]
     delete_after_read: bool
     idle_timeout_ms: Optional[int]
     insert_query: Optional[str]
     max_connections: Optional[int]
     max_lifetime_ms: Optional[int]
+    max_polling_interval_ms: Optional[int]
     min_connections: Optional[int]
     password: Optional[str]
     polling_interval_ms: Optional[int]
@@ -412,6 +442,7 @@ class ZeroMqConfig(TypedDict, total=False):
 FaultMode = Literal["panic", "disconnect", "timeout", "json_format_error", "nack"]
 FileFormat = Literal["normal", "json", "text", "raw"]
 HttpServerProtocol = Literal["auto", "http1_only", "http2_only"]
+MongoConsume = Literal["consumer", "subscriber", "capture_new", "capture_all"]
 MongoDbFormat = Literal["normal", "json", "text", "raw"]
 MqttProtocol = Literal["v5", "v3"]
 NatsDeliverPolicy = Literal["all", "last", "new", "last_per_subject"]

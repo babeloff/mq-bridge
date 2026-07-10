@@ -1732,6 +1732,19 @@ mod tests {
     use crate::traits::{MessageConsumer, MessagePublisher};
     use tempfile::tempdir;
 
+    /// Build a SQLite connection URL from a filesystem path, portably. On Windows a file URL
+    /// needs the three-slash form and forward slashes; elsewhere the two-slash form is fine.
+    fn sqlite_url(path: &std::path::Path) -> String {
+        #[cfg(windows)]
+        {
+            format!("sqlite:///{}", path.to_string_lossy().replace('\\', "/"))
+        }
+        #[cfg(not(windows))]
+        {
+            format!("sqlite://{}", path.to_str().unwrap())
+        }
+    }
+
     #[test]
     fn copy_escape_text_escapes_control_chars() {
         assert_eq!(copy_escape_text("plain"), "plain");
@@ -1770,11 +1783,7 @@ mod tests {
         sqlx::any::install_default_drivers();
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.db");
-
-        #[cfg(windows)]
-        let url = format!("sqlite:///{}", path.to_string_lossy().replace('\\', "/"));
-        #[cfg(not(windows))]
-        let url = format!("sqlite://{}", path.to_str().unwrap());
+        let url = sqlite_url(&path);
 
         // Explicitly create the file first and drop the handle to avoid locking issues on Windows.
         // The `connect` call will create the file if it doesn't exist, but this can be racy in tests.
@@ -1801,7 +1810,7 @@ mod tests {
         sqlx::any::install_default_drivers();
         let dir = tempdir().unwrap();
         let path = dir.path().join("arb.db");
-        let url = format!("sqlite://{}", path.to_str().unwrap());
+        let url = sqlite_url(&path);
         drop(tokio::fs::File::create(&path).await.unwrap());
         let pool = AnyPool::connect(&url).await.unwrap();
         sqlx::query("CREATE TABLE orders (id INTEGER PRIMARY KEY, sku TEXT, qty INTEGER)")
@@ -1836,7 +1845,7 @@ mod tests {
         sqlx::any::install_default_drivers();
         let dir = tempdir().unwrap();
         let path = dir.path().join("dup.db");
-        let url = format!("sqlite://{}", path.to_str().unwrap());
+        let url = sqlite_url(&path);
         drop(tokio::fs::File::create(&path).await.unwrap());
         let pool = AnyPool::connect(&url).await.unwrap();
         sqlx::query("CREATE TABLE events (id INTEGER PRIMARY KEY, ts INTEGER)")
@@ -2012,7 +2021,7 @@ mod tests {
         sqlx::any::install_default_drivers();
         let dir = tempdir().unwrap();
         let path = dir.path().join("ev.db");
-        let url = format!("sqlite://{}", path.to_str().unwrap());
+        let url = sqlite_url(&path);
         drop(tokio::fs::File::create(&path).await.unwrap());
         let pool = AnyPool::connect(&url).await.unwrap();
         sqlx::query("CREATE TABLE events (k TEXT PRIMARY KEY, data TEXT)")
@@ -2029,13 +2038,14 @@ mod tests {
         }
 
         let ckpt = dir.path().join("cursors.json");
-        // Absolute tempdir path -> `file:///abs/path` (three-slash form).
+        // Absolute tempdir path -> `file:///abs/path` (three-slash form), portable across OSes.
+        let ckpt_url = url::Url::from_file_path(&ckpt).unwrap().to_string();
         let config = SqlxConfig {
             url: url.clone(),
             table: "events".to_string(),
             cursor_column: Some("k".to_string()),
             cursor_id: Some("c1".to_string()),
-            checkpoint_store: Some(format!("file://{}", ckpt.to_str().unwrap())),
+            checkpoint_store: Some(ckpt_url),
             ..Default::default()
         };
 
@@ -2069,7 +2079,7 @@ mod tests {
         // A separate SQLite database used only for checkpoints.
         let dir_b = tempdir().unwrap();
         let path_b = dir_b.path().join("ckpt.db");
-        let url_b = format!("sqlite://{}", path_b.to_str().unwrap());
+        let url_b = sqlite_url(&path_b);
         drop(tokio::fs::File::create(&path_b).await.unwrap());
         let pool_b = AnyPool::connect(&url_b).await.unwrap();
 

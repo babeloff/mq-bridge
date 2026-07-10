@@ -40,7 +40,7 @@ fn path_lock(path: &Path) -> Arc<AsyncMutex<()>> {
 
 /// A file-backed checkpoint store: a single JSON object mapping cursor keys to values,
 /// written atomically (unique temp file + rename). Concurrent saves to the same path are
-/// serialized in-process via [`path_lock`]; cross-process sharing still relies on the atomic
+/// serialized in-process via `path_lock`; cross-process sharing still relies on the atomic
 /// rename. Suitable for read-only sources and dev/CLI one-offs.
 pub struct FileCheckpointStore {
     path: PathBuf,
@@ -385,6 +385,9 @@ mod tests {
         );
     }
 
+    // Uses Unix absolute paths; `Url::to_file_path` only maps these to a real path on Unix
+    // (Windows file URLs need a drive letter), so the success assertions are Unix-only.
+    #[cfg(unix)]
     #[test]
     fn parse_file_requires_three_slashes() {
         assert_eq!(
