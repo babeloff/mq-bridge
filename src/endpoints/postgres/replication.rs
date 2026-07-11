@@ -93,11 +93,23 @@ fn map_tls(tls: &crate::models::TlsConfig) -> PgTlsConfig {
     PgTlsConfig::verify_full(tls.ca_file.clone().map(PathBuf::from))
 }
 
-/// Open a plain SQL connection for control-plane slot operations.
-async fn control_conn(url: &str) -> anyhow::Result<PgConnection> {
-    let opts: PgConnectOptions = url
+/// Open a plain SQL connection for control-plane slot operations, applying the
+/// same TLS enforcement as the replication stream so the slot lifecycle can't
+/// silently fall back to an unverified `sslmode=prefer` connection.
+async fn control_conn(url: &str, tls: &crate::models::TlsConfig) -> anyhow::Result<PgConnection> {
+    let mut opts: PgConnectOptions = url
         .parse()
         .context("postgres-cdc: invalid connection URL")?;
+    if tls.required {
+        opts = opts.ssl_mode(if tls.accept_invalid_certs {
+            sqlx::postgres::PgSslMode::Require
+        } else {
+            sqlx::postgres::PgSslMode::VerifyFull
+        });
+        if let Some(ca_file) = &tls.ca_file {
+            opts = opts.ssl_root_cert(ca_file);
+        }
+    }
     opts.connect()
         .await
         .map_err(|e| anyhow!("postgres-cdc: control-plane connect failed: {e}"))
@@ -110,8 +122,9 @@ pub async fn ensure_slot(
     slot_name: &str,
     create_if_missing: bool,
     temporary: bool,
+    tls: &crate::models::TlsConfig,
 ) -> anyhow::Result<()> {
-    let mut conn = control_conn(url).await?;
+    let mut conn = control_conn(url, tls).await?;
 
     let row: Option<(String,)> =
         sqlx::query_as("SELECT slot_name::text FROM pg_replication_slots WHERE slot_name = $1")
@@ -153,11 +166,16 @@ pub async fn ensure_slot(
 /// (before the stream is opened), so a resumed run skips already-persisted
 /// changes. `pg_replication_slot_advance` never moves a slot backwards or past
 /// the server's insert pointer, so a stale `lsn` is a safe no-op.
-pub async fn advance_slot(url: &str, slot_name: &str, lsn: u64) -> anyhow::Result<()> {
+pub async fn advance_slot(
+    url: &str,
+    slot_name: &str,
+    lsn: u64,
+    tls: &crate::models::TlsConfig,
+) -> anyhow::Result<()> {
     if lsn == 0 {
         return Ok(());
     }
-    let mut conn = control_conn(url).await?;
+    let mut conn = control_conn(url, tls).await?;
     sqlx::query("SELECT pg_replication_slot_advance($1, $2::pg_lsn)")
         .bind(slot_name)
         .bind(format_lsn(lsn))
@@ -177,11 +195,12 @@ pub async fn advance_slot_when_inactive(
     url: &str,
     slot_name: &str,
     lsn: u64,
+    tls: &crate::models::TlsConfig,
 ) -> anyhow::Result<()> {
     if lsn == 0 {
         return Ok(());
     }
-    let mut conn = control_conn(url).await?;
+    let mut conn = control_conn(url, tls).await?;
     for _ in 0..40 {
         let active: Option<(Option<bool>,)> =
             sqlx::query_as("SELECT active FROM pg_replication_slots WHERE slot_name = $1")

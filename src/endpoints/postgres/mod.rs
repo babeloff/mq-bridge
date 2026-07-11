@@ -57,6 +57,8 @@ pub struct PostgresCdcConsumer {
     url: String,
     /// Slot name used on teardown to advance the slot durably (see `Drop`).
     slot_name: String,
+    /// TLS config used on teardown to reopen the control-plane connection (see `Drop`).
+    tls: crate::models::TlsConfig,
     ended: bool,
 }
 
@@ -85,6 +87,7 @@ impl PostgresCdcConsumer {
             &config.slot_name,
             config.create_slot,
             config.temporary_slot,
+            &config.tls,
         )
         .await?;
 
@@ -130,7 +133,7 @@ impl PostgresCdcConsumer {
         };
 
         if let Some(lsn) = start_lsn {
-            replication::advance_slot(&config.url, &config.slot_name, lsn).await?;
+            replication::advance_slot(&config.url, &config.slot_name, lsn, &config.tls).await?;
         }
 
         let client = replication::start_replication(config, start_lsn).await?;
@@ -150,6 +153,7 @@ impl PostgresCdcConsumer {
             checkpoint,
             url: config.url.clone(),
             slot_name: config.slot_name.clone(),
+            tls: config.tls.clone(),
             ended: false,
         })
     }
@@ -216,8 +220,11 @@ impl PostgresCdcConsumer {
             Message::Truncate(t) => {
                 let mut staged = Vec::new();
                 for oid in &t.relation_oids {
-                    if let Ok(rel) = self.registry.get(*oid) {
-                        staged.push(stage_truncate(rel, &t));
+                    match self.registry.get(*oid) {
+                        Ok(rel) => staged.push(stage_truncate(rel, &t)),
+                        Err(e) => {
+                            debug!(oid, error = %e, "postgres_cdc: ignoring truncate for unknown relation")
+                        }
                     }
                 }
                 self.tx_buffer.extend(staged);
@@ -397,13 +404,16 @@ impl Drop for PostgresCdcConsumer {
         }
         let url = self.url.clone();
         let slot = self.slot_name.clone();
+        let tls = self.tls.clone();
         let client = &mut self.client;
         tokio::task::block_in_place(|| {
             handle.block_on(async move {
                 // Stop the stream so the server releases the slot, then advance
                 // confirmed_flush_lsn to the last durably-acked LSN.
                 let _ = client.shutdown().await;
-                if let Err(e) = replication::advance_slot_when_inactive(&url, &slot, lsn).await {
+                if let Err(e) =
+                    replication::advance_slot_when_inactive(&url, &slot, lsn, &tls).await
+                {
                     warn!(error = %e, "postgres_cdc: durable slot advance on shutdown failed");
                 }
             });
