@@ -1307,45 +1307,175 @@ impl SqlCursor {
 fn row_to_json(row: &sqlx::any::AnyRow) -> serde_json::Value {
     let mut map = serde_json::Map::new();
     for col in row.columns() {
-        map.insert(
-            col.name().to_string(),
-            extract_json_value(row, col.ordinal()),
-        );
+        map.insert(col.name().to_string(), extract_json_value(row, col));
     }
     serde_json::Value::Object(map)
 }
 
-fn extract_json_value(row: &sqlx::any::AnyRow, idx: usize) -> serde_json::Value {
+/// Decode one column's value straight to its known `AnyTypeInfoKind`, instead of guessing
+/// via a cascade of `try_get::<T>` calls (each of which round-trips through `Any`'s dynamic
+/// dispatch and fails before the right type is found). This is the hot path for the cursor
+/// reader, so avoiding N wasted decode attempts per column matters at scale.
+fn extract_json_value(
+    row: &sqlx::any::AnyRow,
+    col: &<sqlx::Any as sqlx::Database>::Column,
+) -> serde_json::Value {
     use serde_json::Value;
-    if let Ok(v) = row.try_get::<Option<i64>, _>(idx) {
-        return v.map(Value::from).unwrap_or(Value::Null);
-    }
-    if let Ok(v) = row.try_get::<Option<f64>, _>(idx) {
-        return v.map(Value::from).unwrap_or(Value::Null);
-    }
-    if let Ok(v) = row.try_get::<Option<bool>, _>(idx) {
-        return v.map(Value::from).unwrap_or(Value::Null);
-    }
-    if let Ok(v) = row.try_get::<Option<String>, _>(idx) {
-        return v.map(Value::from).unwrap_or(Value::Null);
-    }
-    if let Ok(v) = row.try_get::<Option<Vec<u8>>, _>(idx) {
-        // Bytes have no JSON scalar; expose as a base16 string so the copy is lossless-ish.
-        return v
+    use sqlx::any::AnyTypeInfoKind;
+    let idx = col.ordinal();
+    match col.type_info().kind() {
+        AnyTypeInfoKind::Null => Value::Null,
+        AnyTypeInfoKind::Bool => row
+            .try_get::<Option<bool>, _>(idx)
+            .ok()
+            .flatten()
+            .map(Value::from)
+            .unwrap_or(Value::Null),
+        AnyTypeInfoKind::SmallInt | AnyTypeInfoKind::Integer | AnyTypeInfoKind::BigInt => row
+            .try_get::<Option<i64>, _>(idx)
+            .ok()
+            .flatten()
+            .map(Value::from)
+            .unwrap_or(Value::Null),
+        AnyTypeInfoKind::Real => row
+            .try_get::<Option<f32>, _>(idx)
+            .ok()
+            .flatten()
+            .map(|v| Value::from(v as f64))
+            .unwrap_or(Value::Null),
+        AnyTypeInfoKind::Double => row
+            .try_get::<Option<f64>, _>(idx)
+            .ok()
+            .flatten()
+            .map(Value::from)
+            .unwrap_or(Value::Null),
+        AnyTypeInfoKind::Text => row
+            .try_get::<Option<String>, _>(idx)
+            .ok()
+            .flatten()
+            .map(Value::from)
+            .unwrap_or(Value::Null),
+        AnyTypeInfoKind::Blob => row
+            .try_get::<Option<Vec<u8>>, _>(idx)
+            .ok()
+            .flatten()
+            // Bytes have no JSON scalar; expose as a base16 string so the copy is lossless-ish.
             .map(|b| Value::from(b.iter().map(|x| format!("{:02x}", x)).collect::<String>()))
-            .unwrap_or(Value::Null);
+            .unwrap_or(Value::Null),
     }
-    Value::Null
 }
 
-fn extract_cursor(row: &sqlx::any::AnyRow, column: &str) -> Option<SqlCursor> {
-    if let Ok(Some(n)) = row.try_get::<Option<i64>, _>(column) {
-        return Some(SqlCursor::Int(n));
+/// Resolve the cursor column's ordinal and kind once per batch (same query, same column
+/// order for every row) instead of re-resolving the name -> ordinal lookup on every row.
+fn resolve_cursor_column(
+    row: &sqlx::any::AnyRow,
+    column: &str,
+) -> Option<(usize, sqlx::any::AnyTypeInfoKind)> {
+    let col = row.try_column(column).ok()?;
+    Some((col.ordinal(), col.type_info().kind()))
+}
+
+fn extract_cursor_at(
+    row: &sqlx::any::AnyRow,
+    idx: usize,
+    kind: sqlx::any::AnyTypeInfoKind,
+) -> Option<SqlCursor> {
+    use sqlx::any::AnyTypeInfoKind;
+    match kind {
+        AnyTypeInfoKind::SmallInt | AnyTypeInfoKind::Integer | AnyTypeInfoKind::BigInt => row
+            .try_get::<Option<i64>, _>(idx)
+            .ok()
+            .flatten()
+            .map(SqlCursor::Int),
+        AnyTypeInfoKind::Text => row
+            .try_get::<Option<String>, _>(idx)
+            .ok()
+            .flatten()
+            .map(SqlCursor::Text),
+        _ => None,
     }
-    if let Ok(Some(s)) = row.try_get::<Option<String>, _>(column) {
-        return Some(SqlCursor::Text(s));
+}
+
+/// PostgreSQL base type names (`pg_type.typname`) that the sqlx `Any` driver can map to an
+/// `AnyValue`. This mirrors sqlx-postgres' `PgTypeInfo -> AnyTypeInfo` conversion exactly;
+/// anything not listed (timestamptz, uuid, numeric, json/jsonb, arrays, date/time, interval,
+/// inet, and notably `name`/`bpchar`/`char`) makes `Any` abort row decoding, so we cast it to
+/// `text`. Keep this in lockstep with sqlx: over-including a type reintroduces the hang.
+fn pg_typname_is_any_safe(typname: &str) -> bool {
+    matches!(
+        typname,
+        "bool"
+            | "int2"
+            | "int4"
+            | "int8"
+            | "float4"
+            | "float8"
+            | "bytea"
+            | "text"
+            | "varchar"
+            | "citext"
+    )
+}
+
+/// Double-quote a SQL identifier, escaping embedded quotes.
+fn quote_ident(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+/// Build the SELECT projection used in place of `*` for the cursor reader.
+///
+/// On PostgreSQL the `Any` driver eagerly decodes every column when building a row and aborts
+/// the whole query on the first type it cannot map (e.g. `TIMESTAMPTZ`). We introspect the
+/// table's columns via the catalog and cast every `Any`-incompatible column to `text`, so the
+/// copy succeeds (unmappable values arrive as strings) instead of failing every read forever.
+/// Any introspection failure (or a non-PostgreSQL driver) falls back to `*`, preserving the
+/// previous behaviour.
+async fn build_cursor_projection(pool: &AnyPool, driver_name: &str, table: &str) -> String {
+    if driver_name != "PostgreSQL" {
+        return "*".to_string();
     }
-    None
+    // `$1::regclass` resolves the (optionally schema-qualified) table name against the current
+    // search_path. pg_attribute.attname/pg_type.typname are Postgres `name`-typed columns,
+    // which `Any` cannot decode directly (distinct from `text`), so cast them explicitly.
+    let sql = "SELECT a.attname::text AS name, t.typname::text AS typname \
+               FROM pg_attribute a JOIN pg_type t ON t.oid = a.atttypid \
+               WHERE a.attrelid = $1::regclass AND a.attnum > 0 AND NOT a.attisdropped \
+               ORDER BY a.attnum";
+    let rows = match sqlx::query(sql).bind(table).fetch_all(pool).await {
+        Ok(rows) if !rows.is_empty() => rows,
+        Ok(_) => return "*".to_string(),
+        Err(e) => {
+            warn!(table = %table, error = %e, "Could not introspect PostgreSQL columns; falling back to SELECT * (timestamptz/uuid/etc. columns may fail to decode)");
+            return "*".to_string();
+        }
+    };
+    let mut parts = Vec::with_capacity(rows.len());
+    for row in &rows {
+        let name: String = match row.try_get("name") {
+            Ok(n) => n,
+            Err(_) => return "*".to_string(),
+        };
+        let typname: String = row.try_get("typname").unwrap_or_default();
+        let ident = quote_ident(&name);
+        if pg_typname_is_any_safe(&typname) {
+            parts.push(ident);
+        } else {
+            // Cast to text so `Any` can decode it; keep the original column name via alias.
+            parts.push(format!("{ident}::text AS {ident}"));
+        }
+    }
+    parts.join(", ")
+}
+
+/// A permanent (non-transient) failure: the `Any` driver cannot decode a column type, so
+/// retrying the identical query will fail identically. Detected so the route fails fast with
+/// a clear message instead of reconnecting on a 5s loop forever.
+fn is_permanent_decode_error(e: &sqlx::Error) -> bool {
+    if matches!(e, sqlx::Error::ColumnDecode { .. }) {
+        return true;
+    }
+    let msg = e.to_string();
+    msg.contains("Any driver does not support") || msg.contains("Any driver mapping")
 }
 
 /// Checkpoint store backed by a `mqb_cursors` table in the source database.
@@ -1464,6 +1594,10 @@ pub struct SqlxCursorReader {
     table: String,
     cursor_column: String,
     driver_name: String,
+    /// SELECT projection used in place of `*`. On PostgreSQL, columns whose type the
+    /// sqlx `Any` driver cannot map (timestamptz, uuid, numeric, json, arrays, ...) are
+    /// cast to `text` so `fetch_all` does not abort the whole query; other drivers use `*`.
+    projection: String,
     backoff: PollBackoff,
     checkpoint: Option<Arc<dyn crate::checkpoint::CheckpointStore>>,
     last_value: Arc<Mutex<Option<SqlCursor>>>,
@@ -1547,11 +1681,14 @@ impl SqlxCursorReader {
         };
         info!(table = %config.table, cursor_id = ?config.cursor_id, has_checkpoint = %last_value.is_some(), "SQLx cursor reader initialized");
 
+        let projection = build_cursor_projection(&pool, &driver_name, &config.table).await;
+
         Ok(Self {
             pool,
             table: config.table.clone(),
             cursor_column,
             driver_name,
+            projection,
             backoff: PollBackoff::new(
                 Duration::from_millis(config.polling_interval_ms.unwrap_or(100)),
                 config.max_polling_interval_ms.map(Duration::from_millis),
@@ -1575,14 +1712,16 @@ impl MessageConsumer for SqlxCursorReader {
         let last = self.last_value.lock().unwrap().clone();
         let sql = match &last {
             Some(_) => format!(
-                "SELECT * FROM {0} WHERE {1} > {2} ORDER BY {1} ASC LIMIT {3}",
+                "SELECT {0} FROM {1} WHERE {2} > {3} ORDER BY {2} ASC LIMIT {4}",
+                self.projection,
                 self.table,
                 self.cursor_column,
                 positional_placeholder(&self.driver_name, 1),
                 positional_placeholder(&self.driver_name, 2),
             ),
             None => format!(
-                "SELECT * FROM {0} ORDER BY {1} ASC LIMIT {2}",
+                "SELECT {0} FROM {1} ORDER BY {2} ASC LIMIT {3}",
+                self.projection,
                 self.table,
                 self.cursor_column,
                 positional_placeholder(&self.driver_name, 1),
@@ -1602,10 +1741,23 @@ impl MessageConsumer for SqlxCursorReader {
         let fetch_limit = (max_messages as i64).saturating_add(1);
         query = query.bind(fetch_limit);
 
-        let rows = query
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|e| ConsumerError::Connection(anyhow!(e)))?;
+        let rows = match query.fetch_all(&self.pool).await {
+            Ok(rows) => rows,
+            // A decode/type-mapping failure is permanent: the same query will fail identically
+            // every poll. Surface it as a non-retryable error so the route stops instead of
+            // reconnecting forever, and point the user at the fix.
+            Err(e) if is_permanent_decode_error(&e) => {
+                return Err(ConsumerError::Connection(anyhow::Error::new(
+                    crate::errors::ProcessingError::NonRetryable(anyhow!(
+                        "SQLx cursor reader on table '{}' hit a column of a type the SQL `Any` \
+                         driver cannot decode: {e}. This is permanent; expose the column as \
+                         TEXT/BIGINT (e.g. via a view that CASTs it) and point the reader there.",
+                        self.table
+                    )),
+                )));
+            }
+            Err(e) => return Err(ConsumerError::Connection(anyhow!(e))),
+        };
 
         if rows.is_empty() {
             // Drained: preserve polling cadence (backing off if configured), then surface an empty
@@ -1619,17 +1771,23 @@ impl MessageConsumer for SqlxCursorReader {
         // Rows arrived: return to the base polling interval.
         self.backoff.reset();
 
+        // Resolve the cursor column's position once; every row in this batch shares the
+        // same query/column order, so there's no need to re-resolve it per row.
+        let cursor_col = resolve_cursor_column(&rows[0], &self.cursor_column);
+
         // Extract (cursor, message) for every fetched row.
         let mut fetched: Vec<(SqlCursor, CanonicalMessage)> = Vec::with_capacity(rows.len());
         for row in &rows {
-            let cursor = extract_cursor(row, &self.cursor_column).ok_or_else(|| {
-                ConsumerError::Connection(anyhow!(
-                    "cursor_column '{}' is missing or of a type the SQL `Any` driver cannot decode \
-                     (only integer and text cursors are supported). CAST it to BIGINT/TEXT in a view, \
-                     or point cursor_column at an integer or text column.",
-                    self.cursor_column
-                ))
-            })?;
+            let cursor = cursor_col
+                .and_then(|(idx, kind)| extract_cursor_at(row, idx, kind))
+                .ok_or_else(|| {
+                    ConsumerError::Connection(anyhow!(
+                        "cursor_column '{}' is missing or of a type the SQL `Any` driver cannot decode \
+                         (only integer and text cursors are supported). CAST it to BIGINT/TEXT in a view, \
+                         or point cursor_column at an integer or text column.",
+                        self.cursor_column
+                    ))
+                })?;
             let payload = serde_json::to_vec(&row_to_json(row)).unwrap_or_default();
             fetched.push((cursor, CanonicalMessage::new(payload, None)));
         }
