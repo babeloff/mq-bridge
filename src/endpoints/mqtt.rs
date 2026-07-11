@@ -526,7 +526,8 @@ impl MqttListener {
         let is_connected = Arc::new(AtomicBool::new(false));
 
         let sub_info = Some((client.clone(), topic.to_string(), qos));
-        let (subscribed_tx, mut subscribed_rx) = watch::channel(false);
+        // `None` = no SUBACK yet, `Some(true)` = accepted, `Some(false)` = rejected.
+        let (subscribed_tx, mut subscribed_rx) = watch::channel(None);
         tokio::spawn(run_eventloop(
             eventloop,
             Some(tx),
@@ -544,19 +545,35 @@ impl MqttListener {
         // subscription is actually active before we return. Otherwise a message
         // published immediately after `new()` can be missed (QoS 1 delivers nothing to
         // a not-yet-registered subscription).
-        let waited = tokio::time::timeout(Duration::from_secs(10), async {
+        let outcome = tokio::time::timeout(Duration::from_secs(10), async {
             loop {
-                if *subscribed_rx.borrow_and_update() {
-                    return;
+                if let Some(accepted) = *subscribed_rx.borrow_and_update() {
+                    return Ok(accepted);
                 }
                 if subscribed_rx.changed().await.is_err() {
-                    return;
+                    // Event loop dropped the sender before a SUBACK arrived.
+                    return Err(());
                 }
             }
         })
         .await;
-        if waited.is_err() {
-            warn!(topic = %topic, client_id = %client_id, "Timed out waiting for MQTT subscription confirmation (SUBACK)");
+        match outcome {
+            Err(_elapsed) => {
+                return Err(anyhow!(
+                    "Timed out waiting for MQTT SUBACK for topic '{topic}' (client_id '{client_id}')"
+                ));
+            }
+            Ok(Err(())) => {
+                return Err(anyhow!(
+                    "MQTT subscription channel closed before SUBACK for topic '{topic}' (client_id '{client_id}')"
+                ));
+            }
+            Ok(Ok(false)) => {
+                return Err(anyhow!(
+                    "Broker rejected MQTT subscription for topic '{topic}' (client_id '{client_id}')"
+                ));
+            }
+            Ok(Ok(true)) => {}
         }
         info!(topic = %topic, client_id = %client_id, "MQTT subscribed");
 
@@ -834,10 +851,10 @@ async fn run_eventloop(
     manual_acks: bool,
     is_connected: Arc<AtomicBool>,
     confirm: Option<Arc<PublishConfirm>>,
-    // Fires `true` once the broker confirms our subscription (SUBACK), so `new()`
-    // can wait until the subscription is actually active before returning. Only
-    // set for consumers.
-    subscribed_tx: Option<watch::Sender<bool>>,
+    // Reports the SUBACK outcome so `new()` can wait until the subscription is
+    // actually active before returning: `Some(true)` = accepted, `Some(false)` =
+    // rejected. Only set for consumers.
+    subscribed_tx: Option<watch::Sender<Option<bool>>>,
 ) {
     let mut stopping = false;
     // A future that is always pending until we decide to start the timeout
@@ -906,9 +923,12 @@ async fn run_eventloop(
                                         info!("Session present on V3 connection, resuming...");
                                     }
                                 }
-                                rumqttc::Incoming::SubAck(_) => {
+                                rumqttc::Incoming::SubAck(ack) => {
                                     if let Some(tx) = &subscribed_tx {
-                                        let _ = tx.send(true);
+                                        let accepted = ack.return_codes.iter().all(|c| {
+                                            matches!(c, rumqttc::SubscribeReasonCode::Success(_))
+                                        });
+                                        let _ = tx.send(Some(accepted));
                                     }
                                 }
                                 rumqttc::Incoming::Disconnect => {
@@ -981,9 +1001,12 @@ async fn run_eventloop(
                                             info!("Session present on V5 connection, resuming...");
                                         }
                                     }
-                                    rumqttc::v5::Event::Incoming(rumqttc::v5::Incoming::SubAck(_)) => {
+                                    rumqttc::v5::Event::Incoming(rumqttc::v5::Incoming::SubAck(ack)) => {
                                         if let Some(tx) = &subscribed_tx {
-                                            let _ = tx.send(true);
+                                            let accepted = ack.return_codes.iter().all(|c| {
+                                                matches!(c, rumqttc::v5::mqttbytes::v5::SubscribeReasonCode::Success(_))
+                                            });
+                                            let _ = tx.send(Some(accepted));
                                         }
                                     }
                                     rumqttc::v5::Event::Incoming(rumqttc::v5::Incoming::Disconnect(_)) => {
