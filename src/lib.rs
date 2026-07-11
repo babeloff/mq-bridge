@@ -34,6 +34,41 @@ pub use endpoints::memory::get_or_create_channel;
 pub use publisher::{get_publisher, list_publishers, register_publisher, unregister_publisher};
 pub use route::{get_route, list_routes, register_endpoint, stop_route};
 
+// Re-export the underlying driver crate for each feature-gated endpoint, so
+// downstream code can depend on the exact same version mq-bridge builds against
+// (and share types with it) without adding — and keeping in sync — its own
+// dependency entry. Each is gated on the feature that pulls the crate in.
+#[cfg(feature = "nats")]
+pub use async_nats;
+#[cfg(feature = "amqp")]
+pub use lapin;
+#[cfg(feature = "mongodb")]
+pub use mongodb;
+#[cfg(feature = "kafka")]
+pub use rdkafka;
+#[cfg(feature = "redis-streams")]
+pub use redis;
+#[cfg(feature = "clickhouse")]
+pub use reqwest;
+#[cfg(feature = "mqtt")]
+pub use rumqttc;
+#[cfg(feature = "websocket")]
+pub use tokio_websockets;
+#[cfg(feature = "zeromq")]
+pub use zeromq;
+#[cfg(feature = "aws")]
+pub use {aws_config, aws_sdk_sns, aws_sdk_sqs};
+#[cfg(feature = "grpc")]
+pub use {prost, tonic};
+// `sqlx` is also enabled transitively by `postgres-cdc`; the integration tests
+// use this re-export instead of a duplicate dev-dependency.
+#[cfg(any(feature = "ibm-mq", feature = "ibm-mq-static"))]
+pub use mqi;
+#[cfg(feature = "postgres-cdc")]
+pub use pgwire_replication;
+#[cfg(feature = "sqlx")]
+pub use sqlx;
+
 pub mod consumer {
     pub use crate::middleware::apply_middlewares_to_consumer as apply_middlewares;
 }

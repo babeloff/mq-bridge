@@ -718,6 +718,8 @@ pub enum EndpointType {
     Sqlx(SqlxConfig),
     #[serde(rename = "clickhouse", alias = "click_house")]
     ClickHouse(ClickHouseConfig),
+    #[serde(rename = "postgres_cdc", alias = "postgres-cdc")]
+    PostgresCdc(PostgresCdcConfig),
     Fanout(Vec<Endpoint>),
     #[serde(rename = "stream_buffer")]
     StreamBuffer(StreamBufferConfig),
@@ -754,6 +756,7 @@ impl EndpointType {
             EndpointType::Grpc(_) => "grpc",
             EndpointType::Sqlx(_) => "sqlx",
             EndpointType::ClickHouse(_) => "clickhouse",
+            EndpointType::PostgresCdc(_) => "postgres_cdc",
             EndpointType::Fanout(_) => "fanout",
             EndpointType::StreamBuffer(_) => "stream_buffer",
             EndpointType::Switch(_) => "switch",
@@ -2683,6 +2686,46 @@ pub struct ResponseConfig {
     // This struct is a marker and currently has no fields.
 }
 
+// --- Postgres CDC (logical replication) Configuration ---
+
+/// Postgres logical-replication CDC source (pgoutput). Source-only.
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct PostgresCdcConfig {
+    /// Connection URL, e.g. `postgres://user:pass@host:5432/dbname`.
+    pub url: String,
+    /// Publication name (must already exist; defines which tables are captured).
+    pub publication: String,
+    /// Replication slot name; created if missing when `create_slot` is true.
+    #[serde(default = "default_pg_cdc_slot")]
+    pub slot_name: String,
+    /// Create the replication slot if it does not exist.
+    #[serde(default = "default_true")]
+    pub create_slot: bool,
+    /// Use a temporary slot (dropped on disconnect). Not restart-safe; default is a permanent slot.
+    #[serde(default)]
+    pub temporary_slot: bool,
+    /// Checkpoint key for persisting the confirmed LSN across restarts (optional; the slot is authoritative).
+    pub cursor_id: Option<String>,
+    /// Checkpoint store spec (e.g. `file:///path`); defaults to the source database.
+    pub checkpoint_store: Option<String>,
+    /// Standby-status-update interval in ms; must be shorter than the server's `wal_sender_timeout`.
+    #[serde(default = "default_pg_cdc_status_interval_ms")]
+    pub status_interval_ms: u64,
+    /// TLS configuration for the replication connection.
+    #[serde(default)]
+    pub tls: TlsConfig,
+}
+
+fn default_pg_cdc_slot() -> String {
+    "mq_bridge_slot".to_string()
+}
+
+fn default_pg_cdc_status_interval_ms() -> u64 {
+    10_000
+}
+
 // --- SQLx Specific Configuration ---
 
 /// General SQLx connection configuration.
@@ -2753,6 +2796,12 @@ pub struct SqlxConfig {
     /// (Consumer only) If set, the poll interval backs off exponentially from `polling_interval_ms`
     /// up to this value while drained, resetting on new rows. Unset = constant interval.
     pub max_polling_interval_ms: Option<u64>,
+    /// (Consumer only, PostgreSQL) If set, consume via logical-replication CDC instead of cursor
+    /// polling: streams inserts/updates/deletes from this publication. Requires the `postgres-cdc`
+    /// feature and a Postgres URL. For full control use the dedicated `postgres_cdc` endpoint.
+    pub publication: Option<String>,
+    /// (Consumer only, CDC) Replication slot name; created if missing. Defaults to `mq_bridge_slot`.
+    pub slot_name: Option<String>,
     /// TLS configuration for the database connection.
     #[serde(default)]
     pub tls: TlsConfig,
@@ -3095,6 +3144,9 @@ impl SecretExtractor for EndpointType {
             EndpointType::ClickHouse(cfg) => {
                 cfg.extract_secrets(&format!("{}__{}", prefix, "CLICKHOUSE"), secrets)
             }
+            EndpointType::PostgresCdc(cfg) => {
+                cfg.extract_secrets(&format!("{}__{}", prefix, "POSTGRES_CDC"), secrets)
+            }
             EndpointType::Grpc(cfg) => {
                 cfg.extract_secrets(&format!("{}__{}", prefix, "GRPC"), secrets)
             }
@@ -3314,6 +3366,17 @@ impl SecretExtractor for ClickHouseConfig {
         if let Some(val) = self.password.take() {
             secrets.insert(format!("{}__{}", prefix, "PASSWORD"), val);
         }
+        if let Some(val) = self.checkpoint_store.take() {
+            secrets.insert(format!("{}__{}", prefix, "CHECKPOINT_STORE"), val);
+        }
+        self.tls
+            .extract_secrets(&format!("{}__{}", prefix, "TLS"), secrets);
+    }
+}
+
+impl SecretExtractor for PostgresCdcConfig {
+    fn extract_secrets(&mut self, prefix: &str, secrets: &mut HashMap<String, String>) {
+        extract_sensitive_url(&mut self.url, prefix, "URL", secrets);
         if let Some(val) = self.checkpoint_store.take() {
             secrets.insert(format!("{}__{}", prefix, "CHECKPOINT_STORE"), val);
         }

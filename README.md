@@ -19,6 +19,20 @@
 
 It is not only a forwarder. A route can transform, filter, fan out, retry, rate-limit, deduplicate, or turn a request into a response before the message reaches the next system. The core is built on Tokio and keeps the transport details at the edge, so application code can mostly work with `CanonicalMessage`s and handlers.
 
+### Move data from A to B — inside your own service
+
+If you need to move data reliably between systems and you write code (Rust, Python, or Node), `mq-bridge` is a strong default. It is a **library you embed**, not a daemon or control plane you operate.
+
+**Prefer not to write code?** [`mq-bridge-app`](https://github.com/marcomq/mq-bridge-app) runs the exact same engine as a **standalone, zero-code ETL service** configured entirely by **YAML or environment variables** — move data from A to B without writing a line. It ships a **Postman-style UI** to build, send, and inspect messages against a route, and can **import Postman collections and AsyncAPI documents** to scaffold routes and endpoints for you.
+
+*   **16+ transports, one API**: Kafka, NATS, AMQP (RabbitMQ), MQTT, MongoDB, **Postgres CDC** (logical replication), PostgreSQL / MySQL / SQLite (SQLx), ClickHouse, HTTP, WebSocket, gRPC, ZeroMQ, Redis Streams, AWS SQS/SNS, IBM MQ, files, and in-memory channels — all behind the same `receive_batch` / `send_batch` shape.
+*   **Change Data Capture**: stream row-level changes from **Postgres** (logical replication / `pgoutput`) and **MongoDB** (change streams) as flat rows with an operation marker.
+*   **Restart-safe delivery**: batch-aware ack/nack with commit sequencing for cumulative-ack brokers; the integration suite shows **no data loss during in-flight broker restarts**, including a Postgres CDC restart-safety test.
+*   **Reliability middleware, not a framework**: retries, dead-letter queues, deduplication, rate limiting, and cookie/session persistence wrap any endpoint.
+*   **Polyglot on one engine**: the same Rust core ships as native **Python** and **Node.js** bindings; routing, batching, and broker I/O stay in Rust.
+*   **TLS everywhere, one config shape**: a single `TlsConfig` block (CA bundle, client cert/key for mTLS, insecure-skip) is reused across transports.
+*   **Self-hosted, no daemon**: generate config in the optional UI, paste it into your code, run it in-process. No hosted control plane, no separate scheduler.
+
 
 ## Language Bindings
 
@@ -56,7 +70,8 @@ For implementation details and quick start examples for each usage type, see the
 
 ## Features
 
-*   **Supported Backends**: Kafka, NATS, AMQP (RabbitMQ), MQTT, MongoDB, SQL Databases (PostgreSQL, MySQL, SQLite via sqlx), HTTP, WebSocket, ZeroMQ, Redis Streams, Files, AWS (SQS/SNS), IBM MQ, and in-memory channels.
+*   **Supported Backends**: Kafka, NATS, AMQP (RabbitMQ), MQTT, MongoDB, SQL Databases (PostgreSQL, MySQL, SQLite via sqlx), **Postgres CDC** (logical replication), ClickHouse, gRPC, HTTP, WebSocket, ZeroMQ, Redis Streams, Files, AWS (SQS/SNS), IBM MQ, and in-memory channels.
+*   **Change Data Capture**: PostgreSQL logical replication (`postgres_cdc`) and MongoDB change streams, surfaced as flat rows with an `*.operation` marker (`insert`/`update`/`delete`/`truncate`).
     > **Note**: IBM MQ is included in the `full` feature set via the `ibm-mq` feature, which loads the IBM MQ client library at runtime via dlopen — **no IBM SDK is needed to build**. The IBM MQ redistributable client only has to be present at runtime, and only if you actually use an IBM MQ endpoint (it is loaded lazily on first connect). If the client is missing, the affected route fails fast with a non-retryable error instead of reconnecting forever. The loader finds the client via the platform default name, `MQ_INSTALLATION_PATH` (e.g. `/opt/mqm`), or an explicit `MQB_IBM_MQ_LIB` path. To link the client statically at build time instead, use the `ibm-mq-static` feature (requires the IBM MQ SDK). See the [mqi crate](https://crates.io/crates/mqi/) for details.
     >
     > **TLS**: IBM MQ has its own TLS config shape (`IbmTlsConfig`), since the native client doesn't consume PEM files. The field names mirror the generic `TlsConfig` for config parity, but carry MQ-native semantics: `tls.cert_file` (alias `key_repository`) is a CMS key repository path (e.g. `/path/to/tls` for `tls.kdb`), not a PEM file. The repository can either be passwordless (backed by a `.sth` stash file next to the `.kdb`) or password-protected via `tls.cert_password` (alias `key_repository_password`; requires an IBM MQ client/server at 9.3.0.0 or later, which is the capability level `ibm-mq`/`ibm-mq-static` build against; 9.2 is EOL).
@@ -83,31 +98,32 @@ The error handling follows the same idea. Batch publishing can report partial su
 
 What it does not try to be: a domain framework, an actor runtime, or a full stream processor. You can build CQRS-ish flows with it, but the library cares more about transport, routing, and delivery behavior than about prescribing your domain model.
 
+### How it compares
+
+`mq-bridge` overlaps with config-driven ETL / pipeline runners, but comes in two shapes: a **library you embed in your own service**, or [`mq-bridge-app`](https://github.com/marcomq/mq-bridge-app) — the **same engine as a zero-code, config-driven ETL service**. You get the developer-first path and the no-code path from one codebase.
+
+*   **Choose the `mq-bridge` library** when you write the code that moves the data — in Rust, Python, or Node — and want batching, retries/DLQ/dedup, request-reply, CDC, and TLS behind one small API you run in-process. No separate scheduler, no daemon to operate.
+*   **Choose `mq-bridge-app` for zero-code ETL** when you'd rather move data A→B purely by config: define routes and endpoints in YAML/env, then use its **Postman-style UI** to send test messages and watch them flow — and **import Postman collections or AsyncAPI specs** through the UI to generate the config. Same reliability engine, no build step.
+*   **Choose a dedicated stream processor** when you need windowed joins or aggregations over time.
+
+Either way it stays transport-first on purpose: it moves and routes data reliably rather than prescribing a domain model or a platform.
+
 ## Status
 
-This library was created in 2025 and is still fairly new.
+`mq-bridge` is young (created in 2025) but its reliability behavior is exercised by an automated integration + performance suite across **every** supported endpoint:
 
-It may still be possible that there are issues with
-- old or very new versions of broker servers
-- specific settings of the brokers
-- subscribe/event and response patterns if those are not available natively
+*   Integration and performance tests cover all endpoints in both queue and subscriber modes, request-reply where supported, and protocol-specific behavior.
+*   All endpoints have automated integration tests that showed **no data loss during in-flight broker restarts**; MQTT publish-confirmation was hardened until a chaos test drove in-flight loss to **zero**.
+*   Postgres CDC ships with a **restart-safety integration test**: an un-acked, in-flight batch is redelivered after a database restart with no loss and no gap into already-acknowledged changes.
+*   Throughput is tracked continuously on a public [benchmark dashboard](https://marcomq.github.io/mq-bridge/dev/bench/); ETL/CDC-shaped, like-for-like scenarios and their fixed methodology are documented in [`benches/ETL_BENCHMARKS.md`](benches/ETL_BENCHMARKS.md).
+
+Known rough edges (be deliberate here):
+
+- old or very new broker-server versions, or unusual broker settings
+- subscribe/event and response patterns where the backend has no native equivalent (emulated)
 - NATS without JetStream
-- TLS setups, which are usually non-trivial and have just been tested automatically, but not in detail.
+- **TLS**: one unified `TlsConfig` shape is reused across transports and exercised by automated tests; per-backend certificate matrices (self-signed / CA-signed / mTLS / expired-cert rejection) are being expanded — treat non-trivial TLS setups as needing your own verification for now.
 
-Automated integration and performance tests cover all supported endpoints, including queue and subscriber modes, request-reply (where supported), and protocol-specific behaviors. See the backend feature table below for details on configuration and protocol support.
-
-The following table tracks which endpoints are already used actively in other projects for events. Send me a message or create an issue if you use another endpoint in production:
-
-| Endpoint  | Manual Test |
-|-----------|:-----------:|
-| Kafka     |     ✅      |
-| MongoDB   |     ✅      |
-| HTTP      |     ✅      |
-| IBM MQ    |     ✅      |
-| Retry Middleware    |     ✅      |
-| DLQ Middleware    |     ✅      |
-
-All endpoints have automated integration tests and did not show data loss during simple in-flight broker restarts.
 
 ## Test Notes
 
@@ -157,6 +173,7 @@ The table below summarizes the capabilities and configuration for each backend:
 | **MongoDB** | Set `change_stream: true` | Emulated (Metadata) | **Yes** (Unlock) |
 | **MQTT** | Set `clean_session: true` | Emulated (Property) | Eventual (Skip Ack) |
 | **NATS** | Set `subscriber_mode: true` | **Native** (Inbox) | **Yes** (JetStream Nak) |
+| **Postgres CDC** | N/A (streams committed changes) | No | **Yes** (confirmed LSN not advanced) |
 | **Redis Streams** | Set `subscriber_mode: true` | No | Eventual (PEL, un-acked) |
 | **Sled** | Set `delete_after_read: false` | No | **Yes** (Tx Rollback) |
 | **SQLx** | Not supported | No | Eventual (Skip Delete) |
@@ -172,10 +189,11 @@ The table below summarizes the capabilities and configuration for each backend:
 ### Database Sources: Change Capture vs Polling
 Databases have no native pub/sub, so `mq-bridge` reads them as a source in one of two ways:
 
-*   **Change Data Capture (CDC)** — tails the database's own change log, capturing inserts **and** updates/deletes and resuming from a durable log position. On **MongoDB**, set `consume: capture_new` to watch an existing collection for changes from now on, or `consume: capture_all` to read the existing documents first and then keep capturing changes (no gap, at-least-once). It emits `insert`/`update`/`replace`/`delete` events tagged with `mongodb.operation` metadata and checkpoints progress under `cursor_id`. These use the change stream (full post-image via `updateLookup`) and need a replica set; on a standalone server `capture_all` falls back to an insert-only read.
+*   **Change Data Capture (CDC)** — tails the database's own change log, capturing inserts **and** updates/deletes and resuming from a durable log position.
+    *   On **PostgreSQL**, the `postgres_cdc` endpoint streams a logical-replication slot (`pgoutput`). It emits flat JSON rows tagged with `postgres.operation` metadata (`insert`/`update`/`delete`/`truncate`). Acking a batch confirms the LSN back to the server (`standby_status_update`); a nack (or an interrupted run) does **not** advance the confirmed LSN, so replication resumes from the last acknowledged position on reconnect — at-least-once, verified by a restart-safety integration test. Enable with the `postgres-cdc` feature; requires `wal_level = logical` and a publication. See below.
+    *   On **MongoDB**, set `consume: capture_new` to watch an existing collection for changes from now on, or `consume: capture_all` to read the existing documents first and then keep capturing changes (no gap, at-least-once). It emits `insert`/`update`/`replace`/`delete` events tagged with `mongodb.operation` metadata and checkpoints progress under `cursor_id`. These use the change stream (full post-image via `updateLookup`) and need a replica set; on a standalone server `capture_all` falls back to an insert-only read.
 *   **Cursor polling** — pages an existing table by a monotonic `cursor_column` (`WHERE col > $last ORDER BY col ASC`), persisting the last read value under `cursor_id`. Captures **appends only** — updates and deletes are not observed. Available on **SQLx** (PostgreSQL / MySQL / MariaDB / SQLite) and **ClickHouse**; while idle the poll interval backs off exponentially between `polling_interval_ms` and `max_polling_interval_ms`. **SQLite** and **ClickHouse** are polling-only — they have no server-side change log.
 
-> PostgreSQL logical-replication CDC is on the roadmap but not yet available: the released `tokio-postgres` does not expose the replication protocol.
 
 ### Response Endpoint
 The `response` output endpoint sends a reply back to the original requester. This is useful for synchronous request-reply flows, for example HTTP-to-NATS-to-HTTP. Use `response: {}` as the output endpoint configuration.

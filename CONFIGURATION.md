@@ -139,6 +139,22 @@ For example, to set the Kafka topic for the `kafka_to_nats` route:
 ```sh
 export MQB__KAFKA_TO_NATS__INPUT__KAFKA__TOPIC="my-other-topic"
 ```
+#### Postgres CDC example
+
+```yaml
+orders_cdc:
+  input:
+    postgres_cdc:
+      url: "postgres://user:pass@localhost:5432/app"
+      publication: "orders_pub"   # CREATE PUBLICATION orders_pub FOR TABLE orders;
+      slot_name: "mqb_orders"       # created if missing (permanent slot, resumable)
+  output:
+    nats:
+      subject: "orders.changes"
+      url: "nats://localhost:4222"
+```
+
+Each change arrives as a `CanonicalMessage` whose payload is the flat row and whose `postgres.operation` metadata marks the operation — the same convention as MongoDB CDC, so typed handlers work identically across both. The replication transport uses the published [`pgwire-replication`](https://crates.io/crates/pgwire-replication) crate.
 
 ### NATS JetStream Notes
 

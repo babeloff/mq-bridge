@@ -31,6 +31,8 @@ pub mod nats;
 pub mod null;
 #[cfg(any(feature = "sqlx", feature = "clickhouse"))]
 mod poll;
+#[cfg(feature = "postgres-cdc")]
+pub mod postgres;
 pub mod reader;
 #[cfg(feature = "redis-streams")]
 pub mod redis_streams;
@@ -480,6 +482,15 @@ fn check_consumer_recursive(
             }
             Ok(warnings)
         }
+        #[cfg(feature = "postgres-cdc")]
+        EndpointType::PostgresCdc(cfg) => {
+            if cfg.publication.trim().is_empty() {
+                return Err(anyhow!(
+                    "postgres_cdc consumer requires a 'publication' (defines which tables are captured)."
+                ));
+            }
+            Ok(warnings)
+        }
         #[cfg(feature = "sled")]
         EndpointType::Sled(_) => Ok(warnings),
         EndpointType::Static(_) => Ok(warnings),
@@ -581,6 +592,42 @@ fn resolve_endpoint_recursive(
     } else {
         Ok(endpoint.clone())
     }
+}
+
+/// Map a `sqlx` consumer config that requested CDC (via `publication`) onto a
+/// `PostgresCdcConfig`, so a Postgres `sqlx` endpoint can transparently fall back
+/// to logical-replication CDC. Postgres-only; other drivers error.
+#[cfg(all(feature = "sqlx", feature = "postgres-cdc"))]
+fn sqlx_cfg_to_cdc(
+    cfg: &crate::models::SqlxConfig,
+) -> anyhow::Result<crate::models::PostgresCdcConfig> {
+    let url = cfg.url.trim();
+    if !(url.starts_with("postgres://") || url.starts_with("postgresql://")) {
+        return Err(anyhow!(
+            "sqlx `publication` (CDC) is only supported for PostgreSQL URLs; got '{}'. \
+             Use a postgres:// URL or the dedicated `postgres_cdc` endpoint.",
+            cfg.url
+        ));
+    }
+    if cfg.cursor_column.is_some() {
+        return Err(anyhow!(
+            "sqlx endpoint sets both `publication` (CDC) and `cursor_column` (polling); pick one."
+        ));
+    }
+    Ok(crate::models::PostgresCdcConfig {
+        url: cfg.url.clone(),
+        publication: cfg.publication.clone().unwrap_or_default(),
+        slot_name: cfg
+            .slot_name
+            .clone()
+            .unwrap_or_else(|| "mq_bridge_slot".to_string()),
+        create_slot: true,
+        temporary_slot: false,
+        cursor_id: cfg.cursor_id.clone(),
+        checkpoint_store: cfg.checkpoint_store.clone(),
+        status_interval_ms: 10_000,
+        tls: cfg.tls.clone(),
+    })
 }
 
 /// Creates a `MessageConsumer` based on the route's "in" configuration.
@@ -852,7 +899,23 @@ async fn create_base_consumer(
         }
         #[cfg(feature = "sqlx")]
         EndpointType::Sqlx(cfg) => {
-            if cfg.cursor_column.is_some() {
+            if cfg.publication.is_some() {
+                // A Postgres publication means CDC (logical replication), not polling —
+                // delegate to the postgres_cdc consumer. See `sqlx_cfg_to_cdc`.
+                #[cfg(feature = "postgres-cdc")]
+                {
+                    Ok(boxed(
+                        postgres::PostgresCdcConsumer::new(&sqlx_cfg_to_cdc(cfg)?).await?,
+                    ))
+                }
+                #[cfg(not(feature = "postgres-cdc"))]
+                {
+                    Err(anyhow!(
+                        "sqlx endpoint with `publication` set uses Postgres CDC, which requires \
+                         the `postgres-cdc` feature to be enabled."
+                    ))
+                }
+            } else if cfg.cursor_column.is_some() {
                 // Non-destructive, resumable cursor read of an arbitrary table.
                 Ok(boxed(sqlx::SqlxCursorReader::new(cfg).await?))
             } else {
@@ -870,6 +933,8 @@ async fn create_base_consumer(
                 ))
             }
         }
+        #[cfg(feature = "postgres-cdc")]
+        EndpointType::PostgresCdc(cfg) => Ok(boxed(postgres::PostgresCdcConsumer::new(cfg).await?)),
         #[cfg(feature = "http")]
         EndpointType::Http(cfg) => Ok(boxed(http::HttpConsumer::new(cfg).await?)),
         #[cfg(feature = "websocket")]

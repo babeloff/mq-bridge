@@ -16,7 +16,7 @@ members = ["bindings-common", "python/mq-bridge-py", "node/mq-bridge-node"]
 resolver = "2"
 
 [workspace.package]
-version = "0.3.3"
+version = "0.3.4"
 
 [workspace.dependencies]
 anyhow = "1.0"
@@ -154,6 +154,13 @@ prost = { version = "0.14", optional = true, default-features = false, features 
 tokio-stream = { version = "0.1", optional = true, features = ["net"] }
 
 url = { version = "2.5", optional = true }
+percent-encoding = { version = "2.3", optional = true }
+
+# Postgres CDC (logical replication / pgoutput). pgwire-replication is a
+# narrowly-scoped wire-protocol client (COPY-both, LSN/standby, TLS/SCRAM) that
+# deliberately avoids tokio-postgres; byteorder backs the pgoutput byte decoder.
+pgwire-replication = { version = "0.3", optional = true, default-features = false, features = ["tls-rustls", "scram", "md5"] }
+byteorder = { version = "1.5", optional = true }
 
 # Generate JSON schema
 schemars = { version = "1.2", optional = true }
@@ -173,7 +180,7 @@ middleware = ["metrics", "dedup"]
 # runtime the client is loaded lazily only when an ibm-mq endpoint is opened
 # (clear error if the client isn't installed). Use `ibm-mq-static` instead for
 # static linking.
-full = ["middleware", "mongodb", "kafka", "amqp", "nats", "mqtt", "http", "aws", "zeromq", "redis-streams", "sled", "grpc", "sqlx", "clickhouse", "websocket", "rustls-aws-lc", "ibm-mq"]
+full = ["middleware", "mongodb", "kafka", "amqp", "nats", "mqtt", "http", "aws", "zeromq", "redis-streams", "sled", "grpc", "sqlx", "clickhouse", "websocket", "postgres-cdc", "rustls-aws-lc", "ibm-mq"]
 
 # Functionality features
 dedup = ["sled"]
@@ -222,6 +229,10 @@ redis-streams = ["dep:redis"]
 grpc = ["tonic", "prost", "tokio-stream", "tonic-prost", "tonic-prost-build", "protoc-bin-vendored", "rustls"]
 sqlx = ["dep:sqlx", "url"]
 clickhouse = ["dep:reqwest", "dep:flate2", "url"]
+# Postgres logical-replication CDC (pgoutput). Reuses the sqlx dependency for the
+# slot-lifecycle control plane; the streaming wire protocol is pgwire-replication.
+# Needs Rust 1.88 (pgwire-replication MSRV), like the amqp feature gate.
+postgres-cdc = ["dep:pgwire-replication", "dep:byteorder", "sqlx", "dep:base64", "url", "dep:percent-encoding"]
 
 [dev-dependencies]
 config = { version = "0.15" }
@@ -229,6 +240,8 @@ serde_yaml_ng = "0.10"
 tempfile = "3.10"
 chrono = "0.4"
 metrics-util = "0.20"
+# pgoutput decoder unit tests decode hex-encoded wire fixtures.
+hex = "0.4"
 criterion = { version = "0.8", features = ["async", "async_tokio"] }
 # Used by the router_bench microbench to model the proposed lock-free route table.
 arc-swap = "1"
