@@ -843,6 +843,7 @@ async fn create_client_and_eventloop(
     Ok((client, eventloop))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_eventloop(
     mut eventloop: EventLoop,
     message_tx: Option<Sender<MqttInternalMessage>>,
