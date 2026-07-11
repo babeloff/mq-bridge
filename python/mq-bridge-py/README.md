@@ -90,9 +90,24 @@ schema = config_schema()        # the JSON Schema as a dict
 ```
 
 `config_schema()` is handy for editor validation of YAML configs too — dump it
-to a file and point your `# yaml-language-server: $schema=` line at it. The types
-are regenerated with `uv run python scripts/gen_config_types.py` (a test fails if
-they drift from the schema).
+to a file and point your `# yaml-language-server: $schema=` line at it.
+
+### Regenerating the config types
+
+`mq_bridge/config.pyi` and `mq_bridge/config.py` are **generated — do not edit by
+hand**. Regenerate them whenever the Rust config models change (e.g. adding a
+field or a new endpoint). Because the generator reads the schema from the
+compiled extension, you must rebuild first:
+
+```bash
+# from python/mq-bridge-py/
+uv run maturin develop                              # rebuild the extension
+uv run --no-sync python scripts/gen_config_types.py # regenerate config.pyi / config.py
+```
+
+Then commit the updated `config.pyi`/`config.py`. `tests/test_config_types.py`
+asserts the checked-in output matches the schema, so CI (the "Python package
+smoke test" job) fails if you skip this after a models change.
 
 ## Running a route
 

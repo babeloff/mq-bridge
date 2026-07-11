@@ -670,6 +670,17 @@
         {
           "type": "object",
           "properties": {
+            "postgres_cdc": {
+              "$ref": "#/$defs/PostgresCdcConfig"
+            }
+          },
+          "required": [
+            "postgres_cdc"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
             "fanout": {
               "type": "array",
               "items": {
@@ -2207,6 +2218,73 @@
         "last_per_subject"
       ]
     },
+    "PostgresCdcConfig": {
+      "description": "Postgres logical-replication CDC source (pgoutput). Source-only.",
+      "type": "object",
+      "properties": {
+        "checkpoint_store": {
+          "description": "Checkpoint store spec (e.g. `file:///path`); defaults to the source database.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "create_slot": {
+          "description": "Create the replication slot if it does not exist.",
+          "type": "boolean",
+          "default": true
+        },
+        "cursor_id": {
+          "description": "Checkpoint key for persisting the confirmed LSN across restarts (optional; the slot is authoritative).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "publication": {
+          "description": "Publication name (must already exist; defines which tables are captured).",
+          "type": "string"
+        },
+        "slot_name": {
+          "description": "Replication slot name; created if missing when `create_slot` is true.",
+          "type": "string",
+          "default": "mq_bridge_slot"
+        },
+        "status_interval_ms": {
+          "description": "Standby-status-update interval in ms; must be shorter than the server's `wal_sender_timeout`.",
+          "type": "integer",
+          "format": "uint64",
+          "default": 10000,
+          "minimum": 0
+        },
+        "temporary_slot": {
+          "description": "Use a temporary slot (dropped on disconnect). Not restart-safe; default is a permanent slot.",
+          "type": "boolean",
+          "default": false
+        },
+        "tls": {
+          "description": "TLS configuration for the replication connection.",
+          "$ref": "#/$defs/TlsConfig",
+          "default": {
+            "accept_invalid_certs": false,
+            "ca_file": null,
+            "cert_file": null,
+            "cert_password": null,
+            "key_file": null,
+            "required": false
+          }
+        },
+        "url": {
+          "description": "Connection URL, e.g. `postgres://user:pass@host:5432/dbname`.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "url",
+        "publication"
+      ]
+    },
     "RandomPanicMiddleware": {
       "description": "Middleware for fault injection testing.\n\nAllows testing error handling and recovery mechanisms by injecting faults\nat specific points in the message processing pipeline.\n\n# Examples\n\n```yaml\nrandom_panic:\n  mode: panic\n  trigger_on_message: 3  # Trigger on the 3rd message\n```",
       "type": "object",
@@ -2613,6 +2691,13 @@
           "format": "uint64",
           "minimum": 0
         },
+        "publication": {
+          "description": "(Consumer only, PostgreSQL) If set, consume via logical-replication CDC instead of cursor\npolling: streams inserts/updates/deletes from this publication. Requires the `postgres-cdc`\nfeature and a Postgres URL. For full control use the dedicated `postgres_cdc` endpoint.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "select_query": {
           "description": "(Consumer only) Optional. A custom SQL SELECT query to fetch messages. This is only supported for PostgreSQL and Microsoft SQL Server.\nThe query must include a placeholder for the batch size (`$1` for PostgreSQL, `@p1` for SQL Server).\nThe bridge will bind the route's `batch_size` to this placeholder.",
           "type": [
@@ -2627,6 +2712,13 @@
             "null"
           ],
           "default": true
+        },
+        "slot_name": {
+          "description": "(Consumer only, CDC) Replication slot name; created if missing. Defaults to `mq_bridge_slot`.",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "table": {
           "description": "The table to interact with.",

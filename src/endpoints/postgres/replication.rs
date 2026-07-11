@@ -168,6 +168,46 @@ pub async fn advance_slot(url: &str, slot_name: &str, lsn: u64) -> anyhow::Resul
     Ok(())
 }
 
+/// Wait for the slot to become inactive, then advance its `confirmed_flush_lsn`
+/// to `lsn`. Used on graceful teardown: the streaming connection must be stopped
+/// first, because `pg_replication_slot_advance` refuses to run on an active slot.
+/// The server releases the slot shortly after the walsender's socket closes, so
+/// we poll `pg_replication_slots.active` briefly before advancing.
+pub async fn advance_slot_when_inactive(
+    url: &str,
+    slot_name: &str,
+    lsn: u64,
+) -> anyhow::Result<()> {
+    if lsn == 0 {
+        return Ok(());
+    }
+    let mut conn = control_conn(url).await?;
+    for _ in 0..40 {
+        let active: Option<(Option<bool>,)> =
+            sqlx::query_as("SELECT active FROM pg_replication_slots WHERE slot_name = $1")
+                .bind(slot_name)
+                .fetch_optional(&mut conn)
+                .await
+                .map_err(|e| anyhow!("postgres-cdc: slot status check failed: {e}"))?;
+        match active {
+            // Slot no longer exists — nothing to advance.
+            None => return Ok(()),
+            // Inactive (or NULL) — safe to advance.
+            Some((Some(false) | None,)) => break,
+            // Still held by a walsender — wait for release.
+            Some((Some(true),)) => tokio::time::sleep(Duration::from_millis(25)).await,
+        }
+    }
+    sqlx::query("SELECT pg_replication_slot_advance($1, $2::pg_lsn)")
+        .bind(slot_name)
+        .bind(format_lsn(lsn))
+        .execute(&mut conn)
+        .await
+        .map_err(|e| anyhow!("postgres-cdc: advance slot failed: {e}"))?;
+    debug!("postgres-cdc: advanced slot '{slot_name}' confirmed_flush_lsn to {lsn:#x} on shutdown");
+    Ok(())
+}
+
 /// Open the logical replication stream. `pgwire-replication` handles TCP, TLS,
 /// auth, `START_REPLICATION`, keepalives, and standby-status feedback.
 pub async fn start_replication(

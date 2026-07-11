@@ -106,6 +106,7 @@ class Endpoint(TypedDict, total=False):
     mqtt: MqttConfig
     nats: NatsConfig
     null: Any
+    postgres_cdc: PostgresCdcConfig
     reader: Endpoint
     redis_streams: RedisStreamsConfig
     ref: str
@@ -308,6 +309,19 @@ class NatsConfig(TypedDict, total=False):
     username: Optional[str]
 
 
+class PostgresCdcConfig(TypedDict, total=False):
+    """Postgres logical-replication CDC source (pgoutput). Source-only."""
+    checkpoint_store: Optional[str]
+    create_slot: bool
+    cursor_id: Optional[str]
+    publication: Required[str]
+    slot_name: str
+    status_interval_ms: int
+    temporary_slot: bool
+    tls: TlsConfig
+    url: Required[str]
+
+
 class RandomPanicMiddleware(TypedDict, total=False):
     """Middleware for fault injection testing."""
     enabled: bool
@@ -385,8 +399,10 @@ class SqlxConfig(TypedDict, total=False):
     min_connections: Optional[int]
     password: Optional[str]
     polling_interval_ms: Optional[int]
+    publication: Optional[str]
     select_query: Optional[str]
     shared: Optional[bool]
+    slot_name: Optional[str]
     table: Required[str]
     tls: TlsConfig
     url: Required[str]

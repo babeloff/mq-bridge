@@ -53,6 +53,10 @@ pub struct PostgresCdcConsumer {
     /// Highest durably-acknowledged LSN; fed back to the server as the slot's confirmed position.
     confirmed: Arc<AtomicU64>,
     checkpoint: Option<Arc<dyn CheckpointStore>>,
+    /// Connection URL used on teardown to advance the slot durably (see `Drop`).
+    url: String,
+    /// Slot name used on teardown to advance the slot durably (see `Drop`).
+    slot_name: String,
     ended: bool,
 }
 
@@ -144,6 +148,8 @@ impl PostgresCdcConsumer {
             ready: VecDeque::new(),
             confirmed: Arc::new(AtomicU64::new(start_lsn.unwrap_or(0))),
             checkpoint,
+            url: config.url.clone(),
+            slot_name: config.slot_name.clone(),
             ended: false,
         })
     }
@@ -357,5 +363,50 @@ impl MessageConsumer for PostgresCdcConsumer {
 
     fn as_any(&self) -> &dyn Any {
         self
+    }
+}
+
+/// Durably persist the last acked position on teardown.
+///
+/// The replication library's in-band standby-status feedback is asynchronous —
+/// the worker sends it on its `status_interval` tick and, critically, does *not*
+/// flush a final update on `stop()`/`shutdown()`. A consumer torn down right
+/// after an ack can therefore lose that ack's durability: the server's
+/// `confirmed_flush_lsn` never advances, and after a restart the slot replays
+/// changes that were already acknowledged.
+///
+/// To close that gap we stop the stream (so the server releases the slot) and
+/// advance the slot's `confirmed_flush_lsn` synchronously via SQL —
+/// `pg_replication_slot_advance` requires an *inactive* slot, which is why this
+/// cannot be done per-commit while the stream is live.
+///
+/// This needs `block_in_place`, so it only runs on a multi-thread runtime; on a
+/// current-thread runtime (or off-runtime) we fall back to the best-effort async
+/// feedback already sent during streaming.
+impl Drop for PostgresCdcConsumer {
+    fn drop(&mut self) {
+        let lsn = self.confirmed.load(Ordering::Acquire);
+        if lsn == 0 {
+            return;
+        }
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::CurrentThread {
+            return;
+        }
+        let url = self.url.clone();
+        let slot = self.slot_name.clone();
+        let client = &mut self.client;
+        tokio::task::block_in_place(|| {
+            handle.block_on(async move {
+                // Stop the stream so the server releases the slot, then advance
+                // confirmed_flush_lsn to the last durably-acked LSN.
+                let _ = client.shutdown().await;
+                if let Err(e) = replication::advance_slot_when_inactive(&url, &slot, lsn).await {
+                    warn!(error = %e, "postgres_cdc: durable slot advance on shutdown failed");
+                }
+            });
+        });
     }
 }
