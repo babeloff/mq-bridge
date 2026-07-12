@@ -6,7 +6,6 @@
 use crate::traits::{BoxFuture, Handler, MessagePublisher};
 use crate::traits::{Handled, HandlerError};
 use crate::CanonicalMessage;
-use anyhow::anyhow;
 use async_trait::async_trait;
 use std::any::Any;
 use std::future::Future;
@@ -134,9 +133,6 @@ impl MessagePublisher for CommandPublisher {
             };
         }
 
-        // Keep a copy only for the (rare) case the whole batch send fails outright;
-        // the success path below never touches it.
-        let to_publish_snapshot = to_publish.clone();
         match self.inner.send_batch(to_publish).await {
             Ok(SentBatch::Ack) => {
                 if failed.is_empty() {
@@ -155,24 +151,9 @@ impl MessagePublisher for CommandPublisher {
                 failed.extend(inner_failed);
                 Ok(SentBatch::Partial { responses, failed })
             }
-            Err(err) => {
-                for msg in to_publish_snapshot {
-                    let dup = match &err {
-                        PublisherError::NonRetryable(e) => {
-                            PublisherError::NonRetryable(anyhow!("{}", e))
-                        }
-                        PublisherError::Retryable(e) => PublisherError::Retryable(anyhow!("{}", e)),
-                        PublisherError::Connection(e) => {
-                            PublisherError::Connection(anyhow!("{}", e))
-                        }
-                    };
-                    failed.push((msg, dup));
-                }
-                Ok(SentBatch::Partial {
-                    responses: None,
-                    failed,
-                })
-            }
+            // An outright batch send failure is a batch-level error; propagate it
+            // directly rather than synthesizing a per-message failure for each one.
+            Err(err) => Err(err),
         }
     }
 

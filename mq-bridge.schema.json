@@ -2232,7 +2232,8 @@
           "type": [
             "string",
             "null"
-          ]
+          ],
+          "format": "password"
         },
         "create_slot": {
           "description": "Create the replication slot if it does not exist.",
@@ -2281,7 +2282,8 @@
         },
         "url": {
           "description": "Connection URL, e.g. `postgres://user:pass@host:5432/dbname`.",
-          "type": "string"
+          "type": "string",
+          "format": "password"
         }
       },
       "additionalProperties": false,

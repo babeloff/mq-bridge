@@ -2696,6 +2696,7 @@ pub struct ResponseConfig {
 #[serde(deny_unknown_fields)]
 pub struct PostgresCdcConfig {
     /// Connection URL, e.g. `postgres://user:pass@host:5432/dbname`.
+    #[cfg_attr(feature = "schema", schemars(extend("format"="password")))]
     pub url: String,
     /// Publication name (must already exist; defines which tables are captured).
     pub publication: String,
@@ -2711,6 +2712,7 @@ pub struct PostgresCdcConfig {
     /// Checkpoint key for persisting the confirmed LSN across restarts (optional; the slot is authoritative).
     pub cursor_id: Option<String>,
     /// Checkpoint store spec (e.g. `file:///path`); defaults to the source database.
+    #[cfg_attr(feature = "schema", schemars(extend("format"="password")))]
     pub checkpoint_store: Option<String>,
     /// Standby-status-update interval in ms; must be shorter than the server's `wal_sender_timeout`.
     #[serde(default = "default_pg_cdc_status_interval_ms")]
