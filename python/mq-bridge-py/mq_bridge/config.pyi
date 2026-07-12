@@ -458,7 +458,7 @@ class ZeroMqConfig(TypedDict, total=False):
 
 
 FaultMode = Literal["panic", "disconnect", "timeout", "json_format_error", "nack"]
-FileFormat = Literal["normal", "json", "text", "raw"]
+FileFormat = Literal["normal", "json", "text", "raw", "csv"]
 HttpServerProtocol = Literal["auto", "http1_only", "http2_only"]
 MongoConsume = Literal["consumer", "subscriber", "capture_new", "capture_all"]
 MongoDbFormat = Literal["normal", "json", "text", "raw"]

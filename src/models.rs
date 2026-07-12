@@ -1280,6 +1280,8 @@ pub enum FileFormat {
     Text,
     /// The raw payload of the message is written. For consumers, the line is read as raw bytes.
     Raw,
+    /// CSV rows mapped to/from JSON objects (string values only). The first row is the header/schema.
+    Csv,
 }
 
 // --- File Specific Configuration ---

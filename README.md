@@ -33,6 +33,8 @@ If you need to move data reliably between systems and you write code (Rust, Pyth
 *   **TLS everywhere, one config shape**: a single `TlsConfig` block (CA bundle, client cert/key for mTLS, insecure-skip) is reused across transports.
 *   **Self-hosted, no daemon**: generate config in the optional UI, paste it into your code, run it in-process. No hosted control plane, no separate scheduler.
 
+> **Throughput.** In our own benchmarks, the same engine — driven the zero-code way through [`mq-bridge-app`](https://github.com/marcomq/mq-bridge-app) — sustained ~303,000 rows/s copying 1,000,000 rows from Postgres to JSONL on commodity hardware, keeping it well in the range of dedicated data-movement tools. In a like-for-like Postgres→JSONL comparison (100,000 rows, 256 B payload, `batch_size 1024, concurrency 1`), it ran **~12.1x faster than Meltano** (`tap-postgres` → `target-jsonl`): 197,628 rows/s vs. 16,330 rows/s. Full setup, methodology, and the exact parameters are in [`benches/ETL_BENCHMARKS.md`](benches/ETL_BENCHMARKS.md).
+
 
 ## Language Bindings
 

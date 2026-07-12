@@ -37,6 +37,52 @@ fn get_file_lock(path: &str) -> Arc<Mutex<()>> {
         .clone()
 }
 
+fn csv_escape_field(s: &str) -> String {
+    if s.contains(',') || s.contains('"') || s.contains('\n') || s.contains('\r') {
+        format!("\"{}\"", s.replace('"', "\"\""))
+    } else {
+        s.to_string()
+    }
+}
+
+fn csv_encode_row(fields: &[String]) -> String {
+    fields
+        .iter()
+        .map(|f| csv_escape_field(f))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Parses a single CSV line into fields. Supports quoted fields with escaped `""`.
+fn parse_csv_row(line: &str) -> Vec<String> {
+    let mut fields = Vec::new();
+    let mut cur = String::new();
+    let mut in_quotes = false;
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        if in_quotes {
+            if c == '"' {
+                if chars.peek() == Some(&'"') {
+                    cur.push('"');
+                    chars.next();
+                } else {
+                    in_quotes = false;
+                }
+            } else {
+                cur.push(c);
+            }
+        } else if c == '"' && cur.is_empty() {
+            in_quotes = true;
+        } else if c == ',' {
+            fields.push(std::mem::take(&mut cur));
+        } else {
+            cur.push(c);
+        }
+    }
+    fields.push(cur);
+    fields
+}
+
 fn parse_delimiter(delimiter: Option<&str>) -> anyhow::Result<Vec<u8>> {
     let bytes = match delimiter {
         Some(s) if s.starts_with("0x") => {
@@ -91,6 +137,9 @@ pub struct FilePublisher {
     file_lock: Arc<Mutex<()>>,
     delimiter: Vec<u8>,
     format: FileFormat,
+    /// CSV column order, locked in by the first message written. Shared across
+    /// clones of this publisher so all writers to the same file agree on it.
+    csv_header: Arc<Mutex<Option<Vec<String>>>>,
 }
 
 impl FilePublisher {
@@ -120,6 +169,7 @@ impl FilePublisher {
             file_lock,
             delimiter,
             format,
+            csv_header: Arc::new(Mutex::new(None)),
         })
     }
 }
@@ -149,8 +199,18 @@ impl MessagePublisher for FilePublisher {
             .await
             .context("Failed to open file for writing batch")?;
 
+        let file_is_empty = if matches!(self.format, FileFormat::Csv) {
+            file.metadata().await.map(|m| m.len() == 0).unwrap_or(false)
+        } else {
+            false
+        };
         let mut writer = BufWriter::new(file);
         let mut failed_messages = Vec::new();
+        let mut csv_header_guard = if matches!(self.format, FileFormat::Csv) {
+            Some(self.csv_header.lock().await)
+        } else {
+            None
+        };
 
         // Iterate over messages, consuming them
         for mut msg in messages {
@@ -210,6 +270,44 @@ impl MessagePublisher for FilePublisher {
                         })
                     } else {
                         serde_json::to_vec(&msg)
+                    }
+                }
+                FileFormat::Csv => {
+                    match serde_json::from_slice::<serde_json::Value>(&msg.payload) {
+                        Ok(serde_json::Value::Object(obj)) => {
+                            let hdr = csv_header_guard.as_mut().expect("csv header lock held");
+                            if hdr.is_none() {
+                                let cols: Vec<String> = obj.keys().cloned().collect();
+                                if file_is_empty {
+                                    let header_line = csv_encode_row(&cols);
+                                    if let Err(e) = writer.write_all(header_line.as_bytes()).await {
+                                        return Err(PublisherError::NonRetryable(anyhow::anyhow!(
+                                            e
+                                        )));
+                                    }
+                                    if let Err(e) = writer.write_all(&self.delimiter).await {
+                                        return Err(PublisherError::NonRetryable(anyhow::anyhow!(
+                                            e
+                                        )));
+                                    }
+                                }
+                                **hdr = Some(cols);
+                            }
+                            let cols = hdr.as_ref().unwrap();
+                            let row: Vec<String> = cols
+                                .iter()
+                                .map(|c| match obj.get(c) {
+                                    Some(serde_json::Value::String(s)) => s.clone(),
+                                    Some(v) => v.to_string(),
+                                    None => String::new(),
+                                })
+                                .collect();
+                            Ok(csv_encode_row(&row).into_bytes())
+                        }
+                        _ => Err(serde_json::Error::io(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "CSV format requires a JSON object payload",
+                        ))),
                     }
                 }
             };
@@ -330,6 +428,8 @@ async fn create_file_event_store(
     tokio::spawn(async move {
         let mut current_sleep = std::time::Duration::from_millis(1);
         const MAX_SLEEP: std::time::Duration = std::time::Duration::from_millis(100);
+        // CSV is not supported in this backend (Subscribe + delete); see FileConsumer::new.
+        let mut csv_header: Option<Vec<String>> = None;
 
         loop {
             // Check if the store is still alive
@@ -403,8 +503,9 @@ async fn create_file_event_store(
                         {
                             buffer.pop();
                         }
-                        let msg = parse_message(&buffer, &format_clone);
-                        batch.push(msg);
+                        if let Some(msg) = parse_message(&buffer, &format_clone, &mut csv_header) {
+                            batch.push(msg);
+                        }
                         lines_read += 1;
 
                         state.lines_in_memory += 1;
@@ -534,6 +635,7 @@ fn run_file_tail_task_sync(
     let mut signaled_eof = false;
     const BATCH_SIZE: usize = 1024;
     let mut buf = Vec::with_capacity(1024);
+    let mut csv_header: Option<Vec<String>> = None;
 
     loop {
         if reader.is_none() {
@@ -586,12 +688,13 @@ fn run_file_tail_task_sync(
                         if delimiter.len() == 1 && delimiter[0] == b'\n' && buf.ends_with(b"\r") {
                             buf.pop();
                         }
-                        let mut msg = parse_message(&buf, &format);
-                        if group_id.is_some() {
-                            msg.metadata
-                                .insert("file_offset".to_string(), last_position.to_string());
+                        if let Some(mut msg) = parse_message(&buf, &format, &mut csv_header) {
+                            if group_id.is_some() {
+                                msg.metadata
+                                    .insert("file_offset".to_string(), last_position.to_string());
+                            }
+                            batch.push(msg);
                         }
-                        batch.push(msg);
                         lines_read_in_batch += 1;
                     }
                     Err(e) => {
@@ -657,6 +760,7 @@ fn run_file_queue_task(
     // Emit the empty end-of-file marker once per drained state; see the tail task.
     let mut signaled_eof = false;
     let mut buf = Vec::new();
+    let mut csv_header: Option<Vec<String>> = None;
 
     loop {
         buf.clear();
@@ -707,8 +811,25 @@ fn run_file_queue_task(
                             {
                                 buf.pop();
                             }
-                            batch.push(parse_message(&buf, &format));
-                            lines_read += 1;
+                            match parse_message(&buf, &format, &mut csv_header) {
+                                Some(msg) => {
+                                    batch.push(msg);
+                                    lines_read += 1;
+                                }
+                                None => {
+                                    // CSV header line: remove it immediately so it never
+                                    // occupies a slot in the ack/delete line accounting.
+                                    if let Err(e) = runtime_handle
+                                        .block_on(remove_lines_from_file(&path, 1, &delimiter))
+                                    {
+                                        tracing::error!(
+                                            "Failed to remove CSV header line from {}: {}",
+                                            path,
+                                            e
+                                        );
+                                    }
+                                }
+                            }
                         }
                         Err(_) => break,
                     }
@@ -758,6 +879,16 @@ impl FileConsumer {
     pub async fn new(config: &FileConfig) -> anyhow::Result<Self> {
         let delimiter = parse_delimiter(config.delimiter.as_deref())?;
         let format = config.format.clone();
+        if matches!(format, FileFormat::Csv)
+            && matches!(
+                &config.mode,
+                Some(FileConsumerMode::Subscribe { delete: true })
+            )
+        {
+            return Err(anyhow::anyhow!(
+                "FileFormat::Csv is not supported with Subscribe {{ delete: true }} mode"
+            ));
+        }
         match &config.mode {
             None | Some(FileConsumerMode::Consume { delete: false }) => {
                 Self::new_tail(&config.path, false, None, delimiter.clone(), format).await
@@ -1140,13 +1271,41 @@ impl MessageConsumer for FileConsumer {
     }
 }
 
-fn parse_message(buffer: &[u8], format: &FileFormat) -> CanonicalMessage {
+/// Parses one file line into a message. Returns `None` for CSV header lines,
+/// which establish the schema but carry no data of their own.
+fn parse_message(
+    buffer: &[u8],
+    format: &FileFormat,
+    csv_header: &mut Option<Vec<String>>,
+) -> Option<CanonicalMessage> {
     match format {
+        FileFormat::Csv => {
+            let line = String::from_utf8_lossy(buffer);
+            let fields = parse_csv_row(&line);
+            match csv_header {
+                None => {
+                    *csv_header = Some(fields);
+                    None
+                }
+                Some(cols) => {
+                    let mut obj = serde_json::Map::new();
+                    for (i, col) in cols.iter().enumerate() {
+                        obj.insert(
+                            col.clone(),
+                            serde_json::Value::String(fields.get(i).cloned().unwrap_or_default()),
+                        );
+                    }
+                    let payload =
+                        serde_json::to_vec(&serde_json::Value::Object(obj)).unwrap_or_default();
+                    Some(CanonicalMessage::new(payload, None))
+                }
+            }
+        }
         FileFormat::Raw => {
             let mut msg = CanonicalMessage::new(buffer.to_vec(), None);
             msg.metadata
                 .insert("mq_bridge.original_format".to_string(), "raw".to_string());
-            msg
+            Some(msg)
         }
         FileFormat::Normal | FileFormat::Json | FileFormat::Text => {
             #[derive(serde::Deserialize)]
@@ -1158,7 +1317,7 @@ fn parse_message(buffer: &[u8], format: &FileFormat) -> CanonicalMessage {
                 metadata: HashMap<String, String>,
             }
 
-            match serde_json::from_slice::<AnyPayloadMessage>(buffer) {
+            let msg = match serde_json::from_slice::<AnyPayloadMessage>(buffer) {
                 Ok(wrapper) => {
                     let payload_bytes = if matches!(format, FileFormat::Json) {
                         serde_json::to_vec(&wrapper.payload).unwrap_or_default()
@@ -1191,7 +1350,8 @@ fn parse_message(buffer: &[u8], format: &FileFormat) -> CanonicalMessage {
                         .insert("mq_bridge.original_format".to_string(), "raw".to_string());
                     msg
                 }
-            }
+            };
+            Some(msg)
         }
     }
 }
@@ -2172,6 +2332,41 @@ mod tests {
                 .get("mq_bridge.original_format")
                 .map(|s| s.as_str()),
             Some("raw")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_file_csv_round_trip() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("data.csv");
+        let file_path_str = file_path.to_str().unwrap().to_string();
+
+        let config = FileConfig {
+            path: file_path_str.clone(),
+            format: FileFormat::Csv,
+            ..Default::default()
+        };
+
+        let sink = FilePublisher::new(&config).await.unwrap();
+        let msg1 = msg!(json!({"name": "alice", "age": "30"}));
+        let msg2 = msg!(json!({"name": "bob", "age": "25"}));
+        sink.send_batch(vec![msg1, msg2]).await.unwrap();
+        sink.flush().await.unwrap();
+        drop(sink);
+
+        let content = tokio::fs::read_to_string(&file_path).await.unwrap();
+        assert_eq!(content, "age,name\n30,alice\n25,bob\n");
+
+        let mut source = FileConsumer::new(&config).await.unwrap();
+        let received1 = source.receive().await.unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&received1.message.payload).unwrap(),
+            json!({"name": "alice", "age": "30"})
+        );
+        let received2 = source.receive().await.unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&received2.message.payload).unwrap(),
+            json!({"name": "bob", "age": "25"})
         );
     }
 }
