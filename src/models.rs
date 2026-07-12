@@ -1312,6 +1312,8 @@ pub enum FileConsumerMode {
     /// of the file. If `delete` is true, processed lines are physically removed
     /// from the file once they are successfully acknowledged.
     Consume {
+        /// If true, processed lines are physically removed from the file once
+        /// they are successfully acknowledged.
         #[serde(default)]
         delete: bool,
     },
@@ -1319,6 +1321,8 @@ pub enum FileConsumerMode {
     /// at the current end. If `delete` is true, lines are removed only after
     /// all local application subscribers for this specific file have acknowledged them.
     Subscribe {
+        /// If true, lines are removed only after all local application
+        /// subscribers for this file have acknowledged them.
         #[serde(default)]
         delete: bool,
     },
@@ -2342,9 +2346,9 @@ pub struct HttpConfig {
     /// Minimum message size in bytes to compress. Messages smaller than this are sent uncompressed. Defaults to 1024 bytes.
     #[serde(default)]
     pub compression_threshold_bytes: Option<usize>,
-    /// HTTP Basic Authentication credentials (username, password). For consumers: validates incoming requests. For publishers: adds Authorization header.
     /// (Consumer only) Maximum number of concurrent requests to handle. Defaults to 100.
     pub concurrency_limit: Option<usize>,
+    /// HTTP Basic Authentication credentials (username, password). For consumers: validates incoming requests. For publishers: adds Authorization header.
     #[cfg_attr(feature = "schema", schemars(extend("format"="password")))]
     #[serde(
         default,
