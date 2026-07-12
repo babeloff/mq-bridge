@@ -388,6 +388,19 @@ async fn test_all_performance_pipeline() {
             println!("\n\n>>> Starting MongoDB Replica Set Performance Pipeline Test...");
             integration::mongodb::test_mongodb_replica_set_pipeline().await;
         }
+        if should_run("mongodb_cdc") {
+            println!("\n\n>>> Starting MongoDB CDC (change stream) Performance Pipeline Test...");
+            integration::mongodb::test_mongodb_cdc_performance_pipeline().await;
+        }
+    }
+    #[cfg(all(feature = "postgres-cdc", feature = "test-utils"))]
+    {
+        if should_run("postgres_cdc") {
+            println!(
+                "\n\n>>> Starting Postgres CDC (logical replication) Performance Pipeline Test..."
+            );
+            integration::postgres_cdc::test_postgres_cdc_performance_pipeline().await;
+        }
     }
     #[cfg(any(feature = "ibm-mq-static", feature = "ibm-mq"))]
     {

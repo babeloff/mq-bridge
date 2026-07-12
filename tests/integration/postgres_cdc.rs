@@ -7,9 +7,13 @@
 #![allow(dead_code)]
 
 use mq_bridge::endpoints::postgres::PostgresCdcConsumer;
-use mq_bridge::models::PostgresCdcConfig;
+use mq_bridge::endpoints::sqlx::SqlxPublisher;
+use mq_bridge::models::{PostgresCdcConfig, SqlxConfig};
 use mq_bridge::sqlx::{Connection, PgConnection};
-use mq_bridge::test_utils::{run_test_with_docker, run_test_with_docker_controller, setup_logging};
+use mq_bridge::test_utils::{
+    run_performance_pipeline_test_named, run_test_with_docker, run_test_with_docker_controller,
+    setup_logging, PERF_TEST_MESSAGE_COUNT,
+};
 use mq_bridge::traits::{MessageConsumer, MessageDisposition};
 use std::collections::BTreeSet;
 use std::time::Duration;
@@ -133,6 +137,95 @@ pub async fn test_postgres_cdc_pipeline() {
         for id in 1..=100 {
             assert!(ids.contains(&(id as i64)), "row {id} must be captured");
         }
+    })
+    .await;
+}
+
+// --- CDC performance pipeline -------------------------------------------------------------------
+// Reports a "postgres_cdc Pipeline" row in the consolidated perf summary. The producer INSERTs rows
+// via the `sqlx` publisher; the read side captures them off the WAL through a replication slot
+// (`postgres_cdc`) — non-destructive, no `DELETE`-on-ack. The endpoint opens the slot when the route
+// is deployed, which the harness does before the producer writes, so no changes are missed.
+
+const PERF_TABLE: &str = "cdc_perf";
+
+const PERF_CONFIG_YAML: &str = r#"
+routes:
+  memory_to_pgcdc:
+    concurrency: 4
+    batch_size: 1024
+    input:
+      memory: { topic: "pgcdc-in" }
+    output:
+      middlewares:
+        - retry:
+            max_attempts: 20
+            initial_interval_ms: 500
+            max_interval_ms: 2000
+      sqlx:
+        url: "postgres://testuser:testpass@localhost:5432/testdb"
+        table: "cdc_perf"
+        min_connections: 2
+
+  pgcdc_to_memory:
+    concurrency: 1
+    batch_size: 1024
+    input:
+      postgres_cdc:
+        url: "postgres://testuser:testpass@localhost:5432/testdb"
+        publication: "mqb_cdc_perf_pub"
+        slot_name: "mqb_cdc_perf_slot"
+    output:
+      memory: { topic: "pgcdc-out", capacity: {out_capacity} }
+"#;
+
+/// Materialize the table (using the publisher's own schema), reset any leftover slot/publication,
+/// then create the publication. The slot itself is created by the endpoint at deploy time.
+async fn setup_perf_cdc() {
+    let sqlx_cfg = SqlxConfig {
+        url: URL.to_string(),
+        table: PERF_TABLE.to_string(),
+        auto_create_table: true,
+        ..Default::default()
+    };
+    // Constructing the publisher creates the table.
+    let _publisher = SqlxPublisher::new(&sqlx_cfg).await.expect("create table");
+
+    let mut conn = connect_retry().await;
+    sqlx::query("DELETE FROM cdc_perf")
+        .execute(&mut conn)
+        .await
+        .ok();
+    let _ = sqlx::query(
+        "SELECT pg_drop_replication_slot('mqb_cdc_perf_slot') \
+         FROM pg_replication_slots WHERE slot_name = 'mqb_cdc_perf_slot'",
+    )
+    .execute(&mut conn)
+    .await;
+    let _ = sqlx::query("DROP PUBLICATION IF EXISTS mqb_cdc_perf_pub")
+        .execute(&mut conn)
+        .await;
+    sqlx::query("CREATE PUBLICATION mqb_cdc_perf_pub FOR TABLE cdc_perf")
+        .execute(&mut conn)
+        .await
+        .expect("create publication");
+}
+
+pub async fn test_postgres_cdc_performance_pipeline() {
+    setup_logging();
+    run_test_with_docker(COMPOSE, || async {
+        setup_perf_cdc().await;
+        let config_yaml = PERF_CONFIG_YAML.replace(
+            "{out_capacity}",
+            &(PERF_TEST_MESSAGE_COUNT + 1000).to_string(),
+        );
+        run_performance_pipeline_test_named(
+            "pgcdc",
+            "postgres_cdc",
+            &config_yaml,
+            PERF_TEST_MESSAGE_COUNT,
+        )
+        .await;
     })
     .await;
 }

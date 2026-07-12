@@ -6,8 +6,9 @@ use mq_bridge::test_utils::PERF_TEST_MESSAGE_COUNT;
 use mq_bridge::endpoints::mongodb::{MongoDbConsumer, MongoDbPublisher, MongoDbSubscriber};
 use mq_bridge::test_utils::{
     add_performance_result, run_chaos_pipeline_test, run_direct_perf_test,
-    run_performance_pipeline_test, run_pipeline_test, run_test_with_docker,
-    run_test_with_docker_controller, setup_logging, should_run, verify_subscriber_logic,
+    run_performance_pipeline_test, run_performance_pipeline_test_named, run_pipeline_test,
+    run_test_with_docker, run_test_with_docker_controller, setup_logging, should_run,
+    verify_subscriber_logic,
 };
 const CONFIG_YAML: &str = r#"
 routes:
@@ -229,6 +230,55 @@ pub async fn test_mongodb_performance_pipeline() {
         );
         run_performance_pipeline_test("mongodb", &config_yaml, PERF_TEST_MESSAGE_COUNT).await;
     })
+    .await;
+}
+
+// CDC pipeline: the read side watches the collection via a `$changeStream` (`consume: capture_new`)
+// instead of the destructive queue-drain consumer — it never deletes documents. The reader's change
+// stream is opened when the route is deployed (before the producer writes), so no inserts are missed.
+// Requires a replica set (change streams are unsupported on a standalone mongod).
+const CDC_CONFIG_YAML: &str = r#"
+routes:
+  memory_to_mongodb_cdc:
+    concurrency: 4
+    batch_size: 1024
+    input:
+      memory: { topic: "test-in-mongodb-cdc" }
+    output:
+      middlewares:
+        - retry:
+            max_attempts: 20
+            initial_interval_ms: 500
+            max_interval_ms: 2000
+      mongodb: { url: "mongodb://localhost:27018/?replicaSet=rs0", database: "mq_bridge_test", collection: "cdc_collection" }
+
+  mongodb_cdc_to_memory:
+    concurrency: 1
+    batch_size: 1024
+    input:
+      mongodb: { url: "mongodb://localhost:27018/?replicaSet=rs0", database: "mq_bridge_test", collection: "cdc_collection", consume: capture_new }
+    output:
+      memory: { topic: "test-out-mongodb-cdc", capacity: {out_capacity} }
+"#;
+
+pub async fn test_mongodb_cdc_performance_pipeline() {
+    setup_logging();
+    run_test_with_docker(
+        "tests/integration/docker-compose/mongodb-replica.yml",
+        || async {
+            let config_yaml = CDC_CONFIG_YAML.replace(
+                "{out_capacity}",
+                &(PERF_TEST_MESSAGE_COUNT + 1000).to_string(),
+            );
+            run_performance_pipeline_test_named(
+                "mongodb_cdc",
+                "mongodb_cdc",
+                &config_yaml,
+                PERF_TEST_MESSAGE_COUNT,
+            )
+            .await;
+        },
+    )
     .await;
 }
 
