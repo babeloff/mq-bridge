@@ -1,0 +1,21 @@
+services:
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.8
+    container_name: clickhouse-itest-mq-bridge
+    ports:
+      - "8123:8123"
+      - "9000:9000"
+    environment:
+      # The image's default user is locked to localhost; provision a user the host tests can reach.
+      - CLICKHOUSE_USER=testuser
+      - CLICKHOUSE_PASSWORD=testpass
+      - CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    healthcheck:
+      test: ["CMD", "clickhouse-client", "--query", "SELECT 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 10

@@ -1,0 +1,29 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: postgres-cdc-itest-mq-bridge
+    # Logical replication must be enabled for pgoutput CDC. wal_senders and
+    # replication_slots give headroom for the slot the test creates.
+    command:
+      - "postgres"
+      - "-c"
+      - "wal_level=logical"
+      - "-c"
+      - "max_wal_senders=4"
+      - "-c"
+      - "max_replication_slots=4"
+      # Keep the standby-timeout generous so a paused/slow test client doesn't
+      # get its walsender killed.
+      - "-c"
+      - "wal_sender_timeout=0"
+    ports:
+      - "5432:5432"
+    environment:
+      - POSTGRES_USER=testuser
+      - POSTGRES_PASSWORD=testpass
+      - POSTGRES_DB=testdb
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U testuser -d testdb"]
+      interval: 5s
+      timeout: 5s
+      retries: 5

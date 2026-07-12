@@ -200,6 +200,150 @@
         "max_delay_ms"
       ]
     },
+    "ClickHouseConfig": {
+      "description": "ClickHouse endpoint configuration (talks the ClickHouse HTTP interface).\n\nAs a **publisher** it batch-inserts messages using `FORMAT JSONEachRow` — by default the whole\nmessage payload (which must be a JSON object) becomes one row; set `columns` to build each row\nfrom explicit `${payload:<field>}` / `${metadata:<key>}` tokens instead. As a **consumer** it\nreads an existing table **non-destructively** by paging over a monotonic `cursor_column`\n(ClickHouse has no native queue/pub-sub), serializing each row to a JSON payload.",
+      "type": "object",
+      "properties": {
+        "async_insert": {
+          "description": "(Publisher only) If true, set the ClickHouse `async_insert=1` server setting so inserts are\nbuffered server-side. Defaults to false.",
+          "type": "boolean",
+          "default": false
+        },
+        "checkpoint_store": {
+          "description": "(Consumer only) Where to persist the resume cursor. Because ClickHouse is unsuited to per-row\ncursor upserts, a durable checkpoint requires an **external** store URL:\n- `file:///var/lib/mqb/cursors.json` → local JSON file\n- `postgres://user@host/db/table` / `mysql://host/db/table` → external SQL table (table optional)\n- `mongodb://host/db/collection` → external MongoDB collection (collection optional)\n\nMay embed connection credentials, so it is treated as a secret.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "password"
+        },
+        "columns": {
+          "description": "(Publisher only) Optional per-column mapping. Each entry maps a target column name to a value\ntoken: `${payload:<field>}` takes the top-level JSON field `<field>` of the payload (JSON type\npreserved), `${metadata:<key>}` takes `message.metadata[\"<key>\"]` (as a string), and any other\nvalue is inserted literally. When omitted, the whole payload JSON object is inserted as one row.",
+          "type": [
+            "object",
+            "null"
+          ],
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "connect_timeout_ms": {
+          "description": "Connection (TCP + TLS handshake) timeout in milliseconds. Defaults to 10000ms.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "cursor_column": {
+          "description": "(Consumer only) Read an existing table **non-destructively** and resumably, paging by this\nmonotonic column (`SELECT … WHERE {cursor_column} > {last} ORDER BY {cursor_column} ASC LIMIT n`)\nand persisting the last read value under `cursor_id`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "cursor_id": {
+          "description": "(Consumer only) Cursor id used to key the persisted resume position. Without it, progress is not\npersisted and every restart re-copies from the beginning.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "database": {
+          "description": "Database name. Defaults to `default`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "max_polling_interval_ms": {
+          "description": "(Consumer only) If set, the poll interval backs off exponentially from `polling_interval_ms`\nup to this value while drained, resetting on new rows. Unset = constant interval.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "password": {
+          "description": "Optional password. Takes precedence over any credentials embedded in the `url`.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "password",
+          "default": null
+        },
+        "polling_interval_ms": {
+          "description": "(Consumer only) Polling interval in milliseconds when the table is drained. Defaults to 100ms.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "request_timeout_ms": {
+          "description": "Request timeout in milliseconds for ClickHouse HTTP calls (inserts, cursor reads, status).\nUnset = no timeout (wait indefinitely), which suits very large batch inserts.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "select_columns": {
+          "description": "(Consumer only) Columns to select in `cursor_column` mode. Defaults to `*`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "table": {
+          "description": "The table to read from / write to. May be schema-qualified (`db.table`).",
+          "type": "string"
+        },
+        "tls": {
+          "description": "TLS configuration for `https://` connections.",
+          "$ref": "#/$defs/TlsConfig",
+          "default": {
+            "accept_invalid_certs": false,
+            "ca_file": null,
+            "cert_file": null,
+            "cert_password": null,
+            "key_file": null,
+            "required": false
+          }
+        },
+        "url": {
+          "description": "ClickHouse HTTP endpoint URL, e.g. `http://localhost:8123` (or `https://…`). If it contains\nuserinfo, it will be treated as a secret.",
+          "type": "string",
+          "format": "password"
+        },
+        "username": {
+          "description": "Optional username. Takes precedence over any credentials embedded in the `url`. Defaults to `default`.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "wait_for_async_insert": {
+          "description": "(Publisher only) With `async_insert`, wait for the server to flush before acking. Defaults to\ntrue (durable). False = fire-and-forget: faster, but a crash before flush can drop the batch.",
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "default": null
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "url",
+        "table"
+      ]
+    },
     "CookieJarMiddleware": {
       "description": "Cookie/session jar middleware configuration.\n\nOptimized for HTTP by default: it can read `cookie` and `set-cookie` metadata,\npersist session cookies, and inject them into later outgoing requests.\n\nThe middleware can also capture arbitrary metadata values into the same session store\nand optionally expose stored values back into message metadata.",
       "type": "object",
@@ -515,6 +659,28 @@
         {
           "type": "object",
           "properties": {
+            "clickhouse": {
+              "$ref": "#/$defs/ClickHouseConfig"
+            }
+          },
+          "required": [
+            "clickhouse"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "postgres_cdc": {
+              "$ref": "#/$defs/PostgresCdcConfig"
+            }
+          },
+          "required": [
+            "postgres_cdc"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
             "fanout": {
               "type": "array",
               "items": {
@@ -745,6 +911,11 @@
           "description": "The raw payload of the message is written. For consumers, the line is read as raw bytes.",
           "type": "string",
           "const": "raw"
+        },
+        {
+          "description": "CSV rows mapped to/from JSON objects (string values only). The first row is the header/schema.",
+          "type": "string",
+          "const": "csv"
         }
       ]
     },
@@ -1259,6 +1430,14 @@
             "null"
           ]
         },
+        "partition_key": {
+          "description": "(Publisher only) Name of a metadata field whose value is used as the Kafka record\nkey (drives partitioning/ordering). Unset, or absent on a given message, falls back\nto the message id. Default unset.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
         "partitions": {
           "description": "(Publisher only) Partition count used when auto-creating the topic (default: 6).\nHigher values raise write/consume parallelism; ordering is only guaranteed per\npartition key (message_id), not across the whole topic. Ignored if the topic exists.",
           "type": [
@@ -1571,6 +1750,31 @@
         }
       ]
     },
+    "MongoConsume": {
+      "description": "How a MongoDB endpoint consumes a collection. One intent-named selector — the bridge picks the\nunderlying mechanism (change stream vs. polling) automatically. Defaults to `consumer`.",
+      "oneOf": [
+        {
+          "description": "**Queue** — durably drain a queue collection: claim, process, resume after restart. Default.",
+          "type": "string",
+          "const": "consumer"
+        },
+        {
+          "description": "**Queue, ephemeral** — receive only new messages, no durable position (fan-out subscriber).",
+          "type": "string",
+          "const": "subscriber"
+        },
+        {
+          "description": "**Watch existing collection** — capture changes from now on (insert/update/delete), resuming\nunder `cursor_id`. Reads an existing collection non-destructively.",
+          "type": "string",
+          "const": "capture_new"
+        },
+        {
+          "description": "**Watch existing collection** — read the existing documents first, then capture changes.\nReads an existing collection non-destructively.",
+          "type": "string",
+          "const": "capture_all"
+        }
+      ]
+    },
     "MongoDbConfig": {
       "description": "General MongoDB connection configuration.",
       "type": "object",
@@ -1584,15 +1788,34 @@
           "format": "int64"
         },
         "change_stream": {
-          "description": "(Consumer only) If true, use Change Streams (**Subscriber mode**). Defaults to false (polling/consumer mode).",
+          "description": "(Consumer only) **Deprecated** — use `consume: subscriber`. Kept for compatibility.",
           "type": "boolean",
           "default": false
+        },
+        "checkpoint_store": {
+          "description": "(Consumer only) Where to persist the resume cursor in `capture_new`/`capture_all` mode. A URL\nselects the backend; a bare name (or `/name`) reuses the **source** database with that name:\n- absent → source database, collection `mqb_cursors_<source_collection>` (auto-unique)\n- `/my_cursors` → source database, collection `my_cursors`\n- `file:///var/lib/mqb/cursors.json` → local JSON file (read-only / write-restricted sources)\n- `mongodb://host/db/collection` → external MongoDB collection (collection optional)\n- `postgres://user@host/db/table` or `mysql://host/db/table` → external SQL table (table optional)\n\nWhen no collection/table is named, it defaults to `mqb_cursors_<source_collection>`.\nMay embed connection credentials, so it is treated as a secret.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "password"
         },
         "collection": {
           "description": "The MongoDB collection name.",
           "type": [
             "string",
             "null"
+          ]
+        },
+        "consume": {
+          "description": "(Consumer only) How to consume the collection: `consumer` (default, durable queue),\n`subscriber` (ephemeral queue), `capture_new` (watch an existing collection for changes), or\n`capture_all` (read existing documents first, then watch for changes). The bridge selects the\nunderlying mechanism automatically. If unset, the deprecated `change_stream` boolean is\nhonored for backward compatibility.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MongoConsume"
+            },
+            {
+              "type": "null"
+            }
           ]
         },
         "cursor_id": {
@@ -1853,6 +2076,11 @@
       "description": "General NATS connection configuration.",
       "type": "object",
       "properties": {
+        "deduplicate": {
+          "description": "(Publisher only, JetStream) If true, publish a `Nats-Msg-Id` header (from the message id) so\nJetStream deduplicates redeliveries within the stream's duplicate window. Defaults to false.",
+          "type": "boolean",
+          "default": false
+        },
         "delayed_ack": {
           "description": "(Publisher only) If true, do not wait for an acknowledgement when sending to broker. Defaults to false.",
           "type": "boolean",
@@ -1995,6 +2223,75 @@
         "last_per_subject"
       ]
     },
+    "PostgresCdcConfig": {
+      "description": "Postgres logical-replication CDC source (pgoutput). Source-only.",
+      "type": "object",
+      "properties": {
+        "checkpoint_store": {
+          "description": "Checkpoint store spec (e.g. `file:///path`); defaults to the source database.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "password"
+        },
+        "create_slot": {
+          "description": "Create the replication slot if it does not exist.",
+          "type": "boolean",
+          "default": true
+        },
+        "cursor_id": {
+          "description": "Checkpoint key for persisting the confirmed LSN across restarts (optional; the slot is authoritative).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "publication": {
+          "description": "Publication name (must already exist; defines which tables are captured).",
+          "type": "string"
+        },
+        "slot_name": {
+          "description": "Replication slot name; created if missing when `create_slot` is true.",
+          "type": "string",
+          "default": "mq_bridge_slot"
+        },
+        "status_interval_ms": {
+          "description": "Standby-status-update interval in ms; must be shorter than the server's `wal_sender_timeout`.",
+          "type": "integer",
+          "format": "uint64",
+          "default": 10000,
+          "minimum": 0
+        },
+        "temporary_slot": {
+          "description": "Use a temporary slot (dropped on disconnect). Not restart-safe; default is a permanent slot.",
+          "type": "boolean",
+          "default": false
+        },
+        "tls": {
+          "description": "TLS configuration for the replication connection.",
+          "$ref": "#/$defs/TlsConfig",
+          "default": {
+            "accept_invalid_certs": false,
+            "ca_file": null,
+            "cert_file": null,
+            "cert_password": null,
+            "key_file": null,
+            "required": false
+          }
+        },
+        "url": {
+          "description": "Connection URL, e.g. `postgres://user:pass@host:5432/dbname`.",
+          "type": "string",
+          "format": "password"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "url",
+        "publication"
+      ]
+    },
     "RandomPanicMiddleware": {
       "description": "Middleware for fault injection testing.\n\nAllows testing error handling and recovery mechanisms by injecting faults\nat specific points in the message processing pipeline.\n\n# Examples\n\n```yaml\nrandom_panic:\n  mode: panic\n  trigger_on_message: 3  # Trigger on the 3rd message\n```",
       "type": "object",
@@ -2086,6 +2383,15 @@
           "description": "(Consumer) On group creation, start from the stream beginning (\"0\") not \"$\". Default false.",
           "type": "boolean",
           "default": false
+        },
+        "reader_connections": {
+          "description": "(Consumer) Parallel `XREADGROUP` reader connections fanned out across the group. Default 1.\nIgnored in `subscriber_mode`.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0
         },
         "redelivery_timeout_ms": {
           "description": "(Consumer) Redeliver entries pending ≥ this long via `XAUTOCLAIM`; 0 disables. Default 60000ms.",
@@ -2205,6 +2511,10 @@
           "default": 10,
           "minimum": 0
         },
+        "exit_on_empty": {
+          "description": "If true, the route exits gracefully once the source yields an empty batch\n(drain-then-exit). Off by default — routes normally poll indefinitely.",
+          "type": "boolean"
+        },
         "input": {
           "description": "The input/source endpoint for the route.",
           "$ref": "#/$defs/Endpoint"
@@ -2286,6 +2596,33 @@
           "type": "boolean",
           "default": false
         },
+        "bulk_copy": {
+          "description": "(Publisher only) PostgreSQL only. Bulk-load batches via `COPY FROM STDIN` (much faster than multi-row INSERT). Requires a token-based `insert_query`; no `ON CONFLICT`/`RETURNING`.",
+          "type": "boolean",
+          "default": false
+        },
+        "checkpoint_store": {
+          "description": "(Consumer only) Where to persist the resume cursor in `cursor_column` mode. A URL selects the\nbackend; a bare name (or `/name`) reuses the **source** datastore with that table name:\n- absent → source datastore, table `mqb_cursors_<source_table>` (auto-unique)\n- `/my_cursors` → source datastore, table `my_cursors`\n- `file:///var/lib/mqb/cursors.json` → local JSON file (read-only / write-restricted sources)\n- `postgres://user@host/db/table` or `mysql://host/db/table` → external SQL table (table optional)\n- `mongodb://host/db/collection` → external MongoDB collection (collection optional)\n\nWhen no table/collection is named, it defaults to `mqb_cursors_<source_table>`.\nMay embed connection credentials, so it is treated as a secret.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "password"
+        },
+        "cursor_column": {
+          "description": "(Consumer only) Read an existing table **non-destructively** and resumably, paging by this\nmonotonic column (`SELECT * FROM {table} WHERE {cursor_column} > $last ORDER BY {cursor_column} ASC LIMIT n`)\nand persisting the last read value under `cursor_id`. Does not delete/lock source rows.\nMutually exclusive with `delete_after_read`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "cursor_id": {
+          "description": "(Consumer only) Cursor id used to key the persisted resume position. Recommended when\n`cursor_column` is set: without it, progress is not persisted and every restart re-copies\nfrom the beginning.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "delete_after_read": {
           "description": "(Consumer only) If true, delete messages after processing.",
           "type": "boolean",
@@ -2301,7 +2638,7 @@
           "minimum": 0
         },
         "insert_query": {
-          "description": "(Publisher only) Optional. A custom SQL INSERT query. Use `?` as a placeholder for the payload.\nIf not provided, a default `INSERT INTO {table} (payload) VALUES (?)` is used.",
+          "description": "(Publisher only) Optional. A custom SQL INSERT query. Use `?` as a placeholder for the payload.\nIf not provided, a default `INSERT INTO {table} (payload) VALUES (?)` is used.\n\nFor multi-column inserts, embed explicit source tokens directly in the query:\n`${metadata:<key>}` binds `message.metadata[\"<key>\"]`, and `${payload:<field>}`\nbinds the top-level JSON field `<field>` of the payload (types preserved:\nnumbers/bools stay numeric/bool). There is no fallback between the two: an\nabsent metadata key, non-JSON payload, or missing/non-scalar field binds SQL NULL.\nExample: `INSERT INTO orders (customer_id, sku, qty) VALUES (${metadata:customer_id}, ${payload:sku}, ${payload:qty})`.\nA query with no `${...}` tokens behaves exactly as before (whole payload bound once).\n`auto_create_table` is not supported together with a token-based query.",
           "type": [
             "string",
             "null"
@@ -2318,6 +2655,15 @@
         },
         "max_lifetime_ms": {
           "description": "Maximum lifetime of a connection in milliseconds. Defaults to 1800000ms (30 minutes).",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "max_polling_interval_ms": {
+          "description": "(Consumer only) If set, the poll interval backs off exponentially from `polling_interval_ms`\nup to this value while drained, resetting on new rows. Unset = constant interval.",
           "type": [
             "integer",
             "null"
@@ -2352,6 +2698,13 @@
           "format": "uint64",
           "minimum": 0
         },
+        "publication": {
+          "description": "(Consumer only, PostgreSQL) If set, consume via logical-replication CDC instead of cursor\npolling: streams inserts/updates/deletes from this publication. Requires the `postgres-cdc`\nfeature and a Postgres URL. For full control use the dedicated `postgres_cdc` endpoint.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "select_query": {
           "description": "(Consumer only) Optional. A custom SQL SELECT query to fetch messages. This is only supported for PostgreSQL and Microsoft SQL Server.\nThe query must include a placeholder for the batch size (`$1` for PostgreSQL, `@p1` for SQL Server).\nThe bridge will bind the route's `batch_size` to this placeholder.",
           "type": [
@@ -2366,6 +2719,13 @@
             "null"
           ],
           "default": true
+        },
+        "slot_name": {
+          "description": "(Consumer only, CDC) Replication slot name; created if missing. Defaults to `mq_bridge_slot`.",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "table": {
           "description": "The table to interact with.",

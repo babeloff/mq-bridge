@@ -1,0 +1,178 @@
+#![allow(dead_code)]
+#![cfg(feature = "clickhouse")]
+
+use mq_bridge::endpoints::clickhouse::{ClickHouseCursorReader, ClickHousePublisher};
+use mq_bridge::models::ClickHouseConfig;
+use mq_bridge::test_utils::{run_test_with_docker, setup_logging};
+use mq_bridge::traits::{MessageConsumer, MessageDisposition, MessagePublisher};
+use mq_bridge::CanonicalMessage;
+
+const DOCKER_COMPOSE_FILE: &str = "tests/integration/docker-compose/clickhouse.yml";
+const CH_URL: &str = "http://localhost:8123";
+const CH_USER: &str = "testuser";
+const CH_PASS: &str = "testpass";
+
+fn base_config() -> ClickHouseConfig {
+    ClickHouseConfig {
+        url: CH_URL.into(),
+        username: Some(CH_USER.into()),
+        password: Some(CH_PASS.into()),
+        ..Default::default()
+    }
+}
+
+/// Run raw SQL against the ClickHouse HTTP interface (no bindings needed for setup/asserts).
+async fn ch_exec(sql: &str) -> String {
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(CH_URL)
+        .header("X-ClickHouse-User", CH_USER)
+        .header("X-ClickHouse-Key", CH_PASS)
+        .body(sql.to_string())
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    let text = resp.text().await.unwrap();
+    assert!(
+        status.is_success(),
+        "ClickHouse exec failed ({status}): {text}\nSQL: {sql}"
+    );
+    text
+}
+
+/// End-to-end: sink a batch, read it back non-destructively via the cursor source, and verify a
+/// typed column-mapping insert. Exercises the two ways payloads map to rows (whole-object + mapped).
+pub async fn test_clickhouse_roundtrip() {
+    setup_logging();
+    run_test_with_docker(DOCKER_COMPOSE_FILE, || async {
+        // Fresh table with a monotonic id for cursor paging.
+        ch_exec("DROP TABLE IF EXISTS ch_events").await;
+        ch_exec("CREATE TABLE ch_events (id UInt64, name String) ENGINE = MergeTree ORDER BY id")
+            .await;
+
+        // --- Sink: default JSONEachRow insert (payload is a table-shaped JSON object) ---
+        let pub_cfg = ClickHouseConfig {
+            table: "ch_events".into(),
+            ..base_config()
+        };
+        let publisher = ClickHousePublisher::new(&pub_cfg).await.unwrap();
+        let n: u64 = 50;
+        let batch: Vec<CanonicalMessage> = (1..=n)
+            .map(|i| {
+                CanonicalMessage::new(format!(r#"{{"id":{i},"name":"msg-{i}"}}"#).into_bytes(), None)
+            })
+            .collect();
+        publisher.send_batch(batch).await.unwrap();
+
+        let count = ch_exec("SELECT count() FROM ch_events").await;
+        assert_eq!(count.trim(), n.to_string(), "all rows inserted");
+
+        // --- Source: non-destructive, resumable cursor read over `id` ---
+        let src_cfg = ClickHouseConfig {
+            table: "ch_events".into(),
+            cursor_column: Some("id".into()),
+            ..base_config()
+        };
+        let mut reader = ClickHouseCursorReader::new(&src_cfg).await.unwrap();
+
+        let mut total = 0usize;
+        let mut last_seen: u64 = 0;
+        loop {
+            let b = reader.receive_batch(20).await.unwrap();
+            if b.messages.is_empty() {
+                break;
+            }
+            for m in &b.messages {
+                let v: serde_json::Value = serde_json::from_slice(&m.payload).unwrap();
+                let id = v["id"].as_u64().unwrap();
+                last_seen += 1;
+                assert_eq!(id, last_seen, "rows arrive in ascending id order");
+                assert_eq!(v["name"], format!("msg-{id}"));
+            }
+            total += b.messages.len();
+            let acks = vec![MessageDisposition::Ack; b.messages.len()];
+            (b.commit)(acks).await.unwrap();
+        }
+        assert_eq!(total, n as usize, "cursor read returns every row exactly once");
+
+        // Non-destructive: the source table is untouched.
+        let count2 = ch_exec("SELECT count() FROM ch_events").await;
+        assert_eq!(count2.trim(), n.to_string(), "cursor read is non-destructive");
+
+        // --- Column-mapping sink into a typed table ---
+        ch_exec("DROP TABLE IF EXISTS ch_orders").await;
+        ch_exec(
+            "CREATE TABLE ch_orders (sku String, qty UInt32, cust String) ENGINE = MergeTree ORDER BY sku",
+        )
+        .await;
+        let mut cols = std::collections::BTreeMap::new();
+        cols.insert("sku".to_string(), "${payload:sku}".to_string());
+        cols.insert("qty".to_string(), "${payload:qty}".to_string());
+        cols.insert("cust".to_string(), "${metadata:cust}".to_string());
+        let map_cfg = ClickHouseConfig {
+            table: "ch_orders".into(),
+            columns: Some(cols),
+            ..base_config()
+        };
+        let map_pub = ClickHousePublisher::new(&map_cfg).await.unwrap();
+        let mut msg = CanonicalMessage::new(br#"{"sku":"widget","qty":7}"#.to_vec(), None);
+        msg.metadata.insert("cust".into(), "c-1".into());
+        map_pub.send(msg).await.unwrap();
+
+        let got = ch_exec("SELECT sku, qty, cust FROM ch_orders FORMAT JSONEachRow").await;
+        assert!(
+            got.contains("\"sku\":\"widget\"")
+                && got.contains("\"qty\":7")
+                && got.contains("\"cust\":\"c-1\""),
+            "mapped row mismatch: {got}"
+        );
+
+        println!("[ClickHouse] round-trip + cursor + column-mapping OK");
+    })
+    .await;
+}
+
+/// Publisher and cursor-reader report health, then unhealthy when the server stops.
+pub async fn test_clickhouse_status() {
+    use mq_bridge::test_utils::run_test_with_docker_controller;
+    use tokio::time::{sleep, Duration};
+
+    setup_logging();
+    run_test_with_docker_controller(DOCKER_COMPOSE_FILE, |controller| async move {
+        ch_exec("DROP TABLE IF EXISTS ch_status").await;
+        ch_exec("CREATE TABLE ch_status (id UInt64) ENGINE = MergeTree ORDER BY id").await;
+
+        let cfg = ClickHouseConfig {
+            table: "ch_status".into(),
+            cursor_column: Some("id".into()),
+            ..base_config()
+        };
+        let publisher = ClickHousePublisher::new(&cfg).await.unwrap();
+        let consumer = ClickHouseCursorReader::new(&cfg).await.unwrap();
+
+        sleep(Duration::from_secs(1)).await;
+        assert!(
+            publisher.status().await.healthy,
+            "publisher healthy initially"
+        );
+        assert!(
+            consumer.status().await.healthy,
+            "consumer healthy initially"
+        );
+
+        controller.stop_service("clickhouse");
+        let start = std::time::Instant::now();
+        loop {
+            if !publisher.status().await.healthy && !consumer.status().await.healthy {
+                break;
+            }
+            if start.elapsed() > Duration::from_secs(20) {
+                panic!("[ClickHouse] Timeout waiting for disconnect.");
+            }
+            sleep(Duration::from_secs(1)).await;
+        }
+        println!("[ClickHouse] Status test successful.");
+    })
+    .await;
+}

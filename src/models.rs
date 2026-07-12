@@ -163,6 +163,11 @@ pub struct RouteOptions {
     #[serde(default = "default_false", skip_serializing_if = "is_false")]
     #[cfg_attr(feature = "schema", schemars(default = "default_false"))]
     pub allow_fault_injection: bool,
+    /// If true, the route exits gracefully once the source yields an empty batch
+    /// (drain-then-exit). Off by default — routes normally poll indefinitely.
+    #[serde(default = "default_false", skip_serializing_if = "is_false")]
+    #[cfg_attr(feature = "schema", schemars(default = "default_false"))]
+    pub exit_on_empty: bool,
 }
 
 impl Default for RouteOptions {
@@ -176,6 +181,7 @@ impl Default for RouteOptions {
             reconnect_interval_ms: default_reconnect_interval_ms(),
             empty_batch_delay_ms: default_empty_batch_delay_ms(),
             allow_fault_injection: false,
+            exit_on_empty: false,
         }
     }
 }
@@ -710,6 +716,10 @@ pub enum EndpointType {
     RedisStreams(RedisStreamsConfig),
     Grpc(GrpcConfig),
     Sqlx(SqlxConfig),
+    #[serde(rename = "clickhouse", alias = "click_house")]
+    ClickHouse(ClickHouseConfig),
+    #[serde(rename = "postgres_cdc", alias = "postgres-cdc")]
+    PostgresCdc(PostgresCdcConfig),
     Fanout(Vec<Endpoint>),
     #[serde(rename = "stream_buffer")]
     StreamBuffer(StreamBufferConfig),
@@ -745,6 +755,8 @@ impl EndpointType {
             EndpointType::RedisStreams(_) => "redis_streams",
             EndpointType::Grpc(_) => "grpc",
             EndpointType::Sqlx(_) => "sqlx",
+            EndpointType::ClickHouse(_) => "clickhouse",
+            EndpointType::PostgresCdc(_) => "postgres_cdc",
             EndpointType::Fanout(_) => "fanout",
             EndpointType::StreamBuffer(_) => "stream_buffer",
             EndpointType::Switch(_) => "switch",
@@ -1158,6 +1170,11 @@ pub struct KafkaConfig {
         schemars(default = "default_kafka_partitions_schema", range(min = 1))
     )]
     pub partitions: Option<i32>,
+    /// (Publisher only) Name of a metadata field whose value is used as the Kafka record
+    /// key (drives partitioning/ordering). Unset, or absent on a given message, falls back
+    /// to the message id. Default unset.
+    #[serde(default)]
+    pub partition_key: Option<String>,
 }
 
 impl KafkaConfig {
@@ -1263,6 +1280,8 @@ pub enum FileFormat {
     Text,
     /// The raw payload of the message is written. For consumers, the line is read as raw bytes.
     Raw,
+    /// CSV rows mapped to/from JSON objects (string values only). The first row is the header/schema.
+    Csv,
 }
 
 // --- File Specific Configuration ---
@@ -1382,6 +1401,10 @@ pub struct NatsConfig {
     /// (Publisher only) If true, do not wait for an acknowledgement when sending to broker. Defaults to false.
     #[serde(default)]
     pub delayed_ack: bool,
+    /// (Publisher only, JetStream) If true, publish a `Nats-Msg-Id` header (from the message id) so
+    /// JetStream deduplicates redeliveries within the stream's duplicate window. Defaults to false.
+    #[serde(default)]
+    pub deduplicate: bool,
     /// If no_jetstream: true, use Core NATS (fire-and-forget) instead of JetStream. Defaults to false.
     #[serde(default)]
     pub no_jetstream: bool,
@@ -1794,6 +1817,25 @@ pub enum MongoDbFormat {
     Raw,
 }
 
+/// How a MongoDB endpoint consumes a collection. One intent-named selector — the bridge picks the
+/// underlying mechanism (change stream vs. polling) automatically. Defaults to `consumer`.
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum MongoConsume {
+    /// **Queue** — durably drain a queue collection: claim, process, resume after restart. Default.
+    #[default]
+    Consumer,
+    /// **Queue, ephemeral** — receive only new messages, no durable position (fan-out subscriber).
+    Subscriber,
+    /// **Watch existing collection** — capture changes from now on (insert/update/delete), resuming
+    /// under `cursor_id`. Reads an existing collection non-destructively.
+    CaptureNew,
+    /// **Watch existing collection** — read the existing documents first, then capture changes.
+    /// Reads an existing collection non-destructively.
+    CaptureAll,
+}
+
 // --- MongoDB Specific Configuration ---
 
 /// General MongoDB connection configuration.
@@ -1826,9 +1868,27 @@ pub struct MongoDbConfig {
     /// (Publisher only) If true, the publisher will wait for a response in a dedicated collection. Defaults to false.
     #[serde(default)]
     pub request_reply: bool,
-    /// (Consumer only) If true, use Change Streams (**Subscriber mode**). Defaults to false (polling/consumer mode).
+    /// (Consumer only) How to consume the collection: `consumer` (default, durable queue),
+    /// `subscriber` (ephemeral queue), `capture_new` (watch an existing collection for changes), or
+    /// `capture_all` (read existing documents first, then watch for changes). The bridge selects the
+    /// underlying mechanism automatically. If unset, the deprecated `change_stream` boolean is
+    /// honored for backward compatibility.
+    pub consume: Option<MongoConsume>,
+    /// (Consumer only) **Deprecated** — use `consume: subscriber`. Kept for compatibility.
     #[serde(default)]
     pub change_stream: bool,
+    /// (Consumer only) Where to persist the resume cursor in `capture_new`/`capture_all` mode. A URL
+    /// selects the backend; a bare name (or `/name`) reuses the **source** database with that name:
+    /// - absent → source database, collection `mqb_cursors_<source_collection>` (auto-unique)
+    /// - `/my_cursors` → source database, collection `my_cursors`
+    /// - `file:///var/lib/mqb/cursors.json` → local JSON file (read-only / write-restricted sources)
+    /// - `mongodb://host/db/collection` → external MongoDB collection (collection optional)
+    /// - `postgres://user@host/db/table` or `mysql://host/db/table` → external SQL table (table optional)
+    ///
+    /// When no collection/table is named, it defaults to `mqb_cursors_<source_collection>`.
+    /// May embed connection credentials, so it is treated as a secret.
+    #[cfg_attr(feature = "schema", schemars(extend("format"="password")))]
+    pub checkpoint_store: Option<String>,
     /// (Publisher only) Timeout for request-reply operations in milliseconds. Defaults to 30000ms.
     pub request_timeout_ms: Option<u64>,
     /// (Publisher only) TTL in seconds for documents created by the publisher. If set, a TTL index is created.
@@ -1878,6 +1938,19 @@ impl MongoDbConfig {
     pub fn with_change_stream(mut self, change_stream: bool) -> Self {
         self.change_stream = change_stream;
         self
+    }
+
+    /// The effective consume mode: the explicit `consume` field if set, otherwise derived from the
+    /// deprecated `change_stream` boolean.
+    pub fn resolved_consume(&self) -> MongoConsume {
+        if let Some(mode) = self.consume {
+            return mode;
+        }
+        if self.change_stream {
+            MongoConsume::Subscriber
+        } else {
+            MongoConsume::Consumer
+        }
     }
 }
 
@@ -2615,6 +2688,48 @@ pub struct ResponseConfig {
     // This struct is a marker and currently has no fields.
 }
 
+// --- Postgres CDC (logical replication) Configuration ---
+
+/// Postgres logical-replication CDC source (pgoutput). Source-only.
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct PostgresCdcConfig {
+    /// Connection URL, e.g. `postgres://user:pass@host:5432/dbname`.
+    #[cfg_attr(feature = "schema", schemars(extend("format"="password")))]
+    pub url: String,
+    /// Publication name (must already exist; defines which tables are captured).
+    pub publication: String,
+    /// Replication slot name; created if missing when `create_slot` is true.
+    #[serde(default = "default_pg_cdc_slot")]
+    pub slot_name: String,
+    /// Create the replication slot if it does not exist.
+    #[serde(default = "default_true")]
+    pub create_slot: bool,
+    /// Use a temporary slot (dropped on disconnect). Not restart-safe; default is a permanent slot.
+    #[serde(default)]
+    pub temporary_slot: bool,
+    /// Checkpoint key for persisting the confirmed LSN across restarts (optional; the slot is authoritative).
+    pub cursor_id: Option<String>,
+    /// Checkpoint store spec (e.g. `file:///path`); defaults to the source database.
+    #[cfg_attr(feature = "schema", schemars(extend("format"="password")))]
+    pub checkpoint_store: Option<String>,
+    /// Standby-status-update interval in ms; must be shorter than the server's `wal_sender_timeout`.
+    #[serde(default = "default_pg_cdc_status_interval_ms")]
+    pub status_interval_ms: u64,
+    /// TLS configuration for the replication connection.
+    #[serde(default)]
+    pub tls: TlsConfig,
+}
+
+fn default_pg_cdc_slot() -> String {
+    "mq_bridge_slot".to_string()
+}
+
+fn default_pg_cdc_status_interval_ms() -> u64 {
+    10_000
+}
+
 // --- SQLx Specific Configuration ---
 
 /// General SQLx connection configuration.
@@ -2636,6 +2751,15 @@ pub struct SqlxConfig {
     pub table: String,
     /// (Publisher only) Optional. A custom SQL INSERT query. Use `?` as a placeholder for the payload.
     /// If not provided, a default `INSERT INTO {table} (payload) VALUES (?)` is used.
+    ///
+    /// For multi-column inserts, embed explicit source tokens directly in the query:
+    /// `${metadata:<key>}` binds `message.metadata["<key>"]`, and `${payload:<field>}`
+    /// binds the top-level JSON field `<field>` of the payload (types preserved:
+    /// numbers/bools stay numeric/bool). There is no fallback between the two: an
+    /// absent metadata key, non-JSON payload, or missing/non-scalar field binds SQL NULL.
+    /// Example: `INSERT INTO orders (customer_id, sku, qty) VALUES (${metadata:customer_id}, ${payload:sku}, ${payload:qty})`.
+    /// A query with no `${...}` tokens behaves exactly as before (whole payload bound once).
+    /// `auto_create_table` is not supported together with a token-based query.
     pub insert_query: Option<String>,
     /// (Consumer only) Optional. A custom SQL SELECT query to fetch messages. This is only supported for PostgreSQL and Microsoft SQL Server.
     /// The query must include a placeholder for the batch size (`$1` for PostgreSQL, `@p1` for SQL Server).
@@ -2644,11 +2768,44 @@ pub struct SqlxConfig {
     /// (Consumer only) If true, delete messages after processing.
     #[serde(default)]
     pub delete_after_read: bool,
+    /// (Consumer only) Read an existing table **non-destructively** and resumably, paging by this
+    /// monotonic column (`SELECT * FROM {table} WHERE {cursor_column} > $last ORDER BY {cursor_column} ASC LIMIT n`)
+    /// and persisting the last read value under `cursor_id`. Does not delete/lock source rows.
+    /// Mutually exclusive with `delete_after_read`.
+    pub cursor_column: Option<String>,
+    /// (Consumer only) Cursor id used to key the persisted resume position. Recommended when
+    /// `cursor_column` is set: without it, progress is not persisted and every restart re-copies
+    /// from the beginning.
+    pub cursor_id: Option<String>,
+    /// (Consumer only) Where to persist the resume cursor in `cursor_column` mode. A URL selects the
+    /// backend; a bare name (or `/name`) reuses the **source** datastore with that table name:
+    /// - absent → source datastore, table `mqb_cursors_<source_table>` (auto-unique)
+    /// - `/my_cursors` → source datastore, table `my_cursors`
+    /// - `file:///var/lib/mqb/cursors.json` → local JSON file (read-only / write-restricted sources)
+    /// - `postgres://user@host/db/table` or `mysql://host/db/table` → external SQL table (table optional)
+    /// - `mongodb://host/db/collection` → external MongoDB collection (collection optional)
+    ///
+    /// When no table/collection is named, it defaults to `mqb_cursors_<source_table>`.
+    /// May embed connection credentials, so it is treated as a secret.
+    #[cfg_attr(feature = "schema", schemars(extend("format"="password")))]
+    pub checkpoint_store: Option<String>,
     /// (Publisher only) If true, automatically create the table and indexes if they don't exist. Defaults to false.
     #[serde(default)]
     pub auto_create_table: bool,
+    /// (Publisher only) PostgreSQL only. Bulk-load batches via `COPY FROM STDIN` (much faster than multi-row INSERT). Requires a token-based `insert_query`; no `ON CONFLICT`/`RETURNING`.
+    #[serde(default)]
+    pub bulk_copy: bool,
     /// (Consumer only) Polling interval in milliseconds. Defaults to 100ms.
     pub polling_interval_ms: Option<u64>,
+    /// (Consumer only) If set, the poll interval backs off exponentially from `polling_interval_ms`
+    /// up to this value while drained, resetting on new rows. Unset = constant interval.
+    pub max_polling_interval_ms: Option<u64>,
+    /// (Consumer only, PostgreSQL) If set, consume via logical-replication CDC instead of cursor
+    /// polling: streams inserts/updates/deletes from this publication. Requires the `postgres-cdc`
+    /// feature and a Postgres URL. For full control use the dedicated `postgres_cdc` endpoint.
+    pub publication: Option<String>,
+    /// (Consumer only, CDC) Replication slot name; created if missing. Defaults to `mq_bridge_slot`.
+    pub slot_name: Option<String>,
     /// TLS configuration for the database connection.
     #[serde(default)]
     pub tls: TlsConfig,
@@ -2666,6 +2823,80 @@ pub struct SqlxConfig {
     #[serde(default)]
     #[cfg_attr(feature = "schema", schemars(default = "default_shared_schema"))]
     pub shared: Option<bool>,
+}
+
+// --- ClickHouse Specific Configuration ---
+
+/// ClickHouse endpoint configuration (talks the ClickHouse HTTP interface).
+///
+/// As a **publisher** it batch-inserts messages using `FORMAT JSONEachRow` — by default the whole
+/// message payload (which must be a JSON object) becomes one row; set `columns` to build each row
+/// from explicit `${payload:<field>}` / `${metadata:<key>}` tokens instead. As a **consumer** it
+/// reads an existing table **non-destructively** by paging over a monotonic `cursor_column`
+/// (ClickHouse has no native queue/pub-sub), serializing each row to a JSON payload.
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct ClickHouseConfig {
+    /// ClickHouse HTTP endpoint URL, e.g. `http://localhost:8123` (or `https://…`). If it contains
+    /// userinfo, it will be treated as a secret.
+    #[cfg_attr(feature = "schema", schemars(extend("format"="password")))]
+    pub url: String,
+    /// Optional username. Takes precedence over any credentials embedded in the `url`. Defaults to `default`.
+    #[serde(default)]
+    pub username: Option<String>,
+    /// Optional password. Takes precedence over any credentials embedded in the `url`.
+    #[cfg_attr(feature = "schema", schemars(extend("format"="password")))]
+    #[serde(default)]
+    pub password: Option<String>,
+    /// Database name. Defaults to `default`.
+    pub database: Option<String>,
+    /// The table to read from / write to. May be schema-qualified (`db.table`).
+    pub table: String,
+    /// (Publisher only) Optional per-column mapping. Each entry maps a target column name to a value
+    /// token: `${payload:<field>}` takes the top-level JSON field `<field>` of the payload (JSON type
+    /// preserved), `${metadata:<key>}` takes `message.metadata["<key>"]` (as a string), and any other
+    /// value is inserted literally. When omitted, the whole payload JSON object is inserted as one row.
+    pub columns: Option<std::collections::BTreeMap<String, String>>,
+    /// (Publisher only) If true, set the ClickHouse `async_insert=1` server setting so inserts are
+    /// buffered server-side. Defaults to false.
+    #[serde(default)]
+    pub async_insert: bool,
+    /// (Publisher only) With `async_insert`, wait for the server to flush before acking. Defaults to
+    /// true (durable). False = fire-and-forget: faster, but a crash before flush can drop the batch.
+    #[serde(default)]
+    pub wait_for_async_insert: Option<bool>,
+    /// (Consumer only) Read an existing table **non-destructively** and resumably, paging by this
+    /// monotonic column (`SELECT … WHERE {cursor_column} > {last} ORDER BY {cursor_column} ASC LIMIT n`)
+    /// and persisting the last read value under `cursor_id`.
+    pub cursor_column: Option<String>,
+    /// (Consumer only) Cursor id used to key the persisted resume position. Without it, progress is not
+    /// persisted and every restart re-copies from the beginning.
+    pub cursor_id: Option<String>,
+    /// (Consumer only) Where to persist the resume cursor. Because ClickHouse is unsuited to per-row
+    /// cursor upserts, a durable checkpoint requires an **external** store URL:
+    /// - `file:///var/lib/mqb/cursors.json` → local JSON file
+    /// - `postgres://user@host/db/table` / `mysql://host/db/table` → external SQL table (table optional)
+    /// - `mongodb://host/db/collection` → external MongoDB collection (collection optional)
+    ///
+    /// May embed connection credentials, so it is treated as a secret.
+    #[cfg_attr(feature = "schema", schemars(extend("format"="password")))]
+    pub checkpoint_store: Option<String>,
+    /// (Consumer only) Columns to select in `cursor_column` mode. Defaults to `*`.
+    pub select_columns: Option<String>,
+    /// (Consumer only) Polling interval in milliseconds when the table is drained. Defaults to 100ms.
+    pub polling_interval_ms: Option<u64>,
+    /// (Consumer only) If set, the poll interval backs off exponentially from `polling_interval_ms`
+    /// up to this value while drained, resetting on new rows. Unset = constant interval.
+    pub max_polling_interval_ms: Option<u64>,
+    /// Request timeout in milliseconds for ClickHouse HTTP calls (inserts, cursor reads, status).
+    /// Unset = no timeout (wait indefinitely), which suits very large batch inserts.
+    pub request_timeout_ms: Option<u64>,
+    /// Connection (TCP + TLS handshake) timeout in milliseconds. Defaults to 10000ms.
+    pub connect_timeout_ms: Option<u64>,
+    /// TLS configuration for `https://` connections.
+    #[serde(default)]
+    pub tls: TlsConfig,
 }
 
 // --- Common Configuration ---
@@ -2914,6 +3145,12 @@ impl SecretExtractor for EndpointType {
             EndpointType::Sqlx(cfg) => {
                 cfg.extract_secrets(&format!("{}__{}", prefix, "SQLX"), secrets)
             }
+            EndpointType::ClickHouse(cfg) => {
+                cfg.extract_secrets(&format!("{}__{}", prefix, "CLICKHOUSE"), secrets)
+            }
+            EndpointType::PostgresCdc(cfg) => {
+                cfg.extract_secrets(&format!("{}__{}", prefix, "POSTGRES_CDC"), secrets)
+            }
             EndpointType::Grpc(cfg) => {
                 cfg.extract_secrets(&format!("{}__{}", prefix, "GRPC"), secrets)
             }
@@ -3025,6 +3262,13 @@ impl SecretExtractor for MongoDbConfig {
         if let Some(val) = self.password.take() {
             secrets.insert(format!("{}__{}", prefix, "PASSWORD"), val);
         }
+        // The checkpoint store URL may embed connection credentials.
+        extract_sensitive_optional_url(
+            &mut self.checkpoint_store,
+            prefix,
+            "CHECKPOINT_STORE",
+            secrets,
+        );
         self.tls
             .extract_secrets(&format!("{}__{}", prefix, "TLS"), secrets);
     }
@@ -3111,6 +3355,34 @@ impl SecretExtractor for SqlxConfig {
         }
         if let Some(val) = self.password.take() {
             secrets.insert(format!("{}__{}", prefix, "PASSWORD"), val);
+        }
+        self.tls
+            .extract_secrets(&format!("{}__{}", prefix, "TLS"), secrets);
+    }
+}
+
+impl SecretExtractor for ClickHouseConfig {
+    fn extract_secrets(&mut self, prefix: &str, secrets: &mut HashMap<String, String>) {
+        extract_sensitive_url(&mut self.url, prefix, "URL", secrets);
+        if let Some(val) = self.username.take() {
+            secrets.insert(format!("{}__{}", prefix, "USERNAME"), val);
+        }
+        if let Some(val) = self.password.take() {
+            secrets.insert(format!("{}__{}", prefix, "PASSWORD"), val);
+        }
+        if let Some(val) = self.checkpoint_store.take() {
+            secrets.insert(format!("{}__{}", prefix, "CHECKPOINT_STORE"), val);
+        }
+        self.tls
+            .extract_secrets(&format!("{}__{}", prefix, "TLS"), secrets);
+    }
+}
+
+impl SecretExtractor for PostgresCdcConfig {
+    fn extract_secrets(&mut self, prefix: &str, secrets: &mut HashMap<String, String>) {
+        extract_sensitive_url(&mut self.url, prefix, "URL", secrets);
+        if let Some(val) = self.checkpoint_store.take() {
+            secrets.insert(format!("{}__{}", prefix, "CHECKPOINT_STORE"), val);
         }
         self.tls
             .extract_secrets(&format!("{}__{}", prefix, "TLS"), secrets);

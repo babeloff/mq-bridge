@@ -37,6 +37,90 @@ fn get_file_lock(path: &str) -> Arc<Mutex<()>> {
         .clone()
 }
 
+/// Appends a CSV-escaped field to `buf` without allocating for the common
+/// (no special characters) case. Hot path for CSV row encoding.
+fn csv_append_field(buf: &mut String, s: &str) {
+    if s.contains(',') || s.contains('"') || s.contains('\n') || s.contains('\r') {
+        buf.push('"');
+        for ch in s.chars() {
+            if ch == '"' {
+                buf.push('"');
+            }
+            buf.push(ch);
+        }
+        buf.push('"');
+    } else {
+        buf.push_str(s);
+    }
+}
+
+/// Appends `s` to `buf` with JSON string escaping (no surrounding quotes).
+/// Fast path pushes the whole slice when it contains no characters needing
+/// an escape. Hot path for decoding CSV rows into JSON objects.
+fn json_append_escaped(buf: &mut String, s: &str) {
+    if !s.bytes().any(|b| b < 0x20 || b == b'"' || b == b'\\') {
+        buf.push_str(s);
+        return;
+    }
+    for c in s.chars() {
+        match c {
+            '"' => buf.push_str("\\\""),
+            '\\' => buf.push_str("\\\\"),
+            '\n' => buf.push_str("\\n"),
+            '\r' => buf.push_str("\\r"),
+            '\t' => buf.push_str("\\t"),
+            '\u{08}' => buf.push_str("\\b"),
+            '\u{0C}' => buf.push_str("\\f"),
+            c if (c as u32) < 0x20 => {
+                use std::fmt::Write;
+                let _ = write!(buf, "\\u{:04x}", c as u32);
+            }
+            c => buf.push(c),
+        }
+    }
+}
+
+fn csv_encode_row(fields: &[String]) -> String {
+    let mut buf = String::new();
+    for (i, f) in fields.iter().enumerate() {
+        if i > 0 {
+            buf.push(',');
+        }
+        csv_append_field(&mut buf, f);
+    }
+    buf
+}
+
+/// Parses a single CSV line into fields. Supports quoted fields with escaped `""`.
+fn parse_csv_row(line: &str) -> Vec<String> {
+    let mut fields = Vec::new();
+    let mut cur = String::new();
+    let mut in_quotes = false;
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        if in_quotes {
+            if c == '"' {
+                if chars.peek() == Some(&'"') {
+                    cur.push('"');
+                    chars.next();
+                } else {
+                    in_quotes = false;
+                }
+            } else {
+                cur.push(c);
+            }
+        } else if c == '"' && cur.is_empty() {
+            in_quotes = true;
+        } else if c == ',' {
+            fields.push(std::mem::take(&mut cur));
+        } else {
+            cur.push(c);
+        }
+    }
+    fields.push(cur);
+    fields
+}
+
 fn parse_delimiter(delimiter: Option<&str>) -> anyhow::Result<Vec<u8>> {
     let bytes = match delimiter {
         Some(s) if s.starts_with("0x") => {
@@ -91,6 +175,9 @@ pub struct FilePublisher {
     file_lock: Arc<Mutex<()>>,
     delimiter: Vec<u8>,
     format: FileFormat,
+    /// CSV column order, locked in by the first message written. Shared across
+    /// clones of this publisher so all writers to the same file agree on it.
+    csv_header: Arc<Mutex<Option<Vec<String>>>>,
 }
 
 impl FilePublisher {
@@ -120,6 +207,7 @@ impl FilePublisher {
             file_lock,
             delimiter,
             format,
+            csv_header: Arc::new(Mutex::new(None)),
         })
     }
 }
@@ -149,8 +237,18 @@ impl MessagePublisher for FilePublisher {
             .await
             .context("Failed to open file for writing batch")?;
 
+        let file_is_empty = if matches!(self.format, FileFormat::Csv) {
+            file.metadata().await.map(|m| m.len() == 0).unwrap_or(false)
+        } else {
+            false
+        };
         let mut writer = BufWriter::new(file);
         let mut failed_messages = Vec::new();
+        let mut csv_header_guard = if matches!(self.format, FileFormat::Csv) {
+            Some(self.csv_header.lock().await)
+        } else {
+            None
+        };
 
         // Iterate over messages, consuming them
         for mut msg in messages {
@@ -210,6 +308,54 @@ impl MessagePublisher for FilePublisher {
                         })
                     } else {
                         serde_json::to_vec(&msg)
+                    }
+                }
+                FileFormat::Csv => {
+                    match serde_json::from_slice::<serde_json::Value>(&msg.payload) {
+                        Ok(serde_json::Value::Object(obj)) => {
+                            let hdr = csv_header_guard.as_mut().expect("csv header lock held");
+                            if hdr.is_none() {
+                                // Sort keys so the column order is deterministic and
+                                // independent of serde_json's map type (BTreeMap vs the
+                                // IndexMap enabled by the `preserve_order` feature, which
+                                // `bson`/mongodb turns on under feature unification).
+                                let mut cols: Vec<String> = obj.keys().cloned().collect();
+                                cols.sort();
+                                if file_is_empty {
+                                    let header_line = csv_encode_row(&cols);
+                                    if let Err(e) = writer.write_all(header_line.as_bytes()).await {
+                                        return Err(PublisherError::NonRetryable(anyhow::anyhow!(
+                                            e
+                                        )));
+                                    }
+                                    if let Err(e) = writer.write_all(&self.delimiter).await {
+                                        return Err(PublisherError::NonRetryable(anyhow::anyhow!(
+                                            e
+                                        )));
+                                    }
+                                }
+                                **hdr = Some(cols);
+                            }
+                            let cols = hdr.as_ref().unwrap();
+                            let mut line = String::new();
+                            for (i, c) in cols.iter().enumerate() {
+                                if i > 0 {
+                                    line.push(',');
+                                }
+                                match obj.get(c) {
+                                    Some(serde_json::Value::String(s)) => {
+                                        csv_append_field(&mut line, s)
+                                    }
+                                    Some(v) => csv_append_field(&mut line, &v.to_string()),
+                                    None => {}
+                                }
+                            }
+                            Ok(line.into_bytes())
+                        }
+                        _ => Err(serde_json::Error::io(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "CSV format requires a JSON object payload",
+                        ))),
                     }
                 }
             };
@@ -330,6 +476,8 @@ async fn create_file_event_store(
     tokio::spawn(async move {
         let mut current_sleep = std::time::Duration::from_millis(1);
         const MAX_SLEEP: std::time::Duration = std::time::Duration::from_millis(100);
+        // CSV is not supported in this backend (Subscribe + delete); see FileConsumer::new.
+        let mut csv_header: Option<Vec<String>> = None;
 
         loop {
             // Check if the store is still alive
@@ -403,8 +551,9 @@ async fn create_file_event_store(
                         {
                             buffer.pop();
                         }
-                        let msg = parse_message(&buffer, &format_clone);
-                        batch.push(msg);
+                        if let Some(msg) = parse_message(&buffer, &format_clone, &mut csv_header) {
+                            batch.push(msg);
+                        }
                         lines_read += 1;
 
                         state.lines_in_memory += 1;
@@ -486,6 +635,10 @@ struct FileTailConsumer {
     buffer: Vec<CanonicalMessage>,
     offset_file: Option<Arc<Mutex<tokio::fs::File>>>,
     ready: Arc<AtomicBool>,
+    /// Set when a greedy fill consumed the watcher's end-of-file marker after
+    /// data; the next `receive_batch` surfaces it as an empty batch so a route
+    /// with `exit_on_empty` can drain-then-exit.
+    pending_eof: bool,
 }
 
 fn read_until_bytes_sync<R: std::io::BufRead>(
@@ -524,8 +677,13 @@ fn run_file_tail_task_sync(
     let mut current_sleep = std::time::Duration::from_millis(1);
     const MAX_SLEEP: std::time::Duration = std::time::Duration::from_millis(50);
     let mut initialized = false;
+    // Tracks whether we've already emitted the empty end-of-file marker for the
+    // current drained state, so we signal it once per EOF transition rather than
+    // on every idle poll.
+    let mut signaled_eof = false;
     const BATCH_SIZE: usize = 1024;
     let mut buf = Vec::with_capacity(1024);
+    let mut csv_header: Option<Vec<String>> = None;
 
     loop {
         if reader.is_none() {
@@ -578,12 +736,13 @@ fn run_file_tail_task_sync(
                         if delimiter.len() == 1 && delimiter[0] == b'\n' && buf.ends_with(b"\r") {
                             buf.pop();
                         }
-                        let mut msg = parse_message(&buf, &format);
-                        if group_id.is_some() {
-                            msg.metadata
-                                .insert("file_offset".to_string(), last_position.to_string());
+                        if let Some(mut msg) = parse_message(&buf, &format, &mut csv_header) {
+                            if group_id.is_some() {
+                                msg.metadata
+                                    .insert("file_offset".to_string(), last_position.to_string());
+                            }
+                            batch.push(msg);
                         }
-                        batch.push(msg);
                         lines_read_in_batch += 1;
                     }
                     Err(e) => {
@@ -600,10 +759,18 @@ fn run_file_tail_task_sync(
                 break; // Consumer dropped, exit thread
             }
             current_sleep = std::time::Duration::from_millis(1);
+            signaled_eof = false; // data flowed; re-arm the EOF marker
         }
 
         if lines_read_in_batch == 0 {
-            // EOF reached, sleep
+            // EOF reached. Emit an empty batch once so a drained route can pause
+            // or, with exit_on_empty, terminate. Re-armed when new data arrives.
+            if !signaled_eof {
+                if msg_tx.send_blocking(Vec::new()).is_err() {
+                    break; // Consumer dropped, exit thread
+                }
+                signaled_eof = true;
+            }
             std::thread::sleep(current_sleep);
             current_sleep = std::cmp::min(current_sleep * 2, MAX_SLEEP);
             // Invalidate reader to check for file changes (like rotation) on next poll
@@ -620,6 +787,8 @@ struct FileQueueConsumer {
     buffer: Arc<Mutex<Vec<CanonicalMessage>>>,
     delimiter: Vec<u8>,
     ready: Arc<AtomicBool>,
+    /// See [`FileTailConsumer::pending_eof`].
+    pending_eof: bool,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -636,7 +805,10 @@ fn run_file_queue_task(
     let mut current_sleep = std::time::Duration::from_millis(1);
     const MAX_SLEEP: std::time::Duration = std::time::Duration::from_millis(100);
     let mut initialized = false;
+    // Emit the empty end-of-file marker once per drained state; see the tail task.
+    let mut signaled_eof = false;
     let mut buf = Vec::new();
+    let mut csv_header: Option<Vec<String>> = None;
 
     loop {
         buf.clear();
@@ -687,8 +859,25 @@ fn run_file_queue_task(
                             {
                                 buf.pop();
                             }
-                            batch.push(parse_message(&buf, &format));
-                            lines_read += 1;
+                            match parse_message(&buf, &format, &mut csv_header) {
+                                Some(msg) => {
+                                    batch.push(msg);
+                                    lines_read += 1;
+                                }
+                                None => {
+                                    // CSV header line: remove it immediately so it never
+                                    // occupies a slot in the ack/delete line accounting.
+                                    if let Err(e) = runtime_handle
+                                        .block_on(remove_lines_from_file(&path, 1, &delimiter))
+                                    {
+                                        tracing::error!(
+                                            "Failed to remove CSV header line from {}: {}",
+                                            path,
+                                            e
+                                        );
+                                    }
+                                }
+                            }
                         }
                         Err(_) => break,
                     }
@@ -707,7 +896,16 @@ fn run_file_queue_task(
                 break;
             }
             current_sleep = std::time::Duration::from_millis(1);
+            signaled_eof = false; // data flowed; re-arm the EOF marker
         } else {
+            // EOF: emit an empty batch once so a drained route can pause or,
+            // with exit_on_empty, terminate. Re-armed when new data arrives.
+            if !signaled_eof {
+                if msg_tx.send_blocking(Vec::new()).is_err() {
+                    break;
+                }
+                signaled_eof = true;
+            }
             std::thread::sleep(current_sleep);
             current_sleep = std::cmp::min(current_sleep * 2, MAX_SLEEP);
         }
@@ -729,6 +927,16 @@ impl FileConsumer {
     pub async fn new(config: &FileConfig) -> anyhow::Result<Self> {
         let delimiter = parse_delimiter(config.delimiter.as_deref())?;
         let format = config.format.clone();
+        if matches!(format, FileFormat::Csv)
+            && matches!(
+                &config.mode,
+                Some(FileConsumerMode::Subscribe { delete: true })
+            )
+        {
+            return Err(anyhow::anyhow!(
+                "FileFormat::Csv is not supported with Subscribe {{ delete: true }} mode"
+            ));
+        }
         match &config.mode {
             None | Some(FileConsumerMode::Consume { delete: false }) => {
                 Self::new_tail(&config.path, false, None, delimiter.clone(), format).await
@@ -786,6 +994,7 @@ impl FileConsumer {
                         buffer: Arc::new(Mutex::new(Vec::new())),
                         delimiter,
                         ready,
+                        pending_eof: false,
                     }),
                 })
             }
@@ -886,6 +1095,7 @@ impl FileConsumer {
                 buffer: Vec::new(),
                 offset_file,
                 ready,
+                pending_eof: false,
             }),
         })
     }
@@ -909,8 +1119,20 @@ impl MessageConsumer for FileConsumer {
         match &mut self.backend {
             ConsumerBackend::EventStore(c) => c.receive_batch(max_messages).await,
             ConsumerBackend::Tail(c) => {
+                // A previous greedy fill saw the end-of-file marker trailing the
+                // data it returned; surface it now as an empty batch.
+                if c.pending_eof {
+                    c.pending_eof = false;
+                    return Ok(ReceivedBatch {
+                        messages: Vec::new(),
+                        commit: Box::new(|_| Box::pin(async { Ok(()) })),
+                    });
+                }
+
                 if c.buffer.is_empty() {
                     match c.msg_rx.recv().await {
+                        // An empty batch is the watcher's end-of-file marker; fall
+                        // through to return it as an empty batch.
                         Ok(batch) => c.buffer = batch,
                         Err(_) => return Err(ConsumerError::EndOfStream),
                     }
@@ -919,6 +1141,12 @@ impl MessageConsumer for FileConsumer {
                 // Greedily fill buffer from channel if more messages are available
                 while c.buffer.len() < max_messages {
                     match c.msg_rx.try_recv() {
+                        // Stop at the end-of-file marker; remember it so the next
+                        // call surfaces the empty batch after this data is served.
+                        Ok(next_batch) if next_batch.is_empty() => {
+                            c.pending_eof = true;
+                            break;
+                        }
                         Ok(mut next_batch) => c.buffer.append(&mut next_batch),
                         Err(_) => break, // Channel is empty or disconnected
                     }
@@ -979,11 +1207,23 @@ impl MessageConsumer for FileConsumer {
                 Ok(ReceivedBatch { messages, commit })
             }
             ConsumerBackend::Queue(c) => {
+                // A previous greedy fill saw the watcher's end-of-file marker
+                // after data; surface it now as an empty batch.
+                if c.pending_eof {
+                    c.pending_eof = false;
+                    return Ok(ReceivedBatch {
+                        messages: Vec::new(),
+                        commit: Box::new(|_| Box::pin(async { Ok(()) })),
+                    });
+                }
+
                 {
                     let buffer = c.buffer.lock().await;
                     if buffer.is_empty() {
                         drop(buffer);
                         match c.msg_rx.recv().await {
+                            // An empty batch is the watcher's end-of-file marker;
+                            // fall through to return it as an empty batch.
                             Ok(b) => c.buffer.lock().await.extend(b),
                             Err(_) => return Err(ConsumerError::EndOfStream),
                         }
@@ -993,6 +1233,12 @@ impl MessageConsumer for FileConsumer {
 
                 while buffer.len() < max_messages {
                     match c.msg_rx.try_recv() {
+                        // Stop at the end-of-file marker; remember it so the next
+                        // call surfaces the empty batch after this data is served.
+                        Ok(b) if b.is_empty() => {
+                            c.pending_eof = true;
+                            break;
+                        }
                         Ok(mut b) => buffer.append(&mut b),
                         Err(_) => break,
                     }
@@ -1073,13 +1319,48 @@ impl MessageConsumer for FileConsumer {
     }
 }
 
-fn parse_message(buffer: &[u8], format: &FileFormat) -> CanonicalMessage {
+/// Parses one file line into a message. Returns `None` for CSV header lines,
+/// which establish the schema but carry no data of their own.
+fn parse_message(
+    buffer: &[u8],
+    format: &FileFormat,
+    csv_header: &mut Option<Vec<String>>,
+) -> Option<CanonicalMessage> {
     match format {
+        FileFormat::Csv => {
+            let line = String::from_utf8_lossy(buffer);
+            let fields = parse_csv_row(&line);
+            match csv_header {
+                None => {
+                    *csv_header = Some(fields);
+                    None
+                }
+                Some(cols) => {
+                    // Build the JSON object bytes directly instead of constructing a
+                    // serde_json::Map and re-serializing it. Avoids per-row header
+                    // clones, map allocation/ordering, and a serde serialization pass.
+                    let mut out = String::with_capacity(line.len() + cols.len() * 8 + 2);
+                    out.push('{');
+                    for (i, col) in cols.iter().enumerate() {
+                        if i > 0 {
+                            out.push(',');
+                        }
+                        out.push('"');
+                        json_append_escaped(&mut out, col);
+                        out.push_str("\":\"");
+                        json_append_escaped(&mut out, fields.get(i).map_or("", |s| s.as_str()));
+                        out.push('"');
+                    }
+                    out.push('}');
+                    Some(CanonicalMessage::new(out.into_bytes(), None))
+                }
+            }
+        }
         FileFormat::Raw => {
             let mut msg = CanonicalMessage::new(buffer.to_vec(), None);
             msg.metadata
                 .insert("mq_bridge.original_format".to_string(), "raw".to_string());
-            msg
+            Some(msg)
         }
         FileFormat::Normal | FileFormat::Json | FileFormat::Text => {
             #[derive(serde::Deserialize)]
@@ -1091,7 +1372,7 @@ fn parse_message(buffer: &[u8], format: &FileFormat) -> CanonicalMessage {
                 metadata: HashMap<String, String>,
             }
 
-            match serde_json::from_slice::<AnyPayloadMessage>(buffer) {
+            let msg = match serde_json::from_slice::<AnyPayloadMessage>(buffer) {
                 Ok(wrapper) => {
                     let payload_bytes = if matches!(format, FileFormat::Json) {
                         serde_json::to_vec(&wrapper.payload).unwrap_or_default()
@@ -1124,7 +1405,8 @@ fn parse_message(buffer: &[u8], format: &FileFormat) -> CanonicalMessage {
                         .insert("mq_bridge.original_format".to_string(), "raw".to_string());
                     msg
                 }
-            }
+            };
+            Some(msg)
         }
     }
 }
@@ -1184,7 +1466,16 @@ mod tests {
         assert_eq!(received_msg2.message_id, msg2.message_id);
         assert_eq!(received_msg2.payload, msg2.payload);
 
-        // 6. Verify that reading again waits for new data (timeout)
+        // 6. After draining, the consumer surfaces a one-shot empty batch (the
+        //    drain marker) so a route can pause or exit_on_empty can fire.
+        let drained = source.receive_batch(1).await.unwrap();
+        assert!(
+            drained.messages.is_empty(),
+            "Expected an empty drain marker after the file was drained"
+        );
+
+        // 7. With the marker already emitted and no new data, a further read
+        //    blocks (times out) until new data arrives.
         let result = tokio::time::timeout(
             std::time::Duration::from_millis(200),
             source.receive_batch(1),
@@ -1383,8 +1674,18 @@ mod tests {
             file.write_all(b"line2\n").await.unwrap();
         }
 
-        // Receive new line
-        let received2 = consumer.receive_batch(2).await.unwrap();
+        // Receive new line, skipping any empty drain marker emitted while the
+        // subscriber was caught up to the end of the file at startup.
+        let received2 = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let batch = consumer.receive_batch(2).await.unwrap();
+                if !batch.messages.is_empty() {
+                    break batch;
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for appended line");
         assert_eq!(received2.messages.len(), 1);
         assert_eq!(received2.messages[0].payload.as_ref(), b"line2");
         (received2.commit)(vec![crate::traits::MessageDisposition::Ack])
@@ -2086,6 +2387,41 @@ mod tests {
                 .get("mq_bridge.original_format")
                 .map(|s| s.as_str()),
             Some("raw")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_file_csv_round_trip() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("data.csv");
+        let file_path_str = file_path.to_str().unwrap().to_string();
+
+        let config = FileConfig {
+            path: file_path_str.clone(),
+            format: FileFormat::Csv,
+            ..Default::default()
+        };
+
+        let sink = FilePublisher::new(&config).await.unwrap();
+        let msg1 = msg!(json!({"name": "alice", "age": "30"}));
+        let msg2 = msg!(json!({"name": "bob", "age": "25"}));
+        sink.send_batch(vec![msg1, msg2]).await.unwrap();
+        sink.flush().await.unwrap();
+        drop(sink);
+
+        let content = tokio::fs::read_to_string(&file_path).await.unwrap();
+        assert_eq!(content, "age,name\n30,alice\n25,bob\n");
+
+        let mut source = FileConsumer::new(&config).await.unwrap();
+        let received1 = source.receive().await.unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&received1.message.payload).unwrap(),
+            json!({"name": "alice", "age": "30"})
+        );
+        let received2 = source.receive().await.unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&received2.message.payload).unwrap(),
+            json!({"name": "bob", "age": "25"})
         );
     }
 }

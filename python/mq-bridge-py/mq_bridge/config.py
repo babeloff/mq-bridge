@@ -6,6 +6,7 @@ from __future__ import annotations
 AmqpConfig = dict
 AwsConfig = dict
 BufferMiddleware = dict
+ClickHouseConfig = dict
 CookieJarMiddleware = dict
 DeadLetterQueueMiddleware = dict
 DeduplicationMiddleware = dict
@@ -24,6 +25,7 @@ Middleware = dict
 MongoDbConfig = dict
 MqttConfig = dict
 NatsConfig = dict
+PostgresCdcConfig = dict
 RandomPanicMiddleware = dict
 RedisStreamsConfig = dict
 ResponseConfig = dict
@@ -40,6 +42,7 @@ ZeroMqConfig = dict
 FaultMode = str
 FileFormat = str
 HttpServerProtocol = str
+MongoConsume = str
 MongoDbFormat = str
 MqttProtocol = str
 NatsDeliverPolicy = str
@@ -55,6 +58,7 @@ __all__ = [
     "AmqpConfig",
     "AwsConfig",
     "BufferMiddleware",
+    "ClickHouseConfig",
     "ConfigDocument",
     "CookieJarMiddleware",
     "DeadLetterQueueMiddleware",
@@ -75,12 +79,14 @@ __all__ = [
     "MemoryConfig",
     "MetricsMiddleware",
     "Middleware",
+    "MongoConsume",
     "MongoDbConfig",
     "MongoDbFormat",
     "MqttConfig",
     "MqttProtocol",
     "NatsConfig",
     "NatsDeliverPolicy",
+    "PostgresCdcConfig",
     "RandomPanicMiddleware",
     "RedisStreamsConfig",
     "ResponseConfig",

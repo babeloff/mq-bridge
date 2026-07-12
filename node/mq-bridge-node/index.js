@@ -83,6 +83,10 @@ class Publisher {
     return this._native.send(Message._toNative(message));
   }
 
+  sendBatch(messages) {
+    return this._native.sendBatch(messages.map((message) => Message._toNative(message)));
+  }
+
   async request(message) {
     return Message._fromNative(await this._native.request(Message._toNative(message)));
   }

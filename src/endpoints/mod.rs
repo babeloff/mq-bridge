@@ -7,6 +7,8 @@
 pub mod amqp;
 #[cfg(feature = "aws")]
 pub mod aws;
+#[cfg(feature = "clickhouse")]
+pub mod clickhouse;
 pub mod fanout;
 pub mod file;
 #[cfg(feature = "grpc")]
@@ -27,6 +29,10 @@ pub mod mqtt;
 #[cfg(feature = "nats")]
 pub mod nats;
 pub mod null;
+#[cfg(any(feature = "sqlx", feature = "clickhouse"))]
+mod poll;
+#[cfg(feature = "postgres-cdc")]
+pub mod postgres;
 pub mod reader;
 #[cfg(feature = "redis-streams")]
 pub mod redis_streams;
@@ -377,11 +383,26 @@ fn check_consumer_recursive(
         EndpointType::IbmMq(_) => Ok(warnings),
         #[cfg(feature = "mongodb")]
         EndpointType::MongoDb(cfg) => {
-            if cfg.change_stream && matches!(cfg.format, crate::models::MongoDbFormat::Raw) {
+            use crate::models::MongoConsume;
+            let mode = cfg.resolved_consume();
+            if mode == MongoConsume::Subscriber
+                && matches!(cfg.format, crate::models::MongoDbFormat::Raw)
+            {
                 return Err(anyhow!(
-                    "[route:{}] MongoDB raw format cannot be used with change_stream/subscriber mode because raw documents do not include the seq ordering field",
+                    "[route:{}] MongoDB raw format cannot be used with subscriber mode because raw documents do not include the seq ordering field",
                     route_name
                 ));
+            }
+            if cfg.consume.is_some() && cfg.change_stream {
+                warnings.push(
+                    "Endpoint 'mongodb' sets 'consume'; the deprecated 'change_stream' boolean is ignored and should be removed."
+                    .to_string(),
+                );
+            } else if cfg.change_stream {
+                warnings.push(
+                    "Endpoint 'mongodb' option 'change_stream' is deprecated; use 'consume: subscriber'."
+                    .to_string(),
+                );
             }
             if cfg.reply_polling_ms.is_some() {
                 warnings.push(
@@ -436,6 +457,21 @@ fn check_consumer_recursive(
             }
             Ok(warnings)
         }
+        #[cfg(feature = "clickhouse")]
+        EndpointType::ClickHouse(cfg) => {
+            if cfg.cursor_column.is_none() {
+                return Err(anyhow!(
+                    "ClickHouse endpoint used as a consumer requires 'cursor_column' (ClickHouse has no native queue; only non-destructive cursor reads are supported)."
+                ));
+            }
+            if cfg.columns.is_some() {
+                warnings.push("Endpoint 'clickhouse' is used as a consumer, but 'columns' is a publisher-only option and will be ignored.".to_string());
+            }
+            if cfg.async_insert {
+                warnings.push("Endpoint 'clickhouse' is used as a consumer, but 'async_insert' is a publisher-only option and will be ignored.".to_string());
+            }
+            Ok(warnings)
+        }
         #[cfg(feature = "sqlx")]
         EndpointType::Sqlx(cfg) => {
             if cfg.insert_query.is_some() {
@@ -443,6 +479,15 @@ fn check_consumer_recursive(
                     "Endpoint 'sqlx' is used as a consumer, but 'insert_query' is a publisher-only option and will be ignored."
                     .to_string()
                 );
+            }
+            Ok(warnings)
+        }
+        #[cfg(feature = "postgres-cdc")]
+        EndpointType::PostgresCdc(cfg) => {
+            if cfg.publication.trim().is_empty() {
+                return Err(anyhow!(
+                    "postgres_cdc consumer requires a 'publication' (defines which tables are captured)."
+                ));
             }
             Ok(warnings)
         }
@@ -547,6 +592,42 @@ fn resolve_endpoint_recursive(
     } else {
         Ok(endpoint.clone())
     }
+}
+
+/// Map a `sqlx` consumer config that requested CDC (via `publication`) onto a
+/// `PostgresCdcConfig`, so a Postgres `sqlx` endpoint can transparently fall back
+/// to logical-replication CDC. Postgres-only; other drivers error.
+#[cfg(all(feature = "sqlx", feature = "postgres-cdc"))]
+fn sqlx_cfg_to_cdc(
+    cfg: &crate::models::SqlxConfig,
+) -> anyhow::Result<crate::models::PostgresCdcConfig> {
+    let url = cfg.url.trim();
+    if !(url.starts_with("postgres://") || url.starts_with("postgresql://")) {
+        return Err(anyhow!(
+            "sqlx `publication` (CDC) is only supported for PostgreSQL URLs; got '{}'. \
+             Use a postgres:// URL or the dedicated `postgres_cdc` endpoint.",
+            cfg.url
+        ));
+    }
+    if cfg.cursor_column.is_some() {
+        return Err(anyhow!(
+            "sqlx endpoint sets both `publication` (CDC) and `cursor_column` (polling); pick one."
+        ));
+    }
+    Ok(crate::models::PostgresCdcConfig {
+        url: cfg.url.clone(),
+        publication: cfg.publication.clone().unwrap_or_default(),
+        slot_name: cfg
+            .slot_name
+            .clone()
+            .unwrap_or_else(|| "mq_bridge_slot".to_string()),
+        create_slot: true,
+        temporary_slot: false,
+        cursor_id: cfg.cursor_id.clone(),
+        checkpoint_store: cfg.checkpoint_store.clone(),
+        status_interval_ms: 10_000,
+        tls: cfg.tls.clone(),
+    })
 }
 
 /// Creates a `MessageConsumer` based on the route's "in" configuration.
@@ -817,7 +898,43 @@ async fn create_base_consumer(
             Ok(boxed(grpc::GrpcConsumer::new(&config).await?))
         }
         #[cfg(feature = "sqlx")]
-        EndpointType::Sqlx(cfg) => Ok(boxed(sqlx::SqlxConsumer::new(cfg).await?)),
+        EndpointType::Sqlx(cfg) => {
+            if cfg.publication.is_some() {
+                // A Postgres publication means CDC (logical replication), not polling —
+                // delegate to the postgres_cdc consumer. See `sqlx_cfg_to_cdc`.
+                #[cfg(feature = "postgres-cdc")]
+                {
+                    Ok(boxed(
+                        postgres::PostgresCdcConsumer::new(&sqlx_cfg_to_cdc(cfg)?).await?,
+                    ))
+                }
+                #[cfg(not(feature = "postgres-cdc"))]
+                {
+                    Err(anyhow!(
+                        "sqlx endpoint with `publication` set uses Postgres CDC, which requires \
+                         the `postgres-cdc` feature to be enabled."
+                    ))
+                }
+            } else if cfg.cursor_column.is_some() {
+                // Non-destructive, resumable cursor read of an arbitrary table.
+                Ok(boxed(sqlx::SqlxCursorReader::new(cfg).await?))
+            } else {
+                Ok(boxed(sqlx::SqlxConsumer::new(cfg).await?))
+            }
+        }
+        #[cfg(feature = "clickhouse")]
+        EndpointType::ClickHouse(cfg) => {
+            if cfg.cursor_column.is_some() {
+                // ClickHouse has no native queue; only non-destructive cursor reads are supported.
+                Ok(boxed(clickhouse::ClickHouseCursorReader::new(cfg).await?))
+            } else {
+                Err(anyhow::anyhow!(
+                    "ClickHouse endpoint used as a consumer requires 'cursor_column' (ClickHouse has no native queue; only non-destructive cursor reads are supported)."
+                ))
+            }
+        }
+        #[cfg(feature = "postgres-cdc")]
+        EndpointType::PostgresCdc(cfg) => Ok(boxed(postgres::PostgresCdcConsumer::new(cfg).await?)),
         #[cfg(feature = "http")]
         EndpointType::Http(cfg) => Ok(boxed(http::HttpConsumer::new(cfg).await?)),
         #[cfg(feature = "websocket")]
@@ -831,17 +948,44 @@ async fn create_base_consumer(
         EndpointType::Sled(cfg) => Ok(boxed(sled::SledConsumer::new(cfg)?)),
         #[cfg(feature = "mongodb")]
         EndpointType::MongoDb(cfg) => {
+            use crate::models::MongoConsume;
             let mut config = cfg.clone();
             if config.collection.is_none() {
                 config.collection = Some(route_name.to_string());
             }
-            if config.change_stream {
-                if config.ttl_seconds.is_none() {
-                    config.ttl_seconds = Some(86400); // Remove events by default after 24 hours
+            match config.resolved_consume() {
+                MongoConsume::Consumer => {
+                    // Durable queue drain (auto-uses a change stream when available, else polls).
+                    Ok(boxed(mongodb::MongoDbConsumer::new(&config).await?))
                 }
-                Ok(boxed(mongodb::MongoDbSubscriber::new(&config).await?))
-            } else {
-                Ok(boxed(mongodb::MongoDbConsumer::new(&config).await?))
+                MongoConsume::Subscriber => {
+                    if config.ttl_seconds.is_none() {
+                        config.ttl_seconds = Some(86400); // Remove events by default after 24 hours
+                    }
+                    Ok(boxed(mongodb::MongoDbSubscriber::new(&config).await?))
+                }
+                MongoConsume::CaptureNew => {
+                    // Watch an existing collection for changes from now on (needs a replica set;
+                    // otherwise the change-stream open returns a clear error).
+                    Ok(boxed(
+                        mongodb::MongoDbChangeStreamReader::new(&config, false).await?,
+                    ))
+                }
+                MongoConsume::CaptureAll => {
+                    // Read existing documents first, then capture changes. Prefer a change stream
+                    // (captures updates/deletes); on a standalone server change streams are
+                    // unavailable, so fall back to a non-destructive `_id` read (inserts only).
+                    match mongodb::MongoDbChangeStreamReader::new(&config, true).await {
+                        Ok(reader) => Ok(boxed(reader)),
+                        // Only fall back for the "change streams need a replica set" error (40573);
+                        // auth/network/config and other startup errors propagate untouched.
+                        Err(e) if mongodb::is_change_stream_unsupported(&e) => {
+                            tracing::warn!(error = %e, "MongoDB change streams unavailable (needs a replica set); 'capture_all' falling back to an insert-only read");
+                            Ok(boxed(mongodb::MongoDbIdReader::new(&config).await?))
+                        }
+                        Err(e) => Err(e),
+                    }
+                }
             }
         }
         EndpointType::Custom { name, config } => {
@@ -1125,6 +1269,19 @@ fn check_publisher_recursive(
             }
             Ok(warnings)
         }
+        #[cfg(feature = "clickhouse")]
+        EndpointType::ClickHouse(cfg) => {
+            if cfg.cursor_column.is_some() {
+                warnings.push("Endpoint 'clickhouse' is used as a publisher, but 'cursor_column' is a consumer-only option and will be ignored.".to_string());
+            }
+            if cfg.checkpoint_store.is_some() {
+                warnings.push("Endpoint 'clickhouse' is used as a publisher, but 'checkpoint_store' is a consumer-only option and will be ignored.".to_string());
+            }
+            if cfg.polling_interval_ms.is_some() {
+                warnings.push("Endpoint 'clickhouse' is used as a publisher, but 'polling_interval_ms' is a consumer-only option and will be ignored.".to_string());
+            }
+            Ok(warnings)
+        }
         #[cfg(any(feature = "ibm-mq-static", feature = "ibm-mq"))]
         EndpointType::IbmMq(cfg) => {
             if cfg.wait_timeout_ms != 1000 {
@@ -1400,6 +1557,11 @@ async fn create_base_publisher(
         #[cfg(feature = "sqlx")]
         EndpointType::Sqlx(cfg) => {
             Ok(Box::new(sqlx::SqlxPublisher::new(cfg).await?) as Box<dyn MessagePublisher>)
+        }
+        #[cfg(feature = "clickhouse")]
+        EndpointType::ClickHouse(cfg) => {
+            Ok(Box::new(clickhouse::ClickHousePublisher::new(cfg).await?)
+                as Box<dyn MessagePublisher>)
         }
         #[cfg(feature = "http")]
         EndpointType::Http(cfg) => {

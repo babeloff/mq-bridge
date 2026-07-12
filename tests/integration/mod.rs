@@ -2,6 +2,8 @@
 pub mod amqp;
 #[cfg(feature = "aws")]
 pub mod aws;
+#[cfg(feature = "clickhouse")]
+pub mod clickhouse;
 #[cfg(feature = "grpc")]
 pub mod grpc;
 #[cfg(feature = "http")]
@@ -28,6 +30,8 @@ pub mod mysql;
 pub mod nats;
 #[cfg(feature = "sqlx")]
 pub mod postgres;
+#[cfg(all(feature = "postgres-cdc", feature = "test-utils"))]
+pub mod postgres_cdc;
 #[cfg(feature = "redis-streams")]
 pub mod redis_streams;
 #[cfg(feature = "sqlx")]

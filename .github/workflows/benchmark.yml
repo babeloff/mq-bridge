@@ -179,6 +179,11 @@ jobs:
     name: Collect Benchmark Results
     needs: [benchmark-streams, benchmark-database, benchmark-dockerless]
     runs-on: ubuntu-latest
+    # Serialize gh-pages pushes so overlapping runs don't race the Pages build
+    # (concurrent pushes make GitHub cancel the superseded deployment -> "failed").
+    concurrency:
+      group: gh-pages-publish
+      cancel-in-progress: false
     permissions:
       contents: write
       deployments: write
@@ -248,7 +253,24 @@ jobs:
           tool: 'cargo'
           output-file-path: output.txt
           github-token: ${{ secrets.GITHUB_TOKEN }}
+          # Push on both main and dev so dev commits appear in the benchmark graph.
+          # This mints a gh-pages deployment per run; the next step prunes old ones.
           auto-push: true
           alert-threshold: '40000%'
           comment-on-alert: true
           fail-on-alert: false
+
+      # Keep only the most recent gh-pages deployments so the environment's
+      # deployment list doesn't grow unbounded (one is minted per push above).
+      - name: Prune old gh-pages deployments
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          KEEP: 20
+        run: |
+          gh api "repos/${{ github.repository }}/deployments?environment=github-pages&per_page=100" --paginate -q '.[].id' \
+            | tail -n +$((KEEP + 1)) \
+            | while read -r id; do
+                gh api -X POST "repos/${{ github.repository }}/deployments/$id/statuses" -f state=inactive >/dev/null 2>&1 \
+                  || echo "::warning::failed to mark deployment $id inactive; attempting delete anyway"
+                gh api -X DELETE "repos/${{ github.repository }}/deployments/$id" >/dev/null 2>&1 && echo "pruned $id"
+              done

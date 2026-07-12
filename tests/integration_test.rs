@@ -283,6 +283,59 @@ async fn test_all_status() {
             integration::aws::test_aws_status().await;
         }
     }
+
+    #[cfg(feature = "clickhouse")]
+    {
+        if should_run("clickhouse") {
+            println!("\n\n>>> Starting ClickHouse Status Test...");
+            integration::clickhouse::test_clickhouse_status().await;
+        }
+    }
+}
+
+#[cfg(feature = "sqlx")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires docker compose"]
+async fn test_sqlx_multicolumn() {
+    if should_run("sqlx") || should_run("postgres") {
+        integration::postgres::test_postgres_multicolumn().await;
+    }
+}
+
+#[cfg(feature = "sqlx")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires docker compose"]
+async fn test_sqlx_cursor_timestamptz_to_json() {
+    if should_run("sqlx") || should_run("postgres") {
+        integration::postgres::test_postgres_cursor_timestamptz_to_json().await;
+    }
+}
+
+#[cfg(feature = "clickhouse")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires docker compose"]
+async fn test_clickhouse() {
+    if should_run("clickhouse") {
+        integration::clickhouse::test_clickhouse_roundtrip().await;
+    }
+}
+
+#[cfg(all(feature = "postgres-cdc", feature = "test-utils"))]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires docker compose (postgres with wal_level=logical)"]
+async fn test_postgres_cdc() {
+    if should_run("postgres_cdc") || should_run("postgres") {
+        integration::postgres_cdc::test_postgres_cdc_pipeline().await;
+    }
+}
+
+#[cfg(all(feature = "postgres-cdc", feature = "test-utils"))]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires docker compose (postgres with wal_level=logical)"]
+async fn test_postgres_cdc_restart() {
+    if should_run("postgres_cdc") || should_run("postgres") {
+        integration::postgres_cdc::test_postgres_cdc_restart_safety().await;
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]

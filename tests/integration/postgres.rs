@@ -134,6 +134,180 @@ pub async fn test_postgres_performance_direct() {
     .await;
 }
 
+pub async fn test_postgres_multicolumn() {
+    use mq_bridge::traits::MessagePublisher;
+    use mq_bridge::CanonicalMessage;
+    use sqlx::{AnyPool, Row};
+
+    setup_logging();
+    run_test_with_docker(DOCKER_COMPOSE_FILE, || async {
+        sqlx::any::install_default_drivers();
+        let pool = AnyPool::connect(DATABASE_URL).await.unwrap();
+        sqlx::query("DROP TABLE IF EXISTS orders")
+            .execute(&pool)
+            .await
+            .unwrap();
+        // Typed columns: string-binding everything would fail on `qty INTEGER` / `price DOUBLE PRECISION`.
+        sqlx::query(
+            "CREATE TABLE orders (sku TEXT, qty INTEGER, price DOUBLE PRECISION, cust TEXT)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let config = mq_bridge::models::SqlxConfig {
+            url: DATABASE_URL.to_string(),
+            table: "orders".to_string(),
+            insert_query: Some(
+                "INSERT INTO orders (sku, qty, price, cust) VALUES (${payload:sku}, ${payload:qty}, ${payload:price}, ${metadata:cust})"
+                    .to_string(),
+            ),
+            ..Default::default()
+        };
+        let publisher = SqlxPublisher::new(&config).await.unwrap();
+
+        let mut msg =
+            CanonicalMessage::new(br#"{"sku":"abc","qty":7,"price":1.5}"#.to_vec(), None);
+        msg.metadata.insert("cust".to_string(), "c1".to_string());
+        publisher.send(msg).await.unwrap();
+
+        // Batch of 2 with typed columns and per-row metadata.
+        let mut batch = Vec::new();
+        for i in 0..2 {
+            let mut m = CanonicalMessage::new(
+                format!(r#"{{"sku":"s{i}","qty":{},"price":{}}}"#, i * 10, i as f64 + 0.5)
+                    .into_bytes(),
+                None,
+            );
+            m.metadata.insert("cust".to_string(), format!("b{i}"));
+            batch.push(m);
+        }
+        publisher.send_batch(batch).await.unwrap();
+
+        let row = sqlx::query("SELECT sku, qty, price, cust FROM orders WHERE sku = 'abc'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let sku: String = row.get("sku");
+        let qty: i32 = row.get("qty");
+        let price: f64 = row.get("price");
+        let cust: String = row.get("cust");
+        assert_eq!(sku, "abc");
+        assert_eq!(qty, 7);
+        assert_eq!(price, 1.5);
+        assert_eq!(cust, "c1");
+
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM orders")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 3, "1 single + 2 batch rows expected");
+
+        println!("[Postgres] Multi-column typed insert test successful.");
+    })
+    .await;
+}
+
+/// Regression: a source table with a `TIMESTAMPTZ` column (plus other types the sqlx `Any`
+/// driver cannot map: `NUMERIC`, `TEXT[]`) must be readable by the cursor reader instead of
+/// failing every read forever. Reads 7 columns and writes the rows to a JSON file.
+pub async fn test_postgres_cursor_timestamptz_to_json() {
+    use mq_bridge::traits::MessageConsumer;
+    use sqlx::AnyPool;
+
+    setup_logging();
+    run_test_with_docker(DOCKER_COMPOSE_FILE, || async {
+        sqlx::any::install_default_drivers();
+        let pool = AnyPool::connect(DATABASE_URL).await.unwrap();
+        sqlx::query("DROP TABLE IF EXISTS events")
+            .execute(&pool)
+            .await
+            .unwrap();
+        // 7 columns; created_at/amount/tags are types the `Any` driver cannot decode directly.
+        sqlx::query(
+            "CREATE TABLE events (\
+                id BIGINT PRIMARY KEY, \
+                name TEXT, \
+                amount NUMERIC(10,2), \
+                active BOOLEAN, \
+                ratio DOUBLE PRECISION, \
+                tags TEXT[], \
+                created_at TIMESTAMPTZ)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        // Insert via literal SQL: binding NUMERIC/TIMESTAMPTZ/arrays through `Any` is itself
+        // unsupported, so the values live in the statement text.
+        for i in 1..=3 {
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "INSERT INTO events VALUES ({i}, 'row{i}', {i}.50, true, {i}.25, \
+                 ARRAY['a','b'], TIMESTAMPTZ '2024-01-0{i} 12:00:00+00')"
+            )))
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let config = mq_bridge::models::SqlxConfig {
+            url: DATABASE_URL.to_string(),
+            table: "events".to_string(),
+            cursor_column: Some("id".to_string()),
+            cursor_id: Some("ts-json".to_string()),
+            ..Default::default()
+        };
+
+        let mut reader = mq_bridge::endpoints::sqlx::SqlxCursorReader::new(&config)
+            .await
+            .unwrap();
+        let batch = reader.receive_batch(10).await.unwrap();
+        assert_eq!(batch.messages.len(), 3, "all 3 rows must be read");
+
+        let rows: Vec<serde_json::Value> = batch
+            .messages
+            .iter()
+            .map(|m| serde_json::from_slice(&m.payload).unwrap())
+            .collect();
+
+        // The timestamptz column must be present as a (cast-to-text) string, not null.
+        let created = rows[0].get("created_at").and_then(|v| v.as_str());
+        assert!(
+            created.is_some_and(|s| s.starts_with("2024-01-01")),
+            "created_at should be an RFC-ish string, got {:?}",
+            rows[0].get("created_at")
+        );
+        // NUMERIC and TEXT[] also arrive as strings; native types keep their JSON types.
+        assert!(
+            rows[0].get("amount").unwrap().is_string(),
+            "numeric -> string"
+        );
+        assert!(rows[0].get("tags").unwrap().is_string(), "array -> string");
+        assert!(rows[0].get("id").unwrap().is_i64(), "bigint stays numeric");
+        assert!(
+            rows[0].get("active").unwrap().is_boolean(),
+            "bool stays bool"
+        );
+
+        // Write the read rows out to a JSON file, mirroring `copy --from postgres ... --to file`.
+        let out_path = std::env::temp_dir().join(format!("mqb_events_{}.json", std::process::id()));
+        std::fs::write(&out_path, serde_json::to_vec_pretty(&rows).unwrap()).unwrap();
+        let reread: Vec<serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(&out_path).unwrap()).unwrap();
+        assert_eq!(reread.len(), 3);
+        let _ = std::fs::remove_file(&out_path);
+
+        (batch.commit)(vec![mq_bridge::traits::MessageDisposition::Ack; 3])
+            .await
+            .unwrap();
+
+        println!(
+            "[Postgres] timestamptz cursor -> JSON test successful ({} rows written to file).",
+            reread.len()
+        );
+    })
+    .await;
+}
+
 pub async fn test_postgres_status() {
     use mq_bridge::traits::{MessageConsumer, MessagePublisher};
     use tokio::time::{sleep, Duration};

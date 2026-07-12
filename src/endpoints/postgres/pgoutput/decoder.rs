@@ -1,0 +1,772 @@
+//! pgoutput wire-format decoder — turns raw bytes into `Message` values.
+//!
+//! Ported from faucet-stream (crates/source/postgres-cdc/src/pgoutput,
+//! © the faucet-stream authors, dual-licensed Apache-2.0 OR MIT) and adapted
+//! to mq-bridge's `anyhow` error type. See
+//! <https://github.com/PawanSikawat/faucet-stream>.
+
+use super::messages::*;
+use anyhow::anyhow;
+use byteorder::{BigEndian, ReadBytesExt};
+use std::io::{Cursor, Read};
+
+/// XLogData envelope header that precedes every pgoutput payload coming over
+/// the COPY BOTH stream (after the leading `'w'` byte stripped by the caller).
+///
+/// `pgwire-replication` strips this framing itself and hands us the pgoutput
+/// payload directly, so this decoder is unused on that path; it is retained
+/// (with its fixture tests) to keep the port a complete pgoutput decoder.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct XLogDataHeader {
+    pub wal_start: u64,
+    pub wal_end: u64,
+    pub server_ts: i64,
+}
+
+#[allow(dead_code)] // retained for a complete pgoutput port; pgwire strips this framing
+impl XLogDataHeader {
+    pub const SIZE: usize = 24;
+
+    /// Decode the 24-byte header. Caller has already stripped the leading
+    /// `'w'` discriminator byte from the CopyData payload.
+    pub fn decode(buf: &[u8]) -> anyhow::Result<Self> {
+        if buf.len() < Self::SIZE {
+            return Err(anyhow!(
+                "pgoutput: XLogData header truncated ({} < {})",
+                buf.len(),
+                Self::SIZE
+            ));
+        }
+        let mut c = Cursor::new(buf);
+        Ok(Self {
+            wal_start: c.read_u64::<BigEndian>().map_err(io_err)?,
+            wal_end: c.read_u64::<BigEndian>().map_err(io_err)?,
+            server_ts: c.read_i64::<BigEndian>().map_err(io_err)?,
+        })
+    }
+}
+
+/// PrimaryKeepAlive message (CopyData discriminator `'k'`).
+///
+/// Handled internally by `pgwire-replication`; retained for a complete port.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PrimaryKeepAlive {
+    pub wal_end: u64,
+    pub server_ts: i64,
+    pub reply_requested: bool,
+}
+
+#[allow(dead_code)] // retained for a complete pgoutput port; pgwire handles keepalives
+impl PrimaryKeepAlive {
+    pub const SIZE: usize = 17;
+
+    pub fn decode(buf: &[u8]) -> anyhow::Result<Self> {
+        if buf.len() < Self::SIZE {
+            return Err(anyhow!(
+                "pgoutput: PrimaryKeepAlive truncated ({} < {})",
+                buf.len(),
+                Self::SIZE
+            ));
+        }
+        let mut c = Cursor::new(buf);
+        Ok(Self {
+            wal_end: c.read_u64::<BigEndian>().map_err(io_err)?,
+            server_ts: c.read_i64::<BigEndian>().map_err(io_err)?,
+            reply_requested: c.read_u8().map_err(io_err)? != 0,
+        })
+    }
+}
+
+/// Decode a single pgoutput message from the start of `buf`.
+///
+/// The caller has already stripped the XLogData header. The first byte is
+/// the message kind discriminator.
+pub fn decode_message(buf: &[u8]) -> anyhow::Result<Message> {
+    let mut c = Cursor::new(buf);
+    let kind = MessageKind::from_byte(c.read_u8().map_err(io_err_in("kind byte"))?)?;
+    Ok(match kind {
+        MessageKind::Begin => Message::Begin(decode_begin(&mut c)?),
+        MessageKind::Commit => Message::Commit(decode_commit(&mut c)?),
+        MessageKind::Origin => Message::Origin,
+        MessageKind::Relation => Message::Relation(decode_relation(&mut c)?),
+        MessageKind::Type => Message::Type,
+        MessageKind::Insert => Message::Insert(decode_insert(&mut c)?),
+        MessageKind::Update => Message::Update(decode_update(&mut c)?),
+        MessageKind::Delete => Message::Delete(decode_delete(&mut c)?),
+        MessageKind::Truncate => Message::Truncate(decode_truncate(&mut c)?),
+    })
+}
+
+fn decode_begin(c: &mut Cursor<&[u8]>) -> anyhow::Result<Begin> {
+    Ok(Begin {
+        final_lsn: c.read_u64::<BigEndian>().map_err(io_err_in("BEGIN"))?,
+        commit_ts: c.read_i64::<BigEndian>().map_err(io_err_in("BEGIN"))?,
+        xid: c.read_u32::<BigEndian>().map_err(io_err_in("BEGIN"))?,
+    })
+}
+
+fn decode_commit(c: &mut Cursor<&[u8]>) -> anyhow::Result<Commit> {
+    Ok(Commit {
+        flags: c.read_u8().map_err(io_err_in("COMMIT"))?,
+        commit_lsn: c.read_u64::<BigEndian>().map_err(io_err_in("COMMIT"))?,
+        end_lsn: c.read_u64::<BigEndian>().map_err(io_err_in("COMMIT"))?,
+        commit_ts: c.read_i64::<BigEndian>().map_err(io_err_in("COMMIT"))?,
+    })
+}
+
+fn decode_relation(c: &mut Cursor<&[u8]>) -> anyhow::Result<Relation> {
+    let oid = c.read_u32::<BigEndian>().map_err(io_err_in("RELATION"))?;
+    let namespace = read_cstring(c)?;
+    let name = read_cstring(c)?;
+    let replica_identity = ReplicaIdentity::from_byte(c.read_u8().map_err(io_err_in("RELATION"))?)?;
+    let n_columns = c.read_u16::<BigEndian>().map_err(io_err_in("RELATION"))?;
+    let mut columns = Vec::with_capacity(n_columns as usize);
+    for _ in 0..n_columns {
+        columns.push(ColumnDesc {
+            flags: c.read_u8().map_err(io_err_in("RELATION"))?,
+            name: read_cstring(c)?,
+            type_oid: c.read_u32::<BigEndian>().map_err(io_err_in("RELATION"))?,
+            type_modifier: c.read_i32::<BigEndian>().map_err(io_err_in("RELATION"))?,
+        });
+    }
+    Ok(Relation {
+        oid,
+        namespace,
+        name,
+        replica_identity,
+        columns,
+    })
+}
+
+fn decode_insert(c: &mut Cursor<&[u8]>) -> anyhow::Result<Insert> {
+    let relation_oid = c.read_u32::<BigEndian>().map_err(io_err_in("INSERT"))?;
+    let tag = c.read_u8().map_err(io_err_in("INSERT"))?;
+    if tag != b'N' {
+        return Err(anyhow!(
+            "pgoutput INSERT: expected 'N' tuple tag, got {:?}",
+            tag as char
+        ));
+    }
+    Ok(Insert {
+        relation_oid,
+        new: decode_tuple(c)?,
+    })
+}
+
+fn decode_update(c: &mut Cursor<&[u8]>) -> anyhow::Result<Update> {
+    let relation_oid = c.read_u32::<BigEndian>().map_err(io_err_in("UPDATE"))?;
+    let first = c.read_u8().map_err(io_err_in("UPDATE"))?;
+    let (old_kind, old) = match first {
+        b'K' => (UpdateOldKind::Key, Some(decode_tuple(c)?)),
+        b'O' => (UpdateOldKind::Full, Some(decode_tuple(c)?)),
+        b'N' => {
+            // No old tuple; the byte we just read is already the N tag, so
+            // decode the new tuple directly without re-reading.
+            return Ok(Update {
+                relation_oid,
+                old_kind: UpdateOldKind::None,
+                old: None,
+                new: decode_tuple(c)?,
+            });
+        }
+        other => {
+            return Err(anyhow!(
+                "pgoutput UPDATE: invalid first tag byte {:?} (0x{other:02X}), \
+                 expected 'K', 'O', or 'N'",
+                other as char
+            ));
+        }
+    };
+    // After K or O old-tuple, the next byte must be 'N' for the new tuple.
+    let n_tag = c.read_u8().map_err(io_err_in("UPDATE"))?;
+    if n_tag != b'N' {
+        return Err(anyhow!(
+            "pgoutput UPDATE: expected 'N' new-tuple tag after old tuple, got {:?}",
+            n_tag as char
+        ));
+    }
+    Ok(Update {
+        relation_oid,
+        old_kind,
+        old,
+        new: decode_tuple(c)?,
+    })
+}
+
+fn decode_delete(c: &mut Cursor<&[u8]>) -> anyhow::Result<Delete> {
+    let relation_oid = c.read_u32::<BigEndian>().map_err(io_err_in("DELETE"))?;
+    let tag = c.read_u8().map_err(io_err_in("DELETE"))?;
+    let old_kind = match tag {
+        b'K' => DeleteOldKind::Key,
+        b'O' => DeleteOldKind::Full,
+        other => {
+            return Err(anyhow!(
+                "pgoutput DELETE: expected 'K' or 'O' tuple tag, got {:?}",
+                other as char
+            ));
+        }
+    };
+    Ok(Delete {
+        relation_oid,
+        old_kind,
+        old: decode_tuple(c)?,
+    })
+}
+
+fn decode_truncate(c: &mut Cursor<&[u8]>) -> anyhow::Result<Truncate> {
+    let n = c.read_u32::<BigEndian>().map_err(io_err_in("TRUNCATE"))?;
+    let flags = c.read_u8().map_err(io_err_in("TRUNCATE"))?;
+    // Each relation OID is 4 bytes; a wire-controlled `n` can't exceed the
+    // bytes that actually remain. Reject before reserving so a corrupt frame
+    // can't drive a huge pre-allocation.
+    let rem = remaining(c);
+    if (n as usize).saturating_mul(4) > rem {
+        return Err(anyhow!(
+            "pgoutput TRUNCATE: declared relation count {n} exceeds {rem} remaining bytes"
+        ));
+    }
+    let mut oids = Vec::with_capacity(n as usize);
+    for _ in 0..n {
+        oids.push(c.read_u32::<BigEndian>().map_err(io_err_in("TRUNCATE"))?);
+    }
+    Ok(Truncate {
+        relation_oids: oids,
+        cascade: flags & 0b01 != 0,
+        restart_identity: flags & 0b10 != 0,
+    })
+}
+
+fn decode_tuple(c: &mut Cursor<&[u8]>) -> anyhow::Result<TupleData> {
+    let n = c.read_u16::<BigEndian>().map_err(io_err_in("tuple"))?;
+    let mut cells = Vec::with_capacity(n as usize);
+    for _ in 0..n {
+        let kind = c.read_u8().map_err(io_err_in("tuple"))?;
+        cells.push(match kind {
+            b'n' => TupleCell::Null,
+            b'u' => TupleCell::UnchangedToast,
+            b't' => {
+                let len = c.read_u32::<BigEndian>().map_err(io_err_in("tuple"))?;
+                // Reject a wire-controlled length larger than the bytes that
+                // remain before allocating a buffer for it.
+                let rem = remaining(c);
+                if len as usize > rem {
+                    return Err(anyhow!(
+                        "pgoutput tuple: declared text length {len} exceeds {rem} remaining bytes"
+                    ));
+                }
+                let mut buf = vec![0u8; len as usize];
+                c.read_exact(&mut buf).map_err(io_err_in("tuple"))?;
+                TupleCell::Text(
+                    String::from_utf8(buf)
+                        .map_err(|e| anyhow!("pgoutput tuple text not UTF-8: {e}"))?,
+                )
+            }
+            b'b' => {
+                return Err(anyhow!(
+                    "pgoutput tuple: binary-mode cells not supported in v1"
+                ));
+            }
+            other => {
+                return Err(anyhow!(
+                    "pgoutput tuple: unknown cell tag {:?}",
+                    other as char
+                ));
+            }
+        });
+    }
+    Ok(TupleData { cells })
+}
+
+fn read_cstring(c: &mut Cursor<&[u8]>) -> anyhow::Result<String> {
+    let mut out = Vec::new();
+    loop {
+        let b = c.read_u8().map_err(io_err_in("cstring"))?;
+        if b == 0 {
+            break;
+        }
+        out.push(b);
+    }
+    String::from_utf8(out).map_err(|e| anyhow!("pgoutput cstring: {e}"))
+}
+
+/// Bytes still unread in the cursor — used to bound wire-controlled
+/// allocations against the data that actually remains.
+fn remaining(c: &Cursor<&[u8]>) -> usize {
+    c.get_ref().len().saturating_sub(c.position() as usize)
+}
+
+#[allow(dead_code)] // used by the retained XLogDataHeader/PrimaryKeepAlive decoders
+fn io_err(e: std::io::Error) -> anyhow::Error {
+    anyhow!("pgoutput decode: {e}")
+}
+
+fn io_err_in(ctx: &'static str) -> impl Fn(std::io::Error) -> anyhow::Error {
+    move |e| anyhow!("pgoutput {ctx}: {e}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Decode a hex-encoded fixture (whitespace ignored).
+    fn hex(s: &str) -> Vec<u8> {
+        let s: String = s.chars().filter(|c| !c.is_whitespace()).collect();
+        hex::decode(s).expect("valid hex")
+    }
+
+    #[test]
+    fn decode_xlogdata_header() {
+        // wal_start=0/16A4F88, wal_end=0/16A4FA0, server_ts=750000000000000
+        let bytes = hex("00 00 00 00 01 6A 4F 88 \
+             00 00 00 00 01 6A 4F A0 \
+             00 02 A4 A6 4A 1B 80 00");
+        let h = XLogDataHeader::decode(&bytes).unwrap();
+        assert_eq!(h.wal_start, 0x0000_0000_016A_4F88);
+        assert_eq!(h.wal_end, 0x0000_0000_016A_4FA0);
+        assert_eq!(h.server_ts, 0x0002_A4A6_4A1B_8000);
+    }
+
+    #[test]
+    fn decode_keepalive() {
+        // wal_end=0/16A4F88, ts=750000000000000, reply_requested=1
+        let bytes = hex("00 00 00 00 01 6A 4F 88 \
+             00 02 A4 A6 4A 1B 80 00 \
+             01");
+        let k = PrimaryKeepAlive::decode(&bytes).unwrap();
+        assert_eq!(k.wal_end, 0x0000_0000_016A_4F88);
+        assert!(k.reply_requested);
+    }
+
+    #[test]
+    fn decode_tuple_rejects_text_length_exceeding_remaining() {
+        // n_cells=1, kind 't', declared text len=1000 (0x3E8), but only 2 bytes
+        // ("AB") follow. The declared length must be rejected against the bytes
+        // actually available *before* allocating a buffer for it.
+        let bytes = hex("00 01 74 00 00 03 E8 41 42");
+        let mut c = Cursor::new(bytes.as_slice());
+        let Err(err) = decode_tuple(&mut c) else {
+            panic!("an oversized declared text length must be rejected");
+        };
+        assert!(err.to_string().contains("exceeds"), "{err}");
+    }
+
+    #[test]
+    fn decode_truncate_rejects_relation_count_exceeding_remaining() {
+        // n=1_000_000 relations declared (4 MB of OIDs), flags=0, but only one
+        // 4-byte OID follows. Must be rejected before reserving for `n`.
+        let bytes = hex("00 0F 42 40 00 00 00 00 2A");
+        let mut c = Cursor::new(bytes.as_slice());
+        let Err(err) = decode_truncate(&mut c) else {
+            panic!("an oversized declared relation count must be rejected");
+        };
+        assert!(err.to_string().contains("exceeds"), "{err}");
+    }
+
+    #[test]
+    fn decode_begin_message() {
+        // 'B', final_lsn=0/16A4FA0, ts=750000000000000, xid=0x4D2
+        let bytes = hex("42 \
+             00 00 00 00 01 6A 4F A0 \
+             00 02 A4 A6 4A 1B 80 00 \
+             00 00 04 D2");
+        match decode_message(&bytes).unwrap() {
+            Message::Begin(b) => {
+                assert_eq!(b.final_lsn, 0x0000_0000_016A_4FA0);
+                assert_eq!(b.xid, 0x4D2);
+            }
+            other => panic!("expected Begin, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_commit_message() {
+        // 'C', flags=0, commit_lsn=0/16A4FA0, end_lsn=0/16A4FB0, ts=750000000000000
+        let bytes = hex("43 00 \
+             00 00 00 00 01 6A 4F A0 \
+             00 00 00 00 01 6A 4F B0 \
+             00 02 A4 A6 4A 1B 80 00");
+        match decode_message(&bytes).unwrap() {
+            Message::Commit(c) => {
+                assert_eq!(c.commit_lsn, 0x0000_0000_016A_4FA0);
+                assert_eq!(c.end_lsn, 0x0000_0000_016A_4FB0);
+            }
+            other => panic!("expected Commit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_relation_message_two_columns() {
+        // 'R', oid=16384, ns="public\0", name="users\0", ri='d', n_cols=2
+        // col1: flags=1, name="id\0", type_oid=23 (int4), modifier=-1
+        // col2: flags=0, name="name\0", type_oid=25 (text), modifier=-1
+        let bytes = hex("52 \
+             00 00 40 00 \
+             70 75 62 6C 69 63 00 \
+             75 73 65 72 73 00 \
+             64 \
+             00 02 \
+             01 69 64 00 00 00 00 17 FF FF FF FF \
+             00 6E 61 6D 65 00 00 00 00 19 FF FF FF FF");
+        match decode_message(&bytes).unwrap() {
+            Message::Relation(r) => {
+                assert_eq!(r.oid, 16384);
+                assert_eq!(r.namespace, "public");
+                assert_eq!(r.name, "users");
+                assert_eq!(r.replica_identity, ReplicaIdentity::Default);
+                assert_eq!(r.columns.len(), 2);
+                assert_eq!(r.columns[0].name, "id");
+                assert_eq!(r.columns[0].type_oid, 23);
+                assert_eq!(r.columns[0].flags & 1, 1);
+                assert_eq!(r.columns[1].name, "name");
+                assert_eq!(r.columns[1].type_oid, 25);
+            }
+            other => panic!("expected Relation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_insert_two_text_cells() {
+        // 'I', relation=16384, 'N', n=2, ('t', len=1, "1"), ('t', len=5, "alice")
+        let bytes = hex("49 \
+             00 00 40 00 \
+             4E \
+             00 02 \
+             74 00 00 00 01 31 \
+             74 00 00 00 05 61 6C 69 63 65");
+        match decode_message(&bytes).unwrap() {
+            Message::Insert(i) => {
+                assert_eq!(i.relation_oid, 16384);
+                assert_eq!(i.new.cells.len(), 2);
+                assert_eq!(i.new.cells[0], TupleCell::Text("1".into()));
+                assert_eq!(i.new.cells[1], TupleCell::Text("alice".into()));
+            }
+            other => panic!("expected Insert, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_insert_with_null_and_toast() {
+        // 'I', relation=16384, 'N', n=3, ('t',1,"1"), ('n'), ('u')
+        let bytes = hex("49 \
+             00 00 40 00 \
+             4E \
+             00 03 \
+             74 00 00 00 01 31 \
+             6E \
+             75");
+        match decode_message(&bytes).unwrap() {
+            Message::Insert(i) => {
+                assert_eq!(i.new.cells[1], TupleCell::Null);
+                assert_eq!(i.new.cells[2], TupleCell::UnchangedToast);
+            }
+            other => panic!("expected Insert, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_update_with_key_old() {
+        // 'U', relation=16384, 'K', old{1 cell, t,1,"1"}, 'N', new{2, t,1,"1", t,3,"bob"}
+        let bytes = hex("55 \
+             00 00 40 00 \
+             4B \
+             00 01 74 00 00 00 01 31 \
+             4E \
+             00 02 74 00 00 00 01 31 74 00 00 00 03 62 6F 62");
+        match decode_message(&bytes).unwrap() {
+            Message::Update(u) => {
+                assert_eq!(u.old_kind, UpdateOldKind::Key);
+                assert_eq!(u.old.unwrap().cells, vec![TupleCell::Text("1".into())]);
+                assert_eq!(u.new.cells[1], TupleCell::Text("bob".into()));
+            }
+            other => panic!("expected Update, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_delete_key_only() {
+        // 'D', relation=16384, 'K', old{1, t,1,"1"}
+        let bytes = hex("44 \
+             00 00 40 00 \
+             4B \
+             00 01 74 00 00 00 01 31");
+        match decode_message(&bytes).unwrap() {
+            Message::Delete(d) => {
+                assert_eq!(d.old_kind, DeleteOldKind::Key);
+                assert_eq!(d.old.cells.len(), 1);
+            }
+            other => panic!("expected Delete, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_truncate_two_relations_cascade() {
+        // 'T', n=2, flags=0b01 (cascade), oid=16384, oid=16385
+        let bytes = hex("54 \
+             00 00 00 02 \
+             01 \
+             00 00 40 00 \
+             00 00 40 01");
+        match decode_message(&bytes).unwrap() {
+            Message::Truncate(t) => {
+                assert_eq!(t.relation_oids, vec![16384, 16385]);
+                assert!(t.cascade);
+                assert!(!t.restart_identity);
+            }
+            other => panic!("expected Truncate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_unknown_kind_errors() {
+        let bytes = hex("5A 00 00"); // 'Z'
+        assert!(decode_message(&bytes).is_err());
+    }
+
+    #[test]
+    fn decode_truncated_input_errors() {
+        let bytes = hex("42 00 00"); // 'B' with no body
+        assert!(decode_message(&bytes).is_err());
+    }
+
+    #[test]
+    fn decode_update_no_old_tuple() {
+        // 'U', relation=16384, 'N' (no K/O old), new{2, t,1,"1", t,3,"bob"}
+        let bytes = hex("55 \
+             00 00 40 00 \
+             4E \
+             00 02 74 00 00 00 01 31 74 00 00 00 03 62 6F 62");
+        match decode_message(&bytes).unwrap() {
+            Message::Update(u) => {
+                assert_eq!(u.old_kind, UpdateOldKind::None);
+                assert!(u.old.is_none());
+                assert_eq!(u.new.cells.len(), 2);
+                assert_eq!(u.new.cells[0], TupleCell::Text("1".into()));
+                assert_eq!(u.new.cells[1], TupleCell::Text("bob".into()));
+            }
+            other => panic!("expected Update, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_update_with_full_old_tuple() {
+        // 'U', relation=16384, 'O', old{2, t,1,"1", t,5,"alice"}, 'N', new{2, t,1,"1", t,3,"bob"}
+        let bytes = hex("55 \
+             00 00 40 00 \
+             4F \
+             00 02 74 00 00 00 01 31 74 00 00 00 05 61 6C 69 63 65 \
+             4E \
+             00 02 74 00 00 00 01 31 74 00 00 00 03 62 6F 62");
+        match decode_message(&bytes).unwrap() {
+            Message::Update(u) => {
+                assert_eq!(u.old_kind, UpdateOldKind::Full);
+                let old = u.old.expect("old tuple present");
+                assert_eq!(old.cells.len(), 2);
+                assert_eq!(old.cells[1], TupleCell::Text("alice".into()));
+                assert_eq!(u.new.cells[1], TupleCell::Text("bob".into()));
+            }
+            other => panic!("expected Update, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_truncate_restart_identity_only() {
+        // 'T', n=1, flags=0b10 (restart identity, no cascade), oid=16384
+        let bytes = hex("54 \
+             00 00 00 01 \
+             02 \
+             00 00 40 00");
+        match decode_message(&bytes).unwrap() {
+            Message::Truncate(t) => {
+                assert_eq!(t.relation_oids, vec![16384]);
+                assert!(!t.cascade);
+                assert!(t.restart_identity);
+            }
+            other => panic!("expected Truncate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_insert_empty_text_cell() {
+        // 'I', relation=16384, 'N', n=1, ('t', len=0)
+        let bytes = hex("49 \
+             00 00 40 00 \
+             4E \
+             00 01 \
+             74 00 00 00 00");
+        match decode_message(&bytes).unwrap() {
+            Message::Insert(i) => {
+                assert_eq!(i.new.cells.len(), 1);
+                assert_eq!(i.new.cells[0], TupleCell::Text(String::new()));
+            }
+            other => panic!("expected Insert, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn xlogdata_header_truncated_errors() {
+        // Only 23 bytes — one short of the 24-byte header.
+        let bytes = vec![0u8; XLogDataHeader::SIZE - 1];
+        let Err(err) = XLogDataHeader::decode(&bytes) else {
+            panic!("a header shorter than SIZE must be rejected");
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("XLogData header truncated"), "{msg}");
+        assert!(msg.contains("23 < 24"), "{msg}");
+    }
+
+    #[test]
+    fn keepalive_truncated_errors() {
+        // Only 16 bytes — one short of the 17-byte keepalive.
+        let bytes = vec![0u8; PrimaryKeepAlive::SIZE - 1];
+        let Err(err) = PrimaryKeepAlive::decode(&bytes) else {
+            panic!("a keepalive shorter than SIZE must be rejected");
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("PrimaryKeepAlive truncated"), "{msg}");
+        assert!(msg.contains("16 < 17"), "{msg}");
+    }
+
+    #[test]
+    fn keepalive_no_reply_requested() {
+        // wal_end=0/16A4F88, ts=750000000000000, reply_requested=0
+        let bytes = hex("00 00 00 00 01 6A 4F 88 \
+             00 02 A4 A6 4A 1B 80 00 \
+             00");
+        let k = PrimaryKeepAlive::decode(&bytes).unwrap();
+        assert_eq!(k.wal_end, 0x0000_0000_016A_4F88);
+        assert_eq!(k.server_ts, 0x0002_A4A6_4A1B_8000);
+        assert!(!k.reply_requested);
+    }
+
+    #[test]
+    fn decode_origin_message_ignored() {
+        // 'O' (0x4F) origin message — accepted and mapped to Message::Origin,
+        // the trailing payload bytes are not parsed in v1.
+        let bytes = hex("4F 00 00 00 00 01 6A 4F A0");
+        assert_eq!(decode_message(&bytes).unwrap(), Message::Origin);
+    }
+
+    #[test]
+    fn decode_type_message_ignored() {
+        // 'Y' (0x59) type-registration message — accepted and ignored in v1.
+        let bytes = hex("59 00 00 40 00");
+        assert_eq!(decode_message(&bytes).unwrap(), Message::Type);
+    }
+
+    #[test]
+    fn decode_insert_rejects_non_n_tuple_tag() {
+        // 'I', relation=16384, but the tuple tag is 'K' (0x4B) instead of 'N'.
+        let bytes = hex("49 00 00 40 00 4B");
+        let Err(err) = decode_message(&bytes) else {
+            panic!("INSERT with a non-'N' tuple tag must be rejected");
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("INSERT"), "{msg}");
+        assert!(msg.contains("expected 'N' tuple tag"), "{msg}");
+        assert!(msg.contains("'K'"), "{msg}");
+    }
+
+    #[test]
+    fn decode_update_rejects_invalid_first_tag() {
+        // 'U', relation=16384, first tag 'Z' (0x5A) — not K/O/N.
+        let bytes = hex("55 00 00 40 00 5A");
+        let Err(err) = decode_message(&bytes) else {
+            panic!("UPDATE with an invalid first tag must be rejected");
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("UPDATE"), "{msg}");
+        assert!(msg.contains("invalid first tag byte"), "{msg}");
+        assert!(msg.contains("0x5A"), "{msg}");
+    }
+
+    #[test]
+    fn decode_update_rejects_missing_n_after_old_tuple() {
+        // 'U', relation=16384, 'K', old{1 cell, t,1,"1"}, then 'X' (0x58)
+        // instead of the required 'N' new-tuple tag.
+        let bytes = hex("55 \
+             00 00 40 00 \
+             4B \
+             00 01 74 00 00 00 01 31 \
+             58");
+        let Err(err) = decode_message(&bytes) else {
+            panic!("UPDATE missing the 'N' new-tuple tag must be rejected");
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("UPDATE"), "{msg}");
+        assert!(
+            msg.contains("expected 'N' new-tuple tag after old tuple"),
+            "{msg}"
+        );
+        assert!(msg.contains("'X'"), "{msg}");
+    }
+
+    #[test]
+    fn decode_delete_rejects_invalid_tag() {
+        // 'D', relation=16384, tag 'N' (0x4E) — DELETE only accepts 'K' or 'O'.
+        let bytes = hex("44 00 00 40 00 4E");
+        let Err(err) = decode_message(&bytes) else {
+            panic!("DELETE with a non-K/O tuple tag must be rejected");
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("DELETE"), "{msg}");
+        assert!(msg.contains("expected 'K' or 'O' tuple tag"), "{msg}");
+        assert!(msg.contains("'N'"), "{msg}");
+    }
+
+    #[test]
+    fn decode_delete_full_old_tuple() {
+        // 'D', relation=16384, 'O', old{2, t,1,"1", t,5,"alice"}
+        let bytes = hex("44 \
+             00 00 40 00 \
+             4F \
+             00 02 74 00 00 00 01 31 74 00 00 00 05 61 6C 69 63 65");
+        match decode_message(&bytes).unwrap() {
+            Message::Delete(d) => {
+                assert_eq!(d.old_kind, DeleteOldKind::Full);
+                assert_eq!(d.old.cells.len(), 2);
+                assert_eq!(d.old.cells[1], TupleCell::Text("alice".into()));
+            }
+            other => panic!("expected Delete, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_tuple_rejects_non_utf8_text() {
+        // n_cells=1, kind 't', len=2, bytes 0xFF 0xFE (an invalid UTF-8 pair).
+        let bytes = hex("00 01 74 00 00 00 02 FF FE");
+        let mut c = Cursor::new(bytes.as_slice());
+        let Err(err) = decode_tuple(&mut c) else {
+            panic!("a non-UTF-8 text cell must be rejected");
+        };
+        assert!(err.to_string().contains("not UTF-8"), "{err}");
+    }
+
+    #[test]
+    fn decode_tuple_rejects_binary_mode_cell() {
+        // n_cells=1, kind 'b' (0x62) — binary-mode cells are unsupported in v1.
+        let bytes = hex("00 01 62");
+        let mut c = Cursor::new(bytes.as_slice());
+        let Err(err) = decode_tuple(&mut c) else {
+            panic!("a binary-mode cell must be rejected");
+        };
+        assert!(
+            err.to_string().contains("binary-mode cells not supported"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn decode_tuple_rejects_unknown_cell_tag() {
+        // n_cells=1, kind 'x' (0x78) — not n/u/t/b.
+        let bytes = hex("00 01 78");
+        let mut c = Cursor::new(bytes.as_slice());
+        let Err(err) = decode_tuple(&mut c) else {
+            panic!("an unknown cell tag must be rejected");
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("unknown cell tag"), "{msg}");
+        assert!(msg.contains("'x'"), "{msg}");
+    }
+}

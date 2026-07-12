@@ -36,6 +36,9 @@ pub struct NatsPublisher {
     delayed_ack: bool,
     request_reply: bool,
     request_timeout: std::time::Duration,
+    // If true, publish a `Nats-Msg-Id` header (from the message id) so JetStream
+    // deduplicates redeliveries within the stream's duplicate window.
+    deduplicate: bool,
 }
 
 impl NatsPublisher {
@@ -115,6 +118,7 @@ impl NatsPublisher {
             request_timeout: std::time::Duration::from_millis(
                 config.request_timeout_ms.unwrap_or(30_000),
             ),
+            deduplicate: config.deduplicate,
         })
     }
 }
@@ -144,6 +148,17 @@ impl MessagePublisher for NatsPublisher {
             "mq_bridge.message_id",
             format!("{:032x}", message.message_id).as_str(),
         );
+
+        // Opt-in JetStream deduplication: set Nats-Msg-Id from the message id so the
+        // server drops redeliveries within its duplicate window. Skip if the caller
+        // already supplied an explicit Nats-Msg-Id via metadata. The consumer also
+        // recovers the message id from this header, so it round-trips either way.
+        if self.deduplicate && headers.get("Nats-Msg-Id").is_none() {
+            headers.insert(
+                "Nats-Msg-Id",
+                format!("{:032x}", message.message_id).as_str(),
+            );
+        }
 
         if self.request_reply {
             let response = tokio::time::timeout(

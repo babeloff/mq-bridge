@@ -22,6 +22,7 @@ use core::traits::{Handler, MessageConsumer, MessageDisposition};
 use core::type_handler::TypeHandler;
 use core::{
     CanonicalMessage, Handled, HandlerError, Publisher as CorePublisher, Route as CoreRoute, Sent,
+    SentBatch,
 };
 use mq_bridge_bindings_common as common;
 use pyo3::conversion::IntoPyObjectExt;
@@ -804,6 +805,33 @@ impl Publisher {
             run_sync_task(&runtime, async move {
                 match publisher.send(message).await? {
                     Sent::Ack | Sent::Response(_) => Ok(()),
+                }
+            })
+        })
+        .map_err(to_py_runtime_error)
+    }
+
+    #[pyo3(signature = (messages))]
+    fn send_batch(&self, py: Python<'_>, messages: &Bound<'_, PyAny>) -> PyResult<()> {
+        // Convert each item (Message or bytes) up front, on the Python thread.
+        let mut batch = Vec::new();
+        for item in messages.try_iter()? {
+            batch.push(message_input_to_canonical(&item?, None)?);
+        }
+        let publisher = self.publisher.clone();
+        let runtime = Arc::clone(&self.runtime);
+        py.detach(move || {
+            run_sync_task(&runtime, async move {
+                let count = batch.len();
+                match publisher.send_batch(batch).await? {
+                    SentBatch::Ack => Ok(()),
+                    // A `Partial` with no failures (e.g. request-reply responses) is a full success.
+                    SentBatch::Partial { failed, .. } if failed.is_empty() => Ok(()),
+                    SentBatch::Partial { failed, .. } => Err(anyhow::anyhow!(
+                        "send_batch: {} of {count} message(s) failed to publish. First error: {}",
+                        failed.len(),
+                        failed[0].1
+                    )),
                 }
             })
         })
@@ -2603,6 +2631,38 @@ publishers:
             );
             assert!(response.id.is_some());
         });
+    }
+
+    #[test]
+    fn test_publisher_send_batch_publishes_all() {
+        let path = write_yaml(
+            r#"
+publishers:
+  mem:
+    memory:
+      topic: send_batch_topic
+"#,
+        );
+
+        let publisher = Python::attach(|py| Publisher::from_file(py, &path, Some("mem"))).unwrap();
+        Python::attach(|py| {
+            let msg = Py::new(py, Message::new(b"one".to_vec(), None, None).unwrap()).unwrap();
+            let items = PyList::new(
+                py,
+                [
+                    msg.bind(py).as_any().clone(),
+                    PyBytes::new(py, b"two").into_any(),
+                    PyBytes::new(py, b"three").into_any(),
+                ],
+            )
+            .unwrap();
+            publisher.send_batch(py, items.as_any()).unwrap();
+        });
+
+        let drainer =
+            Python::attach(|py| MemoryDrainer::from_topic(py, "send_batch_topic", 65536)).unwrap();
+        let drained = Python::attach(|py| drainer.drain(py, 3, Some(5.0), 256)).unwrap();
+        assert_eq!(drained, 3);
     }
 
     #[test]
