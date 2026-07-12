@@ -87,15 +87,16 @@ Same source table, same Postgres instance, same machine, both one-shot full-tabl
 
 **~12.1x faster** than Meltano in this scenario. Full setup (including the Meltano project config) is in [mq-bridge-app's `benches/etl/README.md`](https://github.com/marcomq/mq-bridge-app/blob/dev/benches/etl/README.md#5--postgres--jsonl-vs-meltano-tap-postgres--target-jsonl).
 
-### Pending scenarios
+### Validated run — CSV → JSONL vs. Meltano
 
-The three methodology scenarios below have not been run with published numbers yet.
+Same seeded dataset both sides, same machine, one-shot full-file CSV → local JSONL (one JSON object per input row) — mq-bridge-app's `copy` CLI vs. Meltano's `tap-csv` → `target-jsonl`.
 
-| Scenario | Payload | Batch | Concurrency | Backend | Result | Baseline ref |
-| --- | --- | --- | --- | --- | --- | --- |
-| Bulk-insert throughput | 256 B / 4 KiB | 1 / 128 | 1 / 4 | postgres:16 | _TBD rows/s_ | Airbyte records/s |
-| CDC event-to-sink latency | 256 B / 4 KiB | — | 1 / 4 | postgres:16 | _TBD p50/p95/p99_ | Debezium |
-| Batched vs unbatched | 256 B / 4 KiB | 1 vs 128 | 1 / 4 | memory + brokers | _TBD rows/s_ | OpenMessaging Benchmark |
+| Scenario | Payload | Batch | Concurrency | Source → Sink | Result |
+| --- | --- | --- | --- | --- | --- |
+| mq-bridge-app `copy` | 7-col mixed-type, 1,000,000 rows (~116 MiB) | 1024 | 1 | file (CSV) → file (JSONL) | **833,333 rows/s** |
+| Meltano (`tap-csv` → `target-jsonl`) | 7-col mixed-type, 1,000,000 rows | default Singer config | — | file (CSV) → JSONL | ~19,500 rows/s |
+
+**~43x faster** than Meltano in this scenario. Full setup is in [mq-bridge-app's `benches/etl/README.md`](https://github.com/marcomq/mq-bridge-app/blob/dev/benches/etl/README.md#6--csv--jsonl-vs-meltano-faucet-streams-headline-benchmark).
 
 ## Status
 

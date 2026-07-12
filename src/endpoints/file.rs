@@ -37,20 +37,58 @@ fn get_file_lock(path: &str) -> Arc<Mutex<()>> {
         .clone()
 }
 
-fn csv_escape_field(s: &str) -> String {
+/// Appends a CSV-escaped field to `buf` without allocating for the common
+/// (no special characters) case. Hot path for CSV row encoding.
+fn csv_append_field(buf: &mut String, s: &str) {
     if s.contains(',') || s.contains('"') || s.contains('\n') || s.contains('\r') {
-        format!("\"{}\"", s.replace('"', "\"\""))
+        buf.push('"');
+        for ch in s.chars() {
+            if ch == '"' {
+                buf.push('"');
+            }
+            buf.push(ch);
+        }
+        buf.push('"');
     } else {
-        s.to_string()
+        buf.push_str(s);
+    }
+}
+
+/// Appends `s` to `buf` with JSON string escaping (no surrounding quotes).
+/// Fast path pushes the whole slice when it contains no characters needing
+/// an escape. Hot path for decoding CSV rows into JSON objects.
+fn json_append_escaped(buf: &mut String, s: &str) {
+    if !s.bytes().any(|b| b < 0x20 || b == b'"' || b == b'\\') {
+        buf.push_str(s);
+        return;
+    }
+    for c in s.chars() {
+        match c {
+            '"' => buf.push_str("\\\""),
+            '\\' => buf.push_str("\\\\"),
+            '\n' => buf.push_str("\\n"),
+            '\r' => buf.push_str("\\r"),
+            '\t' => buf.push_str("\\t"),
+            '\u{08}' => buf.push_str("\\b"),
+            '\u{0C}' => buf.push_str("\\f"),
+            c if (c as u32) < 0x20 => {
+                use std::fmt::Write;
+                let _ = write!(buf, "\\u{:04x}", c as u32);
+            }
+            c => buf.push(c),
+        }
     }
 }
 
 fn csv_encode_row(fields: &[String]) -> String {
-    fields
-        .iter()
-        .map(|f| csv_escape_field(f))
-        .collect::<Vec<_>>()
-        .join(",")
+    let mut buf = String::new();
+    for (i, f) in fields.iter().enumerate() {
+        if i > 0 {
+            buf.push(',');
+        }
+        csv_append_field(&mut buf, f);
+    }
+    buf
 }
 
 /// Parses a single CSV line into fields. Supports quoted fields with escaped `""`.
@@ -277,7 +315,12 @@ impl MessagePublisher for FilePublisher {
                         Ok(serde_json::Value::Object(obj)) => {
                             let hdr = csv_header_guard.as_mut().expect("csv header lock held");
                             if hdr.is_none() {
-                                let cols: Vec<String> = obj.keys().cloned().collect();
+                                // Sort keys so the column order is deterministic and
+                                // independent of serde_json's map type (BTreeMap vs the
+                                // IndexMap enabled by the `preserve_order` feature, which
+                                // `bson`/mongodb turns on under feature unification).
+                                let mut cols: Vec<String> = obj.keys().cloned().collect();
+                                cols.sort();
                                 if file_is_empty {
                                     let header_line = csv_encode_row(&cols);
                                     if let Err(e) = writer.write_all(header_line.as_bytes()).await {
@@ -294,15 +337,20 @@ impl MessagePublisher for FilePublisher {
                                 **hdr = Some(cols);
                             }
                             let cols = hdr.as_ref().unwrap();
-                            let row: Vec<String> = cols
-                                .iter()
-                                .map(|c| match obj.get(c) {
-                                    Some(serde_json::Value::String(s)) => s.clone(),
-                                    Some(v) => v.to_string(),
-                                    None => String::new(),
-                                })
-                                .collect();
-                            Ok(csv_encode_row(&row).into_bytes())
+                            let mut line = String::new();
+                            for (i, c) in cols.iter().enumerate() {
+                                if i > 0 {
+                                    line.push(',');
+                                }
+                                match obj.get(c) {
+                                    Some(serde_json::Value::String(s)) => {
+                                        csv_append_field(&mut line, s)
+                                    }
+                                    Some(v) => csv_append_field(&mut line, &v.to_string()),
+                                    None => {}
+                                }
+                            }
+                            Ok(line.into_bytes())
                         }
                         _ => Err(serde_json::Error::io(std::io::Error::new(
                             std::io::ErrorKind::InvalidData,
@@ -1288,16 +1336,23 @@ fn parse_message(
                     None
                 }
                 Some(cols) => {
-                    let mut obj = serde_json::Map::new();
+                    // Build the JSON object bytes directly instead of constructing a
+                    // serde_json::Map and re-serializing it. Avoids per-row header
+                    // clones, map allocation/ordering, and a serde serialization pass.
+                    let mut out = String::with_capacity(line.len() + cols.len() * 8 + 2);
+                    out.push('{');
                     for (i, col) in cols.iter().enumerate() {
-                        obj.insert(
-                            col.clone(),
-                            serde_json::Value::String(fields.get(i).cloned().unwrap_or_default()),
-                        );
+                        if i > 0 {
+                            out.push(',');
+                        }
+                        out.push('"');
+                        json_append_escaped(&mut out, col);
+                        out.push_str("\":\"");
+                        json_append_escaped(&mut out, fields.get(i).map_or("", |s| s.as_str()));
+                        out.push('"');
                     }
-                    let payload =
-                        serde_json::to_vec(&serde_json::Value::Object(obj)).unwrap_or_default();
-                    Some(CanonicalMessage::new(payload, None))
+                    out.push('}');
+                    Some(CanonicalMessage::new(out.into_bytes(), None))
                 }
             }
         }
