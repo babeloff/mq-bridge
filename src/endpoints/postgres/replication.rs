@@ -6,6 +6,7 @@
 //! The URL parsing, slot lifecycle, and TLS mapping follow the approach in
 //! faucet-stream (crates/source/postgres-cdc/src/replication.rs, dual
 //! Apache-2.0 OR MIT), adapted to mq-bridge's config and error types.
+//! Pinned upstream commit and per-file changes: `./VENDORED.md`.
 
 use crate::endpoints::postgres::state::format_lsn;
 use crate::models::PostgresCdcConfig;
