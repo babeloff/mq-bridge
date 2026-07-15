@@ -222,6 +222,22 @@ fn check_fault_middleware_allowed(
     Ok(())
 }
 
+/// How many messages a runner may process before it must cooperatively yield.
+///
+/// The route loops drive `async-channel` recv/send, which complete synchronously
+/// on a hot in-memory pipeline and don't count against tokio's cooperative
+/// budget. Without an explicit yield a busy route can starve other tasks (other
+/// routes, the drain side, shutdown) — but yielding every batch costs a full
+/// scheduler round-trip per iteration, which dominates throughput at small batch
+/// sizes. Amortizing the yield over this many processed messages keeps the time
+/// between yields bounded while making the cost negligible.
+///
+/// Set to 128 to match tokio's automatic cooperative-scheduling budget, so this
+/// manual yield fires at the same cadence tokio uses for its own resources. Only
+/// affects `batch_size` smaller than this (larger batches already exceed it in a
+/// single iteration and yield once per batch regardless).
+const YIELD_EVERY_MSGS: usize = 128;
+
 async fn pause_after_empty_batch(delay_ms: u64) {
     if delay_ms > 0 {
         tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
@@ -817,6 +833,8 @@ impl Route {
         let mut batch_scratch = BatchScratch::with_capacity(self.options.batch_size);
         // Check if retry middleware is present on output
         let has_retry_middleware = self.output.has_retry_middleware();
+        // Messages processed since the last cooperative yield (see YIELD_EVERY_MSGS).
+        let mut since_yield = 0usize;
         let run_result = loop {
             select! {
                 Ok(err) = err_rx.recv() => break Err(err),
@@ -856,6 +874,7 @@ impl Route {
                     // Process the batch sequentially without spawning a new task
                     let seq = seq_counter;
                     seq_counter += 1;
+                    let batch_len = received_batch.messages.len();
                     let commit = commit_router.wrap(received_batch.commit, seq);
                     if let Err(err) = send_batch_and_commit(
                         &publisher,
@@ -872,7 +891,13 @@ impl Route {
                         break Err(err);
                     }
 
-                    tokio::task::yield_now().await;
+                    // Cooperatively yield, amortized over messages processed so a
+                    // hot loop can't starve other tasks (see YIELD_EVERY_MSGS).
+                    since_yield += batch_len;
+                    if since_yield >= YIELD_EVERY_MSGS {
+                        since_yield = 0;
+                        tokio::task::yield_now().await;
+                    }
                 }
             }
         };
@@ -950,7 +975,9 @@ impl Route {
             join_set.spawn(async move {
                 debug!("Starting worker {}", i);
                 let mut batch_scratch = BatchScratch::with_capacity(batch_size);
+                let mut since_yield = 0usize;
                 while let Ok((messages, commit_func)) = work_rx_clone.recv().await {
+                    let batch_len = messages.len();
                     if let Err(err) = send_batch_and_commit(
                         &publisher,
                         messages,
@@ -967,7 +994,12 @@ impl Route {
                         report_route_error(&err_tx, err, "Could not send error to main task");
                         break;
                     }
-                    tokio::task::yield_now().await;
+                    // Amortized cooperative yield (see YIELD_EVERY_MSGS).
+                    since_yield += batch_len;
+                    if since_yield >= YIELD_EVERY_MSGS {
+                        since_yield = 0;
+                        tokio::task::yield_now().await;
+                    }
                 }
                 // Wait for all in-flight commits to complete
                 while commit_tasks.join_next().await.is_some() {}
@@ -975,6 +1007,8 @@ impl Route {
         }
 
         let mut seq_counter = 0u64;
+        // Messages enqueued to workers since the last cooperative yield (see YIELD_EVERY_MSGS).
+        let mut since_yield = 0usize;
         // Holds an error that caused the loop to break, to be returned after graceful shutdown.
         let mut loop_error: Option<anyhow::Error> = None;
         // Set when the loop breaks because the source drained with exit_on_empty,
@@ -1045,6 +1079,7 @@ impl Route {
                     // the work item to avoid creating sequence gaps if the work channel
                     // is closed while producing batches.
                     let seq = seq_counter;
+                    let batch_len = messages.len();
                     let wrapped_commit = commit_router.wrap(commit, seq);
 
                     match work_tx.send((messages, wrapped_commit)).await {
@@ -1061,7 +1096,12 @@ impl Route {
                         }
                     }
 
-                    tokio::task::yield_now().await;
+                    // Amortized cooperative yield (see YIELD_EVERY_MSGS).
+                    since_yield += batch_len;
+                    if since_yield >= YIELD_EVERY_MSGS {
+                        since_yield = 0;
+                        tokio::task::yield_now().await;
+                    }
                 }
             }
         }
