@@ -960,19 +960,40 @@ impl Default for CookieJarMiddleware {
 
 /// Weak Join middleware configuration.
 ///
-/// Groups and correlates messages based on a metadata key, waiting for a specified number
-/// of messages within a timeout window before processing them as a batch.
-/// Messages that exceed the timeout are processed individually.
+/// Correlates messages by a metadata key and joins them within a timeout window.
+/// Count mode (default) waits for `expected_count` messages and emits a JSON array.
+/// Branch mode (set `branch_by`) waits for named branches and emits a branch-keyed object.
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct WeakJoinMiddleware {
     /// The metadata key to group messages by (e.g., "correlation_id").
     pub group_by: String,
-    /// The number of messages to wait for.
+    /// The number of messages (count mode) or distinct branches (branch mode) to wait for.
     pub expected_count: usize,
     /// Timeout in milliseconds.
     pub timeout_ms: u64,
+    /// Metadata key naming each message's branch; enables branch mode when set.
+    #[serde(default)]
+    pub branch_by: Option<String>,
+    /// Branch names that must all arrive before firing (branch mode; overrides expected_count).
+    #[serde(default)]
+    pub required: Vec<String>,
+    /// What to do with an incomplete group when the timeout expires.
+    #[serde(default)]
+    pub on_timeout: WeakJoinTimeout,
+}
+
+/// Action taken on an incomplete weak-join group when its timeout expires.
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum WeakJoinTimeout {
+    /// Emit the partial join (current behavior).
+    #[default]
+    Fire,
+    /// Drop the incomplete group without emitting.
+    Discard,
 }
 
 /// Fault injection modes for testing error handling and recovery mechanisms.

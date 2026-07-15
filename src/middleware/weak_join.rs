@@ -1,10 +1,10 @@
-use crate::models::WeakJoinMiddleware;
+use crate::models::{WeakJoinMiddleware, WeakJoinTimeout};
 use crate::traits::{BoxFuture, ConsumerError, MessageConsumer, MessageDisposition, ReceivedBatch};
 use crate::CanonicalMessage;
 use async_trait::async_trait;
 use serde_json::Value;
 use std::any::Any;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
@@ -33,26 +33,91 @@ impl WeakJoinConsumer {
         }
     }
 
-    fn try_join(&self, key: &str, messages: Vec<CanonicalMessage>) -> CanonicalMessage {
-        let payloads: Vec<Value> = messages
-            .iter()
-            .map(|m| match serde_json::from_slice(&m.payload) {
-                Ok(v) => v,
-                Err(_) => Value::String(String::from_utf8_lossy(&m.payload).to_string()),
-            })
-            .collect();
+    /// Dispatches to branch-keyed or count-array joining depending on config.
+    fn emit_join(&self, key: &str, messages: &[CanonicalMessage]) -> CanonicalMessage {
+        if self.config.branch_by.is_some() {
+            self.try_join_branches(key, messages)
+        } else {
+            self.try_join(key, messages)
+        }
+    }
 
+    /// Count mode: merge payloads into a JSON array (arrival order).
+    fn try_join(&self, key: &str, messages: &[CanonicalMessage]) -> CanonicalMessage {
+        let payloads: Vec<Value> = messages.iter().map(payload_to_value).collect();
         let merged_payload = serde_json::to_vec(&payloads).unwrap_or_default();
-        let mut new_msg =
-            CanonicalMessage::new(merged_payload, Some(fast_uuid_v7::gen_id_with_sub_ms_4()));
+        self.finalize(key, merged_payload, messages.first())
+    }
 
-        if let Some(first) = messages.first() {
+    /// Branch mode: merge payloads into an object keyed by branch name.
+    /// The first message seen for a branch wins; later duplicates are ignored (idempotent).
+    fn try_join_branches(&self, key: &str, messages: &[CanonicalMessage]) -> CanonicalMessage {
+        let branch_by = self.config.branch_by.as_deref().unwrap_or_default();
+        let mut obj = serde_json::Map::new();
+        let mut present: Vec<String> = Vec::new();
+        for m in messages {
+            let branch = m
+                .metadata
+                .get(branch_by)
+                .cloned()
+                .unwrap_or_else(|| "unknown".to_string());
+            if obj.contains_key(&branch) {
+                continue;
+            }
+            present.push(branch.clone());
+            obj.insert(branch, payload_to_value(m));
+        }
+        let complete = self.is_complete(messages);
+        let merged_payload = serde_json::to_vec(&Value::Object(obj)).unwrap_or_default();
+        let mut new_msg = self.finalize(key, merged_payload, messages.first());
+        new_msg
+            .metadata
+            .insert("join_branches".to_string(), present.join(","));
+        new_msg
+            .metadata
+            .insert("join_complete".to_string(), complete.to_string());
+        new_msg
+    }
+
+    /// Builds the joined message: fresh id, metadata inherited from the first source, group key stamped.
+    fn finalize(
+        &self,
+        key: &str,
+        payload: Vec<u8>,
+        first: Option<&CanonicalMessage>,
+    ) -> CanonicalMessage {
+        let mut new_msg =
+            CanonicalMessage::new(payload, Some(fast_uuid_v7::gen_id_with_sub_ms_4()));
+        if let Some(first) = first {
             new_msg.metadata = first.metadata.clone();
         }
         new_msg
             .metadata
             .insert(self.config.group_by.clone(), key.to_string());
         new_msg
+    }
+
+    /// Whether a pending group satisfies its fire condition.
+    /// Count mode: `expected_count` messages. Branch mode: all `required` branches present,
+    /// or (if `required` is empty) `expected_count` distinct branches.
+    fn is_complete(&self, messages: &[CanonicalMessage]) -> bool {
+        match self.config.branch_by.as_deref() {
+            None => messages.len() >= self.config.expected_count,
+            Some(branch_by) => {
+                let distinct: HashSet<&str> = messages
+                    .iter()
+                    .filter_map(|m| m.metadata.get(branch_by).map(String::as_str))
+                    .collect();
+                if self.config.required.is_empty() {
+                    distinct.len() >= self.config.expected_count
+                } else {
+                    self.config
+                        .required
+                        .iter()
+                        .all(|b| distinct.contains(b.as_str()))
+                }
+            }
+        }
     }
 
     fn check_timeouts(&self, state: &mut JoinState, ready_messages: &mut Vec<CanonicalMessage>) {
@@ -68,9 +133,20 @@ impl WeakJoinConsumer {
 
         for key in timed_out_keys {
             if let Some((_, msgs)) = state.pending.remove(&key) {
-                ready_messages.push(self.try_join(&key, msgs));
+                if self.config.on_timeout == WeakJoinTimeout::Discard {
+                    continue; // drop the incomplete group without emitting
+                }
+                ready_messages.push(self.emit_join(&key, &msgs));
             }
         }
+    }
+}
+
+/// Deserializes a message payload as JSON, falling back to a lossy UTF-8 string.
+fn payload_to_value(m: &CanonicalMessage) -> Value {
+    match serde_json::from_slice(&m.payload) {
+        Ok(v) => v,
+        Err(_) => Value::String(String::from_utf8_lossy(&m.payload).to_string()),
     }
 }
 
@@ -142,9 +218,9 @@ impl MessageConsumer for WeakJoinConsumer {
                                 .or_insert_with(|| (now, Vec::new()));
                             entry.1.push(msg);
 
-                            if entry.1.len() >= self.config.expected_count {
+                            if self.is_complete(&entry.1) {
                                 let (_, msgs) = state.pending.remove(&key).unwrap();
-                                ready_messages.push(self.try_join(&key, msgs));
+                                ready_messages.push(self.emit_join(&key, &msgs));
                             }
                         }
                         self.check_timeouts(&mut state, &mut ready_messages);
@@ -198,6 +274,9 @@ mod tests {
             group_by: "group_id".to_string(),
             expected_count: 2,
             timeout_ms: 1000,
+            branch_by: None,
+            required: Vec::new(),
+            on_timeout: WeakJoinTimeout::Fire,
         };
 
         let mem_consumer = MemoryConsumer::new_local("join_test", 10);
@@ -236,6 +315,9 @@ mod tests {
             group_by: "group_id".to_string(),
             expected_count: 3,
             timeout_ms: 100,
+            branch_by: None,
+            required: Vec::new(),
+            on_timeout: WeakJoinTimeout::Fire,
         };
 
         let mem_consumer = MemoryConsumer::new_local("join_timeout_test", 10);
@@ -265,5 +347,112 @@ mod tests {
         let payload: Vec<Value> = serde_json::from_slice(&joined.payload).unwrap();
         assert_eq!(payload.len(), 1);
         assert_eq!(payload[0]["val"], 1);
+    }
+
+    #[tokio::test]
+    async fn test_weak_join_branches_all_required() {
+        let config = WeakJoinMiddleware {
+            group_by: "correlation_id".to_string(),
+            expected_count: 0,
+            timeout_ms: 1000,
+            branch_by: Some("branch".to_string()),
+            required: vec!["postgres".to_string(), "features".to_string()],
+            on_timeout: WeakJoinTimeout::Fire,
+        };
+
+        let mem_consumer = MemoryConsumer::new_local("join_branch_test", 10);
+        let channel = mem_consumer.channel();
+
+        let pg = CanonicalMessage::from_json(json!({"id": 42}))
+            .unwrap()
+            .with_metadata_kv("correlation_id", "order-1")
+            .with_metadata_kv("branch", "postgres");
+        let feat = CanonicalMessage::from_json(json!({"score": 0.9}))
+            .unwrap()
+            .with_metadata_kv("correlation_id", "order-1")
+            .with_metadata_kv("branch", "features");
+
+        channel.send_message(pg).await.unwrap();
+        channel.send_message(feat).await.unwrap();
+
+        let mut join_consumer = WeakJoinConsumer::new(Box::new(mem_consumer), &config);
+
+        let batch = join_consumer.receive_batch(10).await.unwrap();
+        assert_eq!(batch.messages.len(), 1);
+
+        let joined = &batch.messages[0];
+        let payload: Value = serde_json::from_slice(&joined.payload).unwrap();
+        // Branch-keyed object, not a positional array.
+        assert_eq!(payload["postgres"]["id"], 42);
+        assert_eq!(payload["features"]["score"], 0.9);
+        assert_eq!(
+            joined.metadata.get("join_complete").map(|s| s.as_str()),
+            Some("true")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_weak_join_branch_incomplete_does_not_fire() {
+        let config = WeakJoinMiddleware {
+            group_by: "correlation_id".to_string(),
+            expected_count: 0,
+            timeout_ms: 1000,
+            branch_by: Some("branch".to_string()),
+            required: vec!["postgres".to_string(), "features".to_string()],
+            on_timeout: WeakJoinTimeout::Fire,
+        };
+
+        let mem_consumer = MemoryConsumer::new_local("join_branch_incomplete", 10);
+        let channel = mem_consumer.channel();
+
+        // Two messages from the SAME branch must NOT satisfy a two-branch join.
+        let pg1 = CanonicalMessage::from_json(json!({"id": 1}))
+            .unwrap()
+            .with_metadata_kv("correlation_id", "order-2")
+            .with_metadata_kv("branch", "postgres");
+        let pg2 = CanonicalMessage::from_json(json!({"id": 2}))
+            .unwrap()
+            .with_metadata_kv("correlation_id", "order-2")
+            .with_metadata_kv("branch", "postgres");
+
+        channel.send_message(pg1).await.unwrap();
+        channel.send_message(pg2).await.unwrap();
+
+        let mut join_consumer = WeakJoinConsumer::new(Box::new(mem_consumer), &config);
+
+        let batch = join_consumer.receive_batch(10).await.unwrap();
+        assert!(batch.messages.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_weak_join_branch_timeout_discard() {
+        let config = WeakJoinMiddleware {
+            group_by: "correlation_id".to_string(),
+            expected_count: 0,
+            timeout_ms: 100,
+            branch_by: Some("branch".to_string()),
+            required: vec!["postgres".to_string(), "features".to_string()],
+            on_timeout: WeakJoinTimeout::Discard,
+        };
+
+        let mem_consumer = MemoryConsumer::new_local("join_branch_discard", 10);
+        let channel = mem_consumer.channel();
+
+        let pg = CanonicalMessage::from_json(json!({"id": 7}))
+            .unwrap()
+            .with_metadata_kv("correlation_id", "order-3")
+            .with_metadata_kv("branch", "postgres");
+        channel.send_message(pg).await.unwrap();
+
+        let mut join_consumer = WeakJoinConsumer::new(Box::new(mem_consumer), &config);
+
+        let batch1 = join_consumer.receive_batch(10).await.unwrap();
+        assert!(batch1.messages.is_empty());
+
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        // Incomplete group is dropped on timeout, not emitted as a partial.
+        let batch2 = join_consumer.receive_batch(10).await.unwrap();
+        assert!(batch2.messages.is_empty());
     }
 }
