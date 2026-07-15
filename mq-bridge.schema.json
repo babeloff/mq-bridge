@@ -829,6 +829,7 @@
               "type": "object",
               "properties": {
                 "delete": {
+                  "description": "If true, processed lines are physically removed from the file once\nthey are successfully acknowledged.",
                   "type": "boolean",
                   "default": false
                 },
@@ -846,6 +847,7 @@
               "type": "object",
               "properties": {
                 "delete": {
+                  "description": "If true, lines are removed only after all local application\nsubscribers for this file have acknowledged them.",
                   "type": "boolean",
                   "default": false
                 },
@@ -1039,6 +1041,7 @@
       "type": "object",
       "properties": {
         "basic_auth": {
+          "description": "HTTP Basic Authentication credentials (username, password). For consumers: validates incoming requests. For publishers: adds Authorization header.",
           "type": [
             "array",
             "null"
@@ -1080,7 +1083,7 @@
           "minimum": 0
         },
         "concurrency_limit": {
-          "description": "HTTP Basic Authentication credentials (username, password). For consumers: validates incoming requests. For publishers: adds Authorization header.\n(Consumer only) Maximum number of concurrent requests to handle. Defaults to 100.",
+          "description": "(Consumer only) Maximum number of concurrent requests to handle. Defaults to 100.",
           "type": [
             "integer",
             "null"
@@ -2906,11 +2909,19 @@
       "additionalProperties": false
     },
     "WeakJoinMiddleware": {
-      "description": "Weak Join middleware configuration.\n\nGroups and correlates messages based on a metadata key, waiting for a specified number\nof messages within a timeout window before processing them as a batch.\nMessages that exceed the timeout are processed individually.",
+      "description": "Weak Join middleware configuration.\n\nCorrelates messages by a metadata key and joins them within a timeout window.\nCount mode (default) waits for `expected_count` messages and emits a JSON array.\nBranch mode (set `branch_by`) waits for named branches and emits a branch-keyed object.",
       "type": "object",
       "properties": {
+        "branch_by": {
+          "description": "Metadata key naming each message's branch; enables branch mode when set.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
         "expected_count": {
-          "description": "The number of messages to wait for.",
+          "description": "The number of messages (count mode) or distinct branches (branch mode) to wait for.",
           "type": "integer",
           "format": "uint",
           "minimum": 0
@@ -2918,6 +2929,19 @@
         "group_by": {
           "description": "The metadata key to group messages by (e.g., \"correlation_id\").",
           "type": "string"
+        },
+        "on_timeout": {
+          "description": "What to do with an incomplete group when the timeout expires.",
+          "$ref": "#/$defs/WeakJoinTimeout",
+          "default": "fire"
+        },
+        "required": {
+          "description": "Branch names that must all arrive before firing (branch mode; overrides expected_count).",
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
         },
         "timeout_ms": {
           "description": "Timeout in milliseconds.",
@@ -2931,6 +2955,21 @@
         "group_by",
         "expected_count",
         "timeout_ms"
+      ]
+    },
+    "WeakJoinTimeout": {
+      "description": "Action taken on an incomplete weak-join group when its timeout expires.",
+      "oneOf": [
+        {
+          "description": "Emit the partial join (current behavior).",
+          "type": "string",
+          "const": "fire"
+        },
+        {
+          "description": "Drop the incomplete group without emitting.",
+          "type": "string",
+          "const": "discard"
+        }
       ]
     },
     "WebSocketConfig": {
@@ -3013,6 +3052,11 @@
           "type": "boolean",
           "default": false
         },
+        "format": {
+          "description": "Wire format: `json` wraps the CanonicalMessage; `raw` sends payload bytes per frame; `raw_framed` adds a JSON metadata frame. Default `json`.",
+          "$ref": "#/$defs/ZeroMqFormat",
+          "default": "json"
+        },
         "internal_buffer_size": {
           "description": "Internal buffer size for the channel. Defaults to 128.",
           "type": [
@@ -3051,6 +3095,15 @@
       "additionalProperties": false,
       "required": [
         "url"
+      ]
+    },
+    "ZeroMqFormat": {
+      "description": "ZeroMQ wire format.\n\n`json` wraps each message as a JSON CanonicalMessage (batched into one frame);\n`raw` sends/receives the payload bytes directly, one frame per message (metadata\nis not transmitted); `raw_framed` sends a two-frame message — a JSON metadata frame\nfollowed by the raw payload frame — keeping the payload binary-safe while still\ncarrying headers. Use `raw`/`raw_framed` for binary feeds such as JPEG, Avro or Protobuf.",
+      "type": "string",
+      "enum": [
+        "json",
+        "raw",
+        "raw_framed"
       ]
     },
     "ZeroMqSocketType": {

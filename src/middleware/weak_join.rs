@@ -56,11 +56,12 @@ impl WeakJoinConsumer {
         let mut obj = serde_json::Map::new();
         let mut present: Vec<String> = Vec::new();
         for m in messages {
-            let branch = m
-                .metadata
-                .get(branch_by)
-                .cloned()
-                .unwrap_or_else(|| "unknown".to_string());
+            // Skip messages without a branch label rather than collapsing them
+            // under a shared "unknown" key.
+            let branch = match m.metadata.get(branch_by) {
+                Some(b) => b.clone(),
+                None => continue,
+            };
             if obj.contains_key(&branch) {
                 continue;
             }
@@ -203,9 +204,13 @@ impl MessageConsumer for WeakJoinConsumer {
                         }
 
                         let mut state = self.state.lock().await;
-                        let now = Instant::now();
                         let mut ready_messages = Vec::new();
+                        // Flush expired groups before admitting new messages, so a
+                        // fresh message for an expired key starts a new group rather
+                        // than joining a stale one.
+                        self.check_timeouts(&mut state, &mut ready_messages);
 
+                        let now = Instant::now();
                         for msg in batch.messages {
                             let key = msg
                                 .metadata
@@ -223,7 +228,6 @@ impl MessageConsumer for WeakJoinConsumer {
                                 ready_messages.push(self.emit_join(&key, &msgs));
                             }
                         }
-                        self.check_timeouts(&mut state, &mut ready_messages);
 
                         if ready_messages.len() > max_messages {
                             let overflow = ready_messages.split_off(max_messages);

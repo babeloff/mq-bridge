@@ -471,7 +471,7 @@ NatsDeliverPolicy = Literal["all", "last", "new", "last_per_subject"]
 StaticConfig = Union[str, Dict[str, Any]]
 WeakJoinTimeout = Literal["fire", "discard"]
 WebSocketExecutionMode = Literal["auto", "direct_only", "routed"]
-ZeroMqFormat = Literal["json", "raw"]
+ZeroMqFormat = Literal["json", "raw", "raw_framed"]
 ZeroMqSocketType = Literal["push", "pull", "pub", "sub", "req", "rep"]
 
 
