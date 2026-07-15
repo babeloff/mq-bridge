@@ -22,8 +22,12 @@ framing, not a Criterion micro-harness.
 
 1. **Bulk-insert throughput** — `memory → sqlx(postgres)` sink, rows/sec at batch 1 and 128.
    Answers "how fast can it load a table". Compare to Airbyte records/sec.
-2. **CDC event-to-sink latency** — insert a row → `postgres_cdc` → `memory`/`null` sink,
-   report p50/p95/p99. Answers "how fast does a change propagate". Compare to Debezium.
+2. **CDC event-to-sink latency** — insert a row → `postgres_cdc` → a single deterministic
+   sink (use `null`) for the published figure; report p50/p95/p99. Define the timing boundary
+   explicitly: the clock **starts at database commit** (the `COMMIT` returning) and **stops
+   when the change surfaces at the sink** (the sink's per-event callback). Answers "how fast
+   does a change propagate". Compare to Debezium. If both `memory` and `null` sinks are
+   measured, report their distributions as separate, clearly labeled variants — never merged.
 3. **Batched vs unbatched throughput** — the same route at `batch_size: 1` vs `128`, to
    quantify the batching lever.
 
@@ -31,7 +35,7 @@ framing, not a Criterion micro-harness.
 
 | Parameter    | Value                                             |
 | ------------ | ------------------------------------------------- |
-| Payload      | 256 B and 4 KiB JSON rows (report both)           |
+| Payload      | 256 B and 4 KiB — **serialized JSON row only**, excluding any transport/message envelope (report both) |
 | Message count| 100_000 per run                                   |
 | Batch sizes  | 1 (unbatched) and 128 (batched)                   |
 | Concurrency  | 1 and 4 route workers                             |
@@ -41,11 +45,37 @@ framing, not a Criterion micro-harness.
 
 No cherry-picking — publish the methodology row with every number.
 
+### Table & workload definition (keep identical across both payload sizes and all runs)
+
+- **Schema**: a single canonical table — `id bigint generated always as identity primary key`,
+  `payload jsonb` (holds the 256 B / 4 KiB JSON row), `created_at timestamptz default now()`.
+  No secondary indexes beyond the primary key unless a scenario explicitly varies them.
+- **Commit behavior**: one row per `INSERT`, auto-committed (one transaction per row) for the
+  latency scenario; batched inserts for the throughput scenarios follow the route `batch_size`.
+  State which mode a number came from.
+- The 256 B / 4 KiB figure sizes the **serialized JSON payload only** (see the Payload row);
+  it does not include the CDC/message envelope, column overhead, or WAL framing.
+
+### Run repetition & aggregation
+
+- Run each parameter combination **≥ 5 times**; reset the database (drop/recreate table and,
+  for CDC, the replication slot) between runs and **randomize run order** across combinations.
+- Report **throughput as the median across runs with a spread** (min–max or IQR).
+- For latency, **pool the raw samples across runs** before computing p50/p95/p99 (do not
+  average per-run percentiles), and report the run count alongside.
+
 ## Reference baselines to line up against
 
 - **Debezium** (Postgres CDC latency/throughput) → scenario 2.
 - **OpenMessaging Benchmark** payload sizes + latency-percentile reporting → scenarios 1/3.
 - **Airbyte** records/sec → scenario 1.
+
+These references were not run on the same hardware/methodology, so they are **directional, not
+head-to-head**. Do **not** present a merged ranking. For each reference number cited, publish its
+metadata next to it — tool **version**, **hardware**, **durability/ack** settings, **batching**,
+**sink semantics**, and the **source of the figure** (paper/docs/blog + link) — and label the
+comparison "directional". The same requirement applies to any additional comparison section
+(e.g. the Meltano numbers in `ETL_BENCHMARKS.md`).
 
 ## Deliverable
 
