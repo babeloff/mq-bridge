@@ -47,7 +47,9 @@ MongoDbFormat = str
 MqttProtocol = str
 NatsDeliverPolicy = str
 StaticConfig = str
+WeakJoinTimeout = str
 WebSocketExecutionMode = str
+ZeroMqFormat = str
 ZeroMqSocketType = str
 RouteConfig = Route
 EndpointConfig = Endpoint
@@ -101,8 +103,10 @@ __all__ = [
     "SwitchConfig",
     "TlsConfig",
     "WeakJoinMiddleware",
+    "WeakJoinTimeout",
     "WebSocketConfig",
     "WebSocketExecutionMode",
     "ZeroMqConfig",
+    "ZeroMqFormat",
     "ZeroMqSocketType",
 ]

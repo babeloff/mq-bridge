@@ -116,6 +116,7 @@ zeromq_pipeline:
       url: "tcp://localhost:5556"
       socket_type: "push"
       bind: false
+      # format: "raw"  # send/receive raw payload bytes per frame instead of JSON-wrapping (e.g. JPEG, Protobuf). Default "json".
 
 # Route 8: PostgreSQL via SQLx
 sqlx_postgres_route:

@@ -1,5 +1,5 @@
 use crate::canonical_message::tracing_support::LazyMessageIds;
-use crate::models::{ZeroMqConfig, ZeroMqSocketType};
+use crate::models::{ZeroMqConfig, ZeroMqFormat, ZeroMqSocketType};
 use crate::traits::{
     BoxFuture, ConsumerError, EndpointStatus, MessageConsumer, MessageDisposition,
     MessagePublisher, PublisherError, ReceivedBatch, SentBatch,
@@ -29,6 +29,7 @@ enum PublisherJob {
 pub struct ZeroMqPublisher {
     tx: Sender<PublisherJob>,
     expects_reply: bool,
+    raw: bool,
 }
 
 impl ZeroMqPublisher {
@@ -110,7 +111,62 @@ impl ZeroMqPublisher {
         Ok(Self {
             tx,
             expects_reply: matches!(socket_type, ZeroMqSocketType::Req),
+            raw: matches!(config.format, ZeroMqFormat::Raw),
         })
+    }
+
+    /// Send each message's payload as its own single-frame ZMQ message, without
+    /// JSON-wrapping the CanonicalMessage. Used when `raw` is enabled.
+    async fn send_batch_raw(
+        &self,
+        messages: Vec<CanonicalMessage>,
+    ) -> Result<SentBatch, PublisherError> {
+        if self.expects_reply {
+            let mut responses = Vec::new();
+            for message in messages {
+                let zmq_msg = ZmqMessage::from(message.payload);
+                let (reply_tx, reply_rx) = oneshot::channel();
+                self.tx
+                    .send(PublisherJob::Request(zmq_msg, reply_tx))
+                    .await
+                    .map_err(|_| {
+                        PublisherError::Retryable(anyhow!("ZeroMQ publisher task closed"))
+                    })?;
+                let response_zmq = reply_rx
+                    .await
+                    .map_err(|_| PublisherError::Retryable(anyhow!("ZeroMQ reply channel closed")))?
+                    .map_err(|e| PublisherError::Retryable(anyhow!(e)))?;
+                // REQ/REP replies are never SUB traffic, so no topic cursor applies.
+                responses.extend(
+                    ZeroMqConsumer::decode_batch(response_zmq, false, true)
+                        .map_err(|e| PublisherError::NonRetryable(anyhow!(e)))?,
+                );
+            }
+            Ok(SentBatch::Partial {
+                responses: Some(responses),
+                failed: vec![],
+            })
+        } else {
+            for message in messages {
+                let zmq_msg = ZmqMessage::from(message.payload);
+                let (ack_tx, ack_rx) = oneshot::channel();
+                self.tx
+                    .send(PublisherJob::Send(zmq_msg, ack_tx))
+                    .await
+                    .map_err(|_| {
+                        PublisherError::Retryable(anyhow!("ZeroMQ publisher task closed"))
+                    })?;
+                ack_rx
+                    .await
+                    .map_err(|_| {
+                        PublisherError::Retryable(anyhow!(
+                            "ZeroMQ publisher task dropped ack channel"
+                        ))
+                    })?
+                    .map_err(|e| PublisherError::Retryable(anyhow!(e)))?;
+            }
+            Ok(SentBatch::Ack)
+        }
     }
 }
 
@@ -121,6 +177,9 @@ impl MessagePublisher for ZeroMqPublisher {
         mut messages: Vec<CanonicalMessage>,
     ) -> Result<SentBatch, PublisherError> {
         trace!(count = messages.len(), message_ids = ?LazyMessageIds(&messages), "Publishing batch of ZeroMQ messages");
+        if self.raw {
+            return self.send_batch_raw(messages).await;
+        }
         // Source/provenance keys are per-hop context and must not be forwarded.
         for message in &mut messages {
             message.strip_source_metadata();
@@ -140,7 +199,7 @@ impl MessagePublisher for ZeroMqPublisher {
                 .map_err(|_| PublisherError::Retryable(anyhow!("ZeroMQ reply channel closed")))?
                 .map_err(|e| PublisherError::Retryable(anyhow!(e)))?;
             // REQ/REP replies are never SUB traffic, so no topic cursor applies.
-            let responses = ZeroMqConsumer::decode_batch(response_zmq, false)
+            let responses = ZeroMqConsumer::decode_batch(response_zmq, false, false)
                 .map_err(|e| PublisherError::NonRetryable(anyhow!(e)))?;
             Ok(SentBatch::Partial {
                 responses: Some(responses),
@@ -216,12 +275,14 @@ pub struct ZeroMqConsumer {
     // Only SUB sockets prepend a subscription-topic frame; for PULL/REP a leading
     // frame is payload, not a topic, so the cursor must not be attached there.
     is_sub: bool,
+    raw: bool,
 }
 
 impl ZeroMqConsumer {
     pub async fn new(config: &ZeroMqConfig) -> anyhow::Result<Self> {
         let socket_type = config.socket_type.clone().unwrap_or(ZeroMqSocketType::Pull);
         let is_sub = matches!(socket_type, ZeroMqSocketType::Sub);
+        let raw = matches!(config.format, ZeroMqFormat::Raw);
         let mut socket = match socket_type {
             ZeroMqSocketType::Pull => {
                 let mut s = zeromq::PullSocket::new();
@@ -325,12 +386,14 @@ impl ZeroMqConsumer {
             rx,
             buffer: VecDeque::new(),
             is_sub,
+            raw,
         })
     }
 
     pub(crate) fn decode_batch(
         zmq_msg: ZmqMessage,
         is_sub: bool,
+        raw: bool,
     ) -> anyhow::Result<Vec<CanonicalMessage>> {
         let frames = zmq_msg.into_vec();
         let payload = frames.last().cloned().unwrap_or_default();
@@ -345,14 +408,26 @@ impl ZeroMqConsumer {
         } else {
             None
         };
-        let mut messages =
-            if let Ok(messages) = serde_json::from_slice::<Vec<CanonicalMessage>>(&payload) {
-                messages
-            } else if let Ok(message) = serde_json::from_slice::<CanonicalMessage>(&payload) {
-                vec![message]
+        // In raw mode each frame is opaque bytes; never attempt JSON decoding. A raw
+        // producer may send multipart, so emit one message per payload frame (dropping
+        // the SUB topic frame) rather than only the last one.
+        let mut messages = if raw {
+            let payload_frames = if is_sub && frames.len() > 1 {
+                &frames[1..]
             } else {
-                vec![CanonicalMessage::new(payload.to_vec(), None)]
+                &frames[..]
             };
+            payload_frames
+                .iter()
+                .map(|f| CanonicalMessage::new_bytes(f.clone(), None))
+                .collect()
+        } else if let Ok(messages) = serde_json::from_slice::<Vec<CanonicalMessage>>(&payload) {
+            messages
+        } else if let Ok(message) = serde_json::from_slice::<CanonicalMessage>(&payload) {
+            vec![message]
+        } else {
+            vec![CanonicalMessage::new(payload.to_vec(), None)]
+        };
         for message in &mut messages {
             // Never let a spoofed `mqb.src.*` key in the inbound payload survive;
             // the authoritative topic cursor (SUB only) is injected below.
@@ -377,7 +452,7 @@ impl ZeroMqConsumer {
             .recv()
             .await
             .map_err(|_| ConsumerError::EndOfStream)??;
-        let msgs = Self::decode_batch(item.msg, self.is_sub)
+        let msgs = Self::decode_batch(item.msg, self.is_sub, self.raw)
             .map_err(|e| ConsumerError::Connection(anyhow!(e)))?;
 
         if let Some(tx) = item.reply_tx {
@@ -543,12 +618,88 @@ mod tests {
         let payload = serde_json::to_vec(&vec![msg]).unwrap();
         let zmq_msg = ZmqMessage::from(bytes::Bytes::from(payload));
 
-        let decoded = ZeroMqConsumer::decode_batch(zmq_msg, false).unwrap();
+        let decoded = ZeroMqConsumer::decode_batch(zmq_msg, false, false).unwrap();
         assert_eq!(decoded.len(), 1);
         assert!(!decoded[0].metadata.contains_key("mqb.src.kafka_offset"));
         assert_eq!(
             decoded[0].metadata.get("user_key").map(String::as_str),
             Some("kept")
         );
+    }
+
+    #[test]
+    fn decode_batch_raw_returns_opaque_payload() {
+        // Raw mode must hand back the frame bytes verbatim, even when they happen to
+        // be valid JSON, without decoding into a CanonicalMessage.
+        let json_looking = br#"[{"message_id":"x","payload":"abc"}]"#;
+        let zmq_msg = ZmqMessage::from(bytes::Bytes::from(json_looking.to_vec()));
+
+        let decoded = ZeroMqConsumer::decode_batch(zmq_msg, false, true).unwrap();
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].payload.as_ref(), json_looking);
+        assert!(decoded[0].metadata.is_empty());
+    }
+
+    #[test]
+    fn decode_batch_raw_multipart_yields_one_message_per_frame() {
+        // A raw producer may send a multipart message; each payload frame must become
+        // its own message rather than only the last frame surfacing.
+        let mut zmq_msg = ZmqMessage::from(bytes::Bytes::from_static(b"frame0"));
+        zmq_msg.push_back(bytes::Bytes::from_static(b"frame1"));
+        zmq_msg.push_back(bytes::Bytes::from_static(b"frame2"));
+
+        let decoded = ZeroMqConsumer::decode_batch(zmq_msg, false, true).unwrap();
+        assert_eq!(decoded.len(), 3);
+        assert_eq!(decoded[0].payload.as_ref(), b"frame0");
+        assert_eq!(decoded[1].payload.as_ref(), b"frame1");
+        assert_eq!(decoded[2].payload.as_ref(), b"frame2");
+    }
+
+    #[test]
+    fn decode_batch_raw_sub_strips_topic_frame() {
+        // For SUB sockets the leading frame is the subscription topic and must be
+        // dropped; the remaining frames are payload.
+        let mut zmq_msg = ZmqMessage::from(bytes::Bytes::from_static(b"my_topic"));
+        zmq_msg.push_back(bytes::Bytes::from_static(b"image_bytes"));
+
+        let decoded = ZeroMqConsumer::decode_batch(zmq_msg, true, true).unwrap();
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].payload.as_ref(), b"image_bytes");
+    }
+
+    #[tokio::test]
+    async fn test_zeromq_push_pull_raw() {
+        let url = "tcp://127.0.0.1:5557".to_string();
+
+        let consumer_config = ZeroMqConfig {
+            url: url.clone(),
+            socket_type: Some(ZeroMqSocketType::Pull),
+            bind: true,
+            format: crate::models::ZeroMqFormat::Raw,
+            ..Default::default()
+        };
+        let publisher_config = ZeroMqConfig {
+            url: url.clone(),
+            socket_type: Some(ZeroMqSocketType::Push),
+            bind: false,
+            format: crate::models::ZeroMqFormat::Raw,
+            ..Default::default()
+        };
+
+        let mut consumer = ZeroMqConsumer::new(&consumer_config).await.unwrap();
+        let publisher = ZeroMqPublisher::new(&publisher_config).await.unwrap();
+
+        // Arbitrary non-JSON binary payload, e.g. a JPEG magic header.
+        let raw_bytes = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10];
+        publisher
+            .send(CanonicalMessage::new(raw_bytes.clone(), None))
+            .await
+            .unwrap();
+
+        let received = tokio::time::timeout(Duration::from_secs(2), consumer.receive())
+            .await
+            .expect("Timed out waiting for message")
+            .unwrap();
+        assert_eq!(received.message.payload.as_ref(), raw_bytes.as_slice());
     }
 }
