@@ -136,53 +136,100 @@ impl ZeroMqPublisher {
     /// for `raw` and `raw_framed`. See [`frame_message`] for the per-format framing.
     async fn send_batch_raw(
         &self,
-        mut messages: Vec<CanonicalMessage>,
+        messages: Vec<CanonicalMessage>,
     ) -> Result<SentBatch, PublisherError> {
+        // Accumulate per-message outcomes so a single Retryable failure only re-sends
+        // the offending message, not the whole batch (which would double-deliver the
+        // ones that already succeeded).
+        let mut failed = Vec::new();
         if self.expects_reply {
             let mut responses = Vec::new();
-            for message in &mut messages {
-                let zmq_msg = self.frame_message(message)?;
+            for mut message in messages {
+                let zmq_msg = match self.frame_message(&mut message) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        failed.push((message, e));
+                        continue;
+                    }
+                };
                 let (reply_tx, reply_rx) = oneshot::channel();
-                self.tx
+                if self
+                    .tx
                     .send(PublisherJob::Request(zmq_msg, reply_tx))
                     .await
-                    .map_err(|_| {
-                        PublisherError::Retryable(anyhow!("ZeroMQ publisher task closed"))
-                    })?;
-                let response_zmq = reply_rx
-                    .await
-                    .map_err(|_| PublisherError::Retryable(anyhow!("ZeroMQ reply channel closed")))?
-                    .map_err(|e| PublisherError::Retryable(anyhow!(e)))?;
+                    .is_err()
+                {
+                    failed.push((
+                        message,
+                        PublisherError::Retryable(anyhow!("ZeroMQ publisher task closed")),
+                    ));
+                    continue;
+                }
+                let response_zmq = match reply_rx.await {
+                    Ok(Ok(r)) => r,
+                    Ok(Err(e)) => {
+                        failed.push((message, PublisherError::Retryable(anyhow!(e))));
+                        continue;
+                    }
+                    Err(_) => {
+                        failed.push((
+                            message,
+                            PublisherError::Retryable(anyhow!("ZeroMQ reply channel closed")),
+                        ));
+                        continue;
+                    }
+                };
                 // REQ/REP replies are never SUB traffic, so no topic cursor applies.
-                responses.extend(
-                    ZeroMqConsumer::decode_batch(response_zmq, false, &self.format)
-                        .map_err(|e| PublisherError::NonRetryable(anyhow!(e)))?,
-                );
+                match ZeroMqConsumer::decode_batch(response_zmq, false, &self.format) {
+                    Ok(decoded) => responses.extend(decoded),
+                    Err(e) => failed.push((message, PublisherError::NonRetryable(anyhow!(e)))),
+                }
             }
             Ok(SentBatch::Partial {
                 responses: Some(responses),
-                failed: vec![],
+                failed,
             })
         } else {
-            for message in &mut messages {
-                let zmq_msg = self.frame_message(message)?;
+            for mut message in messages {
+                let zmq_msg = match self.frame_message(&mut message) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        failed.push((message, e));
+                        continue;
+                    }
+                };
                 let (ack_tx, ack_rx) = oneshot::channel();
-                self.tx
+                if self
+                    .tx
                     .send(PublisherJob::Send(zmq_msg, ack_tx))
                     .await
-                    .map_err(|_| {
-                        PublisherError::Retryable(anyhow!("ZeroMQ publisher task closed"))
-                    })?;
-                ack_rx
-                    .await
-                    .map_err(|_| {
+                    .is_err()
+                {
+                    failed.push((
+                        message,
+                        PublisherError::Retryable(anyhow!("ZeroMQ publisher task closed")),
+                    ));
+                    continue;
+                }
+                match ack_rx.await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => failed.push((message, PublisherError::Retryable(anyhow!(e)))),
+                    Err(_) => failed.push((
+                        message,
                         PublisherError::Retryable(anyhow!(
                             "ZeroMQ publisher task dropped ack channel"
-                        ))
-                    })?
-                    .map_err(|e| PublisherError::Retryable(anyhow!(e)))?;
+                        )),
+                    )),
+                }
             }
-            Ok(SentBatch::Ack)
+            if failed.is_empty() {
+                Ok(SentBatch::Ack)
+            } else {
+                Ok(SentBatch::Partial {
+                    responses: None,
+                    failed,
+                })
+            }
         }
     }
 }
@@ -414,7 +461,10 @@ impl ZeroMqConsumer {
     ) -> anyhow::Result<Vec<CanonicalMessage>> {
         let frames = zmq_msg.into_vec();
         let payload = frames.last().cloned().unwrap_or_default();
-        if payload.is_empty() {
+        // Only short-circuit genuinely empty single-frame inputs. Multipart Raw/RawFramed
+        // messages may carry a trailing empty payload (or leading metadata) that still
+        // needs to be emitted, so don't drop them here.
+        if payload.is_empty() && frames.len() <= 1 {
             return Ok(vec![]);
         }
         // Only SUB traffic prepends the subscription topic as a leading frame;
