@@ -360,7 +360,7 @@ pub mod aws_helper {
 pub mod zeromq_helper {
     use super::PERF_TEST_MESSAGE_COUNT;
     use mq_bridge::endpoints::zeromq::{ZeroMqConsumer, ZeroMqPublisher};
-    use mq_bridge::models::{ZeroMqConfig, ZeroMqSocketType};
+    use mq_bridge::models::{ZeroMqConfig, ZeroMqFormat, ZeroMqSocketType};
     use mq_bridge::traits::{MessageConsumer, MessagePublisher};
     use once_cell::sync::Lazy;
     use rand::RngExt;
@@ -381,6 +381,7 @@ pub mod zeromq_helper {
             bind: false,
             internal_buffer_size: Some(PERF_TEST_MESSAGE_COUNT + 1),
             topic: None,
+            format: ZeroMqFormat::Json,
         };
         Arc::new(ZeroMqPublisher::new(&config).await.unwrap())
     }
@@ -395,6 +396,7 @@ pub mod zeromq_helper {
             bind: true,
             internal_buffer_size: Some(PERF_TEST_MESSAGE_COUNT + 1),
             topic: None,
+            format: ZeroMqFormat::Json,
         };
         Arc::new(Mutex::new(ZeroMqConsumer::new(&config).await.unwrap()))
     }

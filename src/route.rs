@@ -3186,7 +3186,7 @@ mod tests {
 
         // The route must still be running after the source is empty.
         assert!(
-            !handle.0 .0.is_finished(),
+            !handle.handle.is_finished(),
             "route exited on empty batch without exit_on_empty set"
         );
 
