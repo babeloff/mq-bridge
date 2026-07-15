@@ -2088,7 +2088,7 @@ pub struct ZeroMqConfig {
     /// Internal buffer size for the channel. Defaults to 128.
     #[serde(default)]
     pub internal_buffer_size: Option<usize>,
-    /// Wire format: `json` wraps the CanonicalMessage; `raw` sends/receives payload bytes per frame. Default `json`.
+    /// Wire format: `json` wraps the CanonicalMessage; `raw` sends payload bytes per frame; `raw_framed` adds a JSON metadata frame. Default `json`.
     #[serde(default)]
     pub format: ZeroMqFormat,
 }
@@ -2117,14 +2117,17 @@ impl ZeroMqConfig {
 ///
 /// `json` wraps each message as a JSON CanonicalMessage (batched into one frame);
 /// `raw` sends/receives the payload bytes directly, one frame per message (metadata
-/// is not transmitted). Use `raw` for binary feeds such as JPEG, Avro or Protobuf.
+/// is not transmitted); `raw_framed` sends a two-frame message — a JSON metadata frame
+/// followed by the raw payload frame — keeping the payload binary-safe while still
+/// carrying headers. Use `raw`/`raw_framed` for binary feeds such as JPEG, Avro or Protobuf.
 #[derive(Debug, Deserialize, Serialize, Clone, Default, PartialEq, Eq)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum ZeroMqFormat {
     #[default]
     Json,
     Raw,
+    RawFramed,
 }
 
 /// ZeroMQ socket type.
