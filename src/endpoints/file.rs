@@ -359,7 +359,7 @@ impl MessagePublisher for FilePublisher {
                     }
                 }
             };
-            let serialized_msg = match serialized_msg {
+            let mut serialized_msg = match serialized_msg {
                 Ok(s) => s,
                 Err(e) => {
                     tracing::error!("Failed to serialize message for file sink: {}", e);
@@ -371,10 +371,8 @@ impl MessagePublisher for FilePublisher {
             // Write body + delimiter as one contiguous buffer so a concurrent
             // tailing reader never observes the record without its delimiter
             // (shrinks the torn-write window; the reader also guards against it).
-            let mut record = Vec::with_capacity(serialized_msg.len() + self.delimiter.len());
-            record.extend_from_slice(&serialized_msg);
-            record.extend_from_slice(&self.delimiter);
-            if let Err(e) = writer.write_all(&record).await {
+            serialized_msg.extend_from_slice(&self.delimiter);
+            if let Err(e) = writer.write_all(&serialized_msg).await {
                 tracing::error!("Failed to write message to file: {}", e);
                 failed_messages.push((msg, PublisherError::NonRetryable(anyhow::anyhow!(e))));
             }

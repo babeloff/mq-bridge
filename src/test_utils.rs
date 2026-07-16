@@ -14,6 +14,13 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex as AsyncMutex, Semaphore};
 
+/// Minimal view of the test payload used to extract the message id without
+/// parsing the whole JSON object into a `serde_json::Value`.
+#[derive(serde::Deserialize)]
+struct MessageNumHeader {
+    message_num: u64,
+}
+
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::filter::EnvFilter;
 use tracing_subscriber::layer::SubscriberExt;
@@ -703,10 +710,8 @@ async fn run_pipeline_test_internal(
         if !batch.is_empty() {
             if !is_performance_test || at_least_once {
                 for msg in &batch {
-                    if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&msg.payload) {
-                        if let Some(num) = val.get("message_num").and_then(|v| v.as_u64()) {
-                            unique_received_ids.insert(num);
-                        }
+                    if let Ok(hdr) = serde_json::from_slice::<MessageNumHeader>(&msg.payload) {
+                        unique_received_ids.insert(hdr.message_num);
                     }
                 }
             }
@@ -770,10 +775,8 @@ async fn run_pipeline_test_internal(
     if !batch.is_empty() {
         if !is_performance_test || at_least_once {
             for msg in &batch {
-                if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&msg.payload) {
-                    if let Some(num) = val.get("message_num").and_then(|v| v.as_u64()) {
-                        unique_received_ids.insert(num);
-                    }
+                if let Ok(hdr) = serde_json::from_slice::<MessageNumHeader>(&msg.payload) {
+                    unique_received_ids.insert(hdr.message_num);
                 }
             }
         }
