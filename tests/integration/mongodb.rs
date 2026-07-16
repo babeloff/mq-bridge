@@ -3,12 +3,14 @@ use std::sync::Arc;
 
 use mq_bridge::test_utils::PERF_TEST_MESSAGE_COUNT;
 
-use mq_bridge::endpoints::mongodb::{MongoDbConsumer, MongoDbPublisher, MongoDbSubscriber};
+use mq_bridge::endpoints::mongodb::{
+    MongoDbChangeStreamReader, MongoDbConsumer, MongoDbPublisher, MongoDbSubscriber,
+};
 use mq_bridge::test_utils::{
     add_performance_result, run_chaos_pipeline_test, run_direct_perf_test,
     run_performance_pipeline_test, run_performance_pipeline_test_named, run_pipeline_test,
     run_test_with_docker, run_test_with_docker_controller, setup_logging, should_run,
-    verify_subscriber_logic,
+    verify_subscriber_logic, PerformanceResult,
 };
 const CONFIG_YAML: &str = r#"
 routes:
@@ -277,6 +279,171 @@ pub async fn test_mongodb_cdc_performance_pipeline() {
                 PERF_TEST_MESSAGE_COUNT,
             )
             .await;
+        },
+    )
+    .await;
+}
+
+// --- Isolated CDC (change-stream) read benchmarks -----------------------------------------------
+// Like the Postgres CDC benches: the coupled pipeline test above is write-bound (insert + oplog +
+// read timed together). Here the change-stream reader is opened first, the collection is seeded
+// *untimed* (buffered in the oplog), and only the drain / per-change latency is timed — isolating
+// the change-stream reader. Requires a replica set (mongodb-replica.yml).
+
+const CDC_URL: &str = "mongodb://localhost:27018/?replicaSet=rs0";
+const CDC_DB: &str = "mq_bridge_test";
+
+fn cdc_reader_cfg(collection: &str) -> mq_bridge::models::MongoDbConfig {
+    mq_bridge::models::MongoDbConfig {
+        url: CDC_URL.to_string(),
+        database: CDC_DB.to_string(),
+        collection: Some(collection.to_string()),
+        consume: Some(mq_bridge::models::MongoConsume::CaptureNew),
+        format: mq_bridge::models::MongoDbFormat::Json,
+        ..Default::default()
+    }
+}
+
+/// Drain the change stream until `want` events are seen, acking each batch. Returns the count.
+async fn drain_cdc(reader: &mut MongoDbChangeStreamReader, want: usize) -> usize {
+    use mq_bridge::traits::{MessageConsumer, MessageDisposition};
+    let mut got = 0usize;
+    while got < want {
+        let batch = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            reader.receive_batch(1024),
+        )
+        .await
+        .expect("cdc drain timed out")
+        .expect("receive_batch failed");
+        let n = batch.messages.len();
+        (batch.commit)(vec![MessageDisposition::Ack; n])
+            .await
+            .expect("commit (ack) failed");
+        got += n;
+    }
+    got
+}
+
+pub async fn test_mongodb_cdc_read_throughput() {
+    setup_logging();
+    run_test_with_docker(
+        "tests/integration/docker-compose/mongodb-replica.yml",
+        || async {
+            let collection = format!("cdc_readbench_{}", fast_uuid_v7::gen_id());
+            // Open the change stream BEFORE seeding so nothing is missed.
+            let mut reader = MongoDbChangeStreamReader::new(&cdc_reader_cfg(&collection), false)
+                .await
+                .expect("create CDC reader");
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+            let client = mongodb::Client::with_uri_str(CDC_URL).await.unwrap();
+            let coll = client
+                .database(CDC_DB)
+                .collection::<mongodb::bson::Document>(&collection);
+
+            let n = PERF_TEST_MESSAGE_COUNT;
+            let docs: Vec<mongodb::bson::Document> = (1..=n as i64)
+                .map(|id| mongodb::bson::doc! { "id": id, "name": format!("name-{id}") })
+                .collect();
+            coll.insert_many(docs).await.expect("seed collection");
+
+            let start = std::time::Instant::now();
+            let seen = drain_cdc(&mut reader, n).await;
+            let elapsed = start.elapsed();
+
+            assert!(seen >= n, "captured {seen} < {n}");
+            let rps = n as f64 / elapsed.as_secs_f64();
+            println!(
+                "mongodb_cdc read-only throughput: {rps:.0} rows/s ({n} rows in {:.2}s)",
+                elapsed.as_secs_f64()
+            );
+            add_performance_result(PerformanceResult {
+                test_name: "mongodb_cdc read-only".to_string(),
+                read_performance: rps,
+                ..Default::default()
+            });
+        },
+    )
+    .await;
+}
+
+pub async fn test_mongodb_cdc_latency() {
+    setup_logging();
+    run_test_with_docker(
+        "tests/integration/docker-compose/mongodb-replica.yml",
+        || async {
+            use std::time::Instant;
+            let collection = format!("cdc_latency_{}", fast_uuid_v7::gen_id());
+            let mut reader = MongoDbChangeStreamReader::new(&cdc_reader_cfg(&collection), false)
+                .await
+                .expect("create CDC reader");
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            let n = 500usize;
+
+            // Drain in a task, timestamping each event's arrival by id.
+            let drain = tokio::spawn(async move {
+                use mq_bridge::traits::{MessageConsumer, MessageDisposition};
+                let mut arrivals: std::collections::HashMap<i64, Instant> =
+                    std::collections::HashMap::new();
+                while arrivals.len() < n {
+                    let batch = tokio::time::timeout(
+                        std::time::Duration::from_secs(30),
+                        reader.receive_batch(1024),
+                    )
+                    .await
+                    .expect("latency drain timed out")
+                    .expect("receive_batch failed");
+                    let now = Instant::now();
+                    let count = batch.messages.len();
+                    for msg in &batch.messages {
+                        let body: serde_json::Value =
+                            serde_json::from_slice(&msg.payload).unwrap_or_default();
+                        if let Some(id) = body.get("id").and_then(|v| v.as_i64()) {
+                            arrivals.entry(id).or_insert(now);
+                        }
+                    }
+                    (batch.commit)(vec![MessageDisposition::Ack; count])
+                        .await
+                        .expect("commit (ack) failed");
+                }
+                arrivals
+            });
+
+            // Insert one document at a time, recording the write instant per id.
+            let client = mongodb::Client::with_uri_str(CDC_URL).await.unwrap();
+            let coll = client
+                .database(CDC_DB)
+                .collection::<mongodb::bson::Document>(&collection);
+            let mut sent: std::collections::HashMap<i64, Instant> =
+                std::collections::HashMap::new();
+            for id in 1..=n as i64 {
+                coll.insert_one(mongodb::bson::doc! { "id": id, "name": format!("name-{id}") })
+                    .await
+                    .expect("insert");
+                sent.insert(id, Instant::now());
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+
+            let arrivals = drain.await.expect("drain task panicked");
+            let mut lat_ms: Vec<f64> = sent
+                .iter()
+                .filter_map(|(id, t0)| {
+                    arrivals
+                        .get(id)
+                        .map(|t1| t1.saturating_duration_since(*t0).as_secs_f64() * 1000.0)
+                })
+                .collect();
+            assert!(!lat_ms.is_empty(), "no latencies collected");
+            lat_ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let pct = |p: f64| lat_ms[(((lat_ms.len() as f64) * p) as usize).min(lat_ms.len() - 1)];
+            println!(
+                "mongodb_cdc latency (n={}): p50={:.2}ms p95={:.2}ms p99={:.2}ms",
+                lat_ms.len(),
+                pct(0.50),
+                pct(0.95),
+                pct(0.99)
+            );
         },
     )
     .await;

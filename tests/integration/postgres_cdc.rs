@@ -11,12 +11,12 @@ use mq_bridge::endpoints::sqlx::SqlxPublisher;
 use mq_bridge::models::{PostgresCdcConfig, SqlxConfig};
 use mq_bridge::sqlx::{Connection, PgConnection};
 use mq_bridge::test_utils::{
-    run_performance_pipeline_test_named, run_test_with_docker, run_test_with_docker_controller,
-    setup_logging, PERF_TEST_MESSAGE_COUNT,
+    add_performance_result, run_performance_pipeline_test_named, run_test_with_docker,
+    run_test_with_docker_controller, setup_logging, PerformanceResult, PERF_TEST_MESSAGE_COUNT,
 };
 use mq_bridge::traits::{MessageConsumer, MessageDisposition};
 use std::collections::BTreeSet;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const COMPOSE: &str = "tests/integration/docker-compose/postgres_cdc.yml";
 const URL: &str = "postgres://testuser:testpass@localhost:5432/testdb";
@@ -28,6 +28,8 @@ fn cfg(slot: &str) -> PostgresCdcConfig {
         publication: PUBLICATION.to_string(),
         slot_name: slot.to_string(),
         create_slot: true,
+        create_publication: false,
+        publication_tables: Vec::new(),
         temporary_slot: false,
         cursor_id: None,
         checkpoint_store: None,
@@ -137,6 +139,132 @@ pub async fn test_postgres_cdc_pipeline() {
         for id in 1..=100 {
             assert!(ids.contains(&(id as i64)), "row {id} must be captured");
         }
+    })
+    .await;
+}
+
+// --- Isolated CDC read benchmarks ---------------------------------------------------------------
+// Unlike the coupled pipeline test (which times INSERT + WAL + read together and is therefore
+// write-bound), these attach the reader first, seed the table *untimed* — the changes buffer in the
+// WAL, retained by the slot — and then time only the logical-decoding drain. That isolates the CDC
+// reader's throughput and per-change latency, which is where CDC differs from a bulk select.
+
+/// Seed `n` rows in a single statement (untimed) so the read benchmark measures only the drain.
+async fn seed_rows(n: usize) {
+    let mut conn = connect_retry().await;
+    sqlx::query(
+        "INSERT INTO cdc_users (id, name) SELECT g, 'name-' || g FROM generate_series(1, $1) g",
+    )
+    .bind(n as i32)
+    .execute(&mut conn)
+    .await
+    .expect("seed rows");
+}
+
+/// Isolated CDC read throughput: seed first (buffered in the WAL), then time only the drain.
+pub async fn test_postgres_cdc_read_throughput() {
+    setup_logging();
+    run_test_with_docker(COMPOSE, || async {
+        let slot = "mqb_cdc_readbench_slot";
+        reset_schema(slot).await;
+        // Slot must exist BEFORE seeding so the WAL retains the changes for the reader.
+        let mut consumer = PostgresCdcConsumer::new(&cfg(slot))
+            .await
+            .expect("create CDC consumer");
+
+        let n = PERF_TEST_MESSAGE_COUNT;
+        seed_rows(n).await;
+
+        let start = Instant::now();
+        let seen = drain_ids(&mut consumer, n).await;
+        let elapsed = start.elapsed();
+
+        assert!(seen.len() >= n, "captured {} < {n}", seen.len());
+        let rps = n as f64 / elapsed.as_secs_f64();
+        println!(
+            "postgres_cdc read-only throughput: {rps:.0} rows/s ({n} rows in {:.2}s)",
+            elapsed.as_secs_f64()
+        );
+        add_performance_result(PerformanceResult {
+            test_name: "postgres_cdc read-only".to_string(),
+            read_performance: rps,
+            ..Default::default()
+        });
+    })
+    .await;
+}
+
+/// Per-change insert->capture latency (p50/p95/p99). The reader is attached first; rows are then
+/// inserted one at a time so each change is decoded on its own, and we time commit -> delivery.
+pub async fn test_postgres_cdc_latency() {
+    setup_logging();
+    run_test_with_docker(COMPOSE, || async {
+        let slot = "mqb_cdc_latency_slot";
+        reset_schema(slot).await;
+        let mut consumer = PostgresCdcConsumer::new(&cfg(slot))
+            .await
+            .expect("create CDC consumer");
+        let n = 500usize;
+
+        // Drain in a task, timestamping each row's arrival by id.
+        let drain = tokio::spawn(async move {
+            let mut arrivals: std::collections::HashMap<i64, Instant> =
+                std::collections::HashMap::new();
+            while arrivals.len() < n {
+                let batch =
+                    tokio::time::timeout(Duration::from_secs(30), consumer.receive_batch(1024))
+                        .await
+                        .expect("latency drain timed out")
+                        .expect("receive_batch failed");
+                let now = Instant::now();
+                let count = batch.messages.len();
+                for msg in &batch.messages {
+                    let body: serde_json::Value =
+                        serde_json::from_slice(&msg.payload).unwrap_or_default();
+                    if let Some(id) = body.get("id").and_then(|v| v.as_i64()) {
+                        arrivals.entry(id).or_insert(now);
+                    }
+                }
+                (batch.commit)(vec![MessageDisposition::Ack; count])
+                    .await
+                    .expect("commit (ack) failed");
+            }
+            arrivals
+        });
+
+        // Insert one row at a time, recording the commit instant per id.
+        let mut sent: std::collections::HashMap<i64, Instant> = std::collections::HashMap::new();
+        let mut conn = connect_retry().await;
+        for id in 1..=n as i64 {
+            sqlx::query("INSERT INTO cdc_users (id, name) VALUES ($1, $2)")
+                .bind(id as i32)
+                .bind(format!("name-{id}"))
+                .execute(&mut conn)
+                .await
+                .expect("insert row");
+            sent.insert(id, Instant::now());
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        let arrivals = drain.await.expect("drain task panicked");
+        let mut lat_ms: Vec<f64> = sent
+            .iter()
+            .filter_map(|(id, t0)| {
+                arrivals
+                    .get(id)
+                    .map(|t1| t1.saturating_duration_since(*t0).as_secs_f64() * 1000.0)
+            })
+            .collect();
+        assert!(!lat_ms.is_empty(), "no latencies collected");
+        lat_ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let pct = |p: f64| lat_ms[(((lat_ms.len() as f64) * p) as usize).min(lat_ms.len() - 1)];
+        println!(
+            "postgres_cdc latency (n={}): p50={:.2}ms p95={:.2}ms p99={:.2}ms",
+            lat_ms.len(),
+            pct(0.50),
+            pct(0.95),
+            pct(0.99)
+        );
     })
     .await;
 }

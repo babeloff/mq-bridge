@@ -2751,6 +2751,14 @@ pub struct PostgresCdcConfig {
     /// Create the replication slot if it does not exist.
     #[serde(default = "default_true")]
     pub create_slot: bool,
+    /// Create the `publication` if missing (default false; leave off if it pre-exists).
+    /// Needs table ownership for `publication_tables`, or superuser when none are set (`FOR ALL TABLES`).
+    #[serde(default)]
+    pub create_publication: bool,
+    /// Tables to include when managing the publication (`create_publication`); may be `schema.table`.
+    /// Missing ones are added to an existing publication (never removed). Empty = `FOR ALL TABLES` (needs superuser).
+    #[serde(default)]
+    pub publication_tables: Vec<String>,
     /// Use a temporary slot (dropped on disconnect). Not restart-safe; default is a permanent slot.
     #[serde(default)]
     pub temporary_slot: bool,
@@ -2851,6 +2859,10 @@ pub struct SqlxConfig {
     pub publication: Option<String>,
     /// (Consumer only, CDC) Replication slot name; created if missing. Defaults to `mq_bridge_slot`.
     pub slot_name: Option<String>,
+    /// (Consumer only, CDC) When `publication` is set, create it if missing (default false).
+    /// Needs table-owner privilege: it is auto-published `FOR TABLE {table}`.
+    #[serde(default)]
+    pub create_publication: bool,
     /// TLS configuration for the database connection.
     #[serde(default)]
     pub tls: TlsConfig,

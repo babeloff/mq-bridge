@@ -312,9 +312,11 @@ class NatsConfig(TypedDict, total=False):
 class PostgresCdcConfig(TypedDict, total=False):
     """Postgres logical-replication CDC source (pgoutput). Source-only."""
     checkpoint_store: Optional[str]
+    create_publication: bool
     create_slot: bool
     cursor_id: Optional[str]
     publication: Required[str]
+    publication_tables: List[str]
     slot_name: str
     status_interval_ms: int
     temporary_slot: bool
@@ -388,6 +390,7 @@ class SqlxConfig(TypedDict, total=False):
     auto_create_table: bool
     bulk_copy: bool
     checkpoint_store: Optional[str]
+    create_publication: bool
     cursor_column: Optional[str]
     cursor_id: Optional[str]
     delete_after_read: bool

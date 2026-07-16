@@ -2238,6 +2238,11 @@
           ],
           "format": "password"
         },
+        "create_publication": {
+          "description": "Create the `publication` if missing (default false; leave off if it pre-exists).\nNeeds table ownership for `publication_tables`, or superuser when none are set (`FOR ALL TABLES`).",
+          "type": "boolean",
+          "default": false
+        },
         "create_slot": {
           "description": "Create the replication slot if it does not exist.",
           "type": "boolean",
@@ -2253,6 +2258,14 @@
         "publication": {
           "description": "Publication name (must already exist; defines which tables are captured).",
           "type": "string"
+        },
+        "publication_tables": {
+          "description": "Tables to include when managing the publication (`create_publication`); may be `schema.table`.\nMissing ones are added to an existing publication (never removed). Empty = `FOR ALL TABLES` (needs superuser).",
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
         },
         "slot_name": {
           "description": "Replication slot name; created if missing when `create_slot` is true.",
@@ -2611,6 +2624,11 @@
             "null"
           ],
           "format": "password"
+        },
+        "create_publication": {
+          "description": "(Consumer only, CDC) When `publication` is set, create it if missing (default false).\nNeeds table-owner privilege: it is auto-published `FOR TABLE {table}`.",
+          "type": "boolean",
+          "default": false
         },
         "cursor_column": {
           "description": "(Consumer only) Read an existing table **non-destructively** and resumably, paging by this\nmonotonic column (`SELECT * FROM {table} WHERE {cursor_column} > $last ORDER BY {cursor_column} ASC LIMIT n`)\nand persisting the last read value under `cursor_id`. Does not delete/lock source rows.\nMutually exclusive with `delete_after_read`.",

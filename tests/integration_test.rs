@@ -338,6 +338,46 @@ async fn test_postgres_cdc_restart() {
     }
 }
 
+/// Isolated CDC read throughput (seed untimed, time only the replication drain).
+#[cfg(all(feature = "postgres-cdc", feature = "test-utils"))]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires docker compose (postgres with wal_level=logical)"]
+async fn test_postgres_cdc_read_throughput() {
+    if should_run("postgres_cdc") || should_run("postgres") {
+        integration::postgres_cdc::test_postgres_cdc_read_throughput().await;
+    }
+}
+
+/// Per-change insert->capture latency (p50/p95/p99).
+#[cfg(all(feature = "postgres-cdc", feature = "test-utils"))]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires docker compose (postgres with wal_level=logical)"]
+async fn test_postgres_cdc_latency() {
+    if should_run("postgres_cdc") || should_run("postgres") {
+        integration::postgres_cdc::test_postgres_cdc_latency().await;
+    }
+}
+
+/// Isolated MongoDB change-stream read throughput (seed untimed, time only the drain).
+#[cfg(feature = "mongodb")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires docker compose (mongodb replica set)"]
+async fn test_mongodb_cdc_read_throughput() {
+    if should_run("mongodb_cdc") || should_run("mongodb") {
+        integration::mongodb::test_mongodb_cdc_read_throughput().await;
+    }
+}
+
+/// MongoDB change-stream per-change insert->capture latency (p50/p95/p99).
+#[cfg(feature = "mongodb")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires docker compose (mongodb replica set)"]
+async fn test_mongodb_cdc_latency() {
+    if should_run("mongodb_cdc") || should_run("mongodb") {
+        integration::mongodb::test_mongodb_cdc_latency().await;
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires docker compose, takes long time to run"]
 async fn test_all_performance_pipeline() {

@@ -622,6 +622,12 @@ fn sqlx_cfg_to_cdc(
             .clone()
             .unwrap_or_else(|| "mq_bridge_slot".to_string()),
         create_slot: true,
+        create_publication: cfg.create_publication,
+        publication_tables: if cfg.create_publication {
+            vec![cfg.table.clone()]
+        } else {
+            Vec::new()
+        },
         temporary_slot: false,
         cursor_id: cfg.cursor_id.clone(),
         checkpoint_store: cfg.checkpoint_store.clone(),

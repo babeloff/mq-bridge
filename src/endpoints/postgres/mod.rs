@@ -82,6 +82,16 @@ impl PostgresCdcConsumer {
             ));
         }
 
+        if config.create_publication {
+            replication::ensure_publication(
+                &config.url,
+                &config.publication,
+                &config.publication_tables,
+                &config.tls,
+            )
+            .await?;
+        }
+
         replication::ensure_slot(
             &config.url,
             &config.slot_name,
@@ -254,7 +264,7 @@ fn cdc_message(rel: &Relation, operation: &str, body: serde_json::Value) -> Cano
 /// and `[A-Za-z0-9_]` only. Slot names are additionally lowercased by Postgres,
 /// but rejecting anything outside this set is enough to keep the value from
 /// escaping into the replication command it is interpolated into.
-fn is_valid_pg_ident(s: &str) -> bool {
+pub(crate) fn is_valid_pg_ident(s: &str) -> bool {
     !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
