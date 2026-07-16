@@ -288,11 +288,21 @@ async fn add_missing_publication_tables(
             continue;
         }
         let sql = format!("ALTER PUBLICATION {publication} ADD TABLE {t}");
-        sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
+        match sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .execute(&mut *conn)
             .await
-            .map_err(|e| anyhow!("postgres-cdc: add table '{t}' to publication failed: {e}"))?;
-        warn!("postgres-cdc: added table '{t}' to publication '{publication}'");
+        {
+            Ok(_) => warn!("postgres-cdc: added table '{t}' to publication '{publication}'"),
+            // Lost the race to a concurrent reconciler; the table is now a member.
+            Err(e) if is_duplicate_object(&e) => {
+                debug!("postgres-cdc: table '{t}' already in publication '{publication}'")
+            }
+            Err(e) => {
+                return Err(anyhow!(
+                    "postgres-cdc: add table '{t}' to publication failed: {e}"
+                ))
+            }
+        }
     }
     Ok(())
 }

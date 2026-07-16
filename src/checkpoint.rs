@@ -156,15 +156,28 @@ pub fn default_meta_name(source: &str) -> String {
     if full.len() <= MAX {
         return full;
     }
-    // Truncate the source part and append a stable short hash to keep it unique (FNV-1a).
+    let suffix = format!("_{:08x}", fnv1a(source.as_bytes()));
+    let keep = (MAX - PREFIX.len() - suffix.len()).min(ident.len());
+    format!("{PREFIX}{}{suffix}", &ident[..keep])
+}
+
+/// Stable FNV-1a hash, used to disambiguate identifiers that collide after sanitization.
+fn fnv1a(bytes: &[u8]) -> u64 {
     let mut hash: u64 = 0xcbf29ce484222325;
-    for b in source.as_bytes() {
+    for b in bytes {
         hash ^= *b as u64;
         hash = hash.wrapping_mul(0x100000001b3);
     }
-    let suffix = format!("_{hash:08x}");
-    let keep = (MAX - PREFIX.len() - suffix.len()).min(ident.len());
-    format!("{PREFIX}{}{suffix}", &ident[..keep])
+    hash
+}
+
+/// Collision-resistant key for a cursor within an object-store checkpoint prefix. Sanitization
+/// alone can collide (`a.b` and `a_b` both become `a_b`), so a hash of the raw, pre-sanitized
+/// `source:cursor_id` pair is appended to keep distinct sources apart.
+fn object_store_checkpoint_key(source_name: &str, cursor_id: &str) -> String {
+    let sanitized = sanitize_ident(&checkpoint_key(source_name, cursor_id));
+    let hash = fnv1a(format!("{source_name}\0{cursor_id}").as_bytes());
+    format!("{sanitized}_{hash:08x}")
 }
 
 /// Namespaced key for a cursor within a (possibly shared) checkpoint store, so multiple sources
@@ -191,9 +204,13 @@ pub fn parse_checkpoint_store(spec: &str) -> anyhow::Result<CheckpointBackend> {
         // Cloud object stores: hand the whole URL to `object_store` (creds via env). `file` stays
         // on the local JSON store above; R2 uses `s3://` + a custom `AWS_ENDPOINT_URL`.
         "s3" | "s3a" | "gs" | "gcs" | "az" | "azure" | "abfs" | "abfss" => {
-            Ok(CheckpointBackend::ObjectStore {
-                url: spec.to_string(),
-            })
+            // `object_store` only recognizes `gs://` for GCS, not the `gcs://` alias.
+            let url = if scheme == "gcs" {
+                format!("gs:{}", spec.split_once(':').unwrap().1)
+            } else {
+                spec.to_string()
+            };
+            Ok(CheckpointBackend::ObjectStore { url })
         }
         _ => {
             // Schemeless -> source datastore, using the given name (strip a leading '/').
@@ -376,7 +393,7 @@ pub async fn build_external_store(
 /// no cross-process locking needed). URL/creds are resolved by `object_store` from env vars.
 #[cfg(feature = "object-store")]
 mod object_store_backend {
-    use super::{checkpoint_key, sanitize_ident, CheckpointStore};
+    use super::{object_store_checkpoint_key, CheckpointStore};
     use anyhow::Context;
     use async_trait::async_trait;
     use object_store::{path::Path as ObjPath, ObjectStore};
@@ -416,7 +433,8 @@ mod object_store_backend {
     }
 
     /// Build an object-store checkpoint store from a cloud URL. Each cursor gets its own object at
-    /// `<url prefix>/<sanitized source:cursor_id>`, so multiple cursors in one prefix never collide.
+    /// `<url prefix>/<sanitized source:cursor_id>_<hash>`, so multiple cursors in one prefix never
+    /// collide, even when sanitization alone would make two distinct sources look the same.
     pub(super) async fn build_object_store_checkpoint_store(
         url: &str,
         source_name: &str,
@@ -426,7 +444,7 @@ mod object_store_backend {
             .with_context(|| format!("Invalid object-store checkpoint URL '{url}'"))?;
         let (store, base) = object_store::parse_url(&parsed)
             .with_context(|| format!("Failed to build object store for '{url}'"))?;
-        let key = sanitize_ident(&checkpoint_key(source_name, cursor_id));
+        let key = object_store_checkpoint_key(source_name, cursor_id);
         let path = base.child(key);
         Ok(Arc::new(ObjectStoreCheckpointStore {
             store: Arc::from(store),
@@ -459,6 +477,14 @@ mod object_store_backend {
             assert_eq!(c2.load().await.unwrap(), None);
             c2.save("other").await.unwrap();
             assert_eq!(c1.load().await.unwrap(), Some("v2".to_string()));
+        }
+
+        #[test]
+        fn distinct_sources_that_collide_after_sanitization_get_distinct_keys() {
+            // "a.b" and "a_b" both sanitize to "a_b"; the hash suffix must still separate them.
+            let k1 = object_store_checkpoint_key("a.b", "cursor");
+            let k2 = object_store_checkpoint_key("a_b", "cursor");
+            assert_ne!(k1, k2);
         }
 
         // Exercises the real builder end-to-end (URL parse -> object_store::parse_url ->
@@ -535,6 +561,13 @@ mod tests {
             parse_checkpoint_store("file:///tmp/cursors.json").unwrap(),
             CheckpointBackend::File { .. }
         ));
+        // `gcs://` is an alias `object_store` doesn't recognize; normalize it to `gs://`.
+        assert_eq!(
+            parse_checkpoint_store("gcs://bucket/pre").unwrap(),
+            CheckpointBackend::ObjectStore {
+                url: "gs://bucket/pre".to_string()
+            }
+        );
     }
 
     // Uses Unix absolute paths; `Url::to_file_path` only maps these to a real path on Unix
