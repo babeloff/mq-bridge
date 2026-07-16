@@ -368,12 +368,15 @@ impl MessagePublisher for FilePublisher {
                 }
             };
 
-            if let Err(e) = writer.write_all(&serialized_msg).await {
+            // Write body + delimiter as one contiguous buffer so a concurrent
+            // tailing reader never observes the record without its delimiter
+            // (shrinks the torn-write window; the reader also guards against it).
+            let mut record = Vec::with_capacity(serialized_msg.len() + self.delimiter.len());
+            record.extend_from_slice(&serialized_msg);
+            record.extend_from_slice(&self.delimiter);
+            if let Err(e) = writer.write_all(&record).await {
                 tracing::error!("Failed to write message to file: {}", e);
                 failed_messages.push((msg, PublisherError::NonRetryable(anyhow::anyhow!(e))));
-            } else if let Err(e) = writer.write_all(&self.delimiter).await {
-                tracing::error!("Failed to write delimiter to file: {}", e);
-                return Err(PublisherError::NonRetryable(anyhow::anyhow!(e)));
             }
         }
 
@@ -729,10 +732,17 @@ fn run_file_tail_task_sync(
                 match read_until_bytes_sync(r, &delimiter, &mut buf) {
                     Ok(0) => break, // EOF
                     Ok(n) => {
-                        last_position += n as u64;
-                        if buf.ends_with(&delimiter) {
-                            buf.truncate(buf.len() - delimiter.len());
+                        if !buf.ends_with(&delimiter) {
+                            // Torn/partial line: the writer's content reached disk
+                            // ahead of its trailing delimiter. Don't advance the
+                            // position or emit a message; drop the reader so the
+                            // next iteration reopens and re-seeks to last_position,
+                            // re-reading the line whole once the writer finishes it.
+                            reader = None;
+                            break;
                         }
+                        last_position += n as u64;
+                        buf.truncate(buf.len() - delimiter.len());
                         if delimiter.len() == 1 && delimiter[0] == b'\n' && buf.ends_with(b"\r") {
                             buf.pop();
                         }

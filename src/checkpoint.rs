@@ -174,6 +174,7 @@ fn fnv1a(bytes: &[u8]) -> u64 {
 /// Collision-resistant key for a cursor within an object-store checkpoint prefix. Sanitization
 /// alone can collide (`a.b` and `a_b` both become `a_b`), so a hash of the raw, pre-sanitized
 /// `source:cursor_id` pair is appended to keep distinct sources apart.
+#[cfg(feature = "object-store")]
 fn object_store_checkpoint_key(source_name: &str, cursor_id: &str) -> String {
     let sanitized = sanitize_ident(&checkpoint_key(source_name, cursor_id));
     let hash = fnv1a(format!("{source_name}\0{cursor_id}").as_bytes());
@@ -557,8 +558,13 @@ mod tests {
             );
         }
         // `file://` stays on the local JSON store, not the object-store backend.
+        // Build the URL from a real host-absolute path so `Url::to_file_path`
+        // round-trips on Windows (needs a drive letter) as well as Unix.
+        let file_url = url::Url::from_file_path(std::env::temp_dir().join("cursors.json"))
+            .unwrap()
+            .to_string();
         assert!(matches!(
-            parse_checkpoint_store("file:///tmp/cursors.json").unwrap(),
+            parse_checkpoint_store(&file_url).unwrap(),
             CheckpointBackend::File { .. }
         ));
         // `gcs://` is an alias `object_store` doesn't recognize; normalize it to `gs://`.

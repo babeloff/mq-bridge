@@ -8,9 +8,10 @@ use mq_bridge::endpoints::mongodb::{
 };
 use mq_bridge::test_utils::{
     add_performance_result, run_chaos_pipeline_test, run_direct_perf_test,
-    run_performance_pipeline_test, run_performance_pipeline_test_named, run_pipeline_test,
-    run_test_with_docker, run_test_with_docker_controller, setup_logging, should_run,
-    verify_subscriber_logic, PerformanceResult,
+    run_performance_pipeline_test, run_performance_pipeline_test_at_least_once_named,
+    run_performance_pipeline_test_named, run_pipeline_test, run_test_with_docker,
+    run_test_with_docker_controller, setup_logging, should_run, verify_subscriber_logic,
+    PerformanceResult,
 };
 const CONFIG_YAML: &str = r#"
 routes:
@@ -272,7 +273,11 @@ pub async fn test_mongodb_cdc_performance_pipeline() {
                 "{out_capacity}",
                 &(PERF_TEST_MESSAGE_COUNT + 1000).to_string(),
             );
-            run_performance_pipeline_test_named(
+            // A MongoDB change stream is an at-least-once source: it redelivers events on any
+            // resume (getMore timeout / step-down / reconnect under load), so the collection's
+            // 100k unique documents can surface as slightly more than 100k reads. Assert full
+            // unique coverage (no loss) and tolerate those duplicate redeliveries.
+            run_performance_pipeline_test_at_least_once_named(
                 "mongodb_cdc",
                 "mongodb_cdc",
                 &config_yaml,
