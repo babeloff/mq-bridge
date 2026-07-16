@@ -1909,6 +1909,7 @@ pub struct MongoDbConfig {
     /// - `file:///var/lib/mqb/cursors.json` → local JSON file (read-only / write-restricted sources)
     /// - `mongodb://host/db/collection` → external MongoDB collection (collection optional)
     /// - `postgres://user@host/db/table` or `mysql://host/db/table` → external SQL table (table optional)
+    /// - `s3://bucket/prefix` (also `gs://`, `az://`, `abfs://`) → cloud object store; creds via env
     ///
     /// When no collection/table is named, it defaults to `mqb_cursors_<source_collection>`.
     /// May embed connection credentials, so it is treated as a secret.
@@ -2764,7 +2765,7 @@ pub struct PostgresCdcConfig {
     pub temporary_slot: bool,
     /// Checkpoint key for persisting the confirmed LSN across restarts (optional; the slot is authoritative).
     pub cursor_id: Option<String>,
-    /// Checkpoint store spec (e.g. `file:///path`); defaults to the source database.
+    /// Checkpoint store spec (e.g. `file:///path`, `s3://bucket/prefix`); defaults to the source database.
     #[cfg_attr(feature = "schema", schemars(extend("format"="password")))]
     pub checkpoint_store: Option<String>,
     /// Standby-status-update interval in ms; must be shorter than the server's `wal_sender_timeout`.
@@ -2837,6 +2838,7 @@ pub struct SqlxConfig {
     /// - `file:///var/lib/mqb/cursors.json` → local JSON file (read-only / write-restricted sources)
     /// - `postgres://user@host/db/table` or `mysql://host/db/table` → external SQL table (table optional)
     /// - `mongodb://host/db/collection` → external MongoDB collection (collection optional)
+    /// - `s3://bucket/prefix` (also `gs://`, `az://`, `abfs://`) → cloud object store; creds via env
     ///
     /// When no table/collection is named, it defaults to `mqb_cursors_<source_table>`.
     /// May embed connection credentials, so it is treated as a secret.
@@ -2935,6 +2937,7 @@ pub struct ClickHouseConfig {
     /// - `file:///var/lib/mqb/cursors.json` → local JSON file
     /// - `postgres://user@host/db/table` / `mysql://host/db/table` → external SQL table (table optional)
     /// - `mongodb://host/db/collection` → external MongoDB collection (collection optional)
+    /// - `s3://bucket/prefix` (also `gs://`, `az://`, `abfs://`) → cloud object store; creds via env
     ///
     /// May embed connection credentials, so it is treated as a secret.
     #[cfg_attr(feature = "schema", schemars(extend("format"="password")))]

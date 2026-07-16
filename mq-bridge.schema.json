@@ -210,7 +210,7 @@
           "default": false
         },
         "checkpoint_store": {
-          "description": "(Consumer only) Where to persist the resume cursor. Because ClickHouse is unsuited to per-row\ncursor upserts, a durable checkpoint requires an **external** store URL:\n- `file:///var/lib/mqb/cursors.json` → local JSON file\n- `postgres://user@host/db/table` / `mysql://host/db/table` → external SQL table (table optional)\n- `mongodb://host/db/collection` → external MongoDB collection (collection optional)\n\nMay embed connection credentials, so it is treated as a secret.",
+          "description": "(Consumer only) Where to persist the resume cursor. Because ClickHouse is unsuited to per-row\ncursor upserts, a durable checkpoint requires an **external** store URL:\n- `file:///var/lib/mqb/cursors.json` → local JSON file\n- `postgres://user@host/db/table` / `mysql://host/db/table` → external SQL table (table optional)\n- `mongodb://host/db/collection` → external MongoDB collection (collection optional)\n- `s3://bucket/prefix` (also `gs://`, `az://`, `abfs://`) → cloud object store; creds via env\n\nMay embed connection credentials, so it is treated as a secret.",
           "type": [
             "string",
             "null"
@@ -1796,7 +1796,7 @@
           "default": false
         },
         "checkpoint_store": {
-          "description": "(Consumer only) Where to persist the resume cursor in `capture_new`/`capture_all` mode. A URL\nselects the backend; a bare name (or `/name`) reuses the **source** database with that name:\n- absent → source database, collection `mqb_cursors_<source_collection>` (auto-unique)\n- `/my_cursors` → source database, collection `my_cursors`\n- `file:///var/lib/mqb/cursors.json` → local JSON file (read-only / write-restricted sources)\n- `mongodb://host/db/collection` → external MongoDB collection (collection optional)\n- `postgres://user@host/db/table` or `mysql://host/db/table` → external SQL table (table optional)\n\nWhen no collection/table is named, it defaults to `mqb_cursors_<source_collection>`.\nMay embed connection credentials, so it is treated as a secret.",
+          "description": "(Consumer only) Where to persist the resume cursor in `capture_new`/`capture_all` mode. A URL\nselects the backend; a bare name (or `/name`) reuses the **source** database with that name:\n- absent → source database, collection `mqb_cursors_<source_collection>` (auto-unique)\n- `/my_cursors` → source database, collection `my_cursors`\n- `file:///var/lib/mqb/cursors.json` → local JSON file (read-only / write-restricted sources)\n- `mongodb://host/db/collection` → external MongoDB collection (collection optional)\n- `postgres://user@host/db/table` or `mysql://host/db/table` → external SQL table (table optional)\n- `s3://bucket/prefix` (also `gs://`, `az://`, `abfs://`) → cloud object store; creds via env\n\nWhen no collection/table is named, it defaults to `mqb_cursors_<source_collection>`.\nMay embed connection credentials, so it is treated as a secret.",
           "type": [
             "string",
             "null"
@@ -2231,7 +2231,7 @@
       "type": "object",
       "properties": {
         "checkpoint_store": {
-          "description": "Checkpoint store spec (e.g. `file:///path`); defaults to the source database.",
+          "description": "Checkpoint store spec (e.g. `file:///path`, `s3://bucket/prefix`); defaults to the source database.",
           "type": [
             "string",
             "null"
@@ -2618,7 +2618,7 @@
           "default": false
         },
         "checkpoint_store": {
-          "description": "(Consumer only) Where to persist the resume cursor in `cursor_column` mode. A URL selects the\nbackend; a bare name (or `/name`) reuses the **source** datastore with that table name:\n- absent → source datastore, table `mqb_cursors_<source_table>` (auto-unique)\n- `/my_cursors` → source datastore, table `my_cursors`\n- `file:///var/lib/mqb/cursors.json` → local JSON file (read-only / write-restricted sources)\n- `postgres://user@host/db/table` or `mysql://host/db/table` → external SQL table (table optional)\n- `mongodb://host/db/collection` → external MongoDB collection (collection optional)\n\nWhen no table/collection is named, it defaults to `mqb_cursors_<source_table>`.\nMay embed connection credentials, so it is treated as a secret.",
+          "description": "(Consumer only) Where to persist the resume cursor in `cursor_column` mode. A URL selects the\nbackend; a bare name (or `/name`) reuses the **source** datastore with that table name:\n- absent → source datastore, table `mqb_cursors_<source_table>` (auto-unique)\n- `/my_cursors` → source datastore, table `my_cursors`\n- `file:///var/lib/mqb/cursors.json` → local JSON file (read-only / write-restricted sources)\n- `postgres://user@host/db/table` or `mysql://host/db/table` → external SQL table (table optional)\n- `mongodb://host/db/collection` → external MongoDB collection (collection optional)\n- `s3://bucket/prefix` (also `gs://`, `az://`, `abfs://`) → cloud object store; creds via env\n\nWhen no table/collection is named, it defaults to `mqb_cursors_<source_table>`.\nMay embed connection credentials, so it is treated as a secret.",
           "type": [
             "string",
             "null"

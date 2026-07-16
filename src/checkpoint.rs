@@ -3,8 +3,9 @@
 //! A cursor-read source persists the last successfully-sunk key so a restart resumes
 //! without re-emitting already-copied rows. The backing store is selected by `checkpoint_store`:
 //! the default keeps the cursor in the source datastore (a per-source `mqb_cursors_<source>`
-//! collection/table); a `file:///…` URL keeps it in a local JSON file for read-only sources; and
-//! a `postgres|mysql|mongodb://…` URL points it at a separate database entirely.
+//! collection/table); a `file:///…` URL keeps it in a local JSON file for read-only sources; a
+//! `postgres|mysql|mongodb://…` URL points it at a separate database entirely; and an
+//! `s3|gs|az|abfs://…` URL persists it to a cloud object store (one object per cursor).
 //!
 //! Values are opaque strings; each endpoint encodes its native key (a BSON `_id`, a SQL
 //! column value) into a string it can decode back.
@@ -127,6 +128,8 @@ pub enum CheckpointBackend {
         database: String,
         collection: Option<String>,
     },
+    /// `s3|gs|az|abfs://…` — a cloud object store; the full URL is handed to `object_store`.
+    ObjectStore { url: String },
 }
 
 /// Sanitize a source table/collection into an identifier-safe token (`[^A-Za-z0-9_] -> _`).
@@ -185,6 +188,13 @@ pub fn parse_checkpoint_store(spec: &str) -> anyhow::Result<CheckpointBackend> {
         "file" => parse_file_url(spec),
         "postgres" | "postgresql" | "mysql" | "mariadb" | "sqlite" => parse_sqlx_url(spec, &scheme),
         "mongodb" | "mongodb+srv" => parse_mongo_url(spec),
+        // Cloud object stores: hand the whole URL to `object_store` (creds via env). `file` stays
+        // on the local JSON store above; R2 uses `s3://` + a custom `AWS_ENDPOINT_URL`.
+        "s3" | "s3a" | "gs" | "gcs" | "az" | "azure" | "abfs" | "abfss" => {
+            Ok(CheckpointBackend::ObjectStore {
+                url: spec.to_string(),
+            })
+        }
         _ => {
             // Schemeless -> source datastore, using the given name (strip a leading '/').
             let name = spec.strip_prefix('/').unwrap_or(spec).to_string();
@@ -338,9 +348,134 @@ pub async fn build_external_store(
                 ))
             }
         }
+        CheckpointBackend::ObjectStore { url } => {
+            #[cfg(feature = "object-store")]
+            {
+                object_store_backend::build_object_store_checkpoint_store(
+                    &url,
+                    source_name,
+                    cursor_id,
+                )
+                .await
+            }
+            #[cfg(not(feature = "object-store"))]
+            {
+                let _ = (source_name, cursor_id);
+                Err(anyhow!(
+                    "checkpoint_store '{url}' requires the 'object-store' feature to be enabled"
+                ))
+            }
+        }
         CheckpointBackend::Source { .. } => Err(anyhow!(
             "internal: Source checkpoint backend must be built by the caller"
         )),
+    }
+}
+
+/// Cloud object-store checkpoint backend: one object per cursor key (no read-modify-write,
+/// no cross-process locking needed). URL/creds are resolved by `object_store` from env vars.
+#[cfg(feature = "object-store")]
+mod object_store_backend {
+    use super::{checkpoint_key, sanitize_ident, CheckpointStore};
+    use anyhow::Context;
+    use async_trait::async_trait;
+    use object_store::{path::Path as ObjPath, ObjectStore};
+    use std::sync::Arc;
+
+    struct ObjectStoreCheckpointStore {
+        store: Arc<dyn ObjectStore>,
+        path: ObjPath,
+    }
+
+    #[async_trait]
+    impl CheckpointStore for ObjectStoreCheckpointStore {
+        async fn load(&self) -> anyhow::Result<Option<String>> {
+            match self.store.get(&self.path).await {
+                Ok(result) => {
+                    let bytes = result.bytes().await.with_context(|| {
+                        format!("Failed to read checkpoint object '{}'", self.path)
+                    })?;
+                    let value = String::from_utf8(bytes.to_vec()).with_context(|| {
+                        format!("Checkpoint object '{}' is not valid UTF-8", self.path)
+                    })?;
+                    Ok(Some(value))
+                }
+                Err(object_store::Error::NotFound { .. }) => Ok(None),
+                Err(e) => Err(e)
+                    .with_context(|| format!("Failed to load checkpoint object '{}'", self.path)),
+            }
+        }
+
+        async fn save(&self, value: &str) -> anyhow::Result<()> {
+            self.store
+                .put(&self.path, value.to_string().into())
+                .await
+                .with_context(|| format!("Failed to save checkpoint object '{}'", self.path))?;
+            Ok(())
+        }
+    }
+
+    /// Build an object-store checkpoint store from a cloud URL. Each cursor gets its own object at
+    /// `<url prefix>/<sanitized source:cursor_id>`, so multiple cursors in one prefix never collide.
+    pub(super) async fn build_object_store_checkpoint_store(
+        url: &str,
+        source_name: &str,
+        cursor_id: &str,
+    ) -> anyhow::Result<Arc<dyn CheckpointStore>> {
+        let parsed = url::Url::parse(url)
+            .with_context(|| format!("Invalid object-store checkpoint URL '{url}'"))?;
+        let (store, base) = object_store::parse_url(&parsed)
+            .with_context(|| format!("Failed to build object store for '{url}'"))?;
+        let key = sanitize_ident(&checkpoint_key(source_name, cursor_id));
+        let path = base.child(key);
+        Ok(Arc::new(ObjectStoreCheckpointStore {
+            store: Arc::from(store),
+            path,
+        }))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use object_store::memory::InMemory;
+
+        #[tokio::test]
+        async fn object_store_round_trips_and_overwrites() {
+            let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+            let make = |key: &str| ObjectStoreCheckpointStore {
+                store: store.clone(),
+                path: ObjPath::from(format!("cursors/{key}")),
+            };
+
+            let c1 = make("a");
+            assert_eq!(c1.load().await.unwrap(), None);
+            c1.save("v1").await.unwrap();
+            assert_eq!(c1.load().await.unwrap(), Some("v1".to_string()));
+            c1.save("v2").await.unwrap();
+            assert_eq!(c1.load().await.unwrap(), Some("v2".to_string()));
+
+            // A second object in the same prefix is independent.
+            let c2 = make("b");
+            assert_eq!(c2.load().await.unwrap(), None);
+            c2.save("other").await.unwrap();
+            assert_eq!(c1.load().await.unwrap(), Some("v2".to_string()));
+        }
+
+        // Exercises the real builder end-to-end (URL parse -> object_store::parse_url ->
+        // key sanitize -> path.child) via the `memory://` scheme, so the path-derivation
+        // wiring is covered without any external service.
+        #[tokio::test]
+        async fn builder_round_trips_via_memory_url() {
+            let store =
+                build_object_store_checkpoint_store("memory:///mqb/cursors", "orders", "default")
+                    .await
+                    .unwrap();
+            assert_eq!(store.load().await.unwrap(), None);
+            store.save("42").await.unwrap();
+            assert_eq!(store.load().await.unwrap(), Some("42".to_string()));
+            store.save("43").await.unwrap();
+            assert_eq!(store.load().await.unwrap(), Some("43".to_string()));
+        }
     }
 }
 
@@ -383,6 +518,23 @@ mod tests {
                 name: "my_cursors".into()
             }
         );
+    }
+
+    #[test]
+    fn parse_object_store_schemes() {
+        for url in ["s3://bucket/pre", "gs://bucket/pre", "az://acct/container"] {
+            assert_eq!(
+                parse_checkpoint_store(url).unwrap(),
+                CheckpointBackend::ObjectStore {
+                    url: url.to_string()
+                }
+            );
+        }
+        // `file://` stays on the local JSON store, not the object-store backend.
+        assert!(matches!(
+            parse_checkpoint_store("file:///tmp/cursors.json").unwrap(),
+            CheckpointBackend::File { .. }
+        ));
     }
 
     // Uses Unix absolute paths; `Url::to_file_path` only maps these to a real path on Unix
