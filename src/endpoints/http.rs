@@ -1946,11 +1946,56 @@ fn build_http_client(config: &HttpConfig) -> anyhow::Result<HttpClient> {
     Ok(client_builder.build(https_connector))
 }
 
-/// Returns a shared HTTP client for these client-level settings, building one on first
-/// use. The request URL is per-message, so one client serves all targets it can reach.
+/// A set of independent pooled hyper clients that requests are round-robined across.
+///
+/// A single `legacy::Client` guards its connection pool with one mutex, so under high
+/// concurrency every in-flight request serialises on that lock — which caps publisher
+/// throughput and, unlike the server side (no shared lock), does not scale with cores.
+/// Sharding across several clients spreads that contention so send throughput scales.
+struct ShardedHttpClient {
+    clients: Vec<HttpClient>,
+    next: std::sync::atomic::AtomicUsize,
+}
+
+impl ShardedHttpClient {
+    /// Picks the next client, round-robin. Single-shard fast path avoids the atomic.
+    #[inline]
+    fn pick(&self) -> &HttpClient {
+        if self.clients.len() == 1 {
+            return &self.clients[0];
+        }
+        let idx = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % self.clients.len();
+        &self.clients[idx]
+    }
+}
+
+/// Number of pooled clients to shard across — matches available parallelism (capped) so
+/// pool-lock contention scales with cores, like the server side does.
+fn http_client_shard_count() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .clamp(1, 16)
+}
+
+/// Builds a sharded set of connection-pooling hyper clients for these connector settings.
+fn build_sharded_http_client(config: &HttpConfig) -> anyhow::Result<ShardedHttpClient> {
+    let shards = http_client_shard_count();
+    let mut clients = Vec::with_capacity(shards);
+    for _ in 0..shards {
+        clients.push(build_http_client(config)?);
+    }
+    Ok(ShardedHttpClient {
+        clients,
+        next: std::sync::atomic::AtomicUsize::new(0),
+    })
+}
+
+/// Returns a shared sharded HTTP client for these client-level settings, building one on
+/// first use. The request URL is per-message, so one client serves all targets it reaches.
 async fn create_shared_http_client(
     config: &HttpConfig,
-) -> anyhow::Result<std::sync::Arc<HttpClient>> {
+) -> anyhow::Result<std::sync::Arc<ShardedHttpClient>> {
     let identity = crate::connection_registry::connection_identity((
         config.tls.required,
         &config.tls.ca_file,
@@ -1965,7 +2010,7 @@ async fn create_shared_http_client(
         "http-client",
         identity,
         config.shared.unwrap_or(true),
-        move || async move { build_http_client(&config_clone) },
+        move || async move { build_sharded_http_client(&config_clone) },
     )
     .await
 }
@@ -1981,7 +2026,7 @@ async fn create_shared_http_client(
 #[derive(Clone)]
 pub struct HttpPublisher {
     /// Persistent HTTP client with connection pooling
-    client: std::sync::Arc<HttpClient>,
+    client: std::sync::Arc<ShardedHttpClient>,
     url: String,
     base_uri: hyper::Uri,
     /// Default HTTP method to use if not overridden by message metadata
@@ -2132,7 +2177,8 @@ impl MessagePublisher for HttpPublisher {
             PublisherError::NonRetryable(anyhow::anyhow!("Failed to build request: {}", e))
         })?;
 
-        let future = tokio::time::timeout(self.request_timeout, self.client.request(request));
+        let future =
+            tokio::time::timeout(self.request_timeout, self.client.pick().request(request));
 
         let response: hyper::Response<Incoming> = match future.await {
             Ok(Ok(resp)) => resp,

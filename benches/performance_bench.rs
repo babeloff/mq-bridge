@@ -597,83 +597,64 @@ pub mod file_delete_helper {
 #[cfg(feature = "http")]
 pub mod http_helper {
     use mq_bridge::endpoints::http::{HttpConsumer, HttpPublisher};
-    use mq_bridge::endpoints::memory::{MemoryConsumer, MemoryPublisher};
     use mq_bridge::models::HttpConfig;
     use mq_bridge::traits::{MessageConsumer, MessageDisposition, MessagePublisher};
-    use once_cell::sync::Lazy;
     use std::sync::Arc;
-    use std::sync::Mutex as StdMutex;
-    use tokio::sync::Mutex;
 
-    static CURRENT_URL: Lazy<StdMutex<String>> = Lazy::new(|| StdMutex::new(String::new()));
-
-    pub async fn create_consumer() -> Arc<Mutex<dyn MessageConsumer>> {
+    /// HTTP is a synchronous request/reply transport, so it does not fit the generic
+    /// write-then-read harness: that fills a buffer during the write phase and drains it during
+    /// the read phase, but for HTTP the buffer is an in-process channel — so "read" measures
+    /// memory, not the transport. There is no independent read for request/reply; the POST is
+    /// both the write and the read. We therefore measure the *coupled* round-trip throughput.
+    ///
+    /// This sets up a reliable HTTP server (a 200 is returned only once the message is
+    /// committed) whose consumer is continuously drained by a background task that commits
+    /// every message. The returned publisher thus completes a full network round-trip on every
+    /// send, so timing sends yields the true HTTP throughput. Abort the returned handle to stop
+    /// the drain task.
+    pub async fn setup_coupled() -> (Arc<dyn MessagePublisher>, tokio::task::JoinHandle<()>) {
         #[cfg(feature = "rustls")]
         crate::ensure_rustls_installed();
 
-        let http_config = HttpConfig {
+        let consumer_config = HttpConfig {
             url: "127.0.0.1:0".to_string(),
-            // Sufficient internal buffer to prevent backpressure during bursts
-            internal_buffer_size: Some(super::PERF_TEST_MESSAGE_COUNT * 2),
+            internal_buffer_size: Some(super::PERF_TEST_CONCURRENCY * 4),
             concurrency_limit: Some(super::PERF_TEST_CONCURRENCY * 2),
             request_timeout_ms: Some(10000),
-            fire_and_forget: false, // Reliable mode: wait for ack before HTTP response
+            fire_and_forget: false, // reliable: 200 is sent only after commit -> real round-trip
             ..Default::default()
         };
-
-        let mut http_consumer = HttpConsumer::new(&http_config)
+        let mut consumer = HttpConsumer::new(&consumer_config)
             .await
             .expect("Failed to create HttpConsumer");
-        let addr = http_consumer
+        let addr = consumer
             .bound_addr()
             .expect("HttpConsumer should have bound addr");
         let url = format!("http://{}", addr);
 
-        {
-            let mut lock = CURRENT_URL.lock().unwrap();
-            *lock = url;
-        }
-
-        // Setup an internal memory buffer to decouple the "Write" and "Read" phases of the benchmark.
-        // This allows the benchmark to finish writing all messages without deadlocking on the reader.
-        let topic = format!("http_perf_buffer_{}", fast_uuid_v7::gen_id());
-        let mem_config = mq_bridge::models::MemoryConfig {
-            topic,
-            capacity: Some(super::PERF_TEST_MESSAGE_COUNT * 10),
-            ..Default::default()
-        };
-        let mem_publisher = MemoryPublisher::new(&mem_config).unwrap();
-        let mem_consumer = MemoryConsumer::new(&mem_config).unwrap();
-
-        // Background task to bridge Http -> Memory.
-        // We only ACK the HTTP request once the message is safely accepted by the memory queue.
-        tokio::spawn(async move {
-            while let Ok(batch) = http_consumer.receive_batch(100).await {
+        // Drain + commit so every POST gets its 200 (this is what couples the round-trip).
+        let drain = tokio::spawn(async move {
+            while let Ok(batch) = consumer.receive_batch(128).await {
                 let count = batch.messages.len();
-                if count > 0 && mem_publisher.send_batch(batch.messages).await.is_ok() {
-                    let _ = (batch.commit)(vec![MessageDisposition::Ack; count]).await;
+                if count == 0 {
+                    continue;
                 }
+                let _ = (batch.commit)(vec![MessageDisposition::Ack; count]).await;
             }
         });
 
-        Arc::new(Mutex::new(mem_consumer))
-    }
-
-    pub async fn create_publisher() -> Arc<dyn MessagePublisher> {
-        #[cfg(feature = "rustls")]
-        crate::ensure_rustls_installed();
-        let url = {
-            let lock = CURRENT_URL.lock().unwrap();
-            lock.clone()
-        };
-        let config = HttpConfig {
-            url,
-            request_timeout_ms: Some(10000),
-            pool_idle_timeout_ms: Some(1000),
-            tcp_keepalive_ms: Some(1000),
-            ..Default::default()
-        };
-        Arc::new(HttpPublisher::new(&config).await.unwrap())
+        let publisher: Arc<dyn MessagePublisher> = Arc::new(
+            HttpPublisher::new(&HttpConfig {
+                url,
+                request_timeout_ms: Some(10000),
+                pool_idle_timeout_ms: Some(1000),
+                tcp_keepalive_ms: Some(1000),
+                ..Default::default()
+            })
+            .await
+            .unwrap(),
+        );
+        (publisher, drain)
     }
 }
 
@@ -1129,17 +1110,68 @@ fn performance_benchmarks(c: &mut Criterion) {
         PERF_TEST_CONCURRENCY,
         std::time::Duration::from_millis(1000)
     );
-    bench_backend!(
-        "http",
-        "http",
-        http_helper,
-        group,
-        &rt,
-        &BENCH_RESULTS,
-        PERF_TEST_MESSAGE_COUNT,
-        PERF_TEST_CONCURRENCY,
-        std::time::Duration::from_millis(20)
-    );
+    // HTTP is request/reply, so it can't be measured as decoupled write-then-read like the
+    // other endpoints (its "read" would just drain an in-process buffer at memory speed).
+    // Measure the coupled round-trip throughput and report it as both write and read.
+    #[cfg(feature = "http")]
+    if mq_bridge::test_utils::should_run_benchmark("http") {
+        group.bench_function("http_batch", |b| {
+            b.to_async(&rt).iter_custom(|iters| async move {
+                let (publisher, drain) = http_helper::setup_coupled().await;
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                let mut total = Duration::ZERO;
+                for _ in 0..iters {
+                    total += mq_bridge::test_utils::measure_write_performance(
+                        "http_batch",
+                        std::sync::Arc::clone(&publisher),
+                        PERF_TEST_MESSAGE_COUNT,
+                        PERF_TEST_CONCURRENCY,
+                    )
+                    .await;
+                }
+                drain.abort();
+                let msgs_per_sec =
+                    (iters as f64 * PERF_TEST_MESSAGE_COUNT as f64) / total.as_secs_f64();
+                let mut results = BENCH_RESULTS.lock().await;
+                let stats = results.entry("http".to_string()).or_default();
+                stats.write_performance = msgs_per_sec;
+                stats.read_performance = msgs_per_sec;
+                println!(
+                    "\nhttp batch (coupled round-trip): {:.2} msgs/sec",
+                    msgs_per_sec
+                );
+                total
+            })
+        });
+        group.bench_function("http_single", |b| {
+            b.to_async(&rt).iter_custom(|iters| async move {
+                let (publisher, drain) = http_helper::setup_coupled().await;
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                let mut total = Duration::ZERO;
+                for _ in 0..iters {
+                    total += mq_bridge::test_utils::measure_single_write_performance(
+                        "http_single",
+                        std::sync::Arc::clone(&publisher),
+                        PERF_TEST_MESSAGE_COUNT,
+                        PERF_TEST_CONCURRENCY,
+                    )
+                    .await;
+                }
+                drain.abort();
+                let msgs_per_sec =
+                    (iters as f64 * PERF_TEST_MESSAGE_COUNT as f64) / total.as_secs_f64();
+                let mut results = BENCH_RESULTS.lock().await;
+                let stats = results.entry("http".to_string()).or_default();
+                stats.single_write_performance = msgs_per_sec;
+                stats.single_read_performance = msgs_per_sec;
+                println!(
+                    "\nhttp single (coupled round-trip): {:.2} msgs/sec",
+                    msgs_per_sec
+                );
+                total
+            })
+        });
+    }
     bench_backend!(
         "websocket",
         "websocket",
