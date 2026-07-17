@@ -25,6 +25,7 @@ Middleware = dict
 MongoDbConfig = dict
 MqttConfig = dict
 NatsConfig = dict
+ObjectStoreConfig = dict
 PostgresCdcConfig = dict
 RandomPanicMiddleware = dict
 RedisStreamsConfig = dict
@@ -47,7 +48,9 @@ MongoDbFormat = str
 MqttProtocol = str
 NatsDeliverPolicy = str
 StaticConfig = str
+WeakJoinTimeout = str
 WebSocketExecutionMode = str
+ZeroMqFormat = str
 ZeroMqSocketType = str
 RouteConfig = Route
 EndpointConfig = Endpoint
@@ -86,6 +89,7 @@ __all__ = [
     "MqttProtocol",
     "NatsConfig",
     "NatsDeliverPolicy",
+    "ObjectStoreConfig",
     "PostgresCdcConfig",
     "RandomPanicMiddleware",
     "RedisStreamsConfig",
@@ -101,8 +105,10 @@ __all__ = [
     "SwitchConfig",
     "TlsConfig",
     "WeakJoinMiddleware",
+    "WeakJoinTimeout",
     "WebSocketConfig",
     "WebSocketExecutionMode",
     "ZeroMqConfig",
+    "ZeroMqFormat",
     "ZeroMqSocketType",
 ]

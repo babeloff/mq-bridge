@@ -701,6 +701,8 @@ pub enum EndpointType {
     Kafka(KafkaConfig),
     Nats(NatsConfig),
     File(FileConfig),
+    #[serde(rename = "object_store", alias = "objectstore", alias = "s3")]
+    ObjectStore(ObjectStoreConfig),
     Static(StaticConfig),
     Ref(String),
     Memory(MemoryConfig),
@@ -741,6 +743,7 @@ impl EndpointType {
             EndpointType::Kafka(_) => "kafka",
             EndpointType::Nats(_) => "nats",
             EndpointType::File(_) => "file",
+            EndpointType::ObjectStore(_) => "object_store",
             EndpointType::Static(_) => "static",
             EndpointType::Ref(_) => "ref",
             EndpointType::Memory(_) => "memory",
@@ -960,19 +963,40 @@ impl Default for CookieJarMiddleware {
 
 /// Weak Join middleware configuration.
 ///
-/// Groups and correlates messages based on a metadata key, waiting for a specified number
-/// of messages within a timeout window before processing them as a batch.
-/// Messages that exceed the timeout are processed individually.
+/// Correlates messages by a metadata key and joins them within a timeout window.
+/// Count mode (default) waits for `expected_count` messages and emits a JSON array.
+/// Branch mode (set `branch_by`) waits for named branches and emits a branch-keyed object.
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct WeakJoinMiddleware {
     /// The metadata key to group messages by (e.g., "correlation_id").
     pub group_by: String,
-    /// The number of messages to wait for.
+    /// The number of messages (count mode) or distinct branches (branch mode) to wait for.
     pub expected_count: usize,
     /// Timeout in milliseconds.
     pub timeout_ms: u64,
+    /// Metadata key naming each message's branch; enables branch mode when set.
+    #[serde(default)]
+    pub branch_by: Option<String>,
+    /// Branch names that must all arrive before firing (branch mode; overrides expected_count).
+    #[serde(default)]
+    pub required: Vec<String>,
+    /// What to do with an incomplete group when the timeout expires.
+    #[serde(default)]
+    pub on_timeout: WeakJoinTimeout,
+}
+
+/// Action taken on an incomplete weak-join group when its timeout expires.
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum WeakJoinTimeout {
+    /// Emit the partial join (current behavior).
+    #[default]
+    Fire,
+    /// Drop the incomplete group without emitting.
+    Discard,
 }
 
 /// Fault injection modes for testing error handling and recovery mechanisms.
@@ -1312,6 +1336,8 @@ pub enum FileConsumerMode {
     /// of the file. If `delete` is true, processed lines are physically removed
     /// from the file once they are successfully acknowledged.
     Consume {
+        /// If true, processed lines are physically removed from the file once
+        /// they are successfully acknowledged.
         #[serde(default)]
         delete: bool,
     },
@@ -1319,6 +1345,8 @@ pub enum FileConsumerMode {
     /// at the current end. If `delete` is true, lines are removed only after
     /// all local application subscribers for this specific file have acknowledged them.
     Subscribe {
+        /// If true, lines are removed only after all local application
+        /// subscribers for this file have acknowledged them.
         #[serde(default)]
         delete: bool,
     },
@@ -1361,6 +1389,68 @@ impl FileConfig {
     /// Returns the effective consumer mode, defaulting to `Consume` if not set.
     pub fn effective_mode(&self) -> FileConsumerMode {
         self.mode.clone().unwrap_or_default()
+    }
+}
+
+// --- Object Store (S3/GCS/Azure) Specific Configuration ---
+
+/// Configuration for a cloud object-store endpoint (S3, GCS, Azure Blob, R2, ...).
+///
+/// As a **sink**, each flushed batch is written as one immutable object under `url`,
+/// named `<prefix>/[YYYY/MM/DD/]<uuidv7>.<ext>`. As a **source**, objects under `url`
+/// are listed in key order, fetched, split by `delimiter`, and emitted as messages;
+/// progress is persisted to `checkpoint_store` (the last processed object key) so a
+/// restart resumes without re-emitting. Objects are never mutated or deleted in place.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ObjectStoreConfig {
+    /// Object-store URL, e.g. `s3://bucket/prefix`, `gs://bucket/prefix`,
+    /// `az://account/container/prefix`. Credentials are resolved from the environment by
+    /// the `object_store` crate (same mechanism as the checkpoint backend); R2 uses
+    /// `s3://` plus a custom `AWS_ENDPOINT_URL`.
+    pub url: String,
+    /// Record encoding within an object, shared with the file endpoint. Defaults to
+    /// `normal` (one JSON `CanonicalMessage` per line). CSV is supported for sources only.
+    #[serde(default)]
+    pub format: FileFormat,
+    /// Record delimiter within an object. Defaults to newline ("\n"). Can be a string or a
+    /// hex sequence (e.g. "0x00").
+    pub delimiter: Option<String>,
+    /// (Source only) Durable resume store URL recording the last processed object key, e.g.
+    /// `file:///var/lib/mqb/obj.json`, `s3://bucket/cursors`, or `postgres://…`. Without it
+    /// every restart re-lists and re-emits all objects.
+    pub checkpoint_store: Option<String>,
+    /// (Source only) Cursor id namespacing the checkpoint key; enables durable resume.
+    pub cursor_id: Option<String>,
+    /// (Source only) Idle poll interval in milliseconds when no new objects are found.
+    /// Defaults to 1000.
+    pub polling_interval_ms: Option<u64>,
+    /// (Source only) Maximum size in bytes of a single object to fetch into memory. An object
+    /// larger than this fails the read (surfaced as a consumer error) instead of being
+    /// buffered whole. Unset means no limit (the whole object is materialized).
+    pub max_object_bytes: Option<u64>,
+    /// (Sink only) Prepend a `YYYY/MM/DD/` path (write time, UTC) to each object key. Purely
+    /// for readability / lifecycle rules — the uuidv7 name already sorts by time. Default true.
+    #[serde(default = "default_true")]
+    pub date_partition: bool,
+    /// (Sink only) Extension for written objects, without the dot. Defaults to a value derived
+    /// from `format` (`jsonl`, `json`, `txt`, or `bin`).
+    pub extension: Option<String>,
+}
+
+impl Default for ObjectStoreConfig {
+    fn default() -> Self {
+        Self {
+            url: String::new(),
+            format: FileFormat::default(),
+            delimiter: None,
+            checkpoint_store: None,
+            cursor_id: None,
+            polling_interval_ms: None,
+            max_object_bytes: None,
+            date_partition: true,
+            extension: None,
+        }
     }
 }
 
@@ -1884,6 +1974,7 @@ pub struct MongoDbConfig {
     /// - `file:///var/lib/mqb/cursors.json` → local JSON file (read-only / write-restricted sources)
     /// - `mongodb://host/db/collection` → external MongoDB collection (collection optional)
     /// - `postgres://user@host/db/table` or `mysql://host/db/table` → external SQL table (table optional)
+    /// - `s3://bucket/prefix` (also `gs://`, `az://`, `abfs://`) → cloud object store; creds via env
     ///
     /// When no collection/table is named, it defaults to `mqb_cursors_<source_collection>`.
     /// May embed connection credentials, so it is treated as a secret.
@@ -2063,6 +2154,9 @@ pub struct ZeroMqConfig {
     /// Internal buffer size for the channel. Defaults to 128.
     #[serde(default)]
     pub internal_buffer_size: Option<usize>,
+    /// Wire format: `json` wraps the CanonicalMessage; `raw` sends payload bytes per frame; `raw_framed` adds a JSON metadata frame. Default `json`.
+    #[serde(default)]
+    pub format: ZeroMqFormat,
 }
 
 impl ZeroMqConfig {
@@ -2083,6 +2177,23 @@ impl ZeroMqConfig {
         self.bind = bind;
         self
     }
+}
+
+/// ZeroMQ wire format.
+///
+/// `json` wraps each message as a JSON CanonicalMessage (batched into one frame);
+/// `raw` sends/receives the payload bytes directly, one frame per message (metadata
+/// is not transmitted); `raw_framed` sends a two-frame message — a JSON metadata frame
+/// followed by the raw payload frame — keeping the payload binary-safe while still
+/// carrying headers. Use `raw`/`raw_framed` for binary feeds such as JPEG, Avro or Protobuf.
+#[derive(Debug, Deserialize, Serialize, Clone, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum ZeroMqFormat {
+    #[default]
+    Json,
+    Raw,
+    RawFramed,
 }
 
 /// ZeroMQ socket type.
@@ -2342,9 +2453,9 @@ pub struct HttpConfig {
     /// Minimum message size in bytes to compress. Messages smaller than this are sent uncompressed. Defaults to 1024 bytes.
     #[serde(default)]
     pub compression_threshold_bytes: Option<usize>,
-    /// HTTP Basic Authentication credentials (username, password). For consumers: validates incoming requests. For publishers: adds Authorization header.
     /// (Consumer only) Maximum number of concurrent requests to handle. Defaults to 100.
     pub concurrency_limit: Option<usize>,
+    /// HTTP Basic Authentication credentials (username, password). For consumers: validates incoming requests. For publishers: adds Authorization header.
     #[cfg_attr(feature = "schema", schemars(extend("format"="password")))]
     #[serde(
         default,
@@ -2706,12 +2817,20 @@ pub struct PostgresCdcConfig {
     /// Create the replication slot if it does not exist.
     #[serde(default = "default_true")]
     pub create_slot: bool,
+    /// Create the `publication` if missing (default false; leave off if it pre-exists).
+    /// Needs table ownership for `publication_tables`, or superuser when none are set (`FOR ALL TABLES`).
+    #[serde(default)]
+    pub create_publication: bool,
+    /// Tables to include when managing the publication (`create_publication`); may be `schema.table`.
+    /// Missing ones are added to an existing publication (never removed). Empty = `FOR ALL TABLES` (needs superuser).
+    #[serde(default)]
+    pub publication_tables: Vec<String>,
     /// Use a temporary slot (dropped on disconnect). Not restart-safe; default is a permanent slot.
     #[serde(default)]
     pub temporary_slot: bool,
     /// Checkpoint key for persisting the confirmed LSN across restarts (optional; the slot is authoritative).
     pub cursor_id: Option<String>,
-    /// Checkpoint store spec (e.g. `file:///path`); defaults to the source database.
+    /// Checkpoint store spec (e.g. `file:///path`, `s3://bucket/prefix`); defaults to the source database.
     #[cfg_attr(feature = "schema", schemars(extend("format"="password")))]
     pub checkpoint_store: Option<String>,
     /// Standby-status-update interval in ms; must be shorter than the server's `wal_sender_timeout`.
@@ -2784,6 +2903,7 @@ pub struct SqlxConfig {
     /// - `file:///var/lib/mqb/cursors.json` → local JSON file (read-only / write-restricted sources)
     /// - `postgres://user@host/db/table` or `mysql://host/db/table` → external SQL table (table optional)
     /// - `mongodb://host/db/collection` → external MongoDB collection (collection optional)
+    /// - `s3://bucket/prefix` (also `gs://`, `az://`, `abfs://`) → cloud object store; creds via env
     ///
     /// When no table/collection is named, it defaults to `mqb_cursors_<source_table>`.
     /// May embed connection credentials, so it is treated as a secret.
@@ -2806,6 +2926,10 @@ pub struct SqlxConfig {
     pub publication: Option<String>,
     /// (Consumer only, CDC) Replication slot name; created if missing. Defaults to `mq_bridge_slot`.
     pub slot_name: Option<String>,
+    /// (Consumer only, CDC) When `publication` is set, create it if missing (default false).
+    /// Needs table-owner privilege: it is auto-published `FOR TABLE {table}`.
+    #[serde(default)]
+    pub create_publication: bool,
     /// TLS configuration for the database connection.
     #[serde(default)]
     pub tls: TlsConfig,
@@ -2878,6 +3002,7 @@ pub struct ClickHouseConfig {
     /// - `file:///var/lib/mqb/cursors.json` → local JSON file
     /// - `postgres://user@host/db/table` / `mysql://host/db/table` → external SQL table (table optional)
     /// - `mongodb://host/db/collection` → external MongoDB collection (collection optional)
+    /// - `s3://bucket/prefix` (also `gs://`, `az://`, `abfs://`) → cloud object store; creds via env
     ///
     /// May embed connection credentials, so it is treated as a secret.
     #[cfg_attr(feature = "schema", schemars(extend("format"="password")))]

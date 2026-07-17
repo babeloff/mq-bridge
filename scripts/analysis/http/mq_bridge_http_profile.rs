@@ -51,6 +51,13 @@ async fn main() -> anyhow::Result<()> {
 
     if matches!(
         args.mode,
+        ProfileMode::PublisherDirect | ProfileMode::PublisherRoute
+    ) {
+        return run_publisher_load(args).await;
+    }
+
+    if matches!(
+        args.mode,
         ProfileMode::DirectConsumer
             | ProfileMode::DirectConsumerAck
             | ProfileMode::DirectConsumerFireForget
@@ -142,6 +149,11 @@ enum ProfileMode {
     DirectConsumerFireForget,
     InlineResponse,
     InlineBodyOnly,
+    /// Drive `HttpPublisher` directly with `--clients` concurrent senders (isolates the
+    /// publisher from the route pipeline; compare against `--client-url` raw client).
+    PublisherDirect,
+    /// Drive a full memory-source -> HTTP-output route (the real publish path).
+    PublisherRoute,
 }
 
 #[cfg(feature = "http")]
@@ -251,6 +263,8 @@ fn parse_mode(value: &str) -> ProfileMode {
         }
         "inline-response" | "inline_response" => ProfileMode::InlineResponse,
         "inline-body-only" | "inline_body_only" => ProfileMode::InlineBodyOnly,
+        "publisher-direct" | "publisher_direct" => ProfileMode::PublisherDirect,
+        "publisher-route" | "publisher_route" => ProfileMode::PublisherRoute,
         other => {
             eprintln!("invalid --mode: {other}");
             print_help();
@@ -285,7 +299,9 @@ fn print_help() {
     eprintln!(
         "Usage: mq_bridge_http_profile [--mode MODE] [--port PORT] [--duration-s SECONDS] [--path PATH]\n\
          Options:\n\
-           --mode MODE                 route | route-fire-forget | route-handler | immediate | metadata | channel-ack | worker-local-ack | direct-consumer | direct-consumer-ack | direct-consumer-fire-forget | inline-response | inline-body-only (default route)\n\
+           --mode MODE                 route | route-fire-forget | route-handler | immediate | metadata | channel-ack | worker-local-ack | direct-consumer | direct-consumer-ack | direct-consumer-fire-forget | inline-response | inline-body-only | publisher-direct | publisher-route (default route)\n\
+           publisher-direct            Drive HttpPublisher directly with --clients senders against an in-process sink\n\
+           publisher-route             Drive a memory->http route (uses --route-concurrency / --batch-size)\n\
            --client-url URL            run Rust load client instead of server\n\
            --clients N                 Rust load client concurrency (default 8)\n\
            --header-count N            Add N synthetic request headers in Rust load client (default 0)\n\
@@ -614,6 +630,177 @@ fn build_metadata(req: &Request<Incoming>) -> HashMap<String, String> {
     }
 
     metadata
+}
+
+/// Spawns a minimal in-process HTTP sink that counts every request it receives.
+/// Used as the target for the publisher-under-test modes.
+#[cfg(feature = "http")]
+async fn spawn_sink_server(
+    counter: Arc<std::sync::atomic::AtomicU64>,
+) -> anyhow::Result<SocketAddr> {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                break;
+            };
+            let io = TokioIo::new(stream);
+            let counter = counter.clone();
+            tokio::spawn(async move {
+                let service = service_fn(move |req: Request<Incoming>| {
+                    let counter = counter.clone();
+                    async move {
+                        let _ = req.into_body().collect().await;
+                        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        Ok::<_, Infallible>(Response::new(full("ok")))
+                    }
+                });
+                let builder = AutoBuilder::new(TokioExecutor::new());
+                let _ = builder.serve_connection(io, service).await;
+            });
+        }
+    });
+    Ok(addr)
+}
+
+/// Measures throughput of mq-bridge's own `HttpPublisher`, either driven directly
+/// (`publisher-direct`) or through a full memory->http route (`publisher-route`).
+/// Requests are counted at an in-process sink, so the number is delivered req/s.
+#[cfg(feature = "http")]
+async fn run_publisher_load(args: ProfileArgs) -> anyhow::Result<()> {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+    // Install the process-level rustls provider (the HTTP publisher builds a client TLS
+    // config even for plain http:// targets).
+    #[cfg(feature = "rustls-aws-lc")]
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    #[cfg(all(feature = "rustls-ring", not(feature = "rustls-aws-lc")))]
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    let counter = Arc::new(AtomicU64::new(0));
+    let addr = spawn_sink_server(counter.clone()).await?;
+    let url = format!("http://{}{}", addr, args.path);
+
+    let mut http = HttpConfig::new(url);
+    http.method = Some("POST".to_string());
+    http.request_timeout_ms = Some(args.request_timeout_ms);
+
+    println!(
+        "READY sink=http://{}{} mode={:?} duration_s={} clients={} route_concurrency={} batch_size={}",
+        addr, args.path, args.mode, args.duration_s, args.clients, args.route_concurrency, args.batch_size
+    );
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let mut route_handle = None;
+    let mut tasks: Vec<tokio::task::JoinHandle<anyhow::Result<()>>> = Vec::new();
+
+    match args.mode {
+        ProfileMode::PublisherDirect => {
+            // MQB_PER_SENDER_CLIENT=1 gives each sender its own HttpPublisher (own pooled
+            // client) instead of one shared client — isolates shared connection-pool
+            // contention, which is the suspect for send not scaling with cores.
+            let per_sender = std::env::var("MQB_PER_SENDER_CLIENT").as_deref() == Ok("1");
+            let shared_publisher: Option<Arc<dyn MessagePublisher>> = if per_sender {
+                None
+            } else {
+                Some(Arc::new(
+                    mq_bridge::endpoints::http::HttpPublisher::new(&http).await?,
+                ))
+            };
+            for _ in 0..args.clients {
+                let stop = stop.clone();
+                let publisher: Arc<dyn MessagePublisher> = match &shared_publisher {
+                    Some(p) => p.clone(),
+                    None => {
+                        let mut http = http.clone();
+                        http.shared = Some(false);
+                        Arc::new(mq_bridge::endpoints::http::HttpPublisher::new(&http).await?)
+                    }
+                };
+                tasks.push(tokio::spawn(async move {
+                    while !stop.load(Ordering::Relaxed) {
+                        let msg = CanonicalMessage::new_bytes(Bytes::from_static(PAYLOAD), None);
+                        publisher
+                            .send(msg)
+                            .await
+                            .map_err(|e| anyhow::anyhow!("producer send failed: {e}"))?;
+                    }
+                    Ok(())
+                }));
+            }
+        }
+        ProfileMode::PublisherRoute => {
+            let topic = format!("pub_route_{}", std::process::id());
+            // Small item bound so the feeder is paced by the consumer (backpressure).
+            let input = Endpoint::new_memory(&topic, 256);
+            let channel = input.channel().expect("memory endpoint has a channel");
+            let route = Route::new(input.clone(), Endpoint::new(EndpointType::Http(http)))
+                .with_concurrency(args.route_concurrency)
+                .with_commit_concurrency_limit(args.commit_concurrency_limit)
+                .with_batch_size(args.batch_size);
+            route_handle = Some(route.run("pub_route").await?);
+
+            let batch_size = args.batch_size;
+            let stop_feeder = stop.clone();
+            tasks.push(tokio::spawn(async move {
+                while !stop_feeder.load(Ordering::Relaxed) {
+                    let batch: Vec<CanonicalMessage> = (0..batch_size)
+                        .map(|_| CanonicalMessage::new_bytes(Bytes::from_static(PAYLOAD), None))
+                        .collect();
+                    channel
+                        .fill_messages(batch)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("route feeder fill_messages failed: {e}"))?;
+                }
+                channel.close();
+                Ok(())
+            }));
+        }
+        _ => unreachable!("run_publisher_load called with non-publisher mode"),
+    }
+
+    // Warm up, then measure a steady-state window.
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    let c0 = counter.load(Ordering::Relaxed);
+    let t0 = std::time::Instant::now();
+    tokio::time::sleep(std::time::Duration::from_secs(args.duration_s)).await;
+    let delivered = counter.load(Ordering::Relaxed) - c0;
+    let elapsed = t0.elapsed().as_secs_f64();
+
+    let rate = delivered as f64 / elapsed;
+    println!(
+        "Publisher load ({:?}): {} requests in {:.2}s ({:.0} req/s)",
+        args.mode, delivered, elapsed, rate
+    );
+
+    // Tear down. Abort producer tasks first (a route feeder may be parked in a full
+    // channel), then stop the route. A producer that exited with an error *before* this
+    // shutdown means the measured rate is bogus, so reject the whole run in that case;
+    // a task cancelled by the abort is the normal shutdown path.
+    stop.store(true, Ordering::Relaxed);
+    let mut producer_error: Option<anyhow::Error> = None;
+    for task in tasks {
+        task.abort();
+        match task.await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                if producer_error.is_none() {
+                    producer_error = Some(e);
+                }
+            }
+            Err(e) if e.is_cancelled() => {}
+            Err(e) => std::panic::resume_unwind(e.into_panic()),
+        }
+    }
+    if let Some(handle) = route_handle {
+        handle.stop().await;
+        let _ = handle.join().await;
+    }
+    if let Some(e) = producer_error {
+        return Err(e);
+    }
+    Ok(())
 }
 
 #[cfg(feature = "http")]

@@ -14,6 +14,13 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex as AsyncMutex, Semaphore};
 
+/// Minimal view of the test payload used to extract the message id without
+/// parsing the whole JSON object into a `serde_json::Value`.
+#[derive(serde::Deserialize)]
+struct MessageNumHeader {
+    message_num: u64,
+}
+
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::filter::EnvFilter;
 use tracing_subscriber::layer::SubscriberExt;
@@ -346,7 +353,17 @@ impl TestHarness {
 }
 
 pub async fn run_pipeline_test(broker_name: &str, config_yaml: &str) {
-    run_pipeline_test_internal(broker_name, broker_name, config_yaml, 5, false, None, 0).await;
+    run_pipeline_test_internal(
+        broker_name,
+        broker_name,
+        config_yaml,
+        5,
+        false,
+        None,
+        0,
+        false,
+    )
+    .await;
 }
 
 pub async fn run_performance_pipeline_test(
@@ -375,6 +392,30 @@ pub async fn run_performance_pipeline_test_named(
         true,
         None,
         0,
+        false,
+    )
+    .await;
+}
+
+/// Like [`run_performance_pipeline_test_named`], but for pipelines whose read side is a genuine
+/// at-least-once source (e.g. a MongoDB change stream, which redelivers on any resume). The count
+/// assertion then requires every message to arrive at least once (no loss) and tolerates duplicates
+/// rather than demanding exact-once totals — reflecting the CDC contract instead of masking a bug.
+pub async fn run_performance_pipeline_test_at_least_once_named(
+    broker_name: &str,
+    display_name: &str,
+    config_yaml: &str,
+    num_messages: usize,
+) {
+    run_pipeline_test_internal(
+        broker_name,
+        display_name,
+        config_yaml,
+        num_messages,
+        true,
+        None,
+        0,
+        true,
     )
     .await;
 }
@@ -551,10 +592,12 @@ pub async fn run_chaos_pipeline_test(
         false,
         Some(injector),
         allowed_loss,
+        false,
     )
     .await;
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_pipeline_test_internal(
     broker_name: &str,
     display_name: &str,
@@ -563,6 +606,11 @@ async fn run_pipeline_test_internal(
     is_performance_test: bool,
     chaos_injector: Option<Box<dyn FnOnce() -> BoxFuture<'static, ()> + Send>>,
     allowed_loss: usize,
+    // Perf pipelines whose read side is a genuine at-least-once source (e.g. a MongoDB change
+    // stream, which by design redelivers on any resume). Delivering *more* than `num_messages` is
+    // then correct, not a bug, so the count assertion checks unique coverage (no loss) instead of
+    // exact equality. Only meaningful when `is_performance_test` is true.
+    at_least_once: bool,
 ) {
     let yaml_val: serde_yaml_ng::Value =
         serde_yaml_ng::from_str(config_yaml).expect("Failed to parse YAML config");
@@ -660,12 +708,10 @@ async fn run_pipeline_test_internal(
     while wait_start.elapsed() < timeout {
         let batch = harness.out_channel.drain_messages();
         if !batch.is_empty() {
-            if !is_performance_test {
+            if !is_performance_test || at_least_once {
                 for msg in &batch {
-                    if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&msg.payload) {
-                        if let Some(num) = val.get("message_num").and_then(|v| v.as_u64()) {
-                            unique_received_ids.insert(num);
-                        }
+                    if let Ok(hdr) = serde_json::from_slice::<MessageNumHeader>(&msg.payload) {
+                        unique_received_ids.insert(hdr.message_num);
                     }
                 }
             }
@@ -673,7 +719,14 @@ async fn run_pipeline_test_internal(
         }
 
         if is_performance_test {
-            if received.len() >= num_messages {
+            // At-least-once perf pipelines finish when every message has arrived at least once
+            // (duplicates keep total above num_messages); exact-once ones finish on total count.
+            let done = if at_least_once {
+                unique_received_ids.len() >= num_messages
+            } else {
+                received.len() >= num_messages
+            };
+            if done {
                 break;
             }
         } else if unique_received_ids.len() >= num_messages {
@@ -720,12 +773,10 @@ async fn run_pipeline_test_internal(
     // Drain any remaining messages that arrived during shutdown
     let batch = harness.out_channel.drain_messages();
     if !batch.is_empty() {
-        if !is_performance_test {
+        if !is_performance_test || at_least_once {
             for msg in &batch {
-                if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&msg.payload) {
-                    if let Some(num) = val.get("message_num").and_then(|v| v.as_u64()) {
-                        unique_received_ids.insert(num);
-                    }
+                if let Ok(hdr) = serde_json::from_slice::<MessageNumHeader>(&msg.payload) {
+                    unique_received_ids.insert(hdr.message_num);
                 }
             }
         }
@@ -752,14 +803,36 @@ async fn run_pipeline_test_internal(
             single_read_performance: 0.0,
         });
 
-        assert_eq!(
-            received.len(),
-            num_messages,
-            "TEST FAILED for [{}]: Expected {} messages, but found {}.",
-            display_name,
-            num_messages,
-            received.len()
-        );
+        if at_least_once {
+            // At-least-once source (e.g. MongoDB change stream): every message must arrive at
+            // least once — no loss — while duplicates from stream resumes are expected, not a bug.
+            let unique = unique_received_ids.len();
+            assert_eq!(
+                unique,
+                num_messages,
+                "TEST FAILED for [{}]: expected all {} unique messages, but only {} distinct arrived (total received {}). Missing messages indicate real data loss.",
+                display_name,
+                num_messages,
+                unique,
+                received.len()
+            );
+            let duplicates = received.len().saturating_sub(unique);
+            if duplicates > 0 {
+                println!(
+                    "[{}] at-least-once delivery: {} unique with {} duplicate redeliveries (expected for a resumable change stream)",
+                    display_name, unique, duplicates
+                );
+            }
+        } else {
+            assert_eq!(
+                received.len(),
+                num_messages,
+                "TEST FAILED for [{}]: Expected {} messages, but found {}.",
+                display_name,
+                num_messages,
+                received.len()
+            );
+        }
     } else {
         let unique = unique_received_ids.len();
         let min_required = num_messages.saturating_sub(allowed_loss);

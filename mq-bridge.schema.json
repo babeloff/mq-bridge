@@ -210,7 +210,7 @@
           "default": false
         },
         "checkpoint_store": {
-          "description": "(Consumer only) Where to persist the resume cursor. Because ClickHouse is unsuited to per-row\ncursor upserts, a durable checkpoint requires an **external** store URL:\n- `file:///var/lib/mqb/cursors.json` → local JSON file\n- `postgres://user@host/db/table` / `mysql://host/db/table` → external SQL table (table optional)\n- `mongodb://host/db/collection` → external MongoDB collection (collection optional)\n\nMay embed connection credentials, so it is treated as a secret.",
+          "description": "(Consumer only) Where to persist the resume cursor. Because ClickHouse is unsuited to per-row\ncursor upserts, a durable checkpoint requires an **external** store URL:\n- `file:///var/lib/mqb/cursors.json` → local JSON file\n- `postgres://user@host/db/table` / `mysql://host/db/table` → external SQL table (table optional)\n- `mongodb://host/db/collection` → external MongoDB collection (collection optional)\n- `s3://bucket/prefix` (also `gs://`, `az://`, `abfs://`) → cloud object store; creds via env\n\nMay embed connection credentials, so it is treated as a secret.",
           "type": [
             "string",
             "null"
@@ -500,6 +500,17 @@
           },
           "required": [
             "file"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "object_store": {
+              "$ref": "#/$defs/ObjectStoreConfig"
+            }
+          },
+          "required": [
+            "object_store"
           ]
         },
         {
@@ -829,6 +840,7 @@
               "type": "object",
               "properties": {
                 "delete": {
+                  "description": "If true, processed lines are physically removed from the file once\nthey are successfully acknowledged.",
                   "type": "boolean",
                   "default": false
                 },
@@ -846,6 +858,7 @@
               "type": "object",
               "properties": {
                 "delete": {
+                  "description": "If true, lines are removed only after all local application\nsubscribers for this file have acknowledged them.",
                   "type": "boolean",
                   "default": false
                 },
@@ -1039,6 +1052,7 @@
       "type": "object",
       "properties": {
         "basic_auth": {
+          "description": "HTTP Basic Authentication credentials (username, password). For consumers: validates incoming requests. For publishers: adds Authorization header.",
           "type": [
             "array",
             "null"
@@ -1080,7 +1094,7 @@
           "minimum": 0
         },
         "concurrency_limit": {
-          "description": "HTTP Basic Authentication credentials (username, password). For consumers: validates incoming requests. For publishers: adds Authorization header.\n(Consumer only) Maximum number of concurrent requests to handle. Defaults to 100.",
+          "description": "(Consumer only) Maximum number of concurrent requests to handle. Defaults to 100.",
           "type": [
             "integer",
             "null"
@@ -1793,7 +1807,7 @@
           "default": false
         },
         "checkpoint_store": {
-          "description": "(Consumer only) Where to persist the resume cursor in `capture_new`/`capture_all` mode. A URL\nselects the backend; a bare name (or `/name`) reuses the **source** database with that name:\n- absent → source database, collection `mqb_cursors_<source_collection>` (auto-unique)\n- `/my_cursors` → source database, collection `my_cursors`\n- `file:///var/lib/mqb/cursors.json` → local JSON file (read-only / write-restricted sources)\n- `mongodb://host/db/collection` → external MongoDB collection (collection optional)\n- `postgres://user@host/db/table` or `mysql://host/db/table` → external SQL table (table optional)\n\nWhen no collection/table is named, it defaults to `mqb_cursors_<source_collection>`.\nMay embed connection credentials, so it is treated as a secret.",
+          "description": "(Consumer only) Where to persist the resume cursor in `capture_new`/`capture_all` mode. A URL\nselects the backend; a bare name (or `/name`) reuses the **source** database with that name:\n- absent → source database, collection `mqb_cursors_<source_collection>` (auto-unique)\n- `/my_cursors` → source database, collection `my_cursors`\n- `file:///var/lib/mqb/cursors.json` → local JSON file (read-only / write-restricted sources)\n- `mongodb://host/db/collection` → external MongoDB collection (collection optional)\n- `postgres://user@host/db/table` or `mysql://host/db/table` → external SQL table (table optional)\n- `s3://bucket/prefix` (also `gs://`, `az://`, `abfs://`) → cloud object store; creds via env\n\nWhen no collection/table is named, it defaults to `mqb_cursors_<source_collection>`.\nMay embed connection credentials, so it is treated as a secret.",
           "type": [
             "string",
             "null"
@@ -2223,17 +2237,91 @@
         "last_per_subject"
       ]
     },
+    "ObjectStoreConfig": {
+      "description": "Configuration for a cloud object-store endpoint (S3, GCS, Azure Blob, R2, ...).\n\nAs a **sink**, each flushed batch is written as one immutable object under `url`,\nnamed `<prefix>/[YYYY/MM/DD/]<uuidv7>.<ext>`. As a **source**, objects under `url`\nare listed in key order, fetched, split by `delimiter`, and emitted as messages;\nprogress is persisted to `checkpoint_store` (the last processed object key) so a\nrestart resumes without re-emitting. Objects are never mutated or deleted in place.",
+      "type": "object",
+      "properties": {
+        "checkpoint_store": {
+          "description": "(Source only) Durable resume store URL recording the last processed object key, e.g.\n`file:///var/lib/mqb/obj.json`, `s3://bucket/cursors`, or `postgres://…`. Without it\nevery restart re-lists and re-emits all objects.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "cursor_id": {
+          "description": "(Source only) Cursor id namespacing the checkpoint key; enables durable resume.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "date_partition": {
+          "description": "(Sink only) Prepend a `YYYY/MM/DD/` path (write time, UTC) to each object key. Purely\nfor readability / lifecycle rules — the uuidv7 name already sorts by time. Default true.",
+          "type": "boolean",
+          "default": true
+        },
+        "delimiter": {
+          "description": "Record delimiter within an object. Defaults to newline (\"\\n\"). Can be a string or a\nhex sequence (e.g. \"0x00\").",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "extension": {
+          "description": "(Sink only) Extension for written objects, without the dot. Defaults to a value derived\nfrom `format` (`jsonl`, `json`, `txt`, or `bin`).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "format": {
+          "description": "Record encoding within an object, shared with the file endpoint. Defaults to\n`normal` (one JSON `CanonicalMessage` per line). CSV is supported for sources only.",
+          "$ref": "#/$defs/FileFormat",
+          "default": "normal"
+        },
+        "max_object_bytes": {
+          "description": "(Source only) Maximum size in bytes of a single object to fetch into memory. An object\nlarger than this fails the read (surfaced as a consumer error) instead of being\nbuffered whole. Unset means no limit (the whole object is materialized).",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "polling_interval_ms": {
+          "description": "(Source only) Idle poll interval in milliseconds when no new objects are found.\nDefaults to 1000.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "url": {
+          "description": "Object-store URL, e.g. `s3://bucket/prefix`, `gs://bucket/prefix`,\n`az://account/container/prefix`. Credentials are resolved from the environment by\nthe `object_store` crate (same mechanism as the checkpoint backend); R2 uses\n`s3://` plus a custom `AWS_ENDPOINT_URL`.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "url"
+      ]
+    },
     "PostgresCdcConfig": {
       "description": "Postgres logical-replication CDC source (pgoutput). Source-only.",
       "type": "object",
       "properties": {
         "checkpoint_store": {
-          "description": "Checkpoint store spec (e.g. `file:///path`); defaults to the source database.",
+          "description": "Checkpoint store spec (e.g. `file:///path`, `s3://bucket/prefix`); defaults to the source database.",
           "type": [
             "string",
             "null"
           ],
           "format": "password"
+        },
+        "create_publication": {
+          "description": "Create the `publication` if missing (default false; leave off if it pre-exists).\nNeeds table ownership for `publication_tables`, or superuser when none are set (`FOR ALL TABLES`).",
+          "type": "boolean",
+          "default": false
         },
         "create_slot": {
           "description": "Create the replication slot if it does not exist.",
@@ -2250,6 +2338,14 @@
         "publication": {
           "description": "Publication name (must already exist; defines which tables are captured).",
           "type": "string"
+        },
+        "publication_tables": {
+          "description": "Tables to include when managing the publication (`create_publication`); may be `schema.table`.\nMissing ones are added to an existing publication (never removed). Empty = `FOR ALL TABLES` (needs superuser).",
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
         },
         "slot_name": {
           "description": "Replication slot name; created if missing when `create_slot` is true.",
@@ -2602,12 +2698,17 @@
           "default": false
         },
         "checkpoint_store": {
-          "description": "(Consumer only) Where to persist the resume cursor in `cursor_column` mode. A URL selects the\nbackend; a bare name (or `/name`) reuses the **source** datastore with that table name:\n- absent → source datastore, table `mqb_cursors_<source_table>` (auto-unique)\n- `/my_cursors` → source datastore, table `my_cursors`\n- `file:///var/lib/mqb/cursors.json` → local JSON file (read-only / write-restricted sources)\n- `postgres://user@host/db/table` or `mysql://host/db/table` → external SQL table (table optional)\n- `mongodb://host/db/collection` → external MongoDB collection (collection optional)\n\nWhen no table/collection is named, it defaults to `mqb_cursors_<source_table>`.\nMay embed connection credentials, so it is treated as a secret.",
+          "description": "(Consumer only) Where to persist the resume cursor in `cursor_column` mode. A URL selects the\nbackend; a bare name (or `/name`) reuses the **source** datastore with that table name:\n- absent → source datastore, table `mqb_cursors_<source_table>` (auto-unique)\n- `/my_cursors` → source datastore, table `my_cursors`\n- `file:///var/lib/mqb/cursors.json` → local JSON file (read-only / write-restricted sources)\n- `postgres://user@host/db/table` or `mysql://host/db/table` → external SQL table (table optional)\n- `mongodb://host/db/collection` → external MongoDB collection (collection optional)\n- `s3://bucket/prefix` (also `gs://`, `az://`, `abfs://`) → cloud object store; creds via env\n\nWhen no table/collection is named, it defaults to `mqb_cursors_<source_table>`.\nMay embed connection credentials, so it is treated as a secret.",
           "type": [
             "string",
             "null"
           ],
           "format": "password"
+        },
+        "create_publication": {
+          "description": "(Consumer only, CDC) When `publication` is set, create it if missing (default false).\nNeeds table-owner privilege: it is auto-published `FOR TABLE {table}`.",
+          "type": "boolean",
+          "default": false
         },
         "cursor_column": {
           "description": "(Consumer only) Read an existing table **non-destructively** and resumably, paging by this\nmonotonic column (`SELECT * FROM {table} WHERE {cursor_column} > $last ORDER BY {cursor_column} ASC LIMIT n`)\nand persisting the last read value under `cursor_id`. Does not delete/lock source rows.\nMutually exclusive with `delete_after_read`.",
@@ -2906,11 +3007,19 @@
       "additionalProperties": false
     },
     "WeakJoinMiddleware": {
-      "description": "Weak Join middleware configuration.\n\nGroups and correlates messages based on a metadata key, waiting for a specified number\nof messages within a timeout window before processing them as a batch.\nMessages that exceed the timeout are processed individually.",
+      "description": "Weak Join middleware configuration.\n\nCorrelates messages by a metadata key and joins them within a timeout window.\nCount mode (default) waits for `expected_count` messages and emits a JSON array.\nBranch mode (set `branch_by`) waits for named branches and emits a branch-keyed object.",
       "type": "object",
       "properties": {
+        "branch_by": {
+          "description": "Metadata key naming each message's branch; enables branch mode when set.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
         "expected_count": {
-          "description": "The number of messages to wait for.",
+          "description": "The number of messages (count mode) or distinct branches (branch mode) to wait for.",
           "type": "integer",
           "format": "uint",
           "minimum": 0
@@ -2918,6 +3027,19 @@
         "group_by": {
           "description": "The metadata key to group messages by (e.g., \"correlation_id\").",
           "type": "string"
+        },
+        "on_timeout": {
+          "description": "What to do with an incomplete group when the timeout expires.",
+          "$ref": "#/$defs/WeakJoinTimeout",
+          "default": "fire"
+        },
+        "required": {
+          "description": "Branch names that must all arrive before firing (branch mode; overrides expected_count).",
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
         },
         "timeout_ms": {
           "description": "Timeout in milliseconds.",
@@ -2931,6 +3053,21 @@
         "group_by",
         "expected_count",
         "timeout_ms"
+      ]
+    },
+    "WeakJoinTimeout": {
+      "description": "Action taken on an incomplete weak-join group when its timeout expires.",
+      "oneOf": [
+        {
+          "description": "Emit the partial join (current behavior).",
+          "type": "string",
+          "const": "fire"
+        },
+        {
+          "description": "Drop the incomplete group without emitting.",
+          "type": "string",
+          "const": "discard"
+        }
       ]
     },
     "WebSocketConfig": {
@@ -3013,6 +3150,11 @@
           "type": "boolean",
           "default": false
         },
+        "format": {
+          "description": "Wire format: `json` wraps the CanonicalMessage; `raw` sends payload bytes per frame; `raw_framed` adds a JSON metadata frame. Default `json`.",
+          "$ref": "#/$defs/ZeroMqFormat",
+          "default": "json"
+        },
         "internal_buffer_size": {
           "description": "Internal buffer size for the channel. Defaults to 128.",
           "type": [
@@ -3051,6 +3193,15 @@
       "additionalProperties": false,
       "required": [
         "url"
+      ]
+    },
+    "ZeroMqFormat": {
+      "description": "ZeroMQ wire format.\n\n`json` wraps each message as a JSON CanonicalMessage (batched into one frame);\n`raw` sends/receives the payload bytes directly, one frame per message (metadata\nis not transmitted); `raw_framed` sends a two-frame message — a JSON metadata frame\nfollowed by the raw payload frame — keeping the payload binary-safe while still\ncarrying headers. Use `raw`/`raw_framed` for binary feeds such as JPEG, Avro or Protobuf.",
+      "type": "string",
+      "enum": [
+        "json",
+        "raw",
+        "raw_framed"
       ]
     },
     "ZeroMqSocketType": {

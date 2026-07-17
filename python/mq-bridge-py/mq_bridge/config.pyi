@@ -106,6 +106,7 @@ class Endpoint(TypedDict, total=False):
     mqtt: MqttConfig
     nats: NatsConfig
     null: Any
+    object_store: ObjectStoreConfig
     postgres_cdc: PostgresCdcConfig
     reader: Endpoint
     redis_streams: RedisStreamsConfig
@@ -309,12 +310,27 @@ class NatsConfig(TypedDict, total=False):
     username: Optional[str]
 
 
+class ObjectStoreConfig(TypedDict, total=False):
+    """Configuration for a cloud object-store endpoint (S3, GCS, Azure Blob, R2, ...)."""
+    checkpoint_store: Optional[str]
+    cursor_id: Optional[str]
+    date_partition: bool
+    delimiter: Optional[str]
+    extension: Optional[str]
+    format: FileFormat
+    max_object_bytes: Optional[int]
+    polling_interval_ms: Optional[int]
+    url: Required[str]
+
+
 class PostgresCdcConfig(TypedDict, total=False):
     """Postgres logical-replication CDC source (pgoutput). Source-only."""
     checkpoint_store: Optional[str]
+    create_publication: bool
     create_slot: bool
     cursor_id: Optional[str]
     publication: Required[str]
+    publication_tables: List[str]
     slot_name: str
     status_interval_ms: int
     temporary_slot: bool
@@ -388,6 +404,7 @@ class SqlxConfig(TypedDict, total=False):
     auto_create_table: bool
     bulk_copy: bool
     checkpoint_store: Optional[str]
+    create_publication: bool
     cursor_column: Optional[str]
     cursor_id: Optional[str]
     delete_after_read: bool
@@ -434,8 +451,11 @@ class TlsConfig(TypedDict, total=False):
 
 class WeakJoinMiddleware(TypedDict, total=False):
     """Weak Join middleware configuration."""
+    branch_by: Optional[str]
     expected_count: Required[int]
     group_by: Required[str]
+    on_timeout: WeakJoinTimeout
+    required: List[str]
     timeout_ms: Required[int]
 
 
@@ -451,6 +471,7 @@ class WebSocketConfig(TypedDict, total=False):
 
 class ZeroMqConfig(TypedDict, total=False):
     bind: bool
+    format: ZeroMqFormat
     internal_buffer_size: Optional[int]
     socket_type: Optional[ZeroMqSocketType]
     topic: Optional[str]
@@ -465,7 +486,9 @@ MongoDbFormat = Literal["normal", "json", "text", "raw"]
 MqttProtocol = Literal["v5", "v3"]
 NatsDeliverPolicy = Literal["all", "last", "new", "last_per_subject"]
 StaticConfig = Union[str, Dict[str, Any]]
+WeakJoinTimeout = Literal["fire", "discard"]
 WebSocketExecutionMode = Literal["auto", "direct_only", "routed"]
+ZeroMqFormat = Literal["json", "raw", "raw_framed"]
 ZeroMqSocketType = Literal["push", "pull", "pub", "sub", "req", "rep"]
 
 

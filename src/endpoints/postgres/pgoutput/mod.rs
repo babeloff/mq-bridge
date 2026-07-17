@@ -4,6 +4,7 @@
 //! Ported from faucet-stream (crates/source/postgres-cdc/src/pgoutput,
 //! © the faucet-stream authors, dual-licensed Apache-2.0 OR MIT) and adapted
 //! to mq-bridge. See <https://github.com/PawanSikawat/faucet-stream>.
+//! Pinned upstream commit and per-file changes: `../VENDORED.md`.
 
 pub mod decoder;
 pub mod messages;

@@ -29,6 +29,8 @@ pub mod mqtt;
 #[cfg(feature = "nats")]
 pub mod nats;
 pub mod null;
+#[cfg(feature = "object-store")]
+pub mod object_store;
 #[cfg(any(feature = "sqlx", feature = "clickhouse"))]
 mod poll;
 #[cfg(feature = "postgres-cdc")]
@@ -519,6 +521,16 @@ fn check_consumer_recursive(
             Ok(warnings)
         }
         EndpointType::File(_) => Ok(warnings),
+        #[cfg(feature = "object-store")]
+        EndpointType::ObjectStore(cfg) => {
+            if cfg.extension.is_some() {
+                warnings.push("Endpoint 'object_store' is used as a consumer, but 'extension' is a publisher-only option and will be ignored.".to_string());
+            }
+            if cfg.date_partition {
+                warnings.push("Endpoint 'object_store' is used as a consumer, but 'date_partition' is a publisher-only option and will be ignored.".to_string());
+            }
+            Ok(warnings)
+        }
         #[cfg(feature = "websocket")]
         EndpointType::WebSocket(_) => Ok(warnings),
         EndpointType::Custom { .. } => Ok(warnings),
@@ -622,6 +634,12 @@ fn sqlx_cfg_to_cdc(
             .clone()
             .unwrap_or_else(|| "mq_bridge_slot".to_string()),
         create_slot: true,
+        create_publication: cfg.create_publication,
+        publication_tables: if cfg.create_publication {
+            vec![cfg.table.clone()]
+        } else {
+            Vec::new()
+        },
         temporary_slot: false,
         cursor_id: cfg.cursor_id.clone(),
         checkpoint_store: cfg.checkpoint_store.clone(),
@@ -889,6 +907,10 @@ async fn create_base_consumer(
             ))
         }
         EndpointType::File(cfg) => Ok(boxed(file::FileConsumer::new(cfg).await?)),
+        #[cfg(feature = "object-store")]
+        EndpointType::ObjectStore(cfg) => {
+            Ok(boxed(object_store::ObjectStoreConsumer::new(cfg).await?))
+        }
         #[cfg(feature = "grpc")]
         EndpointType::Grpc(cfg) => {
             let mut config = cfg.clone();
@@ -1315,6 +1337,22 @@ fn check_publisher_recursive(
             Ok(warnings)
         }
         EndpointType::File(_) => Ok(warnings),
+        #[cfg(feature = "object-store")]
+        EndpointType::ObjectStore(cfg) => {
+            if cfg.checkpoint_store.is_some() {
+                warnings.push("Endpoint 'object_store' is used as a publisher, but 'checkpoint_store' is a consumer-only option and will be ignored.".to_string());
+            }
+            if cfg.cursor_id.is_some() {
+                warnings.push("Endpoint 'object_store' is used as a publisher, but 'cursor_id' is a consumer-only option and will be ignored.".to_string());
+            }
+            if cfg.polling_interval_ms.is_some() {
+                warnings.push("Endpoint 'object_store' is used as a publisher, but 'polling_interval_ms' is a consumer-only option and will be ignored.".to_string());
+            }
+            if cfg.max_object_bytes.is_some() {
+                warnings.push("Endpoint 'object_store' is used as a publisher, but 'max_object_bytes' is a consumer-only option and will be ignored.".to_string());
+            }
+            Ok(warnings)
+        }
         #[cfg(feature = "websocket")]
         EndpointType::WebSocket(_) => Ok(warnings),
         EndpointType::Static(_) => Ok(warnings),
@@ -1600,6 +1638,10 @@ async fn create_base_publisher(
         EndpointType::File(cfg) => {
             Ok(Box::new(file::FilePublisher::new(cfg).await?) as Box<dyn MessagePublisher>)
         }
+        #[cfg(feature = "object-store")]
+        EndpointType::ObjectStore(cfg) => Ok(Box::new(
+            object_store::ObjectStorePublisher::new(cfg).await?,
+        ) as Box<dyn MessagePublisher>),
         EndpointType::Static(cfg) => Ok(Box::new(static_endpoint::StaticEndpointPublisher::new(
             cfg,
         )?) as Box<dyn MessagePublisher>),

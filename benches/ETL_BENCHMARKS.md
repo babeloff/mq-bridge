@@ -61,14 +61,14 @@ The scenarios are run through
 path a real user takes) so the numbers are comparable to how other ETL/CDC tools publish
 theirs. The run brief lives in [`mq-bridge-app-benchmark-prompt.md`](mq-bridge-app-benchmark-prompt.md).
 
-> ⚠️ **Preliminary — measured on battery power.** The number below was measured on a
-> laptop running on battery, where macOS throttles the CPU. It is **not yet authoritative**
-> and is pending a re-run on AC (mains) power before publication. Treat it as a floor, not a
-> confirmed figure.
+> ⚠️ **Preliminary — measured on battery power.** The numbers below were measured on a
+> laptop running on battery, where macOS throttles the CPU. They are **not yet authoritative**
+> and are pending a re-run on AC (mains) power before publication. Treat them as a floor, not
+> confirmed figures.
 
 **Environment:** Apple M1, 8 cores, 8 GB RAM, macOS (battery power) · via `mq-bridge-app` 0.2.6 · postgres:16
 
-### Validated run — bulk copy Postgres → JSONL
+### Preliminary run — bulk copy Postgres → JSONL
 
 | Scenario | Payload | Batch | Concurrency | Source → Sink | Result |
 | --- | --- | --- | --- | --- | --- |
@@ -76,27 +76,27 @@ theirs. The run brief lives in [`mq-bridge-app-benchmark-prompt.md`](mq-bridge-a
 
 Command: `mq-bridge-app copy --from postgres://…?table=…&cursor_column=id --to file://…?format=raw --drain --batch-size 1024 --concurrency 4`, wall-clocked. Requires an index on the cursor column (`CREATE INDEX ON <table>(id)`) — without it the keyset-pagination reader (`WHERE id > $cursor ORDER BY id LIMIT batch`) does a full scan per batch (near-quadratic).
 
-### Validated run — Postgres → JSONL vs. Meltano
+### Preliminary run — Postgres → JSONL vs. Meltano
 
-Same source table, same Postgres instance, same machine, both one-shot full-table syncs to a local JSONL file — mq-bridge-app's `copy` CLI vs. Meltano's `tap-postgres` → `target-jsonl` (median of 5 timed runs each side).
+Same source table (`bench`: 1,000,000 rows, 7 mixed-type columns), same Postgres instance, same machine, both one-shot full-table syncs to a local JSONL file — mq-bridge-app's `copy` CLI vs. Meltano's `tap-postgres` → `target-jsonl` (median of timed runs each side, row-count parity verified).
 
-| Scenario | Payload | Batch | Concurrency | Source → Sink | Result |
-| --- | --- | --- | --- | --- | --- |
-| mq-bridge-app `copy` | 256 B, 100,000 rows | 1024 | 1 | postgres (keyset cursor) → file (JSONL) | **197,628 rows/s** |
-| Meltano (`tap-postgres` → `target-jsonl`) | 256 B, 100,000 rows | default Singer config | — | postgres → JSONL | 16,330 rows/s |
+| Scenario | Payload | Batch | Concurrency | Source → Sink | Throughput | Peak RSS |
+| --- | --- | --- | --- | --- | --- | --- |
+| mq-bridge-app `copy` | 7-col, 1,000,000 rows | 1024 | 1 | postgres (keyset cursor) → file (JSONL) | **266,951 rows/s** | 19.9 MiB |
+| Meltano (`tap-postgres` → `target-jsonl`) | 7-col, 1,000,000 rows | default Singer config | — | postgres → JSONL | 15,356 rows/s | 599.7 MiB |
 
-**~12.1x faster** than Meltano in this scenario. Full setup (including the Meltano project config) is in [mq-bridge-app's `benches/etl/README.md`](https://github.com/marcomq/mq-bridge-app/blob/dev/benches/etl/README.md#5--postgres--jsonl-vs-meltano-tap-postgres--target-jsonl).
+**~17.4x faster and ~30x leaner in peak memory** than Meltano in this scenario. Full setup (including the Meltano project config) is in [mq-bridge-app's `benches/etl/README.md`](https://github.com/marcomq/mq-bridge-app/blob/dev/benches/etl/README.md#5--postgres--jsonl-vs-meltano-tap-postgres--target-jsonl).
 
-### Validated run — CSV → JSONL vs. Meltano
+### Preliminary run — CSV → JSONL vs. Meltano
 
 Same seeded dataset both sides, same machine, one-shot full-file CSV → local JSONL (one JSON object per input row) — mq-bridge-app's `copy` CLI vs. Meltano's `tap-csv` → `target-jsonl`.
 
-| Scenario | Payload | Batch | Concurrency | Source → Sink | Result |
-| --- | --- | --- | --- | --- | --- |
-| mq-bridge-app `copy` | 7-col mixed-type, 1,000,000 rows (~116 MiB) | 1024 | 1 | file (CSV) → file (JSONL) | **833,333 rows/s** |
-| Meltano (`tap-csv` → `target-jsonl`) | 7-col mixed-type, 1,000,000 rows | default Singer config | — | file (CSV) → JSONL | ~19,500 rows/s |
+| Scenario | Payload | Batch | Concurrency | Source → Sink | Throughput | Peak RSS |
+| --- | --- | --- | --- | --- | --- | --- |
+| mq-bridge-app `copy` | 7-col mixed-type, 1,000,000 rows (~116 MiB) | 1024 | 1 | file (CSV) → file (JSONL) | **833,333 rows/s** | 20.0 MiB |
+| Meltano (`tap-csv` → `target-jsonl`) | 7-col mixed-type, 1,000,000 rows | default Singer config | — | file (CSV) → JSONL | ~19,500 rows/s | 443.8 MiB |
 
-**~43x faster** than Meltano in this scenario. Full setup is in [mq-bridge-app's `benches/etl/README.md`](https://github.com/marcomq/mq-bridge-app/blob/dev/benches/etl/README.md#6--csv--jsonl-vs-meltano-faucet-streams-headline-benchmark).
+**~43x faster and ~22x leaner in peak memory** than Meltano in this scenario. Full setup is in [mq-bridge-app's `benches/etl/README.md`](https://github.com/marcomq/mq-bridge-app/blob/dev/benches/etl/README.md#6--csv--jsonl-vs-meltano).
 
 ## Status
 

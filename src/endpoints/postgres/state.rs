@@ -8,6 +8,7 @@
 //!
 //! `format_lsn` / `parse_lsn` are ported from faucet-stream
 //! (crates/source/postgres-cdc/src/state.rs, dual Apache-2.0 OR MIT).
+//! Pinned upstream commit and per-file changes: `./VENDORED.md`.
 
 use anyhow::anyhow;
 

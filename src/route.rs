@@ -8,8 +8,8 @@ use crate::errors::ProcessingError;
 pub use crate::models::Route;
 use crate::models::{Endpoint, EndpointType, Middleware, RouteOptions};
 use crate::traits::{
-    BatchCommitFunc, ConsumerError, Handler, HandlerError, MessageConsumer, MessageDisposition,
-    MessagePublisher, PublisherError, SentBatch,
+    BatchCommitFunc, ConsumerError, EndpointStatus, Handler, HandlerError, MessageConsumer,
+    MessageDisposition, MessagePublisher, PublisherError, SentBatch,
 };
 use async_channel::{bounded, Sender};
 use serde::de::DeserializeOwned;
@@ -28,16 +28,32 @@ pub use crate::extensions::{
 };
 
 #[derive(Debug)]
-pub struct RouteHandle((JoinHandle<()>, Sender<()>));
+pub struct RouteHandle {
+    handle: JoinHandle<()>,
+    shutdown_tx: Sender<()>,
+    /// Live connection health of the running route, updated by the reconnect
+    /// loop on every (re)connect and failure. Read via [`RouteHandle::status`].
+    status: Arc<RwLock<EndpointStatus>>,
+}
 
 impl RouteHandle {
     pub async fn stop(&self) {
-        let _ = self.0 .1.send(()).await;
-        self.0 .1.close();
+        let _ = self.shutdown_tx.send(()).await;
+        self.shutdown_tx.close();
     }
 
     pub async fn join(self) -> Result<(), tokio::task::JoinError> {
-        self.0 .0.await
+        self.handle.await
+    }
+
+    /// Returns the live health of the running route without opening a new connection.
+    ///
+    /// The reconnect loop updates this on every (re)connect attempt and failure, so a
+    /// supervisor can distinguish "running and connected" (`healthy == true`) from
+    /// "running but failing to connect / reconnecting" (`healthy == false`, with `error`
+    /// set to the last connection error).
+    pub fn status(&self) -> EndpointStatus {
+        recover_read_lock(&self.status, "route_handle_status").clone()
     }
 }
 
@@ -100,7 +116,11 @@ pub(crate) async fn run_consumer_disconnect_hook(route_name: &str, consumer: &dy
 
 impl From<(JoinHandle<()>, Sender<()>)> for RouteHandle {
     fn from(tuple: (JoinHandle<()>, Sender<()>)) -> Self {
-        RouteHandle(tuple)
+        RouteHandle {
+            handle: tuple.0,
+            shutdown_tx: tuple.1,
+            status: Arc::new(RwLock::new(EndpointStatus::default())),
+        }
     }
 }
 
@@ -201,6 +221,22 @@ fn check_fault_middleware_allowed(
 
     Ok(())
 }
+
+/// How many messages a runner may process before it must cooperatively yield.
+///
+/// The route loops drive `async-channel` recv/send, which complete synchronously
+/// on a hot in-memory pipeline and don't count against tokio's cooperative
+/// budget. Without an explicit yield a busy route can starve other tasks (other
+/// routes, the drain side, shutdown) — but yielding every batch costs a full
+/// scheduler round-trip per iteration, which dominates throughput at small batch
+/// sizes. Amortizing the yield over this many processed messages keeps the time
+/// between yields bounded while making the cost negligible.
+///
+/// Set to 128 to match tokio's automatic cooperative-scheduling budget, so this
+/// manual yield fires at the same cadence tokio uses for its own resources. Only
+/// affects `batch_size` smaller than this (larger batches already exceed it in a
+/// single iteration and yield once per batch regardless).
+const YIELD_EVERY_MSGS: usize = 128;
 
 async fn pause_after_empty_batch(delay_ms: u64) {
     if delay_ms > 0 {
@@ -468,11 +504,11 @@ impl Route {
             let handle = active.handle;
 
             // Signal the route to stop and close the shutdown channel.
-            let _ = handle.0 .1.send(()).await;
-            handle.0 .1.close();
+            let _ = handle.shutdown_tx.send(()).await;
+            handle.shutdown_tx.close();
 
             // Extract the JoinHandle so we can monitor and, if needed, abort it.
-            let mut join_handle = handle.0 .0;
+            let mut join_handle = handle.handle;
             tokio::select! {
                 res = &mut join_handle => {
                     // The task finished naturally within the 5s window
@@ -602,70 +638,116 @@ impl Route {
         let route = Arc::new(self.clone());
         let name = Arc::new(name_str.to_string());
 
+        // Live health cell shared with the returned `RouteHandle`. Starts unhealthy
+        // ("connecting") and is flipped to healthy once the route reports ready, back
+        // to unhealthy (with the last error) whenever the run task fails.
+        let status = Arc::new(RwLock::new(EndpointStatus {
+            healthy: false,
+            target: name_str.to_string(),
+            error: Some("connecting".to_string()),
+            ..Default::default()
+        }));
+        let status_loop = Arc::clone(&status);
+
         let handle = tokio::spawn(async move {
-            loop {
+            // The startup `ready` channel is consumed once by `run()`; only the first
+            // (re)connect needs to notify it.
+            let mut startup_notified = false;
+            'reconnect: loop {
                 let route_arc = Arc::clone(&route);
                 let name_arc = Arc::clone(&name);
                 // Create a new, per-iteration internal shutdown channel.
                 // This avoids a race where both this loop and the inner task
                 // try to consume the same external shutdown signal.
                 let (internal_shutdown_tx, internal_shutdown_rx) = bounded(1);
-                let ready_tx_clone = ready_tx.clone();
+                // Per-iteration ready channel so we can observe every (re)connection,
+                // not just the first startup, and update the shared health cell.
+                let (iter_ready_tx, iter_ready_rx) = bounded(1);
 
                 // The actual route logic is in `run_until_err`.
                 let mut run_task = tokio::spawn(async move {
                     route_arc
-                        .run_until_err(&name_arc, Some(internal_shutdown_rx), Some(ready_tx_clone))
+                        .run_until_err(&name_arc, Some(internal_shutdown_rx), Some(iter_ready_tx))
                         .await
                 });
 
-                select! {
-                    _ = shutdown_rx.recv() => {
-                        info!("Shutdown signal received for route '{}'.", name);
-                        // Notify the inner task to shut down.
-                        let _ = internal_shutdown_tx.send(()).await;
-                        // Wait for the inner task to finish gracefully.
-                        let _ = run_task.await;
-                        break;
-                    }
-                    res = &mut run_task => {
-                        match res {
-                            Ok(Ok(should_continue)) if !should_continue => {
-                                info!("Route '{}' completed gracefully. Shutting down.", name);
-                                break;
+                // Inner loop: process ready + result events for this connection attempt.
+                loop {
+                    select! {
+                        _ = shutdown_rx.recv() => {
+                            info!("Shutdown signal received for route '{}'.", name);
+                            // Notify the inner task to shut down.
+                            let _ = internal_shutdown_tx.send(()).await;
+                            // Wait for the inner task to finish gracefully.
+                            let _ = run_task.await;
+                            break 'reconnect;
+                        }
+                        Ok(_) = iter_ready_rx.recv() => {
+                            // The route (re)connected and is ready to process messages.
+                            {
+                                let mut s = recover_write_lock(&status_loop, "route_handle_status");
+                                s.healthy = true;
+                                s.error = None;
                             }
-                            Ok(Err(e)) => {
-                                let is_permanent =
-                                    e.downcast_ref::<ProcessingError>().is_some_and(|pe| matches!(pe, ProcessingError::NonRetryable(_)))
-                                    || e.downcast_ref::<ConsumerError>().is_some_and(|ce| matches!(ce, ConsumerError::EndOfStream));
+                            // Forward to the startup `ready` channel so `run()` can return.
+                            if !startup_notified {
+                                let _ = ready_tx.send(()).await;
+                                startup_notified = true;
+                            }
+                            // Keep waiting for the run result / shutdown.
+                        }
+                        res = &mut run_task => {
+                            match res {
+                                Ok(Ok(should_continue)) if !should_continue => {
+                                    info!("Route '{}' completed gracefully. Shutting down.", name);
+                                    break 'reconnect;
+                                }
+                                Ok(Err(e)) => {
+                                    let is_permanent =
+                                        e.downcast_ref::<ProcessingError>().is_some_and(|pe| matches!(pe, ProcessingError::NonRetryable(_)))
+                                        || e.downcast_ref::<ConsumerError>().is_some_and(|ce| matches!(ce, ConsumerError::EndOfStream));
 
-                                if is_permanent {
-                                    error!("Route '{}' failed with a permanent error: {}. Shutting down.", name, e);
-                                    break;
-                                }
+                                    {
+                                        let mut s = recover_write_lock(&status_loop, "route_handle_status");
+                                        s.healthy = false;
+                                        s.error = Some(e.to_string());
+                                    }
 
-                                warn!(
-                                    "Route '{}' failed: {}. Reconnecting in {}ms...",
-                                    name,
-                                    e,
-                                    reconnect_interval.as_millis()
-                                );
-                                if !reconnect_interval.is_zero() {
-                                    tokio::time::sleep(reconnect_interval).await;
+                                    if is_permanent {
+                                        error!("Route '{}' failed with a permanent error: {}. Shutting down.", name, e);
+                                        break 'reconnect;
+                                    }
+
+                                    warn!(
+                                        "Route '{}' failed: {}. Reconnecting in {}ms...",
+                                        name,
+                                        e,
+                                        reconnect_interval.as_millis()
+                                    );
+                                    if !reconnect_interval.is_zero() {
+                                        tokio::time::sleep(reconnect_interval).await;
+                                    }
+                                    break; // -> next reconnect iteration
                                 }
-                            }
-                            Err(e) => {
-                                error!(
-                                    "Route '{}' task panicked: {}. Reconnecting in {}ms...",
-                                    name,
-                                    e,
-                                    reconnect_interval.as_millis()
-                                );
-                                if !reconnect_interval.is_zero() {
-                                    tokio::time::sleep(reconnect_interval).await;
+                                Err(e) => {
+                                    {
+                                        let mut s = recover_write_lock(&status_loop, "route_handle_status");
+                                        s.healthy = false;
+                                        s.error = Some(format!("route task panicked: {}", e));
+                                    }
+                                    error!(
+                                        "Route '{}' task panicked: {}. Reconnecting in {}ms...",
+                                        name,
+                                        e,
+                                        reconnect_interval.as_millis()
+                                    );
+                                    if !reconnect_interval.is_zero() {
+                                        tokio::time::sleep(reconnect_interval).await;
+                                    }
+                                    break; // -> next reconnect iteration
                                 }
+                                _ => break, // The route should reconnect and continue running.
                             }
-                            _ => {} // The route should continue running.
                         }
                     }
                 }
@@ -673,7 +755,11 @@ impl Route {
         });
 
         match tokio::time::timeout(startup_timeout, ready_rx.recv()).await {
-            Ok(Ok(_)) => Ok(RouteHandle((handle, shutdown_tx))),
+            Ok(Ok(_)) => Ok(RouteHandle {
+                handle,
+                shutdown_tx,
+                status,
+            }),
             _ => {
                 handle.abort();
                 Err(anyhow::anyhow!(
@@ -747,6 +833,8 @@ impl Route {
         let mut batch_scratch = BatchScratch::with_capacity(self.options.batch_size);
         // Check if retry middleware is present on output
         let has_retry_middleware = self.output.has_retry_middleware();
+        // Messages processed since the last cooperative yield (see YIELD_EVERY_MSGS).
+        let mut since_yield = 0usize;
         let run_result = loop {
             select! {
                 Ok(err) = err_rx.recv() => break Err(err),
@@ -786,6 +874,7 @@ impl Route {
                     // Process the batch sequentially without spawning a new task
                     let seq = seq_counter;
                     seq_counter += 1;
+                    let batch_len = received_batch.messages.len();
                     let commit = commit_router.wrap(received_batch.commit, seq);
                     if let Err(err) = send_batch_and_commit(
                         &publisher,
@@ -802,7 +891,13 @@ impl Route {
                         break Err(err);
                     }
 
-                    tokio::task::yield_now().await;
+                    // Cooperatively yield, amortized over messages processed so a
+                    // hot loop can't starve other tasks (see YIELD_EVERY_MSGS).
+                    since_yield += batch_len;
+                    if since_yield >= YIELD_EVERY_MSGS {
+                        since_yield = 0;
+                        tokio::task::yield_now().await;
+                    }
                 }
             }
         };
@@ -880,7 +975,9 @@ impl Route {
             join_set.spawn(async move {
                 debug!("Starting worker {}", i);
                 let mut batch_scratch = BatchScratch::with_capacity(batch_size);
+                let mut since_yield = 0usize;
                 while let Ok((messages, commit_func)) = work_rx_clone.recv().await {
+                    let batch_len = messages.len();
                     if let Err(err) = send_batch_and_commit(
                         &publisher,
                         messages,
@@ -897,7 +994,12 @@ impl Route {
                         report_route_error(&err_tx, err, "Could not send error to main task");
                         break;
                     }
-                    tokio::task::yield_now().await;
+                    // Amortized cooperative yield (see YIELD_EVERY_MSGS).
+                    since_yield += batch_len;
+                    if since_yield >= YIELD_EVERY_MSGS {
+                        since_yield = 0;
+                        tokio::task::yield_now().await;
+                    }
                 }
                 // Wait for all in-flight commits to complete
                 while commit_tasks.join_next().await.is_some() {}
@@ -905,6 +1007,8 @@ impl Route {
         }
 
         let mut seq_counter = 0u64;
+        // Messages enqueued to workers since the last cooperative yield (see YIELD_EVERY_MSGS).
+        let mut since_yield = 0usize;
         // Holds an error that caused the loop to break, to be returned after graceful shutdown.
         let mut loop_error: Option<anyhow::Error> = None;
         // Set when the loop breaks because the source drained with exit_on_empty,
@@ -975,6 +1079,7 @@ impl Route {
                     // the work item to avoid creating sequence gaps if the work channel
                     // is closed while producing batches.
                     let seq = seq_counter;
+                    let batch_len = messages.len();
                     let wrapped_commit = commit_router.wrap(commit, seq);
 
                     match work_tx.send((messages, wrapped_commit)).await {
@@ -991,7 +1096,12 @@ impl Route {
                         }
                     }
 
-                    tokio::task::yield_now().await;
+                    // Amortized cooperative yield (see YIELD_EVERY_MSGS).
+                    since_yield += batch_len;
+                    if since_yield >= YIELD_EVERY_MSGS {
+                        since_yield = 0;
+                        tokio::task::yield_now().await;
+                    }
                 }
             }
         }
@@ -2556,6 +2666,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_route_handle_status_reports_async_connection_failure() {
+        let unique_id = fast_uuid_v7::gen_id().to_string();
+        let factory_name = format!("status_fail_{}", unique_id);
+
+        // Consumer is created successfully (so `run()` reports ready and returns Ok),
+        // but every `receive_batch` fails with a retryable Connection error — mirroring
+        // an endpoint that connects on a background thread and fails asynchronously.
+        let consumer_logic = move || -> Result<Box<dyn MessageConsumer>, anyhow::Error> {
+            struct FailingConsumer;
+            #[async_trait::async_trait]
+            impl MessageConsumer for FailingConsumer {
+                async fn receive_batch(
+                    &mut self,
+                    _max: usize,
+                ) -> Result<ReceivedBatch, ConsumerError> {
+                    Err(ConsumerError::Connection(anyhow::anyhow!(
+                        "queue manager unreachable"
+                    )))
+                }
+                fn as_any(&self) -> &dyn Any {
+                    self
+                }
+            }
+            Ok(Box::new(FailingConsumer))
+        };
+
+        let mut factory = MockEndpointFactory::new();
+        factory.consumer_behavior = Arc::new(Mutex::new(consumer_logic));
+        register_endpoint_factory(&factory_name, Arc::new(factory));
+
+        let input = Endpoint {
+            endpoint_type: EndpointType::Custom {
+                name: factory_name,
+                config: serde_json::Value::Null,
+            },
+            middlewares: vec![],
+            handler: None,
+        };
+        let output = Endpoint::new_memory(&format!("out_{}", unique_id), 10);
+        let mut route = Route::new(input, output);
+        // Long enough to observe the unhealthy/reconnecting state, short enough that the
+        // backoff sleep (which the loop can't interrupt) doesn't slow the test down.
+        route.options.reconnect_interval_ms = 2_000;
+
+        // `run()` returns Ok because the consumer was created and ready was signalled.
+        let handle = route.run("test_status_fail").await.unwrap();
+
+        // The async receive failure should flip the live status to unhealthy.
+        let mut status = handle.status();
+        for _ in 0..50 {
+            if !status.healthy {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            status = handle.status();
+        }
+
+        assert!(!status.healthy, "expected route to report unhealthy status");
+        assert!(
+            status
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("queue manager unreachable"),
+            "expected last connection error in status, got {:?}",
+            status.error
+        );
+
+        handle.stop().await;
+        let _ = handle.join().await;
+    }
+
+    #[tokio::test]
     async fn test_non_retryable_handler_error_does_not_crash_route() {
         let unique_id = fast_uuid_v7::gen_id().to_string();
         let in_topic = format!("bad_input_in_{}", unique_id);
@@ -3003,7 +3186,7 @@ mod tests {
 
         // The route must still be running after the source is empty.
         assert!(
-            !handle.0 .0.is_finished(),
+            !handle.handle.is_finished(),
             "route exited on empty batch without exit_on_empty set"
         );
 

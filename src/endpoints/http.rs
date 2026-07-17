@@ -1946,11 +1946,56 @@ fn build_http_client(config: &HttpConfig) -> anyhow::Result<HttpClient> {
     Ok(client_builder.build(https_connector))
 }
 
-/// Returns a shared HTTP client for these client-level settings, building one on first
-/// use. The request URL is per-message, so one client serves all targets it can reach.
+/// A set of independent pooled hyper clients that requests are round-robined across.
+///
+/// A single `legacy::Client` guards its connection pool with one mutex, so under high
+/// concurrency every in-flight request serialises on that lock — which caps publisher
+/// throughput and, unlike the server side (no shared lock), does not scale with cores.
+/// Sharding across several clients spreads that contention so send throughput scales.
+struct ShardedHttpClient {
+    clients: Vec<HttpClient>,
+    next: std::sync::atomic::AtomicUsize,
+}
+
+impl ShardedHttpClient {
+    /// Picks the next client, round-robin. Single-shard fast path avoids the atomic.
+    #[inline]
+    fn pick(&self) -> &HttpClient {
+        if self.clients.len() == 1 {
+            return &self.clients[0];
+        }
+        let idx = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % self.clients.len();
+        &self.clients[idx]
+    }
+}
+
+/// Number of pooled clients to shard across — matches available parallelism (capped) so
+/// pool-lock contention scales with cores, like the server side does.
+fn http_client_shard_count() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .clamp(1, 16)
+}
+
+/// Builds a sharded set of connection-pooling hyper clients for these connector settings.
+fn build_sharded_http_client(config: &HttpConfig) -> anyhow::Result<ShardedHttpClient> {
+    let shards = http_client_shard_count();
+    let mut clients = Vec::with_capacity(shards);
+    for _ in 0..shards {
+        clients.push(build_http_client(config)?);
+    }
+    Ok(ShardedHttpClient {
+        clients,
+        next: std::sync::atomic::AtomicUsize::new(0),
+    })
+}
+
+/// Returns a shared sharded HTTP client for these client-level settings, building one on
+/// first use. The request URL is per-message, so one client serves all targets it reaches.
 async fn create_shared_http_client(
     config: &HttpConfig,
-) -> anyhow::Result<std::sync::Arc<HttpClient>> {
+) -> anyhow::Result<std::sync::Arc<ShardedHttpClient>> {
     let identity = crate::connection_registry::connection_identity((
         config.tls.required,
         &config.tls.ca_file,
@@ -1965,7 +2010,7 @@ async fn create_shared_http_client(
         "http-client",
         identity,
         config.shared.unwrap_or(true),
-        move || async move { build_http_client(&config_clone) },
+        move || async move { build_sharded_http_client(&config_clone) },
     )
     .await
 }
@@ -1981,7 +2026,7 @@ async fn create_shared_http_client(
 #[derive(Clone)]
 pub struct HttpPublisher {
     /// Persistent HTTP client with connection pooling
-    client: std::sync::Arc<HttpClient>,
+    client: std::sync::Arc<ShardedHttpClient>,
     url: String,
     base_uri: hyper::Uri,
     /// Default HTTP method to use if not overridden by message metadata
@@ -2045,11 +2090,10 @@ impl HttpPublisher {
             stream_response_sink,
         })
     }
-}
 
-#[async_trait]
-impl MessagePublisher for HttpPublisher {
-    async fn send(&self, message: CanonicalMessage) -> Result<Sent, PublisherError> {
+    /// Core send that borrows `message`, so `send_batch` needn't clone every message just to
+    /// keep it available for error reporting — this body only ever reads from it.
+    async fn send_ref(&self, message: &CanonicalMessage) -> Result<Sent, PublisherError> {
         trace!(
             message_id = %format!("{:032x}", message.message_id),
             url = %self.url,
@@ -2132,7 +2176,8 @@ impl MessagePublisher for HttpPublisher {
             PublisherError::NonRetryable(anyhow::anyhow!("Failed to build request: {}", e))
         })?;
 
-        let future = tokio::time::timeout(self.request_timeout, self.client.request(request));
+        let future =
+            tokio::time::timeout(self.request_timeout, self.client.pick().request(request));
 
         let response: hyper::Response<Incoming> = match future.await {
             Ok(Ok(resp)) => resp,
@@ -2269,6 +2314,23 @@ impl MessagePublisher for HttpPublisher {
         Ok(Sent::Response(response_message))
     }
 
+    /// Wraps `send_ref` carrying the batch index, so `send_batch` can build its futures from a
+    /// plain method call (an async closure here trips a higher-ranked-lifetime inference error).
+    async fn send_ref_indexed(
+        &self,
+        idx: usize,
+        message: &CanonicalMessage,
+    ) -> (usize, Result<Sent, PublisherError>) {
+        (idx, self.send_ref(message).await)
+    }
+}
+
+#[async_trait]
+impl MessagePublisher for HttpPublisher {
+    async fn send(&self, message: CanonicalMessage) -> Result<Sent, PublisherError> {
+        self.send_ref(&message).await
+    }
+
     async fn send_batch(
         &self,
         messages: Vec<CanonicalMessage>,
@@ -2281,7 +2343,7 @@ impl MessagePublisher for HttpPublisher {
 
         if messages.len() == 1 {
             let message = messages.into_iter().next().expect("checked len");
-            return match self.send(message.clone()).await {
+            return match self.send_ref(&message).await {
                 Ok(Sent::Ack) => Ok(SentBatch::Ack),
                 Ok(Sent::Response(resp)) => Ok(SentBatch::Partial {
                     responses: Some(vec![resp]),
@@ -2301,25 +2363,45 @@ impl MessagePublisher for HttpPublisher {
             "Publishing batch of HTTP requests"
         );
 
-        let send_futures = messages.into_iter().map(|message| {
-            let msg_for_error = message.clone();
-            async move { self.send(message).await.map_err(|e| (msg_for_error, e)) }
-        });
-
-        let mut stream = futures::stream::iter(send_futures).buffered(self.batch_concurrency);
+        // Unordered so a slow request doesn't head-of-line-block harvesting completed ones;
+        // responses carry their own message_id, so collection order is irrelevant. Futures are
+        // materialized eagerly (only polled by `buffer_unordered`) to sidestep a higher-ranked
+        // lifetime inference error from a lazy iterator of borrowing futures.
+        let send_futures: Vec<_> = messages
+            .iter()
+            .enumerate()
+            .map(|(idx, message)| self.send_ref_indexed(idx, message))
+            .collect();
+        let mut stream =
+            futures::stream::iter(send_futures).buffer_unordered(self.batch_concurrency);
 
         let mut responses = Vec::new();
-        let mut failed = Vec::new();
+        let mut failed_indices: Vec<(usize, PublisherError)> = Vec::new();
 
-        while let Some(result) = stream.next().await {
+        while let Some((idx, result)) = stream.next().await {
             match result {
                 Ok(Sent::Response(resp)) => responses.push(resp),
                 Ok(Sent::Ack) => {}
-                Err((msg, e)) => {
-                    failed.push((msg, e));
-                }
+                Err(e) => failed_indices.push((idx, e)),
             }
         }
+        drop(stream);
+
+        // Reclaim owned messages only for the (rare) failures — avoids a per-message clone.
+        let failed = if failed_indices.is_empty() {
+            Vec::new()
+        } else {
+            let mut owned: Vec<Option<CanonicalMessage>> = messages.into_iter().map(Some).collect();
+            failed_indices
+                .into_iter()
+                .map(|(idx, e)| {
+                    (
+                        owned[idx].take().expect("each failed index reclaimed once"),
+                        e,
+                    )
+                })
+                .collect()
+        };
 
         if failed.is_empty() && responses.is_empty() {
             Ok(SentBatch::Ack)

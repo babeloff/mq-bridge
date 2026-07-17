@@ -6,6 +6,7 @@
 //! The URL parsing, slot lifecycle, and TLS mapping follow the approach in
 //! faucet-stream (crates/source/postgres-cdc/src/replication.rs, dual
 //! Apache-2.0 OR MIT), adapted to mq-bridge's config and error types.
+//! Pinned upstream commit and per-file changes: `./VENDORED.md`.
 
 use crate::endpoints::postgres::state::format_lsn;
 use crate::models::PostgresCdcConfig;
@@ -158,6 +159,150 @@ pub async fn ensure_slot(
              the server until consumed or explicitly dropped. Use temporary_slot: true for \
              ephemeral runs."
         );
+    }
+    Ok(())
+}
+
+/// A publication table reference is a plain identifier or a single `schema.table`,
+/// each part `[A-Za-z0-9_]`. Both are interpolated into DDL, so they are validated
+/// (not bindable as parameters).
+fn is_valid_pg_table_ref(s: &str) -> bool {
+    match s.split_once('.') {
+        Some((schema, table)) => {
+            super::is_valid_pg_ident(schema) && super::is_valid_pg_ident(table)
+        }
+        None => super::is_valid_pg_ident(s),
+    }
+}
+
+/// Split a table reference into `(schema, table)`; an unqualified name has no schema.
+fn split_table_ref(s: &str) -> (Option<&str>, &str) {
+    match s.split_once('.') {
+        Some((schema, table)) => (Some(schema), table),
+        None => (None, s),
+    }
+}
+
+/// True for a Postgres `duplicate_object` (42710) error — e.g. a concurrent
+/// `CREATE PUBLICATION` won the race between our existence check and create.
+fn is_duplicate_object(e: &sqlx::Error) -> bool {
+    e.as_database_error()
+        .and_then(|db| db.code())
+        .is_some_and(|c| c == "42710")
+}
+
+/// Ensure the publication exists, creating it if missing. With `tables` empty the
+/// publication is `FOR ALL TABLES` (needs superuser); otherwise
+/// `FOR TABLE <t1, t2, ...>` (needs ownership of each).
+///
+/// When the publication already exists and named `tables` are given, missing ones
+/// are **added** (`ALTER PUBLICATION ... ADD TABLE`) so the config stays the source
+/// of truth; tables are never dropped, so an operator's extra tables are left intact.
+/// Publication and table names are identifiers (not bindable as parameters), so
+/// they are validated as `[A-Za-z0-9_]` (optionally `schema.table`) before interpolation.
+pub async fn ensure_publication(
+    url: &str,
+    publication: &str,
+    tables: &[String],
+    tls: &crate::models::TlsConfig,
+) -> anyhow::Result<()> {
+    if !super::is_valid_pg_ident(publication) {
+        return Err(anyhow!(
+            "postgres-cdc: `publication` must be a non-empty [A-Za-z0-9_] identifier"
+        ));
+    }
+    for t in tables {
+        if !is_valid_pg_table_ref(t) {
+            return Err(anyhow!(
+                "postgres-cdc: publication table '{t}' must be a [A-Za-z0-9_] identifier \
+                 (optionally schema-qualified as schema.table)"
+            ));
+        }
+    }
+    let mut conn = control_conn(url, tls).await?;
+
+    let exists = sqlx::query_as::<_, (String,)>(
+        "SELECT pubname::text FROM pg_publication WHERE pubname = $1",
+    )
+    .bind(publication)
+    .fetch_optional(&mut conn)
+    .await
+    .map_err(|e| anyhow!("postgres-cdc: publication lookup failed: {e}"))?
+    .is_some();
+
+    if !exists {
+        let sql = if tables.is_empty() {
+            format!("CREATE PUBLICATION {publication} FOR ALL TABLES")
+        } else {
+            format!(
+                "CREATE PUBLICATION {publication} FOR TABLE {}",
+                tables.join(", ")
+            )
+        };
+        // Identifiers were validated above, so the interpolated DDL is safe.
+        match sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
+            .execute(&mut conn)
+            .await
+        {
+            Ok(_) => warn!(
+                "postgres-cdc: created publication '{publication}' — it defines which tables are \
+                 captured; drop it with DROP PUBLICATION when no longer needed."
+            ),
+            // Lost the create race to a concurrent starter; the publication now exists.
+            Err(e) if is_duplicate_object(&e) => {
+                debug!("postgres-cdc: publication '{publication}' created concurrently")
+            }
+            Err(e) => return Err(anyhow!("postgres-cdc: create publication failed: {e}")),
+        }
+    }
+
+    // Reconcile membership (add-only) when we manage a specific table list.
+    if !tables.is_empty() {
+        add_missing_publication_tables(&mut conn, publication, tables).await?;
+    }
+    Ok(())
+}
+
+/// Add any `tables` not already in the publication via `ALTER PUBLICATION ... ADD TABLE`.
+/// An unqualified name is matched by table name in any schema (it resolves via `search_path`);
+/// a `schema.table` reference is matched exactly. Never removes tables.
+async fn add_missing_publication_tables(
+    conn: &mut PgConnection,
+    publication: &str,
+    tables: &[String],
+) -> anyhow::Result<()> {
+    let current: Vec<(String, String)> = sqlx::query_as(
+        "SELECT schemaname::text, tablename::text FROM pg_publication_tables WHERE pubname = $1",
+    )
+    .bind(publication)
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(|e| anyhow!("postgres-cdc: publication membership lookup failed: {e}"))?;
+
+    for t in tables {
+        let (schema, table) = split_table_ref(t);
+        let present = current
+            .iter()
+            .any(|(s, tab)| tab == table && schema.map(|want| want == s).unwrap_or(true));
+        if present {
+            continue;
+        }
+        let sql = format!("ALTER PUBLICATION {publication} ADD TABLE {t}");
+        match sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
+            .execute(&mut *conn)
+            .await
+        {
+            Ok(_) => warn!("postgres-cdc: added table '{t}' to publication '{publication}'"),
+            // Lost the race to a concurrent reconciler; the table is now a member.
+            Err(e) if is_duplicate_object(&e) => {
+                debug!("postgres-cdc: table '{t}' already in publication '{publication}'")
+            }
+            Err(e) => {
+                return Err(anyhow!(
+                    "postgres-cdc: add table '{t}' to publication failed: {e}"
+                ))
+            }
+        }
     }
     Ok(())
 }

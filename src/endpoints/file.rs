@@ -121,7 +121,7 @@ fn parse_csv_row(line: &str) -> Vec<String> {
     fields
 }
 
-fn parse_delimiter(delimiter: Option<&str>) -> anyhow::Result<Vec<u8>> {
+pub(crate) fn parse_delimiter(delimiter: Option<&str>) -> anyhow::Result<Vec<u8>> {
     let bytes = match delimiter {
         Some(s) if s.starts_with("0x") => {
             let hex = s.trim_start_matches("0x");
@@ -258,58 +258,6 @@ impl MessagePublisher for FilePublisher {
             // dropped `mqb.src.*` keys are irrelevant to a retry on the next hop.
             msg.strip_source_metadata();
             let serialized_msg = match self.format {
-                FileFormat::Raw => Ok(msg.payload.to_vec()),
-                FileFormat::Normal => {
-                    if msg
-                        .metadata
-                        .get("mq_bridge.original_format")
-                        .map(|s| s.as_str())
-                        == Some("raw")
-                    {
-                        // If the message was originally raw, pass its payload through directly
-                        // to support raw file-to-file copies without re-wrapping.
-                        Ok(msg.payload.to_vec())
-                    } else {
-                        serde_json::to_vec(&msg)
-                    }
-                }
-                FileFormat::Json => {
-                    if let Ok(json_val) = serde_json::from_slice::<serde_json::Value>(&msg.payload)
-                    {
-                        #[derive(serde::Serialize)]
-                        struct JsonWrapper<'a> {
-                            #[serde(serialize_with = "crate::canonical_message::print_uuidv7")]
-                            message_id: u128,
-                            payload: serde_json::Value,
-                            metadata: &'a HashMap<String, String>,
-                        }
-                        serde_json::to_vec(&JsonWrapper {
-                            message_id: msg.message_id,
-                            payload: json_val,
-                            metadata: &msg.metadata,
-                        })
-                    } else {
-                        serde_json::to_vec(&msg)
-                    }
-                }
-                FileFormat::Text => {
-                    if let Ok(text) = std::str::from_utf8(&msg.payload) {
-                        #[derive(serde::Serialize)]
-                        struct TextWrapper<'a> {
-                            #[serde(serialize_with = "crate::canonical_message::print_uuidv7")]
-                            message_id: u128,
-                            payload: &'a str,
-                            metadata: &'a HashMap<String, String>,
-                        }
-                        serde_json::to_vec(&TextWrapper {
-                            message_id: msg.message_id,
-                            payload: text,
-                            metadata: &msg.metadata,
-                        })
-                    } else {
-                        serde_json::to_vec(&msg)
-                    }
-                }
                 FileFormat::Csv => {
                     match serde_json::from_slice::<serde_json::Value>(&msg.payload) {
                         Ok(serde_json::Value::Object(obj)) => {
@@ -358,8 +306,9 @@ impl MessagePublisher for FilePublisher {
                         ))),
                     }
                 }
+                ref fmt => encode_record(&msg, fmt),
             };
-            let serialized_msg = match serialized_msg {
+            let mut serialized_msg = match serialized_msg {
                 Ok(s) => s,
                 Err(e) => {
                     tracing::error!("Failed to serialize message for file sink: {}", e);
@@ -368,12 +317,19 @@ impl MessagePublisher for FilePublisher {
                 }
             };
 
+            // Write body + delimiter as one contiguous buffer so a concurrent
+            // tailing reader never observes the record without its delimiter
+            // (shrinks the torn-write window; the reader also guards against it).
+            serialized_msg.extend_from_slice(&self.delimiter);
             if let Err(e) = writer.write_all(&serialized_msg).await {
                 tracing::error!("Failed to write message to file: {}", e);
-                failed_messages.push((msg, PublisherError::NonRetryable(anyhow::anyhow!(e))));
-            } else if let Err(e) = writer.write_all(&self.delimiter).await {
-                tracing::error!("Failed to write delimiter to file: {}", e);
-                return Err(PublisherError::NonRetryable(anyhow::anyhow!(e)));
+                // A buffered write failure leaves the BufWriter in an undefined state and the
+                // remaining messages in this batch are unwritten. Abort so the whole batch is
+                // retried rather than reusing the writer, flushing partial data, or acking
+                // messages that never reached the file.
+                return Err(PublisherError::Retryable(
+                    anyhow::Error::new(e).context("Failed to write message to file"),
+                ));
             }
         }
 
@@ -729,10 +685,17 @@ fn run_file_tail_task_sync(
                 match read_until_bytes_sync(r, &delimiter, &mut buf) {
                     Ok(0) => break, // EOF
                     Ok(n) => {
-                        last_position += n as u64;
-                        if buf.ends_with(&delimiter) {
-                            buf.truncate(buf.len() - delimiter.len());
+                        if !buf.ends_with(&delimiter) {
+                            // Torn/partial line: the writer's content reached disk
+                            // ahead of its trailing delimiter. Don't advance the
+                            // position or emit a message; drop the reader so the
+                            // next iteration reopens and re-seeks to last_position,
+                            // re-reading the line whole once the writer finishes it.
+                            reader = None;
+                            break;
                         }
+                        last_position += n as u64;
+                        buf.truncate(buf.len() - delimiter.len());
                         if delimiter.len() == 1 && delimiter[0] == b'\n' && buf.ends_with(b"\r") {
                             buf.pop();
                         }
@@ -1319,9 +1282,69 @@ impl MessageConsumer for FileConsumer {
     }
 }
 
+/// Wraps a message body for the Json/Text file formats. Generic over the payload type
+/// so both formats share one struct while keeping the message_id serializer and field
+/// layout (and thus the on-disk output) identical.
+#[derive(serde::Serialize)]
+struct RecordWrapper<'a, P: serde::Serialize> {
+    #[serde(serialize_with = "crate::canonical_message::print_uuidv7")]
+    message_id: u128,
+    payload: P,
+    metadata: &'a HashMap<String, String>,
+}
+
+/// Encodes a single message body for a non-CSV [`FileFormat`] (Raw/Normal/Json/Text).
+/// Shared by the file sink and the object-store sink. CSV needs cross-record header
+/// state, so it is handled inline by the file sink and rejected by the object sink.
+pub(crate) fn encode_record(
+    msg: &CanonicalMessage,
+    format: &FileFormat,
+) -> Result<Vec<u8>, serde_json::Error> {
+    match format {
+        FileFormat::Raw => Ok(msg.payload.to_vec()),
+        FileFormat::Normal => {
+            if msg
+                .metadata
+                .get("mq_bridge.original_format")
+                .map(|s| s.as_str())
+                == Some("raw")
+            {
+                // A raw-origin message passes through directly to support raw copies
+                // without re-wrapping.
+                Ok(msg.payload.to_vec())
+            } else {
+                serde_json::to_vec(msg)
+            }
+        }
+        FileFormat::Json => {
+            if let Ok(json_val) = serde_json::from_slice::<serde_json::Value>(&msg.payload) {
+                serde_json::to_vec(&RecordWrapper {
+                    message_id: msg.message_id,
+                    payload: json_val,
+                    metadata: &msg.metadata,
+                })
+            } else {
+                serde_json::to_vec(msg)
+            }
+        }
+        FileFormat::Text => {
+            if let Ok(text) = std::str::from_utf8(&msg.payload) {
+                serde_json::to_vec(&RecordWrapper {
+                    message_id: msg.message_id,
+                    payload: text,
+                    metadata: &msg.metadata,
+                })
+            } else {
+                serde_json::to_vec(msg)
+            }
+        }
+        FileFormat::Csv => unreachable!("CSV is encoded by the caller, not encode_record"),
+    }
+}
+
 /// Parses one file line into a message. Returns `None` for CSV header lines,
 /// which establish the schema but carry no data of their own.
-fn parse_message(
+pub(crate) fn parse_message(
     buffer: &[u8],
     format: &FileFormat,
     csv_header: &mut Option<Vec<String>>,

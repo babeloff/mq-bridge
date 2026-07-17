@@ -329,12 +329,70 @@ async fn test_postgres_cdc() {
     }
 }
 
+#[cfg(feature = "object-store")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires docker compose (localstack s3)"]
+async fn test_object_store_pipeline() {
+    if should_run("object_store") {
+        integration::object_store::test_object_store_pipeline().await;
+    }
+}
+
+#[cfg(feature = "object-store")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires docker compose (localstack s3)"]
+async fn test_object_store_resume() {
+    if should_run("object_store") {
+        integration::object_store::test_object_store_resume().await;
+    }
+}
+
 #[cfg(all(feature = "postgres-cdc", feature = "test-utils"))]
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires docker compose (postgres with wal_level=logical)"]
 async fn test_postgres_cdc_restart() {
     if should_run("postgres_cdc") || should_run("postgres") {
         integration::postgres_cdc::test_postgres_cdc_restart_safety().await;
+    }
+}
+
+/// Isolated CDC read throughput (seed untimed, time only the replication drain).
+#[cfg(all(feature = "postgres-cdc", feature = "test-utils"))]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires docker compose (postgres with wal_level=logical)"]
+async fn test_postgres_cdc_read_throughput() {
+    if should_run("postgres_cdc") || should_run("postgres") {
+        integration::postgres_cdc::test_postgres_cdc_read_throughput().await;
+    }
+}
+
+/// Per-change insert->capture latency (p50/p95/p99).
+#[cfg(all(feature = "postgres-cdc", feature = "test-utils"))]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires docker compose (postgres with wal_level=logical)"]
+async fn test_postgres_cdc_latency() {
+    if should_run("postgres_cdc") || should_run("postgres") {
+        integration::postgres_cdc::test_postgres_cdc_latency().await;
+    }
+}
+
+/// Isolated MongoDB change-stream read throughput (seed untimed, time only the drain).
+#[cfg(feature = "mongodb")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires docker compose (mongodb replica set)"]
+async fn test_mongodb_cdc_read_throughput() {
+    if should_run("mongodb_cdc") || should_run("mongodb") {
+        integration::mongodb::test_mongodb_cdc_read_throughput().await;
+    }
+}
+
+/// MongoDB change-stream per-change insert->capture latency (p50/p95/p99).
+#[cfg(feature = "mongodb")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires docker compose (mongodb replica set)"]
+async fn test_mongodb_cdc_latency() {
+    if should_run("mongodb_cdc") || should_run("mongodb") {
+        integration::mongodb::test_mongodb_cdc_latency().await;
     }
 }
 
@@ -387,6 +445,19 @@ async fn test_all_performance_pipeline() {
         if should_run("mongodb_replica_set") {
             println!("\n\n>>> Starting MongoDB Replica Set Performance Pipeline Test...");
             integration::mongodb::test_mongodb_replica_set_pipeline().await;
+        }
+        if should_run("mongodb_cdc") {
+            println!("\n\n>>> Starting MongoDB CDC (change stream) Performance Pipeline Test...");
+            integration::mongodb::test_mongodb_cdc_performance_pipeline().await;
+        }
+    }
+    #[cfg(all(feature = "postgres-cdc", feature = "test-utils"))]
+    {
+        if should_run("postgres_cdc") {
+            println!(
+                "\n\n>>> Starting Postgres CDC (logical replication) Performance Pipeline Test..."
+            );
+            integration::postgres_cdc::test_postgres_cdc_performance_pipeline().await;
         }
     }
     #[cfg(any(feature = "ibm-mq-static", feature = "ibm-mq"))]
