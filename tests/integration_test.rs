@@ -329,6 +329,24 @@ async fn test_postgres_cdc() {
     }
 }
 
+#[cfg(feature = "object-store")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires docker compose (localstack s3)"]
+async fn test_object_store_pipeline() {
+    if should_run("object_store") {
+        integration::object_store::test_object_store_pipeline().await;
+    }
+}
+
+#[cfg(feature = "object-store")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires docker compose (localstack s3)"]
+async fn test_object_store_resume() {
+    if should_run("object_store") {
+        integration::object_store::test_object_store_resume().await;
+    }
+}
+
 #[cfg(all(feature = "postgres-cdc", feature = "test-utils"))]
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires docker compose (postgres with wal_level=logical)"]

@@ -25,7 +25,7 @@ If you need to move data reliably between systems and you write code (Rust, Pyth
 
 **Prefer not to write code?** [`mq-bridge-app`](https://github.com/marcomq/mq-bridge-app) runs the exact same engine as a **standalone, zero-code ETL service** configured entirely by **YAML or environment variables** — move data from A to B without writing a line. It ships a **Postman-style UI** to build, send, and inspect messages against a route, and can **import Postman collections and AsyncAPI documents** to scaffold routes and endpoints for you.
 
-*   **16+ transports, one API**: Kafka, NATS, AMQP (RabbitMQ), MQTT, MongoDB, **Postgres CDC** (logical replication), PostgreSQL / MySQL / SQLite (SQLx), ClickHouse, HTTP, WebSocket, gRPC, ZeroMQ, Redis Streams, AWS SQS/SNS, IBM MQ, files, and in-memory channels — all behind the same `receive_batch` / `send_batch` shape.
+*   **16+ transports, one API**: Kafka, NATS, AMQP (RabbitMQ), MQTT, MongoDB, **Postgres CDC** (logical replication), PostgreSQL / MySQL / SQLite (SQLx), ClickHouse, HTTP, WebSocket, gRPC, ZeroMQ, Redis Streams, AWS SQS/SNS, cloud object storage (S3 / GCS / Azure), IBM MQ, files, and in-memory channels — all behind the same `receive_batch` / `send_batch` shape.
 *   **Change Data Capture**: stream row-level changes from **Postgres** (logical replication / `pgoutput`) and **MongoDB** (change streams) as flat rows with an operation marker.
 *   **Restart-safe delivery**: batch-aware ack/nack with commit sequencing for cumulative-ack brokers; the integration suite shows **no data loss during in-flight broker restarts**, including a Postgres CDC restart-safety test.
 *   **Reliability middleware, not a framework**: retries, dead-letter queues, deduplication, rate limiting, and cookie/session persistence wrap any endpoint.
@@ -72,7 +72,7 @@ For implementation details and quick start examples for each usage type, see the
 
 ## Features
 
-*   **Supported Backends**: Kafka, NATS, AMQP (RabbitMQ), MQTT, MongoDB, SQL Databases (PostgreSQL, MySQL, SQLite via sqlx), **Postgres CDC** (logical replication), ClickHouse, gRPC, HTTP, WebSocket, ZeroMQ, Redis Streams, Files, AWS (SQS/SNS), IBM MQ, and in-memory channels.
+*   **Supported Backends**: Kafka, NATS, AMQP (RabbitMQ), MQTT, MongoDB, SQL Databases (PostgreSQL, MySQL, SQLite via sqlx), **Postgres CDC** (logical replication), ClickHouse, gRPC, HTTP, WebSocket, ZeroMQ, Redis Streams, Files, cloud object storage (S3 / GCS / Azure), AWS (SQS/SNS), IBM MQ, and in-memory channels.
 *   **Change Data Capture**: PostgreSQL logical replication (`postgres_cdc`) and MongoDB change streams, surfaced as flat rows with an `*.operation` marker (`insert`/`update`/`delete`/`truncate`).
     > **Note**: IBM MQ is included in the `full` feature set via the `ibm-mq` feature, which loads the IBM MQ client library at runtime via dlopen — **no IBM SDK is needed to build**. The IBM MQ redistributable client only has to be present at runtime, and only if you actually use an IBM MQ endpoint (it is loaded lazily on first connect). If the client is missing, the affected route fails fast with a non-retryable error instead of reconnecting forever. The loader finds the client via the platform default name, `MQ_INSTALLATION_PATH` (e.g. `/opt/mqm`), or an explicit `MQB_IBM_MQ_LIB` path. To link the client statically at build time instead, use the `ibm-mq-static` feature (requires the IBM MQ SDK). See the [mqi crate](https://crates.io/crates/mqi/) for details.
     >
@@ -196,6 +196,33 @@ Databases have no native pub/sub, so `mq-bridge` reads them as a source in one o
     *   On **MongoDB**, set `consume: capture_new` to watch an existing collection for changes from now on, or `consume: capture_all` to read the existing documents first and then keep capturing changes (no gap, at-least-once). It emits `insert`/`update`/`replace`/`delete` events tagged with `mongodb.operation` metadata and checkpoints progress under `cursor_id`. These use the change stream (full post-image via `updateLookup`) and need a replica set; on a standalone server `capture_all` falls back to an insert-only read.
 *   **Cursor polling** — pages an existing table by a monotonic `cursor_column` (`WHERE col > $last ORDER BY col ASC`), persisting the last read value under `cursor_id`. Captures **appends only** — updates and deletes are not observed. Available on **SQLx** (PostgreSQL / MySQL / MariaDB / SQLite) and **ClickHouse**; while idle the poll interval backs off exponentially between `polling_interval_ms` and `max_polling_interval_ms`. **SQLite** and **ClickHouse** are polling-only — they have no server-side change log.
 
+
+### Cloud Object Storage (S3 / GCS / Azure)
+The `object_store` endpoint (alias `s3`) reads and writes cloud object stores — Amazon S3, Google Cloud Storage, Azure Blob, Cloudflare R2, and anything else the [`object_store`](https://crates.io/crates/object_store) crate speaks — behind the same `receive_batch` / `send_batch` API. Enable it with the `object-store` feature. Credentials and backend options are read from the process environment (`AWS_ACCESS_KEY_ID`, `AWS_ENDPOINT`, `AWS_REGION`, `GOOGLE_SERVICE_ACCOUNT`, `AZURE_STORAGE_ACCOUNT`, ...); the URL scheme picks the backend (`s3://`, `gs://`, `az://`).
+
+*   **As a sink**, each flushed batch is encoded with the same file endpoint formats (`normal` JSONL, `json`, `text`, `raw`) and written as **one immutable object** at `<prefix>/[YYYY/MM/DD/]<uuidv7>.<ext>`. Objects are write-once — nothing is appended or mutated. The uuidv7 name already sorts by write time; the optional `date_partition` prefix (on by default, derived from that same id's timestamp) is a readability / lifecycle-rule convenience.
+*   **As a source**, objects under the prefix are listed in key order, fetched whole, split on the delimiter, and emitted. Progress is a durable cursor holding the last fully-acked object key: set `cursor_id` and an external `checkpoint_store` (`file://`, `s3://`, `postgres://`, `mongodb://`) so a restart resumes without re-emitting. Objects are **never deleted or rewritten** — resume is non-destructive and at-least-once at object granularity (a nacked batch is redelivered; the cursor only advances once an object is fully acked). `csv` is supported on the source only.
+
+```yaml
+archive_to_s3:
+  input:
+    memory: { topic: "events" }
+  output:
+    object_store:
+      url: "s3://my-bucket/events"
+      format: normal            # JSONL; also json / text / raw
+
+replay_from_s3:
+  input:
+    object_store:
+      url: "s3://my-bucket/events"
+      cursor_id: "replayer-1"
+      checkpoint_store: "file:///var/lib/mqb/s3-cursor.json"
+  output:
+    nats: { subject: "events.replay", url: "nats://localhost:4222" }
+```
+
+> Point `checkpoint_store` at a **different** bucket or prefix than the source reads; a cursor object written under the source prefix would be listed and re-read as data (the source rejects an overlapping object-store checkpoint location).
 
 ### Response Endpoint
 The `response` output endpoint sends a reply back to the original requester. This is useful for synchronous request-reply flows, for example HTTP-to-NATS-to-HTTP. Use `response: {}` as the output endpoint configuration.

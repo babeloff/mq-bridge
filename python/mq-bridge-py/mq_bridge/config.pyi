@@ -106,6 +106,7 @@ class Endpoint(TypedDict, total=False):
     mqtt: MqttConfig
     nats: NatsConfig
     null: Any
+    object_store: ObjectStoreConfig
     postgres_cdc: PostgresCdcConfig
     reader: Endpoint
     redis_streams: RedisStreamsConfig
@@ -307,6 +308,19 @@ class NatsConfig(TypedDict, total=False):
     token: Optional[str]
     url: Required[str]
     username: Optional[str]
+
+
+class ObjectStoreConfig(TypedDict, total=False):
+    """Configuration for a cloud object-store endpoint (S3, GCS, Azure Blob, R2, ...)."""
+    checkpoint_store: Optional[str]
+    cursor_id: Optional[str]
+    date_partition: bool
+    delimiter: Optional[str]
+    extension: Optional[str]
+    format: FileFormat
+    max_object_bytes: Optional[int]
+    polling_interval_ms: Optional[int]
+    url: Required[str]
 
 
 class PostgresCdcConfig(TypedDict, total=False):

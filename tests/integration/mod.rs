@@ -28,6 +28,8 @@ pub mod mqtt;
 pub mod mysql;
 #[cfg(feature = "nats")]
 pub mod nats;
+#[cfg(feature = "object-store")]
+pub mod object_store;
 #[cfg(feature = "sqlx")]
 pub mod postgres;
 #[cfg(all(feature = "postgres-cdc", feature = "test-utils"))]

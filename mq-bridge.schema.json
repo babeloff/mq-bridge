@@ -505,6 +505,17 @@
         {
           "type": "object",
           "properties": {
+            "object_store": {
+              "$ref": "#/$defs/ObjectStoreConfig"
+            }
+          },
+          "required": [
+            "object_store"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
             "static": {
               "$ref": "#/$defs/StaticConfig"
             }
@@ -2224,6 +2235,75 @@
         "last",
         "new",
         "last_per_subject"
+      ]
+    },
+    "ObjectStoreConfig": {
+      "description": "Configuration for a cloud object-store endpoint (S3, GCS, Azure Blob, R2, ...).\n\nAs a **sink**, each flushed batch is written as one immutable object under `url`,\nnamed `<prefix>/[YYYY/MM/DD/]<uuidv7>.<ext>`. As a **source**, objects under `url`\nare listed in key order, fetched, split by `delimiter`, and emitted as messages;\nprogress is persisted to `checkpoint_store` (the last processed object key) so a\nrestart resumes without re-emitting. Objects are never mutated or deleted in place.",
+      "type": "object",
+      "properties": {
+        "checkpoint_store": {
+          "description": "(Source only) Durable resume store URL recording the last processed object key, e.g.\n`file:///var/lib/mqb/obj.json`, `s3://bucket/cursors`, or `postgres://…`. Without it\nevery restart re-lists and re-emits all objects.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "cursor_id": {
+          "description": "(Source only) Cursor id namespacing the checkpoint key; enables durable resume.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "date_partition": {
+          "description": "(Sink only) Prepend a `YYYY/MM/DD/` path (write time, UTC) to each object key. Purely\nfor readability / lifecycle rules — the uuidv7 name already sorts by time. Default true.",
+          "type": "boolean",
+          "default": true
+        },
+        "delimiter": {
+          "description": "Record delimiter within an object. Defaults to newline (\"\\n\"). Can be a string or a\nhex sequence (e.g. \"0x00\").",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "extension": {
+          "description": "(Sink only) Extension for written objects, without the dot. Defaults to a value derived\nfrom `format` (`jsonl`, `json`, `txt`, or `bin`).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "format": {
+          "description": "Record encoding within an object, shared with the file endpoint. Defaults to\n`normal` (one JSON `CanonicalMessage` per line). CSV is supported for sources only.",
+          "$ref": "#/$defs/FileFormat",
+          "default": "normal"
+        },
+        "max_object_bytes": {
+          "description": "(Source only) Maximum size in bytes of a single object to fetch into memory. An object\nlarger than this fails the read (surfaced as a consumer error) instead of being\nbuffered whole. Unset means no limit (the whole object is materialized).",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "polling_interval_ms": {
+          "description": "(Source only) Idle poll interval in milliseconds when no new objects are found.\nDefaults to 1000.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "url": {
+          "description": "Object-store URL, e.g. `s3://bucket/prefix`, `gs://bucket/prefix`,\n`az://account/container/prefix`. Credentials are resolved from the environment by\nthe `object_store` crate (same mechanism as the checkpoint backend); R2 uses\n`s3://` plus a custom `AWS_ENDPOINT_URL`.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "url"
       ]
     },
     "PostgresCdcConfig": {

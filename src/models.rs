@@ -701,6 +701,8 @@ pub enum EndpointType {
     Kafka(KafkaConfig),
     Nats(NatsConfig),
     File(FileConfig),
+    #[serde(rename = "object_store", alias = "objectstore", alias = "s3")]
+    ObjectStore(ObjectStoreConfig),
     Static(StaticConfig),
     Ref(String),
     Memory(MemoryConfig),
@@ -741,6 +743,7 @@ impl EndpointType {
             EndpointType::Kafka(_) => "kafka",
             EndpointType::Nats(_) => "nats",
             EndpointType::File(_) => "file",
+            EndpointType::ObjectStore(_) => "object_store",
             EndpointType::Static(_) => "static",
             EndpointType::Ref(_) => "ref",
             EndpointType::Memory(_) => "memory",
@@ -1386,6 +1389,68 @@ impl FileConfig {
     /// Returns the effective consumer mode, defaulting to `Consume` if not set.
     pub fn effective_mode(&self) -> FileConsumerMode {
         self.mode.clone().unwrap_or_default()
+    }
+}
+
+// --- Object Store (S3/GCS/Azure) Specific Configuration ---
+
+/// Configuration for a cloud object-store endpoint (S3, GCS, Azure Blob, R2, ...).
+///
+/// As a **sink**, each flushed batch is written as one immutable object under `url`,
+/// named `<prefix>/[YYYY/MM/DD/]<uuidv7>.<ext>`. As a **source**, objects under `url`
+/// are listed in key order, fetched, split by `delimiter`, and emitted as messages;
+/// progress is persisted to `checkpoint_store` (the last processed object key) so a
+/// restart resumes without re-emitting. Objects are never mutated or deleted in place.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ObjectStoreConfig {
+    /// Object-store URL, e.g. `s3://bucket/prefix`, `gs://bucket/prefix`,
+    /// `az://account/container/prefix`. Credentials are resolved from the environment by
+    /// the `object_store` crate (same mechanism as the checkpoint backend); R2 uses
+    /// `s3://` plus a custom `AWS_ENDPOINT_URL`.
+    pub url: String,
+    /// Record encoding within an object, shared with the file endpoint. Defaults to
+    /// `normal` (one JSON `CanonicalMessage` per line). CSV is supported for sources only.
+    #[serde(default)]
+    pub format: FileFormat,
+    /// Record delimiter within an object. Defaults to newline ("\n"). Can be a string or a
+    /// hex sequence (e.g. "0x00").
+    pub delimiter: Option<String>,
+    /// (Source only) Durable resume store URL recording the last processed object key, e.g.
+    /// `file:///var/lib/mqb/obj.json`, `s3://bucket/cursors`, or `postgres://…`. Without it
+    /// every restart re-lists and re-emits all objects.
+    pub checkpoint_store: Option<String>,
+    /// (Source only) Cursor id namespacing the checkpoint key; enables durable resume.
+    pub cursor_id: Option<String>,
+    /// (Source only) Idle poll interval in milliseconds when no new objects are found.
+    /// Defaults to 1000.
+    pub polling_interval_ms: Option<u64>,
+    /// (Source only) Maximum size in bytes of a single object to fetch into memory. An object
+    /// larger than this fails the read (surfaced as a consumer error) instead of being
+    /// buffered whole. Unset means no limit (the whole object is materialized).
+    pub max_object_bytes: Option<u64>,
+    /// (Sink only) Prepend a `YYYY/MM/DD/` path (write time, UTC) to each object key. Purely
+    /// for readability / lifecycle rules — the uuidv7 name already sorts by time. Default true.
+    #[serde(default = "default_true")]
+    pub date_partition: bool,
+    /// (Sink only) Extension for written objects, without the dot. Defaults to a value derived
+    /// from `format` (`jsonl`, `json`, `txt`, or `bin`).
+    pub extension: Option<String>,
+}
+
+impl Default for ObjectStoreConfig {
+    fn default() -> Self {
+        Self {
+            url: String::new(),
+            format: FileFormat::default(),
+            delimiter: None,
+            checkpoint_store: None,
+            cursor_id: None,
+            polling_interval_ms: None,
+            max_object_bytes: None,
+            date_partition: true,
+            extension: None,
+        }
     }
 }
 

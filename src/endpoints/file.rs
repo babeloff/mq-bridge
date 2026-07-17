@@ -121,7 +121,7 @@ fn parse_csv_row(line: &str) -> Vec<String> {
     fields
 }
 
-fn parse_delimiter(delimiter: Option<&str>) -> anyhow::Result<Vec<u8>> {
+pub(crate) fn parse_delimiter(delimiter: Option<&str>) -> anyhow::Result<Vec<u8>> {
     let bytes = match delimiter {
         Some(s) if s.starts_with("0x") => {
             let hex = s.trim_start_matches("0x");
@@ -258,58 +258,6 @@ impl MessagePublisher for FilePublisher {
             // dropped `mqb.src.*` keys are irrelevant to a retry on the next hop.
             msg.strip_source_metadata();
             let serialized_msg = match self.format {
-                FileFormat::Raw => Ok(msg.payload.to_vec()),
-                FileFormat::Normal => {
-                    if msg
-                        .metadata
-                        .get("mq_bridge.original_format")
-                        .map(|s| s.as_str())
-                        == Some("raw")
-                    {
-                        // If the message was originally raw, pass its payload through directly
-                        // to support raw file-to-file copies without re-wrapping.
-                        Ok(msg.payload.to_vec())
-                    } else {
-                        serde_json::to_vec(&msg)
-                    }
-                }
-                FileFormat::Json => {
-                    if let Ok(json_val) = serde_json::from_slice::<serde_json::Value>(&msg.payload)
-                    {
-                        #[derive(serde::Serialize)]
-                        struct JsonWrapper<'a> {
-                            #[serde(serialize_with = "crate::canonical_message::print_uuidv7")]
-                            message_id: u128,
-                            payload: serde_json::Value,
-                            metadata: &'a HashMap<String, String>,
-                        }
-                        serde_json::to_vec(&JsonWrapper {
-                            message_id: msg.message_id,
-                            payload: json_val,
-                            metadata: &msg.metadata,
-                        })
-                    } else {
-                        serde_json::to_vec(&msg)
-                    }
-                }
-                FileFormat::Text => {
-                    if let Ok(text) = std::str::from_utf8(&msg.payload) {
-                        #[derive(serde::Serialize)]
-                        struct TextWrapper<'a> {
-                            #[serde(serialize_with = "crate::canonical_message::print_uuidv7")]
-                            message_id: u128,
-                            payload: &'a str,
-                            metadata: &'a HashMap<String, String>,
-                        }
-                        serde_json::to_vec(&TextWrapper {
-                            message_id: msg.message_id,
-                            payload: text,
-                            metadata: &msg.metadata,
-                        })
-                    } else {
-                        serde_json::to_vec(&msg)
-                    }
-                }
                 FileFormat::Csv => {
                     match serde_json::from_slice::<serde_json::Value>(&msg.payload) {
                         Ok(serde_json::Value::Object(obj)) => {
@@ -358,6 +306,7 @@ impl MessagePublisher for FilePublisher {
                         ))),
                     }
                 }
+                ref fmt => encode_record(&msg, fmt),
             };
             let mut serialized_msg = match serialized_msg {
                 Ok(s) => s,
@@ -1327,9 +1276,72 @@ impl MessageConsumer for FileConsumer {
     }
 }
 
+/// Encodes a single message body for a non-CSV [`FileFormat`] (Raw/Normal/Json/Text).
+/// Shared by the file sink and the object-store sink. CSV needs cross-record header
+/// state, so it is handled inline by the file sink and rejected by the object sink.
+pub(crate) fn encode_record(
+    msg: &CanonicalMessage,
+    format: &FileFormat,
+) -> Result<Vec<u8>, serde_json::Error> {
+    match format {
+        FileFormat::Raw => Ok(msg.payload.to_vec()),
+        FileFormat::Normal => {
+            if msg
+                .metadata
+                .get("mq_bridge.original_format")
+                .map(|s| s.as_str())
+                == Some("raw")
+            {
+                // A raw-origin message passes through directly to support raw copies
+                // without re-wrapping.
+                Ok(msg.payload.to_vec())
+            } else {
+                serde_json::to_vec(msg)
+            }
+        }
+        FileFormat::Json => {
+            if let Ok(json_val) = serde_json::from_slice::<serde_json::Value>(&msg.payload) {
+                #[derive(serde::Serialize)]
+                struct JsonWrapper<'a> {
+                    #[serde(serialize_with = "crate::canonical_message::print_uuidv7")]
+                    message_id: u128,
+                    payload: serde_json::Value,
+                    metadata: &'a HashMap<String, String>,
+                }
+                serde_json::to_vec(&JsonWrapper {
+                    message_id: msg.message_id,
+                    payload: json_val,
+                    metadata: &msg.metadata,
+                })
+            } else {
+                serde_json::to_vec(msg)
+            }
+        }
+        FileFormat::Text => {
+            if let Ok(text) = std::str::from_utf8(&msg.payload) {
+                #[derive(serde::Serialize)]
+                struct TextWrapper<'a> {
+                    #[serde(serialize_with = "crate::canonical_message::print_uuidv7")]
+                    message_id: u128,
+                    payload: &'a str,
+                    metadata: &'a HashMap<String, String>,
+                }
+                serde_json::to_vec(&TextWrapper {
+                    message_id: msg.message_id,
+                    payload: text,
+                    metadata: &msg.metadata,
+                })
+            } else {
+                serde_json::to_vec(msg)
+            }
+        }
+        FileFormat::Csv => unreachable!("CSV is encoded by the caller, not encode_record"),
+    }
+}
+
 /// Parses one file line into a message. Returns `None` for CSV header lines,
 /// which establish the schema but carry no data of their own.
-fn parse_message(
+pub(crate) fn parse_message(
     buffer: &[u8],
     format: &FileFormat,
     csv_header: &mut Option<Vec<String>>,

@@ -25,6 +25,7 @@ Middleware = dict
 MongoDbConfig = dict
 MqttConfig = dict
 NatsConfig = dict
+ObjectStoreConfig = dict
 PostgresCdcConfig = dict
 RandomPanicMiddleware = dict
 RedisStreamsConfig = dict
@@ -88,6 +89,7 @@ __all__ = [
     "MqttProtocol",
     "NatsConfig",
     "NatsDeliverPolicy",
+    "ObjectStoreConfig",
     "PostgresCdcConfig",
     "RandomPanicMiddleware",
     "RedisStreamsConfig",
