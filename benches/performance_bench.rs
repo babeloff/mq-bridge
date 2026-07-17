@@ -611,8 +611,12 @@ pub mod http_helper {
     /// committed) whose consumer is continuously drained by a background task that commits
     /// every message. The returned publisher thus completes a full network round-trip on every
     /// send, so timing sends yields the true HTTP throughput. Abort the returned handle to stop
-    /// the drain task.
-    pub async fn setup_coupled() -> (Arc<dyn MessagePublisher>, tokio::task::JoinHandle<()>) {
+    /// the drain task, then await it (see `finish_drain`) so receive/commit failures surface.
+    #[allow(clippy::type_complexity)]
+    pub async fn setup_coupled() -> (
+        Arc<dyn MessagePublisher>,
+        tokio::task::JoinHandle<anyhow::Result<()>>,
+    ) {
         #[cfg(feature = "rustls")]
         crate::ensure_rustls_installed();
 
@@ -633,13 +637,21 @@ pub mod http_helper {
         let url = format!("http://{}", addr);
 
         // Drain + commit so every POST gets its 200 (this is what couples the round-trip).
+        // Propagate receive/commit failures instead of swallowing them, so a broken round-trip
+        // fails the benchmark rather than reporting bogus throughput.
         let drain = tokio::spawn(async move {
-            while let Ok(batch) = consumer.receive_batch(128).await {
+            loop {
+                let batch = consumer
+                    .receive_batch(128)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("drain receive_batch failed: {e}"))?;
                 let count = batch.messages.len();
                 if count == 0 {
                     continue;
                 }
-                let _ = (batch.commit)(vec![MessageDisposition::Ack; count]).await;
+                (batch.commit)(vec![MessageDisposition::Ack; count])
+                    .await
+                    .map_err(|e| anyhow::anyhow!("drain commit failed: {e}"))?;
             }
         });
 
@@ -655,6 +667,18 @@ pub mod http_helper {
             .unwrap(),
         );
         (publisher, drain)
+    }
+
+    /// Stop the drain task and surface any failure. Aborts the task, then awaits it: an
+    /// expected cancellation is fine, but a task error or panic fails the benchmark.
+    pub async fn finish_drain(drain: tokio::task::JoinHandle<anyhow::Result<()>>) {
+        drain.abort();
+        match drain.await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => panic!("http drain task failed: {e}"),
+            Err(e) if e.is_cancelled() => {}
+            Err(e) => std::panic::resume_unwind(e.into_panic()),
+        }
     }
 }
 
@@ -1129,7 +1153,7 @@ fn performance_benchmarks(c: &mut Criterion) {
                     )
                     .await;
                 }
-                drain.abort();
+                http_helper::finish_drain(drain).await;
                 let msgs_per_sec =
                     (iters as f64 * PERF_TEST_MESSAGE_COUNT as f64) / total.as_secs_f64();
                 let mut results = BENCH_RESULTS.lock().await;
@@ -1157,7 +1181,7 @@ fn performance_benchmarks(c: &mut Criterion) {
                     )
                     .await;
                 }
-                drain.abort();
+                http_helper::finish_drain(drain).await;
                 let msgs_per_sec =
                     (iters as f64 * PERF_TEST_MESSAGE_COUNT as f64) / total.as_secs_f64();
                 let mut results = BENCH_RESULTS.lock().await;

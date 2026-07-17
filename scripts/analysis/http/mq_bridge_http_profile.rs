@@ -693,7 +693,7 @@ async fn run_publisher_load(args: ProfileArgs) -> anyhow::Result<()> {
 
     let stop = Arc::new(AtomicBool::new(false));
     let mut route_handle = None;
-    let mut tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+    let mut tasks: Vec<tokio::task::JoinHandle<anyhow::Result<()>>> = Vec::new();
 
     match args.mode {
         ProfileMode::PublisherDirect => {
@@ -721,10 +721,12 @@ async fn run_publisher_load(args: ProfileArgs) -> anyhow::Result<()> {
                 tasks.push(tokio::spawn(async move {
                     while !stop.load(Ordering::Relaxed) {
                         let msg = CanonicalMessage::new_bytes(Bytes::from_static(PAYLOAD), None);
-                        if publisher.send(msg).await.is_err() {
-                            break;
-                        }
+                        publisher
+                            .send(msg)
+                            .await
+                            .map_err(|e| anyhow::anyhow!("producer send failed: {e}"))?;
                     }
+                    Ok(())
                 }));
             }
         }
@@ -746,11 +748,13 @@ async fn run_publisher_load(args: ProfileArgs) -> anyhow::Result<()> {
                     let batch: Vec<CanonicalMessage> = (0..batch_size)
                         .map(|_| CanonicalMessage::new_bytes(Bytes::from_static(PAYLOAD), None))
                         .collect();
-                    if channel.fill_messages(batch).await.is_err() {
-                        break;
-                    }
+                    channel
+                        .fill_messages(batch)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("route feeder fill_messages failed: {e}"))?;
                 }
                 channel.close();
+                Ok(())
             }));
         }
         _ => unreachable!("run_publisher_load called with non-publisher mode"),
@@ -771,14 +775,30 @@ async fn run_publisher_load(args: ProfileArgs) -> anyhow::Result<()> {
     );
 
     // Tear down. Abort producer tasks first (a route feeder may be parked in a full
-    // channel), then stop the route.
+    // channel), then stop the route. A producer that exited with an error *before* this
+    // shutdown means the measured rate is bogus, so reject the whole run in that case;
+    // a task cancelled by the abort is the normal shutdown path.
     stop.store(true, Ordering::Relaxed);
-    for task in &tasks {
+    let mut producer_error: Option<anyhow::Error> = None;
+    for task in tasks {
         task.abort();
+        match task.await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                if producer_error.is_none() {
+                    producer_error = Some(e);
+                }
+            }
+            Err(e) if e.is_cancelled() => {}
+            Err(e) => std::panic::resume_unwind(e.into_panic()),
+        }
     }
     if let Some(handle) = route_handle {
         handle.stop().await;
         let _ = handle.join().await;
+    }
+    if let Some(e) = producer_error {
+        return Err(e);
     }
     Ok(())
 }
