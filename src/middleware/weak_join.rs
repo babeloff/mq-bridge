@@ -23,6 +23,11 @@ pub struct WeakJoinConsumer {
 
 impl WeakJoinConsumer {
     pub fn new(inner: Box<dyn MessageConsumer>, config: &WeakJoinMiddleware) -> Self {
+        if config.branch_by.is_none() && !config.required.is_empty() {
+            tracing::warn!(
+                "weak_join: 'required' is set but 'branch_by' is not; 'required' only applies in branch mode and will be ignored in count mode."
+            );
+        }
         Self {
             inner,
             config: config.clone(),

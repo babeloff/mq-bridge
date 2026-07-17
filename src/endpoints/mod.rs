@@ -526,7 +526,7 @@ fn check_consumer_recursive(
             if cfg.extension.is_some() {
                 warnings.push("Endpoint 'object_store' is used as a consumer, but 'extension' is a publisher-only option and will be ignored.".to_string());
             }
-            if !cfg.date_partition {
+            if cfg.date_partition {
                 warnings.push("Endpoint 'object_store' is used as a consumer, but 'date_partition' is a publisher-only option and will be ignored.".to_string());
             }
             Ok(warnings)
@@ -1347,6 +1347,9 @@ fn check_publisher_recursive(
             }
             if cfg.polling_interval_ms.is_some() {
                 warnings.push("Endpoint 'object_store' is used as a publisher, but 'polling_interval_ms' is a consumer-only option and will be ignored.".to_string());
+            }
+            if cfg.max_object_bytes.is_some() {
+                warnings.push("Endpoint 'object_store' is used as a publisher, but 'max_object_bytes' is a consumer-only option and will be ignored.".to_string());
             }
             Ok(warnings)
         }

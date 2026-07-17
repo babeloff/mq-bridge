@@ -28,7 +28,7 @@ use crate::CanonicalMessage;
 use anyhow::{anyhow, Context};
 use async_trait::async_trait;
 use futures::StreamExt;
-use object_store::{path::Path as ObjPath, ObjectStore, PutPayload};
+use object_store::{path::Path as ObjPath, ObjectStore, ObjectStoreExt, PutPayload};
 use std::any::Any;
 use std::sync::Arc;
 use std::time::Duration;
@@ -182,12 +182,13 @@ impl ObjectStorePublisher {
             // Top 48 bits of a uuidv7 are the Unix-epoch millisecond timestamp.
             let (y, m, d) = civil_from_unix_ms((id >> 80) as u64);
             self.base
-                .child(format!("{y:04}").as_str())
-                .child(format!("{m:02}").as_str())
-                .child(format!("{d:02}").as_str())
-                .child(name.as_str())
+                .clone()
+                .join(format!("{y:04}").as_str())
+                .join(format!("{m:02}").as_str())
+                .join(format!("{d:02}").as_str())
+                .join(name.as_str())
         } else {
-            self.base.child(name.as_str())
+            self.base.clone().join(name.as_str())
         }
     }
 }

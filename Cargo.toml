@@ -99,7 +99,7 @@ mongodb = { version = "3.6", optional = true, features = ["cert-key-password"] }
 
 # Object store (checkpoint backend): cloud REST via reqwest, not aws-sdk. 0.12 is the
 # last release supporting rust-version 1.75 (0.14 needs 1.85).
-object_store = { version = "0.12", optional = true, default-features = false, features = ["aws", "gcp", "azure", "http"] }
+object_store = { version = "0.14", optional = true, default-features = false, features = ["aws", "gcp", "azure", "http"] }
 
 # NATS
 async-nats = { version = "0.49", optional = true }

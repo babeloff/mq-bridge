@@ -397,7 +397,7 @@ mod object_store_backend {
     use super::{object_store_checkpoint_key, CheckpointStore};
     use anyhow::Context;
     use async_trait::async_trait;
-    use object_store::{path::Path as ObjPath, ObjectStore};
+    use object_store::{path::Path as ObjPath, ObjectStore, ObjectStoreExt};
     use std::sync::Arc;
 
     struct ObjectStoreCheckpointStore {
@@ -446,7 +446,7 @@ mod object_store_backend {
         let (store, base) = object_store::parse_url(&parsed)
             .with_context(|| format!("Failed to build object store for '{url}'"))?;
         let key = object_store_checkpoint_key(source_name, cursor_id);
-        let path = base.child(key);
+        let path = base.join(key);
         Ok(Arc::new(ObjectStoreCheckpointStore {
             store: Arc::from(store),
             path,

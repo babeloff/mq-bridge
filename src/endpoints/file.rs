@@ -323,7 +323,13 @@ impl MessagePublisher for FilePublisher {
             serialized_msg.extend_from_slice(&self.delimiter);
             if let Err(e) = writer.write_all(&serialized_msg).await {
                 tracing::error!("Failed to write message to file: {}", e);
-                failed_messages.push((msg, PublisherError::NonRetryable(anyhow::anyhow!(e))));
+                // A buffered write failure leaves the BufWriter in an undefined state and the
+                // remaining messages in this batch are unwritten. Abort so the whole batch is
+                // retried rather than reusing the writer, flushing partial data, or acking
+                // messages that never reached the file.
+                return Err(PublisherError::Retryable(
+                    anyhow::Error::new(e).context("Failed to write message to file"),
+                ));
             }
         }
 
@@ -1276,6 +1282,17 @@ impl MessageConsumer for FileConsumer {
     }
 }
 
+/// Wraps a message body for the Json/Text file formats. Generic over the payload type
+/// so both formats share one struct while keeping the message_id serializer and field
+/// layout (and thus the on-disk output) identical.
+#[derive(serde::Serialize)]
+struct RecordWrapper<'a, P: serde::Serialize> {
+    #[serde(serialize_with = "crate::canonical_message::print_uuidv7")]
+    message_id: u128,
+    payload: P,
+    metadata: &'a HashMap<String, String>,
+}
+
 /// Encodes a single message body for a non-CSV [`FileFormat`] (Raw/Normal/Json/Text).
 /// Shared by the file sink and the object-store sink. CSV needs cross-record header
 /// state, so it is handled inline by the file sink and rejected by the object sink.
@@ -1301,14 +1318,7 @@ pub(crate) fn encode_record(
         }
         FileFormat::Json => {
             if let Ok(json_val) = serde_json::from_slice::<serde_json::Value>(&msg.payload) {
-                #[derive(serde::Serialize)]
-                struct JsonWrapper<'a> {
-                    #[serde(serialize_with = "crate::canonical_message::print_uuidv7")]
-                    message_id: u128,
-                    payload: serde_json::Value,
-                    metadata: &'a HashMap<String, String>,
-                }
-                serde_json::to_vec(&JsonWrapper {
+                serde_json::to_vec(&RecordWrapper {
                     message_id: msg.message_id,
                     payload: json_val,
                     metadata: &msg.metadata,
@@ -1319,14 +1329,7 @@ pub(crate) fn encode_record(
         }
         FileFormat::Text => {
             if let Ok(text) = std::str::from_utf8(&msg.payload) {
-                #[derive(serde::Serialize)]
-                struct TextWrapper<'a> {
-                    #[serde(serialize_with = "crate::canonical_message::print_uuidv7")]
-                    message_id: u128,
-                    payload: &'a str,
-                    metadata: &'a HashMap<String, String>,
-                }
-                serde_json::to_vec(&TextWrapper {
+                serde_json::to_vec(&RecordWrapper {
                     message_id: msg.message_id,
                     payload: text,
                     metadata: &msg.metadata,
