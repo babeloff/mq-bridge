@@ -240,6 +240,11 @@ pub async fn test_mongodb_performance_pipeline() {
 // instead of the destructive queue-drain consumer — it never deletes documents. The reader's change
 // stream is opened when the route is deployed (before the producer writes), so no inserts are missed.
 // Requires a replica set (change streams are unsupported on a standalone mongod).
+//
+// The write side uses `format: raw` so the collection holds plain business documents (the message's
+// own JSON), not the wrapped `{_id, payload, metadata}` envelope. The CDC reader emits stored
+// documents verbatim (it never unwraps the envelope, unlike the queue consumer), so raw storage is
+// what lets the drained payloads round-trip back to `message_num`.
 const CDC_CONFIG_YAML: &str = r#"
 routes:
   memory_to_mongodb_cdc:
@@ -253,7 +258,7 @@ routes:
             max_attempts: 20
             initial_interval_ms: 500
             max_interval_ms: 2000
-      mongodb: { url: "mongodb://localhost:27018/?replicaSet=rs0", database: "mq_bridge_test", collection: "cdc_collection" }
+      mongodb: { url: "mongodb://localhost:27018/?replicaSet=rs0", database: "mq_bridge_test", collection: "cdc_collection", format: raw }
 
   mongodb_cdc_to_memory:
     concurrency: 1
