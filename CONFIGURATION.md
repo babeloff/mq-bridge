@@ -129,6 +129,28 @@ sqlx_postgres_route:
   output:
     memory:
       topic: "processed_jobs"
+
+# Route 9: Cross-process IPC via the memory endpoint
+# The `topic` field (alias `url`) is a transport URL:
+#   "name"                  -> memory://name  (in-process, same process only)
+#   "memory://name"         -> in-process channel
+#   "ipc://name"            -> Unix: /run/mq-bridge/name.sock (falls back to
+#                              $XDG_RUNTIME_DIR/mq-bridge, then /tmp/mq-bridge)
+#                              Windows: \\.\pipe\mq-bridge-name
+#   "ipc:///abs/path.sock"  -> that exact socket path (Unix)
+#   "unix:///abs/path.sock" -> Unix only, path must be absolute
+#   "pipe://name"           -> Windows only, \\.\pipe\name
+# The consumer side binds/listens and must be started before the publisher connects.
+# IPC does not support `subscribe_mode` or `request_reply`; `enable_nack` defaults to true.
+ipc_ingest:
+  input:
+    memory:
+      url: "ipc:///run/mq-bridge/orders.sock"
+      capacity: 256
+  output:
+    kafka:
+      topic: "orders"
+      url: "localhost:9092"
 ```
 
 ## Configuration Details

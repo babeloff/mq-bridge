@@ -17,7 +17,7 @@ A `Route` defines a data pipeline from one input endpoint to one output endpoint
 - Attach a handler for business logic (transform, filter, respond)
 
 ### 2. Endpoint
-Endpoints are protocol adapters for sources (consumers) and sinks (publishers). Supported types include Kafka, NATS, AMQP, MQTT, MongoDB, HTTP, SQLx, ZeroMQ, Files, AWS, IBM MQ, and in-memory channels. Endpoints are created via factory functions and configured via serde (json/yml).
+Endpoints are protocol adapters for sources (consumers) and sinks (publishers). Supported types include Kafka, NATS, AMQP, MQTT, MongoDB, HTTP, SQLx, ZeroMQ, Files, AWS, IBM MQ, and the `memory` endpoint (in-process channels and cross-process IPC). Endpoints are created via factory functions and configured via serde (json/yml).
 
 ### 3. Middleware
 Middleware wraps consumers and publishers to add cross-cutting features:
@@ -33,7 +33,79 @@ Handlers are user-defined async functions that process messages. There are two m
 - **EventHandler:** 1-to-N handler for event consumption. Compatible to CommandHandler, but should not return a response.
 - **TypeHandler:** Strongly-typed handler, dispatches based on the `kind` metadata field and deserializes payloads.
 
+## Memory Endpoint and IPC Transport
 
+The `memory` endpoint is not only an in-process channel. Its `topic` field (serde alias: `url`) doubles as a **transport URL**, so the same endpoint type covers both in-process queues and cross-process IPC over Unix domain sockets / Windows named pipes.
+
+### Transport URL schemes
+
+| URL | Resolves to | Platform |
+| --- | --- | --- |
+| `my-topic` | `memory://my-topic` (no scheme = in-process, for backward compatibility) | all |
+| `memory://my-topic` | In-process channel, shared by namespace within the same process | all |
+| `ipc://my-queue` | Unix: `/run/mq-bridge/my-queue.sock`<br>Windows: `\\.\pipe\mq-bridge-my-queue` | Unix + Windows |
+| `ipc:///var/run/my.sock` | That exact socket path (leading `/` = absolute path, note the three slashes) | Unix |
+| `unix:///var/run/my.sock` | That exact socket path; the path **must** be absolute | Unix only |
+| `pipe://my-pipe` | `\\.\pipe\my-pipe` — used verbatim, **no** `mq-bridge-` prefix | Windows only |
+
+Anything else (`http://…`, an empty URL, a relative `unix://path`) is rejected at parse time.
+
+**Named `ipc://` resolution on Unix** falls back in order, using the first writable location:
+1. `/run/mq-bridge/<name>.sock` (systemd standard)
+2. `$XDG_RUNTIME_DIR/mq-bridge/<name>.sock`
+3. `/tmp/mq-bridge/<name>.sock` (less secure)
+
+Because of this fallback, `ipc://name` can land in different places for different users or services. When both sides must agree deterministically, use an explicit path (`ipc:///run/myapp/queue.sock`) instead of a bare name.
+
+### Roles: consumer is the server, publisher is the client
+
+IPC is **unidirectional, publisher → consumer**, and the roles are fixed:
+
+- The **consumer** binds and listens on the socket/pipe (server). It removes a stale socket file before binding, creates the parent directory with mode `0700`, and sets the socket to `0600`. It unlinks the socket on drop.
+- The **publisher** connects to it (client).
+
+So **the consumer process must be running before the publisher connects** — otherwise the publisher fails with a connection error. The consumer serves one connection at a time; if the peer disconnects, it logs a warning and waits for a new connection rather than erroring out.
+
+### IPC requires async construction
+
+`MemoryConsumer::new`, `MemoryPublisher::new`, and `new_local` are synchronous and only support `memory://`. Given an IPC URL they return an error ("requires async endpoint construction"). Use the async constructors:
+
+```rust
+use mq_bridge::endpoints::memory::{MemoryConsumer, MemoryPublisher};
+use mq_bridge::models::MemoryConfig;
+
+let config = MemoryConfig::new_with_url("ipc:///run/mq-bridge/orders.sock", Some(100));
+
+// Server side (start first)
+let mut consumer = MemoryConsumer::new_async(&config).await?;
+// Client side, in another process
+let publisher = MemoryPublisher::new_async(&config).await?;
+```
+
+Routes always build endpoints through the async factories, so an `ipc://` URL works in YAML/JSON config with no extra code:
+
+```yaml
+ipc_ingest:
+  input:
+    memory:
+      url: "ipc:///run/mq-bridge/orders.sock"
+      capacity: 256
+  output:
+    kafka:
+      topic: "orders"
+      url: "localhost:9092"
+```
+
+### Wire format
+
+Batches are serialized with **MessagePack** (`Vec<CanonicalMessage>`) and written as length-prefixed frames: a 4-byte big-endian length followed by the payload. Frames larger than 100 MB are rejected.
+
+### Behavioural differences vs `memory://`
+
+- **`enable_nack` defaults to `true`** for IPC transports (`ipc://`, `unix://`, `pipe://`) and `false` for `memory://`. An explicit `enable_nack` in config always wins.
+- **`subscribe_mode` is not supported** over IPC, on either side — the EventStore/broadcast backend is in-process only.
+- **`request_reply` is not supported** for IPC publishers.
+- **The transport does not queue.** `len()` always reports `0` and `try_recv_batch()` always returns `None`, because a socket has no inspectable backlog. `capacity` bounds the consumer-side buffer, not an internal queue.
 
 ## Batching and Concurrency
 
