@@ -46,6 +46,17 @@ impl RouteHandle {
         self.handle.await
     }
 
+    /// Returns true once the route's task has finished — drained via
+    /// `exit_on_empty`, stopped, or panicked.
+    ///
+    /// [`join`](Self::join) consumes the handle, so a supervisor that keeps
+    /// handles in a map (to keep offering `stop`/`status`) needs this to tell a
+    /// completed route from a running one; [`status`](Self::status) reports
+    /// connection health and stays `healthy` after a clean exit.
+    pub fn is_finished(&self) -> bool {
+        self.handle.is_finished()
+    }
+
     /// Returns the live health of the running route without opening a new connection.
     ///
     /// The reconnect loop updates this on every (re)connect attempt and failure, so a
@@ -3145,11 +3156,18 @@ mod tests {
 
         let handle = route.run("drain_test").await.unwrap();
 
+        // A supervisor holding the handle (rather than consuming it via `join`)
+        // must be able to observe the drain, so poll the borrowing accessor.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !handle.is_finished() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("route did not exit on its own after draining");
+
         // The route future must complete on its own once the table is drained.
-        tokio::time::timeout(Duration::from_secs(10), handle.join())
-            .await
-            .expect("route did not exit on its own after draining")
-            .expect("route task panicked");
+        handle.join().await.expect("route task panicked");
 
         // All N rows must have been forwarded to the memory output.
         let received = tokio::time::timeout(Duration::from_secs(5), collector)
@@ -3186,7 +3204,7 @@ mod tests {
 
         // The route must still be running after the source is empty.
         assert!(
-            !handle.handle.is_finished(),
+            !handle.is_finished(),
             "route exited on empty batch without exit_on_empty set"
         );
 
