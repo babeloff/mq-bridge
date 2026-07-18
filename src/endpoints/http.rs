@@ -2196,7 +2196,7 @@ impl HttpPublisher {
         let stream_response_format = self.stream_response_sink.as_ref().and_then(|_| {
             super::http_stream::streaming_response_format_from_headers(response.headers())
         });
-        let mut response_metadata = HashMap::with_capacity(response.headers().len() + 1);
+        let mut response_metadata = HashMap::with_capacity(response.headers().len() + 2);
         response_metadata.insert(
             HTTP_VERSION.to_string(),
             format!("{:?}", response.version()),
@@ -2210,6 +2210,12 @@ impl HttpPublisher {
                 response_metadata.insert(key.as_str().to_string(), value_str.to_string());
             }
         }
+        // Expose the response status alongside the headers/version — mirrors the consumer
+        // side (which records http_method/http_path/…) so responses carry their status code.
+        response_metadata.insert(
+            HTTP_STATUS_CODE.to_string(),
+            response_status.as_u16().to_string(),
+        );
 
         if response_status.is_success() {
             if let (Some(stream_response_sink), Some(stream_response_format)) =
@@ -2903,6 +2909,11 @@ http_route:
             _ => panic!("Expected response"),
         };
         assert_eq!(response.payload, b"response_payload".to_vec());
+        // The publisher exposes the response status alongside the headers/version.
+        assert_eq!(
+            response.metadata.get(HTTP_STATUS_CODE).map(String::as_str),
+            Some("200")
+        );
     }
 
     #[tokio::test]

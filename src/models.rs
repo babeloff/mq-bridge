@@ -728,6 +728,7 @@ pub enum EndpointType {
     Switch(SwitchConfig),
     Response(ResponseConfig),
     Reader(Box<Endpoint>),
+    Request(RequestForwardConfig),
     Custom {
         name: String,
         config: serde_json::Value,
@@ -765,6 +766,7 @@ impl EndpointType {
             EndpointType::Switch(_) => "switch",
             EndpointType::Response(_) => "response",
             EndpointType::Reader(_) => "reader",
+            EndpointType::Request(_) => "request",
             EndpointType::Custom { .. } => "custom",
             EndpointType::Null => "null",
         }
@@ -782,6 +784,7 @@ impl EndpointType {
                 | EndpointType::Switch(_)
                 | EndpointType::Response(_)
                 | EndpointType::Reader(_)
+                | EndpointType::Request(_)
                 | EndpointType::Custom { .. }
                 | EndpointType::Null
         )
@@ -2799,6 +2802,24 @@ pub struct ResponseConfig {
     // This struct is a marker and currently has no fields.
 }
 
+// --- Request/Forward Endpoint Configuration ---
+
+/// Sends each message to a request-capable endpoint and forwards its response elsewhere.
+///
+/// Turns a request/reply exchange (HTTP, or a request_reply NATS/Mongo/Memory endpoint) into
+/// a one-way flow whose response lands on `forward_to` — e.g. IBM MQ → HTTP → IBM MQ. On
+/// request error/timeout the original message is forwarded instead (unchanged). Route
+/// success vs. failure with a `switch` on `forward_to` (e.g. keyed on `http_status_code`).
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct RequestForwardConfig {
+    /// The request-capable endpoint to send each message to (e.g. an `http` client).
+    pub to: Box<Endpoint>,
+    /// Where the response (or, on error, the original message) is forwarded.
+    pub forward_to: Box<Endpoint>,
+}
+
 // --- Postgres CDC (logical replication) Configuration ---
 
 /// Postgres logical-replication CDC source (pgoutput). Source-only.
@@ -3302,6 +3323,12 @@ impl SecretExtractor for EndpointType {
             }
             EndpointType::Reader(ep) => {
                 ep.extract_secrets(&format!("{}__{}", prefix, "READER"), secrets)
+            }
+            EndpointType::Request(cfg) => {
+                cfg.to
+                    .extract_secrets(&format!("{}__{}", prefix, "REQUEST__TO"), secrets);
+                cfg.forward_to
+                    .extract_secrets(&format!("{}__{}", prefix, "REQUEST__FORWARD_TO"), secrets);
             }
             _ => {}
         }

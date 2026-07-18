@@ -38,6 +38,7 @@ pub mod postgres;
 pub mod reader;
 #[cfg(feature = "redis-streams")]
 pub mod redis_streams;
+pub mod request;
 pub mod response;
 #[cfg(feature = "sled")]
 pub mod sled;
@@ -1710,6 +1711,21 @@ async fn create_base_publisher(
         EndpointType::Reader(inner) => {
             let consumer = create_consumer_from_route(route_name, inner).await?;
             Ok(Box::new(reader::ReaderPublisher::new(consumer)) as Box<dyn MessagePublisher>)
+        }
+        EndpointType::Request(cfg) => {
+            let request =
+                create_publisher_with_depth(route_name.to_string(), (*cfg.to).clone(), depth + 1)
+                    .await?;
+            let forward = create_publisher_with_depth(
+                route_name.to_string(),
+                (*cfg.forward_to).clone(),
+                depth + 1,
+            )
+            .await?;
+            Ok(
+                Box::new(request::RequestForwardPublisher::new(request, forward))
+                    as Box<dyn MessagePublisher>,
+            )
         }
         EndpointType::Custom { name, config } => {
             let factory = get_endpoint_factory(name)
