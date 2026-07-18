@@ -529,6 +529,14 @@ pub struct TransportQueueConsumer {
     topic: String,
     transport: Arc<dyn TransportChannel>,
     buffer: Vec<CanonicalMessage>,
+    /// Nacked messages awaiting redelivery.
+    ///
+    /// IPC transports are unidirectional (publisher -> consumer), so a requeue
+    /// cannot go back down the socket: the publisher never reads, so those bytes
+    /// would strand and eventually block the commit on a full socket buffer.
+    /// Redelivery is therefore consumer-local, and does not survive a consumer
+    /// crash. Shared with the commit closure, which has no access to `&mut self`.
+    requeue: Arc<Mutex<Vec<CanonicalMessage>>>,
     enable_nack: bool,
 }
 
@@ -603,6 +611,7 @@ impl MemoryConsumer {
                     topic: url.display_name(),
                     transport,
                     buffer: Vec::new(),
+                    requeue: Arc::new(Mutex::new(Vec::new())),
                     enable_nack: config.enable_nack,
                 }))
             }
@@ -879,12 +888,24 @@ impl MessageConsumer for TransportQueueConsumer {
     }
     async fn receive_batch(&mut self, max_messages: usize) -> Result<ReceivedBatch, ConsumerError> {
         let mut messages = Vec::with_capacity(max_messages);
-        let buffered = self.buffer.len().min(max_messages);
-        if buffered > 0 {
+
+        // Nacked messages get redelivered ahead of anything new.
+        {
+            let mut requeue = self.requeue.lock().unwrap();
+            let take = requeue.len().min(max_messages);
+            if take > 0 {
+                messages.extend(requeue.drain(..take));
+            }
+        }
+
+        if messages.len() < max_messages && !self.buffer.is_empty() {
+            let buffered = self.buffer.len().min(max_messages - messages.len());
             messages.extend(self.buffer.drain(..buffered));
         }
 
-        if messages.len() < max_messages {
+        // Only block on the transport when nothing was already pending, so a
+        // redelivery is never held up waiting for a new frame to arrive.
+        if messages.is_empty() {
             let mut received = self.transport.recv_batch().await.map_err(|e| {
                 ConsumerError::Connection(anyhow!("Failed to receive via memory transport: {}", e))
             })?;
@@ -897,7 +918,7 @@ impl MessageConsumer for TransportQueueConsumer {
         trace!(count = messages.len(), topic = %self.topic, message_ids = ?LazyMessageIds(&messages), "Received batch from memory transport");
 
         let topic = self.topic.clone();
-        let transport = self.transport.clone();
+        let requeue = self.requeue.clone();
         let enable_nack = self.enable_nack;
         let expected_count = messages.len();
         let messages_for_retry = if enable_nack {
@@ -907,7 +928,7 @@ impl MessageConsumer for TransportQueueConsumer {
         };
 
         let commit = Box::new(move |dispositions: Vec<MessageDisposition>| {
-            let transport = transport.clone();
+            let requeue = requeue.clone();
             let topic = topic.clone();
             let messages_for_retry = messages_for_retry.clone();
             Box::pin(async move {
@@ -935,7 +956,11 @@ impl MessageConsumer for TransportQueueConsumer {
                 }
 
                 if !to_requeue.is_empty() {
-                    transport.send_batch(to_requeue).await?;
+                    // Redeliver locally. Sending back down the socket would push
+                    // these at a publisher that never reads.
+                    let count = to_requeue.len();
+                    requeue.lock().unwrap().extend(to_requeue);
+                    tracing::debug!(topic = %topic, count, "Requeued nacked IPC messages for local redelivery");
                 }
 
                 Ok(())
@@ -949,7 +974,13 @@ impl MessageConsumer for TransportQueueConsumer {
         EndpointStatus {
             healthy: !self.transport.is_closed(),
             target: self.topic.clone(),
-            pending: Some(self.transport.len()),
+            // Everything readable without waiting on the peer: messages held
+            // locally plus whole frames already buffered by the transport.
+            pending: Some(
+                self.buffer.len()
+                    + self.requeue.lock().map(|q| q.len()).unwrap_or(0)
+                    + self.transport.len(),
+            ),
             capacity: self.transport.capacity(),
             details: serde_json::json!({
                 "mode": "transport"
@@ -1156,6 +1187,102 @@ mod tests {
         let received = consumer.receive().await.unwrap();
         (received.commit)(MessageDisposition::Ack).await.unwrap();
         assert_eq!(received.message.payload.as_ref(), b"endpoint-ipc");
+    }
+
+    /// Regression: nacking over IPC used to call `send_batch` on the consumer's
+    /// own transport, writing the messages back down the socket at a publisher
+    /// that never reads. They were never redelivered, and once the peer's
+    /// receive buffer filled the commit blocked while holding a dispatch permit.
+    /// `enable_nack` defaults to true for IPC, so this was the default path.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_unix_ipc_nack_redelivers_locally() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let socket_path = temp_dir.path().join("nack.sock");
+        let url = format!("unix://{}", socket_path.display());
+        let config = MemoryConfig::new_with_url(url, Some(10));
+
+        // Nack support is on by default for IPC transports.
+        assert!(config.clone().with_smart_defaults().enable_nack);
+
+        let mut consumer = MemoryConsumer::new_async(&config).await.unwrap();
+        let publisher = MemoryPublisher::new_async(&config).await.unwrap();
+
+        publisher
+            .send(CanonicalMessage::from_vec(b"to_be_nacked"))
+            .await
+            .unwrap();
+
+        // Receive and nack.
+        let first = consumer.receive().await.unwrap();
+        assert_eq!(first.message.get_payload_str(), "to_be_nacked");
+        (first.commit)(MessageDisposition::Nack).await.unwrap();
+
+        // Must come back without the publisher resending anything.
+        let second = tokio::time::timeout(std::time::Duration::from_secs(1), consumer.receive())
+            .await
+            .expect("nacked message should be redelivered")
+            .unwrap();
+        assert_eq!(second.message.get_payload_str(), "to_be_nacked");
+
+        (second.commit)(MessageDisposition::Ack).await.unwrap();
+
+        // After the ack it must not come back again.
+        let result =
+            tokio::time::timeout(std::time::Duration::from_millis(200), consumer.receive()).await;
+        assert!(result.is_err(), "acked message must not be redelivered");
+    }
+
+    /// A nack must not block even when nothing is draining the socket, and the
+    /// commit must not wedge the route.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_unix_ipc_nack_commit_does_not_block() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let socket_path = temp_dir.path().join("nack_block.sock");
+        let url = format!("unix://{}", socket_path.display());
+        let config = MemoryConfig::new_with_url(url, Some(1));
+
+        let mut consumer = MemoryConsumer::new_async(&config).await.unwrap();
+        let publisher = MemoryPublisher::new_async(&config).await.unwrap();
+
+        // Large enough to exceed the socket buffer (8 KiB on macOS), so the send
+        // only completes once the consumer drains it. It has to run concurrently
+        // with the receive: the consumer accepts the connection inside
+        // `receive_batch`, so a blocking send here would deadlock the test.
+        let total = 200usize;
+        let msgs: Vec<CanonicalMessage> = (0..total)
+            .map(|i| CanonicalMessage::from_vec(format!("m{i}").as_bytes()))
+            .collect();
+        let send_task = tokio::spawn(async move { publisher.send_batch(msgs).await });
+
+        let batch = consumer.receive_batch(total).await.unwrap();
+        let n = batch.messages.len();
+        assert_eq!(n, total);
+        send_task.await.unwrap().unwrap();
+
+        // Nack the whole batch; this must return promptly rather than blocking
+        // on a socket write.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            (batch.commit)(vec![MessageDisposition::Nack; n]),
+        )
+        .await
+        .expect("nack commit must not block")
+        .unwrap();
+
+        // All of them are available again.
+        let requeued = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            consumer.receive_batch(total),
+        )
+        .await
+        .expect("requeued messages should be readable")
+        .unwrap();
+        assert_eq!(requeued.messages.len(), n);
+        (requeued.commit)(vec![MessageDisposition::Ack; n])
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

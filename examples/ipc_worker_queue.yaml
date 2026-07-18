@@ -103,5 +103,3 @@ routes:
 #       memory:
 #         url: "memory://work-queue"
 #         capacity: 1000
-
-# Made with Bob

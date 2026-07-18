@@ -100,12 +100,31 @@ ipc_ingest:
 
 Batches are serialized with **MessagePack** (`Vec<CanonicalMessage>`) and written as length-prefixed frames: a 4-byte big-endian length followed by the payload. Frames larger than 100 MB are rejected.
 
+Framing is handled by `tokio_util::codec::LengthDelimitedCodec` in `endpoints/memory/framed.rs`, shared by both platforms. This matters for more than deduplication: the codec owns the partial-frame buffer, which makes reads **cancel safe**. Routes cancel `receive_batch` on shutdown via `select!`, and a hand-rolled `read_exact` pair would consume part of a frame on cancellation and desync the connection permanently.
+
+### Backpressure
+
+A batch is written as one frame. Socket buffers are small — **8 KiB by default on macOS** (`net.local.stream.sendspace`) — so a batch that outgrows the buffer only completes once the consumer drains it. `send_batch` blocking is therefore normal backpressure, not a fault.
+
+Two consequences worth knowing:
+
+- The consumer must actually be reading, not merely connected. A consumer that has accepted but stopped draining will stall the publisher indefinitely. After 5 seconds blocked, the publisher logs a warning naming the socket; it keeps waiting rather than dropping data.
+- `capacity` does not create a queue here. There is no buffering between the two processes beyond the kernel socket buffer.
+
+### Acknowledgements and redelivery over IPC
+
+`enable_nack` defaults to **`true`** for IPC transports (`ipc://`, `unix://`, `pipe://`) and `false` for `memory://`; an explicit `enable_nack` in config always wins.
+
+Redelivery over IPC is **consumer-local**. The socket carries publisher → consumer traffic only, so a nack cannot travel back to the producer — the publisher never reads, and writing to it would strand the messages and eventually block the commit on a full socket buffer. A nacked message is therefore requeued inside the consumer and redelivered ahead of new traffic. It does **not** survive a consumer crash, and the publisher is never told.
+
+If you need redelivery that survives the consumer process, use a real broker endpoint. mq-bridge deliberately does not implement a bidirectional ack protocol over IPC.
+
 ### Behavioural differences vs `memory://`
 
-- **`enable_nack` defaults to `true`** for IPC transports (`ipc://`, `unix://`, `pipe://`) and `false` for `memory://`. An explicit `enable_nack` in config always wins.
 - **`subscribe_mode` is not supported** over IPC, on either side — the EventStore/broadcast backend is in-process only.
 - **`request_reply` is not supported** for IPC publishers.
-- **The transport does not queue.** `len()` always reports `0` and `try_recv_batch()` always returns `None`, because a socket has no inspectable backlog. `capacity` bounds the consumer-side buffer, not an internal queue.
+- **Only the publisher side may send.** Calling `send_batch` on a consumer-side IPC transport returns an error rather than writing into a peer that never reads.
+- **`capacity` bounds the consumer-side buffer**, not an internal queue — a socket has no backlog of its own. `len()` reports whole frames already buffered by the codec (readable without touching the socket), and endpoint `status().pending` adds the consumer's own buffered and awaiting-redelivery messages.
 
 ## Batching and Concurrency
 

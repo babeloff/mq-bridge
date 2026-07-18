@@ -3239,6 +3239,7 @@ dependencies = [
  "tokio",
  "tokio-rustls 0.26.4",
  "tokio-stream",
+ "tokio-util",
  "tokio-websockets 0.13.2",
  "tonic",
  "tonic-prost",

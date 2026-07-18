@@ -5,16 +5,29 @@
 
 #![cfg(unix)]
 
+use super::framed::{self, FramedIo};
 use super::transport::TransportChannel;
 use crate::CanonicalMessage;
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use std::path::Path;
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
+
+/// Which end of the socket this transport owns.
+///
+/// The socket is unidirectional in practice: the consumer binds and reads, the
+/// publisher connects and writes. Recording the role lets a misdirected send
+/// fail loudly instead of writing into a peer that never reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Role {
+    /// Consumer side: binds the socket and accepts connections.
+    Server,
+    /// Publisher side: connects and sends.
+    Client,
+}
 
 /// Unix Domain Socket transport for local IPC
 #[derive(Clone)]
@@ -25,10 +38,13 @@ pub struct UnixIpcTransport {
 struct UnixIpcTransportInner {
     socket_path: String,
     capacity: usize,
-    // For server mode (consumer)
+    role: Role,
+    // Server mode only: accepts incoming connections.
     listener: Mutex<Option<UnixListener>>,
-    // For client mode (publisher)
-    stream: Mutex<Option<UnixStream>>,
+    // The active connection, framed. Server-side this is empty until the first
+    // accept. The codec owns the partial-frame buffer, which is what makes
+    // reads cancel safe.
+    conn: Mutex<Option<FramedIo<UnixStream>>>,
     closed: Mutex<bool>,
 }
 
@@ -46,7 +62,6 @@ impl UnixIpcTransport {
         if let Some(parent) = socket_path.parent() {
             std::fs::create_dir_all(parent)?;
             // Set restrictive permissions on directory (0700)
-            #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
                 let mut perms = std::fs::metadata(parent)?.permissions();
@@ -58,7 +73,6 @@ impl UnixIpcTransport {
         let listener = UnixListener::bind(socket_path)?;
 
         // Set restrictive permissions on socket (0600)
-        #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             let mut perms = std::fs::metadata(socket_path)?.permissions();
@@ -72,8 +86,9 @@ impl UnixIpcTransport {
             inner: Arc::new(UnixIpcTransportInner {
                 socket_path: socket_path.to_string_lossy().to_string(),
                 capacity,
+                role: Role::Server,
                 listener: Mutex::new(Some(listener)),
-                stream: Mutex::new(None),
+                conn: Mutex::new(None),
                 closed: Mutex::new(false),
             }),
         })
@@ -91,36 +106,12 @@ impl UnixIpcTransport {
             inner: Arc::new(UnixIpcTransportInner {
                 socket_path: socket_path.to_string_lossy().to_string(),
                 capacity,
+                role: Role::Client,
                 listener: Mutex::new(None),
-                stream: Mutex::new(Some(stream)),
+                conn: Mutex::new(Some(framed::wrap(stream))),
                 closed: Mutex::new(false),
             }),
         })
-    }
-
-    /// Send a length-prefixed frame
-    async fn send_frame(stream: &mut UnixStream, data: &[u8]) -> Result<()> {
-        let len = data.len() as u32;
-        stream.write_all(&len.to_be_bytes()).await?;
-        stream.write_all(data).await?;
-        stream.flush().await?;
-        Ok(())
-    }
-
-    /// Receive a length-prefixed frame
-    async fn recv_frame(stream: &mut UnixStream) -> Result<Vec<u8>> {
-        let mut len_bytes = [0u8; 4];
-        stream.read_exact(&mut len_bytes).await?;
-        let len = u32::from_be_bytes(len_bytes) as usize;
-
-        // Sanity check: limit frame size to 100MB
-        if len > 100 * 1024 * 1024 {
-            return Err(anyhow!("Frame too large: {} bytes", len));
-        }
-
-        let mut data = vec![0u8; len];
-        stream.read_exact(&mut data).await?;
-        Ok(data)
     }
 
     /// Accept a connection (server mode)
@@ -158,21 +149,29 @@ impl TransportChannel for UnixIpcTransport {
             return Err(anyhow!("Unix IPC transport is closed"));
         }
 
-        // Serialize the batch using MessagePack
-        let data = rmp_serde::to_vec(&messages)?;
+        // A server writing here would push bytes at a publisher that only ever
+        // sends, silently stranding them and eventually blocking on a full
+        // socket buffer. Refuse instead.
+        if self.inner.role == Role::Server {
+            return Err(anyhow!(
+                "Unix IPC transport at '{}' is the consumer (server) side and cannot send; \
+                 the socket carries publisher -> consumer traffic only",
+                self.inner.socket_path
+            ));
+        }
 
-        let mut stream_guard = self.inner.stream.lock().await;
-        if let Some(stream) = stream_guard.as_mut() {
-            Self::send_frame(stream, &data).await?;
+        let mut conn_guard = self.inner.conn.lock().await;
+        if let Some(conn) = conn_guard.as_mut() {
+            let bytes = framed::send_batch(conn, &messages, &self.inner.socket_path).await?;
             debug!(
                 path = %self.inner.socket_path,
                 count = messages.len(),
-                bytes = data.len(),
+                bytes,
                 "Sent batch via Unix IPC"
             );
             Ok(())
         } else {
-            Err(anyhow!("Unix IPC transport not in client mode"))
+            Err(anyhow!("Unix IPC transport has no active connection"))
         }
     }
 
@@ -182,34 +181,32 @@ impl TransportChannel for UnixIpcTransport {
                 return Err(anyhow!("Unix IPC transport is closed"));
             }
 
-            let mut stream_guard = self.inner.stream.lock().await;
-            if stream_guard.is_none() {
-                drop(stream_guard);
+            let mut conn_guard = self.inner.conn.lock().await;
+            if conn_guard.is_none() {
+                drop(conn_guard);
                 let stream = self.accept_connection().await?;
-                stream_guard = self.inner.stream.lock().await;
-                *stream_guard = Some(stream);
+                conn_guard = self.inner.conn.lock().await;
+                *conn_guard = Some(framed::wrap(stream));
             }
 
-            let read_result = if let Some(stream) = stream_guard.as_mut() {
-                Self::recv_frame(stream).await
+            let read_result = if let Some(conn) = conn_guard.as_mut() {
+                framed::recv_batch(conn).await
             } else {
                 Err(anyhow!("Unix IPC transport has no active connection"))
             };
 
             match read_result {
-                Ok(data) => {
-                    let messages: Vec<CanonicalMessage> = rmp_serde::from_slice(&data)?;
+                Ok(messages) => {
                     debug!(
                         path = %self.inner.socket_path,
                         count = messages.len(),
-                        bytes = data.len(),
                         "Received batch via Unix IPC"
                     );
                     return Ok(messages);
                 }
                 Err(error) if Self::is_disconnected(&error) => {
                     warn!(path = %self.inner.socket_path, error = %error, "Unix IPC peer disconnected; waiting for a new connection");
-                    *stream_guard = None;
+                    *conn_guard = None;
                 }
                 Err(error) => return Err(error),
             }
@@ -217,16 +214,25 @@ impl TransportChannel for UnixIpcTransport {
     }
 
     fn try_recv_batch(&self) -> Result<Option<Vec<CanonicalMessage>>> {
-        // Unix sockets don't support non-blocking try_recv in the same way
-        // This would require a more complex implementation with polling
-        // For now, return None to indicate no immediate data available
-        Ok(None)
+        // Sync context: if the connection is busy or absent there is nothing we
+        // can produce without blocking.
+        let Ok(mut conn_guard) = self.inner.conn.try_lock() else {
+            return Ok(None);
+        };
+        let Some(conn) = conn_guard.as_mut() else {
+            return Ok(None);
+        };
+        framed::try_recv_batch(conn)
     }
 
     fn len(&self) -> usize {
-        // Unix sockets don't have a concept of queued messages
-        // Return 0 as we don't buffer
-        0
+        // Whole frames already buffered by the codec, i.e. readable without IO.
+        self.inner
+            .conn
+            .try_lock()
+            .ok()
+            .and_then(|guard| guard.as_ref().map(framed::buffered_frames))
+            .unwrap_or(0)
     }
 
     fn capacity(&self) -> Option<usize> {
@@ -308,6 +314,95 @@ mod tests {
         server.close();
         assert!(server.is_closed());
     }
-}
 
-// Made with Bob
+    /// The server end must refuse to send rather than strand messages in a
+    /// publisher's receive buffer.
+    #[tokio::test]
+    async fn test_unix_ipc_server_cannot_send() {
+        let temp_dir = TempDir::new().unwrap();
+        let socket_path = temp_dir.path().join("test.sock");
+
+        let server = UnixIpcTransport::new_server(&socket_path, 10)
+            .await
+            .unwrap();
+        let _client = UnixIpcTransport::new_client(&socket_path, 10)
+            .await
+            .unwrap();
+
+        let err = server
+            .send_batch(vec![CanonicalMessage::from_vec(b"nope")])
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("cannot send"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// Cancelling a read mid-frame must not desync the connection.
+    #[tokio::test]
+    async fn test_unix_ipc_cancelled_receive_loses_nothing() {
+        let temp_dir = TempDir::new().unwrap();
+        let socket_path = temp_dir.path().join("cancel.sock");
+
+        let server = UnixIpcTransport::new_server(&socket_path, 10)
+            .await
+            .unwrap();
+        let client = UnixIpcTransport::new_client(&socket_path, 10)
+            .await
+            .unwrap();
+
+        // Cancel a receive that has nothing to read yet.
+        tokio::select! {
+            _ = server.recv_batch() => panic!("nothing has been sent yet"),
+            _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {}
+        }
+
+        client
+            .send_batch(vec![CanonicalMessage::from_vec(b"after-cancel")])
+            .await
+            .unwrap();
+
+        let received = server.recv_batch().await.unwrap();
+        assert_eq!(received[0].payload.as_ref(), b"after-cancel");
+    }
+
+    #[tokio::test]
+    async fn test_unix_ipc_try_recv_and_len() {
+        let temp_dir = TempDir::new().unwrap();
+        let socket_path = temp_dir.path().join("try.sock");
+
+        let server = UnixIpcTransport::new_server(&socket_path, 10)
+            .await
+            .unwrap();
+        let client = UnixIpcTransport::new_client(&socket_path, 10)
+            .await
+            .unwrap();
+
+        // No connection accepted yet, so nothing is available.
+        assert!(server.try_recv_batch().unwrap().is_none());
+        assert_eq!(server.len(), 0);
+
+        client
+            .send_batch(vec![CanonicalMessage::from_vec(b"first")])
+            .await
+            .unwrap();
+
+        // The first recv accepts the connection and reads the frame.
+        let received = server.recv_batch().await.unwrap();
+        assert_eq!(received[0].payload.as_ref(), b"first");
+
+        client
+            .send_batch(vec![CanonicalMessage::from_vec(b"second")])
+            .await
+            .unwrap();
+        // Give the write time to land in the receive buffer.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let polled = server
+            .try_recv_batch()
+            .unwrap()
+            .expect("a frame should be readable without blocking");
+        assert_eq!(polled[0].payload.as_ref(), b"second");
+    }
+}

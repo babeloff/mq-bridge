@@ -56,6 +56,9 @@ futures = "0.3"
 tracing.workspace = true
 bytes = { workspace = true, features = ["serde"] }
 async-channel = { version = "2.5" }
+# Length-delimited framing for the memory endpoint's IPC transports (portable:
+# Unix sockets and Windows named pipes). Already in the tree transitively.
+tokio-util = { version = "0.7", features = ["codec"] }
 once_cell = { version = "1.21" }
 uuid = { version = "1.23" }
 fast-uuid-v7.workspace = true

@@ -171,7 +171,8 @@ The table below summarizes the capabilities and configuration for each backend:
 | **HTTP** | N/A | **Native** (Implicit) | **Yes** (HTTP 500) |
 | **IBM MQ** | Set `topic` | No | **Yes** (Tx Rollback) |
 | **Kafka** | Omit `group_id` | Emulated (Header) | Eventual (Skip Offset) |
-| **Memory** | Set `subscribe_mode: true` | Emulated (Metadata) | **Yes** (Re-queue), by default **disabled** |
+| **Memory** (in-process) | Set `subscribe_mode: true` | Emulated (Metadata) | **Yes** (Re-queue), by default **disabled** |
+| **Memory** (IPC: `ipc://`, `unix://`, `pipe://`) | Not supported | Not supported | **Yes** (Re-queue), by default **enabled**, consumer-local |
 | **MongoDB** | Set `change_stream: true` | Emulated (Metadata) | **Yes** (Unlock) |
 | **MQTT** | Set `clean_session: true` | Emulated (Property) | Eventual (Skip Ack) |
 | **NATS** | Set `subscriber_mode: true` | **Native** (Inbox) | **Yes** (JetStream Nak) |
@@ -186,7 +187,7 @@ The table below summarizes the capabilities and configuration for each backend:
 *   **Request-Reply**:
     *   **Native**: Uses protocol-level correlation (e.g., HTTP connection, NATS reply subject).
     *   **Emulated**: Publishes a new message to a reply destination (specified by the `reply_to` metadata field) carrying a `correlation_id` metadata field.
-*   **Nack Support**: If "Yes", the backend supports explicit negative acknowledgement triggering redelivery. "Eventual" means redelivery depends on timeout or connection drop. "Simulated" is handled in-memory by the bridge.
+*   **Nack Support**: If "Yes", the backend supports explicit negative acknowledgement triggering redelivery. "Eventual" means redelivery depends on timeout or connection drop. "Simulated" is handled in-memory by the bridge. "Consumer-local" means the nacked message is retried inside the consumer process and is lost if that process dies — the producer is never notified.
 
 ### Database Sources: Change Capture vs Polling
 Databases have no native pub/sub, so `mq-bridge` reads them as a source in one of two ways:

@@ -141,7 +141,9 @@ sqlx_postgres_route:
 #   "unix:///abs/path.sock" -> Unix only, path must be absolute
 #   "pipe://name"           -> Windows only, \\.\pipe\name
 # The consumer side binds/listens and must be started before the publisher connects.
-# IPC does not support `subscribe_mode` or `request_reply`; `enable_nack` defaults to true.
+# IPC does not support `subscribe_mode` or `request_reply`.
+# `enable_nack` defaults to true, but redelivery is consumer-local: a nacked message
+# is retried inside the consumer and is lost if the consumer process dies.
 ipc_ingest:
   input:
     memory:

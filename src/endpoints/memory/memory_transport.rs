@@ -138,5 +138,3 @@ mod tests {
         assert!(!transport.is_empty());
     }
 }
-
-// Made with Bob
