@@ -27,6 +27,57 @@ pub use crate::extensions::{
     register_middleware_factory,
 };
 
+/// Why a route's task terminated.
+///
+/// Read via [`RouteHandle::outcome`], which returns `None` while the route is
+/// still running. This is what lets a supervisor of drain-then-exit jobs report
+/// whether a batch job succeeded — [`RouteHandle::status`] reports *connection*
+/// health, which stays `healthy` for a route that ran cleanly to completion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RouteOutcome {
+    /// The source drained and the route exited on its own — `exit_on_empty`
+    /// or an exhausted stream. The job succeeded.
+    Completed,
+    /// Terminated by an explicit `stop()` or shutdown signal.
+    Stopped,
+    /// Terminated by a permanent error; the cause is in
+    /// [`EndpointStatus::error`] from [`RouteHandle::status`].
+    Failed,
+}
+
+/// Publishes the terminal [`RouteOutcome`] when the route task ends.
+///
+/// Publishing from `Drop` rather than inline keeps the invariant total: a task
+/// that panics or is aborted still resolves to `Failed` instead of leaving
+/// [`RouteHandle::outcome`] `None` forever, and the outcome becomes visible
+/// only once the task is actually done.
+struct OutcomeGuard {
+    outcome: Arc<RwLock<Option<RouteOutcome>>>,
+    status: Arc<RwLock<EndpointStatus>>,
+    resolved: Option<RouteOutcome>,
+}
+
+impl OutcomeGuard {
+    fn set(&mut self, outcome: RouteOutcome) {
+        self.resolved = Some(outcome);
+    }
+}
+
+impl Drop for OutcomeGuard {
+    fn drop(&mut self) {
+        let outcome = self.resolved.unwrap_or_else(|| {
+            // Reaching here means the loop never recorded a terminal, so the
+            // task panicked or was aborted; any prior `error` is stale.
+            let mut s = recover_write_lock(&self.status, "route_handle_status");
+            s.healthy = false;
+            s.error = Some("route task panicked or was aborted".to_string());
+            RouteOutcome::Failed
+        });
+        *recover_write_lock(&self.outcome, "route_handle_outcome") = Some(outcome);
+    }
+}
+
 #[derive(Debug)]
 pub struct RouteHandle {
     handle: JoinHandle<()>,
@@ -34,6 +85,9 @@ pub struct RouteHandle {
     /// Live connection health of the running route, updated by the reconnect
     /// loop on every (re)connect and failure. Read via [`RouteHandle::status`].
     status: Arc<RwLock<EndpointStatus>>,
+    /// Terminal outcome, published once by the run task as it exits.
+    /// `None` while the route is still running. Read via [`RouteHandle::outcome`].
+    outcome: Arc<RwLock<Option<RouteOutcome>>>,
 }
 
 impl RouteHandle {
@@ -46,15 +100,18 @@ impl RouteHandle {
         self.handle.await
     }
 
-    /// Returns true once the route's task has finished — drained via
-    /// `exit_on_empty`, stopped, or panicked.
+    /// Returns why the route terminated, or `None` while it is still running.
     ///
-    /// [`join`](Self::join) consumes the handle, so a supervisor that keeps
-    /// handles in a map (to keep offering `stop`/`status`) needs this to tell a
-    /// completed route from a running one; [`status`](Self::status) reports
-    /// connection health and stays `healthy` after a clean exit.
-    pub fn is_finished(&self) -> bool {
-        self.handle.is_finished()
+    /// `Some` exactly when the route's task has finished, so a supervisor that
+    /// keeps handles in a map (to keep offering `stop`/`status`) can poll this
+    /// to tell a completed route from a running one — [`join`](Self::join)
+    /// consumes the handle, so it can't serve that purpose.
+    ///
+    /// Unlike [`status`](Self::status), which reports connection health, this
+    /// distinguishes a clean drain from a stop and from a permanent failure, so
+    /// a supervisor can report whether a batch job actually succeeded.
+    pub fn outcome(&self) -> Option<RouteOutcome> {
+        *recover_read_lock(&self.outcome, "route_handle_outcome")
     }
 
     /// Returns the live health of the running route without opening a new connection.
@@ -131,6 +188,7 @@ impl From<(JoinHandle<()>, Sender<()>)> for RouteHandle {
             handle: tuple.0,
             shutdown_tx: tuple.1,
             status: Arc::new(RwLock::new(EndpointStatus::default())),
+            outcome: Arc::new(RwLock::new(None)),
         }
     }
 }
@@ -659,6 +717,13 @@ impl Route {
             ..Default::default()
         }));
         let status_loop = Arc::clone(&status);
+        // Terminal outcome cell, published by `OutcomeGuard` as the task exits.
+        let outcome = Arc::new(RwLock::new(None::<RouteOutcome>));
+        let mut outcome_guard = OutcomeGuard {
+            outcome: Arc::clone(&outcome),
+            status: Arc::clone(&status),
+            resolved: None,
+        };
 
         let handle = tokio::spawn(async move {
             // The startup `ready` channel is consumed once by `run()`; only the first
@@ -691,6 +756,7 @@ impl Route {
                             let _ = internal_shutdown_tx.send(()).await;
                             // Wait for the inner task to finish gracefully.
                             let _ = run_task.await;
+                            outcome_guard.set(RouteOutcome::Stopped);
                             break 'reconnect;
                         }
                         Ok(_) = iter_ready_rx.recv() => {
@@ -711,12 +777,16 @@ impl Route {
                             match res {
                                 Ok(Ok(should_continue)) if !should_continue => {
                                     info!("Route '{}' completed gracefully. Shutting down.", name);
+                                    outcome_guard.set(RouteOutcome::Completed);
                                     break 'reconnect;
                                 }
                                 Ok(Err(e)) => {
+                                    // An exhausted source is a clean terminal, not a failure:
+                                    // it ends the route the same way `exit_on_empty` does.
+                                    let is_end_of_stream = e.downcast_ref::<ConsumerError>().is_some_and(|ce| matches!(ce, ConsumerError::EndOfStream));
                                     let is_permanent =
                                         e.downcast_ref::<ProcessingError>().is_some_and(|pe| matches!(pe, ProcessingError::NonRetryable(_)))
-                                        || e.downcast_ref::<ConsumerError>().is_some_and(|ce| matches!(ce, ConsumerError::EndOfStream));
+                                        || is_end_of_stream;
 
                                     {
                                         let mut s = recover_write_lock(&status_loop, "route_handle_status");
@@ -725,6 +795,11 @@ impl Route {
                                     }
 
                                     if is_permanent {
+                                        outcome_guard.set(if is_end_of_stream {
+                                            RouteOutcome::Completed
+                                        } else {
+                                            RouteOutcome::Failed
+                                        });
                                         error!("Route '{}' failed with a permanent error: {}. Shutting down.", name, e);
                                         break 'reconnect;
                                     }
@@ -770,6 +845,7 @@ impl Route {
                 handle,
                 shutdown_tx,
                 status,
+                outcome,
             }),
             _ => {
                 handle.abort();
@@ -3159,12 +3235,15 @@ mod tests {
         // A supervisor holding the handle (rather than consuming it via `join`)
         // must be able to observe the drain, so poll the borrowing accessor.
         tokio::time::timeout(Duration::from_secs(10), async {
-            while !handle.is_finished() {
+            while handle.outcome().is_none() {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await
         .expect("route did not exit on its own after draining");
+
+        // A drained batch job must report success, not just "no longer running".
+        assert_eq!(handle.outcome(), Some(RouteOutcome::Completed));
 
         // The route future must complete on its own once the table is drained.
         handle.join().await.expect("route task panicked");
@@ -3203,12 +3282,24 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(300)).await;
 
         // The route must still be running after the source is empty.
-        assert!(
-            !handle.is_finished(),
+        assert_eq!(
+            handle.outcome(),
+            None,
             "route exited on empty batch without exit_on_empty set"
         );
 
         handle.stop().await;
+
+        // An explicit stop must be distinguishable from a drain.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while handle.outcome().is_none() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("route did not exit after stop()");
+        assert_eq!(handle.outcome(), Some(RouteOutcome::Stopped));
+
         Route::stop("no_drain_test").await;
     }
 
