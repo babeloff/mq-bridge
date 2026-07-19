@@ -2907,8 +2907,10 @@ pub struct ResponseConfig {
 ///
 /// Turns a request/reply exchange (HTTP, or a request_reply NATS/Mongo/Memory endpoint) into
 /// a one-way flow whose response lands on `forward_to` — e.g. IBM MQ → HTTP → IBM MQ. On
-/// request error/timeout the original message is forwarded instead (unchanged). Route
-/// success vs. failure with a `switch` on `forward_to` (e.g. keyed on `http_status_code`).
+/// request error/timeout the original message is forwarded instead (unchanged). Successful
+/// responses carry the transport-native status (e.g. `http_status_code`), so a `switch` on
+/// `forward_to` can route them by status; a failed request forwards the original message with
+/// no status key, so catch failures on the switch's default branch.
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]

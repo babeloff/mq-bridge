@@ -18,7 +18,7 @@ use tokio::net::windows::named_pipe::{
     ClientOptions, NamedPipeClient, NamedPipeServer, ServerOptions,
 };
 use tokio::sync::Mutex;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// Server-side pipe state.
 ///
@@ -120,6 +120,23 @@ impl WindowsIpcTransport {
             )),
         }
     }
+
+    /// Whether a read error means the peer hung up (so we should re-accept) rather than a
+    /// fatal fault. Mirrors `is_disconnected` in ipc_unix.rs.
+    fn is_disconnected(error: &anyhow::Error) -> bool {
+        error
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io_error| {
+                matches!(
+                    io_error.kind(),
+                    std::io::ErrorKind::UnexpectedEof
+                        | std::io::ErrorKind::BrokenPipe
+                        | std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::ConnectionAborted
+                        | std::io::ErrorKind::NotConnected
+                )
+            })
+    }
 }
 
 #[async_trait]
@@ -150,28 +167,54 @@ impl TransportChannel for WindowsIpcTransport {
     }
 
     async fn recv_batch(&self) -> Result<Vec<CanonicalMessage>> {
-        if self.inner.closed.load(Ordering::SeqCst) {
-            return Err(anyhow!("Windows Named Pipe transport is closed"));
+        loop {
+            if self.inner.closed.load(Ordering::SeqCst) {
+                return Err(anyhow!("Windows Named Pipe transport is closed"));
+            }
+
+            // Wait for connection if we haven't connected yet (server mode)
+            self.wait_for_connection().await?;
+
+            let read_result = {
+                let mut guard = self.inner.server.lock().await;
+                let ServerState::Connected(conn) = &mut *guard else {
+                    return Err(anyhow!(
+                        "Windows Named Pipe transport not in server mode: {}",
+                        self.inner.pipe_name
+                    ));
+                };
+                framed::recv_batch(conn).await
+            };
+
+            match read_result {
+                Ok(messages) => {
+                    debug!(
+                        pipe = %self.inner.pipe_name,
+                        count = messages.len(),
+                        "Received batch via Named Pipe"
+                    );
+                    return Ok(messages);
+                }
+                // The client went away. Drop the spent handle and stand up a fresh pipe
+                // instance so the next publisher reconnect is served, mirroring ipc_unix.rs.
+                Err(error) if Self::is_disconnected(&error) => {
+                    warn!(pipe = %self.inner.pipe_name, error = %error, "Named Pipe peer disconnected; waiting for a new connection");
+                    let mut guard = self.inner.server.lock().await;
+                    match ServerOptions::new().create(&self.inner.pipe_name) {
+                        Ok(server) => *guard = ServerState::Idle(server),
+                        Err(e) => {
+                            *guard = ServerState::Empty;
+                            return Err(anyhow!(
+                                "Failed to recreate Named Pipe instance at '{}': {}",
+                                self.inner.pipe_name,
+                                e
+                            ));
+                        }
+                    }
+                }
+                Err(error) => return Err(error),
+            }
         }
-
-        // Wait for connection if we haven't connected yet (server mode)
-        self.wait_for_connection().await?;
-
-        let mut guard = self.inner.server.lock().await;
-        let ServerState::Connected(conn) = &mut *guard else {
-            return Err(anyhow!(
-                "Windows Named Pipe transport not in server mode: {}",
-                self.inner.pipe_name
-            ));
-        };
-
-        let messages = framed::recv_batch(conn).await?;
-        debug!(
-            pipe = %self.inner.pipe_name,
-            count = messages.len(),
-            "Received batch via Named Pipe"
-        );
-        Ok(messages)
     }
 
     fn try_recv_batch(&self) -> Result<Option<Vec<CanonicalMessage>>> {

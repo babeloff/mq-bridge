@@ -508,8 +508,9 @@ csv_to_kafka:
 ```
 
 With the CSV source above producing `{"first_name":"John","last_name":"Smith","user_id":"42"}`,
-the mapping yields `{"firstName":"John","lastName":"Smith","id":"42"}` and the schema then
-coerces `id` to the integer `42`.
+the mapping yields `{"firstName":"John","lastName":"Smith","id":"42","address":{"city":"unknown"}}`
+(`$.city` is absent, so `address.city` falls back to its `"unknown"` default) and the schema
+then coerces `id` to the integer `42`.
 
 Failures are always non-retryable and name the offending field, e.g.
 `transform failed at $.items[1].qty [coercion]: cannot coerce string "oops" to integer`.

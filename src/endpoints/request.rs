@@ -12,6 +12,10 @@ use tracing::warn;
 /// `message_id`, and for HTTP the `http_status_code`). On request error/timeout the original
 /// message is forwarded unchanged instead, so a downstream `switch` can route success vs.
 /// failure on the transport-native status. This endpoint adds no metadata of its own.
+///
+/// Retry, if configured, wraps the whole `send`: a `forward_to` failure after a successful
+/// request re-issues the request on the next attempt. The `to` endpoint must therefore be
+/// idempotent — delivery is at-least-once.
 pub struct RequestForwardPublisher {
     request: Arc<dyn MessagePublisher>,
     forward: Arc<dyn MessagePublisher>,
