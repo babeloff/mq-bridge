@@ -19,13 +19,24 @@ A `Route` defines a data pipeline from one input endpoint to one output endpoint
 ### 2. Endpoint
 Endpoints are protocol adapters for sources (consumers) and sinks (publishers). Supported types include Kafka, NATS, AMQP, MQTT, MongoDB, HTTP, SQLx, ZeroMQ, Files, AWS, IBM MQ, and the `memory` endpoint (in-process channels and cross-process IPC). Endpoints are created via factory functions and configured via serde (json/yml).
 
+Beyond these protocol adapters there are **structural endpoints** that compose other endpoints
+or shape routing rather than talking to a broker: `ref`, `fanout`, `switch`, `request`,
+`response`, `reader`, `static`, `stream_buffer`, `null` and `custom`. All of them are
+documented in [REFERENCE.md](REFERENCE.md#structural-endpoints).
+
 ### 3. Middleware
-Middleware wraps consumers and publishers to add cross-cutting features:
-- Retries (exponential backoff)
-- Dead-letter queues (DLQ) to send messages to a fallback / error endpoint
-- Deduplication (sled-based)
-- Metrics
+Middleware wraps consumers and publishers to add cross-cutting features. There is no
+`Middleware` trait: a middleware *is* a decorator implementing `MessageConsumer` and/or
+`MessagePublisher`, which is why `CustomMiddlewareFactory` is defined as `apply_consumer` /
+`apply_publisher`. Available middleware includes:
+- Retries (exponential backoff) and dead-letter queues (DLQ)
+- JSON transformation (`transform`): mapping, type coercion, schema validation
+- Deduplication (sled-based), weak joins, buffering, rate limiting
+- Metrics, delays, fault injection
 - Custom user middleware
+
+The complete list, with fields, defaults and the layer-ordering rules, is in
+[REFERENCE.md](REFERENCE.md#middleware).
 
 ### 4. Handler
 Handlers are user-defined async functions that process messages. There are two main handler types:

@@ -806,6 +806,7 @@ pub enum Middleware {
     Limiter(LimiterMiddleware),
     Buffer(BufferMiddleware),
     CookieJar(CookieJarMiddleware),
+    Transform(TransformMiddleware),
     Custom {
         name: String,
         config: serde_json::Value,
@@ -1000,6 +1001,104 @@ pub enum WeakJoinTimeout {
     Fire,
     /// Drop the incomplete group without emitting.
     Discard,
+}
+
+/// JSON transform middleware configuration.
+///
+/// Reshapes JSON payloads declaratively, in two stages over a single parse: field
+/// `mapping` (rename/move/nest), then `schema` (type coercion, defaults, validation).
+/// Either stage may be omitted; with neither configured the message passes through
+/// untouched and is never parsed.
+///
+/// On an output endpoint a rejected message becomes a non-retryable failure, so a `dlq`
+/// middleware listed *after* this one captures it (publisher middlewares are wrapped in
+/// list order, so the last entry is the outermost layer). On an input endpoint a rejected
+/// message is dropped from the batch and acknowledged, which is how invalid input is kept
+/// out of the route.
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct TransformMiddleware {
+    /// Output field name -> source path (e.g. `firstName: "$.first_name"`). Dots nest the output.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub mapping: HashMap<String, MappingRule>,
+    /// Inline JSON Schema subset (type, properties, required, default, items, nullable, enum).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema: Option<serde_json::Value>,
+    /// Path to a JSON Schema file. Read once at startup; never re-read per message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema_file: Option<String>,
+    /// Coerce safely convertible types (e.g. `"42"` -> `42`) instead of rejecting. Defaults to true.
+    #[serde(default = "default_true")]
+    pub coerce: bool,
+    /// Insert `default` values from the schema for missing fields. Defaults to true.
+    #[serde(default = "default_true")]
+    pub apply_defaults: bool,
+    /// What to do with a message that fails to transform. Defaults to `reject`.
+    #[serde(default)]
+    pub on_error: TransformErrorPolicy,
+}
+
+// Hand-written rather than derived: `coerce` and `apply_defaults` default to *true*, which
+// a derived `Default` would silently turn into `false`. That would make
+// `TransformMiddleware { ..Default::default() }` in Rust behave differently from the same
+// config parsed from YAML.
+impl Default for TransformMiddleware {
+    fn default() -> Self {
+        Self {
+            mapping: HashMap::new(),
+            schema: None,
+            schema_file: None,
+            coerce: default_true(),
+            apply_defaults: default_true(),
+            on_error: TransformErrorPolicy::default(),
+        }
+    }
+}
+
+/// How one output field is produced from the input document.
+///
+/// Either a bare path string (`"$.first_name"`) or an object with a `path` plus an
+/// optional `default` and `required` flag.
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(untagged)]
+pub enum MappingRule {
+    /// Shorthand: just the source path.
+    Path(String),
+    /// Full form with a fallback value and/or a presence requirement.
+    Detailed {
+        /// Source path in the input document (e.g. `$.user.id`, `user.id`, `$.items[0]`).
+        path: String,
+        /// Value used when the source path is absent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        default: Option<serde_json::Value>,
+        /// Reject the message when the source path is absent and no `default` is set.
+        #[serde(default)]
+        required: bool,
+    },
+}
+
+impl MappingRule {
+    /// The source path this rule reads from.
+    pub fn path(&self) -> &str {
+        match self {
+            MappingRule::Path(p) => p,
+            MappingRule::Detailed { path, .. } => path,
+        }
+    }
+}
+
+/// Action taken on a message that fails to transform.
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum TransformErrorPolicy {
+    /// Reject the message: non-retryable failure on output, dropped from the batch on input.
+    #[default]
+    Reject,
+    /// Forward the original payload unchanged with the error recorded in metadata.
+    PassThrough,
 }
 
 /// Fault injection modes for testing error handling and recovery mechanisms.
@@ -3677,6 +3776,7 @@ kafka_to_nats:
                 Middleware::Limiter(_) => {}
                 Middleware::Buffer(_) => {}
                 Middleware::CookieJar(_) => {}
+                Middleware::Transform(_) => {}
             }
         }
 

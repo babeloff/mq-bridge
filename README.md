@@ -156,6 +156,10 @@ Known rough edges (be deliberate here):
 *   **Middleware**: Components that intercept and process messages (e.g., for error handling).
 *   **Handler**: A programmatic component for business logic, such as transforming/consuming messages (`CommandHandler`) or subscribe them (`EventHandler`).
 
+> **[REFERENCE.md](REFERENCE.md)** lists every middleware and every structural endpoint
+> (`ref`, `fanout`, `switch`, `request`, `response`, `reader`, `static`, `stream_buffer`,
+> `null`, `custom`) with fields, defaults and working examples.
+
 ## Backend Features & Configuration
 
 `mq-bridge` endpoints generally default to a **Consumer** pattern (Queue), where messages are persisted and distributed among workers. To achieve **Subscriber** (Pub/Sub) behavior, specific configuration is required.
@@ -475,7 +479,46 @@ Important route-level knobs:
 *   `concurrency`: number of route workers. Defaults to `1`; useful for high-latency handlers or endpoints.
 *   `commit_concurrency_limit`: maximum in-flight commit operations, whether they are queued through ordered commit sequencing or run concurrently for independent-ack transports. Defaults to `4096`.
 
-Middleware can be attached to inputs or outputs. The most commonly used ones are `retry`, `dlq`, `deduplication`, `limiter`, and `cookie_jar`. Retry/DLQ are especially useful with batching because partial failures can be retried or sent to a DLQ without treating the entire batch as equally broken.
+Middleware can be attached to inputs or outputs. The most commonly used ones are `retry`, `dlq`, `deduplication`, `limiter`, `cookie_jar`, and `transform`. Retry/DLQ are especially useful with batching because partial failures can be retried or sent to a DLQ without treating the entire batch as equally broken.
+
+### Transforming JSON messages
+
+The `transform` middleware reshapes JSON payloads declaratively, so field renaming and type
+fixing do not need a custom handler. It runs two optional stages over a single parse:
+`mapping` (rename, move, nest) and then `schema` (coerce, apply defaults, validate).
+
+```yaml
+csv_to_kafka:
+  input:
+    file: { path: "users.csv", format: csv }
+  output:
+    middlewares:
+      - transform:
+          mapping:
+            firstName: "$.first_name"
+            lastName: "$.last_name"
+            id: "$.user_id"
+            "address.city": { path: "$.city", default: "unknown" }
+          schema_file: "schemas/user.json"
+      # `dlq` comes after `transform`: publisher middlewares are wrapped in list order,
+      # so the last entry is the outermost layer and sees the earlier ones' failures.
+      - dlq:
+          endpoint: { file: { path: "rejected.jsonl" } }
+    kafka: { topic: "users", url: "localhost:9092" }
+```
+
+With the CSV source above producing `{"first_name":"John","last_name":"Smith","user_id":"42"}`,
+the mapping yields `{"firstName":"John","lastName":"Smith","id":"42"}` and the schema then
+coerces `id` to the integer `42`.
+
+Failures are always non-retryable and name the offending field, e.g.
+`transform failed at $.items[1].qty [coercion]: cannot coerce string "oops" to integer`.
+On an **output** endpoint the message is failed so a following `dlq` captures it; on an
+**input** endpoint it is dropped from the batch and acknowledged, which keeps invalid data
+out of the route.
+
+See **[REFERENCE.md](REFERENCE.md#transform)** for the full option list, the supported schema
+subset, and the exact set of allowed type coercions.
 
 ## Running Tests
 The project includes integration and performance tests. Most backend tests require Docker.

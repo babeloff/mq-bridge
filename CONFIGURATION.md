@@ -199,6 +199,13 @@ Two gotchas worth knowing before wiring up a `nats` endpoint:
   placeholder string.
 
 ### Middleware Configuration
+
+> Every available middleware, with its fields, defaults, supported side (input/output) and a
+> working example, is listed in **[REFERENCE.md](REFERENCE.md#middleware)**. Note in
+> particular the [ordering rule](REFERENCE.md#ordering--read-this-before-combining-middleware):
+> on an **output**, the *last* middleware in the list is the outermost layer, so `dlq` goes
+> last.
+
 Middleware is defined as a list under an endpoint.
 
 ```yaml
@@ -324,6 +331,10 @@ orders_out:
     dedicated channel.
 
 ### Specialized Endpoints
+
+> This section covers `switch` in depth. The other structural endpoints — `ref`, `fanout`,
+> `request`, `response`, `reader`, `static`, `stream_buffer`, `null` and `custom` — are
+> documented in **[REFERENCE.md](REFERENCE.md#structural-endpoints)**.
 
 #### Switch
 
