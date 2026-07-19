@@ -10,9 +10,9 @@
 //! configuration (source paths, the schema) is compiled once in `new()`.
 //!
 //! Only the JSON Schema subset that matters for message integration is honoured:
-//! `type`, `properties`, `required`, `default`, `items`, `nullable`, `enum`. Other
-//! keywords are ignored rather than rejected, so a fuller schema can be pointed at
-//! without being rewritten.
+//! `type`, `properties`, `required`, `default`, `items`, `nullable`, `enum`, plus
+//! `contentMediaType`/`contentSchema` for embedded JSON. Other keywords are ignored
+//! rather than rejected, so a fuller schema can be pointed at without being rewritten.
 
 use crate::models::{MappingRule, TransformErrorPolicy, TransformMiddleware};
 use crate::traits::{
@@ -35,6 +35,7 @@ pub const TRANSFORM_ERROR_KEY: &str = "mqb.transform_error";
 enum ErrorKind {
     Parse,
     Coercion,
+    Content,
     MissingRequired,
     TypeMismatch,
     Enum,
@@ -45,6 +46,7 @@ impl ErrorKind {
         match self {
             ErrorKind::Parse => "parse",
             ErrorKind::Coercion => "coercion",
+            ErrorKind::Content => "content",
             ErrorKind::MissingRequired => "missing_required",
             ErrorKind::TypeMismatch => "type_mismatch",
             ErrorKind::Enum => "enum",
@@ -290,6 +292,23 @@ struct CompiledSchema {
     default: Option<Value>,
     items: Option<Box<CompiledSchema>>,
     enum_values: Option<Vec<Value>>,
+    /// Set when `contentMediaType` names a JSON media type: the string is parsed in place.
+    /// `Some(None)` parses without validating the result, `Some(Some(_))` also applies
+    /// `contentSchema` to it.
+    content: Option<Option<Box<CompiledSchema>>>,
+}
+
+/// Whether `contentMediaType` names something we can parse as JSON. Covers the `+json`
+/// structured suffix (`application/vnd.acme.order+json`) alongside `application/json`.
+/// Parameters (`; charset=utf-8`) are stripped.
+fn is_json_media_type(media_type: &str) -> bool {
+    let base = media_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    base == "application/json" || base == "text/json" || base.ends_with("+json")
 }
 
 impl CompiledSchema {
@@ -366,6 +385,24 @@ impl CompiledSchema {
             None => None,
         };
 
+        // Embedded JSON is opt-in per field, never implied by `coerce`: parsing a string as
+        // a document is a different operation from widening `"42"` to `42`, and the JSON
+        // Schema spec requires the consumer to ask for it. A media type we cannot decode
+        // (or one paired with a `contentEncoding` we do not implement) is ignored like any
+        // other unsupported keyword, leaving the string untouched.
+        let encoded = obj.contains_key("contentEncoding");
+        let content = match obj.get("contentMediaType") {
+            Some(Value::String(mt)) if is_json_media_type(mt) && !encoded => {
+                let inner = match obj.get("contentSchema") {
+                    Some(sub) => Some(Box::new(CompiledSchema::compile(sub)?)),
+                    None => None,
+                };
+                Some(inner)
+            }
+            Some(Value::String(_)) | None => None,
+            Some(_) => anyhow::bail!("schema 'contentMediaType' must be a string"),
+        };
+
         Ok(Self {
             ty,
             nullable,
@@ -374,6 +411,7 @@ impl CompiledSchema {
             default: obj.get("default").cloned(),
             items,
             enum_values,
+            content,
         })
     }
 
@@ -432,6 +470,26 @@ impl CompiledSchema {
                         Value::Array(allowed.clone())
                     ),
                 ));
+            }
+        }
+
+        // Decode embedded JSON before recursing: the decoded document, not the string that
+        // carried it, is what `contentSchema` describes.
+        if let Some(content_schema) = &self.content {
+            if let Value::String(raw) = value {
+                *value = serde_json::from_str(raw).map_err(|e| {
+                    TransformError::new(
+                        render_path(crumbs),
+                        ErrorKind::Content,
+                        format!("contentMediaType is JSON but the string does not parse: {e}"),
+                    )
+                })?;
+                if let Some(schema) = content_schema {
+                    // Same crumbs, so a failure inside reads as `$.payload.qty`.
+                    schema.apply(value, crumbs, opts)?;
+                }
+                // `properties`/`items` here belong to the string, not to what it decoded to.
+                return Ok(());
             }
         }
 
@@ -1067,6 +1125,138 @@ mod tests {
         let error = run(&cfg, json!({ "other": 1 })).unwrap_err();
         assert_eq!(error.kind, ErrorKind::MissingRequired);
         assert!(error.to_string().contains("$.user_id"), "{error}");
+    }
+
+    // --- Embedded JSON (contentMediaType / contentSchema) ---
+
+    #[test]
+    fn test_content_schema_parses_embedded_json_and_applies_the_inner_schema() {
+        let cfg = compiled(json!({
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "payload": {
+                        "type": "string",
+                        "contentMediaType": "application/json",
+                        "contentSchema": {
+                            "type": "object",
+                            "properties": { "qty": { "type": "integer" } },
+                        },
+                    },
+                },
+            }
+        }));
+
+        // The inner `"7"` proves the decoded document goes through the same coercion pass.
+        let out = run(&cfg, json!({ "payload": "{\"qty\": \"7\"}" })).unwrap();
+
+        assert_eq!(out, json!({ "payload": { "qty": 7 } }));
+    }
+
+    #[test]
+    fn test_content_media_type_alone_parses_without_validating() {
+        let cfg = compiled(json!({
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "payload": { "type": "string", "contentMediaType": "application/json" },
+                },
+            }
+        }));
+
+        let out = run(&cfg, json!({ "payload": "[1, 2]" })).unwrap();
+
+        assert_eq!(out, json!({ "payload": [1, 2] }));
+    }
+
+    #[test]
+    fn test_content_schema_rejects_a_string_that_is_not_json() {
+        let cfg = compiled(json!({
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "payload": { "type": "string", "contentMediaType": "application/json" },
+                },
+            }
+        }));
+
+        let error = run(&cfg, json!({ "payload": "not json" })).unwrap_err();
+
+        assert_eq!(error.kind, ErrorKind::Content);
+        assert!(error.to_string().contains("$.payload"), "{error}");
+    }
+
+    #[test]
+    fn test_structured_suffix_media_type_is_parsed() {
+        let cfg = compiled(json!({
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "payload": {
+                        "type": "string",
+                        "contentMediaType": "application/vnd.acme.order+json; charset=utf-8",
+                    },
+                },
+            }
+        }));
+
+        let out = run(&cfg, json!({ "payload": "{\"a\": 1}" })).unwrap();
+
+        assert_eq!(out, json!({ "payload": { "a": 1 } }));
+    }
+
+    #[test]
+    fn test_unparseable_content_keywords_leave_the_string_untouched() {
+        // A non-JSON media type, an encoding we do not implement, and a `contentSchema`
+        // with no media type are all ignored like any other unsupported keyword, so a
+        // fuller pre-existing schema stays usable.
+        for schema in [
+            json!({ "type": "string", "contentMediaType": "text/csv" }),
+            json!({
+                "type": "string",
+                "contentMediaType": "application/json",
+                "contentEncoding": "base64",
+            }),
+            json!({ "type": "string", "contentSchema": { "type": "object" } }),
+        ] {
+            let cfg = compiled(json!({
+                "schema": { "type": "object", "properties": { "payload": schema } }
+            }));
+
+            let out = run(&cfg, json!({ "payload": "{\"a\": 1}" })).unwrap();
+
+            assert_eq!(out, json!({ "payload": "{\"a\": 1}" }));
+        }
+    }
+
+    #[test]
+    fn test_root_schema_decodes_a_double_encoded_body() {
+        let cfg = compiled(json!({
+            "schema": {
+                "type": "string",
+                "contentMediaType": "application/json",
+                "contentSchema": {
+                    "type": "object",
+                    "properties": { "id": { "type": "integer" } },
+                },
+            }
+        }));
+
+        let out = run(&cfg, json!("{\"id\": \"5\"}")).unwrap();
+
+        assert_eq!(out, json!({ "id": 5 }));
+    }
+
+    #[test]
+    fn test_coerce_alone_never_turns_a_string_into_an_object() {
+        // The guarantee that keeps embedded JSON opt-in: `coerce` widens scalars only.
+        let cfg = compiled(json!({
+            "schema": { "type": "object", "properties": { "payload": { "type": "object" } } }
+        }));
+
+        let error = run(&cfg, json!({ "payload": "{\"a\": 1}" })).unwrap_err();
+
+        assert_eq!(error.kind, ErrorKind::Coercion);
     }
 
     // --- Coercion ---

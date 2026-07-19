@@ -56,6 +56,19 @@ fn documented_middleware_snippets_parse() {
       "address.city": { path: "$.city", default: "unknown" }
     schema_file: "schemas/user.json"
 "#,
+        r#"
+- transform:
+    schema:
+      type: object
+      properties:
+        payload:
+          type: string
+          contentMediaType: application/json
+          contentSchema:
+            type: object
+            properties:
+              qty: { type: integer }
+"#,
         r#"- deduplication: { sled_path: "/var/lib/mq-bridge/dedup", ttl_seconds: 3600 }"#,
         r#"- weak_join: { group_by: "correlation_id", expected_count: 3, timeout_ms: 5000 }"#,
         r#"

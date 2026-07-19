@@ -149,9 +149,45 @@ Paths accept `$.field`, `$.a.b`, and `$.items[0]`; the `$.` prefix is optional. 
 as null.
 
 Schema keywords honoured: `type`, `properties`, `required`, `default`, `items`, `nullable`
-(also `"type": ["string","null"]`), `enum`. Everything else is ignored, so an existing fuller
-schema can be used as-is. Coercions are limited to the lossless ones: `string → integer`,
-`string → number`, `string → boolean` (`true`/`false`/`1`/`0`), `number → string`.
+(also `"type": ["string","null"]`), `enum`, `contentMediaType`, `contentSchema`. Everything
+else is ignored, so an existing fuller schema can be used as-is. Coercions are limited to the
+lossless ones: `string → integer`, `string → number`, `string → boolean` (`true`/`false`/`1`/`0`),
+`number → string`.
+
+#### Embedded JSON
+
+A field carrying a JSON document as a string is decoded by `contentMediaType`, following
+JSON Schema 2020-12:
+
+```yaml
+- transform:
+    schema:
+      type: object
+      properties:
+        payload:
+          type: string
+          contentMediaType: application/json
+          contentSchema:
+            type: object
+            properties:
+              qty: { type: integer }
+```
+
+The string is replaced by the parsed document, and `contentSchema` — if given — is applied to
+it with the same coercion, defaults and validation as anywhere else, so the inner `qty: "7"`
+arrives as `7`. Without `contentSchema` the value is parsed but not validated. A root-level
+schema of this shape decodes a double-encoded message body.
+
+This is **not** a coercion, and `coerce: true` never performs it: widening `"42"` to `42` is
+lossless, whereas evaluating a string as a document is a parse that can succeed on input never
+meant as JSON. It is opt-in per field, as the JSON Schema spec requires. Note that the spec
+treats `contentSchema` as annotation-only; applying it is the opt-in behaviour it carves out.
+
+Media types ending in `+json` (and `text/json`) are decoded too; parameters like
+`; charset=utf-8` are ignored. A media type we cannot decode, or one paired with a
+`contentEncoding`, leaves the string untouched rather than failing. A string that does not
+parse fails with kind `content`:
+`transform failed at $.payload [content]: contentMediaType is JSON but the string does not parse: ...`.
 
 Failures are always non-retryable and name the field, e.g.
 `transform failed at $.items[1].qty [coercion]: cannot coerce string "oops" to integer`.
