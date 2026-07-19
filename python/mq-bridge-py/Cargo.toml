@@ -42,8 +42,9 @@ default = ["full"]
 # Testing-only middleware hooks; do not include this feature in production wheels.
 middleware = ["mq-bridge/middleware"]
 full = ["mq-bridge/full", "rustls-aws-lc"]
-# All-platform set for the `mq-bridge-py-basic` wheel: endpoints that build on
-# every target incl. musl/Alpine. amqp + aws pull aws-lc-sys (BoringSSL C), so
+# All-platform set for the `mq-bridge-py-basic` wheel: the endpoints from
+# `mq-bridge/portable` that build across native OS targets without a special
+# toolchain, incl. musl/Alpine. amqp + aws pull aws-lc-sys (BoringSSL C), so
 # the whole wheel uses the aws-lc crypto provider (same as `full`); aws-lc-sys
 # compiles fine natively on musl given cmake + gcc in the build container (see
 # before-script-linux in publish-python.yml). The old "ring-only / no aws-lc"
@@ -56,7 +57,7 @@ full = ["mq-bridge/full", "rustls-aws-lc"]
 #   - ibm-mq-static -> IBM MQ proprietary C client linked at build (SDK needed)
 # `middleware` is intentionally excluded (metrics + sled dedup are not needed in
 # production wheels; retry/DLQ are not feature-gated and remain available).
-basic = ["http", "nats", "mqtt", "websocket", "zeromq", "mongodb", "amqp", "aws", "rustls-aws-lc"]
+basic = ["mq-bridge/portable", "rustls-aws-lc"]
 dedup = ["mq-bridge/dedup"]
 metrics = ["mq-bridge/metrics"]
 # Compatibility alias: config_schema is part of the public Python API and is

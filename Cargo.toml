@@ -189,6 +189,16 @@ middleware = ["metrics", "dedup"]
 # static linking.
 full = ["middleware", "mongodb", "kafka", "amqp", "nats", "mqtt", "http", "aws", "zeromq", "redis-streams", "sled", "grpc", "sqlx", "clickhouse", "websocket", "postgres-cdc", "object-store", "rustls-aws-lc", "ibm-mq"]
 
+# Endpoints that build across most OS targets (glibc/musl/Alpine, macOS,
+# Windows, aarch64/armv7) without a special toolchain — no librdkafka, protoc,
+# IBM SDK or bundled sqlite. NOT a wasm target: still needs a C compiler for
+# aws-lc crypto (amqp + aws pull aws-lc-sys), and tokio net/raw-TCP endpoints
+# don't run on wasm. Excluded — genuinely need an exotic native toolchain:
+# kafka (librdkafka), sqlx (libsqlite3-sys), grpc (protoc), ibm-mq/ibm-mq-static
+# (IBM C client). postgres-cdc is excluded too: its wire protocol is pure Rust
+# but it pulls in sqlx (C).
+portable = ["mongodb", "amqp", "nats", "mqtt", "http", "aws", "zeromq", "redis-streams", "clickhouse", "websocket", "object-store", "rustls-aws-lc"]
+
 # Functionality features
 dedup = ["sled"]
 metrics = ["dep:metrics"]
