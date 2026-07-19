@@ -2373,14 +2373,21 @@ mod fast_path_equivalence {
             "outer":{"type":"object","properties":{"inner":{"type":"integer"}}},
             "list":{"type":"array","items":{"type":"integer"}}}});
         let out = both(schema, r#"{"outer":{"inner":"bad"},"list":["1","x"]}"#);
-        assert_eq!(out.slow, Err("coercion:$.list[1]".to_string()));
-        // Sorted keys visit `list` first, matching the normal path exactly.
-        assert_eq!(out.fast, Err("coercion:$.list[1]".to_string()));
-        // Insertion order reaches `outer` first and names that instead. Still rejected.
-        assert_eq!(
-            out.fast_other_order,
-            Err("coercion:$.outer.inner".to_string())
-        );
+        // Sorted keys visit `list` first; insertion order reaches `outer` first. Either
+        // way the message is rejected — only the field named in the error differs.
+        let sorted = Err("coercion:$.list[1]".to_string());
+        let insertion = Err("coercion:$.outer.inner".to_string());
+        // The normal path walks the schema's (sorted) properties, so it always names `list`.
+        assert_eq!(out.slow, sorted);
+        // The fast path follows the payload order this build's `Map` would use; the other
+        // ordering is what a build with the opposite `preserve_order` setting produces.
+        let (build_order, other_order) = if map_sorts_keys() {
+            (&sorted, &insertion)
+        } else {
+            (&insertion, &sorted)
+        };
+        assert_eq!(&out.fast, build_order);
+        assert_eq!(&out.fast_other_order, other_order);
     }
 
     #[test]

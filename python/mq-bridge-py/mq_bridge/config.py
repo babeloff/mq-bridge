@@ -29,6 +29,7 @@ ObjectStoreConfig = dict
 PostgresCdcConfig = dict
 RandomPanicMiddleware = dict
 RedisStreamsConfig = dict
+RequestForwardConfig = dict
 ResponseConfig = dict
 RetryMiddleware = dict
 Route = dict
@@ -37,17 +38,20 @@ SqlxConfig = dict
 StreamBufferConfig = dict
 SwitchConfig = dict
 TlsConfig = dict
+TransformMiddleware = dict
 WeakJoinMiddleware = dict
 WebSocketConfig = dict
 ZeroMqConfig = dict
 FaultMode = str
 FileFormat = str
 HttpServerProtocol = str
+MappingRule = str
 MongoConsume = str
 MongoDbFormat = str
 MqttProtocol = str
 NatsDeliverPolicy = str
 StaticConfig = str
+TransformErrorPolicy = str
 WeakJoinTimeout = str
 WebSocketExecutionMode = str
 ZeroMqFormat = str
@@ -79,6 +83,7 @@ __all__ = [
     "IbmTlsConfig",
     "KafkaConfig",
     "LimiterMiddleware",
+    "MappingRule",
     "MemoryConfig",
     "MetricsMiddleware",
     "Middleware",
@@ -93,6 +98,7 @@ __all__ = [
     "PostgresCdcConfig",
     "RandomPanicMiddleware",
     "RedisStreamsConfig",
+    "RequestForwardConfig",
     "ResponseConfig",
     "RetryMiddleware",
     "Route",
@@ -104,6 +110,8 @@ __all__ = [
     "StreamBufferConfig",
     "SwitchConfig",
     "TlsConfig",
+    "TransformErrorPolicy",
+    "TransformMiddleware",
     "WeakJoinMiddleware",
     "WeakJoinTimeout",
     "WebSocketConfig",

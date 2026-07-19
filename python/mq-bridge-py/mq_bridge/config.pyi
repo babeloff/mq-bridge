@@ -111,6 +111,7 @@ class Endpoint(TypedDict, total=False):
     reader: Endpoint
     redis_streams: RedisStreamsConfig
     ref: str
+    request: RequestForwardConfig
     response: ResponseConfig
     sled: SledConfig
     sqlx: SqlxConfig
@@ -243,6 +244,7 @@ class Middleware(TypedDict, total=False):
     metrics: MetricsMiddleware
     random_panic: RandomPanicMiddleware
     retry: RetryMiddleware
+    transform: TransformMiddleware
     weak_join: WeakJoinMiddleware
 
 
@@ -363,6 +365,12 @@ class RedisStreamsConfig(TypedDict, total=False):
     username: Optional[str]
 
 
+class RequestForwardConfig(TypedDict, total=False):
+    """Sends each message to a request-capable endpoint and forwards its response elsewhere."""
+    forward_to: Required[Endpoint]
+    to: Required[Endpoint]
+
+
 class ResponseConfig(TypedDict, total=False):
     pass
 
@@ -449,6 +457,16 @@ class TlsConfig(TypedDict, total=False):
     required: bool
 
 
+class TransformMiddleware(TypedDict, total=False):
+    """JSON transform middleware configuration."""
+    apply_defaults: bool
+    coerce: bool
+    mapping: Dict[str, MappingRule]
+    on_error: TransformErrorPolicy
+    schema: Any
+    schema_file: Optional[str]
+
+
 class WeakJoinMiddleware(TypedDict, total=False):
     """Weak Join middleware configuration."""
     branch_by: Optional[str]
@@ -481,11 +499,13 @@ class ZeroMqConfig(TypedDict, total=False):
 FaultMode = Literal["panic", "disconnect", "timeout", "json_format_error", "nack"]
 FileFormat = Literal["normal", "json", "text", "raw", "csv"]
 HttpServerProtocol = Literal["auto", "http1_only", "http2_only"]
+MappingRule = Union[str, Dict[str, Any]]
 MongoConsume = Literal["consumer", "subscriber", "capture_new", "capture_all"]
 MongoDbFormat = Literal["normal", "json", "text", "raw"]
 MqttProtocol = Literal["v5", "v3"]
 NatsDeliverPolicy = Literal["all", "last", "new", "last_per_subject"]
 StaticConfig = Union[str, Dict[str, Any]]
+TransformErrorPolicy = Literal["reject", "pass_through"]
 WeakJoinTimeout = Literal["fire", "discard"]
 WebSocketExecutionMode = Literal["auto", "direct_only", "routed"]
 ZeroMqFormat = Literal["json", "raw", "raw_framed"]
