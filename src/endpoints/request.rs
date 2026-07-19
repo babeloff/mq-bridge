@@ -244,7 +244,7 @@ mod tests {
         assert_eq!(received[0].get_payload_str(), "original-payload");
         assert_eq!(received[0].message_id, original_id);
         // No status tag was invented on the fallback.
-        assert!(received[0].metadata.get("http_status_code").is_none());
+        assert!(!received[0].metadata.contains_key("http_status_code"));
     }
 
     #[tokio::test]
