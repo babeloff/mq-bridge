@@ -9,6 +9,15 @@
 //! message is never round-tripped through bytes between stages. Everything derived from
 //! configuration (source paths, the schema) is compiled once in `new()`.
 //!
+//! Building that `Value` is the dominant cost — a seven-field object costs about fifteen
+//! allocations, most of them for fields the schema leaves exactly as they were. So when
+//! the configuration allows it (`fast_eligible`), `transform_fast` walks the payload's
+//! top-level fields as borrowed spans and copies the untouched ones straight to the
+//! output, parsing only the fields that actually need work and handing those to the very
+//! same `apply`. It decides *whether* a field is worth parsing, never *how* it is
+//! transformed, so the two routes cannot drift apart in behaviour; `fast_path_equivalence`
+//! holds them to that, including the two differences it documents.
+//!
 //! Only the JSON Schema subset that matters for message integration is honoured:
 //! `type`, `properties`, `required`, `default`, `items`, `nullable`, `enum`, plus
 //! `contentMediaType`/`contentSchema` for embedded JSON. Other keywords are ignored
@@ -541,6 +550,97 @@ impl CompiledSchema {
 
         Ok(())
     }
+
+    /// True when `apply` would leave `raw` — one field's verbatim JSON span — byte for
+    /// byte as it is, so the field can be copied straight to the output and never has to
+    /// become a `Value`. Deliberately conservative: anything with an obligation attached
+    /// (`enum`, `contentMediaType`, sub-schemas, a default that a null could pull in)
+    /// answers `false` and takes the normal path.
+    fn is_passthrough(&self, raw: &str) -> bool {
+        if self.enum_values.is_some()
+            || self.content.is_some()
+            || self.default.is_some()
+            || self.items.is_some()
+            || !self.properties.is_empty()
+            || !self.required.is_empty()
+        {
+            return false;
+        }
+        // Nothing declared: `apply` would only recurse, and there is nothing to recurse
+        // into without `properties` or `items`.
+        let Some(ty) = self.ty else {
+            return true;
+        };
+        let bytes = raw.as_bytes();
+        match (ty, bytes.first()) {
+            (Ty::String, Some(b'"'))
+            | (Ty::Object, Some(b'{'))
+            | (Ty::Array, Some(b'['))
+            | (Ty::Boolean, Some(b't' | b'f'))
+            | (Ty::Null, Some(b'n')) => true,
+            // Looking like a number is not enough for either numeric type: `Ty::matches`
+            // runs against a `Value`, which holds integers as i64/u64 and everything else
+            // as f64. A 24-digit id or `1e400` is well-formed JSON that no `Value` can
+            // represent, and the normal path rejects it — so parse before waving it
+            // through. This also rules out fractions and exponents for `integer`.
+            (Ty::Integer, Some(b'-' | b'0'..=b'9')) => {
+                raw.parse::<i64>().is_ok() || raw.parse::<u64>().is_ok()
+            }
+            (Ty::Number, Some(b'-' | b'0'..=b'9')) => raw.parse::<f64>().is_ok_and(f64::is_finite),
+            _ => false,
+        }
+    }
+
+    /// True when decoding an embedded JSON document is the *only* thing `apply` would do
+    /// to `raw`. That decode is a string unescape followed by a well-formedness check,
+    /// both of which work on bytes, so no `Value` has to be built for the document —
+    /// which for a document of any size is the bulk of the field's cost.
+    ///
+    /// A `contentSchema` means the document is inspected afterwards and does not qualify.
+    fn is_plain_content_decode(&self, raw: &str) -> bool {
+        matches!(self.content, Some(None))
+            && matches!(self.ty, None | Some(Ty::String))
+            && self.enum_values.is_none()
+            && self.default.is_none()
+            && self.items.is_none()
+            && self.properties.is_empty()
+            && self.required.is_empty()
+            && raw.as_bytes().first() == Some(&b'"')
+    }
+}
+
+/// The top-level fields of an object, borrowed from the payload: each key as written and
+/// the verbatim JSON span of its value. Keys carrying escapes cannot be borrowed, and
+/// deserialising then fails, which is exactly when the caller should fall back.
+struct RawPairs<'a>(Vec<(&'a str, &'a serde_json::value::RawValue)>);
+
+impl<'de> serde::Deserialize<'de> for RawPairs<'de> {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct PairVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for PairVisitor {
+            type Value = RawPairs<'de>;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a JSON object")
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<RawPairs<'de>, A::Error> {
+                let mut pairs = Vec::with_capacity(map.size_hint().unwrap_or(8));
+                while let Some(entry) =
+                    map.next_entry::<&'de str, &'de serde_json::value::RawValue>()?
+                {
+                    pairs.push(entry);
+                }
+                Ok(RawPairs(pairs))
+            }
+        }
+
+        deserializer.deserialize_map(PairVisitor)
+    }
 }
 
 /// Applies the one safe coercion for `ty`, or fails. Never best-effort: a value that
@@ -621,6 +721,45 @@ struct Compiled {
     schema: Option<CompiledSchema>,
     opts: Opts,
     on_error: TransformErrorPolicy,
+    /// Decided once: whether `transform_fast` may be tried at all.
+    fast_eligible: bool,
+    /// Decided once: see `map_sorts_keys`.
+    sort_keys: bool,
+}
+
+/// Whether `serde_json::Map` iterates its keys in sorted order.
+///
+/// `Map` is a `BTreeMap` (sorted) normally and an `IndexMap` (insertion order) when
+/// anything in the build enables `serde_json/preserve_order` — a decision made by feature
+/// unification, which this crate cannot see with `cfg`. `transform_fast` writes its keys
+/// directly rather than through a `Map`, so it has to emit them the way the normal path
+/// would, and the only dependable way to learn which `Map` is compiled in is to ask one.
+/// Called once per middleware, never on the hot path.
+fn map_sorts_keys() -> bool {
+    let mut probe = Map::new();
+    probe.insert("b".to_string(), Value::Null);
+    probe.insert("a".to_string(), Value::Null);
+    probe.keys().next().is_some_and(|first| first == "a")
+}
+
+/// Whether the root schema is a plain object carrying no obligation of its own, which is
+/// what lets a field-by-field rewrite stand in for parsing the whole payload. Root-level
+/// `required` and defaults need to know which fields are *absent*, which copying spans
+/// never learns, so they rule the shortcut out.
+fn fast_eligible(rules: &[CompiledRule], schema: Option<&CompiledSchema>, opts: Opts) -> bool {
+    if !rules.is_empty() {
+        return false;
+    }
+    let Some(schema) = schema else {
+        return false;
+    };
+    matches!(schema.ty, None | Some(Ty::Object))
+        && schema.enum_values.is_none()
+        && schema.content.is_none()
+        && schema.items.is_none()
+        && schema.default.is_none()
+        && schema.required.is_empty()
+        && !(opts.apply_defaults && schema.properties.iter().any(|(_, s)| s.default.is_some()))
 }
 
 impl Compiled {
@@ -675,13 +814,16 @@ impl Compiled {
             None => None,
         };
 
+        let opts = Opts {
+            coerce: config.coerce,
+            apply_defaults: config.apply_defaults,
+        };
         Ok(Self {
+            fast_eligible: fast_eligible(&rules, schema.as_ref(), opts),
+            sort_keys: map_sorts_keys(),
             rules,
             schema,
-            opts: Opts {
-                coerce: config.coerce,
-                apply_defaults: config.apply_defaults,
-            },
+            opts,
             on_error: config.on_error,
         })
     }
@@ -717,8 +859,128 @@ impl Compiled {
         Ok(out)
     }
 
+    /// Rewrites the payload field by field, copying the verbatim JSON span of every field
+    /// the schema would not change and parsing only the ones that need work. Those go
+    /// through the same `apply` as the normal path, so nesting, `items`, `enum` and
+    /// `contentSchema` all behave identically — this decides *whether* a field is worth
+    /// parsing, never *how* it is transformed.
+    ///
+    /// `None` means the payload's shape rules the shortcut out and the caller should fall
+    /// back; `Some(Err(_))` is a real transform failure and must not be retried slowly.
+    fn transform_fast(
+        &self,
+        schema: &CompiledSchema,
+        payload: &[u8],
+    ) -> Option<Result<Vec<u8>, TransformError>> {
+        // Not an object, or a key we cannot borrow because it carried escapes.
+        let RawPairs(mut pairs) = serde_json::from_slice::<RawPairs>(payload).ok()?;
+
+        // The output has to carry its keys the way the normal path's `Map` would order
+        // them. Insertion order needs no work: it is the order they were just read in.
+        if self.sort_keys {
+            pairs.sort_by(|a, b| a.0.cmp(b.0));
+        }
+
+        // A `Value` parse collapses duplicate keys (last wins) where copying spans would
+        // emit both, so those rare payloads go the normal way. Quadratic, but objects are
+        // narrow and this runs once per message.
+        if pairs
+            .iter()
+            .enumerate()
+            .any(|(i, (key, _))| pairs[..i].iter().any(|(seen, _)| seen == key))
+        {
+            return None;
+        }
+
+        let mut out = Vec::with_capacity(payload.len() + payload.len() / 2);
+        out.push(b'{');
+        for (i, (key, raw)) in pairs.iter().enumerate() {
+            if i > 0 {
+                out.push(b',');
+            }
+            out.push(b'"');
+            out.extend_from_slice(key.as_bytes());
+            out.extend_from_slice(b"\":");
+
+            let sub = schema
+                .properties
+                .binary_search_by(|(name, _)| name.as_str().cmp(key))
+                .ok()
+                .map(|idx| &schema.properties[idx].1);
+
+            match sub {
+                // Embedded JSON with nothing to check afterwards: unescape the string and
+                // emit the document it carried, without ever building it.
+                Some(sub) if sub.is_plain_content_decode(raw.get()) => {
+                    // serde_json does the unescaping, so `😀` and friends are
+                    // handled exactly as the normal path handles them.
+                    let text: std::borrow::Cow<'_, str> = match serde_json::from_str(raw.get()) {
+                        Ok(text) => text,
+                        Err(e) => {
+                            return Some(Err(TransformError::new(
+                                format!("$.{key}"),
+                                ErrorKind::Parse,
+                                format!("field is not valid JSON: {e}"),
+                            )))
+                        }
+                    };
+                    match serde_json::from_str::<&serde_json::value::RawValue>(&text) {
+                        Ok(document) => out.extend_from_slice(document.get().as_bytes()),
+                        Err(e) => {
+                            return Some(Err(TransformError::new(
+                                format!("$.{key}"),
+                                ErrorKind::Content,
+                                format!(
+                                    "contentMediaType is JSON but the string does not parse: {e}"
+                                ),
+                            )))
+                        }
+                    }
+                }
+                // The schema has something to say about this field and the raw bytes do
+                // not already satisfy it: parse just this field and transform it.
+                Some(sub) if !sub.is_passthrough(raw.get()) => {
+                    let mut value: Value = match serde_json::from_str(raw.get()) {
+                        Ok(value) => value,
+                        Err(e) => {
+                            return Some(Err(TransformError::new(
+                                format!("$.{key}"),
+                                ErrorKind::Parse,
+                                format!("field is not valid JSON: {e}"),
+                            )))
+                        }
+                    };
+                    let mut crumbs = vec![Crumb::Key(key)];
+                    if let Err(e) = sub.apply(&mut value, &mut crumbs, self.opts) {
+                        return Some(Err(e));
+                    }
+                    if let Err(e) = serde_json::to_writer(&mut out, &value) {
+                        return Some(Err(TransformError::new(
+                            format!("$.{key}"),
+                            ErrorKind::Parse,
+                            format!("transformed value could not be serialized: {e}"),
+                        )));
+                    }
+                }
+                // Unmentioned by the schema, or already satisfying it.
+                _ => out.extend_from_slice(raw.get().as_bytes()),
+            }
+        }
+        out.push(b'}');
+        Some(Ok(out))
+    }
+
     /// Parses once, reshapes, serialises once.
     fn transform(&self, message: &mut CanonicalMessage) -> Result<(), TransformError> {
+        if self.fast_eligible {
+            if let Some(schema) = &self.schema {
+                if let Some(result) = self.transform_fast(schema, &message.payload) {
+                    message.payload = Bytes::from(result?);
+                    return Ok(());
+                }
+            }
+        }
+
         let input: Value = serde_json::from_slice(&message.payload).map_err(|e| {
             TransformError::new(
                 "$".to_string(),
@@ -738,7 +1000,11 @@ impl Compiled {
             schema.apply(&mut value, &mut crumbs, self.opts)?;
         }
 
-        let bytes = serde_json::to_vec(&value).map_err(|e| {
+        // Sized from the input rather than left at serde_json's 128-byte default: the
+        // output tracks the input closely, so this is usually the only allocation the
+        // write side makes.
+        let mut bytes = Vec::with_capacity(message.payload.len() + message.payload.len() / 2);
+        serde_json::to_writer(&mut bytes, &value).map_err(|e| {
             TransformError::new(
                 "$".to_string(),
                 ErrorKind::Parse,
@@ -1894,5 +2160,343 @@ memory:
         assert_eq!(batch.messages.len(), 1);
         let out: Value = serde_json::from_slice(&batch.messages[0].payload).unwrap();
         assert_eq!(out, json!({ "firstName": "John", "id": 42 }));
+    }
+}
+
+#[cfg(test)]
+mod fast_path_equivalence {
+    use super::*;
+    use serde_json::json;
+
+    /// What the three runs of a payload produced.
+    struct Outcomes {
+        slow: Result<String, String>,
+        fast: Result<String, String>,
+        /// The fast path with `sort_keys` inverted — that is, how it behaves in a build
+        /// whose `serde_json/preserve_order` setting differs from this one. `mq-bridge-app`
+        /// is such a build (`rmcp` pulls the feature in), so without this the configuration
+        /// the binary actually ships would never be exercised by these tests.
+        fast_other_order: Result<String, String>,
+        eligible: bool,
+    }
+
+    fn both(schema: Value, payload: &str) -> Outcomes {
+        let config = TransformMiddleware {
+            schema: Some(schema),
+            ..Default::default()
+        };
+        let mut compiled = Compiled::new(&config).unwrap();
+        let eligible = compiled.fast_eligible;
+        let sort_keys = compiled.sort_keys;
+
+        let run = |compiled: &Compiled| {
+            let mut message = CanonicalMessage::new(payload.as_bytes().to_vec(), None);
+            match compiled.transform(&mut message) {
+                Ok(()) => Ok(String::from_utf8(message.payload.to_vec()).unwrap()),
+                Err(e) => Err(format!("{}:{}", e.kind.as_str(), e.path)),
+            }
+        };
+
+        compiled.fast_eligible = false;
+        let slow = run(&compiled);
+
+        compiled.fast_eligible = eligible;
+        let fast = run(&compiled);
+
+        compiled.sort_keys = !sort_keys;
+        let fast_other_order = run(&compiled);
+
+        Outcomes {
+            slow,
+            fast,
+            fast_other_order,
+            eligible,
+        }
+    }
+
+    fn as_json(r: &Result<String, String>) -> Result<Value, String> {
+        match r {
+            Ok(s) => Ok(serde_json::from_str(s).expect("valid JSON out")),
+            Err(e) => Err(e.clone()),
+        }
+    }
+
+    /// Compares outcomes as parsed JSON: object key order and escape spelling are
+    /// serialization choices, not data. Both key orderings must agree with the normal path.
+    #[track_caller]
+    fn assert_same(schema: Value, payload: &str) {
+        let out = both(schema, payload);
+        assert_eq!(
+            as_json(&out.slow),
+            as_json(&out.fast),
+            "paths disagree on payload: {payload}"
+        );
+        assert_eq!(
+            as_json(&out.slow),
+            as_json(&out.fast_other_order),
+            "paths disagree under the opposite key ordering on payload: {payload}"
+        );
+    }
+
+    /// Same as `assert_same`, and additionally requires the fast path to have been taken —
+    /// so a case meant to exercise it cannot silently start falling back and still pass.
+    #[track_caller]
+    fn assert_same_via_fast(schema: Value, payload: &str) {
+        let out = both(schema.clone(), payload);
+        assert!(
+            out.eligible,
+            "expected the fast path to be eligible for {schema}"
+        );
+        assert_same(schema, payload);
+    }
+
+    /// Stronger than `assert_same`: byte for byte, for the key ordering this build uses.
+    #[track_caller]
+    fn assert_byte_identical(schema: Value, payload: &str) {
+        let out = both(schema.clone(), payload);
+        assert!(
+            out.eligible,
+            "expected the fast path to be eligible for {schema}"
+        );
+        assert_eq!(
+            out.slow, out.fast,
+            "byte output differs for payload: {payload}"
+        );
+    }
+
+    /// `transform_fast` writes keys itself instead of going through a `serde_json::Map`, so
+    /// it consults `map_sorts_keys` to order them the way the normal path would. That probe
+    /// has to describe the `Map` this build actually compiled in, whichever it is.
+    #[test]
+    fn map_sort_probe_matches_reality() {
+        let mut map = Map::new();
+        map.insert("b".to_string(), Value::from(1));
+        map.insert("a".to_string(), Value::from(2));
+        let serialized = serde_json::to_string(&Value::Object(map)).unwrap();
+        assert_eq!(
+            map_sorts_keys(),
+            serialized.starts_with(r#"{"a""#),
+            "map_sorts_keys disagrees with how this build's Map serialises: {serialized}"
+        );
+    }
+    fn scalars() -> Value {
+        json!({"type":"object","properties":{
+            "s":{"type":"string"},
+            "i":{"type":"integer"},
+            "n":{"type":"number"},
+            "b":{"type":"boolean"},
+            "o":{"type":"object"},
+            "a":{"type":"array"}}})
+    }
+
+    #[test]
+    fn values_already_matching_their_type_are_untouched() {
+        assert_same_via_fast(
+            scalars(),
+            r#"{"s":"x","i":42,"n":1.5,"b":true,"o":{"k":[1,2]},"a":[1,"two",null]}"#,
+        );
+    }
+
+    #[test]
+    fn every_coercion_agrees() {
+        assert_same_via_fast(
+            scalars(),
+            r#"{"s":7,"i":"42","n":"1.5","b":"true","o":{},"a":[]}"#,
+        );
+        assert_same_via_fast(scalars(), r#"{"b":"0","i":"-8","n":"-2.5e3"}"#);
+    }
+
+    #[test]
+    fn a_float_is_not_an_integer_even_though_it_starts_like_one() {
+        // The byte check must not wave `1.5` or `1e3` through as integers.
+        assert_same_via_fast(scalars(), r#"{"i":1.5}"#);
+        assert_same_via_fast(scalars(), r#"{"i":1e3}"#);
+        assert_same_via_fast(scalars(), r#"{"i":-0.0}"#);
+    }
+
+    #[test]
+    fn coercion_failures_agree() {
+        assert_same_via_fast(scalars(), r#"{"i":"not-a-number"}"#);
+        assert_same_via_fast(scalars(), r#"{"b":"maybe"}"#);
+        assert_same_via_fast(scalars(), r#"{"i":{}}"#);
+    }
+
+    #[test]
+    fn embedded_documents_agree() {
+        let schema = json!({"type":"object","properties":{
+            "p":{"type":"string","contentMediaType":"application/json"}}});
+        assert_same_via_fast(schema.clone(), r#"{"p":"{\"a\":1,\"b\":[1,2]}"}"#);
+        assert_same_via_fast(schema.clone(), r#"{"p":"[1,2,3]"}"#);
+        assert_same_via_fast(schema.clone(), r#"{"p":"null"}"#);
+        assert_same_via_fast(schema.clone(), r#"{"p":"\"just a string\""}"#);
+        // Malformed embedded JSON must fail the same way on both paths.
+        assert_same_via_fast(schema.clone(), r#"{"p":"{not json}"}"#);
+        // Escapes inside the embedded document, including a surrogate pair.
+        assert_same_via_fast(schema.clone(), r#"{"p":"{\"e\":\"a\\\"b\\nc\"}"}"#);
+        assert_same_via_fast(schema, r#"{"p":"{\"e\":\"\\ud83d\\ude00\"}"}"#);
+    }
+
+    #[test]
+    fn a_content_schema_still_validates_the_decoded_document() {
+        let schema = json!({"type":"object","properties":{
+            "p":{"type":"string","contentMediaType":"application/json",
+                 "contentSchema":{"type":"object","properties":{"n":{"type":"integer"}}}}}});
+        assert_same(schema.clone(), r#"{"p":"{\"n\":\"5\"}"}"#);
+        assert_same(schema, r#"{"p":"{\"n\":\"oops\"}"}"#);
+    }
+
+    #[test]
+    fn nested_schemas_agree() {
+        let schema = json!({"type":"object","properties":{
+            "outer":{"type":"object","properties":{
+                "inner":{"type":"integer"},
+                "deep":{"type":"object","properties":{"x":{"type":"boolean"}}}}},
+            "list":{"type":"array","items":{"type":"integer"}}}});
+        assert_same_via_fast(
+            schema.clone(),
+            r#"{"outer":{"inner":"3","deep":{"x":"true"}},"list":["1","2"]}"#,
+        );
+        // A single violation is reported identically.
+        assert_same_via_fast(schema, r#"{"outer":{"inner":"bad"},"list":["1","2"]}"#);
+    }
+
+    /// A documented, deliberate difference. The normal path looks for violations in
+    /// schema order; the fast path finds them in the order the payload lists its fields,
+    /// which is not the same when keys are not sorted. A message violating the schema in
+    /// more than one place is rejected either way — only the field named in the error
+    /// differs. Making these agree would mean transforming in schema order and emitting in
+    /// payload order, i.e. buffering every field, which costs more than the diagnostic is
+    /// worth. Asserted so it cannot change unnoticed.
+    #[test]
+    fn known_difference_which_violation_is_reported_when_several() {
+        let schema = json!({"type":"object","properties":{
+            "outer":{"type":"object","properties":{"inner":{"type":"integer"}}},
+            "list":{"type":"array","items":{"type":"integer"}}}});
+        let out = both(schema, r#"{"outer":{"inner":"bad"},"list":["1","x"]}"#);
+        assert_eq!(out.slow, Err("coercion:$.list[1]".to_string()));
+        // Sorted keys visit `list` first, matching the normal path exactly.
+        assert_eq!(out.fast, Err("coercion:$.list[1]".to_string()));
+        // Insertion order reaches `outer` first and names that instead. Still rejected.
+        assert_eq!(
+            out.fast_other_order,
+            Err("coercion:$.outer.inner".to_string())
+        );
+    }
+
+    #[test]
+    fn enums_agree() {
+        let schema = json!({"type":"object","properties":{
+            "e":{"type":"string","enum":["a","b"]}}});
+        assert_same_via_fast(schema.clone(), r#"{"e":"a"}"#);
+        assert_same_via_fast(schema, r#"{"e":"z"}"#);
+    }
+
+    #[test]
+    fn nullability_agrees() {
+        let schema = json!({"type":"object","properties":{
+            "n":{"type":["string","null"]},
+            "s":{"type":"string"}}});
+        assert_same_via_fast(schema.clone(), r#"{"n":null,"s":"x"}"#);
+        // Null against a non-nullable field must fail identically.
+        assert_same_via_fast(schema, r#"{"n":"x","s":null}"#);
+    }
+
+    #[test]
+    fn fields_the_schema_never_mentions_are_carried_through() {
+        assert_same_via_fast(
+            scalars(),
+            r#"{"s":"x","extra":{"deep":[1,{"k":"v"}]},"another":null}"#,
+        );
+    }
+
+    #[test]
+    fn string_escapes_and_unicode_survive_the_byte_copy() {
+        assert_same_via_fast(
+            scalars(),
+            r#"{"s":"tab\there \"quoted\" \\ back / slash é 😀"}"#,
+        );
+    }
+
+    #[test]
+    fn shapes_that_must_fall_back_still_agree() {
+        // Root-level `required` and defaults need to know what is absent.
+        let required = json!({"type":"object","required":["a"],
+                              "properties":{"a":{"type":"string"}}});
+        assert_same(required.clone(), r#"{"a":"x"}"#);
+        assert_same(required, r#"{"b":"x"}"#);
+
+        let defaulted = json!({"type":"object","properties":{
+            "a":{"type":"string","default":"filled"}}});
+        assert_same(defaulted.clone(), r#"{"b":1}"#);
+        assert_same(defaulted, r#"{"a":null}"#);
+
+        // A non-object payload has no fields to walk.
+        assert_same(scalars(), r#"[1,2,3]"#);
+        assert_same(scalars(), r#""bare string""#);
+
+        // Duplicate keys collapse in a `Value`; copying spans would emit both.
+        assert_same(scalars(), r#"{"s":"first","s":"second"}"#);
+
+        // An escaped key cannot be borrowed, so the fast path declines it. These are
+        // genuinely escaped: a quote, a newline, and a \u sequence inside the key.
+        assert_same(scalars(), r#"{"a\"b":1,"s":"x"}"#);
+        assert_same(scalars(), r#"{"a\nb":1,"s":"x"}"#);
+        assert_same(scalars(), r#"{"a\u0041b":1,"s":"x"}"#);
+        // A key that looks like it could close the object or inject a field.
+        assert_same(scalars(), r#"{"a\":1,\"injected":1}"#);
+    }
+
+    #[test]
+    fn integers_beyond_i64_agree() {
+        // A `Value` holds integers as i64/u64, so a 24-digit id is not an `integer` and
+        // must be rejected identically rather than waved through on a byte check.
+        assert_same(scalars(), r#"{"i":999999999999999999999999}"#);
+        assert_same(scalars(), r#"{"i":-999999999999999999999999}"#);
+        // Just past i64::MAX but still a u64: accepted by both.
+        assert_same(scalars(), r#"{"i":9223372036854775808}"#);
+        assert_same(scalars(), r#"{"i":18446744073709551615}"#);
+    }
+
+    #[test]
+    fn numbers_beyond_f64_are_rejected_by_both() {
+        // Both paths reject these; only the reported path differs, because the fast path
+        // can name the offending field where a whole-payload parse cannot.
+        for payload in [r#"{"n":1e400}"#, r#"{"n":-1e400}"#] {
+            let out = both(scalars(), payload);
+            assert!(out.slow.is_err(), "normal path accepted {payload}");
+            assert!(out.fast.is_err(), "fast path accepted {payload}");
+        }
+    }
+
+    /// A documented, deliberate difference. A number too large for f64 sitting in a field
+    /// the schema never mentions is copied through as bytes, because the fast path never
+    /// parses fields it has nothing to say about — where a whole-payload parse rejects the
+    /// message. Catching this would mean parsing every field and giving up the entire
+    /// point of the fast path. Asserted so it cannot change unnoticed.
+    #[test]
+    fn known_difference_unrepresentable_number_in_an_unmentioned_field() {
+        let out = both(scalars(), r#"{"unmentioned":1e400}"#);
+        assert!(out.slow.is_err(), "normal path used to reject this");
+        assert_eq!(out.fast, Ok(r#"{"unmentioned":1e400}"#.to_string()));
+    }
+
+    #[test]
+    fn byte_output_is_identical_for_ordinary_payloads() {
+        assert_byte_identical(scalars(), r#"{"s":"x","i":"42","n":"1.5","b":"true"}"#);
+        assert_byte_identical(scalars(), r#"{"z":1,"a":2,"m":{"nested":[1,2]},"s":7}"#);
+        assert_byte_identical(scalars(), r#"{"s":"quote \" and back \\ slash é"}"#);
+    }
+
+    #[test]
+    fn malformed_payloads_agree() {
+        assert_same(scalars(), r#"{"s":}"#);
+        assert_same(scalars(), r#"not json at all"#);
+        assert_same(scalars(), r#""#);
+    }
+
+    #[test]
+    fn a_root_schema_without_properties_is_still_consistent() {
+        assert_same(json!({"type":"object"}), r#"{"anything":[1,2]}"#);
+        assert_same(json!({}), r#"{"anything":[1,2]}"#);
     }
 }
