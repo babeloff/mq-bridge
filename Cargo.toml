@@ -201,6 +201,9 @@ portable = ["mongodb", "amqp", "nats", "mqtt", "http", "aws", "zeromq", "redis-s
 
 # Functionality features
 dedup = ["sled"]
+# gzip-compressed file endpoint (FileFormat::JsonlGzip). Reuses flate2, already
+# pulled in by the http/clickhouse features.
+compression = ["dep:flate2"]
 metrics = ["dep:metrics"]
 test-utils = ["dep:tracing-appender", "dep:tracing-subscriber", "dep:serde_yaml_ng"]
 # Opt-in produce/consume-only isolation benchmarks (throwaway diagnostics, off by default)

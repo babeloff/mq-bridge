@@ -182,6 +182,12 @@ pub struct FilePublisher {
 
 impl FilePublisher {
     pub async fn new(config: &FileConfig) -> anyhow::Result<Self> {
+        #[cfg(not(feature = "compression"))]
+        if matches!(config.format, FileFormat::JsonlGzip) {
+            return Err(anyhow::anyhow!(
+                "FileFormat::JsonlGzip requires the `compression` feature"
+            ));
+        }
         let path_str = &config.path;
         let path = Path::new(path_str);
         if let Some(parent) = path.parent() {
@@ -210,6 +216,85 @@ impl FilePublisher {
             csv_header: Arc::new(Mutex::new(None)),
         })
     }
+
+    /// Writes one batch as a single gzip member appended to the file. gzip
+    /// members concatenate, so the file stays a valid `.gz` stream that a whole
+    /// decompressor (or the matching consumer) reads back member by member.
+    #[cfg(feature = "compression")]
+    async fn send_batch_gzip(
+        &self,
+        messages: Vec<CanonicalMessage>,
+    ) -> Result<SentBatch, PublisherError> {
+        use std::io::Write as _;
+
+        let _file_guard = self.file_lock.lock().await;
+        let mut raw = Vec::new();
+        let mut failed_messages = Vec::new();
+        for mut msg in messages {
+            msg.strip_source_metadata();
+            match encode_record(&msg, &self.format) {
+                Ok(mut bytes) => {
+                    bytes.extend_from_slice(&self.delimiter);
+                    raw.extend_from_slice(&bytes);
+                }
+                Err(e) => {
+                    tracing::error!("Failed to serialize message for gzip file sink: {}", e);
+                    failed_messages.push((msg, PublisherError::NonRetryable(anyhow::anyhow!(e))));
+                }
+            }
+        }
+
+        if !raw.is_empty() {
+            let mut encoder =
+                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            encoder
+                .write_all(&raw)
+                .map_err(|e| PublisherError::NonRetryable(anyhow::anyhow!(e)))?;
+            let member = encoder
+                .finish()
+                .map_err(|e| PublisherError::NonRetryable(anyhow::anyhow!(e)))?;
+
+            let mut file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&self.path)
+                .await
+                .context("Failed to open file for writing gzip batch")?;
+            // Length before the append: a failed write_all can leave a partial gzip
+            // member behind, which would corrupt the concatenated stream and get
+            // compounded by the Retryable re-append. Truncate back to this
+            // known-good member boundary on failure so a retry appends cleanly.
+            let pre_len = file
+                .metadata()
+                .await
+                .context("Failed to stat gzip file before write")?
+                .len();
+            // Append the whole member in one write so a concurrent reader never
+            // observes a torn member (the consumer also guards against it).
+            if let Err(e) = file.write_all(&member).await {
+                if let Err(te) = file.set_len(pre_len).await {
+                    tracing::error!(
+                        "Failed to truncate gzip file back to {} after write error: {}",
+                        pre_len,
+                        te
+                    );
+                }
+                return Err(PublisherError::Retryable(
+                    anyhow::Error::new(e).context("Failed to write gzip member to file"),
+                ));
+            }
+            file.flush().await.context("Failed to flush gzip file")?;
+        }
+
+        if failed_messages.is_empty() {
+            Ok(SentBatch::Ack)
+        } else {
+            Ok(SentBatch::Partial {
+                responses: None,
+                failed: failed_messages,
+            })
+        }
+    }
 }
 
 #[async_trait]
@@ -221,6 +306,11 @@ impl MessagePublisher for FilePublisher {
     ) -> Result<SentBatch, PublisherError> {
         if messages.is_empty() {
             return Ok(SentBatch::Ack);
+        }
+
+        #[cfg(feature = "compression")]
+        if matches!(self.format, FileFormat::JsonlGzip) {
+            return self.send_batch_gzip(messages).await;
         }
 
         trace!(count = messages.len(), path = %self.path, message_ids = ?LazyMessageIds(&messages), "Writing batch to file");
@@ -877,6 +967,184 @@ fn run_file_queue_task(
     }
 }
 
+/// Reader for `FileFormat::JsonlGzip`. A gzip stream can't be seeked to a line
+/// boundary, so on each growth of the file it re-decompresses from the start and
+/// skips the records already emitted. For the common write-once-then-read ETL
+/// case the file is decompressed exactly once; live-tailing a growing file costs
+/// a re-scan per growth (acceptable for v1).
+#[cfg(feature = "compression")]
+fn run_file_gzip_consume_task_sync(
+    path: String,
+    msg_tx: async_channel::Sender<Vec<CanonicalMessage>>,
+    delimiter: Vec<u8>,
+    format: FileFormat,
+    ready: Arc<AtomicBool>,
+) {
+    const BATCH_SIZE: usize = 1024;
+    const MAX_SLEEP: std::time::Duration = std::time::Duration::from_millis(100);
+    // Consecutive decode failures at an unchanged file length before we give up and
+    // close the stream (surfacing EndOfStream) rather than retrying forever or
+    // silently emitting drain markers for records we can no longer reach.
+    const MAX_DECODE_FAILURES: u32 = 5;
+    let mut records_emitted: usize = 0;
+    let mut last_len: u64 = u64::MAX; // force the first read
+    let mut initialized = false;
+    let mut signaled_eof = false;
+    let mut current_sleep = std::time::Duration::from_millis(1);
+    let mut buf = Vec::new();
+    let mut decode_failures: u32 = 0;
+    let mut failure_len: u64 = u64::MAX;
+
+    loop {
+        let cur_len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+
+        // No growth since the last full pass: emit the drain marker once, then poll.
+        if initialized && cur_len == last_len {
+            if !signaled_eof {
+                if msg_tx.send_blocking(Vec::new()).is_err() {
+                    break;
+                }
+                signaled_eof = true;
+            }
+            std::thread::sleep(current_sleep);
+            current_sleep = std::cmp::min(current_sleep * 2, MAX_SLEEP);
+            continue;
+        }
+
+        let file = match std::fs::File::open(&path) {
+            Ok(f) => f,
+            Err(e) => {
+                tracing::error!("Failed to open {}: {}", path, e);
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                continue;
+            }
+        };
+        let mut reader = std::io::BufReader::new(flate2::read::MultiGzDecoder::new(
+            std::io::BufReader::new(file),
+        ));
+
+        // Skip records emitted on a previous pass (file re-read from the start).
+        let mut csv_header: Option<Vec<String>> = None;
+        let mut skipped = 0;
+        let mut decode_error = false;
+        while skipped < records_emitted {
+            buf.clear();
+            match read_until_bytes_sync(&mut reader, &delimiter, &mut buf) {
+                Ok(0) => break,
+                Ok(_) => skipped += 1,
+                Err(e) => {
+                    tracing::error!("Error decoding {}: {}", path, e);
+                    decode_error = true;
+                    break;
+                }
+            }
+        }
+        if decode_error {
+            // Skip failed: do NOT advance records_emitted/last_len. Bound the retries
+            // so permanent corruption surfaces instead of spinning forever.
+            if cur_len == failure_len {
+                decode_failures += 1;
+            } else {
+                failure_len = cur_len;
+                decode_failures = 1;
+            }
+            if decode_failures >= MAX_DECODE_FAILURES {
+                tracing::error!(
+                    "Giving up decoding {} after {} failed attempts at {} bytes; closing stream",
+                    path,
+                    decode_failures,
+                    cur_len
+                );
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            continue;
+        }
+
+        let mut new_count = 0;
+        let mut read_error = false;
+        let mut batch = Vec::with_capacity(256);
+        loop {
+            buf.clear();
+            match read_until_bytes_sync(&mut reader, &delimiter, &mut buf) {
+                Ok(0) => break,
+                Ok(_) => {
+                    if !buf.ends_with(&delimiter) {
+                        // Torn final member (writer mid-append): don't emit or count
+                        // it; it completes and grows the file on a later poll.
+                        break;
+                    }
+                    buf.truncate(buf.len() - delimiter.len());
+                    if delimiter.len() == 1 && delimiter[0] == b'\n' && buf.ends_with(b"\r") {
+                        buf.pop();
+                    }
+                    if let Some(msg) = parse_message(&buf, &format, &mut csv_header) {
+                        batch.push(msg);
+                    }
+                    new_count += 1;
+                    if batch.len() >= BATCH_SIZE {
+                        if msg_tx.send_blocking(std::mem::take(&mut batch)).is_err() {
+                            return;
+                        }
+                        batch = Vec::with_capacity(256);
+                    }
+                }
+                Err(e) => {
+                    // Truncated/torn member: stop; retry once the writer finishes it.
+                    tracing::debug!("Partial gzip decode of {}: {}", path, e);
+                    read_error = true;
+                    break;
+                }
+            }
+        }
+        if !batch.is_empty() && msg_tx.send_blocking(batch).is_err() {
+            return;
+        }
+
+        // Records actually emitted this pass must be skipped next time, even if the
+        // pass then hit a decode error on the tail.
+        records_emitted += new_count;
+        if !initialized {
+            ready.store(true, Ordering::SeqCst);
+            initialized = true;
+        }
+
+        if read_error {
+            // The pass ended on a decode error, not a clean EOF. Do NOT advance
+            // last_len: a torn member the writer is still completing is retried on the
+            // next pass (once the file grows), while permanent corruption at a fixed
+            // length is bounded here so it surfaces as EndOfStream instead of silently
+            // emitting drain markers for records we can no longer reach.
+            if cur_len == failure_len {
+                decode_failures += 1;
+            } else {
+                failure_len = cur_len;
+                decode_failures = 1;
+            }
+            if decode_failures >= MAX_DECODE_FAILURES {
+                tracing::error!(
+                    "Giving up decoding {} after {} failed attempts at {} bytes; closing stream",
+                    path,
+                    decode_failures,
+                    cur_len
+                );
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            continue;
+        }
+
+        // Clean pass: the tail decoded to EOF, so reset the failure tracker and advance.
+        decode_failures = 0;
+        failure_len = u64::MAX;
+        last_len = cur_len;
+        if new_count > 0 {
+            signaled_eof = false;
+            current_sleep = std::time::Duration::from_millis(1);
+        }
+    }
+}
+
 enum ConsumerBackend {
     EventStore(EventStoreConsumer),
     Tail(FileTailConsumer),
@@ -901,6 +1169,21 @@ impl FileConsumer {
             return Err(anyhow::anyhow!(
                 "FileFormat::Csv is not supported with Subscribe {{ delete: true }} mode"
             ));
+        }
+        if matches!(format, FileFormat::JsonlGzip) {
+            #[cfg(not(feature = "compression"))]
+            return Err(anyhow::anyhow!(
+                "FileFormat::JsonlGzip requires the `compression` feature"
+            ));
+            #[cfg(feature = "compression")]
+            if !matches!(
+                &config.mode,
+                None | Some(FileConsumerMode::Consume { delete: false })
+            ) {
+                return Err(anyhow::anyhow!(
+                    "FileFormat::JsonlGzip is only supported with the default `consume` mode (no delete, no group_id)"
+                ));
+            }
         }
         match &config.mode {
             None | Some(FileConsumerMode::Consume { delete: false }) => {
@@ -1011,6 +1294,34 @@ impl FileConsumer {
         let ready = Arc::new(AtomicBool::new(false));
         let ready_clone = ready.clone();
         let mut offset_file = None;
+
+        // Compressed files have no seekable line offsets, so they use a dedicated
+        // reader that decompresses from the start. Restricted to plain consume mode
+        // (no group_id / start_at_end) by the validation in `new`.
+        #[cfg(feature = "compression")]
+        if matches!(format, FileFormat::JsonlGzip) {
+            let path_clone = path.to_string();
+            let format_clone = format.clone();
+            std::thread::spawn(move || {
+                run_file_gzip_consume_task_sync(
+                    path_clone,
+                    msg_tx,
+                    delimiter,
+                    format_clone,
+                    ready_clone,
+                );
+            });
+            info!(path = %path, mode = "gzip consume", "File consumer connected");
+            return Ok(Self {
+                backend: ConsumerBackend::Tail(FileTailConsumer {
+                    msg_rx,
+                    buffer: Vec::new(),
+                    offset_file: None,
+                    ready,
+                    pending_eof: false,
+                }),
+            });
+        }
 
         if let Some(gid) = &group_id {
             let offset_path = format!("{}.{}.offset", path, gid);
@@ -1303,7 +1614,9 @@ pub(crate) fn encode_record(
     format: &FileFormat,
 ) -> Result<Vec<u8>, serde_json::Error> {
     match format {
-        FileFormat::Raw => Ok(msg.payload.to_vec()),
+        // JsonlGzip writes the payload verbatim (DB rows are already JSON objects),
+        // so the decompressed file is clean JSON Lines — fastest and least verbose.
+        FileFormat::Raw | FileFormat::JsonlGzip => Ok(msg.payload.to_vec()),
         FileFormat::Normal => {
             if msg
                 .metadata
@@ -1381,7 +1694,7 @@ pub(crate) fn parse_message(
                 }
             }
         }
-        FileFormat::Raw => {
+        FileFormat::Raw | FileFormat::JsonlGzip => {
             let mut msg = CanonicalMessage::new(buffer.to_vec(), None);
             msg.metadata
                 .insert("mq_bridge.original_format".to_string(), "raw".to_string());
@@ -1447,6 +1760,141 @@ mod tests {
     use tempfile::tempdir;
     use tokio::fs::OpenOptions;
     use tokio::io::AsyncWriteExt;
+
+    #[cfg(feature = "compression")]
+    #[tokio::test]
+    async fn test_file_jsonl_gzip_roundtrip() {
+        use std::io::Read as _;
+
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("data.jsonl.gz");
+        let path = file_path.to_str().unwrap().to_string();
+
+        let config = FileConfig {
+            path: path.clone(),
+            format: FileFormat::JsonlGzip,
+            ..Default::default()
+        };
+
+        // Write two batches -> two gzip members appended to the same file.
+        let sink = FilePublisher::new(&config).await.unwrap();
+        let m1 = msg!(json!({"id": 1, "name": "alice"}));
+        let m2 = msg!(json!({"id": 2, "name": "bob"}));
+        let m3 = msg!(json!({"id": 3, "name": "carol"}));
+        sink.send_batch(vec![m1.clone(), m2.clone()]).await.unwrap();
+        sink.send_batch(vec![m3.clone()]).await.unwrap();
+        drop(sink);
+
+        // The file is a valid standard gzip stream (concatenated members),
+        // decodable by any gzip tool.
+        let mut raw = std::fs::File::open(&file_path).unwrap();
+        let mut compressed = Vec::new();
+        std::io::Read::read_to_end(&mut raw, &mut compressed).unwrap();
+        let mut decoded = String::new();
+        flate2::read::MultiGzDecoder::new(&compressed[..])
+            .read_to_string(&mut decoded)
+            .unwrap();
+        assert_eq!(decoded.lines().count(), 3);
+
+        // Read the records back through the consumer.
+        let mut source = FileConsumer::new(&config).await.unwrap();
+        let mut got = Vec::new();
+        while got.len() < 3 {
+            let batch = source.receive_batch(10).await.unwrap();
+            if batch.messages.is_empty() {
+                continue;
+            }
+            let len = batch.messages.len();
+            for m in &batch.messages {
+                got.push(m.payload.clone());
+            }
+            let _ = (batch.commit)(vec![crate::traits::MessageDisposition::Ack; len]).await;
+        }
+        assert_eq!(got, vec![m1.payload, m2.payload, m3.payload]);
+    }
+
+    #[cfg(feature = "compression")]
+    async fn collect_gzip(source: &mut FileConsumer, n: usize) -> Vec<bytes::Bytes> {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let mut got = Vec::new();
+            while got.len() < n {
+                let batch = source.receive_batch(10).await.unwrap();
+                if batch.messages.is_empty() {
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                    continue;
+                }
+                for m in &batch.messages {
+                    got.push(m.payload.clone());
+                }
+            }
+            got
+        })
+        .await
+        .expect("timed out collecting gzip messages")
+    }
+
+    #[cfg(feature = "compression")]
+    #[tokio::test]
+    async fn test_file_jsonl_gzip_incremental_growth() {
+        // A second batch appended as a new gzip member to the same file must be
+        // picked up by an already-running consumer via the growth re-scan (which
+        // re-decompresses from the start and skips already-emitted records).
+        let dir = tempdir().unwrap();
+        let path = dir
+            .path()
+            .join("grow.jsonl.gz")
+            .to_str()
+            .unwrap()
+            .to_string();
+        let config = FileConfig {
+            path,
+            format: FileFormat::JsonlGzip,
+            ..Default::default()
+        };
+
+        let sink = FilePublisher::new(&config).await.unwrap();
+        let mut source = FileConsumer::new(&config).await.unwrap();
+
+        let a = msg!(json!({"seq": 1}));
+        sink.send_batch(vec![a.clone()]).await.unwrap();
+        assert_eq!(collect_gzip(&mut source, 1).await, vec![a.payload]);
+
+        // Append a second member after the consumer already drained the first.
+        let b = msg!(json!({"seq": 2}));
+        let c = msg!(json!({"seq": 3}));
+        sink.send_batch(vec![b.clone(), c.clone()]).await.unwrap();
+        assert_eq!(
+            collect_gzip(&mut source, 2).await,
+            vec![b.payload, c.payload]
+        );
+    }
+
+    #[cfg(feature = "compression")]
+    #[tokio::test]
+    async fn test_file_jsonl_gzip_rejects_unsupported_modes() {
+        let dir = tempdir().unwrap();
+        for mode in [
+            FileConsumerMode::Consume { delete: true },
+            FileConsumerMode::Subscribe { delete: false },
+            FileConsumerMode::Subscribe { delete: true },
+            FileConsumerMode::GroupSubscribe {
+                group_id: "g".to_string(),
+                read_from_tail: false,
+            },
+        ] {
+            let path = dir.path().join("m.gz").to_str().unwrap().to_string();
+            let config = FileConfig {
+                path,
+                format: FileFormat::JsonlGzip,
+                mode: Some(mode.clone()),
+                ..Default::default()
+            };
+            assert!(
+                FileConsumer::new(&config).await.is_err(),
+                "expected rejection for mode {mode:?}"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn test_file_sink_and_source_integration() {

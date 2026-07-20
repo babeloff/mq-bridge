@@ -78,6 +78,7 @@ fn extension_for(format: &FileFormat) -> &'static str {
         FileFormat::Normal | FileFormat::Json | FileFormat::Text => "jsonl",
         FileFormat::Csv => "csv",
         FileFormat::Raw => "bin",
+        FileFormat::JsonlGzip => "jsonl.gz",
     }
 }
 
@@ -131,6 +132,43 @@ fn empty_batch() -> ReceivedBatch {
     }
 }
 
+/// Whole-object gzip for `FileFormat::JsonlGzip`. Each object is written once and
+/// read whole, so (unlike the file endpoint) a single gzip member per object is
+/// enough — no append/concatenation.
+#[cfg(feature = "compression")]
+fn gzip_object(data: &[u8]) -> std::io::Result<Vec<u8>> {
+    use std::io::Write as _;
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(data)?;
+    encoder.finish()
+}
+
+#[cfg(feature = "compression")]
+fn gunzip_object(data: &[u8], max_bytes: Option<u64>) -> std::io::Result<Vec<u8>> {
+    use std::io::Read as _;
+    let mut out = Vec::new();
+    let mut decoder = flate2::read::MultiGzDecoder::new(data);
+    match max_bytes {
+        // Read one byte past the limit; a decompressed payload longer than that is
+        // rejected rather than allocated whole (guards against a gzip bomb).
+        Some(limit) => {
+            decoder
+                .take(limit.saturating_add(1))
+                .read_to_end(&mut out)?;
+            if out.len() as u64 > limit {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("decompressed object exceeds max_object_bytes ({limit})"),
+                ));
+            }
+        }
+        None => {
+            decoder.read_to_end(&mut out)?;
+        }
+    }
+    Ok(out)
+}
+
 // --- Publisher (sink) ---
 
 /// Writes each batch as one immutable object under the configured prefix.
@@ -151,6 +189,12 @@ impl ObjectStorePublisher {
             // Not implemented for the sink; sources can still read CSV objects.
             return Err(anyhow!(
                 "object_store sink does not support the 'csv' format (per-object CSV headers are unimplemented); use jsonl/json/text/raw"
+            ));
+        }
+        #[cfg(not(feature = "compression"))]
+        if matches!(config.format, FileFormat::JsonlGzip) {
+            return Err(anyhow!(
+                "object_store 'jsonl_gzip' format requires the `compression` feature"
             ));
         }
         let (store, base) = build_store(&config.url)?;
@@ -239,6 +283,13 @@ impl MessagePublisher for ObjectStorePublisher {
                 failed,
             });
         }
+        // Compress the whole object for JsonlGzip so it lands as a standard `.gz`.
+        #[cfg(feature = "compression")]
+        let body = if matches!(self.format, FileFormat::JsonlGzip) {
+            gzip_object(&body).map_err(|e| PublisherError::NonRetryable(anyhow!(e)))?
+        } else {
+            body
+        };
         let key = self.next_key();
         self.store
             .put(&key, PutPayload::from(body))
@@ -295,6 +346,12 @@ pub struct ObjectStoreConsumer {
 
 impl ObjectStoreConsumer {
     pub async fn new(config: &ObjectStoreConfig) -> anyhow::Result<Self> {
+        #[cfg(not(feature = "compression"))]
+        if matches!(config.format, FileFormat::JsonlGzip) {
+            return Err(anyhow!(
+                "object_store 'jsonl_gzip' format requires the `compression` feature"
+            ));
+        }
         let (store, base) = build_store(&config.url)?;
         let delimiter = parse_delimiter(config.delimiter.as_deref())?;
 
@@ -420,6 +477,14 @@ impl ObjectStoreConsumer {
                 .bytes()
                 .await?
                 .to_vec();
+            // Decompress whole for JsonlGzip before splitting into records.
+            #[cfg(feature = "compression")]
+            let data = if matches!(self.format, FileFormat::JsonlGzip) {
+                gunzip_object(&data, self.max_object_bytes)
+                    .with_context(|| format!("gunzip object '{key}'"))?
+            } else {
+                data
+            };
             return Ok(Some((key, data)));
         }
         Ok(None)
@@ -627,6 +692,97 @@ mod tests {
             date_partition: false,
             extension: "jsonl".to_string(),
         }
+    }
+
+    #[cfg(feature = "compression")]
+    #[tokio::test]
+    async fn gzip_object_round_trips() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+
+        let mut publisher = test_publisher(store.clone());
+        publisher.format = FileFormat::JsonlGzip;
+        publisher.extension = "jsonl.gz".to_string();
+        publisher
+            .send_batch(vec![
+                json_msg(serde_json::json!({"n": 1})),
+                json_msg(serde_json::json!({"n": 2})),
+            ])
+            .await
+            .unwrap();
+
+        // The stored object is real gzip: it decodes to the two JSONL rows.
+        let listed = store
+            .list(Some(&ObjPath::from("data")))
+            .next()
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(listed.location.to_string().ends_with(".jsonl.gz"));
+        let bytes = store
+            .get(&listed.location)
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        let decoded = gunzip_object(&bytes, None).unwrap();
+        assert_eq!(String::from_utf8(decoded).unwrap().lines().count(), 2);
+
+        let mut consumer = ObjectStoreConsumer::from_store(
+            store,
+            ObjPath::from("data"),
+            FileFormat::JsonlGzip,
+            None,
+            None,
+        );
+        let batch = consumer.receive_batch(10).await.unwrap();
+        assert_eq!(batch.messages.len(), 2);
+        assert_eq!(batch.messages[0].payload.as_ref(), br#"{"n":1}"#);
+        assert_eq!(batch.messages[1].payload.as_ref(), br#"{"n":2}"#);
+        (batch.commit)(vec![MessageDisposition::Ack; 2])
+            .await
+            .unwrap();
+    }
+
+    #[cfg(feature = "compression")]
+    #[test]
+    fn gunzip_object_rejects_over_limit() {
+        // Compresses to far less than its decompressed size; the limit is enforced on
+        // the decompressed output, so an over-limit payload must be rejected rather
+        // than allocated whole.
+        let big = vec![b'a'; 10 * 1024];
+        let gz = gzip_object(&big).unwrap();
+        assert!(gz.len() < big.len());
+        assert!(gunzip_object(&gz, Some(1024)).is_err());
+        // A generous limit still round-trips the full payload.
+        assert_eq!(gunzip_object(&gz, Some(64 * 1024)).unwrap(), big);
+    }
+
+    #[cfg(feature = "compression")]
+    #[tokio::test]
+    async fn gzip_source_errors_on_non_gzip_object() {
+        // A jsonl_gzip source must fail cleanly (not panic) if an object under the
+        // prefix is not valid gzip.
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        store
+            .put(
+                &ObjPath::from("data/not-gzip.jsonl.gz"),
+                PutPayload::from(br#"{"n":1}"#.to_vec()),
+            )
+            .await
+            .unwrap();
+
+        let mut consumer = ObjectStoreConsumer::from_store(
+            store,
+            ObjPath::from("data"),
+            FileFormat::JsonlGzip,
+            None,
+            None,
+        );
+        assert!(
+            consumer.receive_batch(10).await.is_err(),
+            "expected a decode error for a non-gzip object"
+        );
     }
 
     #[tokio::test]

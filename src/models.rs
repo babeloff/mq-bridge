@@ -1415,6 +1415,13 @@ pub enum FileFormat {
     Raw,
     /// CSV rows mapped to/from JSON objects (string values only). The first row is the header/schema.
     Csv,
+    /// gzip-compressed JSON Lines. The payload is written verbatim like `raw`
+    /// (database rows are already JSON objects, so the decompressed file is clean
+    /// JSONL — one object per line), and each written batch is a self-contained
+    /// gzip member appended to the file, so the result is a standard `.gz` stream
+    /// readable with `zcat`/`gzip -dc`. Requires the `compression` feature and only
+    /// the default `consume` mode (no delete, no group).
+    JsonlGzip,
 }
 
 // --- File Specific Configuration ---
