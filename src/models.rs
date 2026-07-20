@@ -547,6 +547,13 @@ fn deserialize_middlewares_from_value(value: serde_json::Value) -> anyhow::Resul
 /// a string. Every entry in `metadata` is attached to the produced message; when
 /// this endpoint feeds an HTTP response, those entries become response headers
 /// (e.g. `content-type`), otherwise they are ordinary message metadata.
+///
+/// The `body` supports `${…}` placeholders (compiled once at startup): request
+/// fields `${payload:a.b}` / `${metadata:key}` / `${message:id}`, generators
+/// `${gen:uuid|now|timestamp|counter|random(1,100)}`, and `${env:VAR}`. When the
+/// `content-type` metadata is a JSON type, interpolated request values are
+/// JSON-escaped by default; append `| raw` to splice verbatim, and write `$${…}`
+/// to emit a literal `${…}`. See [`crate::interpolation`] for the full reference.
 #[derive(Debug, Clone, Default)]
 pub struct StaticConfig {
     /// The static response body.

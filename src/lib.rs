@@ -17,6 +17,7 @@ pub mod errors;
 pub mod event_handler;
 pub mod event_store;
 pub mod extensions;
+pub mod interpolation;
 pub mod middleware;
 pub mod models;
 pub mod outcomes;

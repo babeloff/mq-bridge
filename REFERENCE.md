@@ -536,6 +536,38 @@ output:
 `raw: true` sends `body` byte-for-byte; the default JSON-encodes it as a string. Like
 `response`, a `static` output enables the HTTP inline fast path.
 
+#### Placeholders
+
+`body` is a template compiled **once at startup**; rendering a message never re-parses it.
+Tokens use the `${namespace:selector}` form:
+
+| Token | Resolves to |
+|---|---|
+| `${payload:a.b.c}` | a field of the incoming JSON payload (dotted path; array indices allowed) |
+| `${metadata:key}` | a metadata value |
+| `${message:id}` | the message id (UUID string) |
+| `${gen:uuid}` | a fresh UUID v7 |
+| `${gen:now}` / `${gen:timestamp}` | current time (RFC3339 UTC / Unix epoch ms) |
+| `${gen:counter}` | a per-endpoint counter, starting at 0 |
+| `${gen:random(1,100)}` | a random integer in `[min, max]` |
+| `${env:VAR}` | an environment variable, resolved once at startup |
+
+`payload`/`metadata`/`message` read the request, so they are the useful ones on an **output**
+(e.g. an error reply that echoes the request); on an **input** (load-test source) only
+`gen`/`env` produce values. When the body's `content-type` metadata is a JSON type,
+interpolated request values are **JSON-escaped by default** so external data cannot break the
+structure — append `| raw` to a token to splice it verbatim. To emit a literal, un-interpolated
+`${…}`, write `$${…}` (a bare `$$` is left as-is); any `${…}` with an unknown namespace is also
+left untouched.
+
+```yaml
+output:
+  static:
+    body: '{"error":"not found","id":"${message:id}","at":"${gen:now}"}'
+    raw: true
+    metadata: { content-type: "application/json" }
+```
+
 ### `stream_buffer`
 
 An in-memory stream partitioned by correlation ID, used to carry streaming request/response

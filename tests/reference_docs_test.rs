@@ -138,6 +138,12 @@ static:
   raw: true
   metadata: { content-type: "application/json" }
 "#,
+        r#"
+static:
+  body: '{"error":"not found","id":"${message:id}","at":"${gen:now}"}'
+  raw: true
+  metadata: { content-type: "application/json" }
+"#,
         r#"stream_buffer: { topic: "responses" }"#,
         r#"stream_buffer: { topic: "responses", correlation_id: "req-123" }"#,
         r#"
