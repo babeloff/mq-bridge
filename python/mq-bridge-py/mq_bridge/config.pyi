@@ -88,6 +88,14 @@ class DelayMiddleware(TypedDict, total=False):
     delay_ms: Required[int]
 
 
+class EncryptionConfig(TypedDict, total=False):
+    """AEAD encryption settings, shared by the `encryption` middleware (per-message"""
+    cipher: CipherKind
+    decrypt_keys: Dict[str, str]
+    key: Required[str]
+    key_id: str
+
+
 class Endpoint(TypedDict, total=False):
     """Represents a connection point for messages, which can be a source (input) or a sink (output)."""
     amqp: AmqpConfig
@@ -123,7 +131,9 @@ class Endpoint(TypedDict, total=False):
 
 
 class FileConfig(TypedDict, total=False):
+    compression: Compression
     delimiter: Optional[str]
+    encryption: Optional[EncryptionConfig]
     format: FileFormat
     path: Required[str]
 
@@ -240,6 +250,7 @@ class Middleware(TypedDict, total=False):
     deduplication: DeduplicationMiddleware
     delay: DelayMiddleware
     dlq: DeadLetterQueueMiddleware
+    encryption: EncryptionConfig
     limiter: LimiterMiddleware
     metrics: MetricsMiddleware
     random_panic: RandomPanicMiddleware
@@ -315,9 +326,11 @@ class NatsConfig(TypedDict, total=False):
 class ObjectStoreConfig(TypedDict, total=False):
     """Configuration for a cloud object-store endpoint (S3, GCS, Azure Blob, R2, ...)."""
     checkpoint_store: Optional[str]
+    compression: Compression
     cursor_id: Optional[str]
     date_partition: bool
     delimiter: Optional[str]
+    encryption: Optional[EncryptionConfig]
     extension: Optional[str]
     format: FileFormat
     max_object_bytes: Optional[int]
@@ -496,8 +509,10 @@ class ZeroMqConfig(TypedDict, total=False):
     url: Required[str]
 
 
+CipherKind = Literal["xchacha20poly1305", "aes256gcm"]
+Compression = Literal["none", "gzip", "lz4"]
 FaultMode = Literal["panic", "disconnect", "timeout", "json_format_error", "nack"]
-FileFormat = Literal["normal", "json", "text", "raw", "csv", "jsonl_gzip"]
+FileFormat = Literal["normal", "json", "text", "raw", "csv"]
 HttpServerProtocol = Literal["auto", "http1_only", "http2_only"]
 MappingRule = Union[str, Dict[str, Any]]
 MongoConsume = Literal["consumer", "subscriber", "capture_new", "capture_all"]

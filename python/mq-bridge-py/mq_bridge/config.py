@@ -11,6 +11,7 @@ CookieJarMiddleware = dict
 DeadLetterQueueMiddleware = dict
 DeduplicationMiddleware = dict
 DelayMiddleware = dict
+EncryptionConfig = dict
 Endpoint = dict
 FileConfig = dict
 GrpcConfig = dict
@@ -42,6 +43,8 @@ TransformMiddleware = dict
 WeakJoinMiddleware = dict
 WebSocketConfig = dict
 ZeroMqConfig = dict
+CipherKind = str
+Compression = str
 FaultMode = str
 FileFormat = str
 HttpServerProtocol = str
@@ -65,12 +68,15 @@ __all__ = [
     "AmqpConfig",
     "AwsConfig",
     "BufferMiddleware",
+    "CipherKind",
     "ClickHouseConfig",
+    "Compression",
     "ConfigDocument",
     "CookieJarMiddleware",
     "DeadLetterQueueMiddleware",
     "DeduplicationMiddleware",
     "DelayMiddleware",
+    "EncryptionConfig",
     "Endpoint",
     "EndpointConfig",
     "FaultMode",

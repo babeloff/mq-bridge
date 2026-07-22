@@ -15,6 +15,8 @@ mod cookie_jar;
 mod deduplication;
 mod delay;
 mod dlq;
+#[cfg(feature = "encryption")]
+mod encryption;
 mod limiter;
 #[cfg(feature = "metrics")]
 mod metrics;
@@ -29,6 +31,8 @@ use cookie_jar::{CookieJarConsumer, CookieJarPublisher};
 use deduplication::DeduplicationConsumer;
 use delay::{DelayConsumer, DelayPublisher};
 use dlq::DlqPublisher;
+#[cfg(feature = "encryption")]
+use encryption::{EncryptionConsumer, EncryptionPublisher};
 use limiter::{LimiterConsumer, LimiterPublisher};
 #[cfg(feature = "metrics")]
 use metrics::{MetricsConsumer, MetricsPublisher};
@@ -71,6 +75,8 @@ pub async fn apply_middlewares_to_consumer(
             Middleware::Buffer(cfg) => Box::new(BufferConsumer::new(consumer, cfg)?),
             Middleware::CookieJar(cfg) => Box::new(CookieJarConsumer::new(consumer, cfg)),
             Middleware::Transform(cfg) => Box::new(TransformConsumer::new(consumer, cfg)?),
+            #[cfg(feature = "encryption")]
+            Middleware::Encryption(cfg) => Box::new(EncryptionConsumer::new(consumer, cfg)?),
             Middleware::Custom { name, config } => {
                 let factory = get_middleware_factory(name).ok_or_else(|| {
                     anyhow::anyhow!("Custom middleware factory '{}' not found", name)
@@ -132,6 +138,8 @@ pub async fn apply_middlewares_to_publisher(
             Middleware::Buffer(cfg) => Box::new(BufferPublisher::new(publisher, cfg)?),
             Middleware::CookieJar(cfg) => Box::new(CookieJarPublisher::new(publisher, cfg)),
             Middleware::Transform(cfg) => Box::new(TransformPublisher::new(publisher, cfg)?),
+            #[cfg(feature = "encryption")]
+            Middleware::Encryption(cfg) => Box::new(EncryptionPublisher::new(publisher, cfg)?),
             Middleware::Custom { name, config } => {
                 let factory = get_middleware_factory(name).ok_or_else(|| {
                     anyhow::anyhow!("Custom middleware factory '{}' not found", name)

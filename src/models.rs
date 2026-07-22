@@ -798,6 +798,54 @@ impl EndpointType {
     }
 }
 
+/// AEAD cipher selection for [`EncryptionConfig`].
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum CipherKind {
+    /// XChaCha20-Poly1305 (default): 192-bit random nonce, safe at high message rates.
+    #[default]
+    Xchacha20poly1305,
+    /// AES-256-GCM: 96-bit random nonce; prefer the default for very high volumes.
+    Aes256gcm,
+}
+
+/// AEAD encryption settings, shared by the `encryption` middleware (per-message
+/// payload encryption) and the at-rest `encryption` field of the file and
+/// object_store endpoints. Requires the `encryption` feature.
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct EncryptionConfig {
+    /// AEAD cipher. Defaults to `xchacha20poly1305`.
+    #[serde(default)]
+    pub cipher: CipherKind,
+    /// Key identifier written into each envelope; selects the key when decrypting. Defaults to `default`.
+    #[serde(default = "default_encryption_key_id")]
+    pub key_id: String,
+    /// Base64-encoded 32-byte key. Supports `${env:VAR}` to read it from the environment.
+    #[cfg_attr(feature = "schema", schemars(extend("format"="password")))]
+    pub key: String,
+    /// Extra `key_id -> base64 key` entries accepted when decrypting (key rotation).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub decrypt_keys: HashMap<String, String>,
+}
+
+fn default_encryption_key_id() -> String {
+    "default".to_string()
+}
+
+impl Default for EncryptionConfig {
+    fn default() -> Self {
+        Self {
+            cipher: CipherKind::default(),
+            key_id: default_encryption_key_id(),
+            key: String::new(),
+            decrypt_keys: HashMap::new(),
+        }
+    }
+}
+
 /// An enumeration of all supported middleware types.
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
@@ -814,6 +862,7 @@ pub enum Middleware {
     Buffer(BufferMiddleware),
     CookieJar(CookieJarMiddleware),
     Transform(TransformMiddleware),
+    Encryption(EncryptionConfig),
     Custom {
         name: String,
         config: serde_json::Value,
@@ -1415,13 +1464,20 @@ pub enum FileFormat {
     Raw,
     /// CSV rows mapped to/from JSON objects (string values only). The first row is the header/schema.
     Csv,
-    /// gzip-compressed JSON Lines. The payload is written verbatim like `raw`
-    /// (database rows are already JSON objects, so the decompressed file is clean
-    /// JSONL — one object per line), and each written batch is a self-contained
-    /// gzip member appended to the file, so the result is a standard `.gz` stream
-    /// readable with `zcat`/`gzip -dc`. Requires the `compression` feature and only
-    /// the default `consume` mode (no delete, no group).
-    JsonlGzip,
+}
+
+/// Batch compression for the file and object_store endpoints. Orthogonal to `format`.
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum Compression {
+    /// No compression (default).
+    #[default]
+    None,
+    /// gzip; each batch is a self-contained member, so files stay readable with `zcat`.
+    Gzip,
+    /// lz4 frame format; each batch is a self-contained frame (`lz4 -d` compatible).
+    Lz4,
 }
 
 // --- File Specific Configuration ---
@@ -1442,6 +1498,12 @@ pub struct FileConfig {
     /// The format for writing messages to the file (Publisher) or interpreting them (Consumer). Defaults to `normal`.
     #[serde(default)]
     pub format: FileFormat,
+    /// Per-batch compression (`none`, `gzip`, `lz4`). Requires the `compression` feature; consume mode only.
+    #[serde(default)]
+    pub compression: Compression,
+    /// At-rest AEAD encryption applied after compression. Requires the `encryption` feature; consume mode only.
+    #[serde(default)]
+    pub encryption: Option<EncryptionConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1494,6 +1556,8 @@ impl FileConfig {
             mode: Some(FileConsumerMode::default()),
             delimiter: None,
             format: FileFormat::default(),
+            compression: Compression::default(),
+            encryption: None,
         }
     }
 
@@ -1550,8 +1614,16 @@ pub struct ObjectStoreConfig {
     #[serde(default = "default_true")]
     pub date_partition: bool,
     /// (Sink only) Extension for written objects, without the dot. Defaults to a value derived
-    /// from `format` (`jsonl`, `json`, `txt`, or `bin`).
+    /// from `format`, `compression` and `encryption` (e.g. `jsonl`, `csv`, `bin`, `jsonl.gz`,
+    /// `jsonl.lz4`, `jsonl.gz.enc`); encrypted objects get a trailing `.enc` since they are
+    /// ciphertext, not a directly decompressable `.gz`.
     pub extension: Option<String>,
+    /// Whole-object compression (`none`, `gzip`, `lz4`). Requires the `compression` feature.
+    #[serde(default)]
+    pub compression: Compression,
+    /// At-rest AEAD encryption applied after compression. Requires the `encryption` feature.
+    #[serde(default)]
+    pub encryption: Option<EncryptionConfig>,
 }
 
 impl Default for ObjectStoreConfig {
@@ -1566,6 +1638,8 @@ impl Default for ObjectStoreConfig {
             max_object_bytes: None,
             date_partition: true,
             extension: None,
+            compression: Compression::default(),
+            encryption: None,
         }
     }
 }
@@ -3793,6 +3867,7 @@ kafka_to_nats:
                 Middleware::Buffer(_) => {}
                 Middleware::CookieJar(_) => {}
                 Middleware::Transform(_) => {}
+                Middleware::Encryption(_) => {}
             }
         }
 

@@ -200,6 +200,21 @@
         "max_delay_ms"
       ]
     },
+    "CipherKind": {
+      "description": "AEAD cipher selection for [`EncryptionConfig`].",
+      "oneOf": [
+        {
+          "description": "XChaCha20-Poly1305 (default): 192-bit random nonce, safe at high message rates.",
+          "type": "string",
+          "const": "xchacha20poly1305"
+        },
+        {
+          "description": "AES-256-GCM: 96-bit random nonce; prefer the default for very high volumes.",
+          "type": "string",
+          "const": "aes256gcm"
+        }
+      ]
+    },
     "ClickHouseConfig": {
       "description": "ClickHouse endpoint configuration (talks the ClickHouse HTTP interface).\n\nAs a **publisher** it batch-inserts messages using `FORMAT JSONEachRow` — by default the whole\nmessage payload (which must be a JSON object) becomes one row; set `columns` to build each row\nfrom explicit `${payload:<field>}` / `${metadata:<key>}` tokens instead. As a **consumer** it\nreads an existing table **non-destructively** by paging over a monotonic `cursor_column`\n(ClickHouse has no native queue/pub-sub), serializing each row to a JSON payload.",
       "type": "object",
@@ -344,6 +359,26 @@
         "table"
       ]
     },
+    "Compression": {
+      "description": "Batch compression for the file and object_store endpoints. Orthogonal to `format`.",
+      "oneOf": [
+        {
+          "description": "No compression (default).",
+          "type": "string",
+          "const": "none"
+        },
+        {
+          "description": "gzip; each batch is a self-contained member, so files stay readable with `zcat`.",
+          "type": "string",
+          "const": "gzip"
+        },
+        {
+          "description": "lz4 frame format; each batch is a self-contained frame (`lz4 -d` compatible).",
+          "type": "string",
+          "const": "lz4"
+        }
+      ]
+    },
     "CookieJarMiddleware": {
       "description": "Cookie/session jar middleware configuration.\n\nOptimized for HTTP by default: it can read `cookie` and `set-cookie` metadata,\npersist session cookies, and inject them into later outgoing requests.\n\nThe middleware can also capture arbitrary metadata values into the same session store\nand optionally expose stored values back into message metadata.",
       "type": "object",
@@ -442,6 +477,38 @@
       "additionalProperties": false,
       "required": [
         "delay_ms"
+      ]
+    },
+    "EncryptionConfig": {
+      "description": "AEAD encryption settings, shared by the `encryption` middleware (per-message\npayload encryption) and the at-rest `encryption` field of the file and\nobject_store endpoints. Requires the `encryption` feature.",
+      "type": "object",
+      "properties": {
+        "cipher": {
+          "description": "AEAD cipher. Defaults to `xchacha20poly1305`.",
+          "$ref": "#/$defs/CipherKind",
+          "default": "xchacha20poly1305"
+        },
+        "decrypt_keys": {
+          "description": "Extra `key_id -> base64 key` entries accepted when decrypting (key rotation).",
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "key": {
+          "description": "Base64-encoded 32-byte key. Supports `${env:VAR}` to read it from the environment.",
+          "type": "string",
+          "format": "password"
+        },
+        "key_id": {
+          "description": "Key identifier written into each envelope; selects the key when decrypting. Defaults to `default`.",
+          "type": "string",
+          "default": "default"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "key"
       ]
     },
     "Endpoint": {
@@ -826,12 +893,29 @@
     "FileConfig": {
       "type": "object",
       "properties": {
+        "compression": {
+          "description": "Per-batch compression (`none`, `gzip`, `lz4`). Requires the `compression` feature; consume mode only.",
+          "$ref": "#/$defs/Compression",
+          "default": "none"
+        },
         "delimiter": {
           "description": "Optional delimiter for messages. Defaults to newline (\"\\n\").\nCan be a string or a hex sequence (e.g. \"0x00\").\nCurrently only single-byte delimiters are supported.",
           "type": [
             "string",
             "null"
           ]
+        },
+        "encryption": {
+          "description": "At-rest AEAD encryption applied after compression. Requires the `encryption` feature; consume mode only.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/EncryptionConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
         },
         "format": {
           "description": "The format for writing messages to the file (Publisher) or interpreting them (Consumer). Defaults to `normal`.",
@@ -940,11 +1024,6 @@
           "description": "CSV rows mapped to/from JSON objects (string values only). The first row is the header/schema.",
           "type": "string",
           "const": "csv"
-        },
-        {
-          "description": "gzip-compressed JSON Lines. The payload is written verbatim like `raw`\n(database rows are already JSON objects, so the decompressed file is clean\nJSONL — one object per line), and each written batch is a self-contained\ngzip member appended to the file, so the result is a standard `.gz` stream\nreadable with `zcat`/`gzip -dc`. Requires the `compression` feature and only\nthe default `consume` mode (no delete, no group).",
-          "type": "string",
-          "const": "jsonl_gzip"
         }
       ]
     },
@@ -1801,6 +1880,18 @@
         {
           "type": "object",
           "properties": {
+            "encryption": {
+              "$ref": "#/$defs/EncryptionConfig"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "encryption"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
             "custom": {
               "type": "object",
               "properties": {
@@ -2306,6 +2397,11 @@
             "null"
           ]
         },
+        "compression": {
+          "description": "Whole-object compression (`none`, `gzip`, `lz4`). Requires the `compression` feature.",
+          "$ref": "#/$defs/Compression",
+          "default": "none"
+        },
         "cursor_id": {
           "description": "(Source only) Cursor id namespacing the checkpoint key; enables durable resume.",
           "type": [
@@ -2325,8 +2421,20 @@
             "null"
           ]
         },
+        "encryption": {
+          "description": "At-rest AEAD encryption applied after compression. Requires the `encryption` feature.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/EncryptionConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
         "extension": {
-          "description": "(Sink only) Extension for written objects, without the dot. Defaults to a value derived\nfrom `format` (`jsonl`, `json`, `txt`, or `bin`).",
+          "description": "(Sink only) Extension for written objects, without the dot. Defaults to a value derived\nfrom `format`, `compression` and `encryption` (e.g. `jsonl`, `csv`, `bin`, `jsonl.gz`,\n`jsonl.lz4`, `jsonl.gz.enc`); encrypted objects get a trailing `.enc` since they are\nciphertext, not a directly decompressable `.gz`.",
           "type": [
             "string",
             "null"

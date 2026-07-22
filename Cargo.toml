@@ -123,14 +123,20 @@ libmqm-sys = { version = "0.10", optional = true, default-features = false }
 
 # HTTP
 arc-swap = { version = "1", optional = true }
-hyper = { version = "1.8", optional = true, features = ["client", "server", "http1", "http2"] }
+hyper = { version = "1.10", optional = true, features = ["client", "server", "http1", "http2"] }
 hyper-util = { version = "0.1", optional = true, features = ["tokio", "client", "client-legacy", "server", "http1", "http2"] }
 hyper-rustls = { version = "0.27", optional = true, default-features = false, features = ["http1", "http2", "tls12", "logging", "native-tokio"] }
 http-body-util = { version = "0.1", optional = true }
 http-body = { version = "1.0", optional = true }
 h2 = { version = "0.4", optional = true }
 flate2 = { version = "1.0", optional = true }
+# lz4 frame format (concatenable frames, like gzip members) for the `compression` feature.
+lz4_flex = { version = "0.14", optional = true, default-features = false, features = ["frame"] }
 base64 = { version = "0.22", optional = true }
+
+# AEAD ciphers for the `encryption` feature (payload middleware + at-rest file/object).
+chacha20poly1305 = { version = "0.11", optional = true }
+aes-gcm = { version = "0.11", optional = true }
 tokio-websockets = { version = "0.13", optional = true, default-features = false, features = ["client", "server", "sha1_smol", "fastrand"] }
 
 # AWS
@@ -187,7 +193,7 @@ middleware = ["metrics", "dedup"]
 # runtime the client is loaded lazily only when an ibm-mq endpoint is opened
 # (clear error if the client isn't installed). Use `ibm-mq-static` instead for
 # static linking.
-full = ["middleware", "mongodb", "kafka", "amqp", "nats", "mqtt", "http", "aws", "zeromq", "redis-streams", "sled", "grpc", "sqlx", "clickhouse", "websocket", "postgres-cdc", "object-store", "rustls-aws-lc", "ibm-mq"]
+full = ["middleware", "mongodb", "kafka", "amqp", "nats", "mqtt", "http", "aws", "zeromq", "redis-streams", "sled", "grpc", "sqlx", "clickhouse", "websocket", "postgres-cdc", "object-store", "rustls-aws-lc", "ibm-mq", "compression", "encryption"]
 
 # Endpoints that build across most OS targets (glibc/musl/Alpine, macOS,
 # Windows, aarch64/armv7) without a special toolchain — no librdkafka, protoc,
@@ -201,9 +207,12 @@ portable = ["mongodb", "amqp", "nats", "mqtt", "http", "aws", "zeromq", "redis-s
 
 # Functionality features
 dedup = ["sled"]
-# gzip-compressed file endpoint (FileFormat::JsonlGzip). Reuses flate2, already
-# pulled in by the http/clickhouse features.
-compression = ["dep:flate2"]
+# Batch compression (`compression: gzip|lz4`) on the file and object_store
+# endpoints. flate2 is already pulled in by the http/clickhouse features.
+compression = ["dep:flate2", "dep:lz4_flex"]
+# AEAD payload encryption: the `encryption` middleware and the at-rest
+# `encryption` field on the file/object_store endpoints.
+encryption = ["dep:chacha20poly1305", "dep:aes-gcm", "dep:base64"]
 metrics = ["dep:metrics"]
 test-utils = ["dep:tracing-appender", "dep:tracing-subscriber", "dep:serde_yaml_ng"]
 # Opt-in produce/consume-only isolation benchmarks (throwaway diagnostics, off by default)

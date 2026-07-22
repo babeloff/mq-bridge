@@ -89,6 +89,14 @@ fn documented_middleware_snippets_parse() {
     capture_metadata_keys: ["x-csrf-token"]
     export_metadata_prefix: "session."
 "#,
+        r#"- encryption: { key: "${env:MQB_ENC_KEY}" }"#,
+        r#"
+- encryption:
+    cipher: aes256gcm
+    key_id: "k2"
+    key: "${env:MQB_ENC_KEY}"
+    decrypt_keys: { k1: "${env:MQB_OLD_ENC_KEY}" }
+"#,
         r#"- metrics: {}"#,
         r#"- random_panic: { mode: disconnect, trigger_on_message: 500 }"#,
         r#"
@@ -156,6 +164,21 @@ custom:
     for snippet in snippets {
         endpoint(snippet);
     }
+}
+
+/// The at-rest compress-then-encrypt example from the `encryption` section.
+#[test]
+fn documented_at_rest_encryption_snippet_parses() {
+    let ep = endpoint(
+        r#"
+file:
+  path: "data.enc"
+  format: raw
+  compression: lz4
+  encryption: { key: "${env:MQB_ENC_KEY}" }
+"#,
+    );
+    assert_eq!(ep.endpoint_type.name(), "file");
 }
 
 /// `null` is the one endpoint whose YAML spelling is a trap. A bare YAML null is the form

@@ -11,7 +11,11 @@ pub mod canonical_message;
 ))]
 pub mod checkpoint;
 pub mod command_handler;
+#[cfg(feature = "compression")]
+pub(crate) mod compression;
 pub mod connection_registry;
+#[cfg(feature = "encryption")]
+pub mod crypto;
 pub mod endpoints;
 pub mod errors;
 pub mod event_handler;

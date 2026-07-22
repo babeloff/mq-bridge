@@ -3,7 +3,7 @@
 > **Looking for what middleware or structural endpoints exist, and how to configure them?**
 > [REFERENCE.md](REFERENCE.md) is the complete, authoritative list — every middleware
 > (`retry`, `dlq`, `transform`, `deduplication`, `weak_join`, `buffer`, `limiter`, `delay`,
-> `cookie_jar`, `metrics`, `random_panic`, `custom`) and every structural endpoint (`ref`,
+> `cookie_jar`, `encryption`, `metrics`, `random_panic`, `custom`) and every structural endpoint (`ref`,
 > `fanout`, `switch`, `request`, `response`, `reader`, `static`, `stream_buffer`, `null`,
 > `custom`), each with its fields, defaults, and a working YAML example. Do not infer these
 > from the enum definitions in `models.rs`; the reference records the behaviour and the

@@ -3,8 +3,10 @@
 //  Licensed under MIT License, see License file for more details
 //  git clone https://github.com/marcomq/mq-bridge
 use crate::canonical_message::{deserialize_u128, tracing_support::LazyMessageIds};
+#[cfg(feature = "encryption")]
+use crate::crypto::Crypto;
 use crate::event_store::{EventStore, EventStoreConsumer, RetentionPolicy};
-use crate::models::{FileConfig, FileConsumerMode, FileFormat};
+use crate::models::{Compression, FileConfig, FileConsumerMode, FileFormat};
 use crate::traits::{
     ConsumerError, MessageConsumer, MessagePublisher, PublisherError, ReceivedBatch, SentBatch,
 };
@@ -175,19 +177,45 @@ pub struct FilePublisher {
     file_lock: Arc<Mutex<()>>,
     delimiter: Vec<u8>,
     format: FileFormat,
+    #[cfg(any(feature = "compression", feature = "encryption"))]
+    compression: Compression,
+    #[cfg(feature = "encryption")]
+    crypto: Option<Arc<Crypto>>,
     /// CSV column order, locked in by the first message written. Shared across
     /// clones of this publisher so all writers to the same file agree on it.
     csv_header: Arc<Mutex<Option<Vec<String>>>>,
 }
 
+/// Validates the `compression`/`encryption` settings shared by the file
+/// publisher and consumer: both need their Cargo feature, and both switch the
+/// file to per-batch members, which is incompatible with the CSV format (its
+/// header row is per-file, not per-member).
+fn validate_member_settings(config: &FileConfig) -> anyhow::Result<()> {
+    #[cfg(not(feature = "compression"))]
+    if config.compression != Compression::None {
+        return Err(anyhow::anyhow!(
+            "file 'compression' requires the `compression` feature"
+        ));
+    }
+    #[cfg(not(feature = "encryption"))]
+    if config.encryption.is_some() {
+        return Err(anyhow::anyhow!(
+            "file 'encryption' requires the `encryption` feature"
+        ));
+    }
+    if (config.compression != Compression::None || config.encryption.is_some())
+        && matches!(config.format, FileFormat::Csv)
+    {
+        return Err(anyhow::anyhow!(
+            "the 'csv' file format is not supported with compression or encryption"
+        ));
+    }
+    Ok(())
+}
+
 impl FilePublisher {
     pub async fn new(config: &FileConfig) -> anyhow::Result<Self> {
-        #[cfg(not(feature = "compression"))]
-        if matches!(config.format, FileFormat::JsonlGzip) {
-            return Err(anyhow::anyhow!(
-                "FileFormat::JsonlGzip requires the `compression` feature"
-            ));
-        }
+        validate_member_settings(config)?;
         let path_str = &config.path;
         let path = Path::new(path_str);
         if let Some(parent) = path.parent() {
@@ -213,20 +241,41 @@ impl FilePublisher {
             file_lock,
             delimiter,
             format,
+            #[cfg(any(feature = "compression", feature = "encryption"))]
+            compression: config.compression,
+            #[cfg(feature = "encryption")]
+            crypto: config
+                .encryption
+                .as_ref()
+                .map(Crypto::new)
+                .transpose()?
+                .map(Arc::new),
             csv_header: Arc::new(Mutex::new(None)),
         })
     }
 
-    /// Writes one batch as a single gzip member appended to the file. gzip
-    /// members concatenate, so the file stays a valid `.gz` stream that a whole
-    /// decompressor (or the matching consumer) reads back member by member.
-    #[cfg(feature = "compression")]
-    async fn send_batch_gzip(
+    /// True when batches are written as self-contained members (compressed
+    /// and/or encrypted) rather than plain appended lines.
+    #[cfg(any(feature = "compression", feature = "encryption"))]
+    fn is_member_mode(&self) -> bool {
+        #[allow(unused_mut)]
+        let mut member = self.compression != Compression::None;
+        #[cfg(feature = "encryption")]
+        {
+            member |= self.crypto.is_some();
+        }
+        member
+    }
+
+    /// Writes one batch as a single self-contained member appended to the file.
+    /// Compressed members (gzip/lz4) self-delimit, so the file stays a standard
+    /// `.gz`/`.lz4` stream. An encrypted (sealed) member does not, so it is
+    /// wrapped in a `[u64 be length][sealed bytes]` frame instead.
+    #[cfg(any(feature = "compression", feature = "encryption"))]
+    async fn send_batch_member(
         &self,
         messages: Vec<CanonicalMessage>,
     ) -> Result<SentBatch, PublisherError> {
-        use std::io::Write as _;
-
         let _file_guard = self.file_lock.lock().await;
         let mut raw = Vec::new();
         let mut failed_messages = Vec::new();
@@ -238,52 +287,63 @@ impl FilePublisher {
                     raw.extend_from_slice(&bytes);
                 }
                 Err(e) => {
-                    tracing::error!("Failed to serialize message for gzip file sink: {}", e);
+                    tracing::error!("Failed to serialize message for file sink member: {}", e);
                     failed_messages.push((msg, PublisherError::NonRetryable(anyhow::anyhow!(e))));
                 }
             }
         }
 
         if !raw.is_empty() {
-            let mut encoder =
-                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-            encoder
-                .write_all(&raw)
-                .map_err(|e| PublisherError::NonRetryable(anyhow::anyhow!(e)))?;
-            let member = encoder
-                .finish()
-                .map_err(|e| PublisherError::NonRetryable(anyhow::anyhow!(e)))?;
+            #[cfg(feature = "compression")]
+            let raw = if self.compression != Compression::None {
+                crate::compression::compress_member(self.compression, &raw)
+                    .map_err(|e| PublisherError::NonRetryable(anyhow::anyhow!(e)))?
+            } else {
+                raw
+            };
+            #[allow(unused_mut)]
+            let mut member = raw;
+            #[cfg(feature = "encryption")]
+            if let Some(crypto) = &self.crypto {
+                let sealed = crypto
+                    .seal(&member, b"")
+                    .map_err(PublisherError::NonRetryable)?;
+                let mut framed = Vec::with_capacity(8 + sealed.len());
+                framed.extend_from_slice(&(sealed.len() as u64).to_be_bytes());
+                framed.extend_from_slice(&sealed);
+                member = framed;
+            }
 
             let mut file = OpenOptions::new()
                 .create(true)
                 .append(true)
                 .open(&self.path)
                 .await
-                .context("Failed to open file for writing gzip batch")?;
-            // Length before the append: a failed write_all can leave a partial gzip
+                .context("Failed to open file for writing batch member")?;
+            // Length before the append: a failed write_all can leave a partial
             // member behind, which would corrupt the concatenated stream and get
             // compounded by the Retryable re-append. Truncate back to this
             // known-good member boundary on failure so a retry appends cleanly.
             let pre_len = file
                 .metadata()
                 .await
-                .context("Failed to stat gzip file before write")?
+                .context("Failed to stat file before member write")?
                 .len();
             // Append the whole member in one write so a concurrent reader never
             // observes a torn member (the consumer also guards against it).
             if let Err(e) = file.write_all(&member).await {
                 if let Err(te) = file.set_len(pre_len).await {
                     tracing::error!(
-                        "Failed to truncate gzip file back to {} after write error: {}",
+                        "Failed to truncate file back to {} after member write error: {}",
                         pre_len,
                         te
                     );
                 }
                 return Err(PublisherError::Retryable(
-                    anyhow::Error::new(e).context("Failed to write gzip member to file"),
+                    anyhow::Error::new(e).context("Failed to write member to file"),
                 ));
             }
-            file.flush().await.context("Failed to flush gzip file")?;
+            file.flush().await.context("Failed to flush file")?;
         }
 
         if failed_messages.is_empty() {
@@ -308,9 +368,9 @@ impl MessagePublisher for FilePublisher {
             return Ok(SentBatch::Ack);
         }
 
-        #[cfg(feature = "compression")]
-        if matches!(self.format, FileFormat::JsonlGzip) {
-            return self.send_batch_gzip(messages).await;
+        #[cfg(any(feature = "compression", feature = "encryption"))]
+        if self.is_member_mode() {
+            return self.send_batch_member(messages).await;
         }
 
         trace!(count = messages.len(), path = %self.path, message_ids = ?LazyMessageIds(&messages), "Writing batch to file");
@@ -967,19 +1027,25 @@ fn run_file_queue_task(
     }
 }
 
-/// Reader for `FileFormat::JsonlGzip`. A gzip stream can't be seeked to a line
-/// boundary, so on each growth of the file it re-decompresses from the start and
-/// skips the records already emitted. For the common write-once-then-read ETL
-/// case the file is decompressed exactly once; live-tailing a growing file costs
-/// a re-scan per growth (acceptable for v1).
-#[cfg(feature = "compression")]
-fn run_file_gzip_consume_task_sync(
+/// Reader for member-based files (compressed and/or encrypted). Such a stream
+/// can't be seeked to a line boundary, so on each growth of the file it
+/// re-decodes from the start and skips the records already emitted. For the
+/// common write-once-then-read ETL case the file is decoded exactly once;
+/// live-tailing a growing file costs a re-scan per growth (acceptable for v1).
+///
+/// `make_reader` builds the decoding [`Read`](std::io::Read) chain
+/// (decrypt frames and/or decompress members) over a freshly opened file.
+#[cfg(any(feature = "compression", feature = "encryption"))]
+fn run_file_member_consume_task_sync<F>(
     path: String,
     msg_tx: async_channel::Sender<Vec<CanonicalMessage>>,
     delimiter: Vec<u8>,
     format: FileFormat,
     ready: Arc<AtomicBool>,
-) {
+    make_reader: F,
+) where
+    F: Fn(std::fs::File) -> Box<dyn std::io::Read>,
+{
     const BATCH_SIZE: usize = 1024;
     const MAX_SLEEP: std::time::Duration = std::time::Duration::from_millis(100);
     // Consecutive decode failures at an unchanged file length before we give up and
@@ -1019,9 +1085,7 @@ fn run_file_gzip_consume_task_sync(
                 continue;
             }
         };
-        let mut reader = std::io::BufReader::new(flate2::read::MultiGzDecoder::new(
-            std::io::BufReader::new(file),
-        ));
+        let mut reader = std::io::BufReader::new(make_reader(file));
 
         // Skip records emitted on a previous pass (file re-read from the start).
         let mut csv_header: Option<Vec<String>> = None;
@@ -1091,7 +1155,7 @@ fn run_file_gzip_consume_task_sync(
                 }
                 Err(e) => {
                     // Truncated/torn member: stop; retry once the writer finishes it.
-                    tracing::debug!("Partial gzip decode of {}: {}", path, e);
+                    tracing::debug!("Partial member decode of {}: {}", path, e);
                     read_error = true;
                     break;
                 }
@@ -1145,6 +1209,94 @@ fn run_file_gzip_consume_task_sync(
     }
 }
 
+/// Upper bound for one encrypted frame (one sealed batch). A larger length
+/// prefix means corruption; refusing it avoids a huge bogus allocation.
+#[cfg(feature = "encryption")]
+const MAX_ENCRYPTED_FRAME_BYTES: u64 = 1 << 30;
+
+/// Decodes a file of `[u64 be length][sealed member]` frames: each frame is
+/// decrypted and (if configured) decompressed, and the resulting plaintext is
+/// served as one continuous stream. A torn trailing frame surfaces as an
+/// `UnexpectedEof` error, which the member consume task treats like a torn
+/// compressed member (retried once the writer completes it).
+#[cfg(feature = "encryption")]
+struct EncryptedFramesReader<R: std::io::Read> {
+    inner: R,
+    crypto: Arc<Crypto>,
+    #[cfg_attr(not(feature = "compression"), allow(dead_code))]
+    compression: Compression,
+    current: std::io::Cursor<Vec<u8>>,
+}
+
+#[cfg(feature = "encryption")]
+impl<R: std::io::Read> EncryptedFramesReader<R> {
+    fn new(inner: R, crypto: Arc<Crypto>, compression: Compression) -> Self {
+        Self {
+            inner,
+            crypto,
+            compression,
+            current: std::io::Cursor::new(Vec::new()),
+        }
+    }
+
+    /// Reads and decodes the next frame. `Ok(false)` = clean end of file.
+    fn refill(&mut self) -> std::io::Result<bool> {
+        // Read the 8-byte length prefix, distinguishing clean EOF (no bytes at
+        // all) from a torn prefix (some bytes, then EOF).
+        let mut len_buf = [0u8; 8];
+        let mut filled = 0;
+        while filled < len_buf.len() {
+            let n = self.inner.read(&mut len_buf[filled..])?;
+            if n == 0 {
+                if filled == 0 {
+                    return Ok(false);
+                }
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "torn encrypted frame length prefix",
+                ));
+            }
+            filled += n;
+        }
+        let len = u64::from_be_bytes(len_buf);
+        if len > MAX_ENCRYPTED_FRAME_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("encrypted frame length {len} exceeds the {MAX_ENCRYPTED_FRAME_BYTES} byte cap (corrupt file?)"),
+            ));
+        }
+        let mut sealed = vec![0u8; len as usize];
+        self.inner.read_exact(&mut sealed)?;
+        let member = self
+            .crypto
+            .open(&sealed, b"")
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+        #[cfg(feature = "compression")]
+        let member = if self.compression != Compression::None {
+            crate::compression::decompress_all(self.compression, &member, None)?
+        } else {
+            member
+        };
+        self.current = std::io::Cursor::new(member);
+        Ok(true)
+    }
+}
+
+#[cfg(feature = "encryption")]
+impl<R: std::io::Read> std::io::Read for EncryptedFramesReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        loop {
+            let n = self.current.read(buf)?;
+            if n > 0 || buf.is_empty() {
+                return Ok(n);
+            }
+            if !self.refill()? {
+                return Ok(0);
+            }
+        }
+    }
+}
+
 enum ConsumerBackend {
     EventStore(EventStoreConsumer),
     Tail(FileTailConsumer),
@@ -1170,20 +1322,21 @@ impl FileConsumer {
                 "FileFormat::Csv is not supported with Subscribe {{ delete: true }} mode"
             ));
         }
-        if matches!(format, FileFormat::JsonlGzip) {
-            #[cfg(not(feature = "compression"))]
-            return Err(anyhow::anyhow!(
-                "FileFormat::JsonlGzip requires the `compression` feature"
-            ));
-            #[cfg(feature = "compression")]
+        validate_member_settings(config)?;
+        if config.compression != Compression::None || config.encryption.is_some() {
             if !matches!(
                 &config.mode,
                 None | Some(FileConsumerMode::Consume { delete: false })
             ) {
                 return Err(anyhow::anyhow!(
-                    "FileFormat::JsonlGzip is only supported with the default `consume` mode (no delete, no group_id)"
+                    "file 'compression'/'encryption' is only supported with the default `consume` mode (no delete, no group_id)"
                 ));
             }
+            // Member-based files (compressed and/or encrypted) have no seekable
+            // line offsets, so they use a dedicated reader that decodes from the
+            // start of the file.
+            #[cfg(any(feature = "compression", feature = "encryption"))]
+            return Self::new_member_consumer(config, delimiter, format).await;
         }
         match &config.mode {
             None | Some(FileConsumerMode::Consume { delete: false }) => {
@@ -1282,6 +1435,69 @@ impl FileConsumer {
         }
     }
 
+    /// Consumer for member-based files (compressed and/or encrypted): a
+    /// dedicated reader thread decodes the whole stream from the start.
+    /// Restricted to the plain consume mode by the validation in `new`.
+    #[cfg(any(feature = "compression", feature = "encryption"))]
+    async fn new_member_consumer(
+        config: &FileConfig,
+        delimiter: Vec<u8>,
+        format: FileFormat,
+    ) -> anyhow::Result<Self> {
+        let (msg_tx, msg_rx) = async_channel::bounded(100);
+        let ready = Arc::new(AtomicBool::new(false));
+        let ready_clone = ready.clone();
+
+        let compression = config.compression;
+        #[cfg(feature = "encryption")]
+        let crypto = config
+            .encryption
+            .as_ref()
+            .map(Crypto::new)
+            .transpose()?
+            .map(Arc::new);
+        let make_reader = move |file: std::fs::File| -> Box<dyn std::io::Read> {
+            #[cfg(feature = "encryption")]
+            if let Some(crypto) = &crypto {
+                return Box::new(EncryptedFramesReader::new(
+                    std::io::BufReader::new(file),
+                    crypto.clone(),
+                    compression,
+                ));
+            }
+            #[cfg(feature = "compression")]
+            return crate::compression::decompress_reader(
+                compression,
+                std::io::BufReader::new(file),
+            );
+            #[cfg(not(feature = "compression"))]
+            unreachable!("member consumer without compression or encryption")
+        };
+
+        let path_clone = config.path.clone();
+        let format_clone = format;
+        std::thread::spawn(move || {
+            run_file_member_consume_task_sync(
+                path_clone,
+                msg_tx,
+                delimiter,
+                format_clone,
+                ready_clone,
+                make_reader,
+            );
+        });
+        info!(path = %config.path, mode = "member consume (compressed/encrypted)", "File consumer connected");
+        Ok(Self {
+            backend: ConsumerBackend::Tail(FileTailConsumer {
+                msg_rx,
+                buffer: Vec::new(),
+                offset_file: None,
+                ready,
+                pending_eof: false,
+            }),
+        })
+    }
+
     async fn new_tail(
         path: &str,
         start_at_end: bool,
@@ -1294,34 +1510,6 @@ impl FileConsumer {
         let ready = Arc::new(AtomicBool::new(false));
         let ready_clone = ready.clone();
         let mut offset_file = None;
-
-        // Compressed files have no seekable line offsets, so they use a dedicated
-        // reader that decompresses from the start. Restricted to plain consume mode
-        // (no group_id / start_at_end) by the validation in `new`.
-        #[cfg(feature = "compression")]
-        if matches!(format, FileFormat::JsonlGzip) {
-            let path_clone = path.to_string();
-            let format_clone = format.clone();
-            std::thread::spawn(move || {
-                run_file_gzip_consume_task_sync(
-                    path_clone,
-                    msg_tx,
-                    delimiter,
-                    format_clone,
-                    ready_clone,
-                );
-            });
-            info!(path = %path, mode = "gzip consume", "File consumer connected");
-            return Ok(Self {
-                backend: ConsumerBackend::Tail(FileTailConsumer {
-                    msg_rx,
-                    buffer: Vec::new(),
-                    offset_file: None,
-                    ready,
-                    pending_eof: false,
-                }),
-            });
-        }
 
         if let Some(gid) = &group_id {
             let offset_path = format!("{}.{}.offset", path, gid);
@@ -1614,9 +1802,7 @@ pub(crate) fn encode_record(
     format: &FileFormat,
 ) -> Result<Vec<u8>, serde_json::Error> {
     match format {
-        // JsonlGzip writes the payload verbatim (DB rows are already JSON objects),
-        // so the decompressed file is clean JSON Lines — fastest and least verbose.
-        FileFormat::Raw | FileFormat::JsonlGzip => Ok(msg.payload.to_vec()),
+        FileFormat::Raw => Ok(msg.payload.to_vec()),
         FileFormat::Normal => {
             if msg
                 .metadata
@@ -1694,7 +1880,7 @@ pub(crate) fn parse_message(
                 }
             }
         }
-        FileFormat::Raw | FileFormat::JsonlGzip => {
+        FileFormat::Raw => {
             let mut msg = CanonicalMessage::new(buffer.to_vec(), None);
             msg.metadata
                 .insert("mq_bridge.original_format".to_string(), "raw".to_string());
@@ -1752,6 +1938,8 @@ pub(crate) fn parse_message(
 #[cfg(test)]
 mod tests {
     use crate::endpoints::file::{FileConsumer, FilePublisher};
+    #[cfg(any(feature = "compression", feature = "encryption"))]
+    use crate::models::Compression;
     use crate::models::{FileConfig, FileConsumerMode, FileFormat};
     use crate::msg;
     use crate::traits::MessageConsumer;
@@ -1763,7 +1951,7 @@ mod tests {
 
     #[cfg(feature = "compression")]
     #[tokio::test]
-    async fn test_file_jsonl_gzip_roundtrip() {
+    async fn test_file_gzip_roundtrip() {
         use std::io::Read as _;
 
         let dir = tempdir().unwrap();
@@ -1772,7 +1960,8 @@ mod tests {
 
         let config = FileConfig {
             path: path.clone(),
-            format: FileFormat::JsonlGzip,
+            format: FileFormat::Raw,
+            compression: Compression::Gzip,
             ..Default::default()
         };
 
@@ -1813,8 +2002,8 @@ mod tests {
         assert_eq!(got, vec![m1.payload, m2.payload, m3.payload]);
     }
 
-    #[cfg(feature = "compression")]
-    async fn collect_gzip(source: &mut FileConsumer, n: usize) -> Vec<bytes::Bytes> {
+    #[cfg(any(feature = "compression", feature = "encryption"))]
+    async fn collect_compressed(source: &mut FileConsumer, n: usize) -> Vec<bytes::Bytes> {
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             let mut got = Vec::new();
             while got.len() < n {
@@ -1835,7 +2024,115 @@ mod tests {
 
     #[cfg(feature = "compression")]
     #[tokio::test]
-    async fn test_file_jsonl_gzip_incremental_growth() {
+    async fn test_file_lz4_roundtrip() {
+        // Two batches -> two concatenated lz4 frames; the consumer decodes both.
+        let dir = tempdir().unwrap();
+        let path = dir
+            .path()
+            .join("data.jsonl.lz4")
+            .to_str()
+            .unwrap()
+            .to_string();
+        let config = FileConfig {
+            path,
+            format: FileFormat::Raw,
+            compression: Compression::Lz4,
+            ..Default::default()
+        };
+
+        let sink = FilePublisher::new(&config).await.unwrap();
+        let m1 = msg!(json!({"id": 1}));
+        let m2 = msg!(json!({"id": 2}));
+        let m3 = msg!(json!({"id": 3}));
+        sink.send_batch(vec![m1.clone(), m2.clone()]).await.unwrap();
+        sink.send_batch(vec![m3.clone()]).await.unwrap();
+        drop(sink);
+
+        let mut source = FileConsumer::new(&config).await.unwrap();
+        assert_eq!(
+            collect_compressed(&mut source, 3).await,
+            vec![m1.payload, m2.payload, m3.payload]
+        );
+    }
+
+    #[cfg(all(feature = "compression", feature = "encryption"))]
+    #[tokio::test]
+    async fn test_file_encrypted_compressed_roundtrip() {
+        use base64::Engine as _;
+
+        // compress-then-encrypt with length-prefix framing across multiple
+        // batches: the on-disk bytes are ciphertext, and the consumer reads the
+        // original records back.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("data.enc").to_str().unwrap().to_string();
+        let encryption = Some(crate::models::EncryptionConfig {
+            key: base64::engine::general_purpose::STANDARD.encode([42u8; 32]),
+            ..Default::default()
+        });
+        let config = FileConfig {
+            path: path.clone(),
+            format: FileFormat::Raw,
+            compression: Compression::Gzip,
+            encryption: encryption.clone(),
+            ..Default::default()
+        };
+
+        let sink = FilePublisher::new(&config).await.unwrap();
+        let m1 = msg!(json!({"id": 1, "name": "alice"}));
+        let m2 = msg!(json!({"id": 2, "name": "bob"}));
+        let m3 = msg!(json!({"id": 3, "name": "carol"}));
+        sink.send_batch(vec![m1.clone(), m2.clone()]).await.unwrap();
+        sink.send_batch(vec![m3.clone()]).await.unwrap();
+        drop(sink);
+
+        // The raw file is not a gzip stream (it is framed ciphertext).
+        let raw = std::fs::read(&path).unwrap();
+        assert!(!raw.is_empty());
+        let mut decoded = Vec::new();
+        assert!(std::io::Read::read_to_end(
+            &mut flate2::read::MultiGzDecoder::new(&raw[..]),
+            &mut decoded
+        )
+        .is_err());
+        // The plaintext does not appear anywhere in the file.
+        assert!(!raw.windows(5).any(|w| w == b"alice"));
+
+        let mut source = FileConsumer::new(&config).await.unwrap();
+        assert_eq!(
+            collect_compressed(&mut source, 3).await,
+            vec![m1.payload.clone(), m2.payload.clone(), m3.payload.clone()]
+        );
+
+        // A consumer with a different key must fail, not emit garbage.
+        let wrong_key = FileConfig {
+            encryption: Some(crate::models::EncryptionConfig {
+                key: base64::engine::general_purpose::STANDARD.encode([1u8; 32]),
+                ..Default::default()
+            }),
+            ..config.clone()
+        };
+        let mut source = FileConsumer::new(&wrong_key).await.unwrap();
+        let got = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            loop {
+                match source.receive_batch(10).await {
+                    Ok(b) if b.messages.is_empty() => {
+                        tokio::time::sleep(std::time::Duration::from_millis(5)).await
+                    }
+                    other => break other,
+                }
+            }
+        })
+        .await;
+        // Bounded decode failures surface as a closed stream (EndOfStream), never data.
+        assert!(
+            matches!(got, Ok(Err(_))),
+            "expected a consume error, got {got:?}"
+        );
+    }
+
+    #[cfg(feature = "compression")]
+    #[tokio::test]
+    async fn test_file_gzip_incremental_growth() {
         // A second batch appended as a new gzip member to the same file must be
         // picked up by an already-running consumer via the growth re-scan (which
         // re-decompresses from the start and skips already-emitted records).
@@ -1848,7 +2145,8 @@ mod tests {
             .to_string();
         let config = FileConfig {
             path,
-            format: FileFormat::JsonlGzip,
+            format: FileFormat::Raw,
+            compression: Compression::Gzip,
             ..Default::default()
         };
 
@@ -1857,21 +2155,21 @@ mod tests {
 
         let a = msg!(json!({"seq": 1}));
         sink.send_batch(vec![a.clone()]).await.unwrap();
-        assert_eq!(collect_gzip(&mut source, 1).await, vec![a.payload]);
+        assert_eq!(collect_compressed(&mut source, 1).await, vec![a.payload]);
 
         // Append a second member after the consumer already drained the first.
         let b = msg!(json!({"seq": 2}));
         let c = msg!(json!({"seq": 3}));
         sink.send_batch(vec![b.clone(), c.clone()]).await.unwrap();
         assert_eq!(
-            collect_gzip(&mut source, 2).await,
+            collect_compressed(&mut source, 2).await,
             vec![b.payload, c.payload]
         );
     }
 
     #[cfg(feature = "compression")]
     #[tokio::test]
-    async fn test_file_jsonl_gzip_rejects_unsupported_modes() {
+    async fn test_file_compression_rejects_unsupported_modes() {
         let dir = tempdir().unwrap();
         for mode in [
             FileConsumerMode::Consume { delete: true },
@@ -1885,7 +2183,8 @@ mod tests {
             let path = dir.path().join("m.gz").to_str().unwrap().to_string();
             let config = FileConfig {
                 path,
-                format: FileFormat::JsonlGzip,
+                format: FileFormat::Raw,
+                compression: Compression::Gzip,
                 mode: Some(mode.clone()),
                 ..Default::default()
             };

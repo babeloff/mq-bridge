@@ -18,8 +18,10 @@
 //!   non-destructive, at-least-once at object granularity.
 
 use crate::checkpoint::{self, CheckpointBackend, CheckpointStore};
+#[cfg(feature = "encryption")]
+use crate::crypto::Crypto;
 use crate::endpoints::file::{encode_record, parse_delimiter, parse_message};
-use crate::models::{FileFormat, ObjectStoreConfig};
+use crate::models::{Compression, FileFormat, ObjectStoreConfig};
 use crate::traits::{
     BoxFuture, ConsumerError, MessageConsumer, MessageDisposition, MessagePublisher,
     PublisherError, ReceivedBatch, SentBatch,
@@ -72,14 +74,42 @@ fn object_urls_overlap(a: &str, b: &str) -> bool {
     sa.iter().zip(sb.iter()).all(|(x, y)| x == y)
 }
 
-/// Default object extension derived from the record format.
-fn extension_for(format: &FileFormat) -> &'static str {
-    match format {
+/// Default object extension derived from the record format, compression and
+/// encryption (e.g. `jsonl`, `jsonl.gz`, `jsonl.lz4`, `jsonl.gz.enc`). An
+/// encrypted object is ciphertext, so it gets a trailing `.enc` rather than a
+/// bare `.gz`/`.lz4` that tools would wrongly treat as directly decompressable.
+fn extension_for(format: &FileFormat, compression: Compression, encrypted: bool) -> String {
+    let base = match format {
         FileFormat::Normal | FileFormat::Json | FileFormat::Text => "jsonl",
         FileFormat::Csv => "csv",
         FileFormat::Raw => "bin",
-        FileFormat::JsonlGzip => "jsonl.gz",
+    };
+    let mut ext = match compression {
+        Compression::None => base.to_string(),
+        Compression::Gzip => format!("{base}.gz"),
+        Compression::Lz4 => format!("{base}.lz4"),
+    };
+    if encrypted {
+        ext.push_str(".enc");
     }
+    ext
+}
+
+/// Rejects `compression`/`encryption` settings whose Cargo feature is missing.
+fn validate_object_settings(_config: &ObjectStoreConfig) -> anyhow::Result<()> {
+    #[cfg(not(feature = "compression"))]
+    if _config.compression != Compression::None {
+        return Err(anyhow!(
+            "object_store 'compression' requires the `compression` feature"
+        ));
+    }
+    #[cfg(not(feature = "encryption"))]
+    if _config.encryption.is_some() {
+        return Err(anyhow!(
+            "object_store 'encryption' requires the `encryption` feature"
+        ));
+    }
+    Ok(())
 }
 
 /// Splits a fetched object into record slices on `delimiter`, dropping a trailing empty
@@ -132,43 +162,6 @@ fn empty_batch() -> ReceivedBatch {
     }
 }
 
-/// Whole-object gzip for `FileFormat::JsonlGzip`. Each object is written once and
-/// read whole, so (unlike the file endpoint) a single gzip member per object is
-/// enough — no append/concatenation.
-#[cfg(feature = "compression")]
-fn gzip_object(data: &[u8]) -> std::io::Result<Vec<u8>> {
-    use std::io::Write as _;
-    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-    encoder.write_all(data)?;
-    encoder.finish()
-}
-
-#[cfg(feature = "compression")]
-fn gunzip_object(data: &[u8], max_bytes: Option<u64>) -> std::io::Result<Vec<u8>> {
-    use std::io::Read as _;
-    let mut out = Vec::new();
-    let mut decoder = flate2::read::MultiGzDecoder::new(data);
-    match max_bytes {
-        // Read one byte past the limit; a decompressed payload longer than that is
-        // rejected rather than allocated whole (guards against a gzip bomb).
-        Some(limit) => {
-            decoder
-                .take(limit.saturating_add(1))
-                .read_to_end(&mut out)?;
-            if out.len() as u64 > limit {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("decompressed object exceeds max_object_bytes ({limit})"),
-                ));
-            }
-        }
-        None => {
-            decoder.read_to_end(&mut out)?;
-        }
-    }
-    Ok(out)
-}
-
 // --- Publisher (sink) ---
 
 /// Writes each batch as one immutable object under the configured prefix.
@@ -178,6 +171,10 @@ pub struct ObjectStorePublisher {
     base: ObjPath,
     delimiter: Vec<u8>,
     format: FileFormat,
+    #[cfg(feature = "compression")]
+    compression: Compression,
+    #[cfg(feature = "encryption")]
+    crypto: Option<Arc<Crypto>>,
     date_partition: bool,
     extension: String,
 }
@@ -191,24 +188,31 @@ impl ObjectStorePublisher {
                 "object_store sink does not support the 'csv' format (per-object CSV headers are unimplemented); use jsonl/json/text/raw"
             ));
         }
-        #[cfg(not(feature = "compression"))]
-        if matches!(config.format, FileFormat::JsonlGzip) {
-            return Err(anyhow!(
-                "object_store 'jsonl_gzip' format requires the `compression` feature"
-            ));
-        }
+        validate_object_settings(config)?;
         let (store, base) = build_store(&config.url)?;
         let delimiter = parse_delimiter(config.delimiter.as_deref())?;
-        let extension = config
-            .extension
-            .clone()
-            .unwrap_or_else(|| extension_for(&config.format).to_string());
+        let extension = config.extension.clone().unwrap_or_else(|| {
+            extension_for(
+                &config.format,
+                config.compression,
+                config.encryption.is_some(),
+            )
+        });
         info!(url = %config.url, format = ?config.format, "Object-store sink opened");
         Ok(Self {
             store: Arc::from(store),
             base,
             delimiter,
             format: config.format.clone(),
+            #[cfg(feature = "compression")]
+            compression: config.compression,
+            #[cfg(feature = "encryption")]
+            crypto: config
+                .encryption
+                .as_ref()
+                .map(Crypto::new)
+                .transpose()?
+                .map(Arc::new),
             date_partition: config.date_partition,
             extension,
         })
@@ -283,13 +287,24 @@ impl MessagePublisher for ObjectStorePublisher {
                 failed,
             });
         }
-        // Compress the whole object for JsonlGzip so it lands as a standard `.gz`.
+        // Compress-then-encrypt: the whole object is one member, so a compressed
+        // object stays a standard `.gz`/`.lz4` file; a sealed one is a single
+        // envelope (no framing needed — objects are written and read whole).
         #[cfg(feature = "compression")]
-        let body = if matches!(self.format, FileFormat::JsonlGzip) {
-            gzip_object(&body).map_err(|e| PublisherError::NonRetryable(anyhow!(e)))?
+        let body = if self.compression != Compression::None {
+            crate::compression::compress_member(self.compression, &body)
+                .map_err(|e| PublisherError::NonRetryable(anyhow!(e)))?
         } else {
             body
         };
+        #[allow(unused_mut)]
+        let mut body = body;
+        #[cfg(feature = "encryption")]
+        if let Some(crypto) = &self.crypto {
+            body = crypto
+                .seal(&body, b"")
+                .map_err(PublisherError::NonRetryable)?;
+        }
         let key = self.next_key();
         self.store
             .put(&key, PutPayload::from(body))
@@ -332,6 +347,10 @@ pub struct ObjectStoreConsumer {
     base: ObjPath,
     delimiter: Vec<u8>,
     format: FileFormat,
+    #[cfg(feature = "compression")]
+    compression: Compression,
+    #[cfg(feature = "encryption")]
+    crypto: Option<Arc<Crypto>>,
     checkpoint: Option<Arc<dyn CheckpointStore>>,
     /// Last fully-acked object key (the resume cursor).
     last_key: Arc<Mutex<Option<String>>>,
@@ -346,12 +365,7 @@ pub struct ObjectStoreConsumer {
 
 impl ObjectStoreConsumer {
     pub async fn new(config: &ObjectStoreConfig) -> anyhow::Result<Self> {
-        #[cfg(not(feature = "compression"))]
-        if matches!(config.format, FileFormat::JsonlGzip) {
-            return Err(anyhow!(
-                "object_store 'jsonl_gzip' format requires the `compression` feature"
-            ));
-        }
+        validate_object_settings(config)?;
         let (store, base) = build_store(&config.url)?;
         let delimiter = parse_delimiter(config.delimiter.as_deref())?;
 
@@ -413,6 +427,15 @@ impl ObjectStoreConsumer {
             base,
             delimiter,
             format: config.format.clone(),
+            #[cfg(feature = "compression")]
+            compression: config.compression,
+            #[cfg(feature = "encryption")]
+            crypto: config
+                .encryption
+                .as_ref()
+                .map(Crypto::new)
+                .transpose()?
+                .map(Arc::new),
             checkpoint,
             last_key: Arc::new(Mutex::new(last_key)),
             buffer: Arc::new(Mutex::new(Vec::new())),
@@ -435,6 +458,10 @@ impl ObjectStoreConsumer {
             base,
             delimiter: vec![b'\n'],
             format,
+            #[cfg(feature = "compression")]
+            compression: Compression::None,
+            #[cfg(feature = "encryption")]
+            crypto: None,
             checkpoint,
             last_key: Arc::new(Mutex::new(last_key)),
             buffer: Arc::new(Mutex::new(Vec::new())),
@@ -477,11 +504,20 @@ impl ObjectStoreConsumer {
                 .bytes()
                 .await?
                 .to_vec();
-            // Decompress whole for JsonlGzip before splitting into records.
+            // Decrypt-then-decompress (the write path compressed first), whole,
+            // before splitting into records.
+            #[cfg(feature = "encryption")]
+            let data = if let Some(crypto) = &self.crypto {
+                crypto
+                    .open(&data, b"")
+                    .with_context(|| format!("decrypt object '{key}'"))?
+            } else {
+                data
+            };
             #[cfg(feature = "compression")]
-            let data = if matches!(self.format, FileFormat::JsonlGzip) {
-                gunzip_object(&data, self.max_object_bytes)
-                    .with_context(|| format!("gunzip object '{key}'"))?
+            let data = if self.compression != Compression::None {
+                crate::compression::decompress_all(self.compression, &data, self.max_object_bytes)
+                    .with_context(|| format!("decompress object '{key}'"))?
             } else {
                 data
             };
@@ -679,6 +715,31 @@ mod tests {
         assert_eq!(civil_from_unix_ms(1_709_208_000_000), (2024, 2, 29));
     }
 
+    #[test]
+    fn extension_reflects_compression_and_encryption() {
+        assert_eq!(
+            extension_for(&FileFormat::Normal, Compression::None, false),
+            "jsonl"
+        );
+        assert_eq!(
+            extension_for(&FileFormat::Normal, Compression::Gzip, false),
+            "jsonl.gz"
+        );
+        assert_eq!(
+            extension_for(&FileFormat::Raw, Compression::Lz4, false),
+            "bin.lz4"
+        );
+        // Encrypted objects are ciphertext -> trailing `.enc`, never a bare `.gz`.
+        assert_eq!(
+            extension_for(&FileFormat::Normal, Compression::Gzip, true),
+            "jsonl.gz.enc"
+        );
+        assert_eq!(
+            extension_for(&FileFormat::Raw, Compression::None, true),
+            "bin.enc"
+        );
+    }
+
     fn json_msg(v: serde_json::Value) -> CanonicalMessage {
         CanonicalMessage::new(serde_json::to_vec(&v).unwrap(), None)
     }
@@ -689,6 +750,10 @@ mod tests {
             base: ObjPath::from("data"),
             delimiter: vec![b'\n'],
             format: FileFormat::Normal,
+            #[cfg(feature = "compression")]
+            compression: Compression::None,
+            #[cfg(feature = "encryption")]
+            crypto: None,
             date_partition: false,
             extension: "jsonl".to_string(),
         }
@@ -696,28 +761,89 @@ mod tests {
 
     #[cfg(feature = "compression")]
     #[tokio::test]
-    async fn gzip_object_round_trips() {
+    async fn compressed_object_round_trips() {
+        for compression in [Compression::Gzip, Compression::Lz4] {
+            let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+
+            let mut publisher = test_publisher(store.clone());
+            publisher.format = FileFormat::Raw;
+            publisher.compression = compression;
+            publisher.extension = extension_for(&FileFormat::Raw, compression, false);
+            publisher
+                .send_batch(vec![
+                    json_msg(serde_json::json!({"n": 1})),
+                    json_msg(serde_json::json!({"n": 2})),
+                ])
+                .await
+                .unwrap();
+
+            // The stored object is really compressed: it decodes to the two JSONL rows.
+            let listed = store
+                .list(Some(&ObjPath::from("data")))
+                .next()
+                .await
+                .unwrap()
+                .unwrap();
+            let suffix = match compression {
+                Compression::Gzip => ".bin.gz",
+                _ => ".bin.lz4",
+            };
+            assert!(listed.location.to_string().ends_with(suffix));
+            let bytes = store
+                .get(&listed.location)
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap();
+            let decoded = crate::compression::decompress_all(compression, &bytes, None).unwrap();
+            assert_eq!(String::from_utf8(decoded).unwrap().lines().count(), 2);
+
+            let mut consumer = ObjectStoreConsumer::from_store(
+                store,
+                ObjPath::from("data"),
+                FileFormat::Raw,
+                None,
+                None,
+            );
+            consumer.compression = compression;
+            let batch = consumer.receive_batch(10).await.unwrap();
+            assert_eq!(batch.messages.len(), 2);
+            assert_eq!(batch.messages[0].payload.as_ref(), br#"{"n":1}"#);
+            assert_eq!(batch.messages[1].payload.as_ref(), br#"{"n":2}"#);
+            (batch.commit)(vec![MessageDisposition::Ack; 2])
+                .await
+                .unwrap();
+        }
+    }
+
+    #[cfg(all(feature = "compression", feature = "encryption"))]
+    #[tokio::test]
+    async fn encrypted_object_round_trips() {
+        use base64::Engine as _;
+
+        let crypto_cfg = crate::models::EncryptionConfig {
+            key: base64::engine::general_purpose::STANDARD.encode([42u8; 32]),
+            ..Default::default()
+        };
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
 
         let mut publisher = test_publisher(store.clone());
-        publisher.format = FileFormat::JsonlGzip;
-        publisher.extension = "jsonl.gz".to_string();
+        publisher.format = FileFormat::Raw;
+        publisher.compression = Compression::Gzip;
+        publisher.crypto = Some(Arc::new(Crypto::new(&crypto_cfg).unwrap()));
         publisher
-            .send_batch(vec![
-                json_msg(serde_json::json!({"n": 1})),
-                json_msg(serde_json::json!({"n": 2})),
-            ])
+            .send_batch(vec![json_msg(serde_json::json!({"who": "alice"}))])
             .await
             .unwrap();
 
-        // The stored object is real gzip: it decodes to the two JSONL rows.
+        // The stored object is ciphertext: not gzip, and no plaintext inside.
         let listed = store
             .list(Some(&ObjPath::from("data")))
             .next()
             .await
             .unwrap()
             .unwrap();
-        assert!(listed.location.to_string().ends_with(".jsonl.gz"));
         let bytes = store
             .get(&listed.location)
             .await
@@ -725,43 +851,43 @@ mod tests {
             .bytes()
             .await
             .unwrap();
-        let decoded = gunzip_object(&bytes, None).unwrap();
-        assert_eq!(String::from_utf8(decoded).unwrap().lines().count(), 2);
+        assert!(crate::compression::decompress_all(Compression::Gzip, &bytes, None).is_err());
+        assert!(!bytes.windows(5).any(|w| w == b"alice"));
 
         let mut consumer = ObjectStoreConsumer::from_store(
-            store,
+            store.clone(),
             ObjPath::from("data"),
-            FileFormat::JsonlGzip,
+            FileFormat::Raw,
             None,
             None,
         );
+        consumer.compression = Compression::Gzip;
+        consumer.crypto = Some(Arc::new(Crypto::new(&crypto_cfg).unwrap()));
         let batch = consumer.receive_batch(10).await.unwrap();
-        assert_eq!(batch.messages.len(), 2);
-        assert_eq!(batch.messages[0].payload.as_ref(), br#"{"n":1}"#);
-        assert_eq!(batch.messages[1].payload.as_ref(), br#"{"n":2}"#);
-        (batch.commit)(vec![MessageDisposition::Ack; 2])
-            .await
-            .unwrap();
-    }
+        assert_eq!(batch.messages.len(), 1);
+        assert_eq!(batch.messages[0].payload.as_ref(), br#"{"who":"alice"}"#);
 
-    #[cfg(feature = "compression")]
-    #[test]
-    fn gunzip_object_rejects_over_limit() {
-        // Compresses to far less than its decompressed size; the limit is enforced on
-        // the decompressed output, so an over-limit payload must be rejected rather
-        // than allocated whole.
-        let big = vec![b'a'; 10 * 1024];
-        let gz = gzip_object(&big).unwrap();
-        assert!(gz.len() < big.len());
-        assert!(gunzip_object(&gz, Some(1024)).is_err());
-        // A generous limit still round-trips the full payload.
-        assert_eq!(gunzip_object(&gz, Some(64 * 1024)).unwrap(), big);
+        // A consumer with the wrong key fails cleanly.
+        let mut wrong = ObjectStoreConsumer::from_store(
+            store,
+            ObjPath::from("data"),
+            FileFormat::Raw,
+            None,
+            None,
+        );
+        wrong.compression = Compression::Gzip;
+        let wrong_cfg = crate::models::EncryptionConfig {
+            key: base64::engine::general_purpose::STANDARD.encode([1u8; 32]),
+            ..Default::default()
+        };
+        wrong.crypto = Some(Arc::new(Crypto::new(&wrong_cfg).unwrap()));
+        assert!(wrong.receive_batch(10).await.is_err());
     }
 
     #[cfg(feature = "compression")]
     #[tokio::test]
     async fn gzip_source_errors_on_non_gzip_object() {
-        // A jsonl_gzip source must fail cleanly (not panic) if an object under the
+        // A gzip source must fail cleanly (not panic) if an object under the
         // prefix is not valid gzip.
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         store
@@ -775,10 +901,11 @@ mod tests {
         let mut consumer = ObjectStoreConsumer::from_store(
             store,
             ObjPath::from("data"),
-            FileFormat::JsonlGzip,
+            FileFormat::Raw,
             None,
             None,
         );
+        consumer.compression = Compression::Gzip;
         assert!(
             consumer.receive_batch(10).await.is_err(),
             "expected a decode error for a non-gzip object"

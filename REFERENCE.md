@@ -64,6 +64,7 @@ middlewares:
 | [`limiter`](#limiter) | ✅ | ✅ | – | Cap throughput to a message rate |
 | [`delay`](#delay) | ✅ | ✅ | – | Fixed delay per receive/send |
 | [`cookie_jar`](#cookie_jar) | ✅ | ✅ | – | Persist HTTP cookies / session values across messages |
+| [`encryption`](#encryption) | ✅ | ✅ | `encryption` | AEAD-encrypt payloads on send, decrypt on receive |
 | [`metrics`](#metrics) | ✅ | ✅ | `metrics` | Emit throughput/latency/error metrics |
 | [`random_panic`](#random_panic) | ✅ | ✅ | – | Fault injection for testing |
 | [`custom`](#custom-middleware) | ✅ | ✅ | – | Your own middleware via a registered factory |
@@ -315,6 +316,54 @@ Persists HTTP cookies and arbitrary session values across messages. Input and ou
 Reads `set-cookie` from responses and injects `cookie` into later requests. With
 `shared_scope`, instances using the same name share one store across endpoints and routes in
 the process — that is how a login route and a data route reuse one session.
+
+### `encryption`
+
+Encrypts each message **payload** into a self-describing AEAD envelope on the output side
+and decrypts it on the input side. Metadata and routing keys stay in the clear. Input and
+output. Requires the `encryption` feature.
+
+| Field | Type | Default |
+|---|---|---|
+| `cipher` | `xchacha20poly1305` \| `aes256gcm` | `xchacha20poly1305` |
+| `key_id` | string | `default` |
+| `key` | string — base64-encoded 32-byte key; `${env:VAR}` reads it from the environment | required |
+| `decrypt_keys` | map key_id → key | `{}` |
+
+```yaml
+- encryption: { key: "${env:MQB_ENC_KEY}" }
+```
+
+The envelope records the cipher and `key_id`, so key rotation works by sealing with a new
+`key_id`/`key` while listing the old key under `decrypt_keys` on the consuming side. Each
+payload is authenticated independently: any bit-level tampering, a torn frame, or a
+missing/wrong key is a hard consumer error, not a silent drop. Note that this authenticates
+each payload, not the file as a whole — like any append-structured file, an at-rest file
+that loses whole trailing frames (truncation at a frame boundary) reads back as a shorter
+stream with no error, so rely on the consumer's checkpoint/cursor for completeness rather
+than on the encryption layer.
+
+Do **not** combine this middleware with a sink's batch `compression` on the same route:
+ciphertext does not compress. For compressed *and* encrypted data at rest, use the `file` /
+`object_store` endpoints' own fields instead, which apply compress-then-encrypt per batch:
+
+```yaml
+output:
+  file:
+    path: "data.enc"
+    format: raw
+    compression: lz4          # none | gzip | lz4  (`compression` feature)
+    encryption: { key: "${env:MQB_ENC_KEY}" }
+```
+
+Both endpoints accept the same `compression` and `encryption` fields (`object_store`
+derives its default object extension from them, e.g. `.jsonl.gz` / `.jsonl.lz4`, and adds a
+trailing `.enc` when encryption is on since the object is ciphertext, not a directly
+decompressable `.gz`). An
+encrypted **file** is written as length-prefixed sealed frames (one per batch) and is only
+readable through a matching consumer; a compressed-only file stays a standard `.gz`/`.lz4`
+stream. File compression/encryption supports only the default `consume` mode and no `csv`
+format.
 
 ### `metrics`
 
