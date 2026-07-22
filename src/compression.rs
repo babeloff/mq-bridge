@@ -31,6 +31,7 @@ pub(crate) fn compress_member(algo: Compression, data: &[u8]) -> std::io::Result
                 .finish()
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
         }
+        Compression::Zstd => zstd::stream::encode_all(data, zstd::DEFAULT_COMPRESSION_LEVEL),
     }
 }
 
@@ -44,6 +45,23 @@ pub(crate) fn decompress_reader<R: BufRead + 'static>(
         Compression::None => Box::new(reader),
         Compression::Gzip => Box::new(flate2::read::MultiGzDecoder::new(reader)),
         Compression::Lz4 => Box::new(MultiLz4FrameDecoder::new(reader)),
+        // zstd's Decoder reads concatenated frames to EOF, matching the member model. Construction
+        // is fallible, so defer any init error through this infallible boundary via `ErrReader`.
+        Compression::Zstd => match zstd::stream::read::Decoder::with_buffer(reader) {
+            Ok(dec) => Box::new(dec),
+            Err(e) => Box::new(ErrReader(Some(e))),
+        },
+    }
+}
+
+/// A reader that surfaces a single stored error on first read. Lets a fallible decoder constructor
+/// be reported through [`decompress_reader`]'s infallible `Box<dyn Read>` return.
+struct ErrReader(Option<std::io::Error>);
+impl Read for ErrReader {
+    fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+        Err(self.0.take().unwrap_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::Other, "zstd decoder already failed")
+        }))
     }
 }
 
@@ -67,6 +85,7 @@ pub(crate) fn decompress_all(
         Compression::None => Box::new(cursor),
         Compression::Gzip => Box::new(flate2::read::MultiGzDecoder::new(cursor)),
         Compression::Lz4 => Box::new(MultiLz4FrameDecoder::new(cursor)),
+        Compression::Zstd => Box::new(zstd::stream::read::Decoder::with_buffer(cursor)?),
     };
     let mut out = Vec::new();
     match max_bytes {
@@ -136,7 +155,7 @@ mod tests {
 
     #[test]
     fn concatenated_members_round_trip() {
-        for algo in [Compression::Gzip, Compression::Lz4] {
+        for algo in [Compression::Gzip, Compression::Lz4, Compression::Zstd] {
             let a = compress_member(algo, b"first batch\n").unwrap();
             let b = compress_member(algo, b"second batch\n").unwrap();
             let mut joined = a;
@@ -148,7 +167,7 @@ mod tests {
 
     #[test]
     fn decompress_all_enforces_limit() {
-        for algo in [Compression::Gzip, Compression::Lz4] {
+        for algo in [Compression::Gzip, Compression::Lz4, Compression::Zstd] {
             let big = vec![b'a'; 10 * 1024];
             let member = compress_member(algo, &big).unwrap();
             assert!(member.len() < big.len());

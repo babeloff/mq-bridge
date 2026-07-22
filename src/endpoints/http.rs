@@ -8,7 +8,7 @@ use super::http_stream::{
     HttpReceiveStreamConfig, PublishResponseStreamError,
 };
 use crate::canonical_message::tracing_support::LazyMessageIds;
-use crate::models::{HttpConfig, HttpServerProtocol, TlsConfig};
+use crate::models::{Compression, HttpConfig, HttpServerProtocol, TlsConfig};
 use crate::traits::{
     BoxFuture, ConsumerError, MessageConsumer, MessagePublisher, ReceivedBatch, Sent,
 };
@@ -191,7 +191,7 @@ struct HttpConsumerState {
     fire_and_forget: bool,
     receive_streamable: bool,
     basic_auth: Option<(String, String)>,
-    compression_enabled: bool,
+    compression: Compression,
     compression_threshold_bytes: usize,
     custom_headers: HashMap<String, String>,
     concurrency_limit: ConcurrencyLimiter,
@@ -589,18 +589,19 @@ fn request_accepts_text(headers: &hyper::HeaderMap) -> bool {
     })
 }
 
-/// Returns true if the request's `Accept-Encoding` indicates the client can
-/// decode gzip (RFC 9110 §12.5.3). A missing header is treated as "identity
-/// only" — we do not compress, since RFC 9110 lets the server send identity by
-/// default and a client that didn't advertise gzip may be unable to decode it.
-/// An explicit `gzip;q=0` (or `*;q=0`) disables compression.
-fn request_accepts_gzip(headers: &hyper::HeaderMap) -> bool {
+/// Returns true if the request's `Accept-Encoding` advertises `coding` (RFC 9110 §12.5.3). A
+/// missing header is treated as "identity only" — we do not compress, since RFC 9110 lets the
+/// server send identity by default and a client that didn't advertise a coding may be unable to
+/// decode it. An explicit `<coding>;q=0` (or `*;q=0`) disables it. `allow_wildcard` controls
+/// whether a bare `*` counts as acceptance: true for the universally-decodable `gzip`, false for
+/// `lz4` (a non-standard coding a generic `*` client almost certainly cannot decode).
+fn request_accepts(headers: &hyper::HeaderMap, coding: &str, allow_wildcard: bool) -> bool {
     headers.get_all("accept-encoding").iter().any(|value| {
         value.to_str().ok().is_some_and(|raw| {
             raw.split(',').any(|item| {
                 let mut parts = item.split(';').map(str::trim);
-                let coding = parts.next().unwrap_or_default().to_ascii_lowercase();
-                if coding != "gzip" && coding != "*" {
+                let item_coding = parts.next().unwrap_or_default().to_ascii_lowercase();
+                if item_coding != coding && !(allow_wildcard && item_coding == "*") {
                     return false;
                 }
                 // Honor an explicit q=0, which excludes the coding.
@@ -612,6 +613,23 @@ fn request_accepts_gzip(headers: &hyper::HeaderMap) -> bool {
             })
         })
     })
+}
+
+/// Picks the encoding to use for a response body: the configured method, but only when the client
+/// advertised it can decode it. Falls back to `None` (identity) otherwise, so a plain client is
+/// never sent a body it cannot read.
+fn negotiate_response_compression(
+    headers: &hyper::HeaderMap,
+    configured: Compression,
+) -> Compression {
+    match configured {
+        Compression::Gzip if request_accepts(headers, "gzip", true) => Compression::Gzip,
+        Compression::Lz4 if request_accepts(headers, "lz4", false) => Compression::Lz4,
+        // zstd is a registered content coding, but a bare `*` client may predate it, so require the
+        // explicit token (a modern zstd-capable client always lists it).
+        Compression::Zstd if request_accepts(headers, "zstd", false) => Compression::Zstd,
+        _ => Compression::None,
+    }
 }
 
 fn http_version_str(version: hyper::Version) -> &'static str {
@@ -784,7 +802,7 @@ fn setup_http_state_and_channel(
         fire_and_forget: config.fire_and_forget,
         receive_streamable: config.receive_streamable,
         basic_auth: config.basic_auth.clone(),
-        compression_enabled: config.compression_enabled,
+        compression: config.effective_compression(),
         compression_threshold_bytes,
         custom_headers: config.custom_headers.clone(),
         concurrency_limit: ConcurrencyLimiter::new(config.concurrency_limit.unwrap_or(100)),
@@ -1432,12 +1450,13 @@ async fn handle_request_internal(
     // Pure-echo fast path: skip metadata construction; the response is fully
     // determined by the request. Gate is header-only so the body is untouched.
     if inline_echo_fast_path_applies(&state, &parts.headers) {
-        let client_accepts_gzip = request_accepts_gzip(&parts.headers);
+        let response_compression =
+            negotiate_response_compression(&parts.headers, state.compression);
         return inline_echo_response(
             &state,
             &parts.headers,
             body,
-            client_accepts_gzip,
+            response_compression,
             accepts_text,
             permit,
         )
@@ -1466,8 +1485,8 @@ async fn handle_request_internal(
         }
     }
 
-    // Whether the client can decode a gzip response (gates response compression).
-    let client_accepts_gzip = request_accepts_gzip(&parts.headers);
+    // The encoding to use for the response, gated on what the client advertised it can decode.
+    let response_compression = negotiate_response_compression(&parts.headers, state.compression);
 
     // Extract metadata before consuming body
     let mut metadata = HashMap::with_capacity(parts.headers.len() + 6);
@@ -1608,8 +1627,7 @@ async fn handle_request_internal(
 
         return make_response(
             disposition,
-            state.compression_enabled,
-            client_accepts_gzip,
+            response_compression,
             state.compression_threshold_bytes,
             &state.custom_headers,
             accepts_text,
@@ -1679,8 +1697,7 @@ async fn handle_request_internal(
     match tokio::time::timeout(timeout_duration, ack_rx).await {
         Ok(Ok(disposition)) => make_response(
             disposition,
-            state.compression_enabled,
-            client_accepts_gzip,
+            response_compression,
             state.compression_threshold_bytes,
             &state.custom_headers,
             accepts_text,
@@ -1741,7 +1758,7 @@ async fn inline_echo_response(
     state: &HttpConsumerState,
     request_headers: &hyper::HeaderMap,
     body: Incoming,
-    client_accepts_gzip: bool,
+    response_compression: Compression,
     accepts_text: bool,
     permit: tokio::sync::OwnedSemaphorePermit,
 ) -> anyhow::Result<Response<BoxBody>> {
@@ -1776,13 +1793,13 @@ async fn inline_echo_response(
         builder = builder.header(hyper::header::CONTENT_TYPE, "application/octet-stream");
     }
 
-    let (payload_out, was_compressed) = compress_if_needed(
+    let (payload_out, encoding) = compress_if_needed(
         body_bytes,
-        state.compression_enabled && client_accepts_gzip,
+        response_compression,
         state.compression_threshold_bytes,
     )?;
-    if was_compressed {
-        builder = builder.header("Content-Encoding", "gzip");
+    if let Some(token) = encoding {
+        builder = builder.header("Content-Encoding", token);
     }
 
     for (header_name, header_value) in &state.custom_headers {
@@ -1794,8 +1811,7 @@ async fn inline_echo_response(
 
 fn make_response(
     disposition: MessageDisposition,
-    compression_enabled: bool,
-    client_accepts_gzip: bool,
+    response_compression: Compression,
     compression_threshold_bytes: usize,
     custom_headers: &HashMap<String, String>,
     accepts_text: bool,
@@ -1868,19 +1884,19 @@ fn make_response(
             // Compress payload only if the application did not pre-encode it, and
             // only when enabled, beneficial, and the client advertised it can
             // decode gzip (RFC 9110 §12.5.3).
-            let (payload_out, was_compressed) = if let Some(encoding) = preset_encoding {
-                builder = builder.header("Content-Encoding", encoding);
-                (msg.payload, false)
+            let (payload_out, encoding) = if let Some(preset) = preset_encoding {
+                builder = builder.header("Content-Encoding", preset);
+                (msg.payload, None)
             } else {
                 compress_if_needed(
                     msg.payload,
-                    compression_enabled && client_accepts_gzip,
+                    response_compression,
                     compression_threshold_bytes,
                 )?
             };
 
-            if was_compressed {
-                builder = builder.header("Content-Encoding", "gzip");
+            if let Some(token) = encoding {
+                builder = builder.header("Content-Encoding", token);
             }
 
             // Add custom headers to response
@@ -2033,7 +2049,7 @@ pub struct HttpPublisher {
     method: hyper::Method,
     request_timeout: std::time::Duration,
     batch_concurrency: usize,
-    compression_enabled: bool,
+    compression: Compression,
     compression_threshold_bytes: usize,
     basic_auth_header: Option<String>,
     custom_headers: HashMap<String, String>,
@@ -2083,7 +2099,7 @@ impl HttpPublisher {
             method,
             request_timeout,
             batch_concurrency,
-            compression_enabled: config.compression_enabled,
+            compression: config.effective_compression(),
             compression_threshold_bytes,
             basic_auth_header: basic_auth_header_value(config.basic_auth.as_ref()),
             custom_headers: config.custom_headers.clone(),
@@ -2157,18 +2173,28 @@ impl HttpPublisher {
             request_builder = request_builder.header(header_name.as_str(), header_value.as_str());
         }
 
+        // Advertise the coding we can decode so a peer may compress its response. gzip is handled by
+        // the client stack; lz4/zstd must be set explicitly since we decode those ourselves.
+        match self.compression {
+            Compression::Lz4 => request_builder = request_builder.header("Accept-Encoding", "lz4"),
+            Compression::Zstd => {
+                request_builder = request_builder.header("Accept-Encoding", "zstd")
+            }
+            _ => {}
+        }
+
         // Compress payload if enabled and beneficial
-        let (payload_out, was_compressed) = compress_if_needed(
+        let (payload_out, encoding) = compress_if_needed(
             message.payload.clone(),
-            self.compression_enabled,
+            self.compression,
             self.compression_threshold_bytes,
         )
         .map_err(|e| {
             PublisherError::NonRetryable(anyhow::anyhow!("Failed to compress payload: {}", e))
         })?;
 
-        if was_compressed {
-            request_builder = request_builder.header("Content-Encoding", "gzip");
+        if let Some(token) = encoding {
+            request_builder = request_builder.header("Content-Encoding", token);
         }
 
         let body = http_body_util::Full::from(payload_out);
@@ -2554,45 +2580,74 @@ fn load_private_key(path: &str) -> anyhow::Result<PrivateKeyDer<'static>> {
     rustls_pemfile::private_key(&mut key_file)?.context("No private key found in file")
 }
 
-/// Compresses data using gzip if it exceeds the threshold.
-/// Returns (compressed_data, was_compressed).
+/// Compresses data with `method` if it exceeds the threshold. Returns the (possibly unchanged)
+/// bytes and the `Content-Encoding` token to set, or `None` when the body was left uncompressed.
 #[cfg(feature = "http")]
 fn compress_if_needed(
     data: Bytes,
-    compression_enabled: bool,
+    method: Compression,
     threshold: usize,
-) -> anyhow::Result<(Bytes, bool)> {
-    if !compression_enabled || data.len() < threshold {
-        return Ok((data, false));
+) -> anyhow::Result<(Bytes, Option<&'static str>)> {
+    if matches!(method, Compression::None) || data.len() < threshold {
+        return Ok((data, None));
     }
 
-    use flate2::Compression;
     use std::io::Write;
 
     // Pre-size output to avoid per-response reallocs.
-    let mut encoder =
-        flate2::write::GzEncoder::new(Vec::with_capacity(data.len() / 2 + 64), Compression::fast());
-    encoder.write_all(&data)?;
-    let compressed = encoder.finish()?;
+    let (compressed, token): (Vec<u8>, &'static str) = match method {
+        Compression::None => unreachable!(),
+        Compression::Gzip => {
+            let mut encoder = flate2::write::GzEncoder::new(
+                Vec::with_capacity(data.len() / 2 + 64),
+                flate2::Compression::fast(),
+            );
+            encoder.write_all(&data)?;
+            (encoder.finish()?, "gzip")
+        }
+        Compression::Lz4 => {
+            let mut encoder =
+                lz4_flex::frame::FrameEncoder::new(Vec::with_capacity(data.len() / 2 + 64));
+            encoder.write_all(&data)?;
+            (
+                encoder
+                    .finish()
+                    .map_err(|e| anyhow!("lz4 encode failed: {}", e))?,
+                "lz4",
+            )
+        }
+        Compression::Zstd => (
+            zstd::stream::encode_all(&data[..], zstd::DEFAULT_COMPRESSION_LEVEL)?,
+            "zstd",
+        ),
+    };
 
-    // Only use compression if it actually saves space
+    // Only use compression if it actually saves space.
     if compressed.len() < data.len() {
-        Ok((Bytes::from(compressed), true))
+        Ok((Bytes::from(compressed), Some(token)))
     } else {
-        Ok((data, false))
+        Ok((data, None))
     }
 }
 
-/// Decompresses gzip data if the Content-Encoding header indicates it.
+/// Decompresses the body if the `Content-Encoding` header indicates gzip, lz4, or zstd.
 #[cfg(feature = "http")]
 fn decompress_if_needed(data: Bytes, content_encoding: Option<&str>) -> anyhow::Result<Bytes> {
+    use std::io::Read;
     if let Some(encoding) = content_encoding {
-        if encoding.to_lowercase().contains("gzip") {
-            use std::io::Read;
+        let encoding = encoding.to_ascii_lowercase();
+        if encoding.contains("gzip") {
             let mut decoder = flate2::read::GzDecoder::new(&data[..]);
             let mut decompressed = Vec::new();
             decoder.read_to_end(&mut decompressed)?;
             return Ok(Bytes::from(decompressed));
+        } else if encoding.contains("lz4") {
+            let mut decoder = lz4_flex::frame::FrameDecoder::new(&data[..]);
+            let mut decompressed = Vec::new();
+            decoder.read_to_end(&mut decompressed)?;
+            return Ok(Bytes::from(decompressed));
+        } else if encoding.contains("zstd") {
+            return Ok(Bytes::from(zstd::stream::decode_all(&data[..])?));
         }
     }
     Ok(data)
@@ -2773,33 +2828,99 @@ http_route:
     fn test_request_accepts_gzip_false_without_header() {
         // No Accept-Encoding => identity only, do not compress.
         let headers = hyper::HeaderMap::new();
-        assert!(!request_accepts_gzip(&headers));
+        assert!(!request_accepts(&headers, "gzip", true));
     }
 
     #[test]
     fn test_request_accepts_gzip_matches_gzip_and_wildcard() {
         let mut headers = hyper::HeaderMap::new();
         headers.insert(ACCEPT_ENCODING, "gzip, deflate, br".parse().unwrap());
-        assert!(request_accepts_gzip(&headers));
+        assert!(request_accepts(&headers, "gzip", true));
 
         headers.insert(ACCEPT_ENCODING, "deflate, gzip;q=0.8".parse().unwrap());
-        assert!(request_accepts_gzip(&headers));
+        assert!(request_accepts(&headers, "gzip", true));
 
         headers.insert(ACCEPT_ENCODING, "*".parse().unwrap());
-        assert!(request_accepts_gzip(&headers));
+        assert!(request_accepts(&headers, "gzip", true));
     }
 
     #[test]
     fn test_request_accepts_gzip_honors_q_zero_and_other_codings() {
         let mut headers = hyper::HeaderMap::new();
         headers.insert(ACCEPT_ENCODING, "gzip;q=0".parse().unwrap());
-        assert!(!request_accepts_gzip(&headers));
+        assert!(!request_accepts(&headers, "gzip", true));
 
         headers.insert(ACCEPT_ENCODING, "*;q=0".parse().unwrap());
-        assert!(!request_accepts_gzip(&headers));
+        assert!(!request_accepts(&headers, "gzip", true));
 
         headers.insert(ACCEPT_ENCODING, "br, deflate".parse().unwrap());
-        assert!(!request_accepts_gzip(&headers));
+        assert!(!request_accepts(&headers, "gzip", true));
+    }
+
+    #[test]
+    fn test_negotiate_response_compression_gzip_and_lz4() {
+        let mut headers = hyper::HeaderMap::new();
+        // A bare `*` accepts gzip but NOT lz4 (a generic client can't decode lz4).
+        headers.insert(ACCEPT_ENCODING, "*".parse().unwrap());
+        assert_eq!(
+            negotiate_response_compression(&headers, Compression::Gzip),
+            Compression::Gzip
+        );
+        assert_eq!(
+            negotiate_response_compression(&headers, Compression::Lz4),
+            Compression::None
+        );
+
+        // Explicit lz4 is honored; a config of None never compresses.
+        headers.insert(ACCEPT_ENCODING, "lz4".parse().unwrap());
+        assert_eq!(
+            negotiate_response_compression(&headers, Compression::Lz4),
+            Compression::Lz4
+        );
+        assert_eq!(
+            negotiate_response_compression(&headers, Compression::None),
+            Compression::None
+        );
+
+        // zstd, like lz4, requires the explicit token (not `*`).
+        headers.insert(ACCEPT_ENCODING, "gzip, br, zstd".parse().unwrap());
+        assert_eq!(
+            negotiate_response_compression(&headers, Compression::Zstd),
+            Compression::Zstd
+        );
+        headers.insert(ACCEPT_ENCODING, "gzip, br".parse().unwrap());
+        assert_eq!(
+            negotiate_response_compression(&headers, Compression::Zstd),
+            Compression::None
+        );
+    }
+
+    #[test]
+    fn test_effective_compression_maps_legacy_flag_to_gzip() {
+        // Legacy `compression_enabled: true` with no explicit method => gzip.
+        let mut cfg = HttpConfig::new("http://localhost");
+        cfg.compression_enabled = Some(true);
+        assert_eq!(cfg.effective_compression(), Compression::Gzip);
+
+        // An explicit method always wins over the deprecated flag.
+        cfg.compression = Compression::Lz4;
+        assert_eq!(cfg.effective_compression(), Compression::Lz4);
+
+        // Neither set => no compression.
+        let plain = HttpConfig::new("http://localhost");
+        assert_eq!(plain.effective_compression(), Compression::None);
+    }
+
+    #[test]
+    fn test_compress_decompress_round_trip_lz4_and_zstd() {
+        for (method, token) in [(Compression::Lz4, "lz4"), (Compression::Zstd, "zstd")] {
+            let data = Bytes::from(vec![b'x'; 4096]);
+            let (compressed, encoding) = compress_if_needed(data.clone(), method, 16).unwrap();
+            assert_eq!(encoding, Some(token));
+            assert!(compressed.len() < data.len());
+            let restored = decompress_if_needed(compressed, Some(token)).unwrap();
+            assert_eq!(restored, data, "method {method:?}");
+        }
     }
 
     #[test]

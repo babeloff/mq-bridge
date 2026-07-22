@@ -23,7 +23,7 @@ static assets from ``/data/static`` (``STATIC_DIR``), Postgres from
 an empty result so the cleartext profiles still run.
 
 ``json-comp`` is handled by mq-bridge's response compression
-(``compression_enabled``): bodies over the threshold are gzip-encoded when the
+(``compression: gzip``): bodies over the threshold are gzip-encoded when the
 client advertises ``Accept-Encoding: gzip``, identity otherwise — so the same
 ``/json`` handler serves both ``json`` and ``json-comp``.
 """
@@ -76,7 +76,7 @@ def _http_route(name: str, listen: str, http_workers: int, extra: str = "") -> s
         concurrency_limit: 65536
         internal_buffer_size: 16384
         inline_response_fast_path: true
-        compression_enabled: true
+        compression: gzip
         compression_threshold_bytes: 256
 {extra}
     output:

@@ -1,5 +1,5 @@
 //  mq-bridge
-//  © Copyright 2025, by Marco Mengelkoch
+//  © Copyright 2026, by Marco Mengelkoch
 //  Licensed under MIT License, see License file for more details
 //  git clone https://github.com/marcomq/mq-bridge
 

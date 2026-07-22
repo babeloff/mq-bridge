@@ -242,6 +242,11 @@
             "type": "string"
           }
         },
+        "compression": {
+          "description": "HTTP body compression for inserts and cursor reads (`none`, `gzip`, `lz4`, `zstd`). Applied\nas `Content-Encoding` on the request body and negotiated on the response via `Accept-Encoding`.\n`lz4`/`zstd` are faster than `gzip`; all are understood natively by ClickHouse. Defaults to `gzip`.",
+          "$ref": "#/$defs/Compression",
+          "default": "gzip"
+        },
         "connect_timeout_ms": {
           "description": "Connection (TCP + TLS handshake) timeout in milliseconds. Defaults to 10000ms.",
           "type": [
@@ -360,7 +365,7 @@
       ]
     },
     "Compression": {
-      "description": "Batch compression for the file and object_store endpoints. Orthogonal to `format`.",
+      "description": "Compression algorithm. Used for at-rest batches (file, object_store) and for HTTP\nbody compression (http, clickhouse). Orthogonal to `format`.",
       "oneOf": [
         {
           "description": "No compression (default).",
@@ -376,6 +381,11 @@
           "description": "lz4 frame format; each batch is a self-contained frame (`lz4 -d` compatible).",
           "type": "string",
           "const": "lz4"
+        },
+        {
+          "description": "zstd; each batch is a self-contained frame, concatenated frames decode as one\nstream (`zstd -d` compatible). Better ratio than lz4, still fast.",
+          "type": "string",
+          "const": "zstd"
         }
       ]
     },
@@ -916,7 +926,7 @@
       "type": "object",
       "properties": {
         "compression": {
-          "description": "Per-batch compression (`none`, `gzip`, `lz4`). Requires the `compression` feature; consume mode only.",
+          "description": "Per-batch compression (`none`, `gzip`, `lz4`, `zstd`). Requires the `compression` feature; consume mode only.",
           "$ref": "#/$defs/Compression",
           "default": "none"
         },
@@ -1195,10 +1205,17 @@
           "format": "uint",
           "minimum": 0
         },
+        "compression": {
+          "description": "Compression for request/response bodies exceeding the threshold (`none`, `gzip`, `lz4`, `zstd`).\n`gzip`/`zstd` are standard HTTP content encodings; `lz4` is non-standard, so it only applies to\npeers that advertise `Accept-Encoding: lz4` (e.g. another mq-bridge). Server responses are only\ncompressed with a method the client advertised (`zstd`/`lz4` require the explicit token, not `*`).\nDefaults to `none`.",
+          "$ref": "#/$defs/Compression",
+          "default": "none"
+        },
         "compression_enabled": {
-          "description": "Enable gzip compression for request/response bodies exceeding the threshold. Defaults to false.",
-          "type": "boolean",
-          "default": false
+          "description": "Deprecated: replaced by `compression`. Kept for backward compatibility — a legacy\n`compression_enabled: true` (with `compression` unset) is treated as `compression: gzip`.",
+          "type": [
+            "boolean",
+            "null"
+          ]
         },
         "compression_threshold_bytes": {
           "description": "Minimum message size in bytes to compress. Messages smaller than this are sent uncompressed. Defaults to 1024 bytes.",
@@ -2403,7 +2420,7 @@
           ]
         },
         "compression": {
-          "description": "Whole-object compression (`none`, `gzip`, `lz4`). Requires the `compression` feature.",
+          "description": "Whole-object compression (`none`, `gzip`, `lz4`, `zstd`). Requires the `compression` feature.",
           "$ref": "#/$defs/Compression",
           "default": "none"
         },
@@ -2439,7 +2456,7 @@
           "default": null
         },
         "extension": {
-          "description": "(Sink only) Extension for written objects, without the dot. Defaults to a value derived\nfrom `format`, `compression` and `encryption` (e.g. `jsonl`, `csv`, `bin`, `jsonl.gz`,\n`jsonl.lz4`, `jsonl.gz.enc`); encrypted objects get a trailing `.enc` since they are\nciphertext, not a directly decompressable `.gz`.",
+          "description": "(Sink only) Extension for written objects, without the dot. Defaults to a value derived\nfrom `format`, `compression` and `encryption` (e.g. `jsonl`, `csv`, `bin`, `jsonl.gz`,\n`jsonl.lz4`, `jsonl.gz.enc`); encrypted objects get a trailing `.enc` since they are\nciphertext, not a directly decompressible `.gz`.",
           "type": [
             "string",
             "null"

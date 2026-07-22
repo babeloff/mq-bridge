@@ -352,14 +352,14 @@ output:
   file:
     path: "data.enc"
     format: raw
-    compression: lz4          # none | gzip | lz4  (`compression` feature)
+    compression: lz4          # none | gzip | lz4 | zstd  (`compression` feature)
     encryption: { key: "${env:MQB_ENC_KEY}" }
 ```
 
 Both endpoints accept the same `compression` and `encryption` fields (`object_store`
 derives its default object extension from them, e.g. `.jsonl.gz` / `.jsonl.lz4`, and adds a
 trailing `.enc` when encryption is on since the object is ciphertext, not a directly
-decompressable `.gz`). An
+decompressible `.gz`). An
 encrypted **file** is written as length-prefixed sealed frames (one per batch) and is only
 readable through a matching consumer; a compressed-only file stays a standard `.gz`/`.lz4`
 stream. File compression/encryption supports only the default `consume` mode and no `csv`

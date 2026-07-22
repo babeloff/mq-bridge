@@ -46,6 +46,7 @@ class ClickHouseConfig(TypedDict, total=False):
     async_insert: bool
     checkpoint_store: Optional[str]
     columns: Optional[Dict[str, str]]
+    compression: Compression
     connect_timeout_ms: Optional[int]
     cursor_column: Optional[str]
     cursor_id: Optional[str]
@@ -164,7 +165,8 @@ class HttpConfig(TypedDict, total=False):
     """General HTTP connection configuration."""
     basic_auth: Optional[List[Any]]
     batch_concurrency: Optional[int]
-    compression_enabled: bool
+    compression: Compression
+    compression_enabled: Optional[bool]
     compression_threshold_bytes: Optional[int]
     concurrency_limit: Optional[int]
     custom_headers: Dict[str, str]
@@ -517,7 +519,7 @@ class ZeroMqConfig(TypedDict, total=False):
 
 
 CipherKind = Literal["xchacha20poly1305", "aes256gcm"]
-Compression = Literal["none", "gzip", "lz4"]
+Compression = Literal["none", "gzip", "lz4", "zstd"]
 FaultMode = Literal["panic", "disconnect", "timeout", "json_format_error", "nack"]
 FileFormat = Literal["normal", "json", "text", "raw", "csv"]
 HttpServerProtocol = Literal["auto", "http1_only", "http2_only"]

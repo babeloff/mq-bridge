@@ -786,6 +786,7 @@ impl Route {
                                     let is_end_of_stream = e.downcast_ref::<ConsumerError>().is_some_and(|ce| matches!(ce, ConsumerError::EndOfStream));
                                     let is_permanent =
                                         e.downcast_ref::<ProcessingError>().is_some_and(|pe| matches!(pe, ProcessingError::NonRetryable(_)))
+                                        || e.downcast_ref::<ConsumerError>().is_some_and(|ce| matches!(ce, ConsumerError::Permanent(_)))
                                         || is_end_of_stream;
 
                                     {
@@ -954,6 +955,11 @@ impl Route {
                         Err(ConsumerError::Gap { requested, base }) => {
                             // Propagate gap error to trigger reconnect by the outer loop
                             break Err(anyhow::anyhow!("Consumer gap: requested offset {requested} but earliest available is {base}"));
+                        }
+                        Err(ConsumerError::Permanent(e)) => {
+                            // Non-retryable: shut the route down instead of reconnecting
+                            // and re-reading the same poison message forever.
+                            break Err(ConsumerError::Permanent(e).into());
                         }
                     };
                     debug!("Received a batch of {} messages sequentially", received_batch.messages.len());
@@ -1156,6 +1162,12 @@ impl Route {
                         Err(ConsumerError::Gap { requested, base }) => {
                             // Propagate gap error to trigger reconnect by the outer loop
                             loop_error = Some(ConsumerError::Gap { requested, base }.into());
+                            break;
+                        }
+                        Err(ConsumerError::Permanent(e)) => {
+                            // Non-retryable: shut the route down instead of reconnecting
+                            // and re-reading the same poison message forever.
+                            loop_error = Some(ConsumerError::Permanent(e).into());
                             break;
                         }
                     };

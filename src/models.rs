@@ -1472,7 +1472,8 @@ pub enum FileFormat {
     Csv,
 }
 
-/// Batch compression for the file and object_store endpoints. Orthogonal to `format`.
+/// Compression algorithm. Used for at-rest batches (file, object_store) and for HTTP
+/// body compression (http, clickhouse). Orthogonal to `format`.
 #[derive(Debug, Deserialize, Serialize, Clone, Copy, Default, PartialEq, Eq)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
@@ -1484,6 +1485,9 @@ pub enum Compression {
     Gzip,
     /// lz4 frame format; each batch is a self-contained frame (`lz4 -d` compatible).
     Lz4,
+    /// zstd; each batch is a self-contained frame, concatenated frames decode as one
+    /// stream (`zstd -d` compatible). Better ratio than lz4, still fast.
+    Zstd,
 }
 
 // --- File Specific Configuration ---
@@ -1504,7 +1508,7 @@ pub struct FileConfig {
     /// The format for writing messages to the file (Publisher) or interpreting them (Consumer). Defaults to `normal`.
     #[serde(default)]
     pub format: FileFormat,
-    /// Per-batch compression (`none`, `gzip`, `lz4`). Requires the `compression` feature; consume mode only.
+    /// Per-batch compression (`none`, `gzip`, `lz4`, `zstd`). Requires the `compression` feature; consume mode only.
     #[serde(default)]
     pub compression: Compression,
     /// At-rest AEAD encryption applied after compression. Requires the `encryption` feature; consume mode only.
@@ -1622,9 +1626,9 @@ pub struct ObjectStoreConfig {
     /// (Sink only) Extension for written objects, without the dot. Defaults to a value derived
     /// from `format`, `compression` and `encryption` (e.g. `jsonl`, `csv`, `bin`, `jsonl.gz`,
     /// `jsonl.lz4`, `jsonl.gz.enc`); encrypted objects get a trailing `.enc` since they are
-    /// ciphertext, not a directly decompressable `.gz`.
+    /// ciphertext, not a directly decompressible `.gz`.
     pub extension: Option<String>,
-    /// Whole-object compression (`none`, `gzip`, `lz4`). Requires the `compression` feature.
+    /// Whole-object compression (`none`, `gzip`, `lz4`, `zstd`). Requires the `compression` feature.
     #[serde(default)]
     pub compression: Compression,
     /// At-rest AEAD encryption applied after compression. Requires the `encryption` feature.
@@ -2643,9 +2647,17 @@ pub struct HttpConfig {
     /// (Publisher only) Timeout for idle connections in the connection pool in milliseconds. Defaults to 90000ms.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pool_idle_timeout_ms: Option<u64>,
-    /// Enable gzip compression for request/response bodies exceeding the threshold. Defaults to false.
+    /// Compression for request/response bodies exceeding the threshold (`none`, `gzip`, `lz4`, `zstd`).
+    /// `gzip`/`zstd` are standard HTTP content encodings; `lz4` is non-standard, so it only applies to
+    /// peers that advertise `Accept-Encoding: lz4` (e.g. another mq-bridge). Server responses are only
+    /// compressed with a method the client advertised (`zstd`/`lz4` require the explicit token, not `*`).
+    /// Defaults to `none`.
     #[serde(default)]
-    pub compression_enabled: bool,
+    pub compression: Compression,
+    /// Deprecated: replaced by `compression`. Kept for backward compatibility — a legacy
+    /// `compression_enabled: true` (with `compression` unset) is treated as `compression: gzip`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compression_enabled: Option<bool>,
     /// Minimum message size in bytes to compress. Messages smaller than this are sent uncompressed. Defaults to 1024 bytes.
     #[serde(default)]
     pub compression_threshold_bytes: Option<usize>,
@@ -2771,6 +2783,20 @@ impl HttpConfig {
 
     pub fn inline_response_fast_path_enabled(&self) -> bool {
         self.inline_response_fast_path.unwrap_or(true)
+    }
+
+    /// Resolves the effective body compression, honoring the deprecated `compression_enabled`
+    /// flag: when `compression` is left at its `none` default but a legacy `compression_enabled:
+    /// true` is present, it maps to `gzip` (matching the old behavior) and warns once.
+    pub fn effective_compression(&self) -> Compression {
+        if self.compression == Compression::None && self.compression_enabled == Some(true) {
+            tracing::warn!(
+                "HTTP config `compression_enabled: true` is deprecated; use `compression: gzip`. \
+                 Treating it as `gzip` for now."
+            );
+            return Compression::Gzip;
+        }
+        self.compression
     }
 
     pub fn with_stream_response_to(mut self, endpoint: Endpoint) -> Self {
@@ -3238,6 +3264,15 @@ pub struct ClickHouseConfig {
     /// TLS configuration for `https://` connections.
     #[serde(default)]
     pub tls: TlsConfig,
+    /// HTTP body compression for inserts and cursor reads (`none`, `gzip`, `lz4`, `zstd`). Applied
+    /// as `Content-Encoding` on the request body and negotiated on the response via `Accept-Encoding`.
+    /// `lz4`/`zstd` are faster than `gzip`; all are understood natively by ClickHouse. Defaults to `gzip`.
+    #[serde(default = "default_gzip_compression")]
+    pub compression: Compression,
+}
+
+fn default_gzip_compression() -> Compression {
+    Compression::Gzip
 }
 
 // --- Common Configuration ---

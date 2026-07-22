@@ -109,10 +109,13 @@ impl EncryptionConsumer {
     }
 
     fn open_message(&self, message: &mut CanonicalMessage) -> Result<(), ConsumerError> {
+        // A decrypt/authentication failure is permanent: the ciphertext will never
+        // open, so it must be surfaced as non-retryable rather than triggering an
+        // endless reconnect-and-re-read of the same poison message.
         let opened = self
             .crypto
             .open(&message.payload, b"")
-            .map_err(ConsumerError::Connection)?;
+            .map_err(ConsumerError::Permanent)?;
         message.payload = opened.into();
         Ok(())
     }
@@ -266,6 +269,11 @@ mod tests {
             &config(),
         )
         .unwrap();
-        assert!(consumer.receive_batch(10).await.is_err());
+        // A tampered payload is a permanent failure, not a reconnectable one, so
+        // the poison message is not re-read indefinitely.
+        assert!(matches!(
+            consumer.receive_batch(10).await,
+            Err(ConsumerError::Permanent(_))
+        ));
     }
 }

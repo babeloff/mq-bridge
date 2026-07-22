@@ -60,7 +60,9 @@ impl MessagePublisher for ReaderPublisher {
                 Ok(Sent::Response(received.message))
             }
             Err(e) => match e {
-                ConsumerError::EndOfStream => Err(PublisherError::NonRetryable(anyhow::anyhow!(e))),
+                ConsumerError::EndOfStream | ConsumerError::Permanent(_) => {
+                    Err(PublisherError::NonRetryable(anyhow::anyhow!(e)))
+                }
                 _ => Err(PublisherError::Retryable(anyhow::anyhow!(e))),
             },
         }
@@ -93,7 +95,9 @@ impl MessagePublisher for ReaderPublisher {
                 Ok(SentBatch::Ack)
             }
             Err(e) => match e {
-                ConsumerError::EndOfStream => Err(PublisherError::NonRetryable(anyhow::anyhow!(e))),
+                ConsumerError::EndOfStream | ConsumerError::Permanent(_) => {
+                    Err(PublisherError::NonRetryable(anyhow::anyhow!(e)))
+                }
                 _ => Err(PublisherError::Retryable(anyhow::anyhow!(e))),
             },
         }

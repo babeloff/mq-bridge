@@ -132,6 +132,8 @@ h2 = { version = "0.4", optional = true }
 flate2 = { version = "1.0", optional = true }
 # lz4 frame format (concatenable frames, like gzip members) for the `compression` feature.
 lz4_flex = { version = "0.14", optional = true, default-features = false, features = ["frame"] }
+# zstd (bundled libzstd via zstd-sys); Decoder handles concatenated frames like gzip/lz4.
+zstd = { version = "0.13", optional = true }
 base64 = { version = "0.22", optional = true }
 
 # AEAD ciphers for the `encryption` feature (payload middleware + at-rest file/object).
@@ -207,9 +209,9 @@ portable = ["mongodb", "amqp", "nats", "mqtt", "http", "aws", "zeromq", "redis-s
 
 # Functionality features
 dedup = ["sled"]
-# Batch compression (`compression: gzip|lz4`) on the file and object_store
+# Batch compression (`compression: gzip|lz4|zstd`) on the file and object_store
 # endpoints. flate2 is already pulled in by the http/clickhouse features.
-compression = ["dep:flate2", "dep:lz4_flex"]
+compression = ["dep:flate2", "dep:lz4_flex", "dep:zstd"]
 # AEAD payload encryption: the `encryption` middleware and the at-rest
 # `encryption` field on the file/object_store endpoints.
 encryption = ["dep:chacha20poly1305", "dep:aes-gcm", "dep:base64"]
@@ -237,7 +239,7 @@ amqp = ["lapin", "rustls", "rustls-pemfile", "url"]
 nats = ["async-nats", "rustls", "rustls-pemfile"]
 mongodb = ["dep:mongodb", "url"]
 mqtt = ["rumqttc", "rustls", "tokio-rustls", "rustls-pemfile", "url"]
-http = ["dep:arc-swap", "hyper", "hyper-util", "hyper-rustls", "http-body-util", "dep:http-body", "rustls", "tokio-rustls", "rustls-pemfile", "webpki-roots", "h2", "dep:flate2", "dep:base64"]
+http = ["dep:arc-swap", "hyper", "hyper-util", "hyper-rustls", "http-body-util", "dep:http-body", "rustls", "tokio-rustls", "rustls-pemfile", "webpki-roots", "h2", "dep:flate2", "dep:lz4_flex", "dep:zstd", "dep:base64"]
 websocket = ["dep:tokio-websockets"]
 aws = ["aws-config", "aws-sdk-sqs", "aws-sdk-sns", "dep:base64"]
 # Runtime-loaded IBM MQ client via dlopen: builds with no SDK present; the IBM
@@ -257,7 +259,7 @@ redis-streams = ["dep:redis"]
 # Note: The grpc feature requires protobuf-src which can significantly increase build times.
 grpc = ["tonic", "prost", "tokio-stream", "tonic-prost", "tonic-prost-build", "protoc-bin-vendored", "rustls"]
 sqlx = ["dep:sqlx", "url"]
-clickhouse = ["dep:reqwest", "dep:flate2", "url"]
+clickhouse = ["dep:reqwest", "dep:flate2", "dep:lz4_flex", "dep:zstd", "url"]
 # Cloud object-store checkpoint backend (S3/GCS/Azure/R2). Talks cloud REST via reqwest.
 object-store = ["dep:object_store", "url"]
 # Postgres logical-replication CDC (pgoutput). Reuses the sqlx dependency for the

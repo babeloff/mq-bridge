@@ -88,6 +88,7 @@ fn extension_for(format: &FileFormat, compression: Compression, encrypted: bool)
         Compression::None => base.to_string(),
         Compression::Gzip => format!("{base}.gz"),
         Compression::Lz4 => format!("{base}.lz4"),
+        Compression::Zstd => format!("{base}.zst"),
     };
     if encrypted {
         ext.push_str(".enc");
@@ -729,6 +730,10 @@ mod tests {
             extension_for(&FileFormat::Raw, Compression::Lz4, false),
             "bin.lz4"
         );
+        assert_eq!(
+            extension_for(&FileFormat::Normal, Compression::Zstd, false),
+            "jsonl.zst"
+        );
         // Encrypted objects are ciphertext -> trailing `.enc`, never a bare `.gz`.
         assert_eq!(
             extension_for(&FileFormat::Normal, Compression::Gzip, true),
@@ -762,7 +767,7 @@ mod tests {
     #[cfg(feature = "compression")]
     #[tokio::test]
     async fn compressed_object_round_trips() {
-        for compression in [Compression::Gzip, Compression::Lz4] {
+        for compression in [Compression::Gzip, Compression::Lz4, Compression::Zstd] {
             let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
 
             let mut publisher = test_publisher(store.clone());
@@ -786,6 +791,7 @@ mod tests {
                 .unwrap();
             let suffix = match compression {
                 Compression::Gzip => ".bin.gz",
+                Compression::Zstd => ".bin.zst",
                 _ => ".bin.lz4",
             };
             assert!(listed.location.to_string().ends_with(suffix));
