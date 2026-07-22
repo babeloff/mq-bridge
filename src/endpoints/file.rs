@@ -308,6 +308,17 @@ impl FilePublisher {
                 let sealed = crypto
                     .seal(&member, b"")
                     .map_err(PublisherError::NonRetryable)?;
+                // The consumer rejects any frame whose length prefix exceeds this cap, so a
+                // batch sealing larger than it would be written but never read back. Fail
+                // fast and tell the operator to shrink batch_size rather than emit a member
+                // that corrupts the stream on read.
+                if sealed.len() as u64 > MAX_ENCRYPTED_FRAME_BYTES {
+                    return Err(PublisherError::NonRetryable(anyhow::anyhow!(
+                        "encrypted batch frame is {} bytes, exceeding the {} byte cap the consumer can read; reduce batch_size",
+                        sealed.len(),
+                        MAX_ENCRYPTED_FRAME_BYTES
+                    )));
+                }
                 let mut framed = Vec::with_capacity(8 + sealed.len());
                 framed.extend_from_slice(&(sealed.len() as u64).to_be_bytes());
                 framed.extend_from_slice(&sealed);
@@ -338,6 +349,12 @@ impl FilePublisher {
                         pre_len,
                         te
                     );
+                    // Rollback failed, so a partial member is still on disk. A Retryable
+                    // re-append would concatenate onto that torn member and corrupt the
+                    // whole stream, so fail permanently instead of letting a retry compound it.
+                    return Err(PublisherError::NonRetryable(anyhow::Error::new(e).context(
+                        "Failed to write member to file and could not truncate the partial write",
+                    )));
                 }
                 return Err(PublisherError::Retryable(
                     anyhow::Error::new(e).context("Failed to write member to file"),
@@ -353,6 +370,33 @@ impl FilePublisher {
                 responses: None,
                 failed: failed_messages,
             })
+        }
+    }
+}
+
+/// Truncates the append-mode file back to `pre_len` (its length before the batch) so a Retryable
+/// re-append starts from a clean record boundary instead of duplicating a partially written prefix.
+/// When the file's CSV header was written in this batch it is rolled off with the prefix, so the
+/// in-memory "header written" flag is cleared to make the retry rewrite it. `pre_len == None` (the
+/// pre-batch stat failed) skips the rollback and preserves the old duplicate-on-retry behaviour.
+async fn roll_back_partial_batch(
+    writer: &BufWriter<File>,
+    pre_len: Option<u64>,
+    wrote_csv_header: bool,
+    csv_header: Option<&mut tokio::sync::MutexGuard<'_, Option<Vec<String>>>>,
+) {
+    let Some(pl) = pre_len else { return };
+    if let Err(te) = writer.get_ref().set_len(pl).await {
+        tracing::error!(
+            "Failed to truncate file back to {} after write error: {}",
+            pl,
+            te
+        );
+        return;
+    }
+    if wrote_csv_header {
+        if let Some(hdr) = csv_header {
+            **hdr = None;
         }
     }
 }
@@ -387,15 +431,19 @@ impl MessagePublisher for FilePublisher {
             .await
             .context("Failed to open file for writing batch")?;
 
-        let file_is_empty = if matches!(self.format, FileFormat::Csv) {
-            file.metadata().await.map(|m| m.len() == 0).unwrap_or(false)
-        } else {
-            false
-        };
+        // Length before the batch. The 1 MiB BufWriter auto-flushes full chunks mid-loop, so a
+        // failure partway through a large batch can leave a partial prefix on disk; truncate back
+        // to here on failure so the Retryable re-append starts clean instead of duplicating it.
+        // `None` (stat failed) degrades to the old behaviour: no rollback.
+        let pre_len = file.metadata().await.ok().map(|m| m.len());
+        let file_is_empty = matches!(self.format, FileFormat::Csv) && pre_len == Some(0);
         // 1 MiB, not tokio's 8 KiB default: at ~100 B/record a small buffer turns a
         // bulk copy into ~13k write syscalls. Worth ~18% on file-to-file throughput.
         let mut writer = BufWriter::with_capacity(1 << 20, file);
         let mut failed_messages = Vec::new();
+        // Tracks whether this batch wrote the CSV header. On rollback the header is truncated off
+        // disk, so its in-memory "already written" flag must be cleared or the retry would skip it.
+        let mut wrote_csv_header = false;
         let mut csv_header_guard = if matches!(self.format, FileFormat::Csv) {
             Some(self.csv_header.lock().await)
         } else {
@@ -433,6 +481,7 @@ impl MessagePublisher for FilePublisher {
                                             e
                                         )));
                                     }
+                                    wrote_csv_header = true;
                                 }
                                 **hdr = Some(cols);
                             }
@@ -479,16 +528,33 @@ impl MessagePublisher for FilePublisher {
                 // remaining messages in this batch are unwritten. Abort so the whole batch is
                 // retried rather than reusing the writer, flushing partial data, or acking
                 // messages that never reached the file.
+                roll_back_partial_batch(
+                    &writer,
+                    pre_len,
+                    wrote_csv_header,
+                    csv_header_guard.as_mut(),
+                )
+                .await;
                 return Err(PublisherError::Retryable(
                     anyhow::Error::new(e).context("Failed to write message to file"),
                 ));
             }
         }
 
-        writer
-            .flush()
-            .await
-            .context("Failed to flush file writer")?;
+        if let Err(e) = writer.flush().await {
+            // A partial flush can leave part of the batch on disk; roll back so the
+            // Retryable re-append doesn't duplicate the flushed prefix.
+            roll_back_partial_batch(
+                &writer,
+                pre_len,
+                wrote_csv_header,
+                csv_header_guard.as_mut(),
+            )
+            .await;
+            return Err(PublisherError::Retryable(
+                anyhow::Error::new(e).context("Failed to flush file writer"),
+            ));
+        }
         if failed_messages.is_empty() {
             Ok(SentBatch::Ack)
         } else {

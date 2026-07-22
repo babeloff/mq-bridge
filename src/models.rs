@@ -2647,11 +2647,9 @@ pub struct HttpConfig {
     /// (Publisher only) Timeout for idle connections in the connection pool in milliseconds. Defaults to 90000ms.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pool_idle_timeout_ms: Option<u64>,
-    /// Compression for request/response bodies exceeding the threshold (`none`, `gzip`, `lz4`, `zstd`).
-    /// `gzip`/`zstd` are standard HTTP content encodings; `lz4` is non-standard, so it only applies to
-    /// peers that advertise `Accept-Encoding: lz4` (e.g. another mq-bridge). Server responses are only
-    /// compressed with a method the client advertised (`zstd`/`lz4` require the explicit token, not `*`).
-    /// Defaults to `none`.
+    /// Codec for *request* bodies over the threshold (`none`, `gzip`, `lz4`, `zstd`); `lz4` is
+    /// non-standard (mq-bridge peers only). Any non-`none` value advertises `Accept-Encoding: gzip,
+    /// lz4, zstd`, so responses may use any of the three (all decoded). Defaults to `none`.
     #[serde(default)]
     pub compression: Compression,
     /// Deprecated: replaced by `compression`. Kept for backward compatibility — a legacy

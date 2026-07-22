@@ -2173,14 +2173,12 @@ impl HttpPublisher {
             request_builder = request_builder.header(header_name.as_str(), header_value.as_str());
         }
 
-        // Advertise the coding we can decode so a peer may compress its response. gzip is handled by
-        // the client stack; lz4/zstd must be set explicitly since we decode those ourselves.
-        match self.compression {
-            Compression::Lz4 => request_builder = request_builder.header("Accept-Encoding", "lz4"),
-            Compression::Zstd => {
-                request_builder = request_builder.header("Accept-Encoding", "zstd")
-            }
-            _ => {}
+        // Advertise every coding we can decode so a peer may compress its response with whichever
+        // it prefers — decompress_if_needed handles gzip/lz4/zstd regardless of the request-body
+        // algorithm, and the raw hyper client negotiates nothing on its own. `None` leaves the
+        // header off to keep responses uncompressed by default.
+        if !matches!(self.compression, Compression::None) {
+            request_builder = request_builder.header("Accept-Encoding", "gzip, lz4, zstd");
         }
 
         // Compress payload if enabled and beneficial

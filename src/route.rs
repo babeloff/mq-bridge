@@ -182,6 +182,14 @@ pub(crate) async fn run_consumer_disconnect_hook(route_name: &str, consumer: &dy
     }
 }
 
+/// Builds a bare handle from a raw task + shutdown channel.
+///
+/// NOTE: a handle made this way is not wired to an [`OutcomeGuard`], so
+/// [`RouteHandle::outcome`] stays `None` for the task's whole lifetime and
+/// cannot report completion — the guard can only be attached inside the spawned
+/// task body, which this conversion does not own. Use [`Route::run`] when you
+/// need outcome polling; this exists only for callers that assemble a task by
+/// hand and never inspect the outcome.
 impl From<(JoinHandle<()>, Sender<()>)> for RouteHandle {
     fn from(tuple: (JoinHandle<()>, Sender<()>)) -> Self {
         RouteHandle {

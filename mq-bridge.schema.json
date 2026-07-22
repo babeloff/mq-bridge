@@ -1206,7 +1206,7 @@
           "minimum": 0
         },
         "compression": {
-          "description": "Compression for request/response bodies exceeding the threshold (`none`, `gzip`, `lz4`, `zstd`).\n`gzip`/`zstd` are standard HTTP content encodings; `lz4` is non-standard, so it only applies to\npeers that advertise `Accept-Encoding: lz4` (e.g. another mq-bridge). Server responses are only\ncompressed with a method the client advertised (`zstd`/`lz4` require the explicit token, not `*`).\nDefaults to `none`.",
+          "description": "Codec for *request* bodies over the threshold (`none`, `gzip`, `lz4`, `zstd`); `lz4` is\nnon-standard (mq-bridge peers only). Any non-`none` value advertises `Accept-Encoding: gzip,\nlz4, zstd`, so responses may use any of the three (all decoded). Defaults to `none`.",
           "$ref": "#/$defs/Compression",
           "default": "none"
         },
