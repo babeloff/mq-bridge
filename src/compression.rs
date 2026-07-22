@@ -59,9 +59,10 @@ pub(crate) fn decompress_reader<R: BufRead + 'static>(
 struct ErrReader(Option<std::io::Error>);
 impl Read for ErrReader {
     fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
-        Err(self.0.take().unwrap_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::Other, "zstd decoder already failed")
-        }))
+        Err(self
+            .0
+            .take()
+            .unwrap_or_else(|| std::io::Error::other("zstd decoder already failed")))
     }
 }
 
