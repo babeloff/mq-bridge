@@ -11,6 +11,7 @@ CookieJarMiddleware = dict
 DeadLetterQueueMiddleware = dict
 DeduplicationMiddleware = dict
 DelayMiddleware = dict
+DetailedMappingRule = dict
 EncryptionConfig = dict
 Endpoint = dict
 FileConfig = dict
@@ -76,6 +77,7 @@ __all__ = [
     "DeadLetterQueueMiddleware",
     "DeduplicationMiddleware",
     "DelayMiddleware",
+    "DetailedMappingRule",
     "EncryptionConfig",
     "Endpoint",
     "EndpointConfig",

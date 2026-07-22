@@ -1033,6 +1033,11 @@ fn run_file_queue_task(
 /// common write-once-then-read ETL case the file is decoded exactly once;
 /// live-tailing a growing file costs a re-scan per growth (acceptable for v1).
 ///
+/// Operational note: because each growth re-decodes from the start, tailing a
+/// member stream that grows unboundedly is O(n²) in total CPU over its lifetime.
+/// Size or rotate compressed/encrypted inputs (finite members, then a new file)
+/// rather than appending to a single member stream indefinitely.
+///
 /// `make_reader` builds the decoding [`Read`](std::io::Read) chain
 /// (decrypt frames and/or decompress members) over a freshly opened file.
 #[cfg(any(feature = "compression", feature = "encryption"))]
@@ -1985,20 +1990,27 @@ mod tests {
             .unwrap();
         assert_eq!(decoded.lines().count(), 3);
 
-        // Read the records back through the consumer.
+        // Read the records back through the consumer. Bound the loop so an empty
+        // stream can't retry forever (mirrors `collect_compressed`'s 5s cap).
         let mut source = FileConsumer::new(&config).await.unwrap();
-        let mut got = Vec::new();
-        while got.len() < 3 {
-            let batch = source.receive_batch(10).await.unwrap();
-            if batch.messages.is_empty() {
-                continue;
+        let got = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let mut got = Vec::new();
+            while got.len() < 3 {
+                let batch = source.receive_batch(10).await.unwrap();
+                if batch.messages.is_empty() {
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                    continue;
+                }
+                let len = batch.messages.len();
+                for m in &batch.messages {
+                    got.push(m.payload.clone());
+                }
+                let _ = (batch.commit)(vec![crate::traits::MessageDisposition::Ack; len]).await;
             }
-            let len = batch.messages.len();
-            for m in &batch.messages {
-                got.push(m.payload.clone());
-            }
-            let _ = (batch.commit)(vec![crate::traits::MessageDisposition::Ack; len]).await;
-        }
+            got
+        })
+        .await
+        .expect("timed out collecting gzip messages");
         assert_eq!(got, vec![m1.payload, m2.payload, m3.payload]);
     }
 

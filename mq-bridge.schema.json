@@ -479,6 +479,28 @@
         "delay_ms"
       ]
     },
+    "DetailedMappingRule": {
+      "description": "Full mapping form with a fallback value and/or a presence requirement.",
+      "type": "object",
+      "properties": {
+        "default": {
+          "description": "Value used when the source path is absent."
+        },
+        "path": {
+          "description": "Source path in the input document (e.g. `$.user.id`, `user.id`, `$.items[0]`).",
+          "type": "string"
+        },
+        "required": {
+          "description": "Reject the message when the source path is absent and no `default` is set.",
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "path"
+      ]
+    },
     "EncryptionConfig": {
       "description": "AEAD encryption settings, shared by the `encryption` middleware (per-message\npayload encryption) and the at-rest `encryption` field of the file and\nobject_store endpoints. Requires the `encryption` feature.",
       "type": "object",
@@ -1655,24 +1677,7 @@
         },
         {
           "description": "Full form with a fallback value and/or a presence requirement.",
-          "type": "object",
-          "properties": {
-            "default": {
-              "description": "Value used when the source path is absent."
-            },
-            "path": {
-              "description": "Source path in the input document (e.g. `$.user.id`, `user.id`, `$.items[0]`).",
-              "type": "string"
-            },
-            "required": {
-              "description": "Reject the message when the source path is absent and no `default` is set.",
-              "type": "boolean",
-              "default": false
-            }
-          },
-          "required": [
-            "path"
-          ]
+          "$ref": "#/$defs/DetailedMappingRule"
         }
       ]
     },

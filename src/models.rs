@@ -1123,16 +1123,22 @@ pub enum MappingRule {
     /// Shorthand: just the source path.
     Path(String),
     /// Full form with a fallback value and/or a presence requirement.
-    Detailed {
-        /// Source path in the input document (e.g. `$.user.id`, `user.id`, `$.items[0]`).
-        path: String,
-        /// Value used when the source path is absent.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        default: Option<serde_json::Value>,
-        /// Reject the message when the source path is absent and no `default` is set.
-        #[serde(default)]
-        required: bool,
-    },
+    Detailed(DetailedMappingRule),
+}
+
+/// Full mapping form with a fallback value and/or a presence requirement.
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct DetailedMappingRule {
+    /// Source path in the input document (e.g. `$.user.id`, `user.id`, `$.items[0]`).
+    pub path: String,
+    /// Value used when the source path is absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<serde_json::Value>,
+    /// Reject the message when the source path is absent and no `default` is set.
+    #[serde(default)]
+    pub required: bool,
 }
 
 impl MappingRule {
@@ -1140,7 +1146,7 @@ impl MappingRule {
     pub fn path(&self) -> &str {
         match self {
             MappingRule::Path(p) => p,
-            MappingRule::Detailed { path, .. } => path,
+            MappingRule::Detailed(d) => &d.path,
         }
     }
 }

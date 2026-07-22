@@ -779,9 +779,7 @@ impl Compiled {
             }
             let (default, required) = match rule {
                 MappingRule::Path(_) => (None, false),
-                MappingRule::Detailed {
-                    default, required, ..
-                } => (default.clone(), *required),
+                MappingRule::Detailed(d) => (d.default.clone(), d.required),
             };
             rules.push(CompiledRule {
                 out,

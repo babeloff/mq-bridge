@@ -88,6 +88,13 @@ class DelayMiddleware(TypedDict, total=False):
     delay_ms: Required[int]
 
 
+class DetailedMappingRule(TypedDict, total=False):
+    """Full mapping form with a fallback value and/or a presence requirement."""
+    default: Any
+    path: Required[str]
+    required: bool
+
+
 class EncryptionConfig(TypedDict, total=False):
     """AEAD encryption settings, shared by the `encryption` middleware (per-message"""
     cipher: CipherKind
@@ -514,7 +521,7 @@ Compression = Literal["none", "gzip", "lz4"]
 FaultMode = Literal["panic", "disconnect", "timeout", "json_format_error", "nack"]
 FileFormat = Literal["normal", "json", "text", "raw", "csv"]
 HttpServerProtocol = Literal["auto", "http1_only", "http2_only"]
-MappingRule = Union[str, Dict[str, Any]]
+MappingRule = Union[str, DetailedMappingRule]
 MongoConsume = Literal["consumer", "subscriber", "capture_new", "capture_all"]
 MongoDbFormat = Literal["normal", "json", "text", "raw"]
 MqttProtocol = Literal["v5", "v3"]

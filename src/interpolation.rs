@@ -259,15 +259,11 @@ enum Parsed {
 /// Parse the text between `${` and `}` into a token, a folded literal, or a
 /// verbatim marker.
 fn parse_token(inner: &str) -> anyhow::Result<Parsed> {
-    // Split off an optional `| filter`. Only `raw` is supported today.
-    let (spec, raw) = match inner.split_once('|') {
-        Some((spec, filter)) => match filter.trim() {
-            "raw" => (spec.trim(), true),
-            other => {
-                bail!("unknown token filter '{other}' in '${{{inner}}}' (only 'raw' is supported)")
-            }
-        },
-        None => (inner.trim(), false),
+    // Split off an optional `| filter`. Validate it only after the namespace is
+    // recognized, so an unknown namespace stays verbatim even with a bogus filter.
+    let (spec, filter) = match inner.split_once('|') {
+        Some((spec, filter)) => (spec.trim(), Some(filter.trim())),
+        None => (inner.trim(), None),
     };
 
     let (ns, selector) = match spec.split_once(':') {
@@ -287,13 +283,28 @@ fn parse_token(inner: &str) -> anyhow::Result<Parsed> {
             let value = std::env::var(selector).with_context(|| {
                 format!("environment variable '{selector}' for '${{{inner}}}' is not set")
             })?;
+            validate_filter(filter, inner)?;
             return Ok(Parsed::Literal(value));
         }
-        // Unknown namespace: leave the text untouched for backward compatibility.
+        // Unknown namespace: leave the text untouched for backward compatibility,
+        // regardless of any filter.
         _ => return Ok(Parsed::Verbatim),
     };
 
+    let raw = validate_filter(filter, inner)?;
     Ok(Parsed::Token(Token { source, raw }))
+}
+
+/// Validate the optional `| filter` for a recognized namespace. Only `raw` is
+/// supported today; returns whether it was set.
+fn validate_filter(filter: Option<&str>, inner: &str) -> anyhow::Result<bool> {
+    match filter {
+        None => Ok(false),
+        Some("raw") => Ok(true),
+        Some(other) => {
+            bail!("unknown token filter '{other}' in '${{{inner}}}' (only 'raw' is supported)")
+        }
+    }
 }
 
 fn parse_gen(spec: &str) -> anyhow::Result<Gen> {
@@ -510,6 +521,16 @@ mod tests {
         assert_eq!(
             render_str("${FOO} ${bar:baz}", None, None),
             "${FOO} ${bar:baz}"
+        );
+    }
+
+    #[test]
+    fn unknown_namespace_with_bogus_filter_is_verbatim() {
+        // An unrecognized namespace renders unchanged even when it carries a
+        // filter that would be rejected on a recognized namespace.
+        assert_eq!(
+            render_str("${bar:baz | nope}", None, None),
+            "${bar:baz | nope}"
         );
     }
 
