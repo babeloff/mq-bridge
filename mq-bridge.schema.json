@@ -750,6 +750,17 @@
         {
           "type": "object",
           "properties": {
+            "request": {
+              "$ref": "#/$defs/RequestForwardConfig"
+            }
+          },
+          "required": [
+            "request"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
             "custom": {
               "type": "object",
               "properties": {
@@ -929,6 +940,11 @@
           "description": "CSV rows mapped to/from JSON objects (string values only). The first row is the header/schema.",
           "type": "string",
           "const": "csv"
+        },
+        {
+          "description": "gzip-compressed JSON Lines. The payload is written verbatim like `raw`\n(database rows are already JSON objects, so the decompressed file is clean\nJSONL — one object per line), and each written batch is a self-contained\ngzip member appended to the file, so the result is a standard `.gz` stream\nreadable with `zcat`/`gzip -dc`. Requires the `compression` feature and only\nthe default `consume` mode (no delete, no group).",
+          "type": "string",
+          "const": "jsonl_gzip"
         }
       ]
     },
@@ -1551,6 +1567,36 @@
         "messages_per_second"
       ]
     },
+    "MappingRule": {
+      "description": "How one output field is produced from the input document.\n\nEither a bare path string (`\"$.first_name\"`) or an object with a `path` plus an\noptional `default` and `required` flag.",
+      "anyOf": [
+        {
+          "description": "Shorthand: just the source path.",
+          "type": "string"
+        },
+        {
+          "description": "Full form with a fallback value and/or a presence requirement.",
+          "type": "object",
+          "properties": {
+            "default": {
+              "description": "Value used when the source path is absent."
+            },
+            "path": {
+              "description": "Source path in the input document (e.g. `$.user.id`, `user.id`, `$.items[0]`).",
+              "type": "string"
+            },
+            "required": {
+              "description": "Reject the message when the source path is absent and no `default` is set.",
+              "type": "boolean",
+              "default": false
+            }
+          },
+          "required": [
+            "path"
+          ]
+        }
+      ]
+    },
     "MemoryConfig": {
       "type": "object",
       "properties": {
@@ -1738,6 +1784,18 @@
           "additionalProperties": false,
           "required": [
             "cookie_jar"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "transform": {
+              "$ref": "#/$defs/TransformMiddleware"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "transform"
           ]
         },
         {
@@ -2528,6 +2586,25 @@
         "url"
       ]
     },
+    "RequestForwardConfig": {
+      "description": "Sends each message to a request-capable endpoint and forwards its response elsewhere.\n\nTurns a request/reply exchange (HTTP, or a request_reply NATS/Mongo/Memory endpoint) into\na one-way flow whose response lands on `forward_to` — e.g. IBM MQ → HTTP → IBM MQ. On\nrequest error/timeout the original message is forwarded instead (unchanged). Successful\nresponses carry the transport-native status (e.g. `http_status_code`), so a `switch` on\n`forward_to` can route them by status; a failed request forwards the original message with\nno status key, so catch failures on the switch's default branch.",
+      "type": "object",
+      "properties": {
+        "forward_to": {
+          "description": "Where the response (or, on error, the original message) is forwarded.",
+          "$ref": "#/$defs/Endpoint"
+        },
+        "to": {
+          "description": "The request-capable endpoint to send each message to (e.g. an `http` client).",
+          "$ref": "#/$defs/Endpoint"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "to",
+        "forward_to"
+      ]
+    },
     "ResponseConfig": {
       "type": "object",
       "additionalProperties": false
@@ -3002,6 +3079,60 @@
           "description": "If true, enable TLS/SSL.",
           "type": "boolean",
           "default": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "TransformErrorPolicy": {
+      "description": "Action taken on a message that fails to transform.",
+      "oneOf": [
+        {
+          "description": "Reject the message: non-retryable failure on output, dropped from the batch on input.",
+          "type": "string",
+          "const": "reject"
+        },
+        {
+          "description": "Forward the original payload unchanged with the error recorded in metadata.",
+          "type": "string",
+          "const": "pass_through"
+        }
+      ]
+    },
+    "TransformMiddleware": {
+      "description": "JSON transform middleware configuration.\n\nReshapes JSON payloads declaratively, in two stages over a single parse: field\n`mapping` (rename/move/nest), then `schema` (type coercion, defaults, validation).\nEither stage may be omitted; with neither configured the message passes through\nuntouched and is never parsed.\n\nOn an output endpoint a rejected message becomes a non-retryable failure, so a `dlq`\nmiddleware listed *after* this one captures it (publisher middlewares are wrapped in\nlist order, so the last entry is the outermost layer). On an input endpoint a rejected\nmessage is dropped from the batch and acknowledged, which is how invalid input is kept\nout of the route.",
+      "type": "object",
+      "properties": {
+        "apply_defaults": {
+          "description": "Insert `default` values from the schema for missing fields. Defaults to true.",
+          "type": "boolean",
+          "default": true
+        },
+        "coerce": {
+          "description": "Coerce safely convertible types (e.g. `\"42\"` -> `42`) instead of rejecting. Defaults to true.",
+          "type": "boolean",
+          "default": true
+        },
+        "mapping": {
+          "description": "Output field name -> source path (e.g. `firstName: \"$.first_name\"`). Dots nest the output.",
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/MappingRule"
+          }
+        },
+        "on_error": {
+          "description": "What to do with a message that fails to transform. Defaults to `reject`.",
+          "$ref": "#/$defs/TransformErrorPolicy",
+          "default": "reject"
+        },
+        "schema": {
+          "description": "Inline JSON Schema subset (type, properties, required, default, items, nullable, enum)."
+        },
+        "schema_file": {
+          "description": "Path to a JSON Schema file. Read once at startup; never re-read per message.",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "additionalProperties": false
