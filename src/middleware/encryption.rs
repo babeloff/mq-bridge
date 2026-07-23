@@ -8,8 +8,8 @@
 //! Metadata and routing keys stay in the clear. Request-reply response
 //! payloads pass through untouched.
 
-use crate::crypto::Crypto;
 use crate::models::EncryptionConfig;
+use crate::support::crypto::Crypto;
 use crate::traits::{
     BoxFuture, ConsumerError, MessageConsumer, MessagePublisher, PublisherError, Received,
     ReceivedBatch, Sent, SentBatch,

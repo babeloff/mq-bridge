@@ -763,7 +763,7 @@ impl GrpcPublisher {
         let url = config.tls.normalize_url(&config.url);
         // Share one channel across publishers with the same connection settings; the
         // channel multiplexes and the topic is per-message.
-        let identity = crate::connection_registry::connection_identity((
+        let identity = crate::support::connection_registry::connection_identity((
             &url,
             config.tls.required,
             &config.tls.ca_file,
@@ -774,7 +774,7 @@ impl GrpcPublisher {
         ));
         let config_clone = config.clone();
         let url_for_build = url.clone();
-        let shared_channel = crate::connection_registry::get_or_create(
+        let shared_channel = crate::support::connection_registry::get_or_create(
             "grpc-channel",
             identity,
             config.shared.unwrap_or(true),

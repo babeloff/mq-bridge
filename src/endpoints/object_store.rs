@@ -18,10 +18,10 @@
 //!   non-destructive, at-least-once at object granularity.
 
 use crate::checkpoint::{self, CheckpointBackend, CheckpointStore};
-#[cfg(feature = "encryption")]
-use crate::crypto::Crypto;
 use crate::endpoints::file::{encode_record, parse_delimiter, parse_message};
 use crate::models::{Compression, FileFormat, ObjectStoreConfig};
+#[cfg(feature = "encryption")]
+use crate::support::crypto::Crypto;
 use crate::traits::{
     BoxFuture, ConsumerError, MessageConsumer, MessageDisposition, MessagePublisher,
     PublisherError, ReceivedBatch, SentBatch,
@@ -293,7 +293,7 @@ impl MessagePublisher for ObjectStorePublisher {
         // envelope (no framing needed — objects are written and read whole).
         #[cfg(feature = "compression")]
         let body = if self.compression != Compression::None {
-            crate::compression::compress_member(self.compression, &body)
+            crate::support::compression::compress_member(self.compression, &body)
                 .map_err(|e| PublisherError::NonRetryable(anyhow!(e)))?
         } else {
             body
@@ -517,8 +517,12 @@ impl ObjectStoreConsumer {
             };
             #[cfg(feature = "compression")]
             let data = if self.compression != Compression::None {
-                crate::compression::decompress_all(self.compression, &data, self.max_object_bytes)
-                    .with_context(|| format!("decompress object '{key}'"))?
+                crate::support::compression::decompress_all(
+                    self.compression,
+                    &data,
+                    self.max_object_bytes,
+                )
+                .with_context(|| format!("decompress object '{key}'"))?
             } else {
                 data
             };
@@ -802,7 +806,8 @@ mod tests {
                 .bytes()
                 .await
                 .unwrap();
-            let decoded = crate::compression::decompress_all(compression, &bytes, None).unwrap();
+            let decoded =
+                crate::support::compression::decompress_all(compression, &bytes, None).unwrap();
             assert_eq!(String::from_utf8(decoded).unwrap().lines().count(), 2);
 
             let mut consumer = ObjectStoreConsumer::from_store(
@@ -857,7 +862,9 @@ mod tests {
             .bytes()
             .await
             .unwrap();
-        assert!(crate::compression::decompress_all(Compression::Gzip, &bytes, None).is_err());
+        assert!(
+            crate::support::compression::decompress_all(Compression::Gzip, &bytes, None).is_err()
+        );
         assert!(!bytes.windows(5).any(|w| w == b"alice"));
 
         let mut consumer = ObjectStoreConsumer::from_store(

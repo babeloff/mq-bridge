@@ -1,0 +1,345 @@
+//  mq-bridge
+//  © Copyright 2026, by Marco Mengelkoch
+//  Licensed under MIT License, see License file for more details
+//  git clone https://github.com/marcomq/mq-bridge
+
+use super::coerce::{Crumb, Ty};
+use super::error::{ErrorKind, TransformError};
+use super::path::{insert_at, CompiledPath, CompiledRule};
+use super::schema::{CompiledSchema, RawPairs};
+use super::TRANSFORM_ERROR_KEY;
+use crate::models::{MappingRule, TransformErrorPolicy, TransformMiddleware};
+use crate::CanonicalMessage;
+use bytes::Bytes;
+use serde_json::{Map, Value};
+
+#[derive(Debug, Clone, Copy)]
+pub(super) struct Opts {
+    pub(super) coerce: bool,
+    pub(super) apply_defaults: bool,
+}
+
+// --- Compiled configuration ---
+
+/// Everything derived from config, built once and shared by every message.
+#[derive(Debug)]
+pub(super) struct Compiled {
+    /// Empty when no mapping stage is configured.
+    pub(super) rules: Vec<CompiledRule>,
+    pub(super) schema: Option<CompiledSchema>,
+    pub(super) opts: Opts,
+    pub(super) on_error: TransformErrorPolicy,
+    /// Decided once: whether `transform_fast` may be tried at all.
+    pub(super) fast_eligible: bool,
+    /// Decided once: see `map_sorts_keys`.
+    pub(super) sort_keys: bool,
+}
+
+/// Whether `serde_json::Map` iterates its keys in sorted order.
+///
+/// `Map` is a `BTreeMap` (sorted) normally and an `IndexMap` (insertion order) when
+/// anything in the build enables `serde_json/preserve_order` — a decision made by feature
+/// unification, which this crate cannot see with `cfg`. `transform_fast` writes its keys
+/// directly rather than through a `Map`, so it has to emit them the way the normal path
+/// would, and the only dependable way to learn which `Map` is compiled in is to ask one.
+/// Called once per middleware, never on the hot path.
+pub(super) fn map_sorts_keys() -> bool {
+    let mut probe = Map::new();
+    probe.insert("b".to_string(), Value::Null);
+    probe.insert("a".to_string(), Value::Null);
+    probe.keys().next().is_some_and(|first| first == "a")
+}
+
+/// Whether the root schema is a plain object carrying no obligation of its own, which is
+/// what lets a field-by-field rewrite stand in for parsing the whole payload. Root-level
+/// `required` and defaults need to know which fields are *absent*, which copying spans
+/// never learns, so they rule the shortcut out.
+pub(super) fn fast_eligible(
+    rules: &[CompiledRule],
+    schema: Option<&CompiledSchema>,
+    opts: Opts,
+) -> bool {
+    if !rules.is_empty() {
+        return false;
+    }
+    let Some(schema) = schema else {
+        return false;
+    };
+    matches!(schema.ty, None | Some(Ty::Object))
+        && schema.enum_values.is_none()
+        && schema.content.is_none()
+        && schema.items.is_none()
+        && schema.default.is_none()
+        && schema.required.is_empty()
+        && !(opts.apply_defaults && schema.properties.iter().any(|(_, s)| s.default.is_some()))
+}
+
+impl Compiled {
+    pub(super) fn new(config: &TransformMiddleware) -> anyhow::Result<Self> {
+        if config.schema.is_some() && config.schema_file.is_some() {
+            anyhow::bail!("transform middleware: set either 'schema' or 'schema_file', not both");
+        }
+
+        let mut rules = Vec::with_capacity(config.mapping.len());
+        for (out_key, rule) in &config.mapping {
+            if out_key.is_empty() {
+                anyhow::bail!("transform middleware: mapping output key must not be empty");
+            }
+            let out: Vec<String> = out_key.split('.').map(str::to_string).collect();
+            if out.iter().any(String::is_empty) {
+                anyhow::bail!("transform middleware: empty segment in output key '{out_key}'");
+            }
+            let (default, required) = match rule {
+                MappingRule::Path(_) => (None, false),
+                MappingRule::Detailed(d) => (d.default.clone(), d.required),
+            };
+            rules.push(CompiledRule {
+                out,
+                from: CompiledPath::parse(rule.path())?,
+                default,
+                required,
+            });
+        }
+        // Deterministic order: config is a map, so iteration order is otherwise random
+        // and overlapping keys ("a" and "a.b") would resolve inconsistently.
+        rules.sort_by(|a, b| a.out.cmp(&b.out));
+
+        // Read once, at startup. The hot path never touches the filesystem.
+        let schema_value = match (&config.schema, &config.schema_file) {
+            (Some(inline), _) => Some(inline.clone()),
+            (_, Some(path)) => {
+                let raw = std::fs::read_to_string(path).map_err(|e| {
+                    anyhow::anyhow!("transform middleware: cannot read schema file '{path}': {e}")
+                })?;
+                Some(serde_json::from_str(&raw).map_err(|e| {
+                    anyhow::anyhow!(
+                        "transform middleware: schema file '{path}' is not valid JSON: {e}"
+                    )
+                })?)
+            }
+            _ => None,
+        };
+        let schema = match &schema_value {
+            Some(v) => Some(CompiledSchema::compile(v)?),
+            None => None,
+        };
+
+        let opts = Opts {
+            coerce: config.coerce,
+            apply_defaults: config.apply_defaults,
+        };
+        Ok(Self {
+            fast_eligible: fast_eligible(&rules, schema.as_ref(), opts),
+            sort_keys: map_sorts_keys(),
+            rules,
+            schema,
+            opts,
+            on_error: config.on_error,
+        })
+    }
+
+    /// True when neither stage is configured; the message is then never parsed.
+    pub(super) fn is_noop(&self) -> bool {
+        self.rules.is_empty() && self.schema.is_none()
+    }
+
+    fn apply_mapping(&self, input: &Value) -> Result<Value, TransformError> {
+        let mut out = Value::Object(Map::new());
+        for rule in &self.rules {
+            let picked = match rule.from.get(input) {
+                Some(found) => found.clone(),
+                None => match &rule.default {
+                    Some(default) => default.clone(),
+                    None if rule.required => {
+                        return Err(TransformError::new(
+                            rule.from.spec.clone(),
+                            ErrorKind::MissingRequired,
+                            format!(
+                                "required source field is missing (mapped to '{}')",
+                                rule.out.join(".")
+                            ),
+                        ))
+                    }
+                    // Optional and absent: leave the output key out entirely.
+                    None => continue,
+                },
+            };
+            insert_at(&mut out, &rule.out, picked)?;
+        }
+        Ok(out)
+    }
+
+    /// Rewrites the payload field by field, copying the verbatim JSON span of every field
+    /// the schema would not change and parsing only the ones that need work. Those go
+    /// through the same `apply` as the normal path, so nesting, `items`, `enum` and
+    /// `contentSchema` all behave identically — this decides *whether* a field is worth
+    /// parsing, never *how* it is transformed.
+    ///
+    /// `None` means the payload's shape rules the shortcut out and the caller should fall
+    /// back; `Some(Err(_))` is a real transform failure and must not be retried slowly.
+    pub(super) fn transform_fast(
+        &self,
+        schema: &CompiledSchema,
+        payload: &[u8],
+    ) -> Option<Result<Vec<u8>, TransformError>> {
+        // Not an object, or a key we cannot borrow because it carried escapes.
+        let RawPairs(mut pairs) = serde_json::from_slice::<RawPairs>(payload).ok()?;
+
+        // The output has to carry its keys the way the normal path's `Map` would order
+        // them. Insertion order needs no work: it is the order they were just read in.
+        if self.sort_keys {
+            pairs.sort_by(|a, b| a.0.cmp(b.0));
+        }
+
+        // A `Value` parse collapses duplicate keys (last wins) where copying spans would
+        // emit both, so those rare payloads go the normal way. Quadratic, but objects are
+        // narrow and this runs once per message.
+        if pairs
+            .iter()
+            .enumerate()
+            .any(|(i, (key, _))| pairs[..i].iter().any(|(seen, _)| seen == key))
+        {
+            return None;
+        }
+
+        let mut out = Vec::with_capacity(payload.len() + payload.len() / 2);
+        out.push(b'{');
+        for (i, (key, raw)) in pairs.iter().enumerate() {
+            if i > 0 {
+                out.push(b',');
+            }
+            out.push(b'"');
+            out.extend_from_slice(key.as_bytes());
+            out.extend_from_slice(b"\":");
+
+            let sub = schema
+                .properties
+                .binary_search_by(|(name, _)| name.as_str().cmp(key))
+                .ok()
+                .map(|idx| &schema.properties[idx].1);
+
+            match sub {
+                // Embedded JSON with nothing to check afterwards: unescape the string and
+                // emit the document it carried, without ever building it.
+                Some(sub) if sub.is_plain_content_decode(raw.get()) => {
+                    // serde_json does the unescaping, so `😀` and friends are
+                    // handled exactly as the normal path handles them.
+                    let text: std::borrow::Cow<'_, str> = match serde_json::from_str(raw.get()) {
+                        Ok(text) => text,
+                        Err(e) => {
+                            return Some(Err(TransformError::new(
+                                format!("$.{key}"),
+                                ErrorKind::Parse,
+                                format!("field is not valid JSON: {e}"),
+                            )))
+                        }
+                    };
+                    match serde_json::from_str::<&serde_json::value::RawValue>(&text) {
+                        Ok(document) => out.extend_from_slice(document.get().as_bytes()),
+                        Err(e) => {
+                            return Some(Err(TransformError::new(
+                                format!("$.{key}"),
+                                ErrorKind::Content,
+                                format!(
+                                    "contentMediaType is JSON but the string does not parse: {e}"
+                                ),
+                            )))
+                        }
+                    }
+                }
+                // The schema has something to say about this field and the raw bytes do
+                // not already satisfy it: parse just this field and transform it.
+                Some(sub) if !sub.is_passthrough(raw.get()) => {
+                    let mut value: Value = match serde_json::from_str(raw.get()) {
+                        Ok(value) => value,
+                        Err(e) => {
+                            return Some(Err(TransformError::new(
+                                format!("$.{key}"),
+                                ErrorKind::Parse,
+                                format!("field is not valid JSON: {e}"),
+                            )))
+                        }
+                    };
+                    let mut crumbs = vec![Crumb::Key(key)];
+                    if let Err(e) = sub.apply(&mut value, &mut crumbs, self.opts) {
+                        return Some(Err(e));
+                    }
+                    if let Err(e) = serde_json::to_writer(&mut out, &value) {
+                        return Some(Err(TransformError::new(
+                            format!("$.{key}"),
+                            ErrorKind::Parse,
+                            format!("transformed value could not be serialized: {e}"),
+                        )));
+                    }
+                }
+                // Unmentioned by the schema, or already satisfying it.
+                _ => out.extend_from_slice(raw.get().as_bytes()),
+            }
+        }
+        out.push(b'}');
+        Some(Ok(out))
+    }
+
+    /// Parses once, reshapes, serialises once.
+    pub(super) fn transform(&self, message: &mut CanonicalMessage) -> Result<(), TransformError> {
+        if self.fast_eligible {
+            if let Some(schema) = &self.schema {
+                if let Some(result) = self.transform_fast(schema, &message.payload) {
+                    message.payload = Bytes::from(result?);
+                    return Ok(());
+                }
+            }
+        }
+
+        let input: Value = serde_json::from_slice(&message.payload).map_err(|e| {
+            TransformError::new(
+                "$".to_string(),
+                ErrorKind::Parse,
+                format!("payload is not valid JSON: {e}"),
+            )
+        })?;
+
+        let mut value = if self.rules.is_empty() {
+            input
+        } else {
+            self.apply_mapping(&input)?
+        };
+
+        if let Some(schema) = &self.schema {
+            let mut crumbs = Vec::new();
+            schema.apply(&mut value, &mut crumbs, self.opts)?;
+        }
+
+        // Sized from the input rather than left at serde_json's 128-byte default: the
+        // output tracks the input closely, so this is usually the only allocation the
+        // write side makes.
+        let mut bytes = Vec::with_capacity(message.payload.len() + message.payload.len() / 2);
+        serde_json::to_writer(&mut bytes, &value).map_err(|e| {
+            TransformError::new(
+                "$".to_string(),
+                ErrorKind::Parse,
+                format!("transformed value could not be serialized: {e}"),
+            )
+        })?;
+        message.payload = Bytes::from(bytes);
+        Ok(())
+    }
+
+    /// Applies the configured policy to a failure. `Ok` keeps the message (annotated),
+    /// `Err` rejects it.
+    pub(super) fn handle_failure(
+        &self,
+        message: &mut CanonicalMessage,
+        error: TransformError,
+    ) -> Result<(), TransformError> {
+        match self.on_error {
+            TransformErrorPolicy::PassThrough => {
+                message
+                    .metadata
+                    .insert(TRANSFORM_ERROR_KEY.to_string(), error.to_string());
+                Ok(())
+            }
+            TransformErrorPolicy::Reject => Err(error),
+        }
+    }
+}

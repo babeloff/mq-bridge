@@ -2395,7 +2395,7 @@ impl MessageConsumer for MongoDbChangeStreamReader {
 /// Returns a shared MongoDB client for this connection, building one on first use.
 /// The collection/database are handles off the client, so a single client serves all.
 async fn create_shared_client(config: &MongoDbConfig) -> anyhow::Result<std::sync::Arc<Client>> {
-    let identity = crate::connection_registry::connection_identity((
+    let identity = crate::support::connection_registry::connection_identity((
         &config.url,
         &config.username,
         &config.password,
@@ -2406,7 +2406,7 @@ async fn create_shared_client(config: &MongoDbConfig) -> anyhow::Result<std::syn
         config.tls.accept_invalid_certs,
     ));
     let config_clone = config.clone();
-    crate::connection_registry::get_or_create(
+    crate::support::connection_registry::get_or_create(
         "mongodb-client",
         identity,
         config.shared.unwrap_or(true),

@@ -57,7 +57,7 @@ impl NatsPublisher {
         };
         // Share one NATS connection across publishers with the same connection settings;
         // the subject is per-publish. JetStream context/stream setup stays per-publisher.
-        let identity = crate::connection_registry::connection_identity((
+        let identity = crate::support::connection_registry::connection_identity((
             &config.url,
             &config.username,
             &config.password,
@@ -69,7 +69,7 @@ impl NatsPublisher {
             config.tls.accept_invalid_certs,
         ));
         let config_clone = config.clone();
-        let shared_client = crate::connection_registry::get_or_create(
+        let shared_client = crate::support::connection_registry::get_or_create(
             "nats-client",
             identity,
             config.shared.unwrap_or(true),

@@ -2,8 +2,8 @@
 //  © Copyright 2025, by Marco Mengelkoch
 //  Licensed under MIT License, see License file for more details
 //  git clone https://github.com/marcomq/mq-bridge
-use crate::interpolation::CompiledTemplate;
 use crate::models::StaticConfig;
+use crate::support::interpolation::CompiledTemplate;
 use crate::traits::{
     BoxFuture, ConsumerError, MessageConsumer, MessageDisposition, MessagePublisher,
     PublisherError, Received, ReceivedBatch, Sent, SentBatch,

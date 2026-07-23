@@ -553,7 +553,7 @@ fn deserialize_middlewares_from_value(value: serde_json::Value) -> anyhow::Resul
 /// `${gen:uuid|now|timestamp|counter|random(1,100)}`, and `${env:VAR}`. When the
 /// `content-type` metadata is a JSON type, interpolated request values are
 /// JSON-escaped by default; append `| raw` to splice verbatim, and write `$${…}`
-/// to emit a literal `${…}`. See [`crate::interpolation`] for the full reference.
+/// to emit a literal `${…}`. See [`crate::support::interpolation`] for the full reference.
 #[derive(Debug, Clone, Default)]
 pub struct StaticConfig {
     /// The static response body.
@@ -2647,13 +2647,14 @@ pub struct HttpConfig {
     /// (Publisher only) Timeout for idle connections in the connection pool in milliseconds. Defaults to 90000ms.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pool_idle_timeout_ms: Option<u64>,
-    /// Codec for *request* bodies over the threshold (`none`, `gzip`, `lz4`, `zstd`); `lz4` is
-    /// non-standard (mq-bridge peers only). Any non-`none` value advertises `Accept-Encoding: gzip,
-    /// lz4, zstd`, so responses may use any of the three (all decoded). Defaults to `none`.
+    /// (Publisher only) Codec for the request body (`none`, `gzip`, `lz4`, `zstd`); overrides
+    /// `compression_enabled`. `lz4` is non-standard (mq-bridge peers only). Ignored on a consumer —
+    /// enable response compression with `compression_enabled`. Defaults to `none`.
     #[serde(default)]
     pub compression: Compression,
-    /// Deprecated: replaced by `compression`. Kept for backward compatibility — a legacy
-    /// `compression_enabled: true` (with `compression` unset) is treated as `compression: gzip`.
+    /// Turns compression on. Publisher: compress the request body with gzip (unless `compression`
+    /// sets another codec). Consumer: compress responses, negotiating the best codec the client's
+    /// `Accept-Encoding` accepts. Defaults to off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compression_enabled: Option<bool>,
     /// Minimum message size in bytes to compress. Messages smaller than this are sent uncompressed. Defaults to 1024 bytes.
@@ -2783,18 +2784,19 @@ impl HttpConfig {
         self.inline_response_fast_path.unwrap_or(true)
     }
 
-    /// Resolves the effective body compression, honoring the deprecated `compression_enabled`
-    /// flag: when `compression` is left at its `none` default but a legacy `compression_enabled:
-    /// true` is present, it maps to `gzip` (matching the old behavior) and warns once.
-    pub fn effective_compression(&self) -> Compression {
-        if self.compression == Compression::None && self.compression_enabled == Some(true) {
-            tracing::warn!(
-                "HTTP config `compression_enabled: true` is deprecated; use `compression: gzip`. \
-                 Treating it as `gzip` for now."
-            );
-            return Compression::Gzip;
+    /// Request-body codec for a publisher: explicit `compression`, else gzip when
+    /// `compression_enabled`, else none.
+    pub fn publisher_compression(&self) -> Compression {
+        match self.compression {
+            Compression::None if self.compression_enabled == Some(true) => Compression::Gzip,
+            other => other,
         }
-        self.compression
+    }
+
+    /// Whether a consumer compresses responses (then it negotiates the best codec the client
+    /// accepts). Driven by `compression_enabled`; the publisher-only `compression` codec is ignored.
+    pub fn consumer_compression_enabled(&self) -> bool {
+        self.compression_enabled == Some(true)
     }
 
     pub fn with_stream_response_to(mut self, endpoint: Endpoint) -> Self {

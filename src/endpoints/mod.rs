@@ -15,8 +15,6 @@ pub mod file;
 pub mod grpc;
 #[cfg(feature = "http")]
 pub mod http;
-#[cfg(feature = "http")]
-mod http_stream;
 #[cfg(any(feature = "ibm-mq-static", feature = "ibm-mq"))]
 pub mod ibm_mq;
 #[cfg(feature = "kafka")]

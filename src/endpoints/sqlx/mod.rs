@@ -43,6 +43,40 @@ fn is_valid_table_name(name: &str) -> bool {
 }
 
 /// Checks if a SQL query string contains a `(payload)` clause, ignoring case and whitespace.
+/// Locate the top-level `VALUES` keyword that introduces the insert tuple.
+///
+/// Scans at parenthesis-depth 0 and returns the *first* such keyword, so a
+/// `values` column inside the column list (which sits at depth 1) and a MySQL
+/// `VALUES(col)` reference in an `ON DUPLICATE KEY UPDATE` suffix (which follows
+/// the real keyword) are both ignored. Word-boundary checks avoid matching
+/// substrings like `myvalues`. Returns `None` when no top-level keyword is
+/// found, letting the caller fall back to iterative inserts.
+fn find_top_level_values(sql: &str) -> Option<usize> {
+    fn is_word_byte(b: Option<u8>) -> bool {
+        matches!(b, Some(c) if c.is_ascii_alphanumeric() || c == b'_')
+    }
+
+    let bytes = sql.as_bytes();
+    let mut depth: i32 = 0;
+    for i in 0..bytes.len() {
+        match bytes[i] {
+            b'(' => depth += 1,
+            b')' => depth = depth.saturating_sub(1),
+            _ => {
+                if depth == 0
+                    && bytes.len() - i >= 6
+                    && bytes[i..i + 6].eq_ignore_ascii_case(b"VALUES")
+                    && !is_word_byte(i.checked_sub(1).map(|p| bytes[p]))
+                    && !is_word_byte(bytes.get(i + 6).copied())
+                {
+                    return Some(i);
+                }
+            }
+        }
+    }
+    None
+}
+
 fn contains_payload_clause(query: &str) -> bool {
     let lower_query = query.to_lowercase();
     let mut search_start = 0;
@@ -234,11 +268,13 @@ fn build_sqlx_url_with_tls(config: &SqlxConfig) -> anyhow::Result<String> {
             "postgres" | "postgresql" => {
                 let mut query_pairs = url.query_pairs_mut();
                 if config.tls.accept_invalid_certs {
+                    // Explicitly opted out of validation: encrypt but do not verify.
                     query_pairs.append_pair("sslmode", "require");
-                } else if config.tls.ca_file.is_some() {
-                    query_pairs.append_pair("sslmode", "verify-ca");
                 } else {
-                    query_pairs.append_pair("sslmode", "require");
+                    // Validation enabled: verify the chain and hostname. `sslrootcert`
+                    // (appended below) supplies a custom CA when configured; without one
+                    // the system trust store is used.
+                    query_pairs.append_pair("sslmode", "verify-full");
                 }
 
                 if let Some(ca) = &config.tls.ca_file {
@@ -260,7 +296,19 @@ fn build_sqlx_url_with_tls(config: &SqlxConfig) -> anyhow::Result<String> {
                 // for complex TLS setups. We'll add what we can.
                 warn!("For complex MySQL/MariaDB TLS setups, using a client configuration file (my.cnf) is recommended over URL parameters.");
                 let mut query_pairs = url.query_pairs_mut();
-                query_pairs.append_pair("ssl-mode", "REQUIRED");
+                if config.tls.accept_invalid_certs {
+                    // Explicitly opted out of validation: encrypt but do not verify.
+                    query_pairs.append_pair("ssl-mode", "REQUIRED");
+                } else if config.tls.ca_file.is_some() {
+                    // Verify the chain against the configured CA.
+                    query_pairs.append_pair("ssl-mode", "VERIFY_CA");
+                } else {
+                    // Verify the chain and server identity against the system trust store.
+                    query_pairs.append_pair("ssl-mode", "VERIFY_IDENTITY");
+                }
+                if let Some(ca) = &config.tls.ca_file {
+                    query_pairs.append_pair("ssl-ca", ca);
+                }
             }
             "mssql" | "sqlserver" => {
                 let mut query_pairs = url.query_pairs_mut();
@@ -303,7 +351,7 @@ async fn create_sqlx_pool(config: &SqlxConfig) -> anyhow::Result<AnyPool> {
 
 /// Returns a shared connection pool for this database, building one on first use.
 async fn create_shared_sqlx_pool(config: &SqlxConfig) -> anyhow::Result<std::sync::Arc<AnyPool>> {
-    let identity = crate::connection_registry::connection_identity((
+    let identity = crate::support::connection_registry::connection_identity((
         &config.url,
         &config.username,
         &config.password,
@@ -322,7 +370,7 @@ async fn create_shared_sqlx_pool(config: &SqlxConfig) -> anyhow::Result<std::syn
         ),
     ));
     let config_clone = config.clone();
-    crate::connection_registry::get_or_create(
+    crate::support::connection_registry::get_or_create(
         "sqlx-pool",
         identity,
         config.shared.unwrap_or(true),
@@ -380,7 +428,11 @@ fn copy_escape_text(s: &str) -> String {
 /// column/table) is deterministic — retrying the identical payload fails the same way — so surface
 /// it as non-retryable (dead-letterable) instead of looping forever. Connection/pool/IO failures
 /// are transient and stay retryable (at-least-once).
-fn classify_copy_error(e: sqlx::Error) -> PublisherError {
+/// Classifies a SQL error as deterministic (dead-letter) vs transient (retry).
+/// A `Database` error is a rejection by the server (constraint violation, bad SQL,
+/// type mismatch) that will recur on retry, so it is non-retryable; everything else
+/// (connection drops, pool timeouts, protocol errors) is treated as transient.
+fn classify_sql_error(e: sqlx::Error) -> PublisherError {
     if matches!(e, sqlx::Error::Database(_)) {
         PublisherError::NonRetryable(anyhow!(e))
     } else {
@@ -628,7 +680,7 @@ impl MessagePublisher for SqlxPublisher {
         query
             .execute(&self.pool)
             .await
-            .map_err(|e| PublisherError::Retryable(anyhow!(e)))?;
+            .map_err(classify_sql_error)?;
         Ok(Sent::Ack)
     }
 
@@ -648,7 +700,7 @@ impl MessagePublisher for SqlxPublisher {
 
         // Manually construct the query with appropriate placeholders because
         // sqlx::QueryBuilder with the `Any` driver does not correctly rewrite `?` to `$N`.
-        let values_pos = match self.insert_query.to_uppercase().rfind("VALUES") {
+        let values_pos = match find_top_level_values(&self.insert_query) {
             Some(pos) => pos,
             None => {
                 warn!("Could not optimize batch insert due to custom query format. Falling back to iterative inserts.");
@@ -724,7 +776,7 @@ impl MessagePublisher for SqlxPublisher {
         query
             .execute(&self.pool)
             .await
-            .map_err(|e| PublisherError::Retryable(anyhow!(e)))?;
+            .map_err(classify_sql_error)?;
         Ok(SentBatch::Ack)
     }
 
@@ -785,12 +837,12 @@ impl SqlxPublisher {
             .pool
             .copy_in_raw(&stmt)
             .await
-            .map_err(classify_copy_error)?;
+            .map_err(classify_sql_error)?;
         copier
             .send(buf.as_bytes())
             .await
-            .map_err(classify_copy_error)?;
-        copier.finish().await.map_err(classify_copy_error)?;
+            .map_err(classify_sql_error)?;
+        copier.finish().await.map_err(classify_sql_error)?;
 
         trace!(count = messages.len(), table = %sink.table, "Bulk-copied batch to PostgreSQL");
         Ok(SentBatch::Ack)
@@ -814,10 +866,7 @@ impl SqlxPublisher {
             } else {
                 bind_message_sources(query, msg, &self.column_sources)
             };
-            query
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| PublisherError::Retryable(anyhow!(e)))?;
+            query.execute(&mut *tx).await.map_err(classify_sql_error)?;
         }
         tx.commit()
             .await
@@ -1885,692 +1934,4 @@ impl MessageConsumer for SqlxCursorReader {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::traits::{MessageConsumer, MessagePublisher};
-    use tempfile::tempdir;
-
-    /// Build a SQLite connection URL from a filesystem path, portably. On Windows a file URL
-    /// needs the three-slash form and forward slashes; elsewhere the two-slash form is fine.
-    fn sqlite_url(path: &std::path::Path) -> String {
-        #[cfg(windows)]
-        {
-            format!("sqlite:///{}", path.to_string_lossy().replace('\\', "/"))
-        }
-        #[cfg(not(windows))]
-        {
-            format!("sqlite://{}", path.to_str().unwrap())
-        }
-    }
-
-    #[test]
-    fn copy_escape_text_escapes_control_chars() {
-        assert_eq!(copy_escape_text("plain"), "plain");
-        assert_eq!(copy_escape_text("a\tb\nc\r\\d"), "a\\tb\\nc\\r\\\\d");
-    }
-
-    #[test]
-    fn extract_copy_columns_accepts_token_only_tuple() {
-        let cols = extract_copy_columns(
-            "INSERT INTO orders (sku, qty, cust) VALUES (${payload:sku}, ${payload:qty}, ${metadata:cust})",
-            3,
-        )
-        .unwrap();
-        assert_eq!(cols, vec!["sku", "qty", "cust"]);
-    }
-
-    #[test]
-    fn extract_copy_columns_rejects_on_conflict_and_literals() {
-        // ON CONFLICT is not expressible via COPY.
-        assert!(extract_copy_columns(
-            "INSERT INTO t (a) VALUES (${payload:a}) ON CONFLICT DO NOTHING",
-            1,
-        )
-        .is_err());
-        // A non-token literal in the VALUES tuple breaks positional mapping. token_count matches the
-        // two columns so the count check passes and the literal-residue check is what rejects it.
-        assert!(
-            extract_copy_columns("INSERT INTO t (a, b) VALUES (${payload:a}, now())", 2,).is_err()
-        );
-        // Column count must match the token count.
-        assert!(extract_copy_columns("INSERT INTO t (a, b) VALUES (${payload:a})", 1).is_err());
-    }
-
-    async fn setup_db_file() -> (tempfile::TempDir, String) {
-        use sqlx::Connection;
-        sqlx::any::install_default_drivers();
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("test.db");
-        let url = sqlite_url(&path);
-
-        // Explicitly create the file first and drop the handle to avoid locking issues on Windows.
-        // The `connect` call will create the file if it doesn't exist, but this can be racy in tests.
-        drop(tokio::fs::File::create(&path).await.unwrap());
-
-        let mut conn = sqlx::AnyConnection::connect(&url).await.unwrap();
-        sqlx::query(
-            "CREATE TABLE messages (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                payload BLOB NOT NULL,
-                locked_until DATETIME,
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-            )",
-        )
-        .execute(&mut conn)
-        .await
-        .unwrap();
-        conn.close().await.unwrap();
-        (dir, url)
-    }
-
-    /// Creates an arbitrary (non mq-bridge) table `orders(id, sku, qty)` seeded with `n` rows.
-    async fn setup_arbitrary_table(n: i64) -> (tempfile::TempDir, String, AnyPool) {
-        sqlx::any::install_default_drivers();
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("arb.db");
-        let url = sqlite_url(&path);
-        drop(tokio::fs::File::create(&path).await.unwrap());
-        let pool = AnyPool::connect(&url).await.unwrap();
-        sqlx::query("CREATE TABLE orders (id INTEGER PRIMARY KEY, sku TEXT, qty INTEGER)")
-            .execute(&pool)
-            .await
-            .unwrap();
-        for i in 1..=n {
-            sqlx::query("INSERT INTO orders (id, sku, qty) VALUES (?, ?, ?)")
-                .bind(i)
-                .bind(format!("sku{}", i))
-                .bind(i * 10)
-                .execute(&pool)
-                .await
-                .unwrap();
-        }
-        (dir, url, pool)
-    }
-
-    #[test]
-    fn test_sql_cursor_encode_decode_roundtrip() {
-        for c in [SqlCursor::Int(42), SqlCursor::Text("abc:def".into())] {
-            assert_eq!(SqlCursor::decode(&c.encode()), Some(c));
-        }
-        assert_eq!(SqlCursor::decode("garbage"), None);
-    }
-
-    // Regression: a non-unique cursor_column must not lose rows that share the value at a
-    // page boundary. `ts` has a duplicate (20) straddling a batch of 2; all 5 rows must be
-    // emitted exactly once. The naive `col > last` + LIMIT would drop the second ts=20.
-    #[tokio::test]
-    async fn test_sqlx_cursor_reader_non_unique_column_no_loss() {
-        sqlx::any::install_default_drivers();
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("dup.db");
-        let url = sqlite_url(&path);
-        drop(tokio::fs::File::create(&path).await.unwrap());
-        let pool = AnyPool::connect(&url).await.unwrap();
-        sqlx::query("CREATE TABLE events (id INTEGER PRIMARY KEY, ts INTEGER)")
-            .execute(&pool)
-            .await
-            .unwrap();
-        for (id, ts) in [(1, 10), (2, 20), (3, 20), (4, 30), (5, 40)] {
-            sqlx::query("INSERT INTO events (id, ts) VALUES (?, ?)")
-                .bind(id)
-                .bind(ts)
-                .execute(&pool)
-                .await
-                .unwrap();
-        }
-
-        let config = SqlxConfig {
-            url: url.clone(),
-            table: "events".to_string(),
-            cursor_column: Some("ts".to_string()),
-            ..Default::default()
-        };
-        let mut reader = SqlxCursorReader::new(&config).await.unwrap();
-
-        let mut ids = Vec::new();
-        loop {
-            let b = reader.receive_batch(2).await.unwrap();
-            if b.messages.is_empty() {
-                break;
-            }
-            for m in &b.messages {
-                let v: serde_json::Value = serde_json::from_slice(&m.payload).unwrap();
-                ids.push(v["id"].as_i64().unwrap());
-            }
-            let n = b.messages.len();
-            (b.commit)(vec![MessageDisposition::Ack; n]).await.unwrap();
-        }
-        ids.sort_unstable();
-        assert_eq!(
-            ids,
-            vec![1, 2, 3, 4, 5],
-            "no row lost at the duplicate boundary"
-        );
-    }
-
-    // Regression: a mid-batch Nack must make the nacked (and following) rows re-read by the
-    // same running reader, not skipped until a restart. Rows 1..4 are read; row 3 is nacked,
-    // so the next receive_batch on the same reader resumes at row 3.
-    #[tokio::test]
-    async fn test_sqlx_cursor_reader_nack_redelivers_in_process() {
-        let (_dir, url, _pool) = setup_arbitrary_table(5).await;
-        let config = SqlxConfig {
-            url: url.clone(),
-            table: "orders".to_string(),
-            cursor_column: Some("id".to_string()),
-            ..Default::default()
-        };
-        let mut reader = SqlxCursorReader::new(&config).await.unwrap();
-
-        let b = reader.receive_batch(4).await.unwrap();
-        assert_eq!(b.messages.len(), 4);
-        (b.commit)(vec![
-            MessageDisposition::Ack,
-            MessageDisposition::Ack,
-            MessageDisposition::Nack,
-            MessageDisposition::Ack,
-        ])
-        .await
-        .unwrap();
-
-        // Same reader (no restart): must re-read from row 3 (the first nacked row).
-        let b2 = reader.receive_batch(4).await.unwrap();
-        let ids: Vec<i64> = b2
-            .messages
-            .iter()
-            .map(|m| {
-                serde_json::from_slice::<serde_json::Value>(&m.payload).unwrap()["id"]
-                    .as_i64()
-                    .unwrap()
-            })
-            .collect();
-        assert_eq!(
-            ids,
-            vec![3, 4, 5],
-            "nacked rows must be redelivered in-process"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_sqlx_cursor_reader_resumes_and_is_nondestructive() {
-        let (_dir, url, pool) = setup_arbitrary_table(5).await;
-        let config = SqlxConfig {
-            url: url.clone(),
-            table: "orders".to_string(),
-            cursor_column: Some("id".to_string()),
-            cursor_id: Some("copy-1".to_string()),
-            ..Default::default()
-        };
-
-        let mut reader = SqlxCursorReader::new(&config).await.unwrap();
-        let b1 = reader.receive_batch(3).await.unwrap();
-        assert_eq!(b1.messages.len(), 3);
-        // Payload is the full row serialized to JSON.
-        let v: serde_json::Value = serde_json::from_slice(&b1.messages[0].payload).unwrap();
-        assert_eq!(v["id"], 1);
-        assert_eq!(v["sku"], "sku1");
-        assert_eq!(v["qty"], 10);
-        (b1.commit)(vec![MessageDisposition::Ack; 3]).await.unwrap();
-
-        let b2 = reader.receive_batch(3).await.unwrap();
-        assert_eq!(b2.messages.len(), 2);
-        (b2.commit)(vec![MessageDisposition::Ack; 2]).await.unwrap();
-
-        // Drained -> empty batch, independent of how the route handles empty batches.
-        let b3 = reader.receive_batch(3).await.unwrap();
-        assert!(b3.messages.is_empty());
-
-        // Source table is untouched.
-        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM orders")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        assert_eq!(count, 5);
-
-        // Checkpoint persisted in the auto-unique default meta table, keyed by <source>:<id>.
-        let last: String = sqlx::query_scalar(
-            "SELECT last_value FROM mqb_cursors_orders WHERE cursor_id = 'orders:copy-1'",
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert_eq!(last, "int:5");
-
-        // Restart from a fresh reader: resumes past the checkpoint -> nothing re-emitted.
-        let mut reader2 = SqlxCursorReader::new(&config).await.unwrap();
-        let again = reader2.receive_batch(10).await.unwrap();
-        assert!(again.messages.is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_sqlx_cursor_reader_partial_ack_resumes_at_boundary() {
-        let (_dir, url, _pool) = setup_arbitrary_table(5).await;
-        let config = SqlxConfig {
-            url: url.clone(),
-            table: "orders".to_string(),
-            cursor_column: Some("id".to_string()),
-            cursor_id: Some("copy-1".to_string()),
-            ..Default::default()
-        };
-
-        let mut reader = SqlxCursorReader::new(&config).await.unwrap();
-        let b = reader.receive_batch(4).await.unwrap();
-        assert_eq!(b.messages.len(), 4);
-        // Ack the first two, nack the rest: checkpoint must stop at the contiguous boundary.
-        (b.commit)(vec![
-            MessageDisposition::Ack,
-            MessageDisposition::Ack,
-            MessageDisposition::Nack,
-            MessageDisposition::Nack,
-        ])
-        .await
-        .unwrap();
-
-        // A restart resumes at row 3 (ids 3,4,5), never skipping the nacked rows.
-        let mut reader2 = SqlxCursorReader::new(&config).await.unwrap();
-        let b2 = reader2.receive_batch(10).await.unwrap();
-        assert_eq!(b2.messages.len(), 3);
-        let first: serde_json::Value = serde_json::from_slice(&b2.messages[0].payload).unwrap();
-        assert_eq!(first["id"], 3);
-    }
-
-    #[tokio::test]
-    async fn test_sqlx_cursor_reader_text_column_with_file_checkpoint() {
-        sqlx::any::install_default_drivers();
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("ev.db");
-        let url = sqlite_url(&path);
-        drop(tokio::fs::File::create(&path).await.unwrap());
-        let pool = AnyPool::connect(&url).await.unwrap();
-        sqlx::query("CREATE TABLE events (k TEXT PRIMARY KEY, data TEXT)")
-            .execute(&pool)
-            .await
-            .unwrap();
-        for k in ["a", "b", "c"] {
-            sqlx::query("INSERT INTO events (k, data) VALUES (?, ?)")
-                .bind(k)
-                .bind(format!("data-{}", k))
-                .execute(&pool)
-                .await
-                .unwrap();
-        }
-
-        let ckpt = dir.path().join("cursors.json");
-        // Absolute tempdir path -> `file:///abs/path` (three-slash form), portable across OSes.
-        let ckpt_url = url::Url::from_file_path(&ckpt).unwrap().to_string();
-        let config = SqlxConfig {
-            url: url.clone(),
-            table: "events".to_string(),
-            cursor_column: Some("k".to_string()),
-            cursor_id: Some("c1".to_string()),
-            checkpoint_store: Some(ckpt_url),
-            ..Default::default()
-        };
-
-        let mut reader = SqlxCursorReader::new(&config).await.unwrap();
-        let b = reader.receive_batch(10).await.unwrap();
-        assert_eq!(b.messages.len(), 3);
-        (b.commit)(vec![MessageDisposition::Ack; 3]).await.unwrap();
-
-        // File checkpoint written; source DB has NO meta table (read-only-source path).
-        assert!(ckpt.exists());
-        let meta_tables: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name LIKE 'mqb_cursors%'",
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert_eq!(meta_tables, 0);
-
-        // Restart resumes from the file checkpoint -> nothing re-emitted.
-        let mut reader2 = SqlxCursorReader::new(&config).await.unwrap();
-        let again = reader2.receive_batch(10).await.unwrap();
-        assert!(again.messages.is_empty());
-    }
-
-    // checkpoint_store pointing at a *different* database persists the cursor there, leaves the
-    // source DB untouched, and still resumes across a restart.
-    #[tokio::test]
-    async fn test_sqlx_cursor_reader_external_db_checkpoint() {
-        let (_dir_a, url_a, pool_a) = setup_arbitrary_table(3).await;
-
-        // A separate SQLite database used only for checkpoints.
-        let dir_b = tempdir().unwrap();
-        let path_b = dir_b.path().join("ckpt.db");
-        let url_b = sqlite_url(&path_b);
-        drop(tokio::fs::File::create(&path_b).await.unwrap());
-        let pool_b = AnyPool::connect(&url_b).await.unwrap();
-
-        let config = SqlxConfig {
-            url: url_a.clone(),
-            table: "orders".to_string(),
-            cursor_column: Some("id".to_string()),
-            cursor_id: Some("copy-1".to_string()),
-            checkpoint_store: Some(url_b.clone()),
-            ..Default::default()
-        };
-
-        let mut reader = SqlxCursorReader::new(&config).await.unwrap();
-        let b = reader.receive_batch(10).await.unwrap();
-        assert_eq!(b.messages.len(), 3);
-        (b.commit)(vec![MessageDisposition::Ack; 3]).await.unwrap();
-
-        // Cursor landed in the external DB, in the auto-unique table keyed by <source>:<id>.
-        let last: String = sqlx::query_scalar(
-            "SELECT last_value FROM mqb_cursors_orders WHERE cursor_id = 'orders:copy-1'",
-        )
-        .fetch_one(&pool_b)
-        .await
-        .unwrap();
-        assert_eq!(last, "int:3");
-
-        // The source DB was never written to (no meta table).
-        let n: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name LIKE 'mqb_cursors%'",
-        )
-        .fetch_one(&pool_a)
-        .await
-        .unwrap();
-        assert_eq!(n, 0);
-
-        // Restart resumes from the external checkpoint -> nothing re-emitted.
-        let mut reader2 = SqlxCursorReader::new(&config).await.unwrap();
-        assert!(reader2.receive_batch(10).await.unwrap().messages.is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_sqlx_roundtrip_delete() {
-        let (_dir, url) = setup_db_file().await;
-
-        let config = SqlxConfig {
-            url: url.clone(),
-            table: "messages".to_string(),
-            delete_after_read: true,
-            ..Default::default()
-        };
-
-        let publisher = SqlxPublisher::new(&config).await.unwrap();
-        let msg_payload = b"hello sqlx".to_vec();
-        let msg = CanonicalMessage::new(msg_payload.clone(), None);
-        publisher.send(msg).await.unwrap();
-
-        let mut consumer = SqlxConsumer::new(&config).await.unwrap();
-        let received_batch = consumer.receive_batch(1).await.unwrap();
-        assert_eq!(received_batch.messages.len(), 1);
-        assert_eq!(received_batch.messages[0].payload.as_ref(), &msg_payload);
-
-        (received_batch.commit)(vec![MessageDisposition::Ack])
-            .await
-            .unwrap();
-
-        let pool = AnyPool::connect(&url).await.unwrap();
-        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        assert_eq!(count, 0);
-    }
-
-    #[tokio::test]
-    async fn test_sqlx_roundtrip_no_delete() {
-        let (_dir, url) = setup_db_file().await;
-
-        let config = SqlxConfig {
-            url: url.clone(),
-            table: "messages".to_string(),
-            delete_after_read: false,
-            ..Default::default()
-        };
-
-        let publisher = SqlxPublisher::new(&config).await.unwrap();
-        let msg_payload = b"hello sqlx no delete".to_vec();
-        let msg = CanonicalMessage::new(msg_payload.clone(), None);
-        publisher.send(msg).await.unwrap();
-
-        let mut consumer = SqlxConsumer::new(&config).await.unwrap();
-        let received_batch = consumer.receive_batch(1).await.unwrap();
-        assert_eq!(received_batch.messages.len(), 1);
-
-        (received_batch.commit)(vec![MessageDisposition::Ack])
-            .await
-            .unwrap();
-
-        let pool = AnyPool::connect(&url).await.unwrap();
-        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        assert_eq!(count, 1);
-    }
-
-    #[test]
-    fn test_parse_insert_template_no_tokens() {
-        let (q, sources) =
-            parse_insert_template("INSERT INTO t (payload) VALUES (?)", "SQLite").unwrap();
-        assert_eq!(q, "INSERT INTO t (payload) VALUES (?)");
-        assert!(sources.is_empty());
-    }
-
-    #[test]
-    fn test_parse_insert_template_single_metadata() {
-        let (q, sources) =
-            parse_insert_template("INSERT INTO t (a) VALUES (${metadata:x})", "PostgreSQL")
-                .unwrap();
-        assert_eq!(q, "INSERT INTO t (a) VALUES ($1)");
-        assert_eq!(sources, vec![ColumnSource::Metadata("x".to_string())]);
-    }
-
-    #[test]
-    fn test_parse_insert_template_mixed_dialects() {
-        let tpl = "INSERT INTO t (a, b) VALUES (${metadata:a}, ${payload:b})";
-        let expected = vec![
-            ColumnSource::Metadata("a".to_string()),
-            ColumnSource::Payload("b".to_string()),
-        ];
-
-        let (q, s) = parse_insert_template(tpl, "PostgreSQL").unwrap();
-        assert_eq!(q, "INSERT INTO t (a, b) VALUES ($1, $2)");
-        assert_eq!(s, expected);
-
-        let (q, s) = parse_insert_template(tpl, "Microsoft SQL Server").unwrap();
-        assert_eq!(q, "INSERT INTO t (a, b) VALUES (@p1, @p2)");
-        assert_eq!(s, expected);
-
-        let (q, s) = parse_insert_template(tpl, "MySQL").unwrap();
-        assert_eq!(q, "INSERT INTO t (a, b) VALUES (?, ?)");
-        assert_eq!(s, expected);
-    }
-
-    #[test]
-    fn test_parse_insert_template_malformed() {
-        assert!(parse_insert_template("VALUES (${metadata:x)", "SQLite").is_err()); // unclosed
-        assert!(parse_insert_template("VALUES (${bogus:x})", "SQLite").is_err()); // bad prefix
-        assert!(parse_insert_template("VALUES (${metadata})", "SQLite").is_err()); // no ':'
-        assert!(parse_insert_template("VALUES (${payload:})", "SQLite").is_err());
-        // empty field
-    }
-
-    #[test]
-    fn test_resolve_source_metadata() {
-        let mut msg = CanonicalMessage::new(b"{}".to_vec(), None);
-        msg.metadata.insert("k".to_string(), "v".to_string());
-        let json = serde_json::from_slice(&msg.payload).ok();
-        assert_eq!(
-            resolve_source(&msg, &ColumnSource::Metadata("k".to_string()), &json),
-            BindValue::Text("v".to_string())
-        );
-        assert_eq!(
-            resolve_source(&msg, &ColumnSource::Metadata("nope".to_string()), &json),
-            BindValue::Null
-        );
-    }
-
-    #[test]
-    fn test_resolve_source_payload_types() {
-        let msg = CanonicalMessage::new(
-            br#"{"s":"x","i":5,"f":1.5,"b":true,"arr":[1],"n":null}"#.to_vec(),
-            None,
-        );
-        let json = serde_json::from_slice(&msg.payload).ok();
-        let p = |f: &str| resolve_source(&msg, &ColumnSource::Payload(f.to_string()), &json);
-        assert_eq!(p("s"), BindValue::Text("x".to_string()));
-        assert_eq!(p("i"), BindValue::Int(5));
-        assert_eq!(p("f"), BindValue::Float(1.5));
-        assert_eq!(p("b"), BindValue::Bool(true));
-        assert_eq!(p("arr"), BindValue::Null);
-        assert_eq!(p("n"), BindValue::Null);
-        assert_eq!(p("missing"), BindValue::Null);
-    }
-
-    #[test]
-    fn test_resolve_source_no_fallback() {
-        // Payload source must NOT fall back to metadata and vice versa.
-        let mut msg = CanonicalMessage::new(b"not json".to_vec(), None);
-        msg.metadata.insert("k".to_string(), "meta".to_string());
-        let json: Option<serde_json::Value> = serde_json::from_slice(&msg.payload).ok();
-        assert!(json.is_none());
-        // payload:k -> Null even though metadata has "k"
-        assert_eq!(
-            resolve_source(&msg, &ColumnSource::Payload("k".to_string()), &json),
-            BindValue::Null
-        );
-    }
-
-    #[tokio::test]
-    async fn test_sqlx_multicolumn_insert() {
-        let (_dir, url) = setup_db_file().await;
-        let pool = AnyPool::connect(&url).await.unwrap();
-        sqlx::query("CREATE TABLE orders (sku TEXT, qty INTEGER, cust TEXT)")
-            .execute(&pool)
-            .await
-            .unwrap();
-
-        let config = SqlxConfig {
-            url: url.clone(),
-            table: "orders".to_string(),
-            insert_query: Some(
-                "INSERT INTO orders (sku, qty, cust) VALUES (${payload:sku}, ${payload:qty}, ${metadata:cust})"
-                    .to_string(),
-            ),
-            ..Default::default()
-        };
-        let publisher = SqlxPublisher::new(&config).await.unwrap();
-
-        let mut msg = CanonicalMessage::new(br#"{"sku":"abc","qty":7}"#.to_vec(), None);
-        msg.metadata.insert("cust".to_string(), "c1".to_string());
-        publisher.send(msg).await.unwrap();
-
-        let row = sqlx::query("SELECT sku, qty, cust FROM orders")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        let sku: String = row.get("sku");
-        let qty: i64 = row.get("qty");
-        let cust: String = row.get("cust");
-        assert_eq!(sku, "abc");
-        assert_eq!(qty, 7);
-        assert_eq!(cust, "c1");
-    }
-
-    #[tokio::test]
-    async fn test_sqlx_multicolumn_non_json_payload_nulls() {
-        let (_dir, url) = setup_db_file().await;
-        let pool = AnyPool::connect(&url).await.unwrap();
-        sqlx::query("CREATE TABLE t (a TEXT, b TEXT)")
-            .execute(&pool)
-            .await
-            .unwrap();
-
-        let config = SqlxConfig {
-            url: url.clone(),
-            table: "t".to_string(),
-            insert_query: Some(
-                "INSERT INTO t (a, b) VALUES (${metadata:a}, ${payload:b})".to_string(),
-            ),
-            ..Default::default()
-        };
-        let publisher = SqlxPublisher::new(&config).await.unwrap();
-
-        let mut msg = CanonicalMessage::new(b"raw non-json".to_vec(), None);
-        msg.metadata.insert("a".to_string(), "meta_a".to_string());
-        publisher.send(msg).await.unwrap();
-
-        let row = sqlx::query("SELECT a, b FROM t")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        let a: String = row.get("a");
-        let b: Option<String> = row.get("b");
-        assert_eq!(a, "meta_a");
-        assert_eq!(b, None); // payload not JSON -> NULL, no fallback to metadata
-    }
-
-    #[tokio::test]
-    async fn test_sqlx_multicolumn_batch() {
-        let (_dir, url) = setup_db_file().await;
-        let pool = AnyPool::connect(&url).await.unwrap();
-        sqlx::query("CREATE TABLE t (a TEXT, b INTEGER)")
-            .execute(&pool)
-            .await
-            .unwrap();
-
-        let config = SqlxConfig {
-            url: url.clone(),
-            table: "t".to_string(),
-            insert_query: Some(
-                "INSERT INTO t (a, b) VALUES (${metadata:a}, ${payload:b})".to_string(),
-            ),
-            ..Default::default()
-        };
-        let publisher = SqlxPublisher::new(&config).await.unwrap();
-
-        let mut msgs = Vec::new();
-        for i in 0..3 {
-            let mut m = CanonicalMessage::new(format!("{{\"b\":{}}}", i * 10).into_bytes(), None);
-            m.metadata.insert("a".to_string(), format!("row{}", i));
-            msgs.push(m);
-        }
-        publisher.send_batch(msgs).await.unwrap();
-
-        let rows = sqlx::query("SELECT a, b FROM t ORDER BY b")
-            .fetch_all(&pool)
-            .await
-            .unwrap();
-        assert_eq!(rows.len(), 3);
-        for (i, row) in rows.iter().enumerate() {
-            let a: String = row.get("a");
-            let b: i64 = row.get("b");
-            assert_eq!(a, format!("row{}", i));
-            assert_eq!(b, (i as i64) * 10);
-        }
-    }
-
-    #[tokio::test]
-    async fn test_sqlx_auto_create_rejects_tokens() {
-        let (_dir, url) = setup_db_file().await;
-        let config = SqlxConfig {
-            url,
-            table: "t".to_string(),
-            auto_create_table: true,
-            insert_query: Some("INSERT INTO t (a) VALUES (${payload:a})".to_string()),
-            ..Default::default()
-        };
-        assert!(SqlxPublisher::new(&config).await.is_err());
-    }
-
-    #[tokio::test]
-    async fn test_sqlx_status() {
-        let (_dir, url) = setup_db_file().await;
-        let config = SqlxConfig {
-            url: url.clone(),
-            table: "messages".to_string(),
-            ..Default::default()
-        };
-
-        let publisher = SqlxPublisher::new(&config).await.unwrap();
-        let status = publisher.status().await;
-        assert!(status.healthy);
-        assert_eq!(status.target, "messages");
-        assert!(status.details.get("driver").is_some());
-    }
-}
+mod tests;
