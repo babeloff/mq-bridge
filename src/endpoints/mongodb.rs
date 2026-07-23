@@ -1325,89 +1325,92 @@ impl MongoDbSubscriber {
 #[async_trait]
 impl MessageConsumer for MongoDbSubscriber {
     async fn receive_batch(&mut self, max_messages: usize) -> Result<ReceivedBatch, ConsumerError> {
-        loop {
-            // Filter for events with seq > last_seq.
-            // Crucially, we must filter out the sequencer and cursor documents which might be in the same collection.
-            // Events have a 'payload' field, while sequencer/cursors do not.
-            let last_seq = self.last_seq.load(Ordering::Relaxed);
-            let mut filter = doc! {
-                "seq": { "$gt": last_seq },
-                "payload": { "$exists": true }
-            };
-            if let Some(extra) = &self.receive_query {
-                filter = doc! { "$and": [filter, extra.clone()] };
-            }
+        // Filter for events with seq > last_seq.
+        // Crucially, we must filter out the sequencer and cursor documents which might be in the same collection.
+        // Events have a 'payload' field, while sequencer/cursors do not.
+        let last_seq = self.last_seq.load(Ordering::Relaxed);
+        let mut filter = doc! {
+            "seq": { "$gt": last_seq },
+            "payload": { "$exists": true }
+        };
+        if let Some(extra) = &self.receive_query {
+            filter = doc! { "$and": [filter, extra.clone()] };
+        }
 
-            let find_options = FindOptions::builder()
-                .sort(doc! { "seq": 1 })
-                .limit(max_messages as i64)
-                .build();
+        let find_options = FindOptions::builder()
+            .sort(doc! { "seq": 1 })
+            .limit(max_messages as i64)
+            .build();
 
-            let mut cursor = self
-                .collection
-                .find(filter)
-                .with_options(find_options)
-                .await
-                .map_err(|e| ConsumerError::Connection(e.into()))?;
+        let mut cursor = self
+            .collection
+            .find(filter)
+            .with_options(find_options)
+            .await
+            .map_err(|e| ConsumerError::Connection(e.into()))?;
 
-            let mut messages = Vec::new();
-            let mut seqs = Vec::new();
+        let mut messages = Vec::new();
+        let mut seqs = Vec::new();
 
-            while let Some(result) = cursor.next().await {
-                if let Ok(doc) = result {
-                    if let Ok(seq) = doc.get_i64("seq") {
-                        if let Ok(msg) = parse_mongodb_document(doc) {
-                            messages.push(msg);
-                            seqs.push(seq);
-                            // from here on, we will not received this seq anymore
-                            self.last_seq.store(seq, Ordering::Relaxed);
-                        }
+        while let Some(result) = cursor.next().await {
+            if let Ok(doc) = result {
+                if let Ok(seq) = doc.get_i64("seq") {
+                    if let Ok(msg) = parse_mongodb_document(doc) {
+                        messages.push(msg);
+                        seqs.push(seq);
+                        // from here on, we will not received this seq anymore
+                        self.last_seq.store(seq, Ordering::Relaxed);
                     }
                 }
             }
-
-            if !messages.is_empty() {
-                let meta_collection = self.meta_collection.clone();
-                let collection_name = self.collection_name.clone();
-                let cursor_id = self.cursor_id.clone();
-
-                let commit = Box::new(move |dispositions: Vec<MessageDisposition>| {
-                    Box::pin(async move {
-                        let mut highest_acked = 0;
-                        for (disp, seq) in dispositions.iter().zip(seqs.iter()) {
-                            if matches!(
-                                disp,
-                                MessageDisposition::Ack | MessageDisposition::Reply(_)
-                            ) {
-                                highest_acked = *seq;
-                            } else {
-                                break; // Stop at first Nack
-                            }
-                        }
-
-                        if highest_acked > 0 {
-                            // Only persist if we have a cursor_id
-                            if let Some(cid) = cursor_id {
-                                let cursor_doc_id = namespaced_cursor_id(&collection_name, &cid);
-                                if let Err(e) = meta_collection
-                                    .update_one(
-                                        doc! { "_id": cursor_doc_id },
-                                        doc! { "$set": { "last_seq": highest_acked } },
-                                    )
-                                    .with_options(UpdateOptions::builder().upsert(true).build())
-                                    .await
-                                {
-                                    tracing::warn!(cursor_id = %cid, error = %e, "Failed to persist cursor position. Messages may be reprocessed on restart.");
-                                }
-                            }
-                        }
-                        Ok(())
-                    }) as BoxFuture<'static, anyhow::Result<()>>
-                });
-                return Ok(ReceivedBatch { messages, commit });
-            }
-            tokio::time::sleep(self.polling_interval).await;
         }
+
+        if !messages.is_empty() {
+            let meta_collection = self.meta_collection.clone();
+            let collection_name = self.collection_name.clone();
+            let cursor_id = self.cursor_id.clone();
+
+            let commit = Box::new(move |dispositions: Vec<MessageDisposition>| {
+                Box::pin(async move {
+                    let mut highest_acked = 0;
+                    for (disp, seq) in dispositions.iter().zip(seqs.iter()) {
+                        if matches!(disp, MessageDisposition::Ack | MessageDisposition::Reply(_)) {
+                            highest_acked = *seq;
+                        } else {
+                            break; // Stop at first Nack
+                        }
+                    }
+
+                    if highest_acked > 0 {
+                        // Only persist if we have a cursor_id
+                        if let Some(cid) = cursor_id {
+                            let cursor_doc_id = namespaced_cursor_id(&collection_name, &cid);
+                            if let Err(e) = meta_collection
+                                .update_one(
+                                    doc! { "_id": cursor_doc_id },
+                                    doc! { "$set": { "last_seq": highest_acked } },
+                                )
+                                .with_options(UpdateOptions::builder().upsert(true).build())
+                                .await
+                            {
+                                tracing::warn!(cursor_id = %cid, error = %e, "Failed to persist cursor position. Messages may be reprocessed on restart.");
+                            }
+                        }
+                    }
+                    Ok(())
+                }) as BoxFuture<'static, anyhow::Result<()>>
+            });
+            return Ok(ReceivedBatch { messages, commit });
+        }
+
+        // Drained: pace the poll, then surface an empty batch so the route can pause
+        // (empty_batch_delay_ms) or, with exit_on_empty, terminate gracefully. Blocking
+        // here indefinitely would make exit_on_empty unreachable.
+        tokio::time::sleep(self.polling_interval).await;
+        Ok(ReceivedBatch {
+            messages: Vec::new(),
+            commit: Box::new(|_| Box::pin(async { Ok(()) })),
+        })
     }
 
     async fn status(&self) -> EndpointStatus {
