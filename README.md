@@ -177,7 +177,7 @@ The table below summarizes the capabilities and configuration for each backend:
 | **Kafka** | Omit `group_id` | Emulated (Header) | Eventual (Skip Offset) |
 | **Memory** (in-process) | Set `subscribe_mode: true` | Emulated (Metadata) | **Yes** (Re-queue), by default **disabled** |
 | **Memory** (IPC: `ipc://`, `unix://`, `pipe://`) | Not supported | Not supported | **Yes** (Re-queue), by default **enabled**, consumer-local |
-| **MongoDB** | Set `change_stream: true` | Emulated (Metadata) | **Yes** (Unlock) |
+| **MongoDB** | Set `consume: subscriber` | Emulated (Metadata) | **Yes** (Unlock) |
 | **MQTT** | Set `clean_session: true` | Emulated (Property) | Eventual (Skip Ack) |
 | **NATS** | Set `subscriber_mode: true` | **Native** (Inbox) | **Yes** (JetStream Nak) |
 | **Postgres CDC** | N/A (streams committed changes) | No | **Yes** (confirmed LSN not advanced) |
@@ -200,6 +200,36 @@ Databases have no native pub/sub, so `mq-bridge` reads them as a source in one o
     *   On **PostgreSQL**, the `postgres_cdc` endpoint streams a logical-replication slot (`pgoutput`). It emits flat JSON rows tagged with `postgres.operation` metadata (`insert`/`update`/`delete`/`truncate`). Acking a batch confirms the LSN back to the server (`standby_status_update`); a nack (or an interrupted run) does **not** advance the confirmed LSN, so replication resumes from the last acknowledged position on reconnect — at-least-once, verified by a restart-safety integration test. Enable with the `postgres-cdc` feature; requires `wal_level = logical` and a publication. See below.
     *   On **MongoDB**, set `consume: capture_new` to watch an existing collection for changes from now on, or `consume: capture_all` to read the existing documents first and then keep capturing changes (no gap, at-least-once). It emits `insert`/`update`/`replace`/`delete` events tagged with `mongodb.operation` metadata and checkpoints progress under `cursor_id`. These use the change stream (full post-image via `updateLookup`) and need a replica set; on a standalone server `capture_all` falls back to an insert-only read.
 *   **Cursor polling** — pages an existing table by a monotonic `cursor_column` (`WHERE col > $last ORDER BY col ASC`), persisting the last read value under `cursor_id`. Captures **appends only** — updates and deletes are not observed. Available on **SQLx** (PostgreSQL / MySQL / MariaDB / SQLite) and **ClickHouse**; while idle the poll interval backs off exponentially between `polling_interval_ms` and `max_polling_interval_ms`. **SQLite** and **ClickHouse** are polling-only — they have no server-side change log.
+
+#### Choosing a MongoDB consume mode
+
+These are not interchangeable. The default `consumer` is a **competing-consumers work queue**: its
+lock-and-delete protocol lets several readers drain the same collection with each document going to
+exactly one of them — the right thing for dispatching jobs or commands. The `capture_*` modes are
+**readers**: they fan out, so every reader sees every document, and nothing is claimed or removed.
+
+Pick by semantics first. Where both would do — a one-shot bulk read or ETL pass with a single
+reader — **use `capture_all`**: `consumer`'s four round trips per batch (find ids → claim →
+re-fetch → delete on ack) buy exclusivity you aren't using, and cost ~5x.
+
+| `consume` | mechanism | modifies source | ends on drain | use for |
+| :--- | :--- | :--- | :--- | :--- |
+| `consumer` (default) | claim → lock → re-fetch → delete | **yes** | yes | work queues, competing readers |
+| `subscriber` | polls `seq > last_seq`, advancing a cursor | no | yes | ephemeral fan-out |
+| `capture_new` | change stream, new changes only | no | **no** | ongoing CDC |
+| `capture_all` | `_id` snapshot, then change stream | no | standalone only | bulk read / ETL |
+
+500k documents, `batch_size: 1024`, release build, standalone MongoDB: `consumer` → `null`
+**23,667 rows/s**, `capture_all` → jsonl **120,308 rows/s** (`postgres` → `null` reference: 115,924).
+
+*   `concurrency` does not speed up a MongoDB source — batches are fetched serially; it only widens
+    the downstream side.
+*   `consumer` and `subscriber` only read collections written by the mq-bridge MongoDB publisher
+    (UUID `_id` / wrapped `seq` field); other documents are skipped or rejected at startup.
+*   `capture_*` need a replica set. `capture_new` errors without one; `capture_all` degrades to an
+    insert-only `_id` read that terminates on drain. On a replica set it streams indefinitely after
+    the snapshot — plan an external stop, not `exit_on_empty`.
+*   Wart: `capture_all`'s snapshot also emits the internal `<collection>:sequencer` document.
 
 
 ### Cloud Object Storage (S3 / GCS / Azure)

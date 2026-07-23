@@ -2113,16 +2113,17 @@ pub enum MongoDbFormat {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum MongoConsume {
-    /// **Queue** — durably drain a queue collection: claim, process, resume after restart. Default.
+    /// **Queue** — competing consumers: claim, process, delete, so each document goes to exactly one
+    /// reader. Default. Destructive and ~5x slower than `capture_all`; for jobs, not bulk reads.
     #[default]
     Consumer,
     /// **Queue, ephemeral** — receive only new messages, no durable position (fan-out subscriber).
     Subscriber,
     /// **Watch existing collection** — capture changes from now on (insert/update/delete), resuming
-    /// under `cursor_id`. Reads an existing collection non-destructively.
+    /// under `cursor_id`. Reads an existing collection non-destructively; never ends on drain.
     CaptureNew,
     /// **Watch existing collection** — read the existing documents first, then capture changes.
-    /// Reads an existing collection non-destructively.
+    /// Non-destructive and the fastest read mode; use this for bulk reads and ETL.
     CaptureAll,
 }
 
@@ -2158,9 +2159,10 @@ pub struct MongoDbConfig {
     /// (Publisher only) If true, the publisher will wait for a response in a dedicated collection. Defaults to false.
     #[serde(default)]
     pub request_reply: bool,
-    /// (Consumer only) How to consume the collection: `consumer` (default, durable queue),
-    /// `subscriber` (ephemeral queue), `capture_new` (watch an existing collection for changes), or
-    /// `capture_all` (read existing documents first, then watch for changes). The bridge selects the
+    /// (Consumer only) How to consume the collection: `consumer` (default, competing-consumers work
+    /// queue — destructive and ~5x slower), `subscriber` (ephemeral queue), `capture_new` (watch an
+    /// existing collection for changes), or `capture_all` (read existing documents first, then watch
+    /// for changes — use this for single-reader bulk reads and ETL). The bridge selects the
     /// underlying mechanism automatically. If unset, the deprecated `change_stream` boolean is
     /// honored for backward compatibility.
     pub consume: Option<MongoConsume>,

@@ -1206,12 +1206,12 @@
           "minimum": 0
         },
         "compression": {
-          "description": "Codec for *request* bodies over the threshold (`none`, `gzip`, `lz4`, `zstd`); `lz4` is\nnon-standard (mq-bridge peers only). Any non-`none` value advertises `Accept-Encoding: gzip,\nlz4, zstd`, so responses may use any of the three (all decoded). Defaults to `none`.",
+          "description": "(Publisher only) Codec for the request body (`none`, `gzip`, `lz4`, `zstd`); overrides\n`compression_enabled`. `lz4` is non-standard (mq-bridge peers only). Ignored on a consumer —\nenable response compression with `compression_enabled`. Defaults to `none`.",
           "$ref": "#/$defs/Compression",
           "default": "none"
         },
         "compression_enabled": {
-          "description": "Deprecated: replaced by `compression`. Kept for backward compatibility — a legacy\n`compression_enabled: true` (with `compression` unset) is treated as `compression: gzip`.",
+          "description": "Turns compression on. Publisher: compress the request body with gzip (unless `compression`\nsets another codec). Consumer: compress responses, negotiating the best codec the client's\n`Accept-Encoding` accepts. Defaults to off.",
           "type": [
             "boolean",
             "null"
@@ -1939,7 +1939,7 @@
       "description": "How a MongoDB endpoint consumes a collection. One intent-named selector — the bridge picks the\nunderlying mechanism (change stream vs. polling) automatically. Defaults to `consumer`.",
       "oneOf": [
         {
-          "description": "**Queue** — durably drain a queue collection: claim, process, resume after restart. Default.",
+          "description": "**Queue** — competing consumers: claim, process, delete, so each document goes to exactly one\nreader. Default. Destructive and ~5x slower than `capture_all`; for jobs, not bulk reads.",
           "type": "string",
           "const": "consumer"
         },
@@ -1949,12 +1949,12 @@
           "const": "subscriber"
         },
         {
-          "description": "**Watch existing collection** — capture changes from now on (insert/update/delete), resuming\nunder `cursor_id`. Reads an existing collection non-destructively.",
+          "description": "**Watch existing collection** — capture changes from now on (insert/update/delete), resuming\nunder `cursor_id`. Reads an existing collection non-destructively; never ends on drain.",
           "type": "string",
           "const": "capture_new"
         },
         {
-          "description": "**Watch existing collection** — read the existing documents first, then capture changes.\nReads an existing collection non-destructively.",
+          "description": "**Watch existing collection** — read the existing documents first, then capture changes.\nNon-destructive and the fastest read mode; use this for bulk reads and ETL.",
           "type": "string",
           "const": "capture_all"
         }
@@ -1993,7 +1993,7 @@
           ]
         },
         "consume": {
-          "description": "(Consumer only) How to consume the collection: `consumer` (default, durable queue),\n`subscriber` (ephemeral queue), `capture_new` (watch an existing collection for changes), or\n`capture_all` (read existing documents first, then watch for changes). The bridge selects the\nunderlying mechanism automatically. If unset, the deprecated `change_stream` boolean is\nhonored for backward compatibility.",
+          "description": "(Consumer only) How to consume the collection: `consumer` (default, competing-consumers work\nqueue — destructive and ~5x slower), `subscriber` (ephemeral queue), `capture_new` (watch an\nexisting collection for changes), or `capture_all` (read existing documents first, then watch\nfor changes — use this for single-reader bulk reads and ETL). The bridge selects the\nunderlying mechanism automatically. If unset, the deprecated `change_stream` boolean is\nhonored for backward compatibility.",
           "anyOf": [
             {
               "$ref": "#/$defs/MongoConsume"
