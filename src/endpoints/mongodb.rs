@@ -814,22 +814,31 @@ impl MessageConsumer for MongoDbConsumer {
                 return Ok(ReceivedBatch { messages, commit });
             }
 
-            // If no documents found, wait before retrying.
+            // Drained: wait for the next arrival, then surface an empty batch so the
+            // route can pause (empty_batch_delay_ms) or, with exit_on_empty, terminate
+            // gracefully. Blocking here indefinitely would make exit_on_empty unreachable.
             if let Some(stream_mutex) = &self.change_stream {
-                // Replica Set: Wait for a change stream event to wake us up.
+                // Replica set: wait briefly for an insert. On an event, loop back to
+                // claim immediately (low latency); on timeout, return the empty batch
+                // below so exit_on_empty can fire.
                 let mut stream = stream_mutex.lock().await;
                 match tokio::time::timeout(Duration::from_secs(5), stream.next()).await {
-                    Ok(Some(Ok(_))) => {} // Event received, loop back to try claiming documents.
+                    Ok(Some(Ok(_))) => continue, // Event received, loop back to claim.
                     Ok(Some(Err(e))) => return Err(ConsumerError::Connection(e.into())),
                     Ok(None) => {
                         return Err(anyhow!("MongoDB change stream ended unexpectedly").into())
                     }
-                    Err(_) => {} // Timeout, loop back to check for documents.
+                    Err(_) => {} // Timeout: fall through to return the empty batch.
                 }
             } else {
-                // Standalone: Sleep for polling interval.
+                // Standalone: sleep the polling interval, then return the empty batch.
                 tokio::time::sleep(self.polling_interval).await;
             }
+
+            return Ok(ReceivedBatch {
+                messages: Vec::new(),
+                commit: Box::new(|_| Box::pin(async { Ok(()) })),
+            });
         }
     }
 
