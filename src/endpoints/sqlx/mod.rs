@@ -432,12 +432,26 @@ fn copy_escape_text(s: &str) -> String {
 /// A `Database` error is a rejection by the server (constraint violation, bad SQL,
 /// type mismatch) that will recur on retry, so it is non-retryable; everything else
 /// (connection drops, pool timeouts, protocol errors) is treated as transient.
+// Only deterministic failures (constraint violations) are NonRetryable — retrying can never
+// succeed. Every other database error is transient and Retryable: server shutdown (MySQL 1053),
+// lost connections, lock-wait/deadlock, "too many connections", and crash-recovery errors all
+// surface as `Database` errors during a broker restart/failover, and dropping them loses
+// messages. Non-`Database` errors (I/O, pool timeout, TLS) are transport-level and retryable too.
 fn classify_sql_error(e: sqlx::Error) -> PublisherError {
-    if matches!(e, sqlx::Error::Database(_)) {
-        PublisherError::NonRetryable(anyhow!(e))
-    } else {
-        PublisherError::Retryable(anyhow!(e))
+    use sqlx::error::ErrorKind;
+    if let Some(db_err) = e.as_database_error() {
+        if matches!(
+            db_err.kind(),
+            ErrorKind::UniqueViolation
+                | ErrorKind::ForeignKeyViolation
+                | ErrorKind::NotNullViolation
+                | ErrorKind::CheckViolation
+                | ErrorKind::ExclusionViolation
+        ) {
+            return PublisherError::NonRetryable(anyhow!(e));
+        }
     }
+    PublisherError::Retryable(anyhow!(e))
 }
 
 fn extract_copy_columns(raw_query: &str, token_count: usize) -> anyhow::Result<Vec<String>> {

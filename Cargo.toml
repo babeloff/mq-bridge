@@ -190,12 +190,12 @@ protoc-bin-vendored = { version = "3.0", optional = true }
 
 [features]
 default = []
-middleware = ["metrics", "dedup"]
+middleware = ["metrics", "dedup", "compression", "encryption"]
 # ibm-mq (dlopen) is safe to include: it needs no IBM SDK at build, and at
 # runtime the client is loaded lazily only when an ibm-mq endpoint is opened
 # (clear error if the client isn't installed). Use `ibm-mq-static` instead for
 # static linking.
-full = ["middleware", "mongodb", "kafka", "amqp", "nats", "mqtt", "http", "aws", "zeromq", "redis-streams", "sled", "grpc", "sqlx", "clickhouse", "websocket", "postgres-cdc", "object-store", "rustls-aws-lc", "ibm-mq", "compression", "encryption"]
+full = ["middleware", "mongodb", "kafka", "amqp", "nats", "mqtt", "http", "aws", "zeromq", "redis-streams", "sled", "grpc", "sqlx", "clickhouse", "websocket", "postgres-cdc", "object-store", "rustls-aws-lc", "ibm-mq"]
 
 # Endpoints that build across most OS targets (glibc/musl/Alpine, macOS,
 # Windows, aarch64/armv7) without a special toolchain — no librdkafka, protoc,
@@ -205,7 +205,7 @@ full = ["middleware", "mongodb", "kafka", "amqp", "nats", "mqtt", "http", "aws",
 # kafka (librdkafka), sqlx (libsqlite3-sys), grpc (protoc), ibm-mq/ibm-mq-static
 # (IBM C client). postgres-cdc is excluded too: its wire protocol is pure Rust
 # but it pulls in sqlx (C).
-portable = ["mongodb", "amqp", "nats", "mqtt", "http", "aws", "zeromq", "redis-streams", "clickhouse", "websocket", "object-store", "rustls-aws-lc"]
+portable = ["metrics", "dedup", "mongodb", "amqp", "nats", "mqtt", "http", "aws", "zeromq", "redis-streams", "clickhouse", "websocket", "object-store", "rustls-aws-lc"]
 
 # Functionality features
 dedup = ["sled"]

@@ -663,6 +663,63 @@ async fn test_sqlx_auto_create_rejects_tokens() {
     assert!(SqlxPublisher::new(&config).await.is_err());
 }
 
+// Regression for the chaos-test message loss: only genuine constraint violations may be
+// classified NonRetryable (dead-lettered). Every other database error — crucially the
+// operational errors a broker restart/failover produces, e.g. MySQL 1053 "server shutdown in
+// progress", which surface with `ErrorKind::Other` — must stay Retryable so in-flight messages
+// are re-driven instead of silently dropped. Errors are produced by the real driver, which also
+// verifies the `Any` driver actually reports `UniqueViolation` (the production fix relies on it).
+#[tokio::test]
+async fn test_classify_sql_error_constraint_is_nonretryable_others_retryable() {
+    use sqlx::error::ErrorKind;
+    sqlx::any::install_default_drivers();
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("classify.db");
+    let url = sqlite_url(&path);
+    drop(tokio::fs::File::create(&path).await.unwrap());
+    let pool = AnyPool::connect(&url).await.unwrap();
+    sqlx::query("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO t (id) VALUES (1)")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    // A duplicate primary key is deterministic: retrying can never succeed -> NonRetryable.
+    let dup = sqlx::query("INSERT INTO t (id) VALUES (1)")
+        .execute(&pool)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        dup.as_database_error().unwrap().kind(),
+        ErrorKind::UniqueViolation
+    );
+    assert!(matches!(
+        classify_sql_error(dup),
+        PublisherError::NonRetryable(_)
+    ));
+
+    // A non-constraint database error (kind `Other`) models a transient operational failure such
+    // as a server restart -> must be Retryable, never dropped.
+    let other = sqlx::query("INSERT INTO no_such_table (id) VALUES (1)")
+        .execute(&pool)
+        .await
+        .unwrap_err();
+    assert!(other.as_database_error().is_some());
+    assert!(matches!(
+        classify_sql_error(other),
+        PublisherError::Retryable(_)
+    ));
+
+    // Transport-level errors (pool exhaustion, I/O) are transient too.
+    assert!(matches!(
+        classify_sql_error(sqlx::Error::PoolTimedOut),
+        PublisherError::Retryable(_)
+    ));
+}
+
 #[tokio::test]
 async fn test_sqlx_status() {
     let (_dir, url) = setup_db_file().await;
