@@ -60,25 +60,20 @@ impl MessagePublisher for SwitchPublisher {
             return Ok(SentBatch::Ack);
         }
 
-        // Group messages by the value of `metadata_key` (missing key -> empty string).
-        // The grouping key is the metadata value, not the resolved publisher, so two
-        // distinct values that both fall through to `default` stay separate groups and
-        // therefore produce separate `send_batch` calls on the same publisher.
+        // Group messages by the value of `metadata_key` (`None` = key absent, which is a
+        // distinct group from an explicitly empty value). The grouping key is the metadata
+        // value, not the resolved publisher, so two distinct values that both fall through
+        // to `default` stay separate groups and therefore produce separate `send_batch`
+        // calls on the same publisher.
         let mut grouped_messages: HashMap<
-            String,
+            Option<String>,
             (Arc<dyn MessagePublisher>, Vec<CanonicalMessage>),
         > = HashMap::new();
 
         for message in messages {
             if let Some(publisher) = self.get_publisher(&message) {
                 grouped_messages
-                    .entry(
-                        message
-                            .metadata
-                            .get(&self.metadata_key)
-                            .cloned()
-                            .unwrap_or_default(),
-                    )
+                    .entry(message.metadata.get(&self.metadata_key).cloned())
                     .or_insert_with(|| (publisher.clone(), Vec::new()))
                     .1
                     .push(message);

@@ -1611,6 +1611,7 @@ async fn test_request_endpoint_forwards_nothing_when_target_returns_no_response(
     // A plain memory sink acks without producing a response, so there is nothing to
     // forward and the send still succeeds (the input is not blocked).
     let target = Endpoint::new_memory(&get_unique_topic("request_no_reply_target"), 10);
+    let target_channel = target.channel().unwrap();
     let forward_to = Endpoint::new_memory(&get_unique_topic("request_no_reply_forward"), 10);
     let forward_channel = forward_to.channel().unwrap();
 
@@ -1627,5 +1628,9 @@ async fn test_request_endpoint_forwards_nothing_when_target_returns_no_response(
         .await
         .unwrap();
 
+    // The target still received the request; only the (absent) response is not forwarded.
+    let received = target_channel.drain_messages();
+    assert_eq!(received.len(), 1);
+    assert_eq!(received[0].get_payload_str(), "ping");
     assert!(forward_channel.drain_messages().is_empty());
 }
