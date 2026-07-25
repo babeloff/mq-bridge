@@ -60,8 +60,10 @@ impl MessagePublisher for SwitchPublisher {
             return Ok(SentBatch::Ack);
         }
 
-        // Group messages by their target publisher.
-        // We use the raw pointer of the Arc as a key to group messages for the same publisher instance.
+        // Group messages by the value of `metadata_key` (missing key -> empty string).
+        // The grouping key is the metadata value, not the resolved publisher, so two
+        // distinct values that both fall through to `default` stay separate groups and
+        // therefore produce separate `send_batch` calls on the same publisher.
         let mut grouped_messages: HashMap<
             String,
             (Arc<dyn MessagePublisher>, Vec<CanonicalMessage>),
@@ -69,8 +71,6 @@ impl MessagePublisher for SwitchPublisher {
 
         for message in messages {
             if let Some(publisher) = self.get_publisher(&message) {
-                // Use the pointer address of the Arc as a key. This is safe as the Arcs live
-                // as long as the SwitchPublisher and we clone them into the map.
                 grouped_messages
                     .entry(
                         message

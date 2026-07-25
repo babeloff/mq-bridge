@@ -1431,6 +1431,21 @@ fn check_publisher_recursive(
         EndpointType::Response(_) => Ok(warnings),
         EndpointType::Custom { .. } => Ok(warnings),
         EndpointType::Reader(inner) => check_consumer(route_name, inner, allowed_types),
+        EndpointType::Request(cfg) => {
+            warnings.extend(check_publisher_recursive(
+                route_name,
+                &cfg.to,
+                depth + 1,
+                allowed_types,
+            )?);
+            warnings.extend(check_publisher_recursive(
+                route_name,
+                &cfg.forward_to,
+                depth + 1,
+                allowed_types,
+            )?);
+            Ok(warnings)
+        }
         #[allow(unreachable_patterns)]
         _ => {
             if let Some(allowed) = allowed_types {

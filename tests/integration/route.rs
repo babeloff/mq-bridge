@@ -1532,3 +1532,100 @@ pub async fn test_memory_request_reply_multiple_concurrent() {
     Route::stop("mem_rr_multi_con_test").await;
     println!("Memory concurrent multi-request request-reply test passed!");
 }
+
+// --- Structural endpoints through normal configuration + factory wiring ---
+//
+// The structural endpoints have unit tests against hand-built mocks. These build
+// them the way a user does: from `EndpointType` config, via the endpoint factory.
+
+#[tokio::test]
+async fn test_fanout_endpoint_delivers_batch_to_every_configured_destination() {
+    use mq_bridge::endpoints::create_publisher_from_route;
+    use mq_bridge::models::EndpointType;
+    use mq_bridge::traits::SentBatch;
+
+    let left = Endpoint::new_memory(&get_unique_topic("fanout_left"), 10);
+    let right = Endpoint::new_memory(&get_unique_topic("fanout_right"), 10);
+    let left_channel = left.channel().unwrap();
+    let right_channel = right.channel().unwrap();
+
+    let fanout = Endpoint::new(EndpointType::Fanout(vec![left, right]));
+    let publisher = create_publisher_from_route("fanout_config_test", &fanout)
+        .await
+        .unwrap();
+
+    let sent = publisher
+        .send_batch(vec![
+            CanonicalMessage::from("one"),
+            CanonicalMessage::from("two"),
+        ])
+        .await
+        .unwrap();
+    assert!(matches!(sent, SentBatch::Ack));
+
+    for channel in [&left_channel, &right_channel] {
+        let payloads: Vec<String> = channel
+            .drain_messages()
+            .iter()
+            .map(|m| m.get_payload_str().to_string())
+            .collect();
+        assert_eq!(payloads, ["one", "two"]);
+    }
+}
+
+#[tokio::test]
+async fn test_request_endpoint_forwards_response_from_configured_target() {
+    use mq_bridge::endpoints::create_publisher_from_route;
+    use mq_bridge::models::{EndpointType, RequestForwardConfig};
+
+    let forward_to = Endpoint::new_memory(&get_unique_topic("request_forward"), 10);
+    let forward_channel = forward_to.channel().unwrap();
+
+    // `reader` over a `static` source is a request-capable target: its send returns
+    // the read message as the response.
+    let request = Endpoint::new(EndpointType::Request(RequestForwardConfig {
+        to: Box::new(Endpoint::new(EndpointType::Reader(Box::new(
+            Endpoint::new(EndpointType::Static("pong".into())),
+        )))),
+        forward_to: Box::new(forward_to),
+    }));
+
+    let publisher = create_publisher_from_route("request_config_test", &request)
+        .await
+        .unwrap();
+    publisher
+        .send(CanonicalMessage::from("ping"))
+        .await
+        .unwrap();
+
+    let forwarded = forward_channel.drain_messages();
+    assert_eq!(forwarded.len(), 1);
+    assert_eq!(forwarded[0].get_payload_str(), "pong");
+}
+
+#[tokio::test]
+async fn test_request_endpoint_forwards_nothing_when_target_returns_no_response() {
+    use mq_bridge::endpoints::create_publisher_from_route;
+    use mq_bridge::models::{EndpointType, RequestForwardConfig};
+
+    // A plain memory sink acks without producing a response, so there is nothing to
+    // forward and the send still succeeds (the input is not blocked).
+    let target = Endpoint::new_memory(&get_unique_topic("request_no_reply_target"), 10);
+    let forward_to = Endpoint::new_memory(&get_unique_topic("request_no_reply_forward"), 10);
+    let forward_channel = forward_to.channel().unwrap();
+
+    let request = Endpoint::new(EndpointType::Request(RequestForwardConfig {
+        to: Box::new(target),
+        forward_to: Box::new(forward_to),
+    }));
+
+    let publisher = create_publisher_from_route("request_no_reply_test", &request)
+        .await
+        .unwrap();
+    publisher
+        .send(CanonicalMessage::from("ping"))
+        .await
+        .unwrap();
+
+    assert!(forward_channel.drain_messages().is_empty());
+}

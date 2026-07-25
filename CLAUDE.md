@@ -86,7 +86,7 @@ src/
 │   ├── transform/       # Declarative JSON mapping + schema coercion
 │   └── weak_join.rs     # Correlation-keyed join
 ├── support/              # Cross-cutting helpers
-│   ├── compression.rs   # gzip / lz4
+│   ├── compression.rs   # gzip / lz4 / zstd
 │   ├── connection_registry.rs # Shared connection reuse
 │   ├── crypto.rs        # AEAD core (used by encryption middleware + at-rest)
 │   └── interpolation.rs # `${namespace:selector}` templating
