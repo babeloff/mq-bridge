@@ -41,19 +41,24 @@ fn get_file_lock(path: &str) -> Arc<Mutex<()>> {
 
 /// Appends a CSV-escaped field to `buf` without allocating for the common
 /// (no special characters) case. Hot path for CSV row encoding.
-fn csv_append_field(buf: &mut String, s: &str) {
-    if s.contains(',') || s.contains('"') || s.contains('\n') || s.contains('\r') {
-        buf.push('"');
-        for ch in s.chars() {
-            if ch == '"' {
-                buf.push('"');
-            }
-            buf.push(ch);
-        }
-        buf.push('"');
-    } else {
-        buf.push_str(s);
+fn csv_append_field(buf: &mut Vec<u8>, s: &str) {
+    let bytes = s.as_bytes();
+    // One byte pass instead of four `contains` scans.
+    if !bytes
+        .iter()
+        .any(|b| matches!(b, b',' | b'"' | b'\n' | b'\r'))
+    {
+        buf.extend_from_slice(bytes);
+        return;
     }
+    buf.push(b'"');
+    for &b in bytes {
+        if b == b'"' {
+            buf.push(b'"');
+        }
+        buf.push(b);
+    }
+    buf.push(b'"');
 }
 
 /// Appends `s` to `buf` with JSON string escaping (no surrounding quotes).
@@ -82,15 +87,58 @@ fn json_append_escaped(buf: &mut String, s: &str) {
     }
 }
 
-fn csv_encode_row(fields: &[String]) -> String {
-    let mut buf = String::new();
+fn csv_encode_row(fields: &[String]) -> Vec<u8> {
+    let mut buf = Vec::new();
     for (i, f) in fields.iter().enumerate() {
         if i > 0 {
-            buf.push(',');
+            buf.push(b',');
         }
         csv_append_field(&mut buf, f);
     }
     buf
+}
+
+/// Appends one still-unparsed JSON value as a CSV field. Scalars are copied
+/// straight from the source bytes; only escaped strings and nested
+/// arrays/objects need any decoding.
+fn csv_append_raw(buf: &mut Vec<u8>, raw: &serde_json::value::RawValue) {
+    let text = raw.get();
+    match text.as_bytes().first() {
+        Some(b'"') => {
+            let inner = &text[1..text.len() - 1];
+            if !inner.as_bytes().contains(&b'\\') {
+                csv_append_field(buf, inner);
+            } else if let Ok(decoded) = serde_json::from_str::<String>(text) {
+                csv_append_field(buf, &decoded);
+            }
+        }
+        // Nested values are re-serialized compactly, matching the parsed path.
+        Some(b'{') | Some(b'[') => {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(text) {
+                csv_append_field(buf, &v.to_string());
+            }
+        }
+        // Numbers, bools, null: never need quoting, but the scan is one pass anyway.
+        _ => csv_append_field(buf, text),
+    }
+}
+
+/// Appends one JSON value as a CSV field. Numbers, bools and nulls are written
+/// straight into `buf` — they can never need CSV quoting, so this skips both the
+/// escape scan and the `to_string` allocation that dominates numeric-heavy rows.
+fn csv_append_value(buf: &mut Vec<u8>, v: &serde_json::Value) {
+    use std::io::Write as _;
+    match v {
+        serde_json::Value::String(s) => csv_append_field(buf, s),
+        serde_json::Value::Number(n) => {
+            let _ = write!(buf, "{n}");
+        }
+        serde_json::Value::Bool(true) => buf.extend_from_slice(b"true"),
+        serde_json::Value::Bool(false) => buf.extend_from_slice(b"false"),
+        serde_json::Value::Null => buf.extend_from_slice(b"null"),
+        // Nested arrays/objects keep their JSON spelling and do need escaping.
+        other => csv_append_field(buf, &other.to_string()),
+    }
 }
 
 /// Parses a single CSV line into fields. Supports quoted fields with escaped `""`.
@@ -449,6 +497,8 @@ impl MessagePublisher for FilePublisher {
         } else {
             None
         };
+        // Row buffer reused for every CSV record in this batch.
+        let mut csv_row_buf: Vec<u8> = Vec::new();
 
         // Iterate over messages, consuming them
         for mut msg in messages {
@@ -459,57 +509,81 @@ impl MessagePublisher for FilePublisher {
             msg.strip_source_metadata();
             let serialized_msg = match self.format {
                 FileFormat::Csv => {
-                    match serde_json::from_slice::<serde_json::Value>(&msg.payload) {
-                        Ok(serde_json::Value::Object(obj)) => {
-                            let hdr = csv_header_guard.as_mut().expect("csv header lock held");
-                            if hdr.is_none() {
-                                // Sort keys so the column order is deterministic and
-                                // independent of serde_json's map type (BTreeMap vs the
-                                // IndexMap enabled by the `preserve_order` feature, which
-                                // `bson`/mongodb turns on under feature unification).
-                                let mut cols: Vec<String> = obj.keys().cloned().collect();
-                                cols.sort();
-                                if file_is_empty {
-                                    let header_line = csv_encode_row(&cols);
-                                    if let Err(e) = writer.write_all(header_line.as_bytes()).await {
-                                        return Err(PublisherError::NonRetryable(anyhow::anyhow!(
-                                            e
-                                        )));
-                                    }
-                                    if let Err(e) = writer.write_all(&self.delimiter).await {
-                                        return Err(PublisherError::NonRetryable(anyhow::anyhow!(
-                                            e
-                                        )));
-                                    }
-                                    wrote_csv_header = true;
-                                }
-                                **hdr = Some(cols);
-                            }
-                            let cols = hdr.as_ref().unwrap();
-                            let mut line = String::new();
-                            for (i, c) in cols.iter().enumerate() {
-                                if i > 0 {
-                                    line.push(',');
-                                }
-                                match obj.get(c) {
-                                    Some(serde_json::Value::String(s)) => {
-                                        csv_append_field(&mut line, s)
-                                    }
-                                    Some(v) => csv_append_field(&mut line, &v.to_string()),
-                                    None => {}
-                                }
-                            }
-                            Ok(line.into_bytes())
-                        }
-                        _ => Err(serde_json::Error::io(std::io::Error::new(
+                    // Preferred path: borrow the keys and leave the values as unparsed
+                    // JSON slices, so a row costs one scan plus byte copies instead of
+                    // building (and re-serializing) a whole `Value` tree. Payloads with
+                    // escaped keys can't be borrowed, so those fall back to the tree.
+                    let raw_row = serde_json::from_slice::<
+                        HashMap<&str, &serde_json::value::RawValue>,
+                    >(&msg.payload)
+                    .ok();
+                    let parsed_row = match raw_row {
+                        Some(_) => None,
+                        None => match serde_json::from_slice::<serde_json::Value>(&msg.payload) {
+                            Ok(serde_json::Value::Object(obj)) => Some(obj),
+                            _ => None,
+                        },
+                    };
+
+                    if raw_row.is_none() && parsed_row.is_none() {
+                        Err(serde_json::Error::io(std::io::Error::new(
                             std::io::ErrorKind::InvalidData,
                             "CSV format requires a JSON object payload",
-                        ))),
+                        )))
+                    } else {
+                        let hdr = csv_header_guard.as_mut().expect("csv header lock held");
+                        if hdr.is_none() {
+                            // Sort keys so the column order is deterministic and
+                            // independent of serde_json's map type (BTreeMap vs the
+                            // IndexMap enabled by the `preserve_order` feature, which
+                            // `bson`/mongodb turns on under feature unification).
+                            let mut cols: Vec<String> = match (&raw_row, &parsed_row) {
+                                (Some(raw), _) => raw.keys().map(|k| (*k).to_string()).collect(),
+                                (_, Some(obj)) => obj.keys().cloned().collect(),
+                                _ => unreachable!(),
+                            };
+                            cols.sort();
+                            if file_is_empty {
+                                let header_line = csv_encode_row(&cols);
+                                if let Err(e) = writer.write_all(&header_line).await {
+                                    return Err(PublisherError::NonRetryable(anyhow::anyhow!(e)));
+                                }
+                                if let Err(e) = writer.write_all(&self.delimiter).await {
+                                    return Err(PublisherError::NonRetryable(anyhow::anyhow!(e)));
+                                }
+                                wrote_csv_header = true;
+                            }
+                            **hdr = Some(cols);
+                        }
+                        let cols = hdr.as_ref().unwrap();
+                        // Reused across the batch: rows are all the same shape, so
+                        // after the first one this never reallocates.
+                        csv_row_buf.clear();
+                        csv_row_buf.reserve(msg.payload.len() + self.delimiter.len());
+                        for (i, c) in cols.iter().enumerate() {
+                            if i > 0 {
+                                csv_row_buf.push(b',');
+                            }
+                            match (&raw_row, &parsed_row) {
+                                (Some(raw), _) => {
+                                    if let Some(v) = raw.get(c.as_str()) {
+                                        csv_append_raw(&mut csv_row_buf, v);
+                                    }
+                                }
+                                (_, Some(obj)) => {
+                                    if let Some(v) = obj.get(c) {
+                                        csv_append_value(&mut csv_row_buf, v);
+                                    }
+                                }
+                                _ => unreachable!(),
+                            }
+                        }
+                        Ok(None)
                     }
                 }
-                ref fmt => encode_record(&msg, fmt),
+                ref fmt => encode_record(&msg, fmt).map(Some),
             };
-            let mut serialized_msg = match serialized_msg {
+            let serialized_msg = match serialized_msg {
                 Ok(s) => s,
                 Err(e) => {
                     tracing::error!("Failed to serialize message for file sink: {}", e);
@@ -521,8 +595,20 @@ impl MessagePublisher for FilePublisher {
             // Write body + delimiter as one contiguous buffer so a concurrent
             // tailing reader never observes the record without its delimiter
             // (shrinks the torn-write window; the reader also guards against it).
-            serialized_msg.extend_from_slice(&self.delimiter);
-            if let Err(e) = writer.write_all(&serialized_msg).await {
+            // `None` means the body is already in the reused CSV row buffer.
+            let owned_msg;
+            let record: &[u8] = match serialized_msg {
+                Some(mut s) => {
+                    s.extend_from_slice(&self.delimiter);
+                    owned_msg = s;
+                    &owned_msg
+                }
+                None => {
+                    csv_row_buf.extend_from_slice(&self.delimiter);
+                    &csv_row_buf
+                }
+            };
+            if let Err(e) = writer.write_all(record).await {
                 tracing::error!("Failed to write message to file: {}", e);
                 // A buffered write failure leaves the BufWriter in an undefined state and the
                 // remaining messages in this batch are unwritten. Abort so the whole batch is

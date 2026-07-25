@@ -1262,3 +1262,90 @@ async fn test_file_csv_round_trip() {
         json!({"name": "bob", "age": "25"})
     );
 }
+
+#[tokio::test]
+async fn test_file_csv_value_types_and_escaping() {
+    let dir = tempdir().unwrap();
+    let file_path = dir.path().join("data.csv");
+    let config = FileConfig {
+        path: file_path.to_str().unwrap().to_string(),
+        format: FileFormat::Csv,
+        ..Default::default()
+    };
+
+    let sink = FilePublisher::new(&config).await.unwrap();
+    sink.send_batch(vec![
+        msg!(json!({
+            "a_num": 42,
+            "b_float": 1234.56,
+            "c_bool": true,
+            "d_null": null,
+            "e_quoted": "say \"hi\", ok",
+            "f_nested": {"x": 1},
+            "g_empty": ""
+        })),
+        msg!(json!({
+            "a_num": -7,
+            "b_float": 0.5,
+            "c_bool": false,
+            "d_null": null,
+            "e_quoted": "line\nbreak",
+            "f_nested": [1, 2],
+            "g_empty": "plain"
+        })),
+    ])
+    .await
+    .unwrap();
+    sink.flush().await.unwrap();
+    drop(sink);
+
+    let content = tokio::fs::read_to_string(&file_path).await.unwrap();
+    assert_eq!(
+        content,
+        "a_num,b_float,c_bool,d_null,e_quoted,f_nested,g_empty\n\
+         42,1234.56,true,null,\"say \"\"hi\"\", ok\",\"{\"\"x\"\":1}\",\n\
+         -7,0.5,false,null,\"line\nbreak\",\"[1,2]\",plain\n"
+    );
+}
+
+/// Keys containing JSON escapes cannot be borrowed from the payload, so they
+/// take the parsed-`Value` fallback path; the output must be identical.
+#[tokio::test]
+async fn test_file_csv_escaped_keys_fallback() {
+    let dir = tempdir().unwrap();
+    let file_path = dir.path().join("data.csv");
+    let config = FileConfig {
+        path: file_path.to_str().unwrap().to_string(),
+        format: FileFormat::Csv,
+        ..Default::default()
+    };
+
+    let sink = FilePublisher::new(&config).await.unwrap();
+    sink.send_batch(vec![msg!(json!({"we\"ird": 1, "plain": "x"}))])
+        .await
+        .unwrap();
+    sink.flush().await.unwrap();
+    drop(sink);
+
+    let content = tokio::fs::read_to_string(&file_path).await.unwrap();
+    assert_eq!(content, "plain,\"we\"\"ird\"\nx,1\n");
+}
+
+#[tokio::test]
+async fn test_file_csv_rejects_non_object_payload() {
+    let dir = tempdir().unwrap();
+    let file_path = dir.path().join("data.csv");
+    let config = FileConfig {
+        path: file_path.to_str().unwrap().to_string(),
+        format: FileFormat::Csv,
+        ..Default::default()
+    };
+
+    let sink = FilePublisher::new(&config).await.unwrap();
+    let result = sink.send_batch(vec![msg!(json!([1, 2, 3]))]).await.unwrap();
+    match result {
+        crate::outcomes::SentBatch::Partial { failed, .. } => assert_eq!(failed.len(), 1),
+        other => panic!("expected Partial, got {other:?}"),
+    }
+}
+
