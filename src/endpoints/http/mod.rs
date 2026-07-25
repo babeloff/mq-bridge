@@ -801,7 +801,7 @@ fn setup_http_state_and_channel(
     let inline_echo = inline_publisher.as_ref().is_some_and(|publisher| {
         publisher
             .as_any()
-            .is::<crate::endpoints::response::ResponsePublisher>()
+            .is::<crate::endpoints::structural::response::ResponsePublisher>()
     });
 
     let state = HttpConsumerState {

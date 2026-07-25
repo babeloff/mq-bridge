@@ -1186,7 +1186,7 @@ async fn test_custom_endpoint_factory_programmatic() {
             _config: &serde_json::Value,
         ) -> anyhow::Result<Box<dyn MessageConsumer>> {
             Ok(Box::new(
-                mq_bridge::endpoints::static_endpoint::StaticRequestConsumer::new(
+                mq_bridge::endpoints::structural::static_endpoint::StaticRequestConsumer::new(
                     &mq_bridge::models::StaticConfig::from("custom_msg"),
                 )
                 .unwrap(),
@@ -1197,7 +1197,9 @@ async fn test_custom_endpoint_factory_programmatic() {
             _route_name: &str,
             _config: &serde_json::Value,
         ) -> anyhow::Result<Box<dyn MessagePublisher>> {
-            Ok(Box::new(mq_bridge::endpoints::null::NullPublisher))
+            Ok(Box::new(
+                mq_bridge::endpoints::structural::null::NullPublisher,
+            ))
         }
     }
 
@@ -1255,7 +1257,7 @@ async fn test_custom_components_yaml_configuration() {
                 .and_then(|v| v.as_str())
                 .unwrap_or("default");
             Ok(Box::new(
-                mq_bridge::endpoints::static_endpoint::StaticRequestConsumer::new(
+                mq_bridge::endpoints::structural::static_endpoint::StaticRequestConsumer::new(
                     &mq_bridge::models::StaticConfig::from(content),
                 )
                 .unwrap(),
@@ -1266,7 +1268,9 @@ async fn test_custom_components_yaml_configuration() {
             _route: &str,
             _config: &serde_json::Value,
         ) -> anyhow::Result<Box<dyn MessagePublisher>> {
-            Ok(Box::new(mq_bridge::endpoints::null::NullPublisher))
+            Ok(Box::new(
+                mq_bridge::endpoints::structural::null::NullPublisher,
+            ))
         }
     }
 

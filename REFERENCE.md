@@ -433,6 +433,10 @@ another structural endpoint.
 | [`null`](#null) | – | ✅ | Discard everything |
 | [`custom`](#custom-endpoint) | ✅ | ✅ | Your own endpoint via a registered factory |
 
+They live under `src/endpoints/structural/`, and each of the variants above carries
+`"format": "structural_endpoint"` in the generated JSON schema (`mq-bridge.schema.json`),
+so external tooling can tell them apart from the transport endpoints.
+
 ### `ref`
 
 Reuses an endpoint registered under a name, instead of repeating its configuration.

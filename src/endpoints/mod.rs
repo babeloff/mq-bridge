@@ -9,7 +9,6 @@ pub mod amqp;
 pub mod aws;
 #[cfg(feature = "clickhouse")]
 pub mod clickhouse;
-pub mod fanout;
 pub mod file;
 #[cfg(feature = "grpc")]
 pub mod grpc;
@@ -26,30 +25,33 @@ pub mod mongodb;
 pub mod mqtt;
 #[cfg(feature = "nats")]
 pub mod nats;
-pub mod null;
 #[cfg(feature = "object-store")]
 pub mod object_store;
 #[cfg(any(feature = "sqlx", feature = "clickhouse"))]
 mod poll;
 #[cfg(feature = "postgres-cdc")]
 pub mod postgres;
-pub mod reader;
 #[cfg(feature = "redis-streams")]
 pub mod redis_streams;
-pub mod request;
-pub mod response;
 #[cfg(feature = "sled")]
 pub mod sled;
 #[cfg(feature = "sqlx")]
 pub mod sqlx;
-pub mod static_endpoint;
-pub mod stream_buffer;
-pub mod switch;
+/// Structural endpoints (`fanout`, `switch`, `request`, `response`, `reader`,
+/// `static`, `stream_buffer`, `null`) that route or terminate a flow instead of
+/// talking to an external system.
+pub mod structural;
 #[cfg(feature = "websocket")]
 pub mod websocket;
 #[cfg(feature = "zeromq")]
 pub mod zeromq;
 use crate::endpoints::memory::{get_or_create_channel, MemoryChannel};
+/// Backwards-compatible aliases for the structural endpoints, which used to live
+/// directly under `endpoints`. Prefer `endpoints::structural::*`.
+#[doc(hidden)]
+pub use crate::endpoints::structural::{
+    fanout, null, reader, request, response, static_endpoint, stream_buffer, switch,
+};
 use crate::middleware::apply_middlewares_to_consumer;
 use crate::models::{
     Endpoint, EndpointType, MemoryConfig, Middleware, ResponseConfig, StreamBufferConfig,

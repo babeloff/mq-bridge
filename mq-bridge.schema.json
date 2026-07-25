@@ -614,6 +614,7 @@
         },
         {
           "type": "object",
+          "format": "structural_endpoint",
           "properties": {
             "static": {
               "$ref": "#/$defs/StaticConfig"
@@ -625,6 +626,7 @@
         },
         {
           "type": "object",
+          "format": "structural_endpoint",
           "properties": {
             "ref": {
               "type": "string"
@@ -790,6 +792,7 @@
         },
         {
           "type": "object",
+          "format": "structural_endpoint",
           "properties": {
             "fanout": {
               "type": "array",
@@ -804,6 +807,7 @@
         },
         {
           "type": "object",
+          "format": "structural_endpoint",
           "properties": {
             "stream_buffer": {
               "$ref": "#/$defs/StreamBufferConfig"
@@ -815,6 +819,7 @@
         },
         {
           "type": "object",
+          "format": "structural_endpoint",
           "properties": {
             "switch": {
               "$ref": "#/$defs/SwitchConfig"
@@ -826,6 +831,7 @@
         },
         {
           "type": "object",
+          "format": "structural_endpoint",
           "properties": {
             "response": {
               "$ref": "#/$defs/ResponseConfig"
@@ -837,6 +843,7 @@
         },
         {
           "type": "object",
+          "format": "structural_endpoint",
           "properties": {
             "reader": {
               "$ref": "#/$defs/Endpoint"
@@ -848,6 +855,7 @@
         },
         {
           "type": "object",
+          "format": "structural_endpoint",
           "properties": {
             "request": {
               "$ref": "#/$defs/RequestForwardConfig"
@@ -859,6 +867,7 @@
         },
         {
           "type": "object",
+          "format": "structural_endpoint",
           "properties": {
             "custom": {
               "type": "object",

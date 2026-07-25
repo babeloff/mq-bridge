@@ -1043,10 +1043,11 @@ async fn test_http_to_static_response() {
     let mut consumer = HttpConsumer::new(&http_config).await.unwrap();
 
     let static_content = "This is a static response";
-    let static_publisher = crate::endpoints::static_endpoint::StaticEndpointPublisher::new(
-        &crate::models::StaticConfig::from(static_content),
-    )
-    .unwrap();
+    let static_publisher =
+        crate::endpoints::structural::static_endpoint::StaticEndpointPublisher::new(
+            &crate::models::StaticConfig::from(static_content),
+        )
+        .unwrap();
 
     tokio::spawn(async move {
         if let Ok(received) = consumer.receive().await {

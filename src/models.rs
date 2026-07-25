@@ -710,7 +710,9 @@ pub enum EndpointType {
     File(FileConfig),
     #[serde(rename = "object_store", alias = "objectstore", alias = "s3")]
     ObjectStore(ObjectStoreConfig),
+    #[cfg_attr(feature = "schema", schemars(extend("format" = "structural_endpoint")))]
     Static(StaticConfig),
+    #[cfg_attr(feature = "schema", schemars(extend("format" = "structural_endpoint")))]
     Ref(String),
     Memory(MemoryConfig),
     Sled(SledConfig),
@@ -729,13 +731,20 @@ pub enum EndpointType {
     ClickHouse(ClickHouseConfig),
     #[serde(rename = "postgres_cdc", alias = "postgres-cdc")]
     PostgresCdc(PostgresCdcConfig),
+    #[cfg_attr(feature = "schema", schemars(extend("format" = "structural_endpoint")))]
     Fanout(Vec<Endpoint>),
     #[serde(rename = "stream_buffer")]
+    #[cfg_attr(feature = "schema", schemars(extend("format" = "structural_endpoint")))]
     StreamBuffer(StreamBufferConfig),
+    #[cfg_attr(feature = "schema", schemars(extend("format" = "structural_endpoint")))]
     Switch(SwitchConfig),
+    #[cfg_attr(feature = "schema", schemars(extend("format" = "structural_endpoint")))]
     Response(ResponseConfig),
+    #[cfg_attr(feature = "schema", schemars(extend("format" = "structural_endpoint")))]
     Reader(Box<Endpoint>),
+    #[cfg_attr(feature = "schema", schemars(extend("format" = "structural_endpoint")))]
     Request(RequestForwardConfig),
+    #[cfg_attr(feature = "schema", schemars(extend("format" = "structural_endpoint")))]
     Custom {
         name: String,
         config: serde_json::Value,
