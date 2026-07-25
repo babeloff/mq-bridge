@@ -1388,14 +1388,42 @@ impl MessageConsumer for MongoDbSubscriber {
         let mut seqs = Vec::new();
 
         while let Some(result) = cursor.next().await {
-            if let Ok(doc) = result {
-                if let Ok(seq) = doc.get_i64("seq") {
-                    if let Ok(msg) = parse_mongodb_document(doc) {
-                        messages.push(msg);
-                        seqs.push(seq);
-                        // from here on, we will not received this seq anymore
-                        self.last_seq.store(seq, Ordering::Relaxed);
-                    }
+            let doc = match result {
+                Ok(doc) => doc,
+                Err(e) => {
+                    warn!(
+                        collection = %self.collection_name,
+                        error = %e,
+                        "Failed to read document from MongoDB cursor, skipping"
+                    );
+                    continue;
+                }
+            };
+            let seq = match doc.get_i64("seq") {
+                Ok(seq) => seq,
+                Err(e) => {
+                    warn!(
+                        collection = %self.collection_name,
+                        error = %e,
+                        "Skipping document with missing or non-i64 'seq' field"
+                    );
+                    continue;
+                }
+            };
+            match parse_mongodb_document(doc) {
+                Ok(msg) => {
+                    messages.push(msg);
+                    seqs.push(seq);
+                    // from here on, we will not received this seq anymore
+                    self.last_seq.store(seq, Ordering::Relaxed);
+                }
+                Err(e) => {
+                    warn!(
+                        collection = %self.collection_name,
+                        seq,
+                        error = %e,
+                        "Failed to parse MongoDB document, skipping"
+                    );
                 }
             }
         }

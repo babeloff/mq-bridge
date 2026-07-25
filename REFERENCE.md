@@ -362,8 +362,9 @@ trailing `.enc` when encryption is on since the object is ciphertext, not a dire
 decompressible `.gz`). An
 encrypted **file** is written as length-prefixed sealed frames (one per batch) and is only
 readable through a matching consumer; a compressed-only file stays a standard `.gz`/`.lz4`
-stream. File compression/encryption supports only the default `consume` mode and no `csv`
-format.
+stream. File compression/encryption supports only the default `consume` mode. `csv` works
+too: the header row is written into the first member, so the decoded stream is a normal CSV
+file.
 
 ### `metrics`
 

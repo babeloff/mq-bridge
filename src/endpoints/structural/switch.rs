@@ -60,20 +60,19 @@ impl MessagePublisher for SwitchPublisher {
             return Ok(SentBatch::Ack);
         }
 
-        // Group messages by the value of `metadata_key` (`None` = key absent, which is a
-        // distinct group from an explicitly empty value). The grouping key is the metadata
-        // value, not the resolved publisher, so two distinct values that both fall through
-        // to `default` stay separate groups and therefore produce separate `send_batch`
-        // calls on the same publisher.
+        // Group by the resolved publisher's identity, so every message headed for the same
+        // destination lands in one `send_batch` call — including distinct metadata values
+        // that both fall through to `default`.
         let mut grouped_messages: HashMap<
-            Option<String>,
+            usize,
             (Arc<dyn MessagePublisher>, Vec<CanonicalMessage>),
         > = HashMap::new();
 
         for message in messages {
             if let Some(publisher) = self.get_publisher(&message) {
+                let key = Arc::as_ptr(publisher) as *const () as usize;
                 grouped_messages
-                    .entry(message.metadata.get(&self.metadata_key).cloned())
+                    .entry(key)
                     .or_insert_with(|| (publisher.clone(), Vec::new()))
                     .1
                     .push(message);
@@ -197,5 +196,60 @@ mod tests {
         assert_eq!(chan_a.len(), 0);
         assert_eq!(chan_b.len(), 0);
         assert_eq!(chan_default.len(), 1);
+    }
+
+    /// Records the size of every `send_batch` call it receives.
+    #[derive(Default)]
+    struct RecordingPublisher {
+        batches: std::sync::Mutex<Vec<usize>>,
+    }
+
+    #[async_trait]
+    impl MessagePublisher for RecordingPublisher {
+        async fn send_batch(
+            &self,
+            messages: Vec<CanonicalMessage>,
+        ) -> Result<SentBatch, PublisherError> {
+            self.batches.lock().unwrap().push(messages.len());
+            Ok(SentBatch::Ack)
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    #[tokio::test]
+    async fn test_switch_batch_merges_default_routed_groups() {
+        let pub_default = Arc::new(RecordingPublisher::default());
+        // Memory topics resolve through a process-global channel registry, so this needs a
+        // name no other test uses or the parallel suite sees the other test's messages.
+        let pub_a = MemoryPublisher::new_local("switch_merge_topic_a", 10);
+        let chan_a = pub_a.channel();
+
+        let mut cases = HashMap::new();
+        cases.insert(
+            "A".to_string(),
+            Arc::new(pub_a) as Arc<dyn MessagePublisher>,
+        );
+
+        let switch = SwitchPublisher::new(
+            "route_key".to_string(),
+            cases,
+            Some(pub_default.clone() as Arc<dyn MessagePublisher>),
+        );
+
+        // An unmatched value, an explicitly empty value and an absent key all route to
+        // `default`, and must arrive there as a single batch.
+        let messages = vec![
+            CanonicalMessage::from("a").with_metadata_kv("route_key", "A"),
+            CanonicalMessage::from("unmatched").with_metadata_kv("route_key", "C"),
+            CanonicalMessage::from("empty").with_metadata_kv("route_key", ""),
+            CanonicalMessage::from("absent"),
+        ];
+        switch.send_batch(messages).await.unwrap();
+
+        assert_eq!(chan_a.len(), 1);
+        assert_eq!(*pub_default.batches.lock().unwrap(), vec![3]);
     }
 }

@@ -1088,6 +1088,7 @@ async fn test_file_custom_delimiter() {
     let config = FileConfig {
         path: file_path_str.clone(),
         delimiter: Some("|".to_string()),
+        format: FileFormat::Raw,
         mode: Some(FileConsumerMode::Consume { delete: false }),
         ..Default::default()
     };
@@ -1095,8 +1096,8 @@ async fn test_file_custom_delimiter() {
     let publisher = FilePublisher::new(&config).await.unwrap();
     let mut consumer = FileConsumer::new(&config).await.unwrap();
 
-    let msg1 = crate::CanonicalMessage::from("msg1").with_raw_format();
-    let msg2 = crate::CanonicalMessage::from("msg2").with_raw_format();
+    let msg1 = crate::CanonicalMessage::from("msg1");
+    let msg2 = crate::CanonicalMessage::from("msg2");
 
     publisher.send_batch(vec![msg1, msg2]).await.unwrap();
     publisher.flush().await.unwrap();
@@ -1122,6 +1123,7 @@ async fn test_file_xml_delimiter() {
     let config = FileConfig {
         path: file_path_str.clone(),
         delimiter: Some("</message>".to_string()),
+        format: FileFormat::Raw,
         mode: Some(FileConsumerMode::Consume { delete: false }),
         ..Default::default()
     };
@@ -1129,8 +1131,8 @@ async fn test_file_xml_delimiter() {
     let publisher = FilePublisher::new(&config).await.unwrap();
     let mut consumer = FileConsumer::new(&config).await.unwrap();
 
-    let msg1 = crate::CanonicalMessage::from("<xml>content1").with_raw_format();
-    let msg2 = crate::CanonicalMessage::from("<xml>content2").with_raw_format();
+    let msg1 = crate::CanonicalMessage::from("<xml>content1");
+    let msg2 = crate::CanonicalMessage::from("<xml>content2");
 
     publisher.send_batch(vec![msg1, msg2]).await.unwrap();
     publisher.flush().await.unwrap();
@@ -1347,4 +1349,202 @@ async fn test_file_csv_rejects_non_object_payload() {
         crate::outcomes::SentBatch::Partial { failed, .. } => assert_eq!(failed.len(), 1),
         other => panic!("expected Partial, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn test_file_csv_rejects_empty_object_payload() {
+    // An empty object carries no columns; if it established the header, every later row
+    // in the file would be written against an empty column set.
+    let dir = tempdir().unwrap();
+    let file_path = dir.path().join("data.csv");
+    let config = FileConfig {
+        path: file_path.to_str().unwrap().to_string(),
+        format: FileFormat::Csv,
+        ..Default::default()
+    };
+
+    let sink = FilePublisher::new(&config).await.unwrap();
+    let result = sink
+        .send_batch(vec![msg!(json!({})), msg!(json!({"a": 1, "b": 2}))])
+        .await
+        .unwrap();
+    match result {
+        crate::outcomes::SentBatch::Partial { failed, .. } => assert_eq!(failed.len(), 1),
+        other => panic!("expected Partial, got {other:?}"),
+    }
+
+    // The surviving message still got a real header and row.
+    let content = tokio::fs::read_to_string(&file_path).await.unwrap();
+    assert_eq!(content.trim_end(), "a,b\n1,2");
+}
+
+#[cfg(feature = "compression")]
+#[tokio::test]
+async fn test_file_csv_compressed_roundtrip() {
+    // The header row goes into the first member only, so the decompressed stream is a
+    // plain CSV file even though it was written as two gzip members.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("data.csv.gz").to_str().unwrap().to_string();
+    let config = FileConfig {
+        path: path.clone(),
+        format: FileFormat::Csv,
+        compression: Compression::Gzip,
+        ..Default::default()
+    };
+
+    let sink = FilePublisher::new(&config).await.unwrap();
+    sink.send_batch(vec![
+        msg!(json!({"name": "alice", "age": "30"})),
+        msg!(json!({"name": "bob", "age": "25"})),
+    ])
+    .await
+    .unwrap();
+    sink.send_batch(vec![msg!(json!({"name": "carol", "age": "41"}))])
+        .await
+        .unwrap();
+    drop(sink);
+
+    let raw = std::fs::read(&path).unwrap();
+    let mut decoded = Vec::new();
+    std::io::Read::read_to_end(
+        &mut flate2::read::MultiGzDecoder::new(&raw[..]),
+        &mut decoded,
+    )
+    .unwrap();
+    assert_eq!(
+        String::from_utf8(decoded).unwrap(),
+        "age,name\n30,alice\n25,bob\n41,carol\n"
+    );
+
+    let mut source = FileConsumer::new(&config).await.unwrap();
+    let got = collect_compressed(&mut source, 3).await;
+    let rows: Vec<serde_json::Value> = got
+        .iter()
+        .map(|p| serde_json::from_slice(p).unwrap())
+        .collect();
+    assert_eq!(
+        rows,
+        vec![
+            json!({"age": "30", "name": "alice"}),
+            json!({"age": "25", "name": "bob"}),
+            json!({"age": "41", "name": "carol"}),
+        ]
+    );
+}
+
+#[cfg(feature = "encryption")]
+#[tokio::test]
+async fn test_file_csv_encrypted_roundtrip() {
+    use base64::Engine as _;
+
+    let dir = tempdir().unwrap();
+    let path = dir
+        .path()
+        .join("data.csv.enc")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let config = FileConfig {
+        path: path.clone(),
+        format: FileFormat::Csv,
+        encryption: Some(crate::models::EncryptionConfig {
+            key: base64::engine::general_purpose::STANDARD.encode([7u8; 32]),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    let sink = FilePublisher::new(&config).await.unwrap();
+    sink.send_batch(vec![msg!(json!({"name": "alice", "age": "30"}))])
+        .await
+        .unwrap();
+    sink.send_batch(vec![msg!(json!({"name": "bob", "age": "25"}))])
+        .await
+        .unwrap();
+    drop(sink);
+
+    // The rows and the header are ciphertext on disk.
+    let raw = std::fs::read(&path).unwrap();
+    assert!(!raw.windows(5).any(|w| w == b"alice"));
+    assert!(!raw.windows(4).any(|w| w == b"name"));
+
+    let mut source = FileConsumer::new(&config).await.unwrap();
+    let got = collect_compressed(&mut source, 2).await;
+    let rows: Vec<serde_json::Value> = got
+        .iter()
+        .map(|p| serde_json::from_slice(p).unwrap())
+        .collect();
+    assert_eq!(
+        rows,
+        vec![
+            json!({"age": "30", "name": "alice"}),
+            json!({"age": "25", "name": "bob"}),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn test_file_normal_format_preserves_id_of_raw_origin_message() {
+    // The sink's format decides the encoding, not the message's origin: a message that
+    // came from a `raw` file (or any endpoint that marks it raw) keeps its id and
+    // metadata when written to a `normal` file, so the id survives every hop.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("out.log").to_str().unwrap().to_string();
+    let config = FileConfig {
+        path: path.clone(),
+        ..Default::default()
+    };
+
+    let sink = FilePublisher::new(&config).await.unwrap();
+    let msg = crate::CanonicalMessage::from("hello")
+        .with_raw_format()
+        .with_metadata_kv("kind", "greeting");
+    let id = msg.message_id;
+    sink.send_batch(vec![msg]).await.unwrap();
+    drop(sink);
+
+    let mut source = FileConsumer::new(&config).await.unwrap();
+    let received = source.receive().await.unwrap().message;
+    assert_eq!(received.message_id, id);
+    assert_eq!(received.get_payload_str(), "hello");
+    assert_eq!(
+        received.metadata.get("kind").map(String::as_str),
+        Some("greeting")
+    );
+}
+
+#[cfg(feature = "compression")]
+#[tokio::test]
+async fn test_file_csv_compressed_restart_writes_no_second_header() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("d.csv.gz").to_str().unwrap().to_string();
+    let config = FileConfig {
+        path: path.clone(),
+        format: FileFormat::Csv,
+        compression: Compression::Gzip,
+        ..Default::default()
+    };
+    let sink = FilePublisher::new(&config).await.unwrap();
+    sink.send_batch(vec![msg!(json!({"name": "alice", "age": "30"}))])
+        .await
+        .unwrap();
+    drop(sink);
+    // Fresh publisher (process restart): the header must not be written again.
+    let sink = FilePublisher::new(&config).await.unwrap();
+    sink.send_batch(vec![msg!(json!({"name": "bob", "age": "25"}))])
+        .await
+        .unwrap();
+    drop(sink);
+
+    let raw = std::fs::read(&path).unwrap();
+    let mut decoded = Vec::new();
+    std::io::Read::read_to_end(
+        &mut flate2::read::MultiGzDecoder::new(&raw[..]),
+        &mut decoded,
+    )
+    .unwrap();
+    assert_eq!(
+        String::from_utf8(decoded).unwrap(),
+        "age,name\n30,alice\n25,bob\n"
+    );
 }

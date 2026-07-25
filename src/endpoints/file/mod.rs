@@ -98,6 +98,85 @@ fn csv_encode_row(fields: &[String]) -> Vec<u8> {
     buf
 }
 
+/// Encodes `msg`'s JSON-object payload as a CSV row into `row_buf` (cleared first),
+/// establishing the column order from its keys when `hdr` is still unset. Returns
+/// `true` when this call established the header, so the caller can emit the header
+/// line for a new file. Shared by the plain-append and member (compressed/encrypted)
+/// write paths.
+fn csv_encode_message(
+    msg: &CanonicalMessage,
+    hdr: &mut Option<Vec<String>>,
+    row_buf: &mut Vec<u8>,
+) -> Result<bool, serde_json::Error> {
+    // Preferred path: borrow the keys and leave the values as unparsed
+    // JSON slices, so a row costs one scan plus byte copies instead of
+    // building (and re-serializing) a whole `Value` tree. Payloads with
+    // escaped keys can't be borrowed, so those fall back to the tree.
+    let raw_row =
+        serde_json::from_slice::<HashMap<&str, &serde_json::value::RawValue>>(&msg.payload).ok();
+    let parsed_row = match raw_row {
+        Some(_) => None,
+        None => match serde_json::from_slice::<serde_json::Value>(&msg.payload) {
+            Ok(serde_json::Value::Object(obj)) => Some(obj),
+            _ => None,
+        },
+    };
+    // An object with no fields is rejected too: it carries no columns, so letting it
+    // establish the header would fix an empty column set for the rest of the file.
+    let no_columns = match (&raw_row, &parsed_row) {
+        (Some(raw), _) => raw.is_empty(),
+        (_, Some(obj)) => obj.is_empty(),
+        _ => true,
+    };
+    if no_columns {
+        return Err(serde_json::Error::io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "CSV format requires a non-empty JSON object payload",
+        )));
+    }
+
+    let mut header_established = false;
+    if hdr.is_none() {
+        // Sort keys so the column order is deterministic and
+        // independent of serde_json's map type (BTreeMap vs the
+        // IndexMap enabled by the `preserve_order` feature, which
+        // `bson`/mongodb turns on under feature unification).
+        let mut cols: Vec<String> = match (&raw_row, &parsed_row) {
+            (Some(raw), _) => raw.keys().map(|k| (*k).to_string()).collect(),
+            (_, Some(obj)) => obj.keys().cloned().collect(),
+            _ => unreachable!(),
+        };
+        cols.sort();
+        *hdr = Some(cols);
+        header_established = true;
+    }
+
+    let cols = hdr.as_ref().expect("header set above");
+    // Reused across the batch: rows are all the same shape, so
+    // after the first one this never reallocates.
+    row_buf.clear();
+    row_buf.reserve(msg.payload.len());
+    for (i, c) in cols.iter().enumerate() {
+        if i > 0 {
+            row_buf.push(b',');
+        }
+        match (&raw_row, &parsed_row) {
+            (Some(raw), _) => {
+                if let Some(v) = raw.get(c.as_str()) {
+                    csv_append_raw(row_buf, v);
+                }
+            }
+            (_, Some(obj)) => {
+                if let Some(v) = obj.get(c) {
+                    csv_append_value(row_buf, v);
+                }
+            }
+            _ => unreachable!(),
+        }
+    }
+    Ok(header_established)
+}
+
 /// Appends one still-unparsed JSON value as a CSV field. Scalars are copied
 /// straight from the source bytes; only escaped strings and nested
 /// arrays/objects need any decoding.
@@ -235,10 +314,10 @@ pub struct FilePublisher {
 }
 
 /// Validates the `compression`/`encryption` settings shared by the file
-/// publisher and consumer: both need their Cargo feature, and both switch the
-/// file to per-batch members, which is incompatible with the CSV format (its
-/// header row is per-file, not per-member).
+/// publisher and consumer: both need their Cargo feature enabled.
 fn validate_member_settings(config: &FileConfig) -> anyhow::Result<()> {
+    // Only the feature-gated checks below read it, so it is unused with both features on.
+    let _ = config;
     #[cfg(not(feature = "compression"))]
     if config.compression != Compression::None {
         return Err(anyhow::anyhow!(
@@ -249,13 +328,6 @@ fn validate_member_settings(config: &FileConfig) -> anyhow::Result<()> {
     if config.encryption.is_some() {
         return Err(anyhow::anyhow!(
             "file 'encryption' requires the `encryption` feature"
-        ));
-    }
-    if (config.compression != Compression::None || config.encryption.is_some())
-        && matches!(config.format, FileFormat::Csv)
-    {
-        return Err(anyhow::anyhow!(
-            "the 'csv' file format is not supported with compression or encryption"
         ));
     }
     Ok(())
@@ -324,15 +396,67 @@ impl FilePublisher {
         &self,
         messages: Vec<CanonicalMessage>,
     ) -> Result<SentBatch, PublisherError> {
-        let _file_guard = self.file_lock.lock().await;
+        // Members are concatenated, so the decoded stream is one continuous line
+        // stream: the CSV header goes into the first member of a new file only.
+        let is_csv = matches!(self.format, FileFormat::Csv);
+        // CSV takes the file lock for the whole batch, because its header line has to land
+        // in the *first* member of the file: the emptiness check, the header decision and
+        // the append must stay atomic. Every other format appends self-contained records in
+        // any order, so it leaves this `None` and the CPU-bound encode/compress/seal runs
+        // outside the lock — the append below locks only if this is still `None`.
+        let mut file_guard = if is_csv {
+            Some(self.file_lock.lock().await)
+        } else {
+            None
+        };
         let mut raw = Vec::new();
         let mut failed_messages = Vec::new();
+        // Only a successful stat reporting zero bytes counts as empty. A failed stat is
+        // treated as non-empty (matching the plain path's `pre_len == Some(0)`), so a
+        // header can never be inserted into the middle of a file we could not measure.
+        // The not-yet-created case is still empty: the append below creates the file.
+        let file_is_empty = is_csv
+            && match tokio::fs::metadata(&self.path).await {
+                Ok(m) => m.len() == 0,
+                Err(e) => e.kind() == std::io::ErrorKind::NotFound,
+            };
+        let mut csv_header_guard = if is_csv {
+            Some(self.csv_header.lock().await)
+        } else {
+            None
+        };
+        let mut wrote_csv_header = false;
+        let mut csv_row_buf: Vec<u8> = Vec::new();
         for mut msg in messages {
             msg.strip_source_metadata();
-            match encode_record(&msg, &self.format) {
-                Ok(mut bytes) => {
+            // `Ok(None)` means the body is in the reused CSV row buffer.
+            let encoded = match self.format {
+                FileFormat::Csv => {
+                    let hdr = csv_header_guard.as_mut().expect("csv header lock held");
+                    match csv_encode_message(&msg, hdr, &mut csv_row_buf) {
+                        Ok(header_established) => {
+                            if header_established && file_is_empty {
+                                raw.extend_from_slice(&csv_encode_row(
+                                    hdr.as_ref().expect("header set above"),
+                                ));
+                                raw.extend_from_slice(&self.delimiter);
+                                wrote_csv_header = true;
+                            }
+                            Ok(None)
+                        }
+                        Err(e) => Err(e),
+                    }
+                }
+                ref fmt => encode_record(&msg, fmt).map(Some),
+            };
+            match encoded {
+                Ok(Some(mut bytes)) => {
                     bytes.extend_from_slice(&self.delimiter);
                     raw.extend_from_slice(&bytes);
+                }
+                Ok(None) => {
+                    raw.extend_from_slice(&csv_row_buf);
+                    raw.extend_from_slice(&self.delimiter);
                 }
                 Err(e) => {
                     tracing::error!("Failed to serialize message for file sink member: {}", e);
@@ -342,6 +466,10 @@ impl FilePublisher {
         }
 
         if !raw.is_empty() {
+            // Every failure below leaves the member off disk (unwritten or rolled back), so a
+            // CSV header established for this batch is cleared afterwards — otherwise the
+            // retry would think the header was already written and emit a headerless file.
+            let outcome: Result<(), PublisherError> = async {
             #[cfg(feature = "compression")]
             let raw = if self.compression != Compression::None {
                 crate::support::compression::compress_member(self.compression, &raw)
@@ -373,6 +501,11 @@ impl FilePublisher {
                 member = framed;
             }
 
+            // The member is fully built by now, so unless the batch already holds the
+            // lock (CSV), it is taken here and covers only the append.
+            if file_guard.is_none() {
+                file_guard = Some(self.file_lock.lock().await);
+            }
             let mut file = OpenOptions::new()
                 .create(true)
                 .append(true)
@@ -409,6 +542,17 @@ impl FilePublisher {
                 ));
             }
             file.flush().await.context("Failed to flush file")?;
+            Ok(())
+            }
+            .await;
+            if let Err(e) = outcome {
+                if wrote_csv_header {
+                    if let Some(hdr) = csv_header_guard.as_mut() {
+                        **hdr = None;
+                    }
+                }
+                return Err(e);
+            }
         }
 
         if failed_messages.is_empty() {
@@ -509,42 +653,12 @@ impl MessagePublisher for FilePublisher {
             msg.strip_source_metadata();
             let serialized_msg = match self.format {
                 FileFormat::Csv => {
-                    // Preferred path: borrow the keys and leave the values as unparsed
-                    // JSON slices, so a row costs one scan plus byte copies instead of
-                    // building (and re-serializing) a whole `Value` tree. Payloads with
-                    // escaped keys can't be borrowed, so those fall back to the tree.
-                    let raw_row = serde_json::from_slice::<
-                        HashMap<&str, &serde_json::value::RawValue>,
-                    >(&msg.payload)
-                    .ok();
-                    let parsed_row = match raw_row {
-                        Some(_) => None,
-                        None => match serde_json::from_slice::<serde_json::Value>(&msg.payload) {
-                            Ok(serde_json::Value::Object(obj)) => Some(obj),
-                            _ => None,
-                        },
-                    };
-
-                    if raw_row.is_none() && parsed_row.is_none() {
-                        Err(serde_json::Error::io(std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            "CSV format requires a JSON object payload",
-                        )))
-                    } else {
-                        let hdr = csv_header_guard.as_mut().expect("csv header lock held");
-                        if hdr.is_none() {
-                            // Sort keys so the column order is deterministic and
-                            // independent of serde_json's map type (BTreeMap vs the
-                            // IndexMap enabled by the `preserve_order` feature, which
-                            // `bson`/mongodb turns on under feature unification).
-                            let mut cols: Vec<String> = match (&raw_row, &parsed_row) {
-                                (Some(raw), _) => raw.keys().map(|k| (*k).to_string()).collect(),
-                                (_, Some(obj)) => obj.keys().cloned().collect(),
-                                _ => unreachable!(),
-                            };
-                            cols.sort();
-                            if file_is_empty {
-                                let header_line = csv_encode_row(&cols);
+                    let hdr = csv_header_guard.as_mut().expect("csv header lock held");
+                    match csv_encode_message(&msg, hdr, &mut csv_row_buf) {
+                        Ok(header_established) => {
+                            if header_established && file_is_empty {
+                                let header_line =
+                                    csv_encode_row(hdr.as_ref().expect("header set above"));
                                 if let Err(e) = writer.write_all(&header_line).await {
                                     return Err(PublisherError::NonRetryable(anyhow::anyhow!(e)));
                                 }
@@ -553,32 +667,9 @@ impl MessagePublisher for FilePublisher {
                                 }
                                 wrote_csv_header = true;
                             }
-                            **hdr = Some(cols);
+                            Ok(None)
                         }
-                        let cols = hdr.as_ref().unwrap();
-                        // Reused across the batch: rows are all the same shape, so
-                        // after the first one this never reallocates.
-                        csv_row_buf.clear();
-                        csv_row_buf.reserve(msg.payload.len() + self.delimiter.len());
-                        for (i, c) in cols.iter().enumerate() {
-                            if i > 0 {
-                                csv_row_buf.push(b',');
-                            }
-                            match (&raw_row, &parsed_row) {
-                                (Some(raw), _) => {
-                                    if let Some(v) = raw.get(c.as_str()) {
-                                        csv_append_raw(&mut csv_row_buf, v);
-                                    }
-                                }
-                                (_, Some(obj)) => {
-                                    if let Some(v) = obj.get(c) {
-                                        csv_append_value(&mut csv_row_buf, v);
-                                    }
-                                }
-                                _ => unreachable!(),
-                            }
-                        }
-                        Ok(None)
+                        Err(e) => Err(e),
                     }
                 }
                 ref fmt => encode_record(&msg, fmt).map(Some),
@@ -1959,20 +2050,10 @@ pub(crate) fn encode_record(
 ) -> Result<Vec<u8>, serde_json::Error> {
     match format {
         FileFormat::Raw => Ok(msg.payload.to_vec()),
-        FileFormat::Normal => {
-            if msg
-                .metadata
-                .get("mq_bridge.original_format")
-                .map(|s| s.as_str())
-                == Some("raw")
-            {
-                // A raw-origin message passes through directly to support raw copies
-                // without re-wrapping.
-                Ok(msg.payload.to_vec())
-            } else {
-                serde_json::to_vec(msg)
-            }
-        }
+        // The sink format decides the encoding, not the message's origin: `normal`
+        // always writes the wrapper so `message_id` and metadata survive the round
+        // trip. Use `format: raw` for verbatim, unwrapped copies.
+        FileFormat::Normal => serde_json::to_vec(msg),
         FileFormat::Json => {
             if let Ok(json_val) = serde_json::from_slice::<serde_json::Value>(&msg.payload) {
                 serde_json::to_vec(&RecordWrapper {

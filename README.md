@@ -259,6 +259,11 @@ replay_from_s3:
 
 > Point `checkpoint_store` at a **different** bucket or prefix than the source reads; a cursor object written under the source prefix would be listed and re-read as data (the source rejects an overlapping object-store checkpoint location).
 
+> The sink's `format` decides the encoding, not where the message came from: `normal`/`json`/`text`
+> always write the `{message_id, payload, metadata}` wrapper, so the message id survives the round
+> trip. Use `format: raw` to write payloads verbatim (bare documents, no wrapper). Applies to both
+> `file` and `object_store`.
+
 ### Response Endpoint
 The `response` output endpoint sends a reply back to the original requester. This is useful for synchronous request-reply flows, for example HTTP-to-NATS-to-HTTP. Use `response: {}` as the output endpoint configuration.
 
