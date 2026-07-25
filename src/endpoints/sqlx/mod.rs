@@ -1368,7 +1368,7 @@ impl SqlCursor {
 /// Serialize a full row into a JSON object payload (`{column: value, ...}`), trying the
 /// value types the `Any` driver supports. Unknown/unsupported types bind to JSON null.
 fn row_to_json(row: &sqlx::any::AnyRow) -> serde_json::Value {
-    let mut map = serde_json::Map::new();
+    let mut map = serde_json::Map::with_capacity(row.columns().len());
     for col in row.columns() {
         map.insert(col.name().to_string(), extract_json_value(row, col));
     }
@@ -1423,7 +1423,16 @@ fn extract_json_value(
             .ok()
             .flatten()
             // Bytes have no JSON scalar; expose as a base16 string so the copy is lossless-ish.
-            .map(|b| Value::from(b.iter().map(|x| format!("{:02x}", x)).collect::<String>()))
+            // Hand-rolled nibble encoding: `format!` per byte allocates a String per byte.
+            .map(|b| {
+                const HEX: &[u8; 16] = b"0123456789abcdef";
+                let mut s = String::with_capacity(b.len() * 2);
+                for x in &b {
+                    s.push(HEX[(x >> 4) as usize] as char);
+                    s.push(HEX[(x & 0x0f) as usize] as char);
+                }
+                Value::from(s)
+            })
             .unwrap_or(Value::Null),
     }
 }

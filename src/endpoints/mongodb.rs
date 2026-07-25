@@ -156,10 +156,45 @@ fn message_to_document(
     })
 }
 
-fn parse_mongodb_document(doc: Document) -> anyhow::Result<CanonicalMessage> {
-    if let Ok(raw_msg) = mongodb::bson::from_document::<MongoMessageRaw>(doc.clone()) {
-        if let Ok(msg) = raw_msg.try_into() {
-            return Ok(msg);
+/// True when `doc` is a wrapped mq-bridge message whose fields are already known to
+/// convert cleanly. That guarantee is what lets `parse_mongodb_document` take the fields
+/// by value: the raw fallback needs the document intact, so it may only be bypassed when
+/// the conversion cannot fail into it.
+fn is_wrapped_message(doc: &Document) -> bool {
+    if !doc.contains_key("payload") {
+        return false;
+    }
+    if !matches!(doc.get("_id"), Some(Bson::Binary(b)) if b.to_uuid().is_ok()) {
+        return false;
+    }
+    // Non-string metadata values fail `HashMap<String, String>` decoding, which today
+    // falls back to the raw path — so those documents must keep taking it.
+    match doc.get("metadata") {
+        None | Some(Bson::Null) => true,
+        Some(Bson::Document(m)) => m.values().all(|v| matches!(v, Bson::String(_))),
+        Some(_) => false,
+    }
+}
+
+fn parse_mongodb_document(mut doc: Document) -> anyhow::Result<CanonicalMessage> {
+    // Move the three wrapped fields out of the document. `from_document` consumes what it
+    // deserializes, so keeping the raw fallback alive used to cost a deep clone of every
+    // document — including the ones that then went on to deserialize fine.
+    if is_wrapped_message(&doc) {
+        if let (Some(Bson::Binary(bin)), Some(payload)) = (doc.remove("_id"), doc.remove("payload"))
+        {
+            if let Ok(id) = bin.to_uuid() {
+                let metadata = match doc.remove("metadata") {
+                    Some(Bson::Document(m)) => Some(m),
+                    _ => None,
+                };
+                return MongoMessageRaw {
+                    id,
+                    payload,
+                    metadata,
+                }
+                .try_into();
+            }
         }
     }
     document_to_canonical(doc)
@@ -2464,6 +2499,42 @@ async fn create_client(config: &MongoDbConfig) -> anyhow::Result<Client> {
 mod tests {
     use super::*;
     use crate::CanonicalMessage;
+
+    #[test]
+    fn parse_document_takes_wrapped_fields_and_falls_back_otherwise() {
+        let id = mongodb::bson::Uuid::new();
+        // Wrapped: payload is unwrapped and metadata decoded.
+        let msg = parse_mongodb_document(doc! {
+            "_id": id, "payload": "hello", "metadata": { "kind": "greeting" }
+        })
+        .expect("wrapped document parses");
+        assert_eq!(msg.payload.as_ref(), b"hello");
+        assert_eq!(
+            msg.metadata.get("kind").map(String::as_str),
+            Some("greeting")
+        );
+        assert_eq!(msg.message_id, u128::from_be_bytes(id.bytes()));
+
+        // Foreign document (no `payload`): serialized whole, marked raw.
+        let raw = parse_mongodb_document(doc! { "_id": 7, "name": "ada" })
+            .expect("foreign document parses");
+        assert_eq!(
+            raw.metadata
+                .get("mq_bridge.original_format")
+                .map(String::as_str),
+            Some("raw")
+        );
+        assert!(
+            serde_json::from_slice::<serde_json::Value>(&raw.payload).unwrap()["name"] == "ada"
+        );
+
+        // Non-string metadata values still take the raw path, document intact.
+        let mixed =
+            parse_mongodb_document(doc! { "_id": id, "payload": "x", "metadata": { "n": 1 } })
+                .expect("mixed-metadata document parses");
+        let body: serde_json::Value = serde_json::from_slice(&mixed.payload).unwrap();
+        assert_eq!(body["payload"], "x");
+    }
 
     #[test]
     fn resolved_consume_defaults_and_change_stream_alias() {
