@@ -1960,10 +1960,9 @@ mod tests {
             &subbench,
             Duration::from_millis(5),
             Duration::from_secs(1),
-            async {
-                tokio::time::sleep(Duration::from_millis(20)).await;
-                Duration::from_secs(5)
-            },
+            // Never ready, so the timeout branch is the only possible outcome. A
+            // sleep here would race the timeout on coarse-grained OS timers.
+            std::future::pending::<Duration>(),
         )
         .await;
 
