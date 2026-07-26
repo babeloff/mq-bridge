@@ -547,6 +547,13 @@ fn deserialize_middlewares_from_value(value: serde_json::Value) -> anyhow::Resul
 /// a string. Every entry in `metadata` is attached to the produced message; when
 /// this endpoint feeds an HTTP response, those entries become response headers
 /// (e.g. `content-type`), otherwise they are ordinary message metadata.
+///
+/// The `body` supports `${…}` placeholders (compiled once at startup): request
+/// fields `${payload:a.b}` / `${metadata:key}` / `${message:id}`, generators
+/// `${gen:uuid|now|timestamp|counter|random(1,100)}`, and `${env:VAR}`. When the
+/// `content-type` metadata is a JSON type, interpolated request values are
+/// JSON-escaped by default; append `| raw` to splice verbatim, and write `$${…}`
+/// to emit a literal `${…}`. See [`crate::support::interpolation`] for the full reference.
 #[derive(Debug, Clone, Default)]
 pub struct StaticConfig {
     /// The static response body.
@@ -703,7 +710,9 @@ pub enum EndpointType {
     File(FileConfig),
     #[serde(rename = "object_store", alias = "objectstore", alias = "s3")]
     ObjectStore(ObjectStoreConfig),
+    #[cfg_attr(feature = "schema", schemars(extend("format" = "structural_endpoint")))]
     Static(StaticConfig),
+    #[cfg_attr(feature = "schema", schemars(extend("format" = "structural_endpoint")))]
     Ref(String),
     Memory(MemoryConfig),
     Sled(SledConfig),
@@ -722,12 +731,20 @@ pub enum EndpointType {
     ClickHouse(ClickHouseConfig),
     #[serde(rename = "postgres_cdc", alias = "postgres-cdc")]
     PostgresCdc(PostgresCdcConfig),
+    #[cfg_attr(feature = "schema", schemars(extend("format" = "structural_endpoint")))]
     Fanout(Vec<Endpoint>),
     #[serde(rename = "stream_buffer")]
+    #[cfg_attr(feature = "schema", schemars(extend("format" = "structural_endpoint")))]
     StreamBuffer(StreamBufferConfig),
+    #[cfg_attr(feature = "schema", schemars(extend("format" = "structural_endpoint")))]
     Switch(SwitchConfig),
+    #[cfg_attr(feature = "schema", schemars(extend("format" = "structural_endpoint")))]
     Response(ResponseConfig),
+    #[cfg_attr(feature = "schema", schemars(extend("format" = "structural_endpoint")))]
     Reader(Box<Endpoint>),
+    #[cfg_attr(feature = "schema", schemars(extend("format" = "structural_endpoint")))]
+    Request(RequestForwardConfig),
+    #[cfg_attr(feature = "schema", schemars(extend("format" = "structural_endpoint")))]
     Custom {
         name: String,
         config: serde_json::Value,
@@ -765,6 +782,7 @@ impl EndpointType {
             EndpointType::Switch(_) => "switch",
             EndpointType::Response(_) => "response",
             EndpointType::Reader(_) => "reader",
+            EndpointType::Request(_) => "request",
             EndpointType::Custom { .. } => "custom",
             EndpointType::Null => "null",
         }
@@ -782,9 +800,58 @@ impl EndpointType {
                 | EndpointType::Switch(_)
                 | EndpointType::Response(_)
                 | EndpointType::Reader(_)
+                | EndpointType::Request(_)
                 | EndpointType::Custom { .. }
                 | EndpointType::Null
         )
+    }
+}
+
+/// AEAD cipher selection for [`EncryptionConfig`].
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum CipherKind {
+    /// XChaCha20-Poly1305 (default): 192-bit random nonce, safe at high message rates.
+    #[default]
+    Xchacha20poly1305,
+    /// AES-256-GCM: 96-bit random nonce; prefer the default for very high volumes.
+    Aes256gcm,
+}
+
+/// AEAD encryption settings, shared by the `encryption` middleware (per-message
+/// payload encryption) and the at-rest `encryption` field of the file and
+/// object_store endpoints. Requires the `encryption` feature.
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct EncryptionConfig {
+    /// AEAD cipher. Defaults to `xchacha20poly1305`.
+    #[serde(default)]
+    pub cipher: CipherKind,
+    /// Key identifier written into each envelope; selects the key when decrypting. Defaults to `default`.
+    #[serde(default = "default_encryption_key_id")]
+    pub key_id: String,
+    /// Base64-encoded 32-byte key. Supports `${env:VAR}` to read it from the environment.
+    #[cfg_attr(feature = "schema", schemars(extend("format"="password")))]
+    pub key: String,
+    /// Extra `key_id -> base64 key` entries accepted when decrypting (key rotation).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub decrypt_keys: HashMap<String, String>,
+}
+
+fn default_encryption_key_id() -> String {
+    "default".to_string()
+}
+
+impl Default for EncryptionConfig {
+    fn default() -> Self {
+        Self {
+            cipher: CipherKind::default(),
+            key_id: default_encryption_key_id(),
+            key: String::new(),
+            decrypt_keys: HashMap::new(),
+        }
     }
 }
 
@@ -803,6 +870,8 @@ pub enum Middleware {
     Limiter(LimiterMiddleware),
     Buffer(BufferMiddleware),
     CookieJar(CookieJarMiddleware),
+    Transform(TransformMiddleware),
+    Encryption(EncryptionConfig),
     Custom {
         name: String,
         config: serde_json::Value,
@@ -997,6 +1066,110 @@ pub enum WeakJoinTimeout {
     Fire,
     /// Drop the incomplete group without emitting.
     Discard,
+}
+
+/// JSON transform middleware configuration.
+///
+/// Reshapes JSON payloads declaratively, in two stages over a single parse: field
+/// `mapping` (rename/move/nest), then `schema` (type coercion, defaults, validation).
+/// Either stage may be omitted; with neither configured the message passes through
+/// untouched and is never parsed.
+///
+/// On an output endpoint a rejected message becomes a non-retryable failure, so a `dlq`
+/// middleware listed *after* this one captures it (publisher middlewares are wrapped in
+/// list order, so the last entry is the outermost layer). On an input endpoint a rejected
+/// message is dropped from the batch and acknowledged, which is how invalid input is kept
+/// out of the route.
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct TransformMiddleware {
+    /// Output field name -> source path (e.g. `firstName: "$.first_name"`). Dots nest the output.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub mapping: HashMap<String, MappingRule>,
+    /// Inline JSON Schema subset (type, properties, required, default, items, nullable, enum).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema: Option<serde_json::Value>,
+    /// Path to a JSON Schema file. Read once at startup; never re-read per message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema_file: Option<String>,
+    /// Coerce safely convertible types (e.g. `"42"` -> `42`) instead of rejecting. Defaults to true.
+    #[serde(default = "default_true")]
+    pub coerce: bool,
+    /// Insert `default` values from the schema for missing fields. Defaults to true.
+    #[serde(default = "default_true")]
+    pub apply_defaults: bool,
+    /// What to do with a message that fails to transform. Defaults to `reject`.
+    #[serde(default)]
+    pub on_error: TransformErrorPolicy,
+}
+
+// Hand-written rather than derived: `coerce` and `apply_defaults` default to *true*, which
+// a derived `Default` would silently turn into `false`. That would make
+// `TransformMiddleware { ..Default::default() }` in Rust behave differently from the same
+// config parsed from YAML.
+impl Default for TransformMiddleware {
+    fn default() -> Self {
+        Self {
+            mapping: HashMap::new(),
+            schema: None,
+            schema_file: None,
+            coerce: default_true(),
+            apply_defaults: default_true(),
+            on_error: TransformErrorPolicy::default(),
+        }
+    }
+}
+
+/// How one output field is produced from the input document.
+///
+/// Either a bare path string (`"$.first_name"`) or an object with a `path` plus an
+/// optional `default` and `required` flag.
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(untagged)]
+pub enum MappingRule {
+    /// Shorthand: just the source path.
+    Path(String),
+    /// Full form with a fallback value and/or a presence requirement.
+    Detailed(DetailedMappingRule),
+}
+
+/// Full mapping form with a fallback value and/or a presence requirement.
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct DetailedMappingRule {
+    /// Source path in the input document (e.g. `$.user.id`, `user.id`, `$.items[0]`).
+    pub path: String,
+    /// Value used when the source path is absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<serde_json::Value>,
+    /// Reject the message when the source path is absent and no `default` is set.
+    #[serde(default)]
+    pub required: bool,
+}
+
+impl MappingRule {
+    /// The source path this rule reads from.
+    pub fn path(&self) -> &str {
+        match self {
+            MappingRule::Path(p) => p,
+            MappingRule::Detailed(d) => &d.path,
+        }
+    }
+}
+
+/// Action taken on a message that fails to transform.
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum TransformErrorPolicy {
+    /// Reject the message: non-retryable failure on output, dropped from the batch on input.
+    #[default]
+    Reject,
+    /// Forward the original payload unchanged with the error recorded in metadata.
+    PassThrough,
 }
 
 /// Fault injection modes for testing error handling and recovery mechanisms.
@@ -1308,6 +1481,24 @@ pub enum FileFormat {
     Csv,
 }
 
+/// Compression algorithm. Used for at-rest batches (file, object_store) and for HTTP
+/// body compression (http, clickhouse). Orthogonal to `format`.
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum Compression {
+    /// No compression (default).
+    #[default]
+    None,
+    /// gzip; each batch is a self-contained member, so files stay readable with `zcat`.
+    Gzip,
+    /// lz4 frame format; each batch is a self-contained frame (`lz4 -d` compatible).
+    Lz4,
+    /// zstd; each batch is a self-contained frame, concatenated frames decode as one
+    /// stream (`zstd -d` compatible). Better ratio than lz4, still fast.
+    Zstd,
+}
+
 // --- File Specific Configuration ---
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -1326,6 +1517,12 @@ pub struct FileConfig {
     /// The format for writing messages to the file (Publisher) or interpreting them (Consumer). Defaults to `normal`.
     #[serde(default)]
     pub format: FileFormat,
+    /// Per-batch compression (`none`, `gzip`, `lz4`, `zstd`). Requires the `compression` feature; consume mode only.
+    #[serde(default)]
+    pub compression: Compression,
+    /// At-rest AEAD encryption applied after compression. Requires the `encryption` feature; consume mode only.
+    #[serde(default)]
+    pub encryption: Option<EncryptionConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1378,6 +1575,8 @@ impl FileConfig {
             mode: Some(FileConsumerMode::default()),
             delimiter: None,
             format: FileFormat::default(),
+            compression: Compression::default(),
+            encryption: None,
         }
     }
 
@@ -1434,8 +1633,16 @@ pub struct ObjectStoreConfig {
     #[serde(default = "default_true")]
     pub date_partition: bool,
     /// (Sink only) Extension for written objects, without the dot. Defaults to a value derived
-    /// from `format` (`jsonl`, `json`, `txt`, or `bin`).
+    /// from `format`, `compression` and `encryption` (e.g. `jsonl`, `csv`, `bin`, `jsonl.gz`,
+    /// `jsonl.lz4`, `jsonl.gz.enc`); encrypted objects get a trailing `.enc` since they are
+    /// ciphertext, not a directly decompressible `.gz`.
     pub extension: Option<String>,
+    /// Whole-object compression (`none`, `gzip`, `lz4`, `zstd`). Requires the `compression` feature.
+    #[serde(default)]
+    pub compression: Compression,
+    /// At-rest AEAD encryption applied after compression. Requires the `encryption` feature.
+    #[serde(default)]
+    pub encryption: Option<EncryptionConfig>,
 }
 
 impl Default for ObjectStoreConfig {
@@ -1450,6 +1657,8 @@ impl Default for ObjectStoreConfig {
             max_object_bytes: None,
             date_partition: true,
             extension: None,
+            compression: Compression::default(),
+            encryption: None,
         }
     }
 }
@@ -1913,16 +2122,17 @@ pub enum MongoDbFormat {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum MongoConsume {
-    /// **Queue** — durably drain a queue collection: claim, process, resume after restart. Default.
+    /// **Queue** — competing consumers: claim, process, delete, so each document goes to exactly one
+    /// reader. Default. Destructive and ~5x slower than `capture_all`; for jobs, not bulk reads.
     #[default]
     Consumer,
     /// **Queue, ephemeral** — receive only new messages, no durable position (fan-out subscriber).
     Subscriber,
     /// **Watch existing collection** — capture changes from now on (insert/update/delete), resuming
-    /// under `cursor_id`. Reads an existing collection non-destructively.
+    /// under `cursor_id`. Reads an existing collection non-destructively; never ends on drain.
     CaptureNew,
     /// **Watch existing collection** — read the existing documents first, then capture changes.
-    /// Reads an existing collection non-destructively.
+    /// Non-destructive and the fastest read mode; use this for bulk reads and ETL.
     CaptureAll,
 }
 
@@ -1958,9 +2168,10 @@ pub struct MongoDbConfig {
     /// (Publisher only) If true, the publisher will wait for a response in a dedicated collection. Defaults to false.
     #[serde(default)]
     pub request_reply: bool,
-    /// (Consumer only) How to consume the collection: `consumer` (default, durable queue),
-    /// `subscriber` (ephemeral queue), `capture_new` (watch an existing collection for changes), or
-    /// `capture_all` (read existing documents first, then watch for changes). The bridge selects the
+    /// (Consumer only) How to consume the collection: `consumer` (default, competing-consumers work
+    /// queue — destructive and ~5x slower), `subscriber` (ephemeral queue), `capture_new` (watch an
+    /// existing collection for changes), or `capture_all` (read existing documents first, then watch
+    /// for changes — use this for single-reader bulk reads and ETL). The bridge selects the
     /// underlying mechanism automatically. If unset, the deprecated `change_stream` boolean is
     /// honored for backward compatibility.
     pub consume: Option<MongoConsume>,
@@ -2447,9 +2658,16 @@ pub struct HttpConfig {
     /// (Publisher only) Timeout for idle connections in the connection pool in milliseconds. Defaults to 90000ms.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pool_idle_timeout_ms: Option<u64>,
-    /// Enable gzip compression for request/response bodies exceeding the threshold. Defaults to false.
+    /// (Publisher only) Codec for the request body (`none`, `gzip`, `lz4`, `zstd`); overrides
+    /// `compression_enabled`. `lz4` is non-standard (mq-bridge peers only). Ignored on a consumer —
+    /// enable response compression with `compression_enabled`. Defaults to `none`.
     #[serde(default)]
-    pub compression_enabled: bool,
+    pub compression: Compression,
+    /// Turns compression on. Publisher: compress the request body with gzip (unless `compression`
+    /// sets another codec). Consumer: compress responses, negotiating the best codec the client's
+    /// `Accept-Encoding` accepts. Defaults to off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compression_enabled: Option<bool>,
     /// Minimum message size in bytes to compress. Messages smaller than this are sent uncompressed. Defaults to 1024 bytes.
     #[serde(default)]
     pub compression_threshold_bytes: Option<usize>,
@@ -2575,6 +2793,21 @@ impl HttpConfig {
 
     pub fn inline_response_fast_path_enabled(&self) -> bool {
         self.inline_response_fast_path.unwrap_or(true)
+    }
+
+    /// Request-body codec for a publisher: explicit `compression`, else gzip when
+    /// `compression_enabled`, else none.
+    pub fn publisher_compression(&self) -> Compression {
+        match self.compression {
+            Compression::None if self.compression_enabled == Some(true) => Compression::Gzip,
+            other => other,
+        }
+    }
+
+    /// Whether a consumer compresses responses (then it negotiates the best codec the client
+    /// accepts). Driven by `compression_enabled`; the publisher-only `compression` codec is ignored.
+    pub fn consumer_compression_enabled(&self) -> bool {
+        self.compression_enabled == Some(true)
     }
 
     pub fn with_stream_response_to(mut self, endpoint: Endpoint) -> Self {
@@ -2797,6 +3030,26 @@ pub struct SwitchConfig {
 #[serde(deny_unknown_fields)]
 pub struct ResponseConfig {
     // This struct is a marker and currently has no fields.
+}
+
+// --- Request/Forward Endpoint Configuration ---
+
+/// Sends each message to a request-capable endpoint and forwards its response elsewhere.
+///
+/// Turns a request/reply exchange (HTTP, or a request_reply NATS/Mongo/Memory endpoint) into
+/// a one-way flow whose response lands on `forward_to` — e.g. IBM MQ → HTTP → IBM MQ. On
+/// request error/timeout the original message is forwarded instead (unchanged). Successful
+/// responses carry the transport-native status (e.g. `http_status_code`), so a `switch` on
+/// `forward_to` can route them by status; a failed request forwards the original message with
+/// no status key, so catch failures on the switch's default branch.
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct RequestForwardConfig {
+    /// The request-capable endpoint to send each message to (e.g. an `http` client).
+    pub to: Box<Endpoint>,
+    /// Where the response (or, on error, the original message) is forwarded.
+    pub forward_to: Box<Endpoint>,
 }
 
 // --- Postgres CDC (logical replication) Configuration ---
@@ -3022,6 +3275,15 @@ pub struct ClickHouseConfig {
     /// TLS configuration for `https://` connections.
     #[serde(default)]
     pub tls: TlsConfig,
+    /// HTTP body compression for inserts and cursor reads (`none`, `gzip`, `lz4`, `zstd`). Applied
+    /// as `Content-Encoding` on the request body and negotiated on the response via `Accept-Encoding`.
+    /// `lz4`/`zstd` are faster than `gzip`; all are understood natively by ClickHouse. Defaults to `gzip`.
+    #[serde(default = "default_gzip_compression")]
+    pub compression: Compression,
+}
+
+fn default_gzip_compression() -> Compression {
+    Compression::Gzip
 }
 
 // --- Common Configuration ---
@@ -3302,6 +3564,12 @@ impl SecretExtractor for EndpointType {
             }
             EndpointType::Reader(ep) => {
                 ep.extract_secrets(&format!("{}__{}", prefix, "READER"), secrets)
+            }
+            EndpointType::Request(cfg) => {
+                cfg.to
+                    .extract_secrets(&format!("{}__{}", prefix, "REQUEST__TO"), secrets);
+                cfg.forward_to
+                    .extract_secrets(&format!("{}__{}", prefix, "REQUEST__FORWARD_TO"), secrets);
             }
             _ => {}
         }
@@ -3650,6 +3918,8 @@ kafka_to_nats:
                 Middleware::Limiter(_) => {}
                 Middleware::Buffer(_) => {}
                 Middleware::CookieJar(_) => {}
+                Middleware::Transform(_) => {}
+                Middleware::Encryption(_) => {}
             }
         }
 

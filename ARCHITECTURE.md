@@ -17,15 +17,26 @@ A `Route` defines a data pipeline from one input endpoint to one output endpoint
 - Attach a handler for business logic (transform, filter, respond)
 
 ### 2. Endpoint
-Endpoints are protocol adapters for sources (consumers) and sinks (publishers). Supported types include Kafka, NATS, AMQP, MQTT, MongoDB, HTTP, SQLx, ZeroMQ, Files, AWS, IBM MQ, and in-memory channels. Endpoints are created via factory functions and configured via serde (json/yml).
+Endpoints are protocol adapters for sources (consumers) and sinks (publishers). Supported types include Kafka, NATS, AMQP, MQTT, MongoDB, HTTP, SQLx, ZeroMQ, Files, AWS, IBM MQ, and the `memory` endpoint (in-process channels and cross-process IPC). Endpoints are created via factory functions and configured via serde (json/yml).
+
+Beyond these protocol adapters there are **structural endpoints** that compose other endpoints
+or shape routing rather than talking to a broker: `ref`, `fanout`, `switch`, `request`,
+`response`, `reader`, `static`, `stream_buffer`, `null` and `custom`. All of them are
+documented in [REFERENCE.md](REFERENCE.md#structural-endpoints).
 
 ### 3. Middleware
-Middleware wraps consumers and publishers to add cross-cutting features:
-- Retries (exponential backoff)
-- Dead-letter queues (DLQ) to send messages to a fallback / error endpoint
-- Deduplication (sled-based)
-- Metrics
+Middleware wraps consumers and publishers to add cross-cutting features. There is no
+`Middleware` trait: a middleware *is* a decorator implementing `MessageConsumer` and/or
+`MessagePublisher`, which is why `CustomMiddlewareFactory` is defined as `apply_consumer` /
+`apply_publisher`. Available middleware includes:
+- Retries (exponential backoff) and dead-letter queues (DLQ)
+- JSON transformation (`transform`): mapping, type coercion, schema validation
+- Deduplication (sled-based), weak joins, buffering, rate limiting
+- Metrics, delays, fault injection
 - Custom user middleware
+
+The complete list, with fields, defaults and the layer-ordering rules, is in
+[REFERENCE.md](REFERENCE.md#middleware).
 
 ### 4. Handler
 Handlers are user-defined async functions that process messages. There are two main handler types:
@@ -33,7 +44,98 @@ Handlers are user-defined async functions that process messages. There are two m
 - **EventHandler:** 1-to-N handler for event consumption. Compatible to CommandHandler, but should not return a response.
 - **TypeHandler:** Strongly-typed handler, dispatches based on the `kind` metadata field and deserializes payloads.
 
+## Memory Endpoint and IPC Transport
 
+The `memory` endpoint is not only an in-process channel. Its `topic` field (serde alias: `url`) doubles as a **transport URL**, so the same endpoint type covers both in-process queues and cross-process IPC over Unix domain sockets / Windows named pipes.
+
+### Transport URL schemes
+
+| URL | Resolves to | Platform |
+| --- | --- | --- |
+| `my-topic` | `memory://my-topic` (no scheme = in-process, for backward compatibility) | all |
+| `memory://my-topic` | In-process channel, shared by namespace within the same process | all |
+| `ipc://my-queue` | Unix: `/run/mq-bridge/my-queue.sock`<br>Windows: `\\.\pipe\mq-bridge-my-queue` | Unix + Windows |
+| `ipc:///var/run/my.sock` | That exact socket path (leading `/` = absolute path, note the three slashes) | Unix |
+| `unix:///var/run/my.sock` | That exact socket path; the path **must** be absolute | Unix only |
+| `pipe://my-pipe` | `\\.\pipe\my-pipe` — used verbatim, **no** `mq-bridge-` prefix | Windows only |
+
+Anything else (`http://…`, an empty URL, a relative `unix://path`) is rejected at parse time.
+
+**Named `ipc://` resolution on Unix** falls back in order, using the first writable location:
+1. `/run/mq-bridge/<name>.sock` (systemd standard)
+2. `$XDG_RUNTIME_DIR/mq-bridge/<name>.sock`
+3. `/tmp/mq-bridge/<name>.sock` (less secure)
+
+Because of this fallback, `ipc://name` can land in different places for different users or services. When both sides must agree deterministically, use an explicit path (`ipc:///run/myapp/queue.sock`) instead of a bare name.
+
+### Roles: consumer is the server, publisher is the client
+
+IPC is **unidirectional, publisher → consumer**, and the roles are fixed:
+
+- The **consumer** binds and listens on the socket/pipe (server). It removes a stale socket file before binding, creates the parent directory with mode `0700`, and sets the socket to `0600`. It unlinks the socket on drop.
+- The **publisher** connects to it (client).
+
+So **the consumer process must be running before the publisher connects** — otherwise the publisher fails with a connection error. The consumer serves one connection at a time; if the peer disconnects, it logs a warning and waits for a new connection rather than erroring out.
+
+### IPC requires async construction
+
+`MemoryConsumer::new`, `MemoryPublisher::new`, and `new_local` are synchronous and only support `memory://`. Given an IPC URL they return an error ("requires async endpoint construction"). Use the async constructors:
+
+```rust
+use mq_bridge::endpoints::memory::{MemoryConsumer, MemoryPublisher};
+use mq_bridge::models::MemoryConfig;
+
+let config = MemoryConfig::new_with_url("ipc:///run/mq-bridge/orders.sock", Some(100));
+
+// Server side (start first)
+let mut consumer = MemoryConsumer::new_async(&config).await?;
+// Client side, in another process
+let publisher = MemoryPublisher::new_async(&config).await?;
+```
+
+Routes always build endpoints through the async factories, so an `ipc://` URL works in YAML/JSON config with no extra code:
+
+```yaml
+ipc_ingest:
+  input:
+    memory:
+      url: "ipc:///run/mq-bridge/orders.sock"
+      capacity: 256
+  output:
+    kafka:
+      topic: "orders"
+      url: "localhost:9092"
+```
+
+### Wire format
+
+Batches are serialized with **MessagePack** (`Vec<CanonicalMessage>`) and written as length-prefixed frames: a 4-byte big-endian length followed by the payload. Frames larger than 100 MB are rejected.
+
+Framing is handled by `tokio_util::codec::LengthDelimitedCodec` in `endpoints/memory/framed.rs`, shared by both platforms. This matters for more than deduplication: the codec owns the partial-frame buffer, which makes reads **cancel safe**. Routes cancel `receive_batch` on shutdown via `select!`, and a hand-rolled `read_exact` pair would consume part of a frame on cancellation and desync the connection permanently.
+
+### Backpressure
+
+A batch is written as one frame. Socket buffers are small — **8 KiB by default on macOS** (`net.local.stream.sendspace`) — so a batch that outgrows the buffer only completes once the consumer drains it. `send_batch` blocking is therefore normal backpressure, not a fault.
+
+Two consequences worth knowing:
+
+- The consumer must actually be reading, not merely connected. A consumer that has accepted but stopped draining will stall the publisher indefinitely. After 5 seconds blocked, the publisher logs a warning naming the socket; it keeps waiting rather than dropping data.
+- `capacity` does not create a queue here. There is no buffering between the two processes beyond the kernel socket buffer.
+
+### Acknowledgements and redelivery over IPC
+
+`enable_nack` defaults to **`true`** for IPC transports (`ipc://`, `unix://`, `pipe://`) and `false` for `memory://`; an explicit `enable_nack` in config always wins.
+
+Redelivery over IPC is **consumer-local**. The socket carries publisher → consumer traffic only, so a nack cannot travel back to the producer — the publisher never reads, and writing to it would strand the messages and eventually block the commit on a full socket buffer. A nacked message is therefore requeued inside the consumer and redelivered ahead of new traffic. It does **not** survive a consumer crash, and the publisher is never told.
+
+If you need redelivery that survives the consumer process, use a real broker endpoint. mq-bridge deliberately does not implement a bidirectional ack protocol over IPC.
+
+### Behavioural differences vs `memory://`
+
+- **`subscribe_mode` is not supported** over IPC, on either side — the EventStore/broadcast backend is in-process only.
+- **`request_reply` is not supported** for IPC publishers.
+- **Only the publisher side may send.** Calling `send_batch` on a consumer-side IPC transport returns an error rather than writing into a peer that never reads.
+- **`capacity` bounds the consumer-side buffer**, not an internal queue — a socket has no backlog of its own. `len()` reports whole frames already buffered by the codec (readable without touching the socket), and endpoint `status().pending` adds the consumer's own buffered and awaiting-redelivery messages.
 
 ## Batching and Concurrency
 

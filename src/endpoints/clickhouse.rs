@@ -18,7 +18,7 @@
 
 use super::poll::PollBackoff;
 use crate::checkpoint::{self, CheckpointBackend, CheckpointStore};
-use crate::models::ClickHouseConfig;
+use crate::models::{ClickHouseConfig, Compression};
 use crate::traits::{
     BoxFuture, ConsumerError, EndpointStatus, MessageConsumer, MessageDisposition,
     MessagePublisher, PublisherError, ReceivedBatch, SentBatch,
@@ -103,6 +103,7 @@ struct ChClient {
     database: String,
     user: String,
     password: String,
+    compression: Compression,
 }
 
 impl ChClient {
@@ -133,19 +134,54 @@ impl ChClient {
             database: config.database.clone().unwrap_or_else(|| "default".into()),
             user: config.username.clone().unwrap_or_else(|| "default".into()),
             password: config.password.clone().unwrap_or_default(),
+            compression: config.compression,
         })
+    }
+
+    /// Compresses a request body with the configured method, returning the encoded bytes and the
+    /// `Content-Encoding` token. `None` compression returns the bytes unchanged with no token.
+    fn encode_body(&self, data: &[u8]) -> anyhow::Result<(Vec<u8>, Option<&'static str>)> {
+        use std::io::Write;
+        match self.compression {
+            Compression::None => Ok((data.to_vec(), None)),
+            Compression::Gzip => {
+                let mut enc =
+                    flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+                enc.write_all(data)
+                    .context("Failed to gzip ClickHouse request body")?;
+                Ok((
+                    enc.finish().context("Failed to finish gzip encoding")?,
+                    Some("gzip"),
+                ))
+            }
+            Compression::Lz4 => {
+                let mut enc = lz4_flex::frame::FrameEncoder::new(Vec::new());
+                enc.write_all(data)
+                    .context("Failed to lz4 ClickHouse request body")?;
+                Ok((
+                    enc.finish().context("Failed to finish lz4 encoding")?,
+                    Some("lz4"),
+                ))
+            }
+            Compression::Zstd => Ok((
+                zstd::stream::encode_all(data, zstd::DEFAULT_COMPRESSION_LEVEL)
+                    .context("Failed to zstd ClickHouse request body")?,
+                Some("zstd"),
+            )),
+        }
     }
 
     /// POST `sql` (which may include trailing JSONEachRow data) and return the response body.
     /// `extra` adds request query params (e.g. `async_insert`, `param_*` typed query parameters).
-    /// When `gzip_body` is set the request body is gzip-compressed (`Content-Encoding: gzip`), worth
-    /// it for large insert bodies. Response bodies are transparently gunzipped by reqwest's `gzip`
-    /// feature whenever the server compresses them (enabled per-request via `enable_http_compression`).
+    /// When `compress_body` is set the request body is compressed with the configured method
+    /// (`Content-Encoding: gzip`/`lz4`), worth it for large insert bodies. For responses we let the
+    /// server compress (via `enable_http_compression`): `gzip` is gunzipped transparently by reqwest's
+    /// `gzip` feature, and `lz4` (which reqwest does not know) is decoded here.
     async fn run(
         &self,
         sql: &str,
         extra: &[(&str, &str)],
-        gzip_body: bool,
+        compress_body: bool,
     ) -> anyhow::Result<String> {
         let mut params: Vec<(&str, &str)> = vec![("database", self.database.as_str())];
         params.extend_from_slice(extra);
@@ -155,13 +191,20 @@ impl ChClient {
             .query(&params)
             .header("X-ClickHouse-User", &self.user)
             .header("X-ClickHouse-Key", &self.password);
-        if gzip_body {
-            use std::io::Write;
-            let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-            enc.write_all(sql.as_bytes())
-                .context("Failed to gzip ClickHouse request body")?;
-            let compressed = enc.finish().context("Failed to finish gzip encoding")?;
-            req = req.header("Content-Encoding", "gzip").body(compressed);
+        // reqwest advertises gzip on its own; for lz4/zstd we must ask explicitly (and doing so also
+        // stops reqwest adding its gzip default, so the server won't send a body reqwest would
+        // silently gunzip out from under our own decoder).
+        match self.compression {
+            Compression::Lz4 => req = req.header("Accept-Encoding", "lz4"),
+            Compression::Zstd => req = req.header("Accept-Encoding", "zstd"),
+            _ => {}
+        }
+        if compress_body {
+            let (encoded, encoding) = self.encode_body(sql.as_bytes())?;
+            match encoding {
+                Some(token) => req = req.header("Content-Encoding", token).body(encoded),
+                None => req = req.body(encoded),
+            }
         } else {
             req = req.body(sql.to_string());
         }
@@ -170,12 +213,57 @@ impl ChClient {
             .await
             .with_context(|| format!("ClickHouse request to '{}' failed", self.url))?;
         let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
+        // reqwest strips `Content-Encoding` after auto-gunzipping, so a surviving `lz4`/`zstd` here
+        // means the raw body still needs decoding; anything else (incl. gunzipped gzip) is plain.
+        let resp_encoding = resp
+            .headers()
+            .get(reqwest::header::CONTENT_ENCODING)
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.to_ascii_lowercase());
+        let bytes = resp.bytes().await.with_context(|| {
+            format!(
+                "Failed to read ClickHouse response body from '{}'",
+                self.url
+            )
+        })?;
+        let text = match resp_encoding.as_deref() {
+            Some("lz4") => {
+                let decoded = lz4_decode_all(&bytes).with_context(|| {
+                    format!(
+                        "Failed to lz4-decode ClickHouse response from '{}'",
+                        self.url
+                    )
+                })?;
+                String::from_utf8_lossy(&decoded).into_owned()
+            }
+            Some("zstd") => {
+                let decoded = zstd::stream::decode_all(&bytes[..]).with_context(|| {
+                    format!(
+                        "Failed to zstd-decode ClickHouse response from '{}'",
+                        self.url
+                    )
+                })?;
+                String::from_utf8_lossy(&decoded).into_owned()
+            }
+            _ => String::from_utf8_lossy(&bytes).into_owned(),
+        };
         if !status.is_success() {
             return Err(anyhow!("ClickHouse returned {}: {}", status, text.trim()));
         }
         Ok(text)
     }
+}
+
+/// Decodes one or more concatenated lz4 frames (ClickHouse may flush the response as several frames).
+fn lz4_decode_all(data: &[u8]) -> std::io::Result<Vec<u8>> {
+    use std::io::{BufRead, Read};
+    let mut reader = std::io::Cursor::new(data);
+    let mut out = Vec::new();
+    while !reader.fill_buf()?.is_empty() {
+        let mut dec = lz4_flex::frame::FrameDecoder::new(&mut reader);
+        dec.read_to_end(&mut out)?;
+    }
+    Ok(out)
 }
 
 // --- Publisher (sink) ---

@@ -428,6 +428,9 @@ fn spawn_stream_reader(ctx: ReaderCtx) {
                 }
                 // BLOCK timeout with no data — just poll again.
                 Ok(None) => {}
+                // Client-side read timeout: same "no data" condition as `Ok(None)`,
+                // it just fired before the server's empty BLOCK reply arrived.
+                Err(e) if e.is_timeout() => {}
                 Err(e) => {
                     if tx
                         .send(Err(ConsumerError::Connection(anyhow!(

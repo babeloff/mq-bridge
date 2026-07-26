@@ -9,14 +9,11 @@ pub mod amqp;
 pub mod aws;
 #[cfg(feature = "clickhouse")]
 pub mod clickhouse;
-pub mod fanout;
 pub mod file;
 #[cfg(feature = "grpc")]
 pub mod grpc;
 #[cfg(feature = "http")]
 pub mod http;
-#[cfg(feature = "http")]
-mod http_stream;
 #[cfg(any(feature = "ibm-mq-static", feature = "ibm-mq"))]
 pub mod ibm_mq;
 #[cfg(feature = "kafka")]
@@ -28,29 +25,33 @@ pub mod mongodb;
 pub mod mqtt;
 #[cfg(feature = "nats")]
 pub mod nats;
-pub mod null;
 #[cfg(feature = "object-store")]
 pub mod object_store;
 #[cfg(any(feature = "sqlx", feature = "clickhouse"))]
 mod poll;
 #[cfg(feature = "postgres-cdc")]
 pub mod postgres;
-pub mod reader;
 #[cfg(feature = "redis-streams")]
 pub mod redis_streams;
-pub mod response;
 #[cfg(feature = "sled")]
 pub mod sled;
 #[cfg(feature = "sqlx")]
 pub mod sqlx;
-pub mod static_endpoint;
-pub mod stream_buffer;
-pub mod switch;
+/// Structural endpoints (`fanout`, `switch`, `request`, `response`, `reader`,
+/// `static`, `stream_buffer`, `null`) that route or terminate a flow instead of
+/// talking to an external system.
+pub mod structural;
 #[cfg(feature = "websocket")]
 pub mod websocket;
 #[cfg(feature = "zeromq")]
 pub mod zeromq;
 use crate::endpoints::memory::{get_or_create_channel, MemoryChannel};
+/// Backwards-compatible aliases for the structural endpoints, which used to live
+/// directly under `endpoints`. Prefer `endpoints::structural::*`.
+#[doc(hidden)]
+pub use crate::endpoints::structural::{
+    fanout, null, reader, request, response, static_endpoint, stream_buffer, switch,
+};
 use crate::middleware::apply_middlewares_to_consumer;
 use crate::models::{
     Endpoint, EndpointType, MemoryConfig, Middleware, ResponseConfig, StreamBufferConfig,
@@ -1430,6 +1431,21 @@ fn check_publisher_recursive(
         EndpointType::Response(_) => Ok(warnings),
         EndpointType::Custom { .. } => Ok(warnings),
         EndpointType::Reader(inner) => check_consumer(route_name, inner, allowed_types),
+        EndpointType::Request(cfg) => {
+            warnings.extend(check_publisher_recursive(
+                route_name,
+                &cfg.to,
+                depth + 1,
+                allowed_types,
+            )?);
+            warnings.extend(check_publisher_recursive(
+                route_name,
+                &cfg.forward_to,
+                depth + 1,
+                allowed_types,
+            )?);
+            Ok(warnings)
+        }
         #[allow(unreachable_patterns)]
         _ => {
             if let Some(allowed) = allowed_types {
@@ -1710,6 +1726,21 @@ async fn create_base_publisher(
         EndpointType::Reader(inner) => {
             let consumer = create_consumer_from_route(route_name, inner).await?;
             Ok(Box::new(reader::ReaderPublisher::new(consumer)) as Box<dyn MessagePublisher>)
+        }
+        EndpointType::Request(cfg) => {
+            let request =
+                create_publisher_with_depth(route_name.to_string(), (*cfg.to).clone(), depth + 1)
+                    .await?;
+            let forward = create_publisher_with_depth(
+                route_name.to_string(),
+                (*cfg.forward_to).clone(),
+                depth + 1,
+            )
+            .await?;
+            Ok(
+                Box::new(request::RequestForwardPublisher::new(request, forward))
+                    as Box<dyn MessagePublisher>,
+            )
         }
         EndpointType::Custom { name, config } => {
             let factory = get_endpoint_factory(name)

@@ -4,7 +4,9 @@
 //  git clone https://github.com/marcomq/mq-bridge
 use crate::canonical_message::{deserialize_u128, tracing_support::LazyMessageIds};
 use crate::event_store::{EventStore, EventStoreConsumer, RetentionPolicy};
-use crate::models::{FileConfig, FileConsumerMode, FileFormat};
+use crate::models::{Compression, FileConfig, FileConsumerMode, FileFormat};
+#[cfg(feature = "encryption")]
+use crate::support::crypto::Crypto;
 use crate::traits::{
     ConsumerError, MessageConsumer, MessagePublisher, PublisherError, ReceivedBatch, SentBatch,
 };
@@ -39,19 +41,24 @@ fn get_file_lock(path: &str) -> Arc<Mutex<()>> {
 
 /// Appends a CSV-escaped field to `buf` without allocating for the common
 /// (no special characters) case. Hot path for CSV row encoding.
-fn csv_append_field(buf: &mut String, s: &str) {
-    if s.contains(',') || s.contains('"') || s.contains('\n') || s.contains('\r') {
-        buf.push('"');
-        for ch in s.chars() {
-            if ch == '"' {
-                buf.push('"');
-            }
-            buf.push(ch);
-        }
-        buf.push('"');
-    } else {
-        buf.push_str(s);
+fn csv_append_field(buf: &mut Vec<u8>, s: &str) {
+    let bytes = s.as_bytes();
+    // One byte pass instead of four `contains` scans.
+    if !bytes
+        .iter()
+        .any(|b| matches!(b, b',' | b'"' | b'\n' | b'\r'))
+    {
+        buf.extend_from_slice(bytes);
+        return;
     }
+    buf.push(b'"');
+    for &b in bytes {
+        if b == b'"' {
+            buf.push(b'"');
+        }
+        buf.push(b);
+    }
+    buf.push(b'"');
 }
 
 /// Appends `s` to `buf` with JSON string escaping (no surrounding quotes).
@@ -80,15 +87,163 @@ fn json_append_escaped(buf: &mut String, s: &str) {
     }
 }
 
-fn csv_encode_row(fields: &[String]) -> String {
-    let mut buf = String::new();
+fn csv_encode_row(fields: &[String]) -> Vec<u8> {
+    let mut buf = Vec::new();
     for (i, f) in fields.iter().enumerate() {
         if i > 0 {
-            buf.push(',');
+            buf.push(b',');
         }
         csv_append_field(&mut buf, f);
     }
     buf
+}
+
+/// Encodes `msg`'s JSON-object payload as a CSV row into `row_buf` (cleared first),
+/// establishing the column order from its keys when `hdr` is still unset. Returns
+/// `true` when this call established the header, so the caller can emit the header
+/// line for a new file. Shared by the plain-append and member (compressed/encrypted)
+/// write paths.
+fn csv_encode_message(
+    msg: &CanonicalMessage,
+    hdr: &mut Option<Vec<String>>,
+    row_buf: &mut Vec<u8>,
+) -> Result<bool, serde_json::Error> {
+    // Preferred path: borrow the keys and leave the values as unparsed
+    // JSON slices, so a row costs one scan plus byte copies instead of
+    // building (and re-serializing) a whole `Value` tree. Payloads with
+    // escaped keys can't be borrowed, so those fall back to the tree.
+    let raw_row =
+        serde_json::from_slice::<HashMap<&str, &serde_json::value::RawValue>>(&msg.payload).ok();
+    let parsed_row = match raw_row {
+        Some(_) => None,
+        None => match serde_json::from_slice::<serde_json::Value>(&msg.payload) {
+            Ok(serde_json::Value::Object(obj)) => Some(obj),
+            _ => None,
+        },
+    };
+    // An object with no fields is rejected too: it carries no columns, so letting it
+    // establish the header would fix an empty column set for the rest of the file.
+    let no_columns = match (&raw_row, &parsed_row) {
+        (Some(raw), _) => raw.is_empty(),
+        (_, Some(obj)) => obj.is_empty(),
+        _ => true,
+    };
+    if no_columns {
+        return Err(serde_json::Error::io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "CSV format requires a non-empty JSON object payload",
+        )));
+    }
+
+    let mut header_established = false;
+    if hdr.is_none() {
+        // Sort keys so the column order is deterministic and
+        // independent of serde_json's map type (BTreeMap vs the
+        // IndexMap enabled by the `preserve_order` feature, which
+        // `bson`/mongodb turns on under feature unification).
+        let mut cols: Vec<String> = match (&raw_row, &parsed_row) {
+            (Some(raw), _) => raw.keys().map(|k| (*k).to_string()).collect(),
+            (_, Some(obj)) => obj.keys().cloned().collect(),
+            _ => unreachable!(),
+        };
+        cols.sort();
+        *hdr = Some(cols);
+        header_established = true;
+    }
+
+    let cols = hdr.as_ref().expect("header set above");
+    // Reused across the batch: rows are all the same shape, so
+    // after the first one this never reallocates.
+    row_buf.clear();
+    row_buf.reserve(msg.payload.len());
+    // Columns this payload actually supplied, for the drift check below.
+    let mut matched = 0usize;
+    for (i, c) in cols.iter().enumerate() {
+        if i > 0 {
+            row_buf.push(b',');
+        }
+        match (&raw_row, &parsed_row) {
+            (Some(raw), _) => {
+                if let Some(v) = raw.get(c.as_str()) {
+                    csv_append_raw(row_buf, v);
+                    matched += 1;
+                }
+            }
+            (_, Some(obj)) => {
+                if let Some(v) = obj.get(c) {
+                    csv_append_value(row_buf, v);
+                    matched += 1;
+                }
+            }
+            _ => unreachable!(),
+        }
+    }
+    if !header_established {
+        // Keys the payload has beyond the ones the header covers are dropped silently, and
+        // missing ones become empty fields; both mean the file's schema drifted. Counting
+        // matches costs nothing extra, and the diagnostic is emitted once per process so a
+        // whole drifted stream doesn't flood the log.
+        let row_len = match (&raw_row, &parsed_row) {
+            (Some(raw), _) => raw.len(),
+            (_, Some(obj)) => obj.len(),
+            _ => 0,
+        };
+        if matched < cols.len() || row_len > matched {
+            static WARNED: AtomicBool = AtomicBool::new(false);
+            if !WARNED.swap(true, Ordering::Relaxed) {
+                warn!(
+                    header_columns = cols.len(),
+                    payload_keys = row_len,
+                    matched_columns = matched,
+                    "CSV payload keys differ from the established header: extra keys are dropped and missing ones written as empty fields. Logged once per process."
+                );
+            }
+        }
+    }
+    Ok(header_established)
+}
+
+/// Appends one still-unparsed JSON value as a CSV field. Scalars are copied
+/// straight from the source bytes; only escaped strings and nested
+/// arrays/objects need any decoding.
+fn csv_append_raw(buf: &mut Vec<u8>, raw: &serde_json::value::RawValue) {
+    let text = raw.get();
+    match text.as_bytes().first() {
+        Some(b'"') => {
+            let inner = &text[1..text.len() - 1];
+            if !inner.as_bytes().contains(&b'\\') {
+                csv_append_field(buf, inner);
+            } else if let Ok(decoded) = serde_json::from_str::<String>(text) {
+                csv_append_field(buf, &decoded);
+            }
+        }
+        // Nested values are re-serialized compactly, matching the parsed path.
+        Some(b'{') | Some(b'[') => {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(text) {
+                csv_append_field(buf, &v.to_string());
+            }
+        }
+        // Numbers, bools, null: never need quoting, but the scan is one pass anyway.
+        _ => csv_append_field(buf, text),
+    }
+}
+
+/// Appends one JSON value as a CSV field. Numbers, bools and nulls are written
+/// straight into `buf` — they can never need CSV quoting, so this skips both the
+/// escape scan and the `to_string` allocation that dominates numeric-heavy rows.
+fn csv_append_value(buf: &mut Vec<u8>, v: &serde_json::Value) {
+    use std::io::Write as _;
+    match v {
+        serde_json::Value::String(s) => csv_append_field(buf, s),
+        serde_json::Value::Number(n) => {
+            let _ = write!(buf, "{n}");
+        }
+        serde_json::Value::Bool(true) => buf.extend_from_slice(b"true"),
+        serde_json::Value::Bool(false) => buf.extend_from_slice(b"false"),
+        serde_json::Value::Null => buf.extend_from_slice(b"null"),
+        // Nested arrays/objects keep their JSON spelling and do need escaping.
+        other => csv_append_field(buf, &other.to_string()),
+    }
 }
 
 /// Parses a single CSV line into fields. Supports quoted fields with escaped `""`.
@@ -175,13 +330,38 @@ pub struct FilePublisher {
     file_lock: Arc<Mutex<()>>,
     delimiter: Vec<u8>,
     format: FileFormat,
+    #[cfg(any(feature = "compression", feature = "encryption"))]
+    compression: Compression,
+    #[cfg(feature = "encryption")]
+    crypto: Option<Arc<Crypto>>,
     /// CSV column order, locked in by the first message written. Shared across
     /// clones of this publisher so all writers to the same file agree on it.
     csv_header: Arc<Mutex<Option<Vec<String>>>>,
 }
 
+/// Validates the `compression`/`encryption` settings shared by the file
+/// publisher and consumer: both need their Cargo feature enabled.
+fn validate_member_settings(config: &FileConfig) -> anyhow::Result<()> {
+    // Only the feature-gated checks below read it, so it is unused with both features on.
+    let _ = config;
+    #[cfg(not(feature = "compression"))]
+    if config.compression != Compression::None {
+        return Err(anyhow::anyhow!(
+            "file 'compression' requires the `compression` feature"
+        ));
+    }
+    #[cfg(not(feature = "encryption"))]
+    if config.encryption.is_some() {
+        return Err(anyhow::anyhow!(
+            "file 'encryption' requires the `encryption` feature"
+        ));
+    }
+    Ok(())
+}
+
 impl FilePublisher {
     pub async fn new(config: &FileConfig) -> anyhow::Result<Self> {
+        validate_member_settings(config)?;
         let path_str = &config.path;
         let path = Path::new(path_str);
         if let Some(parent) = path.parent() {
@@ -207,8 +387,259 @@ impl FilePublisher {
             file_lock,
             delimiter,
             format,
+            #[cfg(any(feature = "compression", feature = "encryption"))]
+            compression: config.compression,
+            #[cfg(feature = "encryption")]
+            crypto: config
+                .encryption
+                .as_ref()
+                .map(Crypto::new)
+                .transpose()?
+                .map(Arc::new),
             csv_header: Arc::new(Mutex::new(None)),
         })
+    }
+
+    /// True when batches are written as self-contained members (compressed
+    /// and/or encrypted) rather than plain appended lines.
+    #[cfg(any(feature = "compression", feature = "encryption"))]
+    fn is_member_mode(&self) -> bool {
+        #[allow(unused_mut)]
+        let mut member = self.compression != Compression::None;
+        #[cfg(feature = "encryption")]
+        {
+            member |= self.crypto.is_some();
+        }
+        member
+    }
+
+    /// Writes one batch as a single self-contained member appended to the file.
+    /// Compressed members (gzip/lz4) self-delimit, so the file stays a standard
+    /// `.gz`/`.lz4` stream. An encrypted (sealed) member does not, so it is
+    /// wrapped in a `[u64 be length][sealed bytes]` frame instead.
+    #[cfg(any(feature = "compression", feature = "encryption"))]
+    async fn send_batch_member(
+        &self,
+        messages: Vec<CanonicalMessage>,
+    ) -> Result<SentBatch, PublisherError> {
+        // Opened up front, before the CPU-bound encode/compress/seal below, and kept
+        // open until the append. The order matters for throughput, not just tidiness:
+        // this task is woken by the route's producer and lands in that thread's LIFO
+        // slot, so any CPU it runs before its first suspension point holds the producer
+        // there. `open` is a blocking-pool hop that always suspends, which is why the
+        // plain path (which opens first) never stalls; building the member first cost
+        // ~1.9ms of producer dead time per batch, made compressed writes ~35% slower
+        // and pinned the pipeline to one core regardless of `concurrency`.
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+            .await
+            .context("Failed to open file for writing batch member")?;
+        // Members are concatenated, so the decoded stream is one continuous line
+        // stream: the CSV header goes into the first member of a new file only.
+        let is_csv = matches!(self.format, FileFormat::Csv);
+        // CSV takes the file lock for the whole batch, because its header line has to land
+        // in the *first* member of the file: the emptiness check, the header decision and
+        // the append must stay atomic. Every other format appends self-contained records in
+        // any order, so it leaves this `None` and the CPU-bound encode/compress/seal runs
+        // outside the lock — the append below locks only if this is still `None`.
+        let mut file_guard = if is_csv {
+            Some(self.file_lock.lock().await)
+        } else {
+            None
+        };
+        let mut raw = Vec::new();
+        let mut failed_messages = Vec::new();
+        // Only a successful stat reporting zero bytes counts as empty. A failed stat is
+        // treated as non-empty (matching the plain path's `pre_len == Some(0)`), so a
+        // header can never be inserted into the middle of a file we could not measure.
+        // The not-yet-created case is still empty: the append below creates the file.
+        let file_is_empty = is_csv
+            && match tokio::fs::metadata(&self.path).await {
+                Ok(m) => m.len() == 0,
+                Err(e) => e.kind() == std::io::ErrorKind::NotFound,
+            };
+        let mut csv_header_guard = if is_csv {
+            Some(self.csv_header.lock().await)
+        } else {
+            None
+        };
+        let mut wrote_csv_header = false;
+        let mut csv_row_buf: Vec<u8> = Vec::new();
+        for mut msg in messages {
+            msg.strip_source_metadata();
+            // `Ok(None)` means the body is in the reused CSV row buffer.
+            let encoded = match self.format {
+                FileFormat::Csv => {
+                    let hdr = csv_header_guard.as_mut().expect("csv header lock held");
+                    match csv_encode_message(&msg, hdr, &mut csv_row_buf) {
+                        Ok(header_established) => {
+                            if header_established && file_is_empty {
+                                raw.extend_from_slice(&csv_encode_row(
+                                    hdr.as_ref().expect("header set above"),
+                                ));
+                                raw.extend_from_slice(&self.delimiter);
+                                wrote_csv_header = true;
+                            }
+                            Ok(None)
+                        }
+                        Err(e) => Err(e),
+                    }
+                }
+                ref fmt => encode_record(&msg, fmt).map(Some),
+            };
+            match encoded {
+                Ok(Some(mut bytes)) => {
+                    bytes.extend_from_slice(&self.delimiter);
+                    raw.extend_from_slice(&bytes);
+                }
+                Ok(None) => {
+                    raw.extend_from_slice(&csv_row_buf);
+                    raw.extend_from_slice(&self.delimiter);
+                }
+                Err(e) => {
+                    tracing::error!("Failed to serialize message for file sink member: {}", e);
+                    failed_messages.push((msg, PublisherError::NonRetryable(anyhow::anyhow!(e))));
+                }
+            }
+        }
+
+        if !raw.is_empty() {
+            // Every failure below leaves the member off disk (unwritten or rolled back), so a
+            // CSV header established for this batch is cleared afterwards — otherwise the
+            // retry would think the header was already written and emit a headerless file.
+            let outcome: Result<(), PublisherError> = async {
+            #[cfg(feature = "compression")]
+            let raw = if self.compression != Compression::None {
+                crate::support::compression::compress_member(self.compression, &raw)
+                    .map_err(|e| PublisherError::NonRetryable(anyhow::anyhow!(e)))?
+            } else {
+                raw
+            };
+            #[allow(unused_mut)]
+            let mut member = raw;
+            #[cfg(feature = "encryption")]
+            if let Some(crypto) = &self.crypto {
+                let sealed = crypto
+                    .seal(&member, b"")
+                    .map_err(PublisherError::NonRetryable)?;
+                // The consumer rejects any frame whose length prefix exceeds this cap, so a
+                // batch sealing larger than it would be written but never read back. Fail
+                // fast and tell the operator to shrink batch_size rather than emit a member
+                // that corrupts the stream on read.
+                if sealed.len() as u64 > MAX_ENCRYPTED_FRAME_BYTES {
+                    return Err(PublisherError::NonRetryable(anyhow::anyhow!(
+                        "encrypted batch frame is {} bytes, exceeding the {} byte cap the consumer can read; reduce batch_size",
+                        sealed.len(),
+                        MAX_ENCRYPTED_FRAME_BYTES
+                    )));
+                }
+                let mut framed = Vec::with_capacity(8 + sealed.len());
+                framed.extend_from_slice(&(sealed.len() as u64).to_be_bytes());
+                framed.extend_from_slice(&sealed);
+                member = framed;
+            }
+
+            // The member is fully built by now, so unless the batch already holds the
+            // lock (CSV), it is taken here and covers only the append.
+            if file_guard.is_none() {
+                file_guard = Some(self.file_lock.lock().await);
+            }
+            // Length before the append: a failed write_all can leave a partial
+            // member behind, which would corrupt the concatenated stream and get
+            // compounded by the Retryable re-append. Truncate back to this
+            // known-good member boundary on failure so a retry appends cleanly.
+            let pre_len = file
+                .metadata()
+                .await
+                .context("Failed to stat file before member write")?
+                .len();
+            // Append the whole member in one write so a concurrent reader never
+            // observes a torn member (the consumer also guards against it).
+            if let Err(e) = file.write_all(&member).await {
+                if let Err(te) = file.set_len(pre_len).await {
+                    tracing::error!(
+                        "Failed to truncate file back to {} after member write error: {}",
+                        pre_len,
+                        te
+                    );
+                    // Rollback failed, so a partial member is still on disk. A Retryable
+                    // re-append would concatenate onto that torn member and corrupt the
+                    // whole stream, so fail permanently instead of letting a retry compound it.
+                    return Err(PublisherError::NonRetryable(anyhow::Error::new(e).context(
+                        "Failed to write member to file and could not truncate the partial write",
+                    )));
+                }
+                return Err(PublisherError::Retryable(
+                    anyhow::Error::new(e).context("Failed to write member to file"),
+                ));
+            }
+            // Same rollback as the write above: a failed flush can leave a partial
+            // member on disk, which a Retryable re-append would concatenate onto.
+            if let Err(e) = file.flush().await {
+                if let Err(te) = file.set_len(pre_len).await {
+                    tracing::error!(
+                        "Failed to truncate file back to {} after member flush error: {}",
+                        pre_len,
+                        te
+                    );
+                    return Err(PublisherError::NonRetryable(anyhow::Error::new(e).context(
+                        "Failed to flush member to file and could not truncate the partial write",
+                    )));
+                }
+                return Err(PublisherError::Retryable(
+                    anyhow::Error::new(e).context("Failed to flush file"),
+                ));
+            }
+            Ok(())
+            }
+            .await;
+            if let Err(e) = outcome {
+                if wrote_csv_header {
+                    if let Some(hdr) = csv_header_guard.as_mut() {
+                        **hdr = None;
+                    }
+                }
+                return Err(e);
+            }
+        }
+
+        if failed_messages.is_empty() {
+            Ok(SentBatch::Ack)
+        } else {
+            Ok(SentBatch::Partial {
+                responses: None,
+                failed: failed_messages,
+            })
+        }
+    }
+}
+
+/// Truncates the append-mode file back to `pre_len` (its length before the batch) so a Retryable
+/// re-append starts from a clean record boundary instead of duplicating a partially written prefix.
+/// When the file's CSV header was written in this batch it is rolled off with the prefix, so the
+/// in-memory "header written" flag is cleared to make the retry rewrite it. `pre_len == None` (the
+/// pre-batch stat failed) skips the rollback and preserves the old duplicate-on-retry behaviour.
+async fn roll_back_partial_batch(
+    writer: &BufWriter<File>,
+    pre_len: Option<u64>,
+    wrote_csv_header: bool,
+    csv_header: Option<&mut tokio::sync::MutexGuard<'_, Option<Vec<String>>>>,
+) {
+    let Some(pl) = pre_len else { return };
+    if let Err(te) = writer.get_ref().set_len(pl).await {
+        tracing::error!(
+            "Failed to truncate file back to {} after write error: {}",
+            pl,
+            te
+        );
+        return;
+    }
+    if wrote_csv_header {
+        if let Some(hdr) = csv_header {
+            **hdr = None;
+        }
     }
 }
 
@@ -221,6 +652,11 @@ impl MessagePublisher for FilePublisher {
     ) -> Result<SentBatch, PublisherError> {
         if messages.is_empty() {
             return Ok(SentBatch::Ack);
+        }
+
+        #[cfg(any(feature = "compression", feature = "encryption"))]
+        if self.is_member_mode() {
+            return self.send_batch_member(messages).await;
         }
 
         trace!(count = messages.len(), path = %self.path, message_ids = ?LazyMessageIds(&messages), "Writing batch to file");
@@ -237,18 +673,26 @@ impl MessagePublisher for FilePublisher {
             .await
             .context("Failed to open file for writing batch")?;
 
-        let file_is_empty = if matches!(self.format, FileFormat::Csv) {
-            file.metadata().await.map(|m| m.len() == 0).unwrap_or(false)
-        } else {
-            false
-        };
-        let mut writer = BufWriter::new(file);
+        // Length before the batch. The 1 MiB BufWriter auto-flushes full chunks mid-loop, so a
+        // failure partway through a large batch can leave a partial prefix on disk; truncate back
+        // to here on failure so the Retryable re-append starts clean instead of duplicating it.
+        // `None` (stat failed) degrades to the old behaviour: no rollback.
+        let pre_len = file.metadata().await.ok().map(|m| m.len());
+        let file_is_empty = matches!(self.format, FileFormat::Csv) && pre_len == Some(0);
+        // 1 MiB, not tokio's 8 KiB default: at ~100 B/record a small buffer turns a
+        // bulk copy into ~13k write syscalls. Worth ~18% on file-to-file throughput.
+        let mut writer = BufWriter::with_capacity(1 << 20, file);
         let mut failed_messages = Vec::new();
+        // Tracks whether this batch wrote the CSV header. On rollback the header is truncated off
+        // disk, so its in-memory "already written" flag must be cleared or the retry would skip it.
+        let mut wrote_csv_header = false;
         let mut csv_header_guard = if matches!(self.format, FileFormat::Csv) {
             Some(self.csv_header.lock().await)
         } else {
             None
         };
+        // Row buffer reused for every CSV record in this batch.
+        let mut csv_row_buf: Vec<u8> = Vec::new();
 
         // Iterate over messages, consuming them
         for mut msg in messages {
@@ -257,58 +701,43 @@ impl MessagePublisher for FilePublisher {
             // pushed to `failed_messages` keeps its remaining fields, and the
             // dropped `mqb.src.*` keys are irrelevant to a retry on the next hop.
             msg.strip_source_metadata();
+            // Carried out of the match so the `hdr` borrow ends before the write,
+            // which needs the guard again for the rollback path.
+            let mut csv_header_line: Option<Vec<u8>> = None;
             let serialized_msg = match self.format {
                 FileFormat::Csv => {
-                    match serde_json::from_slice::<serde_json::Value>(&msg.payload) {
-                        Ok(serde_json::Value::Object(obj)) => {
-                            let hdr = csv_header_guard.as_mut().expect("csv header lock held");
-                            if hdr.is_none() {
-                                // Sort keys so the column order is deterministic and
-                                // independent of serde_json's map type (BTreeMap vs the
-                                // IndexMap enabled by the `preserve_order` feature, which
-                                // `bson`/mongodb turns on under feature unification).
-                                let mut cols: Vec<String> = obj.keys().cloned().collect();
-                                cols.sort();
-                                if file_is_empty {
-                                    let header_line = csv_encode_row(&cols);
-                                    if let Err(e) = writer.write_all(header_line.as_bytes()).await {
-                                        return Err(PublisherError::NonRetryable(anyhow::anyhow!(
-                                            e
-                                        )));
-                                    }
-                                    if let Err(e) = writer.write_all(&self.delimiter).await {
-                                        return Err(PublisherError::NonRetryable(anyhow::anyhow!(
-                                            e
-                                        )));
-                                    }
-                                }
-                                **hdr = Some(cols);
+                    let hdr = csv_header_guard.as_mut().expect("csv header lock held");
+                    match csv_encode_message(&msg, hdr, &mut csv_row_buf) {
+                        Ok(header_established) => {
+                            if header_established && file_is_empty {
+                                let mut line =
+                                    csv_encode_row(hdr.as_ref().expect("header set above"));
+                                line.extend_from_slice(&self.delimiter);
+                                csv_header_line = Some(line);
                             }
-                            let cols = hdr.as_ref().unwrap();
-                            let mut line = String::new();
-                            for (i, c) in cols.iter().enumerate() {
-                                if i > 0 {
-                                    line.push(',');
-                                }
-                                match obj.get(c) {
-                                    Some(serde_json::Value::String(s)) => {
-                                        csv_append_field(&mut line, s)
-                                    }
-                                    Some(v) => csv_append_field(&mut line, &v.to_string()),
-                                    None => {}
-                                }
-                            }
-                            Ok(line.into_bytes())
+                            Ok(None)
                         }
-                        _ => Err(serde_json::Error::io(std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            "CSV format requires a JSON object payload",
-                        ))),
+                        Err(e) => Err(e),
                     }
                 }
-                ref fmt => encode_record(&msg, fmt),
+                ref fmt => encode_record(&msg, fmt).map(Some),
             };
-            let mut serialized_msg = match serialized_msg {
+            if let Some(line) = csv_header_line {
+                // Set before the write: the header is established in memory either way, so a
+                // rollback has to clear it even when the write itself failed.
+                wrote_csv_header = true;
+                if let Err(e) = writer.write_all(&line).await {
+                    roll_back_partial_batch(
+                        &writer,
+                        pre_len,
+                        wrote_csv_header,
+                        csv_header_guard.as_mut(),
+                    )
+                    .await;
+                    return Err(PublisherError::NonRetryable(anyhow::anyhow!(e)));
+                }
+            }
+            let serialized_msg = match serialized_msg {
                 Ok(s) => s,
                 Err(e) => {
                     tracing::error!("Failed to serialize message for file sink: {}", e);
@@ -320,23 +749,52 @@ impl MessagePublisher for FilePublisher {
             // Write body + delimiter as one contiguous buffer so a concurrent
             // tailing reader never observes the record without its delimiter
             // (shrinks the torn-write window; the reader also guards against it).
-            serialized_msg.extend_from_slice(&self.delimiter);
-            if let Err(e) = writer.write_all(&serialized_msg).await {
+            // `None` means the body is already in the reused CSV row buffer.
+            let owned_msg;
+            let record: &[u8] = match serialized_msg {
+                Some(mut s) => {
+                    s.extend_from_slice(&self.delimiter);
+                    owned_msg = s;
+                    &owned_msg
+                }
+                None => {
+                    csv_row_buf.extend_from_slice(&self.delimiter);
+                    &csv_row_buf
+                }
+            };
+            if let Err(e) = writer.write_all(record).await {
                 tracing::error!("Failed to write message to file: {}", e);
                 // A buffered write failure leaves the BufWriter in an undefined state and the
                 // remaining messages in this batch are unwritten. Abort so the whole batch is
                 // retried rather than reusing the writer, flushing partial data, or acking
                 // messages that never reached the file.
+                roll_back_partial_batch(
+                    &writer,
+                    pre_len,
+                    wrote_csv_header,
+                    csv_header_guard.as_mut(),
+                )
+                .await;
                 return Err(PublisherError::Retryable(
                     anyhow::Error::new(e).context("Failed to write message to file"),
                 ));
             }
         }
 
-        writer
-            .flush()
-            .await
-            .context("Failed to flush file writer")?;
+        if let Err(e) = writer.flush().await {
+            // A partial flush can leave part of the batch on disk; roll back so the
+            // Retryable re-append doesn't duplicate the flushed prefix.
+            roll_back_partial_batch(
+                &writer,
+                pre_len,
+                wrote_csv_header,
+                csv_header_guard.as_mut(),
+            )
+            .await;
+            return Err(PublisherError::Retryable(
+                anyhow::Error::new(e).context("Failed to flush file writer"),
+            ));
+        }
         if failed_messages.is_empty() {
             Ok(SentBatch::Ack)
         } else {
@@ -585,7 +1043,6 @@ async fn remove_lines_from_file(path: &str, count: usize, delimiter: &[u8]) -> a
 
     Ok(())
 }
-
 struct FileTailConsumer {
     msg_rx: async_channel::Receiver<Vec<CanonicalMessage>>,
     buffer: Vec<CanonicalMessage>,
@@ -875,6 +1332,281 @@ fn run_file_queue_task(
     }
 }
 
+/// Reader for member-based files (compressed and/or encrypted). Such a stream
+/// can't be seeked to a line boundary, so on each growth of the file it
+/// re-decodes from the start and skips the records already emitted. For the
+/// common write-once-then-read ETL case the file is decoded exactly once;
+/// live-tailing a growing file costs a re-scan per growth (acceptable for v1).
+///
+/// Operational note: because each growth re-decodes from the start, tailing a
+/// member stream that grows unboundedly is O(n²) in total CPU over its lifetime.
+/// Size or rotate compressed/encrypted inputs (finite members, then a new file)
+/// rather than appending to a single member stream indefinitely.
+///
+/// `make_reader` builds the decoding [`Read`](std::io::Read) chain
+/// (decrypt frames and/or decompress members) over a freshly opened file.
+#[cfg(any(feature = "compression", feature = "encryption"))]
+fn run_file_member_consume_task_sync<F>(
+    path: String,
+    msg_tx: async_channel::Sender<Vec<CanonicalMessage>>,
+    delimiter: Vec<u8>,
+    format: FileFormat,
+    ready: Arc<AtomicBool>,
+    make_reader: F,
+) where
+    F: Fn(std::fs::File) -> Box<dyn std::io::Read>,
+{
+    const BATCH_SIZE: usize = 1024;
+    const MAX_SLEEP: std::time::Duration = std::time::Duration::from_millis(100);
+    // Consecutive decode failures at an unchanged file length before we give up and
+    // close the stream (surfacing EndOfStream) rather than retrying forever or
+    // silently emitting drain markers for records we can no longer reach.
+    const MAX_DECODE_FAILURES: u32 = 5;
+    let mut records_emitted: usize = 0;
+    let mut last_len: u64 = u64::MAX; // force the first read
+    let mut initialized = false;
+    let mut signaled_eof = false;
+    let mut current_sleep = std::time::Duration::from_millis(1);
+    let mut buf = Vec::new();
+    let mut decode_failures: u32 = 0;
+    let mut failure_len: u64 = u64::MAX;
+
+    loop {
+        let cur_len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+
+        // No growth since the last full pass: emit the drain marker once, then poll.
+        if initialized && cur_len == last_len {
+            if !signaled_eof {
+                if msg_tx.send_blocking(Vec::new()).is_err() {
+                    break;
+                }
+                signaled_eof = true;
+            }
+            std::thread::sleep(current_sleep);
+            current_sleep = std::cmp::min(current_sleep * 2, MAX_SLEEP);
+            continue;
+        }
+
+        let file = match std::fs::File::open(&path) {
+            Ok(f) => f,
+            Err(e) => {
+                tracing::error!("Failed to open {}: {}", path, e);
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                continue;
+            }
+        };
+        let mut reader = std::io::BufReader::new(make_reader(file));
+
+        // Skip records emitted on a previous pass (file re-read from the start).
+        let mut csv_header: Option<Vec<String>> = None;
+        let mut skipped = 0;
+        let mut decode_error = false;
+        while skipped < records_emitted {
+            buf.clear();
+            match read_until_bytes_sync(&mut reader, &delimiter, &mut buf) {
+                Ok(0) => break,
+                Ok(_) => skipped += 1,
+                Err(e) => {
+                    tracing::error!("Error decoding {}: {}", path, e);
+                    decode_error = true;
+                    break;
+                }
+            }
+        }
+        if decode_error {
+            // Skip failed: do NOT advance records_emitted/last_len. Bound the retries
+            // so permanent corruption surfaces instead of spinning forever.
+            if cur_len == failure_len {
+                decode_failures += 1;
+            } else {
+                failure_len = cur_len;
+                decode_failures = 1;
+            }
+            if decode_failures >= MAX_DECODE_FAILURES {
+                tracing::error!(
+                    "Giving up decoding {} after {} failed attempts at {} bytes; closing stream",
+                    path,
+                    decode_failures,
+                    cur_len
+                );
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            continue;
+        }
+
+        let mut new_count = 0;
+        let mut read_error = false;
+        let mut batch = Vec::with_capacity(256);
+        loop {
+            buf.clear();
+            match read_until_bytes_sync(&mut reader, &delimiter, &mut buf) {
+                Ok(0) => break,
+                Ok(_) => {
+                    if !buf.ends_with(&delimiter) {
+                        // Torn final member (writer mid-append): don't emit or count
+                        // it; it completes and grows the file on a later poll.
+                        break;
+                    }
+                    buf.truncate(buf.len() - delimiter.len());
+                    if delimiter.len() == 1 && delimiter[0] == b'\n' && buf.ends_with(b"\r") {
+                        buf.pop();
+                    }
+                    if let Some(msg) = parse_message(&buf, &format, &mut csv_header) {
+                        batch.push(msg);
+                    }
+                    new_count += 1;
+                    if batch.len() >= BATCH_SIZE {
+                        if msg_tx.send_blocking(std::mem::take(&mut batch)).is_err() {
+                            return;
+                        }
+                        batch = Vec::with_capacity(256);
+                    }
+                }
+                Err(e) => {
+                    // Truncated/torn member: stop; retry once the writer finishes it.
+                    tracing::debug!("Partial member decode of {}: {}", path, e);
+                    read_error = true;
+                    break;
+                }
+            }
+        }
+        if !batch.is_empty() && msg_tx.send_blocking(batch).is_err() {
+            return;
+        }
+
+        // Records actually emitted this pass must be skipped next time, even if the
+        // pass then hit a decode error on the tail.
+        records_emitted += new_count;
+        if !initialized {
+            ready.store(true, Ordering::SeqCst);
+            initialized = true;
+        }
+
+        if read_error {
+            // The pass ended on a decode error, not a clean EOF. Do NOT advance
+            // last_len: a torn member the writer is still completing is retried on the
+            // next pass (once the file grows), while permanent corruption at a fixed
+            // length is bounded here so it surfaces as EndOfStream instead of silently
+            // emitting drain markers for records we can no longer reach.
+            if cur_len == failure_len {
+                decode_failures += 1;
+            } else {
+                failure_len = cur_len;
+                decode_failures = 1;
+            }
+            if decode_failures >= MAX_DECODE_FAILURES {
+                tracing::error!(
+                    "Giving up decoding {} after {} failed attempts at {} bytes; closing stream",
+                    path,
+                    decode_failures,
+                    cur_len
+                );
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            continue;
+        }
+
+        // Clean pass: the tail decoded to EOF, so reset the failure tracker and advance.
+        decode_failures = 0;
+        failure_len = u64::MAX;
+        last_len = cur_len;
+        if new_count > 0 {
+            signaled_eof = false;
+            current_sleep = std::time::Duration::from_millis(1);
+        }
+    }
+}
+
+/// Upper bound for one encrypted frame (one sealed batch). A larger length
+/// prefix means corruption; refusing it avoids a huge bogus allocation.
+#[cfg(feature = "encryption")]
+const MAX_ENCRYPTED_FRAME_BYTES: u64 = 1 << 30;
+
+/// Decodes a file of `[u64 be length][sealed member]` frames: each frame is
+/// decrypted and (if configured) decompressed, and the resulting plaintext is
+/// served as one continuous stream. A torn trailing frame surfaces as an
+/// `UnexpectedEof` error, which the member consume task treats like a torn
+/// compressed member (retried once the writer completes it).
+#[cfg(feature = "encryption")]
+struct EncryptedFramesReader<R: std::io::Read> {
+    inner: R,
+    crypto: Arc<Crypto>,
+    #[cfg_attr(not(feature = "compression"), allow(dead_code))]
+    compression: Compression,
+    current: std::io::Cursor<Vec<u8>>,
+}
+
+#[cfg(feature = "encryption")]
+impl<R: std::io::Read> EncryptedFramesReader<R> {
+    fn new(inner: R, crypto: Arc<Crypto>, compression: Compression) -> Self {
+        Self {
+            inner,
+            crypto,
+            compression,
+            current: std::io::Cursor::new(Vec::new()),
+        }
+    }
+
+    /// Reads and decodes the next frame. `Ok(false)` = clean end of file.
+    fn refill(&mut self) -> std::io::Result<bool> {
+        // Read the 8-byte length prefix, distinguishing clean EOF (no bytes at
+        // all) from a torn prefix (some bytes, then EOF).
+        let mut len_buf = [0u8; 8];
+        let mut filled = 0;
+        while filled < len_buf.len() {
+            let n = self.inner.read(&mut len_buf[filled..])?;
+            if n == 0 {
+                if filled == 0 {
+                    return Ok(false);
+                }
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "torn encrypted frame length prefix",
+                ));
+            }
+            filled += n;
+        }
+        let len = u64::from_be_bytes(len_buf);
+        if len > MAX_ENCRYPTED_FRAME_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("encrypted frame length {len} exceeds the {MAX_ENCRYPTED_FRAME_BYTES} byte cap (corrupt file?)"),
+            ));
+        }
+        let mut sealed = vec![0u8; len as usize];
+        self.inner.read_exact(&mut sealed)?;
+        let member = self
+            .crypto
+            .open(&sealed, b"")
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+        #[cfg(feature = "compression")]
+        let member = if self.compression != Compression::None {
+            crate::support::compression::decompress_all(self.compression, &member, None)?
+        } else {
+            member
+        };
+        self.current = std::io::Cursor::new(member);
+        Ok(true)
+    }
+}
+
+#[cfg(feature = "encryption")]
+impl<R: std::io::Read> std::io::Read for EncryptedFramesReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        loop {
+            let n = self.current.read(buf)?;
+            if n > 0 || buf.is_empty() {
+                return Ok(n);
+            }
+            if !self.refill()? {
+                return Ok(0);
+            }
+        }
+    }
+}
+
 enum ConsumerBackend {
     EventStore(EventStoreConsumer),
     Tail(FileTailConsumer),
@@ -899,6 +1631,22 @@ impl FileConsumer {
             return Err(anyhow::anyhow!(
                 "FileFormat::Csv is not supported with Subscribe {{ delete: true }} mode"
             ));
+        }
+        validate_member_settings(config)?;
+        if config.compression != Compression::None || config.encryption.is_some() {
+            if !matches!(
+                &config.mode,
+                None | Some(FileConsumerMode::Consume { delete: false })
+            ) {
+                return Err(anyhow::anyhow!(
+                    "file 'compression'/'encryption' is only supported with the default `consume` mode (no delete, no group_id)"
+                ));
+            }
+            // Member-based files (compressed and/or encrypted) have no seekable
+            // line offsets, so they use a dedicated reader that decodes from the
+            // start of the file.
+            #[cfg(any(feature = "compression", feature = "encryption"))]
+            return Self::new_member_consumer(config, delimiter, format).await;
         }
         match &config.mode {
             None | Some(FileConsumerMode::Consume { delete: false }) => {
@@ -995,6 +1743,69 @@ impl FileConsumer {
                 })
             }
         }
+    }
+
+    /// Consumer for member-based files (compressed and/or encrypted): a
+    /// dedicated reader thread decodes the whole stream from the start.
+    /// Restricted to the plain consume mode by the validation in `new`.
+    #[cfg(any(feature = "compression", feature = "encryption"))]
+    async fn new_member_consumer(
+        config: &FileConfig,
+        delimiter: Vec<u8>,
+        format: FileFormat,
+    ) -> anyhow::Result<Self> {
+        let (msg_tx, msg_rx) = async_channel::bounded(100);
+        let ready = Arc::new(AtomicBool::new(false));
+        let ready_clone = ready.clone();
+
+        let compression = config.compression;
+        #[cfg(feature = "encryption")]
+        let crypto = config
+            .encryption
+            .as_ref()
+            .map(Crypto::new)
+            .transpose()?
+            .map(Arc::new);
+        let make_reader = move |file: std::fs::File| -> Box<dyn std::io::Read> {
+            #[cfg(feature = "encryption")]
+            if let Some(crypto) = &crypto {
+                return Box::new(EncryptedFramesReader::new(
+                    std::io::BufReader::new(file),
+                    crypto.clone(),
+                    compression,
+                ));
+            }
+            #[cfg(feature = "compression")]
+            return crate::support::compression::decompress_reader(
+                compression,
+                std::io::BufReader::new(file),
+            );
+            #[cfg(not(feature = "compression"))]
+            unreachable!("member consumer without compression or encryption")
+        };
+
+        let path_clone = config.path.clone();
+        let format_clone = format;
+        std::thread::spawn(move || {
+            run_file_member_consume_task_sync(
+                path_clone,
+                msg_tx,
+                delimiter,
+                format_clone,
+                ready_clone,
+                make_reader,
+            );
+        });
+        info!(path = %config.path, mode = "member consume (compressed/encrypted)", "File consumer connected");
+        Ok(Self {
+            backend: ConsumerBackend::Tail(FileTailConsumer {
+                msg_rx,
+                buffer: Vec::new(),
+                offset_file: None,
+                ready,
+                pending_eof: false,
+            }),
+        })
     }
 
     async fn new_tail(
@@ -1302,20 +2113,10 @@ pub(crate) fn encode_record(
 ) -> Result<Vec<u8>, serde_json::Error> {
     match format {
         FileFormat::Raw => Ok(msg.payload.to_vec()),
-        FileFormat::Normal => {
-            if msg
-                .metadata
-                .get("mq_bridge.original_format")
-                .map(|s| s.as_str())
-                == Some("raw")
-            {
-                // A raw-origin message passes through directly to support raw copies
-                // without re-wrapping.
-                Ok(msg.payload.to_vec())
-            } else {
-                serde_json::to_vec(msg)
-            }
-        }
+        // The sink format decides the encoding, not the message's origin: `normal`
+        // always writes the wrapper so `message_id` and metadata survive the round
+        // trip. Use `format: raw` for verbatim, unwrapped copies.
+        FileFormat::Normal => serde_json::to_vec(msg),
         FileFormat::Json => {
             if let Ok(json_val) = serde_json::from_slice::<serde_json::Value>(&msg.payload) {
                 serde_json::to_vec(&RecordWrapper {
@@ -1385,7 +2186,8 @@ pub(crate) fn parse_message(
                 .insert("mq_bridge.original_format".to_string(), "raw".to_string());
             Some(msg)
         }
-        FileFormat::Normal | FileFormat::Json | FileFormat::Text => {
+        // `json` keeps the payload as a JSON value, so it needs the whole tree.
+        FileFormat::Json => {
             #[derive(serde::Deserialize)]
             struct AnyPayloadMessage {
                 #[serde(deserialize_with = "deserialize_u128")]
@@ -1396,1055 +2198,252 @@ pub(crate) fn parse_message(
             }
 
             let msg = match serde_json::from_slice::<AnyPayloadMessage>(buffer) {
-                Ok(wrapper) => {
-                    let payload_bytes = if matches!(format, FileFormat::Json) {
-                        serde_json::to_vec(&wrapper.payload).unwrap_or_default()
-                    } else {
-                        match wrapper.payload {
-                            serde_json::Value::String(s) => s.into_bytes(),
-                            serde_json::Value::Array(arr) => {
-                                if let Ok(bytes) = serde_json::from_value::<Vec<u8>>(
-                                    serde_json::Value::Array(arr.clone()),
-                                ) {
-                                    bytes
-                                } else {
-                                    serde_json::to_vec(&serde_json::Value::Array(arr))
-                                        .unwrap_or_default()
-                                }
-                            }
-                            other => serde_json::to_vec(&other).unwrap_or_default(),
-                        }
-                    };
-                    CanonicalMessage {
-                        message_id: wrapper.message_id,
-                        payload: payload_bytes.into(),
-                        metadata: wrapper.metadata,
-                    }
-                }
-                Err(e) => {
-                    warn!(error = %e, content_length = buffer.len(), "Failed to parse file line as JSON, treating as raw.");
-                    let mut msg = CanonicalMessage::new(buffer.to_vec(), None);
-                    msg.metadata
-                        .insert("mq_bridge.original_format".to_string(), "raw".to_string());
-                    msg
-                }
+                Ok(wrapper) => CanonicalMessage {
+                    message_id: wrapper.message_id,
+                    payload: serde_json::to_vec(&wrapper.payload)
+                        .unwrap_or_default()
+                        .into(),
+                    metadata: wrapper.metadata,
+                },
+                Err(e) => raw_fallback_message(buffer, e),
+            };
+            Some(msg)
+        }
+        // `normal` and `text` want the payload as bytes, so it is decoded in one
+        // pass by [`RawPayload`] rather than through a `serde_json::Value`.
+        FileFormat::Normal | FileFormat::Text => {
+            #[derive(serde::Deserialize)]
+            struct BytePayloadMessage {
+                #[serde(deserialize_with = "deserialize_u128")]
+                message_id: u128,
+                payload: RawPayload,
+                #[serde(default)]
+                metadata: HashMap<String, String>,
+            }
+
+            let msg = match serde_json::from_slice::<BytePayloadMessage>(buffer) {
+                Ok(wrapper) => CanonicalMessage {
+                    message_id: wrapper.message_id,
+                    payload: wrapper.payload.into_bytes().into(),
+                    metadata: wrapper.metadata,
+                },
+                Err(e) => raw_fallback_message(buffer, e),
             };
             Some(msg)
         }
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use crate::endpoints::file::{FileConsumer, FilePublisher};
-    use crate::models::{FileConfig, FileConsumerMode, FileFormat};
-    use crate::msg;
-    use crate::traits::MessageConsumer;
-    use crate::traits::MessagePublisher;
-    use serde_json::json;
-    use tempfile::tempdir;
-    use tokio::fs::OpenOptions;
-    use tokio::io::AsyncWriteExt;
-
-    #[tokio::test]
-    async fn test_file_sink_and_source_integration() {
-        // 1. Setup a temporary directory and file path
-        let dir = tempdir().unwrap();
-        let file_path = dir.path().join("test.log");
-        let file_path_str = file_path.to_str().unwrap().to_string();
-
-        // 2. Create a FileSink
-        let config = FileConfig {
-            path: file_path_str.clone(),
-            ..Default::default()
-        };
-        let sink = FilePublisher::new(&config).await.unwrap();
-
-        let msg1 = msg!(json!({"hello": "world"}));
-        let msg2 = msg!(json!({"foo": "bar"}));
-
-        sink.send_batch(vec![msg1.clone(), msg2.clone()])
-            .await
-            .unwrap();
-        // Explicitly flush to ensure data is written before we try to read it.
-        sink.flush().await.unwrap();
-        // Drop the sink to release the file lock on some OSes before the source tries to open it.
-        drop(sink);
-
-        // 4. Create a FileConsumer to read from the same file
-        let mut source = FileConsumer::new(&config).await.unwrap();
-
-        // 5. Receive the messages and verify them
-        let received1 = source.receive().await.unwrap();
-        let _ = (received1.commit)(crate::traits::MessageDisposition::Ack).await; // Commit is a no-op, but we should call it
-
-        assert_eq!(received1.message.message_id, msg1.message_id);
-        assert_eq!(received1.message.payload, msg1.payload);
-
-        let batch = source.receive_batch(1).await.unwrap();
-        let (received_msgs, commit2) = (batch.messages, batch.commit);
-        let len = received_msgs.len();
-        let received_msg2 = received_msgs.into_iter().next().unwrap();
-        let _ = commit2(vec![crate::traits::MessageDisposition::Ack; len]).await;
-        assert_eq!(received_msg2.message_id, msg2.message_id);
-        assert_eq!(received_msg2.payload, msg2.payload);
-
-        // 6. After draining, the consumer surfaces a one-shot empty batch (the
-        //    drain marker) so a route can pause or exit_on_empty can fire.
-        let drained = source.receive_batch(1).await.unwrap();
-        assert!(
-            drained.messages.is_empty(),
-            "Expected an empty drain marker after the file was drained"
-        );
-
-        // 7. With the marker already emitted and no new data, a further read
-        //    blocks (times out) until new data arrives.
-        let result = tokio::time::timeout(
-            std::time::Duration::from_millis(200),
-            source.receive_batch(1),
-        )
-        .await;
-        assert!(result.is_err(), "Expected timeout waiting for new data");
+/// A line that is not the JSON envelope the format promised is kept verbatim as a
+/// raw payload rather than dropped, and marked so the next hop can tell.
+fn raw_fallback_message(buffer: &[u8], err: serde_json::Error) -> CanonicalMessage {
+    // A file that is not JSON at all hits this for every line, so only the first
+    // occurrence warns; the rest stay at debug.
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    if !WARNED.swap(true, Ordering::Relaxed) {
+        warn!(error = %err, content_length = buffer.len(), "Failed to parse file line as JSON, treating as raw. Further occurrences are logged at debug level.");
+    } else {
+        tracing::debug!(error = %err, content_length = buffer.len(), "Failed to parse file line as JSON, treating as raw.");
     }
+    let mut msg = CanonicalMessage::new(buffer.to_vec(), None);
+    msg.metadata
+        .insert("mq_bridge.original_format".to_string(), "raw".to_string());
+    msg
+}
 
-    #[tokio::test]
-    async fn test_file_sink_creates_directory() {
-        let dir = tempdir().unwrap();
-        let nested_dir_path = dir.path().join("nested");
-        let file_path = nested_dir_path.join("test.log");
+/// The payload of a `normal`/`text` line, decoded in a single pass.
+///
+/// `normal` serializes the payload as a JSON array of byte values, which is the
+/// common case and the expensive one: routing it through `serde_json::Value`
+/// allocates a boxed number per byte and then walks the array a second time to
+/// turn it back into `Vec<u8>`. This collects those bytes straight off the
+/// parser and only materializes a `Value` for payloads that are not byte arrays
+/// (a `json`-format file read back as `normal`, say), which keeps the fallback
+/// behaviour — render the payload as JSON text — byte-for-byte the same.
+enum RawPayload {
+    Bytes(Vec<u8>),
+    Str(String),
+    Other(serde_json::Value),
+}
 
-        let config = FileConfig {
-            path: file_path.to_str().unwrap().to_string(),
-            ..Default::default()
-        };
-        let sink_result = FilePublisher::new(&config).await;
-
-        assert!(sink_result.is_ok());
-        assert!(nested_dir_path.exists());
-        assert!(file_path.exists());
-    }
-
-    #[tokio::test]
-    async fn test_file_consumer_consume_mode() {
-        let dir = tempdir().unwrap();
-        let file_path = dir.path().join("consume.log");
-        let file_path_str = file_path.to_str().unwrap().to_string();
-
-        // Write 3 lines
-        tokio::fs::write(&file_path, b"line1\nline2\nline3\n")
-            .await
-            .unwrap();
-
-        let config = FileConfig {
-            path: file_path_str,
-            mode: Some(FileConsumerMode::Consume { delete: true }),
-            ..Default::default()
-        };
-        let mut consumer = FileConsumer::new(&config).await.unwrap();
-
-        // Receive first message
-        let received1 = consumer.receive().await.unwrap();
-        assert_eq!(received1.message.payload.as_ref(), b"line1");
-
-        // Commit first message (should remove line1)
-        (received1.commit)(crate::traits::MessageDisposition::Ack)
-            .await
-            .unwrap();
-
-        // Verify file content - wait for async deletion
-        let mut content = String::new();
-        for _ in 0..20 {
-            content = tokio::fs::read_to_string(&file_path).await.unwrap();
-            if content == "line2\nline3\n" {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+impl RawPayload {
+    fn into_bytes(self) -> Vec<u8> {
+        match self {
+            RawPayload::Bytes(b) => b,
+            RawPayload::Str(s) => s.into_bytes(),
+            RawPayload::Other(v) => serde_json::to_vec(&v).unwrap_or_default(),
         }
-        assert_eq!(content, "line2\nline3\n");
-
-        // Receive second message
-        let received2 = consumer.receive().await.unwrap();
-        assert_eq!(received2.message.payload.as_ref(), b"line2");
-        (received2.commit)(crate::traits::MessageDisposition::Ack)
-            .await
-            .unwrap();
-
-        // Receive third message
-        let received3 = consumer.receive().await.unwrap();
-        assert_eq!(received3.message.payload.as_ref(), b"line3");
-        (received3.commit)(crate::traits::MessageDisposition::Ack)
-            .await
-            .unwrap();
-
-        // Verify file is empty
-        for _ in 0..20 {
-            content = tokio::fs::read_to_string(&file_path).await.unwrap();
-            if content.is_empty() {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-        assert_eq!(content, "");
-    }
-
-    #[tokio::test]
-    async fn test_file_consumer_nack_behavior() {
-        let dir = tempdir().unwrap();
-        let file_path = dir.path().join("nack.log");
-        let file_path_str = file_path.to_str().unwrap().to_string();
-
-        // Write 2 lines
-        tokio::fs::write(&file_path, b"msg1\nmsg2\n").await.unwrap();
-
-        let config = FileConfig {
-            path: file_path_str.clone(),
-            mode: Some(FileConsumerMode::Consume { delete: true }),
-            ..Default::default()
-        };
-        let mut consumer = FileConsumer::new(&config).await.unwrap();
-
-        // 1. Receive batch (should get msg1)
-        let batch1 = consumer.receive_batch(1).await.unwrap();
-        assert_eq!(batch1.messages.len(), 1);
-        assert_eq!(batch1.messages[0].payload.as_ref(), b"msg1");
-
-        // 2. Nack the batch
-        (batch1.commit)(vec![crate::traits::MessageDisposition::Nack])
-            .await
-            .unwrap();
-
-        // 3. Receive again - should get msg1 again because it wasn't removed
-        let batch2 = consumer.receive_batch(1).await.unwrap();
-        assert_eq!(batch2.messages.len(), 1);
-        assert_eq!(batch2.messages[0].payload.as_ref(), b"msg1");
-
-        // 4. Ack
-        (batch2.commit)(vec![crate::traits::MessageDisposition::Ack])
-            .await
-            .unwrap();
-
-        // 5. Receive next - should get msg2
-        let batch3 = consumer.receive_batch(1).await.unwrap();
-        assert_eq!(batch3.messages.len(), 1);
-        assert_eq!(batch3.messages[0].payload.as_ref(), b"msg2");
-    }
-
-    #[tokio::test]
-    async fn test_file_consumer_consume_no_delete() {
-        let dir = tempdir().unwrap();
-        let file_path = dir.path().join("consume_no_delete.log");
-        let file_path_str = file_path.to_str().unwrap().to_string();
-
-        // Write 3 lines
-        tokio::fs::write(&file_path, b"line1\nline2\nline3\n")
-            .await
-            .unwrap();
-
-        let config = FileConfig {
-            path: file_path_str.clone(),
-            ..Default::default()
-        };
-        let mut consumer = FileConsumer::new(&config).await.unwrap();
-
-        // Receive first message
-        let received1 = consumer.receive().await.unwrap();
-        assert_eq!(received1.message.payload.as_ref(), b"line1");
-
-        // Commit first message (should NOT remove line1)
-        (received1.commit)(crate::traits::MessageDisposition::Ack)
-            .await
-            .unwrap();
-
-        // Give some time for any potential (but unwanted) background deletion to happen
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-        // Verify file content remains unchanged
-        let content = tokio::fs::read_to_string(&file_path).await.unwrap();
-        assert_eq!(content, "line1\nline2\nline3\n");
-
-        // Receive second message
-        let received2 = consumer.receive().await.unwrap();
-        assert_eq!(received2.message.payload.as_ref(), b"line2");
-    }
-
-    #[tokio::test]
-    async fn test_file_consumer_subscribe_mode() {
-        let dir = tempdir().unwrap();
-        let file_path = dir.path().join("subscribe.log");
-        let file_path_str = file_path.to_str().unwrap().to_string();
-
-        // Write initial content
-        tokio::fs::write(&file_path, b"line1\n").await.unwrap();
-
-        let config = FileConfig {
-            path: file_path_str.clone(),
-            mode: Some(FileConsumerMode::Subscribe { delete: false }),
-            ..Default::default()
-        };
-
-        let mut consumer = FileConsumer::new(&config).await.unwrap();
-
-        // Give the background tailer a moment to initialize and find its starting position.
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-        // Append new line
-        {
-            let mut file = OpenOptions::new()
-                .append(true)
-                .open(&file_path)
-                .await
-                .unwrap();
-            file.write_all(b"line2\n").await.unwrap();
-        }
-
-        // Receive new line, skipping any empty drain marker emitted while the
-        // subscriber was caught up to the end of the file at startup.
-        let received2 = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            loop {
-                let batch = consumer.receive_batch(2).await.unwrap();
-                if !batch.messages.is_empty() {
-                    break batch;
-                }
-            }
-        })
-        .await
-        .expect("timed out waiting for appended line");
-        assert_eq!(received2.messages.len(), 1);
-        assert_eq!(received2.messages[0].payload.as_ref(), b"line2");
-        (received2.commit)(vec![crate::traits::MessageDisposition::Ack])
-            .await
-            .unwrap();
-
-        // Verify file content is unchanged
-        let content = tokio::fs::read_to_string(&file_path).await.unwrap();
-        assert_eq!(content, "line1\nline2\n");
-    }
-
-    #[tokio::test]
-    async fn test_file_consumer_consume_explicit_delete() {
-        let dir = tempdir().unwrap();
-        let file_path = dir.path().join("consume_explicit_delete.log");
-        let file_path_str = file_path.to_str().unwrap().to_string();
-
-        tokio::fs::write(&file_path, b"line1\n").await.unwrap();
-
-        let config = FileConfig {
-            path: file_path_str.clone(),
-            mode: Some(FileConsumerMode::Consume { delete: true }),
-            ..Default::default()
-        };
-        let mut consumer = FileConsumer::new(&config).await.unwrap();
-
-        let received = consumer.receive().await.unwrap();
-        assert_eq!(received.message.payload.as_ref(), b"line1");
-
-        (received.commit)(crate::traits::MessageDisposition::Ack)
-            .await
-            .unwrap();
-
-        // Verify file becomes empty
-        let mut content = String::new();
-        for _ in 0..20 {
-            content = tokio::fs::read_to_string(&file_path).await.unwrap();
-            if content.is_empty() {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-        assert_eq!(content, "");
-    }
-
-    #[tokio::test]
-    async fn test_file_consumer_subscribe_with_delete() {
-        let dir = tempdir().unwrap();
-        let file_path = dir.path().join("subscribe_delete.log");
-        let file_path_str = file_path.to_str().unwrap().to_string();
-
-        tokio::fs::write(&file_path, b"line1\n").await.unwrap();
-
-        let config = FileConfig {
-            path: file_path_str.clone(),
-            mode: Some(FileConsumerMode::Subscribe { delete: true }),
-            ..Default::default()
-        };
-
-        let mut sub1 = FileConsumer::new(&config).await.unwrap();
-        let mut sub2 = FileConsumer::new(&config).await.unwrap();
-
-        let msg1 = sub1.receive().await.unwrap();
-        assert_eq!(msg1.message.payload.as_ref(), b"line1");
-
-        let msg2 = sub2.receive().await.unwrap();
-        assert_eq!(msg2.message.payload.as_ref(), b"line1");
-
-        // Sub1 acks. File should NOT be deleted yet.
-        (msg1.commit)(crate::traits::MessageDisposition::Ack)
-            .await
-            .unwrap();
-
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        let content = tokio::fs::read_to_string(&file_path).await.unwrap();
-        assert_eq!(content, "line1\n");
-
-        // Sub2 acks. File should be deleted.
-        (msg2.commit)(crate::traits::MessageDisposition::Ack)
-            .await
-            .unwrap();
-
-        let mut content = String::new();
-        for _ in 0..20 {
-            content = tokio::fs::read_to_string(&file_path).await.unwrap();
-            if content.is_empty() {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-        assert_eq!(content, "");
-    }
-
-    #[tokio::test]
-    async fn test_file_consumer_subscribe_explicit_no_delete() {
-        let dir = tempdir().unwrap();
-        let file_path = dir.path().join("subscribe_no_delete.log");
-        let file_path_str = file_path.to_str().unwrap().to_string();
-
-        tokio::fs::write(&file_path, b"line1\n").await.unwrap();
-
-        let config = FileConfig {
-            path: file_path_str.clone(),
-            mode: Some(FileConsumerMode::Subscribe { delete: false }),
-            ..Default::default()
-        };
-
-        let mut consumer = FileConsumer::new(&config).await.unwrap();
-        // Give the background tailer a moment to initialize and find its starting position.
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        {
-            let mut file = OpenOptions::new()
-                .append(true)
-                .open(&file_path)
-                .await
-                .unwrap();
-            file.write_all(b"line2\n").await.unwrap();
-        }
-
-        let received = consumer.receive().await.unwrap();
-        assert_eq!(received.message.payload.as_ref(), b"line2");
-
-        (received.commit)(crate::traits::MessageDisposition::Ack)
-            .await
-            .unwrap();
-
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        let content = tokio::fs::read_to_string(&file_path).await.unwrap();
-        assert_eq!(content, "line1\nline2\n");
-    }
-
-    use crate::models::{Endpoint, EndpointType, Route};
-
-    #[tokio::test]
-    async fn test_route_file_consume_explicit_delete() {
-        let dir = tempdir().unwrap();
-        let file_path = dir.path().join("route_consume_explicit_delete.log");
-        let file_path_str = file_path.to_str().unwrap().to_string();
-        tokio::fs::write(&file_path, b"msg1\n").await.unwrap();
-
-        let input = Endpoint::new(EndpointType::File(FileConfig {
-            path: file_path_str.clone(),
-            mode: Some(FileConsumerMode::Consume { delete: true }),
-            ..Default::default()
-        }));
-        let output = Endpoint::new_memory("out_consume_explicit_delete", 10);
-        let route = Route::new(input, output.clone());
-
-        let handle = route
-            .run("test_route_consume_explicit_delete")
-            .await
-            .unwrap();
-
-        let channel = output.channel().unwrap();
-        // Wait for message
-        let mut received = Vec::new();
-        for _ in 0..20 {
-            if !channel.is_empty() {
-                received = channel.drain_messages();
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-        assert_eq!(received.len(), 1);
-        assert_eq!(&received[0].payload.to_vec(), b"msg1");
-
-        // Verify deletion
-        let mut content = String::new();
-        for _ in 0..20 {
-            content = tokio::fs::read_to_string(&file_path).await.unwrap();
-            if content.is_empty() {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-        assert_eq!(content, "");
-
-        handle.stop().await;
-    }
-
-    #[tokio::test]
-    async fn test_route_file_subscribe_with_delete() {
-        let dir = tempdir().unwrap();
-        let file_path = dir.path().join("route_subscribe_delete.log");
-        let file_path_str = file_path.to_str().unwrap().to_string();
-        tokio::fs::write(&file_path, b"msg1\n").await.unwrap();
-
-        let input = Endpoint::new(EndpointType::File(FileConfig {
-            path: file_path_str.clone(),
-            mode: Some(FileConsumerMode::Subscribe { delete: true }),
-            ..Default::default()
-        }));
-        let output = Endpoint::new_memory("out_subscribe_delete", 10);
-        let route = Route::new(input, output.clone());
-
-        let handle = route.run("test_route_subscribe_delete").await.unwrap();
-
-        let channel = output.channel().unwrap();
-        let mut received = Vec::new();
-        for _ in 0..20 {
-            if !channel.is_empty() {
-                received = channel.drain_messages();
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-        assert_eq!(received.len(), 1);
-
-        // Verify deletion
-        let mut content = String::new();
-        for _ in 0..20 {
-            content = tokio::fs::read_to_string(&file_path).await.unwrap();
-            if content.is_empty() {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-        assert_eq!(content, "");
-
-        handle.stop().await;
-    }
-
-    #[tokio::test]
-    async fn test_route_file_subscribe_explicit_no_delete() {
-        let dir = tempdir().unwrap();
-        let file_path = dir.path().join("route_subscribe_no_delete.log");
-        let file_path_str = file_path.to_str().unwrap().to_string();
-        tokio::fs::write(&file_path, b"msg1\n").await.unwrap();
-
-        let input = Endpoint::new(EndpointType::File(FileConfig {
-            path: file_path_str.clone(),
-            mode: Some(FileConsumerMode::Subscribe { delete: false }),
-            ..Default::default()
-        }));
-        let output = Endpoint::new_memory("out_subscribe_no_delete", 10);
-        let route = Route::new(input, output.clone());
-
-        let handle = route.run("test_route_subscribe_no_delete").await.unwrap();
-
-        let channel = output.channel().unwrap();
-        let mut received = Vec::new();
-        for _ in 0..20 {
-            if !channel.is_empty() {
-                received = channel.drain_messages();
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-        assert_eq!(received.len(), 0);
-
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        let content = tokio::fs::read_to_string(&file_path).await.unwrap();
-        assert_eq!(content, "msg1\n");
-
-        handle.stop().await;
-    }
-
-    #[tokio::test]
-    async fn test_route_file_consume_all_lines() {
-        let dir = tempdir().unwrap();
-        let file_path = dir.path().join("consume_all.log");
-        let file_path_str = file_path.to_str().unwrap().to_string();
-
-        // Write 10 lines
-        let mut content = String::new();
-        for i in 0..10 {
-            content.push_str(&format!("msg{}\n", i));
-        }
-        tokio::fs::write(&file_path, content).await.unwrap();
-
-        let input = Endpoint::new(EndpointType::File(FileConfig {
-            path: file_path_str.clone(),
-            mode: Some(FileConsumerMode::Consume { delete: true }),
-            ..Default::default()
-        }));
-        let output = Endpoint::new_memory("out_consume_all", 100);
-        let route = Route::new(input, output.clone());
-
-        let handle = route.run("test_route_consume_all").await.unwrap();
-
-        let channel = output.channel().unwrap();
-        // Wait for messages
-        let mut received_count = 0;
-        for _ in 0..100 {
-            received_count += channel.drain_messages().len();
-            if received_count >= 10 {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-        assert_eq!(received_count, 10);
-
-        // Verify file is empty
-        let mut content = String::new();
-        for _ in 0..40 {
-            content = tokio::fs::read_to_string(&file_path).await.unwrap();
-            if content.is_empty() {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-        assert_eq!(content, "");
-
-        handle.stop().await;
-    }
-
-    #[tokio::test]
-    async fn test_file_consumer_group_id_persistence() {
-        let dir = tempdir().unwrap();
-        let file_path = dir.path().join("group_id.log");
-        let file_path_str = file_path.to_str().unwrap().to_string();
-        let offset_path = dir.path().join("group_id.log.my_group.offset");
-
-        // Write initial content
-        tokio::fs::write(&file_path, b"msg1\nmsg2\n").await.unwrap();
-
-        let config = FileConfig {
-            path: file_path_str.clone(),
-            mode: Some(FileConsumerMode::GroupSubscribe {
-                group_id: "my_group".to_string(),
-                read_from_tail: false,
-            }),
-            ..Default::default()
-        };
-
-        // 1. First consumer reads msg1
-        let mut consumer1 = FileConsumer::new(&config).await.unwrap();
-        // Allow thread to start
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-        let batch1 = consumer1.receive_batch(1).await.unwrap();
-        assert_eq!(batch1.messages[0].payload.as_ref(), b"msg1");
-
-        // Commit msg1 -> should write offset
-        (batch1.commit)(vec![crate::traits::MessageDisposition::Ack])
-            .await
-            .unwrap();
-
-        // Verify offset file exists and contains correct offset (length of "msg1\n" is 5)
-        let offset_content = tokio::fs::read_to_string(&offset_path).await.unwrap();
-        assert_eq!(offset_content, "5");
-
-        drop(consumer1);
-
-        // 2. Second consumer (simulating restart) should start from offset 5 (msg2)
-        let mut consumer2 = FileConsumer::new(&config).await.unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-        let batch2 = consumer2.receive_batch(1).await.unwrap();
-        assert_eq!(batch2.messages[0].payload.as_ref(), b"msg2");
-
-        (batch2.commit)(vec![crate::traits::MessageDisposition::Ack])
-            .await
-            .unwrap();
-
-        // Verify offset updated (5 + length of "msg2\n" (5) = 10)
-        let offset_content = tokio::fs::read_to_string(&offset_path).await.unwrap();
-        assert_eq!(offset_content, "10");
-    }
-
-    #[tokio::test]
-    async fn test_file_consumer_group_id_init_from_start() {
-        let dir = tempdir().unwrap();
-        let file_path = dir.path().join("group_id_start.log");
-        let file_path_str = file_path.to_str().unwrap().to_string();
-
-        // Write initial content
-        tokio::fs::write(&file_path, b"msg1\nmsg2\n").await.unwrap();
-
-        let config = FileConfig {
-            path: file_path_str.clone(),
-            mode: Some(FileConsumerMode::GroupSubscribe {
-                group_id: "my_group_start".to_string(),
-                read_from_tail: false,
-            }),
-            ..Default::default()
-        };
-
-        // Consumer should start from beginning (msg1)
-        let mut consumer = FileConsumer::new(&config).await.unwrap();
-        // Allow thread to start
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-        let batch = consumer.receive_batch(2).await.unwrap();
-        assert_eq!(batch.messages.len(), 2);
-        assert_eq!(batch.messages[0].payload.as_ref(), b"msg1");
-        assert_eq!(batch.messages[1].payload.as_ref(), b"msg2");
-    }
-
-    #[tokio::test]
-    async fn test_file_tail_concurrent_publish_and_consume() {
-        // This test verifies that the tail reader can work concurrently with the publisher
-        // writing to the file. This is critical for Windows compatibility where file locking
-        // semantics may prevent concurrent access if not handled correctly.
-        // Note: Even though this runs in the same process, Windows file sharing modes are
-        // enforced per-handle. Since the consumer does not participate in the `FILE_LOCKS`
-        // mutex used by the publisher, this effectively tests that the OS allows the
-        // publisher to open/write while the consumer has the file open for reading.
-        let dir = tempdir().unwrap();
-        let file_path = dir.path().join("concurrent.log");
-        let file_path_str = file_path.to_str().unwrap().to_string();
-
-        // Create file with initial message
-        tokio::fs::write(&file_path, b"msg0\n").await.unwrap();
-
-        let config = FileConfig {
-            path: file_path_str.clone(),
-            mode: Some(FileConsumerMode::Subscribe { delete: false }),
-            ..Default::default()
-        };
-
-        // Start the tail consumer
-        let mut consumer = FileConsumer::new(&config).await.unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-        // Spawn a task that continuously publishes messages while the consumer is reading
-        let publisher_path = file_path_str.clone();
-        let publish_handle = tokio::spawn(async move {
-            let pub_config = FileConfig {
-                path: publisher_path,
-                mode: Some(FileConsumerMode::Subscribe { delete: false }),
-                ..Default::default()
-            };
-            let publisher = FilePublisher::new(&pub_config).await.unwrap();
-
-            // Send enough messages to ensure overlap between reading and writing
-            for i in 1..=100 {
-                let msg = msg!(json!({"id": i, "data": format!("message_{}", i)}));
-                publisher.send_batch(vec![msg]).await.unwrap();
-                // Small delay to allow consumer to catch up and potentially open the file
-                if i % 10 == 0 {
-                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                }
-            }
-        });
-
-        // Consumer should be able to read messages while publisher is writing
-        let mut received_count = 0;
-        let mut message_ids = Vec::new();
-
-        // We expect 100 published messages (initial msg0 is skipped in Subscribe mode)
-        let expected_count = 100;
-        let start = std::time::Instant::now();
-
-        while received_count < expected_count {
-            if start.elapsed() > std::time::Duration::from_secs(10) {
-                break;
-            }
-            match tokio::time::timeout(
-                std::time::Duration::from_millis(200),
-                consumer.receive_batch(10),
-            )
-            .await
-            {
-                Ok(Ok(batch)) => {
-                    for msg in &batch.messages {
-                        received_count += 1;
-                        if let Ok(json_msg) =
-                            serde_json::from_slice::<serde_json::Value>(&msg.payload)
-                        {
-                            if let Some(id) = json_msg.get("id").and_then(|v| v.as_i64()) {
-                                message_ids.push(id);
-                            }
-                        }
-                    }
-                    (batch.commit)(vec![
-                        crate::traits::MessageDisposition::Ack;
-                        batch.messages.len()
-                    ])
-                    .await
-                    .unwrap();
-                }
-                Ok(Err(_)) => break, // Stream ended
-                Err(_) => continue,  // Timeout waiting for message
-            }
-        }
-
-        publish_handle.await.unwrap();
-
-        // Verify we received at least some messages from the publisher
-        // We should receive the messages from the concurrent publisher
-        assert_eq!(
-            received_count, expected_count,
-            "Expected {} messages, got {}. This may indicate file locking issues on this platform.",
-            expected_count, received_count
-        );
-
-        // Verify the file still exists and can be read (not locked/deleted)
-        let final_content = tokio::fs::read_to_string(&file_path)
-            .await
-            .expect("File should still be readable after concurrent access");
-        assert!(
-            !final_content.is_empty(),
-            "File should contain messages after concurrent access"
-        );
-    }
-
-    /// Simulates an external process (like a Python script or log writer) appending to the file.
-    /// Unlike `test_file_tail_concurrent_publish_and_consume`, this test:
-    /// 1. Does not use `FilePublisher` (bypassing internal `FILE_LOCKS`).
-    /// 2. Keeps the file handle open across multiple writes (simulating a long-running writer),
-    ///    which stresses file locking/sharing semantics on OSs like Windows.
-    #[tokio::test]
-    async fn test_file_subscribe_concurrent_external_write() {
-        let dir = tempdir().unwrap();
-        let file_path = dir.path().join("external_write.log");
-        let file_path_str = file_path.to_str().unwrap().to_string();
-
-        // Create empty file
-        tokio::fs::write(&file_path, b"").await.unwrap();
-
-        let config = FileConfig {
-            path: file_path_str.clone(),
-            mode: Some(FileConsumerMode::Subscribe { delete: false }),
-            ..Default::default()
-        };
-
-        let mut consumer = FileConsumer::new(&config).await.unwrap();
-
-        // Give the background tailer a moment to initialize
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-        let file_path_clone = file_path.clone();
-        let write_task = tokio::spawn(async move {
-            let mut file = OpenOptions::new()
-                .append(true)
-                .open(&file_path_clone)
-                .await
-                .unwrap();
-
-            for i in 0..5 {
-                let line = format!("message {}\n", i);
-                file.write_all(line.as_bytes()).await.unwrap();
-                file.flush().await.unwrap();
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            }
-        });
-
-        for i in 0..5 {
-            let received =
-                tokio::time::timeout(std::time::Duration::from_secs(5), consumer.receive())
-                    .await
-                    .expect("Timed out waiting for message")
-                    .unwrap();
-
-            let expected_payload = format!("message {}", i);
-            assert_eq!(received.message.get_payload_str().trim(), expected_payload);
-            (received.commit)(crate::traits::MessageDisposition::Ack)
-                .await
-                .unwrap();
-        }
-
-        write_task.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_file_custom_delimiter() {
-        let dir = tempdir().unwrap();
-        let file_path = dir.path().join("custom_delim.log");
-        let file_path_str = file_path.to_str().unwrap().to_string();
-
-        let config = FileConfig {
-            path: file_path_str.clone(),
-            delimiter: Some("|".to_string()),
-            mode: Some(FileConsumerMode::Consume { delete: false }),
-            ..Default::default()
-        };
-
-        let publisher = FilePublisher::new(&config).await.unwrap();
-        let mut consumer = FileConsumer::new(&config).await.unwrap();
-
-        let msg1 = crate::CanonicalMessage::from("msg1").with_raw_format();
-        let msg2 = crate::CanonicalMessage::from("msg2").with_raw_format();
-
-        publisher.send_batch(vec![msg1, msg2]).await.unwrap();
-        publisher.flush().await.unwrap();
-        drop(publisher); // Release lock
-
-        // Verify file content has pipes
-        let content = tokio::fs::read_to_string(&file_path).await.unwrap();
-        assert_eq!(content, "msg1|msg2|");
-
-        let received1 = consumer.receive().await.unwrap();
-        assert_eq!(received1.message.get_payload_str(), "msg1");
-
-        let received2 = consumer.receive().await.unwrap();
-        assert_eq!(received2.message.get_payload_str(), "msg2");
-    }
-
-    #[tokio::test]
-    async fn test_file_xml_delimiter() {
-        let dir = tempdir().unwrap();
-        let file_path = dir.path().join("xml_delim.log");
-        let file_path_str = file_path.to_str().unwrap().to_string();
-
-        let config = FileConfig {
-            path: file_path_str.clone(),
-            delimiter: Some("</message>".to_string()),
-            mode: Some(FileConsumerMode::Consume { delete: false }),
-            ..Default::default()
-        };
-
-        let publisher = FilePublisher::new(&config).await.unwrap();
-        let mut consumer = FileConsumer::new(&config).await.unwrap();
-
-        let msg1 = crate::CanonicalMessage::from("<xml>content1").with_raw_format();
-        let msg2 = crate::CanonicalMessage::from("<xml>content2").with_raw_format();
-
-        publisher.send_batch(vec![msg1, msg2]).await.unwrap();
-        publisher.flush().await.unwrap();
-        drop(publisher); // Release lock
-
-        // Verify file content has tags
-        let content = tokio::fs::read_to_string(&file_path).await.unwrap();
-        assert_eq!(content, "<xml>content1</message><xml>content2</message>");
-
-        let received1 = consumer.receive().await.unwrap();
-        assert_eq!(received1.message.get_payload_str(), "<xml>content1");
-
-        let received2 = consumer.receive().await.unwrap();
-        assert_eq!(received2.message.get_payload_str(), "<xml>content2");
-    }
-
-    #[tokio::test]
-    async fn test_file_formats_and_fallbacks() {
-        let dir = tempdir().unwrap();
-
-        // 1. Test JSON Format Roundtrip
-        let json_path = dir.path().join("json.log");
-        let json_config = FileConfig {
-            path: json_path.to_str().unwrap().to_string(),
-            format: FileFormat::Json,
-            ..Default::default()
-        };
-
-        let json_publisher = FilePublisher::new(&json_config).await.unwrap();
-        let mut json_consumer = FileConsumer::new(&json_config).await.unwrap();
-
-        let json_payload = json!({"key": "value", "num": 123});
-        let msg = msg!(json_payload.clone());
-
-        json_publisher.send_batch(vec![msg.clone()]).await.unwrap();
-        json_publisher.flush().await.unwrap();
-        drop(json_publisher); // Release lock
-
-        let received = json_consumer.receive().await.unwrap();
-        let received_json: serde_json::Value =
-            serde_json::from_slice(&received.message.payload).unwrap();
-        assert_eq!(received_json, json_payload);
-        (received.commit)(crate::traits::MessageDisposition::Ack)
-            .await
-            .unwrap();
-
-        // 2. Test Text Format Roundtrip
-        let text_path = dir.path().join("text.log");
-        let text_config = FileConfig {
-            path: text_path.to_str().unwrap().to_string(),
-            format: FileFormat::Text,
-            ..Default::default()
-        };
-
-        let text_publisher = FilePublisher::new(&text_config).await.unwrap();
-        let mut text_consumer = FileConsumer::new(&text_config).await.unwrap();
-
-        let text_payload = "Hello World";
-        let msg = crate::CanonicalMessage::from(text_payload);
-
-        text_publisher.send_batch(vec![msg.clone()]).await.unwrap();
-        text_publisher.flush().await.unwrap();
-        drop(text_publisher);
-
-        let received = text_consumer.receive().await.unwrap();
-        assert_eq!(received.message.get_payload_str(), text_payload);
-        (received.commit)(crate::traits::MessageDisposition::Ack)
-            .await
-            .unwrap();
-
-        // 3. Test Fallback (Corrupted/Raw line in Json format)
-        // We append a raw line that isn't the expected JSON wrapper structure
-        {
-            let mut file = OpenOptions::new()
-                .append(true)
-                .open(&json_path)
-                .await
-                .unwrap();
-            file.write_all(b"Not a JSON wrapper\n").await.unwrap();
-        }
-
-        let received_fallback = json_consumer.receive().await.unwrap();
-        // Should be treated as raw
-        assert_eq!(
-            received_fallback.message.get_payload_str(),
-            "Not a JSON wrapper"
-        );
-        assert_eq!(
-            received_fallback
-                .message
-                .metadata
-                .get("mq_bridge.original_format")
-                .map(|s| s.as_str()),
-            Some("raw")
-        );
-    }
-
-    #[tokio::test]
-    async fn test_file_csv_round_trip() {
-        let dir = tempdir().unwrap();
-        let file_path = dir.path().join("data.csv");
-        let file_path_str = file_path.to_str().unwrap().to_string();
-
-        let config = FileConfig {
-            path: file_path_str.clone(),
-            format: FileFormat::Csv,
-            ..Default::default()
-        };
-
-        let sink = FilePublisher::new(&config).await.unwrap();
-        let msg1 = msg!(json!({"name": "alice", "age": "30"}));
-        let msg2 = msg!(json!({"name": "bob", "age": "25"}));
-        sink.send_batch(vec![msg1, msg2]).await.unwrap();
-        sink.flush().await.unwrap();
-        drop(sink);
-
-        let content = tokio::fs::read_to_string(&file_path).await.unwrap();
-        assert_eq!(content, "age,name\n30,alice\n25,bob\n");
-
-        let mut source = FileConsumer::new(&config).await.unwrap();
-        let received1 = source.receive().await.unwrap();
-        assert_eq!(
-            serde_json::from_slice::<serde_json::Value>(&received1.message.payload).unwrap(),
-            json!({"name": "alice", "age": "30"})
-        );
-        let received2 = source.receive().await.unwrap();
-        assert_eq!(
-            serde_json::from_slice::<serde_json::Value>(&received2.message.payload).unwrap(),
-            json!({"name": "bob", "age": "25"})
-        );
     }
 }
+
+/// One element of a payload array: a byte on the fast path, anything else kept
+/// as a `Value` so a non-byte array still round-trips as JSON text.
+enum PayloadElement {
+    Byte(u8),
+    Other(serde_json::Value),
+}
+
+impl<'de> serde::Deserialize<'de> for PayloadElement {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct ElementVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for ElementVisitor {
+            type Value = PayloadElement;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a JSON value")
+            }
+
+            fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<PayloadElement, E> {
+                Ok(match u8::try_from(v) {
+                    Ok(b) => PayloadElement::Byte(b),
+                    Err(_) => PayloadElement::Other(v.into()),
+                })
+            }
+
+            fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<PayloadElement, E> {
+                Ok(match u8::try_from(v) {
+                    Ok(b) => PayloadElement::Byte(b),
+                    Err(_) => PayloadElement::Other(v.into()),
+                })
+            }
+
+            fn visit_f64<E: serde::de::Error>(self, v: f64) -> Result<PayloadElement, E> {
+                Ok(PayloadElement::Other(
+                    serde_json::Number::from_f64(v).map_or(serde_json::Value::Null, Into::into),
+                ))
+            }
+
+            fn visit_bool<E: serde::de::Error>(self, v: bool) -> Result<PayloadElement, E> {
+                Ok(PayloadElement::Other(v.into()))
+            }
+
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<PayloadElement, E> {
+                Ok(PayloadElement::Other(v.into()))
+            }
+
+            fn visit_unit<E: serde::de::Error>(self) -> Result<PayloadElement, E> {
+                Ok(PayloadElement::Other(serde_json::Value::Null))
+            }
+
+            fn visit_none<E: serde::de::Error>(self) -> Result<PayloadElement, E> {
+                Ok(PayloadElement::Other(serde_json::Value::Null))
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                seq: A,
+            ) -> Result<PayloadElement, A::Error> {
+                serde::Deserialize::deserialize(serde::de::value::SeqAccessDeserializer::new(seq))
+                    .map(PayloadElement::Other)
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                map: A,
+            ) -> Result<PayloadElement, A::Error> {
+                serde::Deserialize::deserialize(serde::de::value::MapAccessDeserializer::new(map))
+                    .map(PayloadElement::Other)
+            }
+        }
+
+        d.deserialize_any(ElementVisitor)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for RawPayload {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct PayloadVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for PayloadVisitor {
+            type Value = RawPayload;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a byte array, a string or any JSON value")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<RawPayload, E> {
+                Ok(RawPayload::Str(v.to_string()))
+            }
+
+            fn visit_string<E: serde::de::Error>(self, v: String) -> Result<RawPayload, E> {
+                Ok(RawPayload::Str(v))
+            }
+
+            fn visit_bytes<E: serde::de::Error>(self, v: &[u8]) -> Result<RawPayload, E> {
+                Ok(RawPayload::Bytes(v.to_vec()))
+            }
+
+            fn visit_byte_buf<E: serde::de::Error>(self, v: Vec<u8>) -> Result<RawPayload, E> {
+                Ok(RawPayload::Bytes(v))
+            }
+
+            fn visit_bool<E: serde::de::Error>(self, v: bool) -> Result<RawPayload, E> {
+                Ok(RawPayload::Other(v.into()))
+            }
+
+            fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<RawPayload, E> {
+                Ok(RawPayload::Other(v.into()))
+            }
+
+            fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<RawPayload, E> {
+                Ok(RawPayload::Other(v.into()))
+            }
+
+            fn visit_f64<E: serde::de::Error>(self, v: f64) -> Result<RawPayload, E> {
+                Ok(RawPayload::Other(
+                    serde_json::Number::from_f64(v).map_or(serde_json::Value::Null, Into::into),
+                ))
+            }
+
+            fn visit_unit<E: serde::de::Error>(self) -> Result<RawPayload, E> {
+                Ok(RawPayload::Other(serde_json::Value::Null))
+            }
+
+            fn visit_none<E: serde::de::Error>(self) -> Result<RawPayload, E> {
+                Ok(RawPayload::Other(serde_json::Value::Null))
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                map: A,
+            ) -> Result<RawPayload, A::Error> {
+                serde::Deserialize::deserialize(serde::de::value::MapAccessDeserializer::new(map))
+                    .map(RawPayload::Other)
+            }
+
+            /// Bytes accumulate until an element turns out not to be one; from
+            /// there the array is rebuilt as a `Value` so it renders as JSON text,
+            /// matching what the `Value`-based decode used to produce.
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<RawPayload, A::Error> {
+                let mut bytes: Vec<u8> = Vec::with_capacity(seq.size_hint().unwrap_or(0));
+                while let Some(element) = seq.next_element::<PayloadElement>()? {
+                    match element {
+                        PayloadElement::Byte(b) => bytes.push(b),
+                        PayloadElement::Other(value) => {
+                            let mut values: Vec<serde_json::Value> =
+                                bytes.into_iter().map(serde_json::Value::from).collect();
+                            values.push(value);
+                            while let Some(rest) = seq.next_element::<PayloadElement>()? {
+                                values.push(match rest {
+                                    PayloadElement::Byte(b) => b.into(),
+                                    PayloadElement::Other(v) => v,
+                                });
+                            }
+                            return Ok(RawPayload::Other(serde_json::Value::Array(values)));
+                        }
+                    }
+                }
+                Ok(RawPayload::Bytes(bytes))
+            }
+        }
+
+        d.deserialize_any(PayloadVisitor)
+    }
+}
+
+#[cfg(test)]
+mod tests;

@@ -3,6 +3,7 @@
 //  Licensed under MIT License, see License file for more details
 //  git clone https://github.com/marcomq/mq-bridge
 use crate::models::StaticConfig;
+use crate::support::interpolation::CompiledTemplate;
 use crate::traits::{
     BoxFuture, ConsumerError, MessageConsumer, MessageDisposition, MessagePublisher,
     PublisherError, Received, ReceivedBatch, Sent, SentBatch,
@@ -13,28 +14,65 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use serde_json::Value;
 use std::any::Any;
+use std::sync::Arc;
 use tracing::trace;
+
+/// JSON-encode `rendered` as a JSON string unless `raw`, in which case it is
+/// returned unchanged. Mirrors the historical static-body behaviour.
+fn wrap_payload(rendered: Vec<u8>, raw: bool) -> anyhow::Result<Vec<u8>> {
+    if raw {
+        Ok(rendered)
+    } else {
+        serde_json::to_vec(&Value::String(
+            String::from_utf8_lossy(&rendered).into_owned(),
+        ))
+        .context("Failed to serialize static response to JSON")
+    }
+}
+
+/// Case-insensitive lookup of the `content-type` metadata entry, which selects
+/// the token escaping context for a raw body.
+fn content_type_of(metadata: &std::collections::HashMap<String, String>) -> Option<&str> {
+    metadata
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+        .map(|(_, v)| v.as_str())
+}
 
 /// A sink that responds with a static, pre-configured message.
 #[derive(Clone)]
 pub struct StaticEndpointPublisher {
-    payload: Vec<u8>,
+    template: Arc<CompiledTemplate>,
+    raw: bool,
+    /// Precomputed payload for a template with no tokens (the common case).
+    static_payload: Option<Bytes>,
     content_raw: String,
     metadata: std::collections::HashMap<String, String>,
 }
 
 impl StaticEndpointPublisher {
     pub fn new(config: &StaticConfig) -> anyhow::Result<Self> {
-        // In `raw` mode the body is sent verbatim; otherwise it is JSON-encoded
-        // as a string (the historical behaviour, kept for backward compatibility).
-        let payload = if config.raw {
-            config.body.clone().into_bytes()
+        // In `raw` mode the rendered body is sent verbatim, so token escaping
+        // follows the content-type. Otherwise the body is JSON-encoded as a
+        // string (historical behaviour), which escapes it, so tokens render raw.
+        let content_type = if config.raw {
+            content_type_of(&config.metadata)
         } else {
-            serde_json::to_vec(&Value::String(config.body.clone()))
-                .context("Failed to serialize static response to JSON")?
+            None
+        };
+        let template = CompiledTemplate::compile(&config.body, content_type)?;
+        let static_payload = if template.is_dynamic() {
+            None
+        } else {
+            Some(Bytes::from(wrap_payload(
+                template.render(None),
+                config.raw,
+            )?))
         };
         Ok(Self {
-            payload,
+            template: Arc::new(template),
+            raw: config.raw,
+            static_payload,
             content_raw: config.body.clone(),
             metadata: config.metadata.clone(),
         })
@@ -43,8 +81,15 @@ impl StaticEndpointPublisher {
 
 #[async_trait]
 impl MessagePublisher for StaticEndpointPublisher {
-    async fn send(&self, _message: CanonicalMessage) -> Result<Sent, PublisherError> {
-        let mut response_msg = CanonicalMessage::new(self.payload.clone(), None);
+    async fn send(&self, message: CanonicalMessage) -> Result<Sent, PublisherError> {
+        let payload = match &self.static_payload {
+            Some(p) => p.clone(),
+            None => Bytes::from(
+                wrap_payload(self.template.render(Some(&message)), self.raw)
+                    .map_err(PublisherError::NonRetryable)?,
+            ),
+        };
+        let mut response_msg = CanonicalMessage::new_bytes(payload, None);
         // Attach configured metadata to the response. When this feeds an HTTP
         // response these become headers (e.g. `content-type`), so the server
         // emits them instead of defaulting to `application/octet-stream`.
@@ -80,19 +125,37 @@ impl MessagePublisher for StaticEndpointPublisher {
 /// A source that always produces the same static message.
 #[derive(Clone)]
 pub struct StaticRequestConsumer {
-    payload: Bytes,
-    #[allow(dead_code)]
-    content: String, // Kept for metadata/tracing if needed
+    template: Arc<CompiledTemplate>,
+    /// Precomputed payload for a template with no tokens (the common case).
+    static_payload: Option<Bytes>,
     metadata: std::collections::HashMap<String, String>,
 }
 
 impl StaticRequestConsumer {
     pub fn new(config: &StaticConfig) -> anyhow::Result<Self> {
+        // The source sends the rendered body as raw bytes, so token escaping
+        // follows the content-type. There is no input message, so only
+        // `gen`/`env` tokens produce values.
+        let template = CompiledTemplate::compile(&config.body, content_type_of(&config.metadata))?;
+        let static_payload = if template.is_dynamic() {
+            None
+        } else {
+            Some(Bytes::from(template.render(None)))
+        };
         Ok(Self {
-            payload: Bytes::copy_from_slice(config.body.as_bytes()),
-            content: config.body.clone(),
+            template: Arc::new(template),
+            static_payload,
             metadata: config.metadata.clone(),
         })
+    }
+
+    /// The payload for the next produced message: cheap clone when static, a
+    /// fresh render otherwise (so `${gen:…}` tokens vary per message).
+    fn next_payload(&self) -> Bytes {
+        match &self.static_payload {
+            Some(p) => p.clone(),
+            None => Bytes::from(self.template.render(None)),
+        }
     }
 }
 
@@ -103,7 +166,7 @@ impl MessageConsumer for StaticRequestConsumer {
         false
     }
     async fn receive(&mut self) -> Result<Received, ConsumerError> {
-        let mut message = CanonicalMessage::new_bytes(self.payload.clone(), None);
+        let mut message = CanonicalMessage::new_bytes(self.next_payload(), None);
         message.metadata = self.metadata.clone();
         trace!(message_id = %format!("{:032x}", message.message_id), "Producing static message");
         let commit = Box::new(|_disposition: MessageDisposition| {
@@ -120,7 +183,7 @@ impl MessageConsumer for StaticRequestConsumer {
         // Each message still involves cloning the payload and generating a new UUID.
         let mut messages = Vec::with_capacity(_max_messages);
         for _ in 0.._max_messages {
-            let mut message = CanonicalMessage::new_bytes(self.payload.clone(), None);
+            let mut message = CanonicalMessage::new_bytes(self.next_payload(), None);
             message.metadata = self.metadata.clone();
             messages.push(message);
         }

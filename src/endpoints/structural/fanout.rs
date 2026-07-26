@@ -42,14 +42,31 @@ impl MessagePublisher for FanoutPublisher {
 
         let results = join_all(batch_sends).await;
 
-        // For fan-out, we consider the batch successful if it was successfully sent to *all* publishers.
-        // If any publisher returns a hard error, we propagate it.
-        // We don't currently aggregate partial failures from different fan-out destinations.
+        // A hard error from any publisher is propagated. Otherwise the per-destination
+        // partial failures are merged: a message that failed at any destination is
+        // reported as failed for the whole fan-out, so the route nacks it. Duplicate
+        // entries for the same message across destinations are harmless (the route
+        // keys failures by message_id). Responses are not forwarded: with several
+        // destinations there is no single response to attribute to an input message.
+        let mut failed = Vec::new();
         for result in results {
-            result?;
+            match result? {
+                SentBatch::Ack => {}
+                SentBatch::Partial {
+                    responses: _,
+                    failed: child_failed,
+                } => failed.extend(child_failed),
+            }
         }
 
-        Ok(SentBatch::Ack)
+        if failed.is_empty() {
+            Ok(SentBatch::Ack)
+        } else {
+            Ok(SentBatch::Partial {
+                responses: None,
+                failed,
+            })
+        }
     }
 
     async fn status(&self) -> EndpointStatus {
@@ -104,6 +121,8 @@ mod tests {
         batch_payloads: Mutex<Vec<Vec<String>>>,
         status: EndpointStatus,
         batch_error: Option<String>,
+        /// Payloads this publisher reports as failed instead of erroring the whole batch.
+        batch_partial_failures: Vec<String>,
     }
 
     #[async_trait]
@@ -131,6 +150,28 @@ mod tests {
                 return Err(ProcessingError::NonRetryable(anyhow::anyhow!(
                     message.clone()
                 )));
+            }
+
+            if !self.batch_partial_failures.is_empty() {
+                let failed: Vec<_> = messages
+                    .into_iter()
+                    .filter(|m| {
+                        self.batch_partial_failures
+                            .contains(&m.get_payload_str().to_string())
+                    })
+                    .map(|m| {
+                        (
+                            m,
+                            ProcessingError::Retryable(anyhow::anyhow!("destination rejected")),
+                        )
+                    })
+                    .collect();
+                if !failed.is_empty() {
+                    return Ok(SentBatch::Partial {
+                        responses: None,
+                        failed,
+                    });
+                }
             }
 
             Ok(SentBatch::Ack)
@@ -176,6 +217,33 @@ mod tests {
         assert!(matches!(err, ProcessingError::NonRetryable(_)));
         assert_eq!(ok.batch_payloads.lock().unwrap().len(), 1);
         assert_eq!(failing.batch_payloads.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_fanout_send_batch_preserves_child_partial_failures() {
+        let ok = Arc::new(RecordingPublisher::default());
+        let partial = Arc::new(RecordingPublisher {
+            batch_partial_failures: vec!["two".to_string()],
+            ..Default::default()
+        });
+        let fanout = FanoutPublisher::new(vec![ok.clone(), partial.clone()]);
+
+        let sent = fanout
+            .send_batch(vec![
+                CanonicalMessage::from("one"),
+                CanonicalMessage::from("two"),
+            ])
+            .await
+            .unwrap();
+
+        match sent {
+            SentBatch::Partial { responses, failed } => {
+                assert!(responses.is_none());
+                assert_eq!(failed.len(), 1);
+                assert_eq!(failed[0].0.get_payload_str(), "two");
+            }
+            SentBatch::Ack => panic!("expected partial failure to be preserved"),
+        }
     }
 
     #[tokio::test]

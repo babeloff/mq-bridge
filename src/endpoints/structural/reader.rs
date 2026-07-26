@@ -60,7 +60,9 @@ impl MessagePublisher for ReaderPublisher {
                 Ok(Sent::Response(received.message))
             }
             Err(e) => match e {
-                ConsumerError::EndOfStream => Err(PublisherError::NonRetryable(anyhow::anyhow!(e))),
+                ConsumerError::EndOfStream | ConsumerError::Permanent(_) => {
+                    Err(PublisherError::NonRetryable(anyhow::anyhow!(e)))
+                }
                 _ => Err(PublisherError::Retryable(anyhow::anyhow!(e))),
             },
         }
@@ -79,21 +81,32 @@ impl MessagePublisher for ReaderPublisher {
         match consumer.receive_batch(count).await {
             Ok(batch) => {
                 let received_count = batch.messages.len();
-                if received_count > 0 {
-                    if let Err(e) =
-                        (batch.commit)(vec![MessageDisposition::Ack; received_count]).await
-                    {
-                        return Err(PublisherError::Retryable(anyhow::anyhow!(
-                            "Failed to commit batch in ReaderPublisher: {}",
-                            e
-                        )));
-                    }
+                if received_count == 0 {
+                    return Ok(SentBatch::Ack);
                 }
 
-                Ok(SentBatch::Ack)
+                // Same reasoning as `send`: the read must be committed here, because the
+                // publisher interface cannot hand the inner consumer's commit lifecycle
+                // back to the route.
+                if let Err(e) = (batch.commit)(vec![MessageDisposition::Ack; received_count]).await
+                {
+                    return Err(PublisherError::Retryable(anyhow::anyhow!(
+                        "Failed to commit batch in ReaderPublisher: {}",
+                        e
+                    )));
+                }
+
+                // Surface the read messages as responses, mirroring `send`'s
+                // `Sent::Response`, so the route can dispatch them instead of dropping them.
+                Ok(SentBatch::Partial {
+                    responses: Some(batch.messages),
+                    failed: Vec::new(),
+                })
             }
             Err(e) => match e {
-                ConsumerError::EndOfStream => Err(PublisherError::NonRetryable(anyhow::anyhow!(e))),
+                ConsumerError::EndOfStream | ConsumerError::Permanent(_) => {
+                    Err(PublisherError::NonRetryable(anyhow::anyhow!(e)))
+                }
                 _ => Err(PublisherError::Retryable(anyhow::anyhow!(e))),
             },
         }
@@ -304,7 +317,20 @@ mod tests {
             ])
             .await
             .unwrap();
-        assert!(matches!(sent, SentBatch::Ack));
+        match sent {
+            SentBatch::Partial { responses, failed } => {
+                assert!(failed.is_empty());
+                let responses = responses.expect("read messages should be returned as responses");
+                assert_eq!(
+                    responses
+                        .iter()
+                        .map(|m| m.get_payload_str().to_string())
+                        .collect::<Vec<_>>(),
+                    ["one", "two"]
+                );
+            }
+            SentBatch::Ack => panic!("expected read messages to be returned as responses"),
+        }
         assert_eq!(commit_log.lock().unwrap().len(), 1);
         assert!(commit_log.lock().unwrap()[0]
             .iter()

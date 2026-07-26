@@ -1,0 +1,1622 @@
+use crate::endpoints::file::{FileConsumer, FilePublisher};
+#[cfg(any(feature = "compression", feature = "encryption"))]
+use crate::models::Compression;
+use crate::models::{FileConfig, FileConsumerMode, FileFormat};
+use crate::msg;
+use crate::traits::MessageConsumer;
+use crate::traits::MessagePublisher;
+use serde_json::json;
+use tempfile::tempdir;
+use tokio::fs::OpenOptions;
+use tokio::io::AsyncWriteExt;
+
+#[cfg(feature = "compression")]
+#[tokio::test]
+async fn test_file_gzip_roundtrip() {
+    use std::io::Read as _;
+
+    let dir = tempdir().unwrap();
+    let file_path = dir.path().join("data.jsonl.gz");
+    let path = file_path.to_str().unwrap().to_string();
+
+    let config = FileConfig {
+        path: path.clone(),
+        format: FileFormat::Raw,
+        compression: Compression::Gzip,
+        ..Default::default()
+    };
+
+    // Write two batches -> two gzip members appended to the same file.
+    let sink = FilePublisher::new(&config).await.unwrap();
+    let m1 = msg!(json!({"id": 1, "name": "alice"}));
+    let m2 = msg!(json!({"id": 2, "name": "bob"}));
+    let m3 = msg!(json!({"id": 3, "name": "carol"}));
+    sink.send_batch(vec![m1.clone(), m2.clone()]).await.unwrap();
+    sink.send_batch(vec![m3.clone()]).await.unwrap();
+    drop(sink);
+
+    // The file is a valid standard gzip stream (concatenated members),
+    // decodable by any gzip tool.
+    let mut raw = std::fs::File::open(&file_path).unwrap();
+    let mut compressed = Vec::new();
+    std::io::Read::read_to_end(&mut raw, &mut compressed).unwrap();
+    let mut decoded = String::new();
+    flate2::read::MultiGzDecoder::new(&compressed[..])
+        .read_to_string(&mut decoded)
+        .unwrap();
+    assert_eq!(decoded.lines().count(), 3);
+
+    // Read the records back through the consumer. Bound the loop so an empty
+    // stream can't retry forever (mirrors `collect_compressed`'s 5s cap).
+    let mut source = FileConsumer::new(&config).await.unwrap();
+    let got = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let mut got = Vec::new();
+        while got.len() < 3 {
+            let batch = source.receive_batch(10).await.unwrap();
+            if batch.messages.is_empty() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                continue;
+            }
+            let len = batch.messages.len();
+            for m in &batch.messages {
+                got.push(m.payload.clone());
+            }
+            let _ = (batch.commit)(vec![crate::traits::MessageDisposition::Ack; len]).await;
+        }
+        got
+    })
+    .await
+    .expect("timed out collecting gzip messages");
+    assert_eq!(got, vec![m1.payload, m2.payload, m3.payload]);
+}
+
+#[cfg(any(feature = "compression", feature = "encryption"))]
+async fn collect_compressed(source: &mut FileConsumer, n: usize) -> Vec<bytes::Bytes> {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let mut got = Vec::new();
+        while got.len() < n {
+            let batch = source.receive_batch(10).await.unwrap();
+            if batch.messages.is_empty() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                continue;
+            }
+            for m in &batch.messages {
+                got.push(m.payload.clone());
+            }
+        }
+        got
+    })
+    .await
+    .expect("timed out collecting gzip messages")
+}
+
+#[cfg(feature = "compression")]
+#[tokio::test]
+async fn test_file_lz4_roundtrip() {
+    // Two batches -> two concatenated lz4 frames; the consumer decodes both.
+    let dir = tempdir().unwrap();
+    let path = dir
+        .path()
+        .join("data.jsonl.lz4")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let config = FileConfig {
+        path,
+        format: FileFormat::Raw,
+        compression: Compression::Lz4,
+        ..Default::default()
+    };
+
+    let sink = FilePublisher::new(&config).await.unwrap();
+    let m1 = msg!(json!({"id": 1}));
+    let m2 = msg!(json!({"id": 2}));
+    let m3 = msg!(json!({"id": 3}));
+    sink.send_batch(vec![m1.clone(), m2.clone()]).await.unwrap();
+    sink.send_batch(vec![m3.clone()]).await.unwrap();
+    drop(sink);
+
+    let mut source = FileConsumer::new(&config).await.unwrap();
+    assert_eq!(
+        collect_compressed(&mut source, 3).await,
+        vec![m1.payload, m2.payload, m3.payload]
+    );
+}
+
+#[cfg(all(feature = "compression", feature = "encryption"))]
+#[tokio::test]
+async fn test_file_encrypted_compressed_roundtrip() {
+    use base64::Engine as _;
+
+    // compress-then-encrypt with length-prefix framing across multiple
+    // batches: the on-disk bytes are ciphertext, and the consumer reads the
+    // original records back.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("data.enc").to_str().unwrap().to_string();
+    let encryption = Some(crate::models::EncryptionConfig {
+        key: base64::engine::general_purpose::STANDARD.encode([42u8; 32]),
+        ..Default::default()
+    });
+    let config = FileConfig {
+        path: path.clone(),
+        format: FileFormat::Raw,
+        compression: Compression::Gzip,
+        encryption: encryption.clone(),
+        ..Default::default()
+    };
+
+    let sink = FilePublisher::new(&config).await.unwrap();
+    let m1 = msg!(json!({"id": 1, "name": "alice"}));
+    let m2 = msg!(json!({"id": 2, "name": "bob"}));
+    let m3 = msg!(json!({"id": 3, "name": "carol"}));
+    sink.send_batch(vec![m1.clone(), m2.clone()]).await.unwrap();
+    sink.send_batch(vec![m3.clone()]).await.unwrap();
+    drop(sink);
+
+    // The raw file is not a gzip stream (it is framed ciphertext).
+    let raw = std::fs::read(&path).unwrap();
+    assert!(!raw.is_empty());
+    let mut decoded = Vec::new();
+    assert!(std::io::Read::read_to_end(
+        &mut flate2::read::MultiGzDecoder::new(&raw[..]),
+        &mut decoded
+    )
+    .is_err());
+    // The plaintext does not appear anywhere in the file.
+    assert!(!raw.windows(5).any(|w| w == b"alice"));
+
+    let mut source = FileConsumer::new(&config).await.unwrap();
+    assert_eq!(
+        collect_compressed(&mut source, 3).await,
+        vec![m1.payload.clone(), m2.payload.clone(), m3.payload.clone()]
+    );
+
+    // A consumer with a different key must fail, not emit garbage.
+    let wrong_key = FileConfig {
+        encryption: Some(crate::models::EncryptionConfig {
+            key: base64::engine::general_purpose::STANDARD.encode([1u8; 32]),
+            ..Default::default()
+        }),
+        ..config.clone()
+    };
+    let mut source = FileConsumer::new(&wrong_key).await.unwrap();
+    let got = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        loop {
+            match source.receive_batch(10).await {
+                Ok(b) if b.messages.is_empty() => {
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await
+                }
+                other => break other,
+            }
+        }
+    })
+    .await;
+    // Bounded decode failures surface as a closed stream (EndOfStream), never data.
+    assert!(
+        matches!(got, Ok(Err(_))),
+        "expected a consume error, got {got:?}"
+    );
+}
+
+#[cfg(feature = "compression")]
+#[tokio::test]
+async fn test_file_gzip_incremental_growth() {
+    // A second batch appended as a new gzip member to the same file must be
+    // picked up by an already-running consumer via the growth re-scan (which
+    // re-decompresses from the start and skips already-emitted records).
+    let dir = tempdir().unwrap();
+    let path = dir
+        .path()
+        .join("grow.jsonl.gz")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let config = FileConfig {
+        path,
+        format: FileFormat::Raw,
+        compression: Compression::Gzip,
+        ..Default::default()
+    };
+
+    let sink = FilePublisher::new(&config).await.unwrap();
+    let mut source = FileConsumer::new(&config).await.unwrap();
+
+    let a = msg!(json!({"seq": 1}));
+    sink.send_batch(vec![a.clone()]).await.unwrap();
+    assert_eq!(collect_compressed(&mut source, 1).await, vec![a.payload]);
+
+    // Append a second member after the consumer already drained the first.
+    let b = msg!(json!({"seq": 2}));
+    let c = msg!(json!({"seq": 3}));
+    sink.send_batch(vec![b.clone(), c.clone()]).await.unwrap();
+    assert_eq!(
+        collect_compressed(&mut source, 2).await,
+        vec![b.payload, c.payload]
+    );
+}
+
+#[cfg(feature = "compression")]
+#[tokio::test]
+async fn test_file_compression_rejects_unsupported_modes() {
+    let dir = tempdir().unwrap();
+    for mode in [
+        FileConsumerMode::Consume { delete: true },
+        FileConsumerMode::Subscribe { delete: false },
+        FileConsumerMode::Subscribe { delete: true },
+        FileConsumerMode::GroupSubscribe {
+            group_id: "g".to_string(),
+            read_from_tail: false,
+        },
+    ] {
+        let path = dir.path().join("m.gz").to_str().unwrap().to_string();
+        let config = FileConfig {
+            path,
+            format: FileFormat::Raw,
+            compression: Compression::Gzip,
+            mode: Some(mode.clone()),
+            ..Default::default()
+        };
+        assert!(
+            FileConsumer::new(&config).await.is_err(),
+            "expected rejection for mode {mode:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_file_sink_and_source_integration() {
+    // 1. Setup a temporary directory and file path
+    let dir = tempdir().unwrap();
+    let file_path = dir.path().join("test.log");
+    let file_path_str = file_path.to_str().unwrap().to_string();
+
+    // 2. Create a FileSink
+    let config = FileConfig {
+        path: file_path_str.clone(),
+        ..Default::default()
+    };
+    let sink = FilePublisher::new(&config).await.unwrap();
+
+    let msg1 = msg!(json!({"hello": "world"}));
+    let msg2 = msg!(json!({"foo": "bar"}));
+
+    sink.send_batch(vec![msg1.clone(), msg2.clone()])
+        .await
+        .unwrap();
+    // Explicitly flush to ensure data is written before we try to read it.
+    sink.flush().await.unwrap();
+    // Drop the sink to release the file lock on some OSes before the source tries to open it.
+    drop(sink);
+
+    // 4. Create a FileConsumer to read from the same file
+    let mut source = FileConsumer::new(&config).await.unwrap();
+
+    // 5. Receive the messages and verify them
+    let received1 = source.receive().await.unwrap();
+    let _ = (received1.commit)(crate::traits::MessageDisposition::Ack).await; // Commit is a no-op, but we should call it
+
+    assert_eq!(received1.message.message_id, msg1.message_id);
+    assert_eq!(received1.message.payload, msg1.payload);
+
+    let batch = source.receive_batch(1).await.unwrap();
+    let (received_msgs, commit2) = (batch.messages, batch.commit);
+    let len = received_msgs.len();
+    let received_msg2 = received_msgs.into_iter().next().unwrap();
+    let _ = commit2(vec![crate::traits::MessageDisposition::Ack; len]).await;
+    assert_eq!(received_msg2.message_id, msg2.message_id);
+    assert_eq!(received_msg2.payload, msg2.payload);
+
+    // 6. After draining, the consumer surfaces a one-shot empty batch (the
+    //    drain marker) so a route can pause or exit_on_empty can fire.
+    let drained = source.receive_batch(1).await.unwrap();
+    assert!(
+        drained.messages.is_empty(),
+        "Expected an empty drain marker after the file was drained"
+    );
+
+    // 7. With the marker already emitted and no new data, a further read
+    //    blocks (times out) until new data arrives.
+    let result = tokio::time::timeout(
+        std::time::Duration::from_millis(200),
+        source.receive_batch(1),
+    )
+    .await;
+    assert!(result.is_err(), "Expected timeout waiting for new data");
+}
+
+#[tokio::test]
+async fn test_file_sink_creates_directory() {
+    let dir = tempdir().unwrap();
+    let nested_dir_path = dir.path().join("nested");
+    let file_path = nested_dir_path.join("test.log");
+
+    let config = FileConfig {
+        path: file_path.to_str().unwrap().to_string(),
+        ..Default::default()
+    };
+    let sink_result = FilePublisher::new(&config).await;
+
+    assert!(sink_result.is_ok());
+    assert!(nested_dir_path.exists());
+    assert!(file_path.exists());
+}
+
+#[tokio::test]
+async fn test_file_consumer_consume_mode() {
+    let dir = tempdir().unwrap();
+    let file_path = dir.path().join("consume.log");
+    let file_path_str = file_path.to_str().unwrap().to_string();
+
+    // Write 3 lines
+    tokio::fs::write(&file_path, b"line1\nline2\nline3\n")
+        .await
+        .unwrap();
+
+    let config = FileConfig {
+        path: file_path_str,
+        mode: Some(FileConsumerMode::Consume { delete: true }),
+        ..Default::default()
+    };
+    let mut consumer = FileConsumer::new(&config).await.unwrap();
+
+    // Receive first message
+    let received1 = consumer.receive().await.unwrap();
+    assert_eq!(received1.message.payload.as_ref(), b"line1");
+
+    // Commit first message (should remove line1)
+    (received1.commit)(crate::traits::MessageDisposition::Ack)
+        .await
+        .unwrap();
+
+    // Verify file content - wait for async deletion
+    let mut content = String::new();
+    for _ in 0..20 {
+        content = tokio::fs::read_to_string(&file_path).await.unwrap();
+        if content == "line2\nline3\n" {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(content, "line2\nline3\n");
+
+    // Receive second message
+    let received2 = consumer.receive().await.unwrap();
+    assert_eq!(received2.message.payload.as_ref(), b"line2");
+    (received2.commit)(crate::traits::MessageDisposition::Ack)
+        .await
+        .unwrap();
+
+    // Receive third message
+    let received3 = consumer.receive().await.unwrap();
+    assert_eq!(received3.message.payload.as_ref(), b"line3");
+    (received3.commit)(crate::traits::MessageDisposition::Ack)
+        .await
+        .unwrap();
+
+    // Verify file is empty
+    for _ in 0..20 {
+        content = tokio::fs::read_to_string(&file_path).await.unwrap();
+        if content.is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(content, "");
+}
+
+#[tokio::test]
+async fn test_file_consumer_nack_behavior() {
+    let dir = tempdir().unwrap();
+    let file_path = dir.path().join("nack.log");
+    let file_path_str = file_path.to_str().unwrap().to_string();
+
+    // Write 2 lines
+    tokio::fs::write(&file_path, b"msg1\nmsg2\n").await.unwrap();
+
+    let config = FileConfig {
+        path: file_path_str.clone(),
+        mode: Some(FileConsumerMode::Consume { delete: true }),
+        ..Default::default()
+    };
+    let mut consumer = FileConsumer::new(&config).await.unwrap();
+
+    // 1. Receive batch (should get msg1)
+    let batch1 = consumer.receive_batch(1).await.unwrap();
+    assert_eq!(batch1.messages.len(), 1);
+    assert_eq!(batch1.messages[0].payload.as_ref(), b"msg1");
+
+    // 2. Nack the batch
+    (batch1.commit)(vec![crate::traits::MessageDisposition::Nack])
+        .await
+        .unwrap();
+
+    // 3. Receive again - should get msg1 again because it wasn't removed
+    let batch2 = consumer.receive_batch(1).await.unwrap();
+    assert_eq!(batch2.messages.len(), 1);
+    assert_eq!(batch2.messages[0].payload.as_ref(), b"msg1");
+
+    // 4. Ack
+    (batch2.commit)(vec![crate::traits::MessageDisposition::Ack])
+        .await
+        .unwrap();
+
+    // 5. Receive next - should get msg2
+    let batch3 = consumer.receive_batch(1).await.unwrap();
+    assert_eq!(batch3.messages.len(), 1);
+    assert_eq!(batch3.messages[0].payload.as_ref(), b"msg2");
+}
+
+#[tokio::test]
+async fn test_file_consumer_consume_no_delete() {
+    let dir = tempdir().unwrap();
+    let file_path = dir.path().join("consume_no_delete.log");
+    let file_path_str = file_path.to_str().unwrap().to_string();
+
+    // Write 3 lines
+    tokio::fs::write(&file_path, b"line1\nline2\nline3\n")
+        .await
+        .unwrap();
+
+    let config = FileConfig {
+        path: file_path_str.clone(),
+        ..Default::default()
+    };
+    let mut consumer = FileConsumer::new(&config).await.unwrap();
+
+    // Receive first message
+    let received1 = consumer.receive().await.unwrap();
+    assert_eq!(received1.message.payload.as_ref(), b"line1");
+
+    // Commit first message (should NOT remove line1)
+    (received1.commit)(crate::traits::MessageDisposition::Ack)
+        .await
+        .unwrap();
+
+    // Give some time for any potential (but unwanted) background deletion to happen
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    // Verify file content remains unchanged
+    let content = tokio::fs::read_to_string(&file_path).await.unwrap();
+    assert_eq!(content, "line1\nline2\nline3\n");
+
+    // Receive second message
+    let received2 = consumer.receive().await.unwrap();
+    assert_eq!(received2.message.payload.as_ref(), b"line2");
+}
+
+#[tokio::test]
+async fn test_file_consumer_subscribe_mode() {
+    let dir = tempdir().unwrap();
+    let file_path = dir.path().join("subscribe.log");
+    let file_path_str = file_path.to_str().unwrap().to_string();
+
+    // Write initial content
+    tokio::fs::write(&file_path, b"line1\n").await.unwrap();
+
+    let config = FileConfig {
+        path: file_path_str.clone(),
+        mode: Some(FileConsumerMode::Subscribe { delete: false }),
+        ..Default::default()
+    };
+
+    let mut consumer = FileConsumer::new(&config).await.unwrap();
+
+    // Give the background tailer a moment to initialize and find its starting position.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    // Append new line
+    {
+        let mut file = OpenOptions::new()
+            .append(true)
+            .open(&file_path)
+            .await
+            .unwrap();
+        file.write_all(b"line2\n").await.unwrap();
+    }
+
+    // Receive new line, skipping any empty drain marker emitted while the
+    // subscriber was caught up to the end of the file at startup.
+    let received2 = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let batch = consumer.receive_batch(2).await.unwrap();
+            if !batch.messages.is_empty() {
+                break batch;
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for appended line");
+    assert_eq!(received2.messages.len(), 1);
+    assert_eq!(received2.messages[0].payload.as_ref(), b"line2");
+    (received2.commit)(vec![crate::traits::MessageDisposition::Ack])
+        .await
+        .unwrap();
+
+    // Verify file content is unchanged
+    let content = tokio::fs::read_to_string(&file_path).await.unwrap();
+    assert_eq!(content, "line1\nline2\n");
+}
+
+#[tokio::test]
+async fn test_file_consumer_consume_explicit_delete() {
+    let dir = tempdir().unwrap();
+    let file_path = dir.path().join("consume_explicit_delete.log");
+    let file_path_str = file_path.to_str().unwrap().to_string();
+
+    tokio::fs::write(&file_path, b"line1\n").await.unwrap();
+
+    let config = FileConfig {
+        path: file_path_str.clone(),
+        mode: Some(FileConsumerMode::Consume { delete: true }),
+        ..Default::default()
+    };
+    let mut consumer = FileConsumer::new(&config).await.unwrap();
+
+    let received = consumer.receive().await.unwrap();
+    assert_eq!(received.message.payload.as_ref(), b"line1");
+
+    (received.commit)(crate::traits::MessageDisposition::Ack)
+        .await
+        .unwrap();
+
+    // Verify file becomes empty
+    let mut content = String::new();
+    for _ in 0..20 {
+        content = tokio::fs::read_to_string(&file_path).await.unwrap();
+        if content.is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(content, "");
+}
+
+#[tokio::test]
+async fn test_file_consumer_subscribe_with_delete() {
+    let dir = tempdir().unwrap();
+    let file_path = dir.path().join("subscribe_delete.log");
+    let file_path_str = file_path.to_str().unwrap().to_string();
+
+    tokio::fs::write(&file_path, b"line1\n").await.unwrap();
+
+    let config = FileConfig {
+        path: file_path_str.clone(),
+        mode: Some(FileConsumerMode::Subscribe { delete: true }),
+        ..Default::default()
+    };
+
+    let mut sub1 = FileConsumer::new(&config).await.unwrap();
+    let mut sub2 = FileConsumer::new(&config).await.unwrap();
+
+    let msg1 = sub1.receive().await.unwrap();
+    assert_eq!(msg1.message.payload.as_ref(), b"line1");
+
+    let msg2 = sub2.receive().await.unwrap();
+    assert_eq!(msg2.message.payload.as_ref(), b"line1");
+
+    // Sub1 acks. File should NOT be deleted yet.
+    (msg1.commit)(crate::traits::MessageDisposition::Ack)
+        .await
+        .unwrap();
+
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let content = tokio::fs::read_to_string(&file_path).await.unwrap();
+    assert_eq!(content, "line1\n");
+
+    // Sub2 acks. File should be deleted.
+    (msg2.commit)(crate::traits::MessageDisposition::Ack)
+        .await
+        .unwrap();
+
+    let mut content = String::new();
+    for _ in 0..20 {
+        content = tokio::fs::read_to_string(&file_path).await.unwrap();
+        if content.is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(content, "");
+}
+
+#[tokio::test]
+async fn test_file_consumer_subscribe_explicit_no_delete() {
+    let dir = tempdir().unwrap();
+    let file_path = dir.path().join("subscribe_no_delete.log");
+    let file_path_str = file_path.to_str().unwrap().to_string();
+
+    tokio::fs::write(&file_path, b"line1\n").await.unwrap();
+
+    let config = FileConfig {
+        path: file_path_str.clone(),
+        mode: Some(FileConsumerMode::Subscribe { delete: false }),
+        ..Default::default()
+    };
+
+    let mut consumer = FileConsumer::new(&config).await.unwrap();
+    // Give the background tailer a moment to initialize and find its starting position.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    {
+        let mut file = OpenOptions::new()
+            .append(true)
+            .open(&file_path)
+            .await
+            .unwrap();
+        file.write_all(b"line2\n").await.unwrap();
+    }
+
+    let received = consumer.receive().await.unwrap();
+    assert_eq!(received.message.payload.as_ref(), b"line2");
+
+    (received.commit)(crate::traits::MessageDisposition::Ack)
+        .await
+        .unwrap();
+
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let content = tokio::fs::read_to_string(&file_path).await.unwrap();
+    assert_eq!(content, "line1\nline2\n");
+}
+
+use crate::models::{Endpoint, EndpointType, Route};
+
+#[tokio::test]
+async fn test_route_file_consume_explicit_delete() {
+    let dir = tempdir().unwrap();
+    let file_path = dir.path().join("route_consume_explicit_delete.log");
+    let file_path_str = file_path.to_str().unwrap().to_string();
+    tokio::fs::write(&file_path, b"msg1\n").await.unwrap();
+
+    let input = Endpoint::new(EndpointType::File(FileConfig {
+        path: file_path_str.clone(),
+        mode: Some(FileConsumerMode::Consume { delete: true }),
+        ..Default::default()
+    }));
+    let output = Endpoint::new_memory("out_consume_explicit_delete", 10);
+    let route = Route::new(input, output.clone());
+
+    let handle = route
+        .run("test_route_consume_explicit_delete")
+        .await
+        .unwrap();
+
+    let channel = output.channel().unwrap();
+    // Wait for message
+    let mut received = Vec::new();
+    for _ in 0..20 {
+        if !channel.is_empty() {
+            received = channel.drain_messages();
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(received.len(), 1);
+    assert_eq!(&received[0].payload.to_vec(), b"msg1");
+
+    // Verify deletion
+    let mut content = String::new();
+    for _ in 0..20 {
+        content = tokio::fs::read_to_string(&file_path).await.unwrap();
+        if content.is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(content, "");
+
+    handle.stop().await;
+}
+
+#[tokio::test]
+async fn test_route_file_subscribe_with_delete() {
+    let dir = tempdir().unwrap();
+    let file_path = dir.path().join("route_subscribe_delete.log");
+    let file_path_str = file_path.to_str().unwrap().to_string();
+    tokio::fs::write(&file_path, b"msg1\n").await.unwrap();
+
+    let input = Endpoint::new(EndpointType::File(FileConfig {
+        path: file_path_str.clone(),
+        mode: Some(FileConsumerMode::Subscribe { delete: true }),
+        ..Default::default()
+    }));
+    let output = Endpoint::new_memory("out_subscribe_delete", 10);
+    let route = Route::new(input, output.clone());
+
+    let handle = route.run("test_route_subscribe_delete").await.unwrap();
+
+    let channel = output.channel().unwrap();
+    let mut received = Vec::new();
+    for _ in 0..20 {
+        if !channel.is_empty() {
+            received = channel.drain_messages();
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(received.len(), 1);
+
+    // Verify deletion
+    let mut content = String::new();
+    for _ in 0..20 {
+        content = tokio::fs::read_to_string(&file_path).await.unwrap();
+        if content.is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(content, "");
+
+    handle.stop().await;
+}
+
+#[tokio::test]
+async fn test_route_file_subscribe_explicit_no_delete() {
+    let dir = tempdir().unwrap();
+    let file_path = dir.path().join("route_subscribe_no_delete.log");
+    let file_path_str = file_path.to_str().unwrap().to_string();
+    tokio::fs::write(&file_path, b"msg1\n").await.unwrap();
+
+    let input = Endpoint::new(EndpointType::File(FileConfig {
+        path: file_path_str.clone(),
+        mode: Some(FileConsumerMode::Subscribe { delete: false }),
+        ..Default::default()
+    }));
+    let output = Endpoint::new_memory("out_subscribe_no_delete", 10);
+    let route = Route::new(input, output.clone());
+
+    let handle = route.run("test_route_subscribe_no_delete").await.unwrap();
+
+    let channel = output.channel().unwrap();
+    let mut received = Vec::new();
+    for _ in 0..20 {
+        if !channel.is_empty() {
+            received = channel.drain_messages();
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(received.len(), 0);
+
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let content = tokio::fs::read_to_string(&file_path).await.unwrap();
+    assert_eq!(content, "msg1\n");
+
+    handle.stop().await;
+}
+
+#[tokio::test]
+async fn test_route_file_consume_all_lines() {
+    let dir = tempdir().unwrap();
+    let file_path = dir.path().join("consume_all.log");
+    let file_path_str = file_path.to_str().unwrap().to_string();
+
+    // Write 10 lines
+    let mut content = String::new();
+    for i in 0..10 {
+        content.push_str(&format!("msg{}\n", i));
+    }
+    tokio::fs::write(&file_path, content).await.unwrap();
+
+    let input = Endpoint::new(EndpointType::File(FileConfig {
+        path: file_path_str.clone(),
+        mode: Some(FileConsumerMode::Consume { delete: true }),
+        ..Default::default()
+    }));
+    let output = Endpoint::new_memory("out_consume_all", 100);
+    let route = Route::new(input, output.clone());
+
+    let handle = route.run("test_route_consume_all").await.unwrap();
+
+    let channel = output.channel().unwrap();
+    // Wait for messages
+    let mut received_count = 0;
+    for _ in 0..100 {
+        received_count += channel.drain_messages().len();
+        if received_count >= 10 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(received_count, 10);
+
+    // Verify file is empty
+    let mut content = String::new();
+    for _ in 0..40 {
+        content = tokio::fs::read_to_string(&file_path).await.unwrap();
+        if content.is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(content, "");
+
+    handle.stop().await;
+}
+
+#[tokio::test]
+async fn test_file_consumer_group_id_persistence() {
+    let dir = tempdir().unwrap();
+    let file_path = dir.path().join("group_id.log");
+    let file_path_str = file_path.to_str().unwrap().to_string();
+    let offset_path = dir.path().join("group_id.log.my_group.offset");
+
+    // Write initial content
+    tokio::fs::write(&file_path, b"msg1\nmsg2\n").await.unwrap();
+
+    let config = FileConfig {
+        path: file_path_str.clone(),
+        mode: Some(FileConsumerMode::GroupSubscribe {
+            group_id: "my_group".to_string(),
+            read_from_tail: false,
+        }),
+        ..Default::default()
+    };
+
+    // 1. First consumer reads msg1
+    let mut consumer1 = FileConsumer::new(&config).await.unwrap();
+    // Allow thread to start
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let batch1 = consumer1.receive_batch(1).await.unwrap();
+    assert_eq!(batch1.messages[0].payload.as_ref(), b"msg1");
+
+    // Commit msg1 -> should write offset
+    (batch1.commit)(vec![crate::traits::MessageDisposition::Ack])
+        .await
+        .unwrap();
+
+    // Verify offset file exists and contains correct offset (length of "msg1\n" is 5)
+    let offset_content = tokio::fs::read_to_string(&offset_path).await.unwrap();
+    assert_eq!(offset_content, "5");
+
+    drop(consumer1);
+
+    // 2. Second consumer (simulating restart) should start from offset 5 (msg2)
+    let mut consumer2 = FileConsumer::new(&config).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let batch2 = consumer2.receive_batch(1).await.unwrap();
+    assert_eq!(batch2.messages[0].payload.as_ref(), b"msg2");
+
+    (batch2.commit)(vec![crate::traits::MessageDisposition::Ack])
+        .await
+        .unwrap();
+
+    // Verify offset updated (5 + length of "msg2\n" (5) = 10)
+    let offset_content = tokio::fs::read_to_string(&offset_path).await.unwrap();
+    assert_eq!(offset_content, "10");
+}
+
+#[tokio::test]
+async fn test_file_consumer_group_id_init_from_start() {
+    let dir = tempdir().unwrap();
+    let file_path = dir.path().join("group_id_start.log");
+    let file_path_str = file_path.to_str().unwrap().to_string();
+
+    // Write initial content
+    tokio::fs::write(&file_path, b"msg1\nmsg2\n").await.unwrap();
+
+    let config = FileConfig {
+        path: file_path_str.clone(),
+        mode: Some(FileConsumerMode::GroupSubscribe {
+            group_id: "my_group_start".to_string(),
+            read_from_tail: false,
+        }),
+        ..Default::default()
+    };
+
+    // Consumer should start from beginning (msg1)
+    let mut consumer = FileConsumer::new(&config).await.unwrap();
+    // Allow thread to start
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let batch = consumer.receive_batch(2).await.unwrap();
+    assert_eq!(batch.messages.len(), 2);
+    assert_eq!(batch.messages[0].payload.as_ref(), b"msg1");
+    assert_eq!(batch.messages[1].payload.as_ref(), b"msg2");
+}
+
+#[tokio::test]
+async fn test_file_tail_concurrent_publish_and_consume() {
+    // This test verifies that the tail reader can work concurrently with the publisher
+    // writing to the file. This is critical for Windows compatibility where file locking
+    // semantics may prevent concurrent access if not handled correctly.
+    // Note: Even though this runs in the same process, Windows file sharing modes are
+    // enforced per-handle. Since the consumer does not participate in the `FILE_LOCKS`
+    // mutex used by the publisher, this effectively tests that the OS allows the
+    // publisher to open/write while the consumer has the file open for reading.
+    let dir = tempdir().unwrap();
+    let file_path = dir.path().join("concurrent.log");
+    let file_path_str = file_path.to_str().unwrap().to_string();
+
+    // Create file with initial message
+    tokio::fs::write(&file_path, b"msg0\n").await.unwrap();
+
+    let config = FileConfig {
+        path: file_path_str.clone(),
+        mode: Some(FileConsumerMode::Subscribe { delete: false }),
+        ..Default::default()
+    };
+
+    // Start the tail consumer
+    let mut consumer = FileConsumer::new(&config).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    // Spawn a task that continuously publishes messages while the consumer is reading
+    let publisher_path = file_path_str.clone();
+    let publish_handle = tokio::spawn(async move {
+        let pub_config = FileConfig {
+            path: publisher_path,
+            mode: Some(FileConsumerMode::Subscribe { delete: false }),
+            ..Default::default()
+        };
+        let publisher = FilePublisher::new(&pub_config).await.unwrap();
+
+        // Send enough messages to ensure overlap between reading and writing
+        for i in 1..=100 {
+            let msg = msg!(json!({"id": i, "data": format!("message_{}", i)}));
+            publisher.send_batch(vec![msg]).await.unwrap();
+            // Small delay to allow consumer to catch up and potentially open the file
+            if i % 10 == 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }
+    });
+
+    // Consumer should be able to read messages while publisher is writing
+    let mut received_count = 0;
+    let mut message_ids = Vec::new();
+
+    // We expect 100 published messages (initial msg0 is skipped in Subscribe mode)
+    let expected_count = 100;
+    let start = std::time::Instant::now();
+
+    while received_count < expected_count {
+        if start.elapsed() > std::time::Duration::from_secs(10) {
+            break;
+        }
+        match tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            consumer.receive_batch(10),
+        )
+        .await
+        {
+            Ok(Ok(batch)) => {
+                for msg in &batch.messages {
+                    received_count += 1;
+                    if let Ok(json_msg) = serde_json::from_slice::<serde_json::Value>(&msg.payload)
+                    {
+                        if let Some(id) = json_msg.get("id").and_then(|v| v.as_i64()) {
+                            message_ids.push(id);
+                        }
+                    }
+                }
+                (batch.commit)(vec![
+                    crate::traits::MessageDisposition::Ack;
+                    batch.messages.len()
+                ])
+                .await
+                .unwrap();
+            }
+            Ok(Err(_)) => break, // Stream ended
+            Err(_) => continue,  // Timeout waiting for message
+        }
+    }
+
+    publish_handle.await.unwrap();
+
+    // Verify we received at least some messages from the publisher
+    // We should receive the messages from the concurrent publisher
+    assert_eq!(
+        received_count, expected_count,
+        "Expected {} messages, got {}. This may indicate file locking issues on this platform.",
+        expected_count, received_count
+    );
+
+    // Verify the file still exists and can be read (not locked/deleted)
+    let final_content = tokio::fs::read_to_string(&file_path)
+        .await
+        .expect("File should still be readable after concurrent access");
+    assert!(
+        !final_content.is_empty(),
+        "File should contain messages after concurrent access"
+    );
+}
+
+/// Simulates an external process (like a Python script or log writer) appending to the file.
+/// Unlike `test_file_tail_concurrent_publish_and_consume`, this test:
+/// 1. Does not use `FilePublisher` (bypassing internal `FILE_LOCKS`).
+/// 2. Keeps the file handle open across multiple writes (simulating a long-running writer),
+///    which stresses file locking/sharing semantics on OSs like Windows.
+#[tokio::test]
+async fn test_file_subscribe_concurrent_external_write() {
+    let dir = tempdir().unwrap();
+    let file_path = dir.path().join("external_write.log");
+    let file_path_str = file_path.to_str().unwrap().to_string();
+
+    // Create empty file
+    tokio::fs::write(&file_path, b"").await.unwrap();
+
+    let config = FileConfig {
+        path: file_path_str.clone(),
+        mode: Some(FileConsumerMode::Subscribe { delete: false }),
+        ..Default::default()
+    };
+
+    let mut consumer = FileConsumer::new(&config).await.unwrap();
+
+    // Give the background tailer a moment to initialize
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let file_path_clone = file_path.clone();
+    let write_task = tokio::spawn(async move {
+        let mut file = OpenOptions::new()
+            .append(true)
+            .open(&file_path_clone)
+            .await
+            .unwrap();
+
+        for i in 0..5 {
+            let line = format!("message {}\n", i);
+            file.write_all(line.as_bytes()).await.unwrap();
+            file.flush().await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    });
+
+    for i in 0..5 {
+        let received = tokio::time::timeout(std::time::Duration::from_secs(5), consumer.receive())
+            .await
+            .expect("Timed out waiting for message")
+            .unwrap();
+
+        let expected_payload = format!("message {}", i);
+        assert_eq!(received.message.get_payload_str().trim(), expected_payload);
+        (received.commit)(crate::traits::MessageDisposition::Ack)
+            .await
+            .unwrap();
+    }
+
+    write_task.await.unwrap();
+}
+
+#[tokio::test]
+async fn test_file_custom_delimiter() {
+    let dir = tempdir().unwrap();
+    let file_path = dir.path().join("custom_delim.log");
+    let file_path_str = file_path.to_str().unwrap().to_string();
+
+    let config = FileConfig {
+        path: file_path_str.clone(),
+        delimiter: Some("|".to_string()),
+        format: FileFormat::Raw,
+        mode: Some(FileConsumerMode::Consume { delete: false }),
+        ..Default::default()
+    };
+
+    let publisher = FilePublisher::new(&config).await.unwrap();
+    let mut consumer = FileConsumer::new(&config).await.unwrap();
+
+    let msg1 = crate::CanonicalMessage::from("msg1");
+    let msg2 = crate::CanonicalMessage::from("msg2");
+
+    publisher.send_batch(vec![msg1, msg2]).await.unwrap();
+    publisher.flush().await.unwrap();
+    drop(publisher); // Release lock
+
+    // Verify file content has pipes
+    let content = tokio::fs::read_to_string(&file_path).await.unwrap();
+    assert_eq!(content, "msg1|msg2|");
+
+    let received1 = consumer.receive().await.unwrap();
+    assert_eq!(received1.message.get_payload_str(), "msg1");
+
+    let received2 = consumer.receive().await.unwrap();
+    assert_eq!(received2.message.get_payload_str(), "msg2");
+}
+
+#[tokio::test]
+async fn test_file_xml_delimiter() {
+    let dir = tempdir().unwrap();
+    let file_path = dir.path().join("xml_delim.log");
+    let file_path_str = file_path.to_str().unwrap().to_string();
+
+    let config = FileConfig {
+        path: file_path_str.clone(),
+        delimiter: Some("</message>".to_string()),
+        format: FileFormat::Raw,
+        mode: Some(FileConsumerMode::Consume { delete: false }),
+        ..Default::default()
+    };
+
+    let publisher = FilePublisher::new(&config).await.unwrap();
+    let mut consumer = FileConsumer::new(&config).await.unwrap();
+
+    let msg1 = crate::CanonicalMessage::from("<xml>content1");
+    let msg2 = crate::CanonicalMessage::from("<xml>content2");
+
+    publisher.send_batch(vec![msg1, msg2]).await.unwrap();
+    publisher.flush().await.unwrap();
+    drop(publisher); // Release lock
+
+    // Verify file content has tags
+    let content = tokio::fs::read_to_string(&file_path).await.unwrap();
+    assert_eq!(content, "<xml>content1</message><xml>content2</message>");
+
+    let received1 = consumer.receive().await.unwrap();
+    assert_eq!(received1.message.get_payload_str(), "<xml>content1");
+
+    let received2 = consumer.receive().await.unwrap();
+    assert_eq!(received2.message.get_payload_str(), "<xml>content2");
+}
+
+#[tokio::test]
+async fn test_file_formats_and_fallbacks() {
+    let dir = tempdir().unwrap();
+
+    // 1. Test JSON Format Roundtrip
+    let json_path = dir.path().join("json.log");
+    let json_config = FileConfig {
+        path: json_path.to_str().unwrap().to_string(),
+        format: FileFormat::Json,
+        ..Default::default()
+    };
+
+    let json_publisher = FilePublisher::new(&json_config).await.unwrap();
+    let mut json_consumer = FileConsumer::new(&json_config).await.unwrap();
+
+    let json_payload = json!({"key": "value", "num": 123});
+    let msg = msg!(json_payload.clone());
+
+    json_publisher.send_batch(vec![msg.clone()]).await.unwrap();
+    json_publisher.flush().await.unwrap();
+    drop(json_publisher); // Release lock
+
+    let received = json_consumer.receive().await.unwrap();
+    let received_json: serde_json::Value =
+        serde_json::from_slice(&received.message.payload).unwrap();
+    assert_eq!(received_json, json_payload);
+    (received.commit)(crate::traits::MessageDisposition::Ack)
+        .await
+        .unwrap();
+
+    // 2. Test Text Format Roundtrip
+    let text_path = dir.path().join("text.log");
+    let text_config = FileConfig {
+        path: text_path.to_str().unwrap().to_string(),
+        format: FileFormat::Text,
+        ..Default::default()
+    };
+
+    let text_publisher = FilePublisher::new(&text_config).await.unwrap();
+    let mut text_consumer = FileConsumer::new(&text_config).await.unwrap();
+
+    let text_payload = "Hello World";
+    let msg = crate::CanonicalMessage::from(text_payload);
+
+    text_publisher.send_batch(vec![msg.clone()]).await.unwrap();
+    text_publisher.flush().await.unwrap();
+    drop(text_publisher);
+
+    let received = text_consumer.receive().await.unwrap();
+    assert_eq!(received.message.get_payload_str(), text_payload);
+    (received.commit)(crate::traits::MessageDisposition::Ack)
+        .await
+        .unwrap();
+
+    // 3. Test Fallback (Corrupted/Raw line in Json format)
+    // We append a raw line that isn't the expected JSON wrapper structure
+    {
+        let mut file = OpenOptions::new()
+            .append(true)
+            .open(&json_path)
+            .await
+            .unwrap();
+        file.write_all(b"Not a JSON wrapper\n").await.unwrap();
+    }
+
+    let received_fallback = json_consumer.receive().await.unwrap();
+    // Should be treated as raw
+    assert_eq!(
+        received_fallback.message.get_payload_str(),
+        "Not a JSON wrapper"
+    );
+    assert_eq!(
+        received_fallback
+            .message
+            .metadata
+            .get("mq_bridge.original_format")
+            .map(|s| s.as_str()),
+        Some("raw")
+    );
+}
+
+#[tokio::test]
+async fn test_file_csv_round_trip() {
+    let dir = tempdir().unwrap();
+    let file_path = dir.path().join("data.csv");
+    let file_path_str = file_path.to_str().unwrap().to_string();
+
+    let config = FileConfig {
+        path: file_path_str.clone(),
+        format: FileFormat::Csv,
+        ..Default::default()
+    };
+
+    let sink = FilePublisher::new(&config).await.unwrap();
+    let msg1 = msg!(json!({"name": "alice", "age": "30"}));
+    let msg2 = msg!(json!({"name": "bob", "age": "25"}));
+    sink.send_batch(vec![msg1, msg2]).await.unwrap();
+    sink.flush().await.unwrap();
+    drop(sink);
+
+    let content = tokio::fs::read_to_string(&file_path).await.unwrap();
+    assert_eq!(content, "age,name\n30,alice\n25,bob\n");
+
+    let mut source = FileConsumer::new(&config).await.unwrap();
+    let received1 = source.receive().await.unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&received1.message.payload).unwrap(),
+        json!({"name": "alice", "age": "30"})
+    );
+    let received2 = source.receive().await.unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&received2.message.payload).unwrap(),
+        json!({"name": "bob", "age": "25"})
+    );
+}
+
+#[tokio::test]
+async fn test_file_csv_value_types_and_escaping() {
+    let dir = tempdir().unwrap();
+    let file_path = dir.path().join("data.csv");
+    let config = FileConfig {
+        path: file_path.to_str().unwrap().to_string(),
+        format: FileFormat::Csv,
+        ..Default::default()
+    };
+
+    let sink = FilePublisher::new(&config).await.unwrap();
+    sink.send_batch(vec![
+        msg!(json!({
+            "a_num": 42,
+            "b_float": 1234.56,
+            "c_bool": true,
+            "d_null": null,
+            "e_quoted": "say \"hi\", ok",
+            "f_nested": {"x": 1},
+            "g_empty": ""
+        })),
+        msg!(json!({
+            "a_num": -7,
+            "b_float": 0.5,
+            "c_bool": false,
+            "d_null": null,
+            "e_quoted": "line\nbreak",
+            "f_nested": [1, 2],
+            "g_empty": "plain"
+        })),
+    ])
+    .await
+    .unwrap();
+    sink.flush().await.unwrap();
+    drop(sink);
+
+    let content = tokio::fs::read_to_string(&file_path).await.unwrap();
+    assert_eq!(
+        content,
+        "a_num,b_float,c_bool,d_null,e_quoted,f_nested,g_empty\n\
+         42,1234.56,true,null,\"say \"\"hi\"\", ok\",\"{\"\"x\"\":1}\",\n\
+         -7,0.5,false,null,\"line\nbreak\",\"[1,2]\",plain\n"
+    );
+}
+
+/// Keys containing JSON escapes cannot be borrowed from the payload, so they
+/// take the parsed-`Value` fallback path; the output must be identical.
+#[tokio::test]
+async fn test_file_csv_escaped_keys_fallback() {
+    let dir = tempdir().unwrap();
+    let file_path = dir.path().join("data.csv");
+    let config = FileConfig {
+        path: file_path.to_str().unwrap().to_string(),
+        format: FileFormat::Csv,
+        ..Default::default()
+    };
+
+    let sink = FilePublisher::new(&config).await.unwrap();
+    sink.send_batch(vec![msg!(json!({"we\"ird": 1, "plain": "x"}))])
+        .await
+        .unwrap();
+    sink.flush().await.unwrap();
+    drop(sink);
+
+    let content = tokio::fs::read_to_string(&file_path).await.unwrap();
+    assert_eq!(content, "plain,\"we\"\"ird\"\nx,1\n");
+}
+
+#[tokio::test]
+async fn test_file_csv_rejects_non_object_payload() {
+    let dir = tempdir().unwrap();
+    let file_path = dir.path().join("data.csv");
+    let config = FileConfig {
+        path: file_path.to_str().unwrap().to_string(),
+        format: FileFormat::Csv,
+        ..Default::default()
+    };
+
+    let sink = FilePublisher::new(&config).await.unwrap();
+    let result = sink.send_batch(vec![msg!(json!([1, 2, 3]))]).await.unwrap();
+    match result {
+        crate::outcomes::SentBatch::Partial { failed, .. } => assert_eq!(failed.len(), 1),
+        other => panic!("expected Partial, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_file_csv_rejects_empty_object_payload() {
+    // An empty object carries no columns; if it established the header, every later row
+    // in the file would be written against an empty column set.
+    let dir = tempdir().unwrap();
+    let file_path = dir.path().join("data.csv");
+    let config = FileConfig {
+        path: file_path.to_str().unwrap().to_string(),
+        format: FileFormat::Csv,
+        ..Default::default()
+    };
+
+    let sink = FilePublisher::new(&config).await.unwrap();
+    let result = sink
+        .send_batch(vec![msg!(json!({})), msg!(json!({"a": 1, "b": 2}))])
+        .await
+        .unwrap();
+    match result {
+        crate::outcomes::SentBatch::Partial { failed, .. } => assert_eq!(failed.len(), 1),
+        other => panic!("expected Partial, got {other:?}"),
+    }
+
+    // The surviving message still got a real header and row.
+    let content = tokio::fs::read_to_string(&file_path).await.unwrap();
+    assert_eq!(content.trim_end(), "a,b\n1,2");
+}
+
+#[cfg(feature = "compression")]
+#[tokio::test]
+async fn test_file_csv_compressed_roundtrip() {
+    // The header row goes into the first member only, so the decompressed stream is a
+    // plain CSV file even though it was written as two gzip members.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("data.csv.gz").to_str().unwrap().to_string();
+    let config = FileConfig {
+        path: path.clone(),
+        format: FileFormat::Csv,
+        compression: Compression::Gzip,
+        ..Default::default()
+    };
+
+    let sink = FilePublisher::new(&config).await.unwrap();
+    sink.send_batch(vec![
+        msg!(json!({"name": "alice", "age": "30"})),
+        msg!(json!({"name": "bob", "age": "25"})),
+    ])
+    .await
+    .unwrap();
+    sink.send_batch(vec![msg!(json!({"name": "carol", "age": "41"}))])
+        .await
+        .unwrap();
+    drop(sink);
+
+    let raw = std::fs::read(&path).unwrap();
+    let mut decoded = Vec::new();
+    std::io::Read::read_to_end(
+        &mut flate2::read::MultiGzDecoder::new(&raw[..]),
+        &mut decoded,
+    )
+    .unwrap();
+    assert_eq!(
+        String::from_utf8(decoded).unwrap(),
+        "age,name\n30,alice\n25,bob\n41,carol\n"
+    );
+
+    let mut source = FileConsumer::new(&config).await.unwrap();
+    let got = collect_compressed(&mut source, 3).await;
+    let rows: Vec<serde_json::Value> = got
+        .iter()
+        .map(|p| serde_json::from_slice(p).unwrap())
+        .collect();
+    assert_eq!(
+        rows,
+        vec![
+            json!({"age": "30", "name": "alice"}),
+            json!({"age": "25", "name": "bob"}),
+            json!({"age": "41", "name": "carol"}),
+        ]
+    );
+}
+
+#[cfg(feature = "encryption")]
+#[tokio::test]
+async fn test_file_csv_encrypted_roundtrip() {
+    use base64::Engine as _;
+
+    let dir = tempdir().unwrap();
+    let path = dir
+        .path()
+        .join("data.csv.enc")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let config = FileConfig {
+        path: path.clone(),
+        format: FileFormat::Csv,
+        encryption: Some(crate::models::EncryptionConfig {
+            key: base64::engine::general_purpose::STANDARD.encode([7u8; 32]),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    let sink = FilePublisher::new(&config).await.unwrap();
+    sink.send_batch(vec![msg!(json!({"name": "alice", "age": "30"}))])
+        .await
+        .unwrap();
+    sink.send_batch(vec![msg!(json!({"name": "bob", "age": "25"}))])
+        .await
+        .unwrap();
+    drop(sink);
+
+    // The rows and the header are ciphertext on disk.
+    let raw = std::fs::read(&path).unwrap();
+    assert!(!raw.windows(5).any(|w| w == b"alice"));
+    assert!(!raw.windows(4).any(|w| w == b"name"));
+
+    let mut source = FileConsumer::new(&config).await.unwrap();
+    let got = collect_compressed(&mut source, 2).await;
+    let rows: Vec<serde_json::Value> = got
+        .iter()
+        .map(|p| serde_json::from_slice(p).unwrap())
+        .collect();
+    assert_eq!(
+        rows,
+        vec![
+            json!({"age": "30", "name": "alice"}),
+            json!({"age": "25", "name": "bob"}),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn test_file_normal_format_preserves_id_of_raw_origin_message() {
+    // The sink's format decides the encoding, not the message's origin: a message that
+    // came from a `raw` file (or any endpoint that marks it raw) keeps its id and
+    // metadata when written to a `normal` file, so the id survives every hop.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("out.log").to_str().unwrap().to_string();
+    let config = FileConfig {
+        path: path.clone(),
+        ..Default::default()
+    };
+
+    let sink = FilePublisher::new(&config).await.unwrap();
+    let msg = crate::CanonicalMessage::from("hello")
+        .with_raw_format()
+        .with_metadata_kv("kind", "greeting");
+    let id = msg.message_id;
+    sink.send_batch(vec![msg]).await.unwrap();
+    drop(sink);
+
+    let mut source = FileConsumer::new(&config).await.unwrap();
+    let received = source.receive().await.unwrap().message;
+    assert_eq!(received.message_id, id);
+    assert_eq!(received.get_payload_str(), "hello");
+    assert_eq!(
+        received.metadata.get("kind").map(String::as_str),
+        Some("greeting")
+    );
+}
+
+#[cfg(feature = "compression")]
+#[tokio::test]
+async fn test_file_csv_compressed_restart_writes_no_second_header() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("d.csv.gz").to_str().unwrap().to_string();
+    let config = FileConfig {
+        path: path.clone(),
+        format: FileFormat::Csv,
+        compression: Compression::Gzip,
+        ..Default::default()
+    };
+    let sink = FilePublisher::new(&config).await.unwrap();
+    sink.send_batch(vec![msg!(json!({"name": "alice", "age": "30"}))])
+        .await
+        .unwrap();
+    drop(sink);
+    // Fresh publisher (process restart): the header must not be written again.
+    let sink = FilePublisher::new(&config).await.unwrap();
+    sink.send_batch(vec![msg!(json!({"name": "bob", "age": "25"}))])
+        .await
+        .unwrap();
+    drop(sink);
+
+    let raw = std::fs::read(&path).unwrap();
+    let mut decoded = Vec::new();
+    std::io::Read::read_to_end(
+        &mut flate2::read::MultiGzDecoder::new(&raw[..]),
+        &mut decoded,
+    )
+    .unwrap();
+    assert_eq!(
+        String::from_utf8(decoded).unwrap(),
+        "age,name\n30,alice\n25,bob\n"
+    );
+}
+
+/// `normal`/`text` decode the payload in one pass (see `RawPayload`), with a
+/// fallback to JSON text for anything that is not a byte array. Every shape a
+/// payload can take is pinned here, because the fast path and the fallback have
+/// to agree with what the previous `serde_json::Value` decode produced.
+#[test]
+fn test_parse_message_payload_shapes() {
+    use crate::endpoints::file::parse_message;
+
+    let line = |payload: &str| {
+        format!(r#"{{"message_id":"019f9b12-d786-7ebe-a7ec-a1aa71bc47ae","payload":{payload}}}"#)
+            .into_bytes()
+    };
+    let decoded = |payload: &str, format: FileFormat| -> Vec<u8> {
+        let mut header = None;
+        parse_message(&line(payload), &format, &mut header)
+            .expect("line decodes")
+            .payload
+            .to_vec()
+    };
+
+    // Byte arrays — the fast path — become the bytes themselves.
+    assert_eq!(decoded("[104,105]", FileFormat::Normal), b"hi");
+    assert_eq!(decoded("[]", FileFormat::Normal), b"");
+    assert_eq!(decoded("[0,255]", FileFormat::Normal), vec![0u8, 255]);
+    // A string payload is taken verbatim.
+    assert_eq!(decoded(r#""hi""#, FileFormat::Normal), b"hi");
+    assert_eq!(decoded(r#""hi""#, FileFormat::Text), b"hi");
+
+    // Anything that is not a byte array falls back to its JSON text, including
+    // arrays that only stop being byte-like partway through.
+    assert_eq!(decoded("[1,2,300]", FileFormat::Normal), b"[1,2,300]");
+    assert_eq!(decoded("[1,-2]", FileFormat::Normal), b"[1,-2]");
+    assert_eq!(decoded("[1.5]", FileFormat::Normal), b"[1.5]");
+    assert_eq!(decoded(r#"[1,"a"]"#, FileFormat::Normal), br#"[1,"a"]"#);
+    assert_eq!(decoded("[[1],2]", FileFormat::Normal), b"[[1],2]");
+    assert_eq!(decoded("[null]", FileFormat::Normal), b"[null]");
+    assert_eq!(decoded(r#"{"a":1}"#, FileFormat::Normal), br#"{"a":1}"#);
+    assert_eq!(decoded("5", FileFormat::Normal), b"5");
+    assert_eq!(decoded("true", FileFormat::Normal), b"true");
+    assert_eq!(decoded("null", FileFormat::Normal), b"null");
+
+    // `json` keeps the payload as a JSON value, so a byte array stays an array.
+    assert_eq!(decoded("[104,105]", FileFormat::Json), b"[104,105]");
+
+    // message_id and metadata survive the fast path.
+    let mut header = None;
+    let msg = parse_message(
+        br#"{"message_id":"019f9b12-d786-7ebe-a7ec-a1aa71bc47ae","payload":[104,105],"metadata":{"k":"v"}}"#,
+        &FileFormat::Normal,
+        &mut header,
+    )
+    .expect("line decodes");
+    assert_eq!(msg.payload.to_vec(), b"hi");
+    assert_eq!(msg.metadata.get("k").map(String::as_str), Some("v"));
+    assert_eq!(
+        format!("{:032x}", msg.message_id),
+        "019f9b12d7867ebea7eca1aa71bc47ae"
+    );
+
+    // A line that is not the promised envelope is kept verbatim and marked.
+    let mut header = None;
+    let msg =
+        parse_message(b"not json at all", &FileFormat::Normal, &mut header).expect("line decodes");
+    assert_eq!(msg.payload.to_vec(), b"not json at all");
+    assert_eq!(
+        msg.metadata
+            .get("mq_bridge.original_format")
+            .map(String::as_str),
+        Some("raw")
+    );
+}

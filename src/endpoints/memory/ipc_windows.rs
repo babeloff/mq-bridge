@@ -5,6 +5,7 @@
 
 #![cfg(windows)]
 
+use super::framed::{self, FramedIo};
 use super::transport::TransportChannel;
 use crate::CanonicalMessage;
 use anyhow::{anyhow, Result};
@@ -13,12 +14,24 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
 };
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::windows::named_pipe::{
     ClientOptions, NamedPipeClient, NamedPipeServer, ServerOptions,
 };
 use tokio::sync::Mutex;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
+
+/// Server-side pipe state.
+///
+/// A named pipe must be connected before it can be framed, so the raw handle is
+/// held until the first client arrives.
+enum ServerState {
+    /// Created, waiting for a client.
+    Idle(NamedPipeServer),
+    /// Connected and wrapped in the codec.
+    Connected(FramedIo<NamedPipeServer>),
+    /// Transient state while transitioning.
+    Empty,
+}
 
 /// Windows Named Pipe transport for local IPC
 #[derive(Clone)]
@@ -29,11 +42,10 @@ pub struct WindowsIpcTransport {
 struct WindowsIpcTransportInner {
     pipe_name: String,
     capacity: usize,
-    // For server mode (consumer)
-    server: Mutex<Option<NamedPipeServer>>,
-    // For client mode (publisher)
-    client: Mutex<Option<NamedPipeClient>>,
-    connected: Mutex<bool>,
+    // Consumer side.
+    server: Mutex<ServerState>,
+    // Publisher side.
+    client: Mutex<Option<FramedIo<NamedPipeClient>>>,
     closed: AtomicBool,
 }
 
@@ -53,9 +65,8 @@ impl WindowsIpcTransport {
             inner: Arc::new(WindowsIpcTransportInner {
                 pipe_name: full_path,
                 capacity,
-                server: Mutex::new(Some(server)),
+                server: Mutex::new(ServerState::Idle(server)),
                 client: Mutex::new(None),
-                connected: Mutex::new(false),
                 closed: AtomicBool::new(false),
             }),
         })
@@ -74,60 +85,57 @@ impl WindowsIpcTransport {
             inner: Arc::new(WindowsIpcTransportInner {
                 pipe_name: full_path,
                 capacity,
-                server: Mutex::new(None),
-                client: Mutex::new(Some(client)),
-                connected: Mutex::new(true),
+                server: Mutex::new(ServerState::Empty),
+                client: Mutex::new(Some(framed::wrap(client))),
                 closed: AtomicBool::new(false),
             }),
         })
     }
 
-    /// Send a length-prefixed frame
-    async fn send_frame<W>(pipe: &mut W, data: &[u8]) -> Result<()>
-    where
-        W: AsyncWrite + Unpin + Send,
-    {
-        let len = data.len() as u32;
-        pipe.write_all(&len.to_be_bytes()).await?;
-        pipe.write_all(data).await?;
-        pipe.flush().await?;
-        Ok(())
-    }
-
-    /// Receive a length-prefixed frame
-    async fn recv_frame<R>(pipe: &mut R) -> Result<Vec<u8>>
-    where
-        R: AsyncRead + Unpin + Send,
-    {
-        let mut len_bytes = [0u8; 4];
-        pipe.read_exact(&mut len_bytes).await?;
-        let len = u32::from_be_bytes(len_bytes) as usize;
-
-        // Sanity check: limit frame size to 100MB
-        if len > 100 * 1024 * 1024 {
-            return Err(anyhow!("Frame too large: {} bytes", len));
-        }
-
-        let mut data = vec![0u8; len];
-        pipe.read_exact(&mut data).await?;
-        Ok(data)
-    }
-
     /// Wait for a client connection (server mode)
     pub async fn wait_for_connection(&self) -> Result<()> {
-        if *self.inner.connected.lock().await {
-            return Ok(());
+        let mut guard = self.inner.server.lock().await;
+        match std::mem::replace(&mut *guard, ServerState::Empty) {
+            ServerState::Connected(conn) => {
+                *guard = ServerState::Connected(conn);
+                Ok(())
+            }
+            ServerState::Idle(server) => {
+                match server.connect().await {
+                    Ok(()) => {
+                        debug!(pipe = %self.inner.pipe_name, "Client connected to Named Pipe");
+                        *guard = ServerState::Connected(framed::wrap(server));
+                        Ok(())
+                    }
+                    Err(e) => {
+                        // Keep the handle so a later attempt can retry.
+                        *guard = ServerState::Idle(server);
+                        Err(e.into())
+                    }
+                }
+            }
+            ServerState::Empty => Err(anyhow!(
+                "Windows Named Pipe transport not in server mode: {}",
+                self.inner.pipe_name
+            )),
         }
+    }
 
-        let mut server_guard = self.inner.server.lock().await;
-        if let Some(server) = server_guard.as_mut() {
-            server.connect().await?;
-            *self.inner.connected.lock().await = true;
-            debug!(pipe = %self.inner.pipe_name, "Client connected to Named Pipe");
-            Ok(())
-        } else {
-            Err(anyhow!("Windows Named Pipe transport not in server mode"))
-        }
+    /// Whether a read error means the peer hung up (so we should re-accept) rather than a
+    /// fatal fault. Mirrors `is_disconnected` in ipc_unix.rs.
+    fn is_disconnected(error: &anyhow::Error) -> bool {
+        error
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io_error| {
+                matches!(
+                    io_error.kind(),
+                    std::io::ErrorKind::UnexpectedEof
+                        | std::io::ErrorKind::BrokenPipe
+                        | std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::ConnectionAborted
+                        | std::io::ErrorKind::NotConnected
+                )
+            })
     }
 }
 
@@ -138,58 +146,96 @@ impl TransportChannel for WindowsIpcTransport {
             return Err(anyhow!("Windows Named Pipe transport is closed"));
         }
 
-        // Serialize the batch using MessagePack
-        let data = rmp_serde::to_vec(&messages)?;
-
+        // Only the publisher side sends; see the matching guard in ipc_unix.rs.
         let mut client_guard = self.inner.client.lock().await;
-        if let Some(client) = client_guard.as_mut() {
-            Self::send_frame(client, &data).await?;
+        if let Some(conn) = client_guard.as_mut() {
+            let bytes = framed::send_batch(conn, &messages, &self.inner.pipe_name).await?;
             debug!(
                 pipe = %self.inner.pipe_name,
                 count = messages.len(),
-                bytes = data.len(),
+                bytes,
                 "Sent batch via Named Pipe"
             );
             Ok(())
         } else {
-            Err(anyhow!("Windows Named Pipe transport not in client mode"))
+            Err(anyhow!(
+                "Windows Named Pipe transport at '{}' is the consumer (server) side and cannot \
+                 send; the pipe carries publisher -> consumer traffic only",
+                self.inner.pipe_name
+            ))
         }
     }
 
     async fn recv_batch(&self) -> Result<Vec<CanonicalMessage>> {
-        if self.inner.closed.load(Ordering::SeqCst) {
-            return Err(anyhow!("Windows Named Pipe transport is closed"));
-        }
+        loop {
+            if self.inner.closed.load(Ordering::SeqCst) {
+                return Err(anyhow!("Windows Named Pipe transport is closed"));
+            }
 
-        // Wait for connection if we haven't connected yet (server mode)
-        self.wait_for_connection().await?;
-        let mut server_guard = self.inner.server.lock().await;
-        if let Some(server) = server_guard.as_mut() {
-            let data = Self::recv_frame(server).await?;
-            let messages: Vec<CanonicalMessage> = rmp_serde::from_slice(&data)?;
-            debug!(
-                pipe = %self.inner.pipe_name,
-                count = messages.len(),
-                bytes = data.len(),
-                "Received batch via Named Pipe"
-            );
-            Ok(messages)
-        } else {
-            Err(anyhow!("Windows Named Pipe transport not in server mode"))
+            // Wait for connection if we haven't connected yet (server mode)
+            self.wait_for_connection().await?;
+
+            let read_result = {
+                let mut guard = self.inner.server.lock().await;
+                let ServerState::Connected(conn) = &mut *guard else {
+                    return Err(anyhow!(
+                        "Windows Named Pipe transport not in server mode: {}",
+                        self.inner.pipe_name
+                    ));
+                };
+                framed::recv_batch(conn).await
+            };
+
+            match read_result {
+                Ok(messages) => {
+                    debug!(
+                        pipe = %self.inner.pipe_name,
+                        count = messages.len(),
+                        "Received batch via Named Pipe"
+                    );
+                    return Ok(messages);
+                }
+                // The client went away. Drop the spent handle and stand up a fresh pipe
+                // instance so the next publisher reconnect is served, mirroring ipc_unix.rs.
+                Err(error) if Self::is_disconnected(&error) => {
+                    warn!(pipe = %self.inner.pipe_name, error = %error, "Named Pipe peer disconnected; waiting for a new connection");
+                    let mut guard = self.inner.server.lock().await;
+                    match ServerOptions::new().create(&self.inner.pipe_name) {
+                        Ok(server) => *guard = ServerState::Idle(server),
+                        Err(e) => {
+                            *guard = ServerState::Empty;
+                            return Err(anyhow!(
+                                "Failed to recreate Named Pipe instance at '{}': {}",
+                                self.inner.pipe_name,
+                                e
+                            ));
+                        }
+                    }
+                }
+                Err(error) => return Err(error),
+            }
         }
     }
 
     fn try_recv_batch(&self) -> Result<Option<Vec<CanonicalMessage>>> {
-        // Named pipes don't support non-blocking try_recv in the same way
-        // This would require a more complex implementation with polling
-        // For now, return None to indicate no immediate data available
-        Ok(None)
+        let Ok(mut guard) = self.inner.server.try_lock() else {
+            return Ok(None);
+        };
+        let ServerState::Connected(conn) = &mut *guard else {
+            return Ok(None);
+        };
+        framed::try_recv_batch(conn)
     }
 
     fn len(&self) -> usize {
-        // Named pipes don't have a concept of queued messages
-        // Return 0 as we don't buffer
-        0
+        // Whole frames already buffered by the codec, i.e. readable without IO.
+        match self.inner.server.try_lock() {
+            Ok(guard) => match &*guard {
+                ServerState::Connected(conn) => framed::buffered_frames(conn),
+                _ => 0,
+            },
+            Err(_) => 0,
+        }
     }
 
     fn capacity(&self) -> Option<usize> {
@@ -213,7 +259,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_windows_pipe_roundtrip() {
-        let pipe_name = format!("mq-bridge-test-{}", uuid::Uuid::new_v4());
+        let pipe_name = format!("mq-bridge-test-{}", fast_uuid_v7::gen_id_str());
 
         // Create server
         let server = WindowsIpcTransport::new_server(&pipe_name, 10)
@@ -245,7 +291,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_windows_pipe_close() {
-        let pipe_name = format!("mq-bridge-test-{}", uuid::Uuid::new_v4());
+        let pipe_name = format!("mq-bridge-test-{}", fast_uuid_v7::gen_id_str());
 
         let server = WindowsIpcTransport::new_server(&pipe_name, 10)
             .await
@@ -255,6 +301,51 @@ mod tests {
         server.close();
         assert!(server.is_closed());
     }
-}
 
-// Made with Bob
+    /// The server end must refuse to send rather than strand messages in a
+    /// publisher's receive buffer.
+    #[tokio::test]
+    async fn test_windows_pipe_server_cannot_send() {
+        let pipe_name = format!("mq-bridge-test-{}", fast_uuid_v7::gen_id_str());
+
+        let server = WindowsIpcTransport::new_server(&pipe_name, 10)
+            .await
+            .unwrap();
+
+        let err = server
+            .send_batch(vec![CanonicalMessage::from_vec(b"nope")])
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("cannot send"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// Cancelling a read mid-frame must not desync the connection.
+    #[tokio::test]
+    async fn test_windows_pipe_cancelled_receive_loses_nothing() {
+        let pipe_name = format!("mq-bridge-test-{}", fast_uuid_v7::gen_id_str());
+
+        let server = WindowsIpcTransport::new_server(&pipe_name, 10)
+            .await
+            .unwrap();
+        let client = WindowsIpcTransport::new_client(&pipe_name, 10)
+            .await
+            .unwrap();
+        server.wait_for_connection().await.unwrap();
+
+        tokio::select! {
+            _ = server.recv_batch() => panic!("nothing has been sent yet"),
+            _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {}
+        }
+
+        client
+            .send_batch(vec![CanonicalMessage::from_vec(b"after-cancel")])
+            .await
+            .unwrap();
+
+        let received = server.recv_batch().await.unwrap();
+        assert_eq!(received[0].payload.as_ref(), b"after-cancel");
+    }
+}

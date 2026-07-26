@@ -200,6 +200,21 @@
         "max_delay_ms"
       ]
     },
+    "CipherKind": {
+      "description": "AEAD cipher selection for [`EncryptionConfig`].",
+      "oneOf": [
+        {
+          "description": "XChaCha20-Poly1305 (default): 192-bit random nonce, safe at high message rates.",
+          "type": "string",
+          "const": "xchacha20poly1305"
+        },
+        {
+          "description": "AES-256-GCM: 96-bit random nonce; prefer the default for very high volumes.",
+          "type": "string",
+          "const": "aes256gcm"
+        }
+      ]
+    },
     "ClickHouseConfig": {
       "description": "ClickHouse endpoint configuration (talks the ClickHouse HTTP interface).\n\nAs a **publisher** it batch-inserts messages using `FORMAT JSONEachRow` — by default the whole\nmessage payload (which must be a JSON object) becomes one row; set `columns` to build each row\nfrom explicit `${payload:<field>}` / `${metadata:<key>}` tokens instead. As a **consumer** it\nreads an existing table **non-destructively** by paging over a monotonic `cursor_column`\n(ClickHouse has no native queue/pub-sub), serializing each row to a JSON payload.",
       "type": "object",
@@ -226,6 +241,11 @@
           "additionalProperties": {
             "type": "string"
           }
+        },
+        "compression": {
+          "description": "HTTP body compression for inserts and cursor reads (`none`, `gzip`, `lz4`, `zstd`). Applied\nas `Content-Encoding` on the request body and negotiated on the response via `Accept-Encoding`.\n`lz4`/`zstd` are faster than `gzip`; all are understood natively by ClickHouse. Defaults to `gzip`.",
+          "$ref": "#/$defs/Compression",
+          "default": "gzip"
         },
         "connect_timeout_ms": {
           "description": "Connection (TCP + TLS handshake) timeout in milliseconds. Defaults to 10000ms.",
@@ -344,6 +364,31 @@
         "table"
       ]
     },
+    "Compression": {
+      "description": "Compression algorithm. Used for at-rest batches (file, object_store) and for HTTP\nbody compression (http, clickhouse). Orthogonal to `format`.",
+      "oneOf": [
+        {
+          "description": "No compression (default).",
+          "type": "string",
+          "const": "none"
+        },
+        {
+          "description": "gzip; each batch is a self-contained member, so files stay readable with `zcat`.",
+          "type": "string",
+          "const": "gzip"
+        },
+        {
+          "description": "lz4 frame format; each batch is a self-contained frame (`lz4 -d` compatible).",
+          "type": "string",
+          "const": "lz4"
+        },
+        {
+          "description": "zstd; each batch is a self-contained frame, concatenated frames decode as one\nstream (`zstd -d` compatible). Better ratio than lz4, still fast.",
+          "type": "string",
+          "const": "zstd"
+        }
+      ]
+    },
     "CookieJarMiddleware": {
       "description": "Cookie/session jar middleware configuration.\n\nOptimized for HTTP by default: it can read `cookie` and `set-cookie` metadata,\npersist session cookies, and inject them into later outgoing requests.\n\nThe middleware can also capture arbitrary metadata values into the same session store\nand optionally expose stored values back into message metadata.",
       "type": "object",
@@ -444,6 +489,60 @@
         "delay_ms"
       ]
     },
+    "DetailedMappingRule": {
+      "description": "Full mapping form with a fallback value and/or a presence requirement.",
+      "type": "object",
+      "properties": {
+        "default": {
+          "description": "Value used when the source path is absent."
+        },
+        "path": {
+          "description": "Source path in the input document (e.g. `$.user.id`, `user.id`, `$.items[0]`).",
+          "type": "string"
+        },
+        "required": {
+          "description": "Reject the message when the source path is absent and no `default` is set.",
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "path"
+      ]
+    },
+    "EncryptionConfig": {
+      "description": "AEAD encryption settings, shared by the `encryption` middleware (per-message\npayload encryption) and the at-rest `encryption` field of the file and\nobject_store endpoints. Requires the `encryption` feature.",
+      "type": "object",
+      "properties": {
+        "cipher": {
+          "description": "AEAD cipher. Defaults to `xchacha20poly1305`.",
+          "$ref": "#/$defs/CipherKind",
+          "default": "xchacha20poly1305"
+        },
+        "decrypt_keys": {
+          "description": "Extra `key_id -> base64 key` entries accepted when decrypting (key rotation).",
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "key": {
+          "description": "Base64-encoded 32-byte key. Supports `${env:VAR}` to read it from the environment.",
+          "type": "string",
+          "format": "password"
+        },
+        "key_id": {
+          "description": "Key identifier written into each envelope; selects the key when decrypting. Defaults to `default`.",
+          "type": "string",
+          "default": "default"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "key"
+      ]
+    },
     "Endpoint": {
       "description": "Represents a connection point for messages, which can be a source (input) or a sink (output).",
       "type": "object",
@@ -515,6 +614,7 @@
         },
         {
           "type": "object",
+          "format": "structural_endpoint",
           "properties": {
             "static": {
               "$ref": "#/$defs/StaticConfig"
@@ -526,6 +626,7 @@
         },
         {
           "type": "object",
+          "format": "structural_endpoint",
           "properties": {
             "ref": {
               "type": "string"
@@ -691,6 +792,7 @@
         },
         {
           "type": "object",
+          "format": "structural_endpoint",
           "properties": {
             "fanout": {
               "type": "array",
@@ -705,6 +807,7 @@
         },
         {
           "type": "object",
+          "format": "structural_endpoint",
           "properties": {
             "stream_buffer": {
               "$ref": "#/$defs/StreamBufferConfig"
@@ -716,6 +819,7 @@
         },
         {
           "type": "object",
+          "format": "structural_endpoint",
           "properties": {
             "switch": {
               "$ref": "#/$defs/SwitchConfig"
@@ -727,6 +831,7 @@
         },
         {
           "type": "object",
+          "format": "structural_endpoint",
           "properties": {
             "response": {
               "$ref": "#/$defs/ResponseConfig"
@@ -738,6 +843,7 @@
         },
         {
           "type": "object",
+          "format": "structural_endpoint",
           "properties": {
             "reader": {
               "$ref": "#/$defs/Endpoint"
@@ -749,6 +855,19 @@
         },
         {
           "type": "object",
+          "format": "structural_endpoint",
+          "properties": {
+            "request": {
+              "$ref": "#/$defs/RequestForwardConfig"
+            }
+          },
+          "required": [
+            "request"
+          ]
+        },
+        {
+          "type": "object",
+          "format": "structural_endpoint",
           "properties": {
             "custom": {
               "type": "object",
@@ -815,12 +934,29 @@
     "FileConfig": {
       "type": "object",
       "properties": {
+        "compression": {
+          "description": "Per-batch compression (`none`, `gzip`, `lz4`, `zstd`). Requires the `compression` feature; consume mode only.",
+          "$ref": "#/$defs/Compression",
+          "default": "none"
+        },
         "delimiter": {
           "description": "Optional delimiter for messages. Defaults to newline (\"\\n\").\nCan be a string or a hex sequence (e.g. \"0x00\").\nCurrently only single-byte delimiters are supported.",
           "type": [
             "string",
             "null"
           ]
+        },
+        "encryption": {
+          "description": "At-rest AEAD encryption applied after compression. Requires the `encryption` feature; consume mode only.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/EncryptionConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
         },
         "format": {
           "description": "The format for writing messages to the file (Publisher) or interpreting them (Consumer). Defaults to `normal`.",
@@ -1078,10 +1214,17 @@
           "format": "uint",
           "minimum": 0
         },
+        "compression": {
+          "description": "(Publisher only) Codec for the request body (`none`, `gzip`, `lz4`, `zstd`); overrides\n`compression_enabled`. `lz4` is non-standard (mq-bridge peers only). Ignored on a consumer —\nenable response compression with `compression_enabled`. Defaults to `none`.",
+          "$ref": "#/$defs/Compression",
+          "default": "none"
+        },
         "compression_enabled": {
-          "description": "Enable gzip compression for request/response bodies exceeding the threshold. Defaults to false.",
-          "type": "boolean",
-          "default": false
+          "description": "Turns compression on. Publisher: compress the request body with gzip (unless `compression`\nsets another codec). Consumer: compress responses, negotiating the best codec the client's\n`Accept-Encoding` accepts. Defaults to off.",
+          "type": [
+            "boolean",
+            "null"
+          ]
         },
         "compression_threshold_bytes": {
           "description": "Minimum message size in bytes to compress. Messages smaller than this are sent uncompressed. Defaults to 1024 bytes.",
@@ -1551,6 +1694,19 @@
         "messages_per_second"
       ]
     },
+    "MappingRule": {
+      "description": "How one output field is produced from the input document.\n\nEither a bare path string (`\"$.first_name\"`) or an object with a `path` plus an\noptional `default` and `required` flag.",
+      "anyOf": [
+        {
+          "description": "Shorthand: just the source path.",
+          "type": "string"
+        },
+        {
+          "description": "Full form with a fallback value and/or a presence requirement.",
+          "$ref": "#/$defs/DetailedMappingRule"
+        }
+      ]
+    },
     "MemoryConfig": {
       "type": "object",
       "properties": {
@@ -1743,6 +1899,30 @@
         {
           "type": "object",
           "properties": {
+            "transform": {
+              "$ref": "#/$defs/TransformMiddleware"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "transform"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "encryption": {
+              "$ref": "#/$defs/EncryptionConfig"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "encryption"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
             "custom": {
               "type": "object",
               "properties": {
@@ -1768,7 +1948,7 @@
       "description": "How a MongoDB endpoint consumes a collection. One intent-named selector — the bridge picks the\nunderlying mechanism (change stream vs. polling) automatically. Defaults to `consumer`.",
       "oneOf": [
         {
-          "description": "**Queue** — durably drain a queue collection: claim, process, resume after restart. Default.",
+          "description": "**Queue** — competing consumers: claim, process, delete, so each document goes to exactly one\nreader. Default. Destructive and ~5x slower than `capture_all`; for jobs, not bulk reads.",
           "type": "string",
           "const": "consumer"
         },
@@ -1778,12 +1958,12 @@
           "const": "subscriber"
         },
         {
-          "description": "**Watch existing collection** — capture changes from now on (insert/update/delete), resuming\nunder `cursor_id`. Reads an existing collection non-destructively.",
+          "description": "**Watch existing collection** — capture changes from now on (insert/update/delete), resuming\nunder `cursor_id`. Reads an existing collection non-destructively; never ends on drain.",
           "type": "string",
           "const": "capture_new"
         },
         {
-          "description": "**Watch existing collection** — read the existing documents first, then capture changes.\nReads an existing collection non-destructively.",
+          "description": "**Watch existing collection** — read the existing documents first, then capture changes.\nNon-destructive and the fastest read mode; use this for bulk reads and ETL.",
           "type": "string",
           "const": "capture_all"
         }
@@ -1822,7 +2002,7 @@
           ]
         },
         "consume": {
-          "description": "(Consumer only) How to consume the collection: `consumer` (default, durable queue),\n`subscriber` (ephemeral queue), `capture_new` (watch an existing collection for changes), or\n`capture_all` (read existing documents first, then watch for changes). The bridge selects the\nunderlying mechanism automatically. If unset, the deprecated `change_stream` boolean is\nhonored for backward compatibility.",
+          "description": "(Consumer only) How to consume the collection: `consumer` (default, competing-consumers work\nqueue — destructive and ~5x slower), `subscriber` (ephemeral queue), `capture_new` (watch an\nexisting collection for changes), or `capture_all` (read existing documents first, then watch\nfor changes — use this for single-reader bulk reads and ETL). The bridge selects the\nunderlying mechanism automatically. If unset, the deprecated `change_stream` boolean is\nhonored for backward compatibility.",
           "anyOf": [
             {
               "$ref": "#/$defs/MongoConsume"
@@ -2248,6 +2428,11 @@
             "null"
           ]
         },
+        "compression": {
+          "description": "Whole-object compression (`none`, `gzip`, `lz4`, `zstd`). Requires the `compression` feature.",
+          "$ref": "#/$defs/Compression",
+          "default": "none"
+        },
         "cursor_id": {
           "description": "(Source only) Cursor id namespacing the checkpoint key; enables durable resume.",
           "type": [
@@ -2267,8 +2452,20 @@
             "null"
           ]
         },
+        "encryption": {
+          "description": "At-rest AEAD encryption applied after compression. Requires the `encryption` feature.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/EncryptionConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
         "extension": {
-          "description": "(Sink only) Extension for written objects, without the dot. Defaults to a value derived\nfrom `format` (`jsonl`, `json`, `txt`, or `bin`).",
+          "description": "(Sink only) Extension for written objects, without the dot. Defaults to a value derived\nfrom `format`, `compression` and `encryption` (e.g. `jsonl`, `csv`, `bin`, `jsonl.gz`,\n`jsonl.lz4`, `jsonl.gz.enc`); encrypted objects get a trailing `.enc` since they are\nciphertext, not a directly decompressible `.gz`.",
           "type": [
             "string",
             "null"
@@ -2526,6 +2723,25 @@
       "additionalProperties": false,
       "required": [
         "url"
+      ]
+    },
+    "RequestForwardConfig": {
+      "description": "Sends each message to a request-capable endpoint and forwards its response elsewhere.\n\nTurns a request/reply exchange (HTTP, or a request_reply NATS/Mongo/Memory endpoint) into\na one-way flow whose response lands on `forward_to` — e.g. IBM MQ → HTTP → IBM MQ. On\nrequest error/timeout the original message is forwarded instead (unchanged). Successful\nresponses carry the transport-native status (e.g. `http_status_code`), so a `switch` on\n`forward_to` can route them by status; a failed request forwards the original message with\nno status key, so catch failures on the switch's default branch.",
+      "type": "object",
+      "properties": {
+        "forward_to": {
+          "description": "Where the response (or, on error, the original message) is forwarded.",
+          "$ref": "#/$defs/Endpoint"
+        },
+        "to": {
+          "description": "The request-capable endpoint to send each message to (e.g. an `http` client).",
+          "$ref": "#/$defs/Endpoint"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "to",
+        "forward_to"
       ]
     },
     "ResponseConfig": {
@@ -3002,6 +3218,60 @@
           "description": "If true, enable TLS/SSL.",
           "type": "boolean",
           "default": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "TransformErrorPolicy": {
+      "description": "Action taken on a message that fails to transform.",
+      "oneOf": [
+        {
+          "description": "Reject the message: non-retryable failure on output, dropped from the batch on input.",
+          "type": "string",
+          "const": "reject"
+        },
+        {
+          "description": "Forward the original payload unchanged with the error recorded in metadata.",
+          "type": "string",
+          "const": "pass_through"
+        }
+      ]
+    },
+    "TransformMiddleware": {
+      "description": "JSON transform middleware configuration.\n\nReshapes JSON payloads declaratively, in two stages over a single parse: field\n`mapping` (rename/move/nest), then `schema` (type coercion, defaults, validation).\nEither stage may be omitted; with neither configured the message passes through\nuntouched and is never parsed.\n\nOn an output endpoint a rejected message becomes a non-retryable failure, so a `dlq`\nmiddleware listed *after* this one captures it (publisher middlewares are wrapped in\nlist order, so the last entry is the outermost layer). On an input endpoint a rejected\nmessage is dropped from the batch and acknowledged, which is how invalid input is kept\nout of the route.",
+      "type": "object",
+      "properties": {
+        "apply_defaults": {
+          "description": "Insert `default` values from the schema for missing fields. Defaults to true.",
+          "type": "boolean",
+          "default": true
+        },
+        "coerce": {
+          "description": "Coerce safely convertible types (e.g. `\"42\"` -> `42`) instead of rejecting. Defaults to true.",
+          "type": "boolean",
+          "default": true
+        },
+        "mapping": {
+          "description": "Output field name -> source path (e.g. `firstName: \"$.first_name\"`). Dots nest the output.",
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/MappingRule"
+          }
+        },
+        "on_error": {
+          "description": "What to do with a message that fails to transform. Defaults to `reject`.",
+          "$ref": "#/$defs/TransformErrorPolicy",
+          "default": "reject"
+        },
+        "schema": {
+          "description": "Inline JSON Schema subset (type, properties, required, default, items, nullable, enum)."
+        },
+        "schema_file": {
+          "description": "Path to a JSON Schema file. Read once at startup; never re-read per message.",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "additionalProperties": false

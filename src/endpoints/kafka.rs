@@ -133,7 +133,7 @@ impl KafkaPublisher {
             sorted.sort();
             sorted
         });
-        let identity = crate::connection_registry::connection_identity((
+        let identity = crate::support::connection_registry::connection_identity((
             &config.url,
             &config.username,
             &config.password,
@@ -145,7 +145,7 @@ impl KafkaPublisher {
             &producer_options,
         ));
         let shared = config.shared.unwrap_or(true);
-        let producer = crate::connection_registry::get_or_create(
+        let producer = crate::support::connection_registry::get_or_create(
             "kafka-producer",
             identity,
             shared,

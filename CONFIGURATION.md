@@ -129,6 +129,30 @@ sqlx_postgres_route:
   output:
     memory:
       topic: "processed_jobs"
+
+# Route 9: Cross-process IPC via the memory endpoint
+# The `topic` field (alias `url`) is a transport URL:
+#   "name"                  -> memory://name  (in-process, same process only)
+#   "memory://name"         -> in-process channel
+#   "ipc://name"            -> Unix: /run/mq-bridge/name.sock (falls back to
+#                              $XDG_RUNTIME_DIR/mq-bridge, then /tmp/mq-bridge)
+#                              Windows: \\.\pipe\mq-bridge-name
+#   "ipc:///abs/path.sock"  -> that exact socket path (Unix)
+#   "unix:///abs/path.sock" -> Unix only, path must be absolute
+#   "pipe://name"           -> Windows only, \\.\pipe\name
+# The consumer side binds/listens and must be started before the publisher connects.
+# IPC does not support `subscribe_mode` or `request_reply`.
+# `enable_nack` defaults to true, but redelivery is consumer-local: a nacked message
+# is retried inside the consumer and is lost if the consumer process dies.
+ipc_ingest:
+  input:
+    memory:
+      url: "ipc:///run/mq-bridge/orders.sock"
+      capacity: 256
+  output:
+    kafka:
+      topic: "orders"
+      url: "localhost:9092"
 ```
 
 ## Configuration Details
@@ -175,6 +199,13 @@ Two gotchas worth knowing before wiring up a `nats` endpoint:
   placeholder string.
 
 ### Middleware Configuration
+
+> Every available middleware, with its fields, defaults, supported side (input/output) and a
+> working example, is listed in **[REFERENCE.md](REFERENCE.md#middleware)**. Note in
+> particular the [ordering rule](REFERENCE.md#ordering--read-this-before-combining-middleware):
+> on an **output**, the *last* middleware in the list is the outermost layer, so `dlq` goes
+> last.
+
 Middleware is defined as a list under an endpoint.
 
 ```yaml
@@ -300,6 +331,10 @@ orders_out:
     dedicated channel.
 
 ### Specialized Endpoints
+
+> This section covers `switch` in depth. The other structural endpoints — `ref`, `fanout`,
+> `request`, `response`, `reader`, `static`, `stream_buffer`, `null` and `custom` — are
+> documented in **[REFERENCE.md](REFERENCE.md#structural-endpoints)**.
 
 #### Switch
 

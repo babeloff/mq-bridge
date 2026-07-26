@@ -262,5 +262,3 @@ mod tests {
         assert!(result.is_err());
     }
 }
-
-// Made with Bob

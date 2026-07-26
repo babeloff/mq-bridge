@@ -11,7 +11,6 @@ pub mod canonical_message;
 ))]
 pub mod checkpoint;
 pub mod command_handler;
-pub mod connection_registry;
 pub mod endpoints;
 pub mod errors;
 pub mod event_handler;
@@ -23,6 +22,7 @@ pub mod outcomes;
 pub mod publisher;
 pub mod response;
 pub mod route;
+pub mod support;
 #[cfg(feature = "test-utils")]
 pub mod test_utils;
 pub mod traits;

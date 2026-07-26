@@ -46,6 +46,7 @@ class ClickHouseConfig(TypedDict, total=False):
     async_insert: bool
     checkpoint_store: Optional[str]
     columns: Optional[Dict[str, str]]
+    compression: Compression
     connect_timeout_ms: Optional[int]
     cursor_column: Optional[str]
     cursor_id: Optional[str]
@@ -88,6 +89,21 @@ class DelayMiddleware(TypedDict, total=False):
     delay_ms: Required[int]
 
 
+class DetailedMappingRule(TypedDict, total=False):
+    """Full mapping form with a fallback value and/or a presence requirement."""
+    default: Any
+    path: Required[str]
+    required: bool
+
+
+class EncryptionConfig(TypedDict, total=False):
+    """AEAD encryption settings, shared by the `encryption` middleware (per-message"""
+    cipher: CipherKind
+    decrypt_keys: Dict[str, str]
+    key: Required[str]
+    key_id: str
+
+
 class Endpoint(TypedDict, total=False):
     """Represents a connection point for messages, which can be a source (input) or a sink (output)."""
     amqp: AmqpConfig
@@ -111,6 +127,7 @@ class Endpoint(TypedDict, total=False):
     reader: Endpoint
     redis_streams: RedisStreamsConfig
     ref: str
+    request: RequestForwardConfig
     response: ResponseConfig
     sled: SledConfig
     sqlx: SqlxConfig
@@ -122,7 +139,9 @@ class Endpoint(TypedDict, total=False):
 
 
 class FileConfig(TypedDict, total=False):
+    compression: Compression
     delimiter: Optional[str]
+    encryption: Optional[EncryptionConfig]
     format: FileFormat
     path: Required[str]
 
@@ -146,7 +165,8 @@ class HttpConfig(TypedDict, total=False):
     """General HTTP connection configuration."""
     basic_auth: Optional[List[Any]]
     batch_concurrency: Optional[int]
-    compression_enabled: bool
+    compression: Compression
+    compression_enabled: Optional[bool]
     compression_threshold_bytes: Optional[int]
     concurrency_limit: Optional[int]
     custom_headers: Dict[str, str]
@@ -239,10 +259,12 @@ class Middleware(TypedDict, total=False):
     deduplication: DeduplicationMiddleware
     delay: DelayMiddleware
     dlq: DeadLetterQueueMiddleware
+    encryption: EncryptionConfig
     limiter: LimiterMiddleware
     metrics: MetricsMiddleware
     random_panic: RandomPanicMiddleware
     retry: RetryMiddleware
+    transform: TransformMiddleware
     weak_join: WeakJoinMiddleware
 
 
@@ -313,9 +335,11 @@ class NatsConfig(TypedDict, total=False):
 class ObjectStoreConfig(TypedDict, total=False):
     """Configuration for a cloud object-store endpoint (S3, GCS, Azure Blob, R2, ...)."""
     checkpoint_store: Optional[str]
+    compression: Compression
     cursor_id: Optional[str]
     date_partition: bool
     delimiter: Optional[str]
+    encryption: Optional[EncryptionConfig]
     extension: Optional[str]
     format: FileFormat
     max_object_bytes: Optional[int]
@@ -361,6 +385,12 @@ class RedisStreamsConfig(TypedDict, total=False):
     subscriber_mode: bool
     url: Required[str]
     username: Optional[str]
+
+
+class RequestForwardConfig(TypedDict, total=False):
+    """Sends each message to a request-capable endpoint and forwards its response elsewhere."""
+    forward_to: Required[Endpoint]
+    to: Required[Endpoint]
 
 
 class ResponseConfig(TypedDict, total=False):
@@ -449,6 +479,16 @@ class TlsConfig(TypedDict, total=False):
     required: bool
 
 
+class TransformMiddleware(TypedDict, total=False):
+    """JSON transform middleware configuration."""
+    apply_defaults: bool
+    coerce: bool
+    mapping: Dict[str, MappingRule]
+    on_error: TransformErrorPolicy
+    schema: Any
+    schema_file: Optional[str]
+
+
 class WeakJoinMiddleware(TypedDict, total=False):
     """Weak Join middleware configuration."""
     branch_by: Optional[str]
@@ -478,14 +518,18 @@ class ZeroMqConfig(TypedDict, total=False):
     url: Required[str]
 
 
+CipherKind = Literal["xchacha20poly1305", "aes256gcm"]
+Compression = Literal["none", "gzip", "lz4", "zstd"]
 FaultMode = Literal["panic", "disconnect", "timeout", "json_format_error", "nack"]
 FileFormat = Literal["normal", "json", "text", "raw", "csv"]
 HttpServerProtocol = Literal["auto", "http1_only", "http2_only"]
+MappingRule = Union[str, DetailedMappingRule]
 MongoConsume = Literal["consumer", "subscriber", "capture_new", "capture_all"]
 MongoDbFormat = Literal["normal", "json", "text", "raw"]
 MqttProtocol = Literal["v5", "v3"]
 NatsDeliverPolicy = Literal["all", "last", "new", "last_per_subject"]
 StaticConfig = Union[str, Dict[str, Any]]
+TransformErrorPolicy = Literal["reject", "pass_through"]
 WeakJoinTimeout = Literal["fire", "discard"]
 WebSocketExecutionMode = Literal["auto", "direct_only", "routed"]
 ZeroMqFormat = Literal["json", "raw", "raw_framed"]

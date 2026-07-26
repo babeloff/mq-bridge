@@ -24,7 +24,7 @@
 //! `/async-db` then returns an empty result so the cleartext profiles still run.
 //!
 //! `json-comp` is handled by mq-bridge's response compression
-//! (`compression_enabled`): bodies above the threshold are gzip-encoded when the
+//! (`compression: gzip`): bodies above the threshold are gzip-encoded when the
 //! client advertises `Accept-Encoding: gzip`, and sent identity otherwise — so
 //! the same `/json` handler serves both the `json` and `json-comp` profiles.
 //!
@@ -329,7 +329,11 @@ async fn main() -> anyhow::Result<()> {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(256);
-            match PgPoolOptions::new().max_connections(max).connect(&url).await {
+            match PgPoolOptions::new()
+                .max_connections(max)
+                .connect(&url)
+                .await
+            {
                 Ok(pool) => Some(pool),
                 Err(e) => {
                     eprintln!("Postgres connection failed ({e}); /async-db returns empty");
@@ -372,8 +376,8 @@ async fn main() -> anyhow::Result<()> {
         // negotiates HTTP/1.1 rather than upgrading to h2.
         let h1tls_listen =
             std::env::var("MQB_H1TLS_LISTEN").unwrap_or_else(|_| "0.0.0.0:8081".to_string());
-        let h1tls = make_http(h1tls_listen, Some(tls))
-            .with_server_protocol(HttpServerProtocol::Http1Only);
+        let h1tls =
+            make_http(h1tls_listen, Some(tls)).with_server_protocol(HttpServerProtocol::Http1Only);
         let h1tls_route = build_route(h1tls, state.clone());
         handles.push(h1tls_route.run("httparena-json-tls").await?);
     }
@@ -418,7 +422,7 @@ fn make_http(listen: String, tls: Option<TlsConfig>) -> HttpConfig {
     // honors that and skips re-compressing them. Dynamic `/json` responses are
     // serialized fresh per request (no response caching) and compressed by the
     // library's per-request gzip when the client advertises Accept-Encoding.
-    http.compression_enabled = true;
+    http.compression = mq_bridge::models::Compression::Gzip;
     http.compression_threshold_bytes = Some(256);
     if let Some(tls) = tls {
         http.tls = tls;

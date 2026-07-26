@@ -156,10 +156,45 @@ fn message_to_document(
     })
 }
 
-fn parse_mongodb_document(doc: Document) -> anyhow::Result<CanonicalMessage> {
-    if let Ok(raw_msg) = mongodb::bson::from_document::<MongoMessageRaw>(doc.clone()) {
-        if let Ok(msg) = raw_msg.try_into() {
-            return Ok(msg);
+/// True when `doc` is a wrapped mq-bridge message whose fields are already known to
+/// convert cleanly. That guarantee is what lets `parse_mongodb_document` take the fields
+/// by value: the raw fallback needs the document intact, so it may only be bypassed when
+/// the conversion cannot fail into it.
+fn is_wrapped_message(doc: &Document) -> bool {
+    if !doc.contains_key("payload") {
+        return false;
+    }
+    if !matches!(doc.get("_id"), Some(Bson::Binary(b)) if b.to_uuid().is_ok()) {
+        return false;
+    }
+    // Non-string metadata values fail `HashMap<String, String>` decoding, which today
+    // falls back to the raw path — so those documents must keep taking it.
+    match doc.get("metadata") {
+        None | Some(Bson::Null) => true,
+        Some(Bson::Document(m)) => m.values().all(|v| matches!(v, Bson::String(_))),
+        Some(_) => false,
+    }
+}
+
+fn parse_mongodb_document(mut doc: Document) -> anyhow::Result<CanonicalMessage> {
+    // Move the three wrapped fields out of the document. `from_document` consumes what it
+    // deserializes, so keeping the raw fallback alive used to cost a deep clone of every
+    // document — including the ones that then went on to deserialize fine.
+    if is_wrapped_message(&doc) {
+        if let (Some(Bson::Binary(bin)), Some(payload)) = (doc.remove("_id"), doc.remove("payload"))
+        {
+            if let Ok(id) = bin.to_uuid() {
+                let metadata = match doc.remove("metadata") {
+                    Some(Bson::Document(m)) => Some(m),
+                    _ => None,
+                };
+                return MongoMessageRaw {
+                    id,
+                    payload,
+                    metadata,
+                }
+                .try_into();
+            }
         }
     }
     document_to_canonical(doc)
@@ -814,22 +849,31 @@ impl MessageConsumer for MongoDbConsumer {
                 return Ok(ReceivedBatch { messages, commit });
             }
 
-            // If no documents found, wait before retrying.
+            // Drained: wait for the next arrival, then surface an empty batch so the
+            // route can pause (empty_batch_delay_ms) or, with exit_on_empty, terminate
+            // gracefully. Blocking here indefinitely would make exit_on_empty unreachable.
             if let Some(stream_mutex) = &self.change_stream {
-                // Replica Set: Wait for a change stream event to wake us up.
+                // Replica set: wait briefly for an insert. On an event, loop back to
+                // claim immediately (low latency); on timeout, return the empty batch
+                // below so exit_on_empty can fire.
                 let mut stream = stream_mutex.lock().await;
                 match tokio::time::timeout(Duration::from_secs(5), stream.next()).await {
-                    Ok(Some(Ok(_))) => {} // Event received, loop back to try claiming documents.
+                    Ok(Some(Ok(_))) => continue, // Event received, loop back to claim.
                     Ok(Some(Err(e))) => return Err(ConsumerError::Connection(e.into())),
                     Ok(None) => {
                         return Err(anyhow!("MongoDB change stream ended unexpectedly").into())
                     }
-                    Err(_) => {} // Timeout, loop back to check for documents.
+                    Err(_) => {} // Timeout: fall through to return the empty batch.
                 }
             } else {
-                // Standalone: Sleep for polling interval.
+                // Standalone: sleep the polling interval, then return the empty batch.
                 tokio::time::sleep(self.polling_interval).await;
             }
+
+            return Ok(ReceivedBatch {
+                messages: Vec::new(),
+                commit: Box::new(|_| Box::pin(async { Ok(()) })),
+            });
         }
     }
 
@@ -1316,89 +1360,120 @@ impl MongoDbSubscriber {
 #[async_trait]
 impl MessageConsumer for MongoDbSubscriber {
     async fn receive_batch(&mut self, max_messages: usize) -> Result<ReceivedBatch, ConsumerError> {
-        loop {
-            // Filter for events with seq > last_seq.
-            // Crucially, we must filter out the sequencer and cursor documents which might be in the same collection.
-            // Events have a 'payload' field, while sequencer/cursors do not.
-            let last_seq = self.last_seq.load(Ordering::Relaxed);
-            let mut filter = doc! {
-                "seq": { "$gt": last_seq },
-                "payload": { "$exists": true }
+        // Filter for events with seq > last_seq.
+        // Crucially, we must filter out the sequencer and cursor documents which might be in the same collection.
+        // Events have a 'payload' field, while sequencer/cursors do not.
+        let last_seq = self.last_seq.load(Ordering::Relaxed);
+        let mut filter = doc! {
+            "seq": { "$gt": last_seq },
+            "payload": { "$exists": true }
+        };
+        if let Some(extra) = &self.receive_query {
+            filter = doc! { "$and": [filter, extra.clone()] };
+        }
+
+        let find_options = FindOptions::builder()
+            .sort(doc! { "seq": 1 })
+            .limit(max_messages as i64)
+            .build();
+
+        let mut cursor = self
+            .collection
+            .find(filter)
+            .with_options(find_options)
+            .await
+            .map_err(|e| ConsumerError::Connection(e.into()))?;
+
+        let mut messages = Vec::new();
+        let mut seqs = Vec::new();
+
+        while let Some(result) = cursor.next().await {
+            let doc = match result {
+                Ok(doc) => doc,
+                Err(e) => {
+                    warn!(
+                        collection = %self.collection_name,
+                        error = %e,
+                        "Failed to read document from MongoDB cursor, skipping"
+                    );
+                    continue;
+                }
             };
-            if let Some(extra) = &self.receive_query {
-                filter = doc! { "$and": [filter, extra.clone()] };
-            }
-
-            let find_options = FindOptions::builder()
-                .sort(doc! { "seq": 1 })
-                .limit(max_messages as i64)
-                .build();
-
-            let mut cursor = self
-                .collection
-                .find(filter)
-                .with_options(find_options)
-                .await
-                .map_err(|e| ConsumerError::Connection(e.into()))?;
-
-            let mut messages = Vec::new();
-            let mut seqs = Vec::new();
-
-            while let Some(result) = cursor.next().await {
-                if let Ok(doc) = result {
-                    if let Ok(seq) = doc.get_i64("seq") {
-                        if let Ok(msg) = parse_mongodb_document(doc) {
-                            messages.push(msg);
-                            seqs.push(seq);
-                            // from here on, we will not received this seq anymore
-                            self.last_seq.store(seq, Ordering::Relaxed);
-                        }
-                    }
+            let seq = match doc.get_i64("seq") {
+                Ok(seq) => seq,
+                Err(e) => {
+                    warn!(
+                        collection = %self.collection_name,
+                        error = %e,
+                        "Skipping document with missing or non-i64 'seq' field"
+                    );
+                    continue;
+                }
+            };
+            match parse_mongodb_document(doc) {
+                Ok(msg) => {
+                    messages.push(msg);
+                    seqs.push(seq);
+                    // from here on, we will not received this seq anymore
+                    self.last_seq.store(seq, Ordering::Relaxed);
+                }
+                Err(e) => {
+                    warn!(
+                        collection = %self.collection_name,
+                        seq,
+                        error = %e,
+                        "Failed to parse MongoDB document, skipping"
+                    );
                 }
             }
-
-            if !messages.is_empty() {
-                let meta_collection = self.meta_collection.clone();
-                let collection_name = self.collection_name.clone();
-                let cursor_id = self.cursor_id.clone();
-
-                let commit = Box::new(move |dispositions: Vec<MessageDisposition>| {
-                    Box::pin(async move {
-                        let mut highest_acked = 0;
-                        for (disp, seq) in dispositions.iter().zip(seqs.iter()) {
-                            if matches!(
-                                disp,
-                                MessageDisposition::Ack | MessageDisposition::Reply(_)
-                            ) {
-                                highest_acked = *seq;
-                            } else {
-                                break; // Stop at first Nack
-                            }
-                        }
-
-                        if highest_acked > 0 {
-                            // Only persist if we have a cursor_id
-                            if let Some(cid) = cursor_id {
-                                let cursor_doc_id = namespaced_cursor_id(&collection_name, &cid);
-                                if let Err(e) = meta_collection
-                                    .update_one(
-                                        doc! { "_id": cursor_doc_id },
-                                        doc! { "$set": { "last_seq": highest_acked } },
-                                    )
-                                    .with_options(UpdateOptions::builder().upsert(true).build())
-                                    .await
-                                {
-                                    tracing::warn!(cursor_id = %cid, error = %e, "Failed to persist cursor position. Messages may be reprocessed on restart.");
-                                }
-                            }
-                        }
-                        Ok(())
-                    }) as BoxFuture<'static, anyhow::Result<()>>
-                });
-                return Ok(ReceivedBatch { messages, commit });
-            }
-            tokio::time::sleep(self.polling_interval).await;
         }
+
+        if !messages.is_empty() {
+            let meta_collection = self.meta_collection.clone();
+            let collection_name = self.collection_name.clone();
+            let cursor_id = self.cursor_id.clone();
+
+            let commit = Box::new(move |dispositions: Vec<MessageDisposition>| {
+                Box::pin(async move {
+                    let mut highest_acked = 0;
+                    for (disp, seq) in dispositions.iter().zip(seqs.iter()) {
+                        if matches!(disp, MessageDisposition::Ack | MessageDisposition::Reply(_)) {
+                            highest_acked = *seq;
+                        } else {
+                            break; // Stop at first Nack
+                        }
+                    }
+
+                    if highest_acked > 0 {
+                        // Only persist if we have a cursor_id
+                        if let Some(cid) = cursor_id {
+                            let cursor_doc_id = namespaced_cursor_id(&collection_name, &cid);
+                            if let Err(e) = meta_collection
+                                .update_one(
+                                    doc! { "_id": cursor_doc_id },
+                                    doc! { "$set": { "last_seq": highest_acked } },
+                                )
+                                .with_options(UpdateOptions::builder().upsert(true).build())
+                                .await
+                            {
+                                tracing::warn!(cursor_id = %cid, error = %e, "Failed to persist cursor position. Messages may be reprocessed on restart.");
+                            }
+                        }
+                    }
+                    Ok(())
+                }) as BoxFuture<'static, anyhow::Result<()>>
+            });
+            return Ok(ReceivedBatch { messages, commit });
+        }
+
+        // Drained: pace the poll, then surface an empty batch so the route can pause
+        // (empty_batch_delay_ms) or, with exit_on_empty, terminate gracefully. Blocking
+        // here indefinitely would make exit_on_empty unreachable.
+        tokio::time::sleep(self.polling_interval).await;
+        Ok(ReceivedBatch {
+            messages: Vec::new(),
+            commit: Box::new(|_| Box::pin(async { Ok(()) })),
+        })
     }
 
     async fn status(&self) -> EndpointStatus {
@@ -2395,7 +2470,7 @@ impl MessageConsumer for MongoDbChangeStreamReader {
 /// Returns a shared MongoDB client for this connection, building one on first use.
 /// The collection/database are handles off the client, so a single client serves all.
 async fn create_shared_client(config: &MongoDbConfig) -> anyhow::Result<std::sync::Arc<Client>> {
-    let identity = crate::connection_registry::connection_identity((
+    let identity = crate::support::connection_registry::connection_identity((
         &config.url,
         &config.username,
         &config.password,
@@ -2406,7 +2481,7 @@ async fn create_shared_client(config: &MongoDbConfig) -> anyhow::Result<std::syn
         config.tls.accept_invalid_certs,
     ));
     let config_clone = config.clone();
-    crate::connection_registry::get_or_create(
+    crate::support::connection_registry::get_or_create(
         "mongodb-client",
         identity,
         config.shared.unwrap_or(true),
@@ -2452,6 +2527,42 @@ async fn create_client(config: &MongoDbConfig) -> anyhow::Result<Client> {
 mod tests {
     use super::*;
     use crate::CanonicalMessage;
+
+    #[test]
+    fn parse_document_takes_wrapped_fields_and_falls_back_otherwise() {
+        let id = mongodb::bson::Uuid::new();
+        // Wrapped: payload is unwrapped and metadata decoded.
+        let msg = parse_mongodb_document(doc! {
+            "_id": id, "payload": "hello", "metadata": { "kind": "greeting" }
+        })
+        .expect("wrapped document parses");
+        assert_eq!(msg.payload.as_ref(), b"hello");
+        assert_eq!(
+            msg.metadata.get("kind").map(String::as_str),
+            Some("greeting")
+        );
+        assert_eq!(msg.message_id, u128::from_be_bytes(id.bytes()));
+
+        // Foreign document (no `payload`): serialized whole, marked raw.
+        let raw = parse_mongodb_document(doc! { "_id": 7, "name": "ada" })
+            .expect("foreign document parses");
+        assert_eq!(
+            raw.metadata
+                .get("mq_bridge.original_format")
+                .map(String::as_str),
+            Some("raw")
+        );
+        assert!(
+            serde_json::from_slice::<serde_json::Value>(&raw.payload).unwrap()["name"] == "ada"
+        );
+
+        // Non-string metadata values still take the raw path, document intact.
+        let mixed =
+            parse_mongodb_document(doc! { "_id": id, "payload": "x", "metadata": { "n": 1 } })
+                .expect("mixed-metadata document parses");
+        let body: serde_json::Value = serde_json::from_slice(&mixed.payload).unwrap();
+        assert_eq!(body["payload"], "x");
+    }
 
     #[test]
     fn resolved_consume_defaults_and_change_stream_alias() {

@@ -24,9 +24,16 @@
 //!   function is called;
 //! - `Ack` finalizes the read;
 //! - `Nack` or dropping the batch without committing requeues messages to the
-//!   same correlation partition;
+//!   same correlation partition. Requeued messages are appended to the partition
+//!   write sequence, so their original position is not restored — redelivery
+//!   ordering relative to messages already queued is not preserved;
 //! - acking an end marker with `metadata["http_stream_end"] == "true"` removes
 //!   that correlation partition.
+//!
+//! Requeueing is best effort: when the partition channel is full or already
+//! closed the retry is handed to a background task, which needs a running Tokio
+//! runtime. Without one (e.g. requeueing from a `Drop` outside the runtime) the
+//! messages are dropped and the failure is logged.
 //!
 //! # HTTP streaming response example
 //!
@@ -79,8 +86,9 @@
 ///
 /// Messages are removed from the buffer only when the received batch is acked.
 /// Nacked or dropped uncommitted batches are requeued to the same correlation
-/// partition. Acking a message with `metadata["http_stream_end"] == "true"`
-/// cleans up that partition.
+/// partition, appended to its write sequence rather than restored to their
+/// original position, so redelivery ordering is not preserved. Acking a message
+/// with `metadata["http_stream_end"] == "true"` cleans up that partition.
 ///
 /// # Example
 ///
@@ -464,11 +472,19 @@ impl MessageConsumer for StreamBufferConsumer {
     }
 
     async fn status(&self) -> EndpointStatus {
+        // The channel carries batches, not individual messages, and async_channel
+        // cannot be inspected without draining it, so `pending`/`capacity` are batch
+        // counts. `buffered_messages` is the exact message count already split off
+        // into this consumer's local buffer.
         EndpointStatus {
             healthy: !self.receiver.is_closed(),
             target: format!("{}/{}", self.topic, self.correlation_id),
             pending: Some(self.receiver.len()),
             capacity: Some(self.receiver.capacity().unwrap_or(0)),
+            details: serde_json::json!({
+                "queued_batches": self.receiver.len(),
+                "buffered_messages": self.buffer.len(),
+            }),
             ..Default::default()
         }
     }

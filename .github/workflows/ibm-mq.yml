@@ -221,4 +221,3 @@ jobs:
       - name: Build documentation
         run: cargo doc --features ibm-mq --no-deps
 
-# Made with Bob

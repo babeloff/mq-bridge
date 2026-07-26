@@ -15,11 +15,14 @@ mod cookie_jar;
 mod deduplication;
 mod delay;
 mod dlq;
+#[cfg(feature = "encryption")]
+mod encryption;
 mod limiter;
 #[cfg(feature = "metrics")]
 mod metrics;
 mod random_panic;
 mod retry;
+mod transform;
 mod weak_join;
 
 use buffer::{BufferConsumer, BufferPublisher};
@@ -28,11 +31,14 @@ use cookie_jar::{CookieJarConsumer, CookieJarPublisher};
 use deduplication::DeduplicationConsumer;
 use delay::{DelayConsumer, DelayPublisher};
 use dlq::DlqPublisher;
+#[cfg(feature = "encryption")]
+use encryption::{EncryptionConsumer, EncryptionPublisher};
 use limiter::{LimiterConsumer, LimiterPublisher};
 #[cfg(feature = "metrics")]
 use metrics::{MetricsConsumer, MetricsPublisher};
 use random_panic::{RandomPanicConsumer, RandomPanicPublisher};
 use retry::RetryPublisher;
+use transform::{TransformConsumer, TransformPublisher};
 use weak_join::WeakJoinConsumer;
 
 /// Wraps a `MessageConsumer` with the middlewares specified in the endpoint configuration.
@@ -68,6 +74,9 @@ pub async fn apply_middlewares_to_consumer(
             Middleware::Limiter(cfg) => Box::new(LimiterConsumer::new(consumer, cfg)?),
             Middleware::Buffer(cfg) => Box::new(BufferConsumer::new(consumer, cfg)?),
             Middleware::CookieJar(cfg) => Box::new(CookieJarConsumer::new(consumer, cfg)),
+            Middleware::Transform(cfg) => Box::new(TransformConsumer::new(consumer, cfg)?),
+            #[cfg(feature = "encryption")]
+            Middleware::Encryption(cfg) => Box::new(EncryptionConsumer::new(consumer, cfg)?),
             Middleware::Custom { name, config } => {
                 let factory = get_middleware_factory(name).ok_or_else(|| {
                     anyhow::anyhow!("Custom middleware factory '{}' not found", name)
@@ -88,8 +97,22 @@ pub async fn apply_middlewares_to_consumer(
 
 /// Wraps a `MessagePublisher` with the middlewares specified in the endpoint configuration.
 ///
-/// Middlewares are applied in the order of the configuration list.
-/// This means the first middleware in the config is the outermost layer, executed first.
+/// The list is walked front to back, each entry wrapping the publisher built so far. This
+/// means the **last** middleware in the config is the outermost layer and runs first on an
+/// outgoing message — the opposite of [`apply_middlewares_to_consumer`], which iterates in
+/// reverse so its *first* entry is outermost.
+///
+/// Practically: a middleware must be listed **after** the ones whose failures it should see.
+/// `retry` then `dlq` gives "retry the send, dead-letter it once attempts are exhausted":
+///
+/// ```yaml
+/// middlewares:
+///   - retry: { max_attempts: 3 }
+///   - dlq: { endpoint: { file: { path: "failed.jsonl" } } }
+/// ```
+///
+/// Reversing those two would put `retry` outside `dlq`, so the DLQ would never see an
+/// exhausted-retry failure. See `REFERENCE.md` for the full ordering rules.
 pub async fn apply_middlewares_to_publisher(
     mut publisher: Box<dyn MessagePublisher>,
     endpoint: &Endpoint,
@@ -114,6 +137,9 @@ pub async fn apply_middlewares_to_publisher(
             Middleware::Limiter(cfg) => Box::new(LimiterPublisher::new(publisher, cfg)?),
             Middleware::Buffer(cfg) => Box::new(BufferPublisher::new(publisher, cfg)?),
             Middleware::CookieJar(cfg) => Box::new(CookieJarPublisher::new(publisher, cfg)),
+            Middleware::Transform(cfg) => Box::new(TransformPublisher::new(publisher, cfg)?),
+            #[cfg(feature = "encryption")]
+            Middleware::Encryption(cfg) => Box::new(EncryptionPublisher::new(publisher, cfg)?),
             Middleware::Custom { name, config } => {
                 let factory = get_middleware_factory(name).ok_or_else(|| {
                     anyhow::anyhow!("Custom middleware factory '{}' not found", name)

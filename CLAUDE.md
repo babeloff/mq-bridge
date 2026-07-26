@@ -1,5 +1,14 @@
 # mq-bridge Project Context
 
+> **Looking for what middleware or structural endpoints exist, and how to configure them?**
+> [REFERENCE.md](REFERENCE.md) is the complete, authoritative list — every middleware
+> (`retry`, `dlq`, `transform`, `deduplication`, `weak_join`, `buffer`, `limiter`, `delay`,
+> `cookie_jar`, `encryption`, `metrics`, `random_panic`, `custom`) and every structural endpoint (`ref`,
+> `fanout`, `switch`, `request`, `response`, `reader`, `static`, `stream_buffer`, `null`,
+> `custom`), each with its fields, defaults, and a working YAML example. Do not infer these
+> from the enum definitions in `models.rs`; the reference records the behaviour and the
+> spelling traps too. Every snippet in it is parsed by `tests/reference_docs_test.rs`.
+
 ## Project Overview
 
 `mq-bridge` is an asynchronous message bridging library for Rust that connects different messaging systems, data stores, and protocols. It acts as a **programmable integration layer**, allowing for transformation, filtering, handling, events, and complex routing.
@@ -32,31 +41,66 @@ src/
 ├── traits.rs             # Core traits (MessageConsumer, MessagePublisher, Handler)
 ├── models.rs             # Configuration models (Route, Endpoint, Middleware)
 ├── route.rs              # Route execution logic (sequential/concurrent)
-├── endpoints/             # Endpoint implementations
+├── endpoints/            # Endpoint implementations
 │   ├── mod.rs           # Factory functions for creating consumers/publishers
-│   ├── kafka.rs         # Kafka consumer/publisher
-│   ├── nats.rs          # NATS consumer/publisher
 │   ├── amqp.rs          # AMQP (RabbitMQ) consumer/publisher
+│   ├── aws.rs           # AWS SQS/SNS
+│   ├── clickhouse.rs    # ClickHouse sink + cursor source
+│   ├── file/            # File-based endpoints
+│   ├── grpc.rs          # gRPC consumer/publisher
+│   ├── http/            # HTTP consumer/publisher (+ streaming)
+│   ├── ibm_mq.rs        # IBM MQ (client loaded at runtime via dlopen)
+│   ├── kafka.rs         # Kafka consumer/publisher
+│   ├── memory/          # In-memory channels + IPC transports
+│   ├── mongodb.rs       # MongoDB consumer/publisher/change streams
 │   ├── mqtt.rs          # MQTT consumer/publisher
-│   ├── mongodb.rs       # MongoDB consumer/publisher
-│   ├── http.rs          # HTTP consumer/publisher
-│   ├── memory.rs        # In-memory channels (for testing)
-│   ├── file.rs          # File-based endpoints
-│   ├── fanout.rs        # Fanout publisher (broadcast)
-│   ├── switch.rs        # Content-based routing
-│   └── null.rs          # Null endpoint (sink)
+│   ├── nats.rs          # NATS consumer/publisher
+│   ├── object_store.rs  # Cloud object storage (S3 / GCS / Azure)
+│   ├── poll.rs          # Shared cursor-polling helper (sqlx, clickhouse)
+│   ├── postgres/        # Postgres CDC (logical replication + pgoutput)
+│   ├── redis_streams.rs # Redis Streams
+│   ├── sled.rs          # Embedded sled queue
+│   ├── sqlx/            # PostgreSQL / MySQL / SQLite
+│   ├── websocket.rs     # WebSocket consumer/publisher
+│   ├── zeromq.rs        # ZeroMQ consumer/publisher
+│   └── structural/      # Structural endpoints (no external system)
+│       ├── fanout.rs          # Broadcast to every listed endpoint
+│       ├── switch.rs          # Content-based routing
+│       ├── request.rs         # Request/reply call, forward the response
+│       ├── response.rs        # Reply to the origin of the current request
+│       ├── reader.rs          # Trigger a pull from a consumer
+│       ├── static_endpoint.rs # Fixed, pre-rendered message
+│       ├── stream_buffer.rs   # Correlation-partitioned in-memory stream
+│       └── null.rs            # Null endpoint (sink)
 ├── middleware/           # Middleware implementations
-│   ├── retry.rs         # Exponential backoff retry
-│   ├── dlq.rs           # Dead-letter queue
+│   ├── buffer.rs        # Batch accumulation
+│   ├── cookie_jar.rs    # Cookie / metadata persistence across requests
 │   ├── deduplication.rs # Message deduplication (sled)
+│   ├── delay.rs         # Artificial delay
+│   ├── dlq.rs           # Dead-letter queue
+│   ├── encryption.rs    # AEAD payload encryption
+│   ├── limiter.rs       # Throughput limiting (msg/s)
 │   ├── metrics.rs       # Metrics collection
-│   └── random_panic.rs   # Testing middleware
+│   ├── random_panic.rs  # Testing middleware
+│   ├── retry.rs         # Exponential backoff retry
+│   ├── transform/       # Declarative JSON mapping + schema coercion
+│   └── weak_join.rs     # Correlation-keyed join
+├── support/              # Cross-cutting helpers
+│   ├── compression.rs   # gzip / lz4 / zstd
+│   ├── connection_registry.rs # Shared connection reuse
+│   ├── crypto.rs        # AEAD core (used by encryption middleware + at-rest)
+│   └── interpolation.rs # `${namespace:selector}` templating
 ├── command_handler.rs    # Command handler wrapper
 ├── event_handler.rs      # Event handler wrapper
 ├── event_store.rs        # In-memory event store
-├── type_handler.rs      # Typed message handlers
-├── errors.rs            # Error types
-└── outcomes.rs          # Result types (Handled, Sent, Received)
+├── type_handler.rs       # Typed message handlers
+├── publisher.rs          # Standalone publisher API
+├── checkpoint.rs         # Durable cursor stores (file/s3/postgres/mongodb)
+├── extensions.rs         # Custom endpoint/middleware factory registration
+├── response.rs           # Ergonomic response helpers
+├── test_utils.rs         # Shared test helpers
+├── errors.rs             # Error types
+└── outcomes.rs           # Result types (Handled, Sent, Received)
 ```
 
 ### Consumer vs Subscriber

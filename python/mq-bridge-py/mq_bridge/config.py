@@ -11,6 +11,8 @@ CookieJarMiddleware = dict
 DeadLetterQueueMiddleware = dict
 DeduplicationMiddleware = dict
 DelayMiddleware = dict
+DetailedMappingRule = dict
+EncryptionConfig = dict
 Endpoint = dict
 FileConfig = dict
 GrpcConfig = dict
@@ -29,6 +31,7 @@ ObjectStoreConfig = dict
 PostgresCdcConfig = dict
 RandomPanicMiddleware = dict
 RedisStreamsConfig = dict
+RequestForwardConfig = dict
 ResponseConfig = dict
 RetryMiddleware = dict
 Route = dict
@@ -37,17 +40,22 @@ SqlxConfig = dict
 StreamBufferConfig = dict
 SwitchConfig = dict
 TlsConfig = dict
+TransformMiddleware = dict
 WeakJoinMiddleware = dict
 WebSocketConfig = dict
 ZeroMqConfig = dict
+CipherKind = str
+Compression = str
 FaultMode = str
 FileFormat = str
 HttpServerProtocol = str
+MappingRule = str
 MongoConsume = str
 MongoDbFormat = str
 MqttProtocol = str
 NatsDeliverPolicy = str
 StaticConfig = str
+TransformErrorPolicy = str
 WeakJoinTimeout = str
 WebSocketExecutionMode = str
 ZeroMqFormat = str
@@ -61,12 +69,16 @@ __all__ = [
     "AmqpConfig",
     "AwsConfig",
     "BufferMiddleware",
+    "CipherKind",
     "ClickHouseConfig",
+    "Compression",
     "ConfigDocument",
     "CookieJarMiddleware",
     "DeadLetterQueueMiddleware",
     "DeduplicationMiddleware",
     "DelayMiddleware",
+    "DetailedMappingRule",
+    "EncryptionConfig",
     "Endpoint",
     "EndpointConfig",
     "FaultMode",
@@ -79,6 +91,7 @@ __all__ = [
     "IbmTlsConfig",
     "KafkaConfig",
     "LimiterMiddleware",
+    "MappingRule",
     "MemoryConfig",
     "MetricsMiddleware",
     "Middleware",
@@ -93,6 +106,7 @@ __all__ = [
     "PostgresCdcConfig",
     "RandomPanicMiddleware",
     "RedisStreamsConfig",
+    "RequestForwardConfig",
     "ResponseConfig",
     "RetryMiddleware",
     "Route",
@@ -104,6 +118,8 @@ __all__ = [
     "StreamBufferConfig",
     "SwitchConfig",
     "TlsConfig",
+    "TransformErrorPolicy",
+    "TransformMiddleware",
     "WeakJoinMiddleware",
     "WeakJoinTimeout",
     "WebSocketConfig",

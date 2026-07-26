@@ -156,6 +156,10 @@ Known rough edges (be deliberate here):
 *   **Middleware**: Components that intercept and process messages (e.g., for error handling).
 *   **Handler**: A programmatic component for business logic, such as transforming/consuming messages (`CommandHandler`) or subscribe them (`EventHandler`).
 
+> **[REFERENCE.md](REFERENCE.md)** lists every middleware and every structural endpoint
+> (`ref`, `fanout`, `switch`, `request`, `response`, `reader`, `static`, `stream_buffer`,
+> `null`, `custom`) with fields, defaults and working examples.
+
 ## Backend Features & Configuration
 
 `mq-bridge` endpoints generally default to a **Consumer** pattern (Queue), where messages are persisted and distributed among workers. To achieve **Subscriber** (Pub/Sub) behavior, specific configuration is required.
@@ -171,8 +175,9 @@ The table below summarizes the capabilities and configuration for each backend:
 | **HTTP** | N/A | **Native** (Implicit) | **Yes** (HTTP 500) |
 | **IBM MQ** | Set `topic` | No | **Yes** (Tx Rollback) |
 | **Kafka** | Omit `group_id` | Emulated (Header) | Eventual (Skip Offset) |
-| **Memory** | Set `subscribe_mode: true` | Emulated (Metadata) | **Yes** (Re-queue), by default **disabled** |
-| **MongoDB** | Set `change_stream: true` | Emulated (Metadata) | **Yes** (Unlock) |
+| **Memory** (in-process) | Set `subscribe_mode: true` | Emulated (Metadata) | **Yes** (Re-queue), by default **disabled** |
+| **Memory** (IPC: `ipc://`, `unix://`, `pipe://`) | Not supported | Not supported | **Yes** (Re-queue), by default **enabled**, consumer-local |
+| **MongoDB** | Set `consume: subscriber` | Emulated (Metadata) | **Yes** (Unlock) |
 | **MQTT** | Set `clean_session: true` | Emulated (Property) | Eventual (Skip Ack) |
 | **NATS** | Set `subscriber_mode: true` | **Native** (Inbox) | **Yes** (JetStream Nak) |
 | **Postgres CDC** | N/A (streams committed changes) | No | **Yes** (confirmed LSN not advanced) |
@@ -186,7 +191,7 @@ The table below summarizes the capabilities and configuration for each backend:
 *   **Request-Reply**:
     *   **Native**: Uses protocol-level correlation (e.g., HTTP connection, NATS reply subject).
     *   **Emulated**: Publishes a new message to a reply destination (specified by the `reply_to` metadata field) carrying a `correlation_id` metadata field.
-*   **Nack Support**: If "Yes", the backend supports explicit negative acknowledgement triggering redelivery. "Eventual" means redelivery depends on timeout or connection drop. "Simulated" is handled in-memory by the bridge.
+*   **Nack Support**: If "Yes", the backend supports explicit negative acknowledgement triggering redelivery. "Eventual" means redelivery depends on timeout or connection drop. "Simulated" is handled in-memory by the bridge. "Consumer-local" means the nacked message is retried inside the consumer process and is lost if that process dies — the producer is never notified.
 
 ### Database Sources: Change Capture vs Polling
 Databases have no native pub/sub, so `mq-bridge` reads them as a source in one of two ways:
@@ -195,6 +200,36 @@ Databases have no native pub/sub, so `mq-bridge` reads them as a source in one o
     *   On **PostgreSQL**, the `postgres_cdc` endpoint streams a logical-replication slot (`pgoutput`). It emits flat JSON rows tagged with `postgres.operation` metadata (`insert`/`update`/`delete`/`truncate`). Acking a batch confirms the LSN back to the server (`standby_status_update`); a nack (or an interrupted run) does **not** advance the confirmed LSN, so replication resumes from the last acknowledged position on reconnect — at-least-once, verified by a restart-safety integration test. Enable with the `postgres-cdc` feature; requires `wal_level = logical` and a publication. See below.
     *   On **MongoDB**, set `consume: capture_new` to watch an existing collection for changes from now on, or `consume: capture_all` to read the existing documents first and then keep capturing changes (no gap, at-least-once). It emits `insert`/`update`/`replace`/`delete` events tagged with `mongodb.operation` metadata and checkpoints progress under `cursor_id`. These use the change stream (full post-image via `updateLookup`) and need a replica set; on a standalone server `capture_all` falls back to an insert-only read.
 *   **Cursor polling** — pages an existing table by a monotonic `cursor_column` (`WHERE col > $last ORDER BY col ASC`), persisting the last read value under `cursor_id`. Captures **appends only** — updates and deletes are not observed. Available on **SQLx** (PostgreSQL / MySQL / MariaDB / SQLite) and **ClickHouse**; while idle the poll interval backs off exponentially between `polling_interval_ms` and `max_polling_interval_ms`. **SQLite** and **ClickHouse** are polling-only — they have no server-side change log.
+
+#### Choosing a MongoDB consume mode
+
+These are not interchangeable. The default `consumer` is a **competing-consumers work queue**: its
+lock-and-delete protocol lets several readers drain the same collection with each document going to
+exactly one of them — the right thing for dispatching jobs or commands. The `capture_*` modes are
+**readers**: they fan out, so every reader sees every document, and nothing is claimed or removed.
+
+Pick by semantics first. Where both would do — a one-shot bulk read or ETL pass with a single
+reader — **use `capture_all`**: `consumer`'s four round trips per batch (find ids → claim →
+re-fetch → delete on ack) buy exclusivity you aren't using, and cost ~5x.
+
+| `consume` | mechanism | modifies source | ends on drain | use for |
+| :--- | :--- | :--- | :--- | :--- |
+| `consumer` (default) | claim → lock → re-fetch → delete | **yes** | yes | work queues, competing readers |
+| `subscriber` | polls `seq > last_seq`, advancing a cursor | no | yes | ephemeral fan-out |
+| `capture_new` | change stream, new changes only | no | **no** | ongoing CDC |
+| `capture_all` | `_id` snapshot, then change stream | no | standalone only | bulk read / ETL |
+
+500k documents, `batch_size: 1024`, release build, standalone MongoDB: `consumer` → `null`
+**23,667 rows/s**, `capture_all` → jsonl **120,308 rows/s** (`postgres` → `null` reference: 115,924).
+
+*   `concurrency` does not speed up a MongoDB source — batches are fetched serially; it only widens
+    the downstream side.
+*   `consumer` and `subscriber` only read collections written by the mq-bridge MongoDB publisher
+    (UUID `_id` / wrapped `seq` field); other documents are skipped or rejected at startup.
+*   `capture_*` need a replica set. `capture_new` errors without one; `capture_all` degrades to an
+    insert-only `_id` read that terminates on drain. On a replica set it streams indefinitely after
+    the snapshot — plan an external stop, not `exit_on_empty`.
+*   Wart: `capture_all`'s snapshot also emits the internal `<collection>:sequencer` document.
 
 
 ### Cloud Object Storage (S3 / GCS / Azure)
@@ -223,6 +258,11 @@ replay_from_s3:
 ```
 
 > Point `checkpoint_store` at a **different** bucket or prefix than the source reads; a cursor object written under the source prefix would be listed and re-read as data (the source rejects an overlapping object-store checkpoint location).
+
+> The sink's `format` decides the encoding, not where the message came from: `normal`/`json`/`text`
+> always write the `{message_id, payload, metadata}` wrapper, so the message id survives the round
+> trip. Use `format: raw` to write payloads verbatim (bare documents, no wrapper). Applies to both
+> `file` and `object_store`.
 
 ### Response Endpoint
 The `response` output endpoint sends a reply back to the original requester. This is useful for synchronous request-reply flows, for example HTTP-to-NATS-to-HTTP. Use `response: {}` as the output endpoint configuration.
@@ -474,7 +514,47 @@ Important route-level knobs:
 *   `concurrency`: number of route workers. Defaults to `1`; useful for high-latency handlers or endpoints.
 *   `commit_concurrency_limit`: maximum in-flight commit operations, whether they are queued through ordered commit sequencing or run concurrently for independent-ack transports. Defaults to `4096`.
 
-Middleware can be attached to inputs or outputs. The most commonly used ones are `retry`, `dlq`, `deduplication`, `limiter`, and `cookie_jar`. Retry/DLQ are especially useful with batching because partial failures can be retried or sent to a DLQ without treating the entire batch as equally broken.
+Middleware can be attached to inputs or outputs. The most commonly used ones are `retry`, `dlq`, `deduplication`, `limiter`, `cookie_jar`, and `transform`. Retry/DLQ are especially useful with batching because partial failures can be retried or sent to a DLQ without treating the entire batch as equally broken.
+
+### Transforming JSON messages
+
+The `transform` middleware reshapes JSON payloads declaratively, so field renaming and type
+fixing do not need a custom handler. It runs two optional stages over a single parse:
+`mapping` (rename, move, nest) and then `schema` (coerce, apply defaults, validate).
+
+```yaml
+csv_to_kafka:
+  input:
+    file: { path: "users.csv", format: csv }
+  output:
+    middlewares:
+      - transform:
+          mapping:
+            firstName: "$.first_name"
+            lastName: "$.last_name"
+            id: "$.user_id"
+            "address.city": { path: "$.city", default: "unknown" }
+          schema_file: "schemas/user.json"
+      # `dlq` comes after `transform`: publisher middlewares are wrapped in list order,
+      # so the last entry is the outermost layer and sees the earlier ones' failures.
+      - dlq:
+          endpoint: { file: { path: "rejected.jsonl" } }
+    kafka: { topic: "users", url: "localhost:9092" }
+```
+
+With the CSV source above producing `{"first_name":"John","last_name":"Smith","user_id":"42"}`,
+the mapping yields `{"firstName":"John","lastName":"Smith","id":"42","address":{"city":"unknown"}}`
+(`$.city` is absent, so `address.city` falls back to its `"unknown"` default) and the schema
+then coerces `id` to the integer `42`.
+
+Failures are always non-retryable and name the offending field, e.g.
+`transform failed at $.items[1].qty [coercion]: cannot coerce string "oops" to integer`.
+On an **output** endpoint the message is failed so a following `dlq` captures it; on an
+**input** endpoint it is dropped from the batch and acknowledged, which keeps invalid data
+out of the route.
+
+See **[REFERENCE.md](REFERENCE.md#transform)** for the full option list, the supported schema
+subset, and the exact set of allowed type coercions.
 
 ## Running Tests
 The project includes integration and performance tests. Most backend tests require Docker.

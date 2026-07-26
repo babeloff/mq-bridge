@@ -930,7 +930,9 @@ mod dlopen_tests {
     }
 
     // A failed library load must be classified non-retryable so routes fail
-    // fast instead of reconnecting forever.
+    // fast instead of reconnecting forever. Skips on hosts that have the client
+    // installed: the loader always falls back to the bare library name, so there
+    // is no way to force a miss there.
     #[test]
     fn missing_library_is_non_retryable() {
         // Save & restore the env we mutate so this test can't leak into sibling
@@ -960,7 +962,10 @@ mod dlopen_tests {
         std::env::set_var("MQB_IBM_MQ_LIB", "/nonexistent/path/libmqm_r");
         std::env::remove_var("MQ_INSTALLATION_PATH");
         let err = match load_ibm_mq_library() {
-            Ok(_) => panic!("load must fail without a client"),
+            Ok(_) => {
+                eprintln!("skipping: IBM MQ client is installed, cannot test a missing one");
+                return;
+            }
             Err(e) => e,
         };
         assert!(

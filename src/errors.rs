@@ -36,6 +36,11 @@ pub enum ConsumerError {
     /// The consumer has reached the end of the stream and has shut down gracefully.
     #[error("consumer reached end of stream")]
     EndOfStream,
+
+    /// A permanent, non-retryable error: the message cannot be processed and must
+    /// not be re-read (e.g. failed AEAD decryption/authentication of a payload).
+    #[error("permanent consumer error: {0}")]
+    Permanent(#[source] anyhow::Error),
 }
 
 impl From<anyhow::Error> for ConsumerError {

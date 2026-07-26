@@ -198,5 +198,3 @@ async fn test_transport_url_display() {
         assert_eq!(url.display_name(), "pipe://test");
     }
 }
-
-// Made with Bob
