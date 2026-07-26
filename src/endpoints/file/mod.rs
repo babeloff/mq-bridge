@@ -396,6 +396,20 @@ impl FilePublisher {
         &self,
         messages: Vec<CanonicalMessage>,
     ) -> Result<SentBatch, PublisherError> {
+        // Opened up front, before the CPU-bound encode/compress/seal below, and kept
+        // open until the append. The order matters for throughput, not just tidiness:
+        // this task is woken by the route's producer and lands in that thread's LIFO
+        // slot, so any CPU it runs before its first suspension point holds the producer
+        // there. `open` is a blocking-pool hop that always suspends, which is why the
+        // plain path (which opens first) never stalls; building the member first cost
+        // ~1.9ms of producer dead time per batch, made compressed writes ~35% slower
+        // and pinned the pipeline to one core regardless of `concurrency`.
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+            .await
+            .context("Failed to open file for writing batch member")?;
         // Members are concatenated, so the decoded stream is one continuous line
         // stream: the CSV header goes into the first member of a new file only.
         let is_csv = matches!(self.format, FileFormat::Csv);
@@ -506,12 +520,6 @@ impl FilePublisher {
             if file_guard.is_none() {
                 file_guard = Some(self.file_lock.lock().await);
             }
-            let mut file = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&self.path)
-                .await
-                .context("Failed to open file for writing batch member")?;
             // Length before the append: a failed write_all can leave a partial
             // member behind, which would corrupt the concatenated stream and get
             // compounded by the Retryable re-append. Truncate back to this
@@ -2123,7 +2131,8 @@ pub(crate) fn parse_message(
                 .insert("mq_bridge.original_format".to_string(), "raw".to_string());
             Some(msg)
         }
-        FileFormat::Normal | FileFormat::Json | FileFormat::Text => {
+        // `json` keeps the payload as a JSON value, so it needs the whole tree.
+        FileFormat::Json => {
             #[derive(serde::Deserialize)]
             struct AnyPayloadMessage {
                 #[serde(deserialize_with = "deserialize_u128")]
@@ -2134,41 +2143,243 @@ pub(crate) fn parse_message(
             }
 
             let msg = match serde_json::from_slice::<AnyPayloadMessage>(buffer) {
-                Ok(wrapper) => {
-                    let payload_bytes = if matches!(format, FileFormat::Json) {
-                        serde_json::to_vec(&wrapper.payload).unwrap_or_default()
-                    } else {
-                        match wrapper.payload {
-                            serde_json::Value::String(s) => s.into_bytes(),
-                            serde_json::Value::Array(arr) => {
-                                if let Ok(bytes) = serde_json::from_value::<Vec<u8>>(
-                                    serde_json::Value::Array(arr.clone()),
-                                ) {
-                                    bytes
-                                } else {
-                                    serde_json::to_vec(&serde_json::Value::Array(arr))
-                                        .unwrap_or_default()
-                                }
-                            }
-                            other => serde_json::to_vec(&other).unwrap_or_default(),
-                        }
-                    };
-                    CanonicalMessage {
-                        message_id: wrapper.message_id,
-                        payload: payload_bytes.into(),
-                        metadata: wrapper.metadata,
-                    }
-                }
-                Err(e) => {
-                    warn!(error = %e, content_length = buffer.len(), "Failed to parse file line as JSON, treating as raw.");
-                    let mut msg = CanonicalMessage::new(buffer.to_vec(), None);
-                    msg.metadata
-                        .insert("mq_bridge.original_format".to_string(), "raw".to_string());
-                    msg
-                }
+                Ok(wrapper) => CanonicalMessage {
+                    message_id: wrapper.message_id,
+                    payload: serde_json::to_vec(&wrapper.payload)
+                        .unwrap_or_default()
+                        .into(),
+                    metadata: wrapper.metadata,
+                },
+                Err(e) => raw_fallback_message(buffer, e),
             };
             Some(msg)
         }
+        // `normal` and `text` want the payload as bytes, so it is decoded in one
+        // pass by [`RawPayload`] rather than through a `serde_json::Value`.
+        FileFormat::Normal | FileFormat::Text => {
+            #[derive(serde::Deserialize)]
+            struct BytePayloadMessage {
+                #[serde(deserialize_with = "deserialize_u128")]
+                message_id: u128,
+                payload: RawPayload,
+                #[serde(default)]
+                metadata: HashMap<String, String>,
+            }
+
+            let msg = match serde_json::from_slice::<BytePayloadMessage>(buffer) {
+                Ok(wrapper) => CanonicalMessage {
+                    message_id: wrapper.message_id,
+                    payload: wrapper.payload.into_bytes().into(),
+                    metadata: wrapper.metadata,
+                },
+                Err(e) => raw_fallback_message(buffer, e),
+            };
+            Some(msg)
+        }
+    }
+}
+
+/// A line that is not the JSON envelope the format promised is kept verbatim as a
+/// raw payload rather than dropped, and marked so the next hop can tell.
+fn raw_fallback_message(buffer: &[u8], err: serde_json::Error) -> CanonicalMessage {
+    warn!(error = %err, content_length = buffer.len(), "Failed to parse file line as JSON, treating as raw.");
+    let mut msg = CanonicalMessage::new(buffer.to_vec(), None);
+    msg.metadata
+        .insert("mq_bridge.original_format".to_string(), "raw".to_string());
+    msg
+}
+
+/// The payload of a `normal`/`text` line, decoded in a single pass.
+///
+/// `normal` serializes the payload as a JSON array of byte values, which is the
+/// common case and the expensive one: routing it through `serde_json::Value`
+/// allocates a boxed number per byte and then walks the array a second time to
+/// turn it back into `Vec<u8>`. This collects those bytes straight off the
+/// parser and only materializes a `Value` for payloads that are not byte arrays
+/// (a `json`-format file read back as `normal`, say), which keeps the fallback
+/// behaviour — render the payload as JSON text — byte-for-byte the same.
+enum RawPayload {
+    Bytes(Vec<u8>),
+    Str(String),
+    Other(serde_json::Value),
+}
+
+impl RawPayload {
+    fn into_bytes(self) -> Vec<u8> {
+        match self {
+            RawPayload::Bytes(b) => b,
+            RawPayload::Str(s) => s.into_bytes(),
+            RawPayload::Other(v) => serde_json::to_vec(&v).unwrap_or_default(),
+        }
+    }
+}
+
+/// One element of a payload array: a byte on the fast path, anything else kept
+/// as a `Value` so a non-byte array still round-trips as JSON text.
+enum PayloadElement {
+    Byte(u8),
+    Other(serde_json::Value),
+}
+
+impl<'de> serde::Deserialize<'de> for PayloadElement {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct ElementVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for ElementVisitor {
+            type Value = PayloadElement;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a JSON value")
+            }
+
+            fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<PayloadElement, E> {
+                Ok(match u8::try_from(v) {
+                    Ok(b) => PayloadElement::Byte(b),
+                    Err(_) => PayloadElement::Other(v.into()),
+                })
+            }
+
+            fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<PayloadElement, E> {
+                Ok(match u8::try_from(v) {
+                    Ok(b) => PayloadElement::Byte(b),
+                    Err(_) => PayloadElement::Other(v.into()),
+                })
+            }
+
+            fn visit_f64<E: serde::de::Error>(self, v: f64) -> Result<PayloadElement, E> {
+                Ok(PayloadElement::Other(
+                    serde_json::Number::from_f64(v).map_or(serde_json::Value::Null, Into::into),
+                ))
+            }
+
+            fn visit_bool<E: serde::de::Error>(self, v: bool) -> Result<PayloadElement, E> {
+                Ok(PayloadElement::Other(v.into()))
+            }
+
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<PayloadElement, E> {
+                Ok(PayloadElement::Other(v.into()))
+            }
+
+            fn visit_unit<E: serde::de::Error>(self) -> Result<PayloadElement, E> {
+                Ok(PayloadElement::Other(serde_json::Value::Null))
+            }
+
+            fn visit_none<E: serde::de::Error>(self) -> Result<PayloadElement, E> {
+                Ok(PayloadElement::Other(serde_json::Value::Null))
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                seq: A,
+            ) -> Result<PayloadElement, A::Error> {
+                serde::Deserialize::deserialize(serde::de::value::SeqAccessDeserializer::new(seq))
+                    .map(PayloadElement::Other)
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                map: A,
+            ) -> Result<PayloadElement, A::Error> {
+                serde::Deserialize::deserialize(serde::de::value::MapAccessDeserializer::new(map))
+                    .map(PayloadElement::Other)
+            }
+        }
+
+        d.deserialize_any(ElementVisitor)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for RawPayload {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct PayloadVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for PayloadVisitor {
+            type Value = RawPayload;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a byte array, a string or any JSON value")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<RawPayload, E> {
+                Ok(RawPayload::Str(v.to_string()))
+            }
+
+            fn visit_string<E: serde::de::Error>(self, v: String) -> Result<RawPayload, E> {
+                Ok(RawPayload::Str(v))
+            }
+
+            fn visit_bytes<E: serde::de::Error>(self, v: &[u8]) -> Result<RawPayload, E> {
+                Ok(RawPayload::Bytes(v.to_vec()))
+            }
+
+            fn visit_byte_buf<E: serde::de::Error>(self, v: Vec<u8>) -> Result<RawPayload, E> {
+                Ok(RawPayload::Bytes(v))
+            }
+
+            fn visit_bool<E: serde::de::Error>(self, v: bool) -> Result<RawPayload, E> {
+                Ok(RawPayload::Other(v.into()))
+            }
+
+            fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<RawPayload, E> {
+                Ok(RawPayload::Other(v.into()))
+            }
+
+            fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<RawPayload, E> {
+                Ok(RawPayload::Other(v.into()))
+            }
+
+            fn visit_f64<E: serde::de::Error>(self, v: f64) -> Result<RawPayload, E> {
+                Ok(RawPayload::Other(
+                    serde_json::Number::from_f64(v).map_or(serde_json::Value::Null, Into::into),
+                ))
+            }
+
+            fn visit_unit<E: serde::de::Error>(self) -> Result<RawPayload, E> {
+                Ok(RawPayload::Other(serde_json::Value::Null))
+            }
+
+            fn visit_none<E: serde::de::Error>(self) -> Result<RawPayload, E> {
+                Ok(RawPayload::Other(serde_json::Value::Null))
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                map: A,
+            ) -> Result<RawPayload, A::Error> {
+                serde::Deserialize::deserialize(serde::de::value::MapAccessDeserializer::new(map))
+                    .map(RawPayload::Other)
+            }
+
+            /// Bytes accumulate until an element turns out not to be one; from
+            /// there the array is rebuilt as a `Value` so it renders as JSON text,
+            /// matching what the `Value`-based decode used to produce.
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<RawPayload, A::Error> {
+                let mut bytes: Vec<u8> = Vec::with_capacity(seq.size_hint().unwrap_or(0));
+                while let Some(element) = seq.next_element::<PayloadElement>()? {
+                    match element {
+                        PayloadElement::Byte(b) => bytes.push(b),
+                        PayloadElement::Other(value) => {
+                            let mut values: Vec<serde_json::Value> =
+                                bytes.into_iter().map(serde_json::Value::from).collect();
+                            values.push(value);
+                            while let Some(rest) = seq.next_element::<PayloadElement>()? {
+                                values.push(match rest {
+                                    PayloadElement::Byte(b) => b.into(),
+                                    PayloadElement::Other(v) => v,
+                                });
+                            }
+                            return Ok(RawPayload::Other(serde_json::Value::Array(values)));
+                        }
+                    }
+                }
+                Ok(RawPayload::Bytes(bytes))
+            }
+        }
+
+        d.deserialize_any(PayloadVisitor)
     }
 }
 

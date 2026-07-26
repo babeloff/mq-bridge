@@ -1548,3 +1548,75 @@ async fn test_file_csv_compressed_restart_writes_no_second_header() {
         "age,name\n30,alice\n25,bob\n"
     );
 }
+
+/// `normal`/`text` decode the payload in one pass (see `RawPayload`), with a
+/// fallback to JSON text for anything that is not a byte array. Every shape a
+/// payload can take is pinned here, because the fast path and the fallback have
+/// to agree with what the previous `serde_json::Value` decode produced.
+#[test]
+fn test_parse_message_payload_shapes() {
+    use crate::endpoints::file::parse_message;
+
+    let line = |payload: &str| {
+        format!(r#"{{"message_id":"019f9b12-d786-7ebe-a7ec-a1aa71bc47ae","payload":{payload}}}"#)
+            .into_bytes()
+    };
+    let decoded = |payload: &str, format: FileFormat| -> Vec<u8> {
+        let mut header = None;
+        parse_message(&line(payload), &format, &mut header)
+            .expect("line decodes")
+            .payload
+            .to_vec()
+    };
+
+    // Byte arrays — the fast path — become the bytes themselves.
+    assert_eq!(decoded("[104,105]", FileFormat::Normal), b"hi");
+    assert_eq!(decoded("[]", FileFormat::Normal), b"");
+    assert_eq!(decoded("[0,255]", FileFormat::Normal), vec![0u8, 255]);
+    // A string payload is taken verbatim.
+    assert_eq!(decoded(r#""hi""#, FileFormat::Normal), b"hi");
+    assert_eq!(decoded(r#""hi""#, FileFormat::Text), b"hi");
+
+    // Anything that is not a byte array falls back to its JSON text, including
+    // arrays that only stop being byte-like partway through.
+    assert_eq!(decoded("[1,2,300]", FileFormat::Normal), b"[1,2,300]");
+    assert_eq!(decoded("[1,-2]", FileFormat::Normal), b"[1,-2]");
+    assert_eq!(decoded("[1.5]", FileFormat::Normal), b"[1.5]");
+    assert_eq!(decoded(r#"[1,"a"]"#, FileFormat::Normal), br#"[1,"a"]"#);
+    assert_eq!(decoded("[[1],2]", FileFormat::Normal), b"[[1],2]");
+    assert_eq!(decoded("[null]", FileFormat::Normal), b"[null]");
+    assert_eq!(decoded(r#"{"a":1}"#, FileFormat::Normal), br#"{"a":1}"#);
+    assert_eq!(decoded("5", FileFormat::Normal), b"5");
+    assert_eq!(decoded("true", FileFormat::Normal), b"true");
+    assert_eq!(decoded("null", FileFormat::Normal), b"null");
+
+    // `json` keeps the payload as a JSON value, so a byte array stays an array.
+    assert_eq!(decoded("[104,105]", FileFormat::Json), b"[104,105]");
+
+    // message_id and metadata survive the fast path.
+    let mut header = None;
+    let msg = parse_message(
+        br#"{"message_id":"019f9b12-d786-7ebe-a7ec-a1aa71bc47ae","payload":[104,105],"metadata":{"k":"v"}}"#,
+        &FileFormat::Normal,
+        &mut header,
+    )
+    .expect("line decodes");
+    assert_eq!(msg.payload.to_vec(), b"hi");
+    assert_eq!(msg.metadata.get("k").map(String::as_str), Some("v"));
+    assert_eq!(
+        format!("{:032x}", msg.message_id),
+        "019f9b12d7867ebea7eca1aa71bc47ae"
+    );
+
+    // A line that is not the promised envelope is kept verbatim and marked.
+    let mut header = None;
+    let msg =
+        parse_message(b"not json at all", &FileFormat::Normal, &mut header).expect("line decodes");
+    assert_eq!(msg.payload.to_vec(), b"not json at all");
+    assert_eq!(
+        msg.metadata
+            .get("mq_bridge.original_format")
+            .map(String::as_str),
+        Some("raw")
+    );
+}
