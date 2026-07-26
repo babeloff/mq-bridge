@@ -2111,16 +2111,13 @@ impl MongoDbChangeStreamReader {
     ) -> Result<Option<ReceivedBatch>, ConsumerError> {
         let resume_from = self.snapshot_last_id.lock().unwrap().clone();
         let last = resume_from.clone();
+        // Never snapshot the bridge's own sequencer bookkeeping doc (see `available_message_filter`).
         let mut filter = match &last {
-            Some(v) => doc! { "_id": { "$gt": v.clone() } },
-            None => doc! {},
+            Some(v) => doc! { "_id": { "$gt": v.clone() }, "seq_counter": { "$exists": false } },
+            None => doc! { "seq_counter": { "$exists": false } },
         };
         if let Some(extra) = &self.receive_query {
-            filter = if filter.is_empty() {
-                extra.clone()
-            } else {
-                doc! { "$and": [filter, extra.clone()] }
-            };
+            filter = doc! { "$and": [filter, extra.clone()] };
         }
         let find_options = FindOptions::builder()
             .sort(doc! { "_id": 1 })
@@ -2207,6 +2204,10 @@ impl MongoDbChangeStreamReader {
         let (op, payload) = match event.operation_type {
             OperationType::Insert | OperationType::Update | OperationType::Replace => {
                 let doc = event.full_document.as_ref()?;
+                // Skip the bridge's own sequencer bookkeeping doc (its `$inc` updates and insert).
+                if doc.contains_key("seq_counter") {
+                    return None;
+                }
                 (op_str(&event.operation_type), serde_json::to_vec(doc).ok()?)
             }
             OperationType::Delete => {

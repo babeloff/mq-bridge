@@ -3132,6 +3132,11 @@ pub struct SqlxConfig {
     /// Example: `INSERT INTO orders (customer_id, sku, qty) VALUES (${metadata:customer_id}, ${payload:sku}, ${payload:qty})`.
     /// A query with no `${...}` tokens behaves exactly as before (whole payload bound once).
     /// `auto_create_table` is not supported together with a token-based query.
+    ///
+    /// Tokens bind as text/number/bool; Postgres won't implicitly cast text into a
+    /// `numeric`/`timestamptz` column (these arrive as JSON strings from a sql source).
+    /// Add an explicit cast next to the token — it is preserved verbatim in the SQL:
+    /// `VALUES (${payload:amount}::numeric, ${payload:created_at}::timestamptz)`.
     pub insert_query: Option<String>,
     /// (Consumer only) Optional. A custom SQL SELECT query to fetch messages. This is only supported for PostgreSQL and Microsoft SQL Server.
     /// The query must include a placeholder for the batch size (`$1` for PostgreSQL, `@p1` for SQL Server).

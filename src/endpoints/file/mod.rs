@@ -1052,6 +1052,34 @@ struct FileTailConsumer {
     /// data; the next `receive_batch` surfaces it as an empty batch so a route
     /// with `exit_on_empty` can drain-then-exit.
     pending_eof: bool,
+    /// Member (compressed/encrypted) readers publish the reason they gave up
+    /// decoding here before closing the channel. When set, a closed channel is a
+    /// permanent decode failure (wrong codec/key), reported as
+    /// `ConsumerError::Permanent` so the route fails instead of completing cleanly.
+    /// `None` for plain readers, whose closed channel is a normal end-of-stream.
+    decode_error: Option<Arc<StdMutex<Option<String>>>>,
+}
+
+/// Returns the `compression` codec name if the file at `path` begins with that
+/// compressor's magic bytes. Used to reject reading a compressed file with no
+/// `compression` configured (which would emit undecoded garbage). Names match the
+/// `Compression` config spelling. `None` if the file is absent, empty, too short,
+/// or has no recognized magic.
+fn sniff_compression_magic(path: &str) -> Option<&'static str> {
+    use std::io::Read;
+    let mut head = [0u8; 4];
+    let mut f = std::fs::File::open(path).ok()?;
+    let n = f.read(&mut head).ok()?;
+    let head = &head[..n];
+    if head.starts_with(&[0x1f, 0x8b]) {
+        Some("gzip")
+    } else if head.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]) {
+        Some("zstd")
+    } else if head.starts_with(&[0x04, 0x22, 0x4d, 0x18]) {
+        Some("lz4")
+    } else {
+        None
+    }
 }
 
 fn read_until_bytes_sync<R: std::io::BufRead>(
@@ -1352,6 +1380,7 @@ fn run_file_member_consume_task_sync<F>(
     delimiter: Vec<u8>,
     format: FileFormat,
     ready: Arc<AtomicBool>,
+    decode_error_slot: Arc<StdMutex<Option<String>>>,
     make_reader: F,
 ) where
     F: Fn(std::fs::File) -> Box<dyn std::io::Read>,
@@ -1423,12 +1452,12 @@ fn run_file_member_consume_task_sync<F>(
                 decode_failures = 1;
             }
             if decode_failures >= MAX_DECODE_FAILURES {
-                tracing::error!(
-                    "Giving up decoding {} after {} failed attempts at {} bytes; closing stream",
-                    path,
-                    decode_failures,
-                    cur_len
+                let msg = format!(
+                    "Giving up decoding {path} after {decode_failures} failed attempts at {cur_len} bytes; \
+                     the file's compression/encryption likely does not match this endpoint's config"
                 );
+                tracing::error!("{msg}; closing stream");
+                *decode_error_slot.lock().unwrap() = Some(msg);
                 break;
             }
             std::thread::sleep(std::time::Duration::from_secs(1));
@@ -1496,12 +1525,12 @@ fn run_file_member_consume_task_sync<F>(
                 decode_failures = 1;
             }
             if decode_failures >= MAX_DECODE_FAILURES {
-                tracing::error!(
-                    "Giving up decoding {} after {} failed attempts at {} bytes; closing stream",
-                    path,
-                    decode_failures,
-                    cur_len
+                let msg = format!(
+                    "Giving up decoding {path} after {decode_failures} failed attempts at {cur_len} bytes; \
+                     the file's compression/encryption likely does not match this endpoint's config"
                 );
+                tracing::error!("{msg}; closing stream");
+                *decode_error_slot.lock().unwrap() = Some(msg);
                 break;
             }
             std::thread::sleep(std::time::Duration::from_secs(1));
@@ -1648,6 +1677,17 @@ impl FileConsumer {
             #[cfg(any(feature = "compression", feature = "encryption"))]
             return Self::new_member_consumer(config, delimiter, format).await;
         }
+        // No codec configured: guard against reading a compressed file as plaintext,
+        // which would otherwise split the raw bytes on newlines and emit binary garbage
+        // as "messages" under a clean success. A known compressor magic at offset 0 is
+        // unambiguous here (a JSON/text member never starts with these bytes).
+        if let Some(codec) = sniff_compression_magic(&config.path) {
+            return Err(anyhow::anyhow!(
+                "file '{}' begins with a {codec} magic header but no `compression` is configured; \
+                 set `compression: {codec}` (and any `encryption`) to match how it was written",
+                config.path
+            ));
+        }
         match &config.mode {
             None | Some(FileConsumerMode::Consume { delete: false }) => {
                 Self::new_tail(&config.path, false, None, delimiter.clone(), format).await
@@ -1757,6 +1797,8 @@ impl FileConsumer {
         let (msg_tx, msg_rx) = async_channel::bounded(100);
         let ready = Arc::new(AtomicBool::new(false));
         let ready_clone = ready.clone();
+        let decode_error: Arc<StdMutex<Option<String>>> = Arc::new(StdMutex::new(None));
+        let decode_error_clone = decode_error.clone();
 
         let compression = config.compression;
         #[cfg(feature = "encryption")]
@@ -1793,6 +1835,7 @@ impl FileConsumer {
                 delimiter,
                 format_clone,
                 ready_clone,
+                decode_error_clone,
                 make_reader,
             );
         });
@@ -1804,6 +1847,7 @@ impl FileConsumer {
                 offset_file: None,
                 ready,
                 pending_eof: false,
+                decode_error: Some(decode_error),
             }),
         })
     }
@@ -1870,6 +1914,7 @@ impl FileConsumer {
                 offset_file,
                 ready,
                 pending_eof: false,
+                decode_error: None,
             }),
         })
     }
@@ -1908,7 +1953,19 @@ impl MessageConsumer for FileConsumer {
                         // An empty batch is the watcher's end-of-file marker; fall
                         // through to return it as an empty batch.
                         Ok(batch) => c.buffer = batch,
-                        Err(_) => return Err(ConsumerError::EndOfStream),
+                        // Channel closed. For a member reader, a recorded decode
+                        // error means the codec/key didn't match — fail the route
+                        // rather than masquerade as a clean end-of-stream.
+                        Err(_) => {
+                            if let Some(reason) = c
+                                .decode_error
+                                .as_ref()
+                                .and_then(|slot| slot.lock().unwrap().take())
+                            {
+                                return Err(ConsumerError::Permanent(anyhow::anyhow!(reason)));
+                            }
+                            return Err(ConsumerError::EndOfStream);
+                        }
                     }
                 }
 

@@ -119,6 +119,17 @@ errors are **not** dead-lettered — they propagate so the route can reconnect. 
 is a full endpoint, so it can itself have middleware. If the DLQ send fails with a connection
 error that error propagates rather than silently dropping the message.
 
+**Without a `dlq` (or `retry`) middleware**, a message that fails permanently — a data/type
+error the sink rejects, a poison payload a handler rejects — is logged at `error` level and
+**dropped**, and the route keeps processing the rest of the batch. This tolerate-and-continue
+policy keeps one bad message from halting the whole stream, but it means a *systematic* failure
+(e.g. every row hitting a column-type mismatch) drains the input while committing nothing and
+still ends `completed`. Add a `dlq` to capture the failures for inspection/replay, or watch the
+route's logs — a burst of `Dropping message … due to non-retryable error` is the signal. Note
+that transient errors are handled separately: several endpoints retry connection/timeout errors
+internally, and the `retry` middleware adds backoff on top, so only genuinely permanent errors
+reach this drop path.
+
 ### `transform`
 
 Declarative JSON reshaping: field mapping, then schema-directed coercion, defaults and
@@ -365,6 +376,17 @@ readable through a matching consumer; a compressed-only file stays a standard `.
 stream. File compression/encryption supports only the default `consume` mode. `csv` works
 too: the header row is written into the first member, so the decoded stream is a normal CSV
 file.
+
+A file **source** must declare the same `compression`/`encryption` the data was written with.
+A mismatch (wrong key, wrong codec, or a missing field) is a permanent decode failure: the
+route ends `failed` with the error in its status, rather than completing as if the file were
+empty. Reading a compressed file with no `compression` set is likewise rejected up front by
+sniffing the leading magic bytes, so raw compressed bytes are never emitted as messages.
+
+> **f64 precision.** Numbers move through payloads as JSON. serde_json's default parser shifts
+> ~1 ULP on ~19% of 17-significant-digit doubles, so a `postgres → file → postgres` hop of a
+> `double precision` column can change the last bit. Build with the `float-roundtrip` feature
+> for bit-exact float parsing across every endpoint (it trades a little parse speed for it).
 
 ### `metrics`
 

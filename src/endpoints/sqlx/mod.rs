@@ -428,26 +428,42 @@ fn copy_escape_text(s: &str) -> String {
 /// column/table) is deterministic — retrying the identical payload fails the same way — so surface
 /// it as non-retryable (dead-letterable) instead of looping forever. Connection/pool/IO failures
 /// are transient and stay retryable (at-least-once).
+/// True for SQLSTATE classes whose errors are deterministic: the same statement +
+/// value fails identically on retry, so retrying can never succeed. Classified by the
+/// two-char class prefix (ANSI SQLSTATE, shared by Postgres and MySQL):
+///   - `42` syntax error / access-rule violation — undefined column/table, and crucially
+///     `42804` datatype_mismatch (text bound into a `numeric`/`timestamptz` column).
+///   - `22` data exception — invalid text representation, numeric overflow, bad datetime.
+///   - `23` integrity constraint violation (also caught by `ErrorKind` below).
+/// Everything else (08 connection, 40 deadlock/serialization, 53 resources,
+/// 55 object-not-ready, 57 operator-intervention, 58 system) is transient and retried.
+fn is_deterministic_sqlstate(code: &str) -> bool {
+    matches!(&code.get(..2), Some("42") | Some("22") | Some("23"))
+}
+
 /// Classifies a SQL error as deterministic (dead-letter) vs transient (retry).
-/// A `Database` error is a rejection by the server (constraint violation, bad SQL,
-/// type mismatch) that will recur on retry, so it is non-retryable; everything else
-/// (connection drops, pool timeouts, protocol errors) is treated as transient.
-// Only deterministic failures (constraint violations) are NonRetryable — retrying can never
-// succeed. Every other database error is transient and Retryable: server shutdown (MySQL 1053),
-// lost connections, lock-wait/deadlock, "too many connections", and crash-recovery errors all
-// surface as `Database` errors during a broker restart/failover, and dropping them loses
-// messages. Non-`Database` errors (I/O, pool timeout, TLS) are transport-level and retryable too.
+///
+/// Deterministic errors — constraint violations and the syntax/data/type classes above —
+/// are `NonRetryable`: retrying the identical statement and value fails the same way, so
+/// they must dead-letter (or fail the route) rather than loop forever. A `42804` type
+/// mismatch could in theory succeed after a concurrent schema migration, but the message
+/// belongs in the DLQ for replay, not in an infinite retry that wedges the route.
+///
+/// Everything else stays `Retryable` (at-least-once): connection drops, pool timeouts,
+/// deadlocks/serialization failures, "too many connections", and crash-recovery errors
+/// all surface transiently during a restart/failover, and dropping them would lose messages.
 fn classify_sql_error(e: sqlx::Error) -> PublisherError {
     use sqlx::error::ErrorKind;
     if let Some(db_err) = e.as_database_error() {
-        if matches!(
+        let deterministic = matches!(
             db_err.kind(),
             ErrorKind::UniqueViolation
                 | ErrorKind::ForeignKeyViolation
                 | ErrorKind::NotNullViolation
                 | ErrorKind::CheckViolation
                 | ErrorKind::ExclusionViolation
-        ) {
+        ) || db_err.code().is_some_and(|c| is_deterministic_sqlstate(&c));
+        if deterministic {
             return PublisherError::NonRetryable(anyhow!(e));
         }
     }

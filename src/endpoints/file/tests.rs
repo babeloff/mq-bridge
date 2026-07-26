@@ -191,11 +191,59 @@ async fn test_file_encrypted_compressed_roundtrip() {
         }
     })
     .await;
-    // Bounded decode failures surface as a closed stream (EndOfStream), never data.
+    // A codec/key mismatch is a permanent decode failure: it must surface as
+    // ConsumerError::Permanent (which fails the route), never as data or a clean
+    // EndOfStream that would masquerade as success.
     assert!(
-        matches!(got, Ok(Err(_))),
-        "expected a consume error, got {got:?}"
+        matches!(got, Ok(Err(crate::traits::ConsumerError::Permanent(_)))),
+        "expected ConsumerError::Permanent, got {got:?}"
     );
+}
+
+#[tokio::test]
+async fn test_reading_compressed_file_without_codec_is_rejected() {
+    // A gzip file read with no `compression` configured must be rejected at connect,
+    // not read as plaintext and split into binary "messages" under a clean success.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("data.bin");
+    // gzip magic + arbitrary bytes.
+    std::fs::write(&path, [0x1f, 0x8b, 0x08, 0x00, 0x11, 0x22]).unwrap();
+    let config = FileConfig {
+        path: path.to_string_lossy().to_string(),
+        ..Default::default()
+    };
+    let err = match FileConsumer::new(&config).await {
+        Ok(_) => panic!("expected a rejection reading a gzip file without `compression`"),
+        Err(e) => e.to_string(),
+    };
+    assert!(err.contains("gzip"), "unexpected error: {err}");
+    // A plaintext JSON file is accepted.
+    std::fs::write(&path, b"{\"a\":1}\n").unwrap();
+    assert!(FileConsumer::new(&config).await.is_ok());
+}
+
+#[test]
+fn test_sniff_compression_magic() {
+    use super::sniff_compression_magic;
+    let dir = tempdir().unwrap();
+    let cases: &[(&[u8], Option<&str>)] = &[
+        (&[0x1f, 0x8b, 0x08], Some("gzip")),
+        (&[0x28, 0xb5, 0x2f, 0xfd], Some("zstd")),
+        (&[0x04, 0x22, 0x4d, 0x18], Some("lz4")),
+        (b"{\"json\":1}", None),
+        (&[0x1f], None), // too short to be gzip
+        (b"", None),
+    ];
+    for (i, (bytes, want)) in cases.iter().enumerate() {
+        let p = dir.path().join(format!("f{i}"));
+        std::fs::write(&p, bytes).unwrap();
+        assert_eq!(
+            sniff_compression_magic(&p.to_string_lossy()),
+            *want,
+            "case {i}"
+        );
+    }
+    assert_eq!(sniff_compression_magic("/no/such/file"), None);
 }
 
 #[cfg(feature = "compression")]
