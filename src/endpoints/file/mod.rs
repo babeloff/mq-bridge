@@ -156,6 +156,8 @@ fn csv_encode_message(
     // after the first one this never reallocates.
     row_buf.clear();
     row_buf.reserve(msg.payload.len());
+    // Columns this payload actually supplied, for the drift check below.
+    let mut matched = 0usize;
     for (i, c) in cols.iter().enumerate() {
         if i > 0 {
             row_buf.push(b',');
@@ -164,14 +166,38 @@ fn csv_encode_message(
             (Some(raw), _) => {
                 if let Some(v) = raw.get(c.as_str()) {
                     csv_append_raw(row_buf, v);
+                    matched += 1;
                 }
             }
             (_, Some(obj)) => {
                 if let Some(v) = obj.get(c) {
                     csv_append_value(row_buf, v);
+                    matched += 1;
                 }
             }
             _ => unreachable!(),
+        }
+    }
+    if !header_established {
+        // Keys the payload has beyond the ones the header covers are dropped silently, and
+        // missing ones become empty fields; both mean the file's schema drifted. Counting
+        // matches costs nothing extra, and the diagnostic is emitted once per process so a
+        // whole drifted stream doesn't flood the log.
+        let row_len = match (&raw_row, &parsed_row) {
+            (Some(raw), _) => raw.len(),
+            (_, Some(obj)) => obj.len(),
+            _ => 0,
+        };
+        if matched < cols.len() || row_len > matched {
+            static WARNED: AtomicBool = AtomicBool::new(false);
+            if !WARNED.swap(true, Ordering::Relaxed) {
+                warn!(
+                    header_columns = cols.len(),
+                    payload_keys = row_len,
+                    matched_columns = matched,
+                    "CSV payload keys differ from the established header: extra keys are dropped and missing ones written as empty fields. Logged once per process."
+                );
+            }
         }
     }
     Ok(header_established)
@@ -549,7 +575,23 @@ impl FilePublisher {
                     anyhow::Error::new(e).context("Failed to write member to file"),
                 ));
             }
-            file.flush().await.context("Failed to flush file")?;
+            // Same rollback as the write above: a failed flush can leave a partial
+            // member on disk, which a Retryable re-append would concatenate onto.
+            if let Err(e) = file.flush().await {
+                if let Err(te) = file.set_len(pre_len).await {
+                    tracing::error!(
+                        "Failed to truncate file back to {} after member flush error: {}",
+                        pre_len,
+                        te
+                    );
+                    return Err(PublisherError::NonRetryable(anyhow::Error::new(e).context(
+                        "Failed to flush member to file and could not truncate the partial write",
+                    )));
+                }
+                return Err(PublisherError::Retryable(
+                    anyhow::Error::new(e).context("Failed to flush file"),
+                ));
+            }
             Ok(())
             }
             .await;
@@ -659,21 +701,19 @@ impl MessagePublisher for FilePublisher {
             // pushed to `failed_messages` keeps its remaining fields, and the
             // dropped `mqb.src.*` keys are irrelevant to a retry on the next hop.
             msg.strip_source_metadata();
+            // Carried out of the match so the `hdr` borrow ends before the write,
+            // which needs the guard again for the rollback path.
+            let mut csv_header_line: Option<Vec<u8>> = None;
             let serialized_msg = match self.format {
                 FileFormat::Csv => {
                     let hdr = csv_header_guard.as_mut().expect("csv header lock held");
                     match csv_encode_message(&msg, hdr, &mut csv_row_buf) {
                         Ok(header_established) => {
                             if header_established && file_is_empty {
-                                let header_line =
+                                let mut line =
                                     csv_encode_row(hdr.as_ref().expect("header set above"));
-                                if let Err(e) = writer.write_all(&header_line).await {
-                                    return Err(PublisherError::NonRetryable(anyhow::anyhow!(e)));
-                                }
-                                if let Err(e) = writer.write_all(&self.delimiter).await {
-                                    return Err(PublisherError::NonRetryable(anyhow::anyhow!(e)));
-                                }
-                                wrote_csv_header = true;
+                                line.extend_from_slice(&self.delimiter);
+                                csv_header_line = Some(line);
                             }
                             Ok(None)
                         }
@@ -682,6 +722,21 @@ impl MessagePublisher for FilePublisher {
                 }
                 ref fmt => encode_record(&msg, fmt).map(Some),
             };
+            if let Some(line) = csv_header_line {
+                // Set before the write: the header is established in memory either way, so a
+                // rollback has to clear it even when the write itself failed.
+                wrote_csv_header = true;
+                if let Err(e) = writer.write_all(&line).await {
+                    roll_back_partial_batch(
+                        &writer,
+                        pre_len,
+                        wrote_csv_header,
+                        csv_header_guard.as_mut(),
+                    )
+                    .await;
+                    return Err(PublisherError::NonRetryable(anyhow::anyhow!(e)));
+                }
+            }
             let serialized_msg = match serialized_msg {
                 Ok(s) => s,
                 Err(e) => {
@@ -2182,7 +2237,14 @@ pub(crate) fn parse_message(
 /// A line that is not the JSON envelope the format promised is kept verbatim as a
 /// raw payload rather than dropped, and marked so the next hop can tell.
 fn raw_fallback_message(buffer: &[u8], err: serde_json::Error) -> CanonicalMessage {
-    warn!(error = %err, content_length = buffer.len(), "Failed to parse file line as JSON, treating as raw.");
+    // A file that is not JSON at all hits this for every line, so only the first
+    // occurrence warns; the rest stay at debug.
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    if !WARNED.swap(true, Ordering::Relaxed) {
+        warn!(error = %err, content_length = buffer.len(), "Failed to parse file line as JSON, treating as raw. Further occurrences are logged at debug level.");
+    } else {
+        tracing::debug!(error = %err, content_length = buffer.len(), "Failed to parse file line as JSON, treating as raw.");
+    }
     let mut msg = CanonicalMessage::new(buffer.to_vec(), None);
     msg.metadata
         .insert("mq_bridge.original_format".to_string(), "raw".to_string());
