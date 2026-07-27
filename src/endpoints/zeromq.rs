@@ -340,6 +340,8 @@ pub struct ZeroMqConsumer {
     // frame is payload, not a topic, so the cursor must not be attached there.
     is_sub: bool,
     format: ZeroMqFormat,
+    /// Drain mode: only then does an idle recv return without filling (empty batch).
+    exit_on_empty: bool,
 }
 
 impl ZeroMqConsumer {
@@ -451,6 +453,7 @@ impl ZeroMqConsumer {
             buffer: VecDeque::new(),
             is_sub,
             format,
+            exit_on_empty: false,
         })
     }
 
@@ -533,11 +536,12 @@ impl ZeroMqConsumer {
     }
 
     async fn fill_buffer(&mut self) -> Result<(), ConsumerError> {
-        let item = self
-            .rx
-            .recv()
-            .await
-            .map_err(|_| ConsumerError::EndOfStream)??;
+        // Drain mode: a brief idle timeout returns empty-handed so --drain can fire.
+        let Some(item) = crate::traits::drain_gated(self.exit_on_empty, self.rx.recv()).await
+        else {
+            return Ok(());
+        };
+        let item = item.map_err(|_| ConsumerError::EndOfStream)??;
         let msgs = Self::decode_batch(item.msg, self.is_sub, &self.format)
             .map_err(|e| ConsumerError::Connection(anyhow!(e)))?;
 
@@ -575,6 +579,9 @@ impl MessageConsumer for ZeroMqConsumer {
     // replies or is a no-op), so commits are order-independent.
     fn commit_requires_order(&self) -> bool {
         false
+    }
+    fn set_exit_on_empty(&mut self, exit_on_empty: bool) {
+        self.exit_on_empty = exit_on_empty;
     }
     async fn receive_batch(&mut self, max_messages: usize) -> Result<ReceivedBatch, ConsumerError> {
         if max_messages == 0 {

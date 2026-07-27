@@ -60,6 +60,8 @@ pub struct PostgresCdcConsumer {
     /// TLS config used on teardown to reopen the control-plane connection (see `Drop`).
     tls: crate::models::TlsConfig,
     ended: bool,
+    /// Drain mode: only then does an idle replication read time out into an empty batch.
+    exit_on_empty: bool,
 }
 
 impl PostgresCdcConsumer {
@@ -165,6 +167,7 @@ impl PostgresCdcConsumer {
             slot_name: config.slot_name.clone(),
             tls: config.tls.clone(),
             ended: false,
+            exit_on_empty: false,
         })
     }
 
@@ -291,6 +294,9 @@ fn stage_truncate(rel: &Relation, _t: &Truncate) -> CanonicalMessage {
 
 #[async_trait]
 impl MessageConsumer for PostgresCdcConsumer {
+    fn set_exit_on_empty(&mut self, exit_on_empty: bool) {
+        self.exit_on_empty = exit_on_empty;
+    }
     async fn receive_batch(&mut self, max_messages: usize) -> Result<ReceivedBatch, ConsumerError> {
         if max_messages == 0 {
             return Ok(ReceivedBatch {
@@ -307,7 +313,13 @@ impl MessageConsumer for PostgresCdcConsumer {
             if self.ended {
                 return Err(ConsumerError::EndOfStream);
             }
-            match self.client.recv().await {
+            // Drain mode: a brief idle timeout yields an empty batch (no-op commit, so the
+            // slot is not advanced past unconsumed changes) and lets --drain fire.
+            let Some(ev) = crate::traits::drain_gated(self.exit_on_empty, self.client.recv()).await
+            else {
+                return Ok(ReceivedBatch::empty());
+            };
+            match ev {
                 Ok(None) | Ok(Some(ReplicationEvent::StoppedAt { .. })) => {
                     self.ended = true;
                     return Err(ConsumerError::EndOfStream);

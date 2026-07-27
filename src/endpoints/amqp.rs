@@ -482,6 +482,8 @@ pub struct AmqpConsumer {
     is_poisoned: Arc<AtomicBool>,
     reply_confirms_selected: Arc<tokio::sync::OnceCell<()>>,
     prefetch: u16,
+    /// Drain mode: only then does an idle wait surface an empty batch.
+    exit_on_empty: bool,
 }
 
 impl AmqpConsumer {
@@ -597,6 +599,7 @@ impl AmqpConsumer {
             is_poisoned: Arc::new(AtomicBool::new(false)),
             reply_confirms_selected: Arc::new(tokio::sync::OnceCell::new()),
             prefetch: prefetch_count,
+            exit_on_empty: false,
         })
     }
 }
@@ -749,6 +752,9 @@ impl MessageConsumer for AmqpConsumer {
     fn commit_requires_order(&self) -> bool {
         false
     }
+    fn set_exit_on_empty(&mut self, exit_on_empty: bool) {
+        self.exit_on_empty = exit_on_empty;
+    }
     async fn receive_batch(&mut self, max_messages: usize) -> Result<ReceivedBatch, ConsumerError> {
         if self.is_poisoned.load(Ordering::Relaxed) {
             return Err(ConsumerError::Connection(anyhow::anyhow!(
@@ -786,6 +792,10 @@ impl MessageConsumer for AmqpConsumer {
                         return Err(ConsumerError::Connection(anyhow::anyhow!(
                             "AMQP connection lost while waiting for messages"
                         )));
+                    }
+                    // Drain mode: surface an empty batch instead of looping on an idle queue.
+                    if self.exit_on_empty {
+                        return Ok(ReceivedBatch::empty());
                     }
                 }
             }

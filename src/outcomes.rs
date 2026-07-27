@@ -54,6 +54,17 @@ pub struct ReceivedBatch {
     pub commit: BatchCommitFunc,
 }
 
+impl ReceivedBatch {
+    /// An empty batch with a no-op commit. Consumers return this to signal idle —
+    /// the route treats it as the drain trigger under `exit_on_empty`/`--drain`.
+    pub fn empty() -> Self {
+        Self {
+            messages: Vec::new(),
+            commit: Box::new(|_| Box::pin(async { Ok(()) })),
+        }
+    }
+}
+
 impl std::fmt::Debug for ReceivedBatch {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ReceivedBatch")

@@ -464,6 +464,7 @@ impl EventStore {
             store: self.clone(),
             subscriber_id,
             last_offset: Arc::new(AtomicU64::new(0)),
+            exit_on_empty: false,
         }
     }
 }
@@ -473,6 +474,8 @@ pub struct EventStoreConsumer {
     store: Arc<EventStore>,
     subscriber_id: String,
     last_offset: Arc<AtomicU64>,
+    /// Drain mode: only then does an idle wait time out into an empty batch.
+    exit_on_empty: bool,
 }
 
 #[async_trait]
@@ -480,6 +483,9 @@ impl MessageConsumer for EventStoreConsumer {
     // Intentionally keeps the ordered default: the consumer advances a per-reader
     // position cursor in the log, so out-of-order commits could skip un-acked
     // events. (Backs the memory Log and file-event-store backends.)
+    fn set_exit_on_empty(&mut self, exit_on_empty: bool) {
+        self.exit_on_empty = exit_on_empty;
+    }
     async fn receive_batch(&mut self, max_messages: usize) -> Result<ReceivedBatch, ConsumerError> {
         self.store
             .register_subscriber(self.subscriber_id.clone())
@@ -497,8 +503,16 @@ impl MessageConsumer for EventStoreConsumer {
         };
 
         let stored_events = if stored_events.is_empty() {
-            // Wait for new events
-            self.store.wait_for_events(last_offset_val).await;
+            // Wait for new events; drain mode times out into an empty batch.
+            if crate::traits::drain_gated(
+                self.exit_on_empty,
+                self.store.wait_for_events(last_offset_val),
+            )
+            .await
+            .is_none()
+            {
+                return Ok(ReceivedBatch::empty());
+            }
             match self
                 .store
                 .get_events_since(last_offset_val, max_messages)

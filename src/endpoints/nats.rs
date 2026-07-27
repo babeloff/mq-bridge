@@ -284,6 +284,10 @@ pub struct NatsConsumer {
     core: NatsCore,
     client: async_nats::Client,
     subject: String,
+    /// Set by the route when `exit_on_empty`/`--drain` is active. Only then does an
+    /// idle read time out into an empty batch; otherwise it blocks indefinitely
+    /// (event-driven, no added latency) as a streaming source should.
+    exit_on_empty: bool,
 }
 use std::any::Any;
 
@@ -332,6 +336,7 @@ impl NatsConsumer {
             core,
             client,
             subject: subject.to_string(),
+            exit_on_empty: false,
         })
     }
 }
@@ -344,9 +349,18 @@ impl MessageConsumer for NatsConsumer {
         false
     }
 
+    fn set_exit_on_empty(&mut self, exit_on_empty: bool) {
+        self.exit_on_empty = exit_on_empty;
+    }
+
     async fn receive_batch(&mut self, max_messages: usize) -> Result<ReceivedBatch, ConsumerError> {
         self.core
-            .receive_batch(max_messages, &self.subject, &self.client)
+            .receive_batch(
+                max_messages,
+                &self.subject,
+                &self.client,
+                self.exit_on_empty,
+            )
             .await
     }
 
@@ -575,6 +589,7 @@ impl NatsCore {
         max_messages: usize,
         subject: &str,
         client: &async_nats::Client,
+        exit_on_empty: bool,
     ) -> Result<ReceivedBatch, ConsumerError> {
         if max_messages == 0 {
             return Ok(ReceivedBatch {
@@ -583,13 +598,21 @@ impl NatsCore {
             });
         }
 
+        // In drain mode (`exit_on_empty`/`--drain`) block only briefly for the first
+        // message, then surface an empty batch so the drain can fire instead of blocking
+        // forever. Otherwise (streaming, the default) block indefinitely — event-driven,
+        // no added latency. `.next()` is cancel-safe, so the timeout loses no message.
         match self {
             NatsCore::JetStream { stream, .. } => {
                 let mut canonical_messages = Vec::with_capacity(max_messages);
                 let mut jetstream_messages = Vec::with_capacity(max_messages);
 
                 tracing::trace!("Waiting for next NATS JetStream message");
-                let message_stream = stream.next().await;
+                let Some(message_stream) =
+                    crate::traits::drain_gated(exit_on_empty, stream.next()).await
+                else {
+                    return Ok(ReceivedBatch::empty()); // Idle: let the drain fire.
+                };
                 tracing::trace!("Received NATS JetStream message");
 
                 // Process the first message if it exists
@@ -656,7 +679,11 @@ impl NatsCore {
                 let mut messages = Vec::with_capacity(max_messages);
                 let mut reply_subjects = Vec::with_capacity(max_messages);
 
-                if let Some(message) = sub.next().await {
+                let Some(first) = crate::traits::drain_gated(exit_on_empty, sub.next()).await
+                else {
+                    return Ok(ReceivedBatch::empty()); // Idle: let the drain fire.
+                };
+                if let Some(message) = first {
                     // Note: reply_subjects are recorded from the native Message.reply while metadata["reply_to"]
                     // may reflect header-provided values (read by route.rs). The batch commit closure always
                     // publishes to the original Message.reply to preserve native NATS reply semantics.

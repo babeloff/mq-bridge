@@ -83,6 +83,13 @@ impl MessageConsumer for GrpcConsumer {
         false
     }
 
+    fn set_exit_on_empty(&mut self, exit_on_empty: bool) {
+        match &mut self.inner {
+            GrpcConsumerInner::Client(c) => c.set_exit_on_empty(exit_on_empty),
+            GrpcConsumerInner::Server(s) => s.set_exit_on_empty(exit_on_empty),
+        }
+    }
+
     async fn receive_batch(
         &mut self,
         max_messages: usize,
@@ -125,6 +132,8 @@ impl MessageConsumer for GrpcConsumer {
 struct ClientModeConsumer {
     _client: BridgeClient<Channel>,
     stream: tonic::Streaming<BridgeMessage>,
+    /// Drain mode: only then does an idle first-message read time out into an empty batch.
+    exit_on_empty: bool,
 }
 
 impl ClientModeConsumer {
@@ -150,17 +159,21 @@ impl ClientModeConsumer {
         Ok(Self {
             _client: client,
             stream,
+            exit_on_empty: false,
         })
     }
 }
 
 #[async_trait]
 impl MessageConsumer for ClientModeConsumer {
+    fn set_exit_on_empty(&mut self, exit_on_empty: bool) {
+        self.exit_on_empty = exit_on_empty;
+    }
     async fn receive_batch(
         &mut self,
         max_messages: usize,
     ) -> Result<crate::outcomes::ReceivedBatch, ConsumerError> {
-        receive_from_stream(&mut self.stream, max_messages).await
+        receive_from_stream(&mut self.stream, max_messages, self.exit_on_empty).await
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -173,11 +186,16 @@ impl MessageConsumer for ClientModeConsumer {
 async fn receive_from_stream(
     stream: &mut tonic::Streaming<BridgeMessage>,
     max_messages: usize,
+    exit_on_empty: bool,
 ) -> Result<crate::outcomes::ReceivedBatch, ConsumerError> {
     let mut messages = Vec::with_capacity(max_messages);
     loop {
         let result = if messages.is_empty() {
-            Ok(stream.message().await)
+            // Drain mode: a brief idle timeout on the first message yields an empty batch.
+            match crate::traits::drain_gated(exit_on_empty, stream.message()).await {
+                Some(r) => Ok(r),
+                None => return Ok(crate::outcomes::ReceivedBatch::empty()),
+            }
         } else {
             tokio::time::timeout(Duration::from_millis(GRPC_BATCH_POLL_MS), stream.message()).await
         };
@@ -223,6 +241,8 @@ struct ServerModeConsumer {
     rxs: Vec<mpsc::Receiver<BridgeMessage>>,
     // Round-robin cursor for the next shard to drain first, so none starves.
     drain_start: usize,
+    /// Drain mode: only then does an idle first-message poll time out into an empty batch.
+    exit_on_empty: bool,
 }
 
 /// Tonic service implementation that fans incoming messages into a subscriber
@@ -521,6 +541,7 @@ impl ServerModeConsumer {
             shared_server,
             rxs,
             drain_start: 0,
+            exit_on_empty: false,
         })
     }
 
@@ -670,6 +691,9 @@ impl Drop for ServerModeConsumer {
 
 #[async_trait]
 impl MessageConsumer for ServerModeConsumer {
+    fn set_exit_on_empty(&mut self, exit_on_empty: bool) {
+        self.exit_on_empty = exit_on_empty;
+    }
     async fn receive_batch(
         &mut self,
         max_messages: usize,
@@ -718,7 +742,11 @@ impl MessageConsumer for ServerModeConsumer {
                 }
             });
             let next = if messages.is_empty() {
-                poll.await
+                // Drain mode: a brief idle timeout on the first message yields an empty batch.
+                match crate::traits::drain_gated(self.exit_on_empty, poll).await {
+                    Some(value) => value,
+                    None => return Ok(crate::outcomes::ReceivedBatch::empty()),
+                }
             } else {
                 match tokio::time::timeout(Duration::from_millis(GRPC_BATCH_POLL_MS), poll).await {
                     Ok(value) => value,

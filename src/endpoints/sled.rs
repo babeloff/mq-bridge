@@ -140,6 +140,8 @@ pub struct SledConsumer {
     notify_rx: async_channel::Receiver<()>,
     delete_after_read: bool,
     last_key: Option<IVec>,
+    /// Drain mode: only then does an idle wait time out into an empty batch.
+    exit_on_empty: bool,
 }
 
 impl SledConsumer {
@@ -212,6 +214,7 @@ impl SledConsumer {
             notify_rx: rx,
             delete_after_read: config.delete_after_read,
             last_key,
+            exit_on_empty: false,
         })
     }
 }
@@ -222,6 +225,9 @@ impl MessageConsumer for SledConsumer {
     // not deleting), so commits are independent and order-free.
     fn commit_requires_order(&self) -> bool {
         false
+    }
+    fn set_exit_on_empty(&mut self, exit_on_empty: bool) {
+        self.exit_on_empty = exit_on_empty;
     }
     async fn receive(&mut self) -> Result<Received, ConsumerError> {
         loop {
@@ -332,8 +338,12 @@ impl MessageConsumer for SledConsumer {
         let mut messages = Vec::with_capacity(max_messages);
         let mut commits = Vec::with_capacity(max_messages);
 
-        // First message blocks
-        let first = self.receive().await?;
+        // First message blocks; drain mode times out into an empty batch (recv is cancel-safe).
+        let Some(first) = crate::traits::drain_gated(self.exit_on_empty, self.receive()).await
+        else {
+            return Ok(ReceivedBatch::empty());
+        };
+        let first = first?;
         messages.push(first.message);
         commits.push(first.commit);
 

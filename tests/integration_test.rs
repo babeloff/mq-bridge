@@ -105,6 +105,8 @@ async fn test_all_subscriber_logic() {
         if should_run("nats") {
             println!("\n\n>>> Starting NATS Subscriber Logic Test...");
             integration::nats::test_nats_subscriber_logic().await;
+            println!("\n\n>>> Starting NATS Drain (exit_on_empty) Test...");
+            integration::nats::test_nats_drain_exits_on_empty().await;
         }
     }
     #[cfg(feature = "redis-streams")]
@@ -112,6 +114,8 @@ async fn test_all_subscriber_logic() {
         if should_run("redis_streams") {
             println!("\n\n>>> Starting Redis Streams Subscriber Logic Test...");
             integration::redis_streams::test_redis_subscriber_logic().await;
+            println!("\n\n>>> Starting Redis Streams Drain (exit_on_empty) Test...");
+            integration::redis_streams::test_redis_drain_exits_on_empty().await;
         }
     }
     #[cfg(feature = "amqp")]

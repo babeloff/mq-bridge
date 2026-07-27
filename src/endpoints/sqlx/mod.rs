@@ -452,22 +452,52 @@ fn is_deterministic_sqlstate(code: &str) -> bool {
 /// Everything else stays `Retryable` (at-least-once): connection drops, pool timeouts,
 /// deadlocks/serialization failures, "too many connections", and crash-recovery errors
 /// all surface transiently during a restart/failover, and dropping them would lose messages.
-fn classify_sql_error(e: sqlx::Error) -> PublisherError {
+/// Shared deterministic-vs-transient decision used by both the sink
+/// (`classify_sql_error`) and the source (`classify_sql_consumer_error`).
+fn sql_error_is_deterministic(e: &sqlx::Error) -> bool {
     use sqlx::error::ErrorKind;
-    if let Some(db_err) = e.as_database_error() {
-        let deterministic = matches!(
-            db_err.kind(),
-            ErrorKind::UniqueViolation
-                | ErrorKind::ForeignKeyViolation
-                | ErrorKind::NotNullViolation
-                | ErrorKind::CheckViolation
-                | ErrorKind::ExclusionViolation
-        ) || db_err.code().is_some_and(|c| is_deterministic_sqlstate(&c));
-        if deterministic {
-            return PublisherError::NonRetryable(anyhow!(e));
-        }
+    let Some(db_err) = e.as_database_error() else {
+        return false;
+    };
+    if matches!(
+        db_err.kind(),
+        ErrorKind::UniqueViolation
+            | ErrorKind::ForeignKeyViolation
+            | ErrorKind::NotNullViolation
+            | ErrorKind::CheckViolation
+            | ErrorKind::ExclusionViolation
+    ) {
+        return true;
+    }
+    if db_err.code().is_some_and(|c| is_deterministic_sqlstate(&c)) {
+        return true;
+    }
+    // SQLite reports schema errors as a bare SQLITE_ERROR with no SQLSTATE, so the
+    // code/kind checks above miss them. Match the message so a missing column or
+    // table fails fast (Postgres `42703`/`42P01` and MySQL `42S22`/`42S02` are
+    // already caught by SQLSTATE above).
+    let msg = db_err.message().to_ascii_lowercase();
+    msg.contains("no such column") || msg.contains("no such table")
+}
+
+fn classify_sql_error(e: sqlx::Error) -> PublisherError {
+    if sql_error_is_deterministic(&e) {
+        return PublisherError::NonRetryable(anyhow!(e));
     }
     PublisherError::Retryable(anyhow!(e))
+}
+
+/// Consumer-side twin of [`classify_sql_error`]. A deterministic schema/type/
+/// constraint error (missing column, undefined table, bad type) is `Permanent`
+/// so the route fails fast instead of reconnecting every `reconnect_interval_ms`
+/// forever on an unrecoverable read. Everything else stays `Connection`
+/// (retryable) so restarts/failovers recover without losing messages.
+fn classify_sql_consumer_error(e: sqlx::Error) -> ConsumerError {
+    if sql_error_is_deterministic(&e) {
+        ConsumerError::Permanent(anyhow!(e))
+    } else {
+        ConsumerError::Connection(anyhow!(e))
+    }
 }
 
 fn extract_copy_columns(raw_query: &str, token_count: usize) -> anyhow::Result<Vec<String>> {
@@ -1013,7 +1043,7 @@ impl SqlxConsumer {
             .pool
             .begin()
             .await
-            .map_err(|e| ConsumerError::Connection(e.into()))?;
+            .map_err(classify_sql_consumer_error)?;
 
         // 1. Find and lock rows
         let lock_query = format!(
@@ -1025,7 +1055,7 @@ impl SqlxConsumer {
             .bind(limit as i64)
             .fetch_all(&mut *tx)
             .await
-            .map_err(|e| ConsumerError::Connection(e.into()))?
+            .map_err(classify_sql_consumer_error)?
             .into_iter()
             .map(|row| row.get("id"))
             .collect();
@@ -1054,7 +1084,7 @@ impl SqlxConsumer {
         query
             .execute(&mut *tx)
             .await
-            .map_err(|e| ConsumerError::Connection(e.into()))?;
+            .map_err(classify_sql_consumer_error)?;
 
         // 3. Select the full rows that we just locked
         let select_query = format!(
@@ -1070,12 +1100,10 @@ impl SqlxConsumer {
         let rows = query
             .fetch_all(&mut *tx)
             .await
-            .map_err(|e| ConsumerError::Connection(e.into()))?;
+            .map_err(classify_sql_consumer_error)?;
 
         // 4. Commit the transaction
-        tx.commit()
-            .await
-            .map_err(|e| ConsumerError::Connection(e.into()))?;
+        tx.commit().await.map_err(classify_sql_consumer_error)?;
 
         Ok(rows)
     }
@@ -1090,7 +1118,7 @@ impl SqlxConsumer {
             .pool
             .begin_with("BEGIN IMMEDIATE")
             .await
-            .map_err(|e| ConsumerError::Connection(e.into()))?;
+            .map_err(classify_sql_consumer_error)?;
 
         let select_query = format!(
             "SELECT id FROM {} WHERE locked_until IS NULL OR locked_until < datetime('now') ORDER BY id LIMIT ?",
@@ -1101,7 +1129,7 @@ impl SqlxConsumer {
             .bind(limit as i64)
             .fetch_all(&mut *tx)
             .await
-            .map_err(|e| ConsumerError::Connection(e.into()))?
+            .map_err(classify_sql_consumer_error)?
             .into_iter()
             .map(|row| row.get("id"))
             .collect();
@@ -1128,7 +1156,7 @@ impl SqlxConsumer {
         query
             .execute(&mut *tx)
             .await
-            .map_err(|e| ConsumerError::Connection(e.into()))?;
+            .map_err(classify_sql_consumer_error)?;
 
         let select_payload_query = format!(
             "SELECT id, payload FROM {} WHERE id IN ({})",
@@ -1141,11 +1169,9 @@ impl SqlxConsumer {
         let rows = query
             .fetch_all(&mut *tx)
             .await
-            .map_err(|e| ConsumerError::Connection(e.into()))?;
+            .map_err(classify_sql_consumer_error)?;
 
-        tx.commit()
-            .await
-            .map_err(|e| ConsumerError::Connection(e.into()))?;
+        tx.commit().await.map_err(classify_sql_consumer_error)?;
 
         Ok(rows)
     }
@@ -1197,7 +1223,7 @@ impl MessageConsumer for SqlxConsumer {
                 .bind(max_messages as i64)
                 .fetch_all(&self.pool)
                 .await
-                .map_err(|e| ConsumerError::Connection(anyhow!(e)))?,
+                .map_err(classify_sql_consumer_error)?,
             "MySQL" | "MariaDB" => self.fetch_and_lock_mysql(max_messages).await?,
             "SQLite" => self.fetch_and_lock_sqlite(max_messages).await?,
             _ => {
@@ -1208,7 +1234,7 @@ impl MessageConsumer for SqlxConsumer {
                     .bind(max_messages as i64)
                     .fetch_all(&self.pool)
                     .await
-                    .map_err(|e| ConsumerError::Connection(anyhow!(e)))?
+                    .map_err(classify_sql_consumer_error)?
             }
         };
 
@@ -1844,7 +1870,7 @@ impl MessageConsumer for SqlxCursorReader {
                     )),
                 )));
             }
-            Err(e) => return Err(ConsumerError::Connection(anyhow!(e))),
+            Err(e) => return Err(classify_sql_consumer_error(e)),
         };
 
         if rows.is_empty() {

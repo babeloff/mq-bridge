@@ -1058,6 +1058,10 @@ struct FileTailConsumer {
     /// `ConsumerError::Permanent` so the route fails instead of completing cleanly.
     /// `None` for plain readers, whose closed channel is a normal end-of-stream.
     decode_error: Option<Arc<StdMutex<Option<String>>>>,
+    /// Set by the route when `exit_on_empty` is active. Tells the reader thread a
+    /// final record without a trailing delimiter is a complete record to emit
+    /// (the file is done), not a torn mid-write to withhold. Shared with the thread.
+    drain_on_empty: Arc<AtomicBool>,
 }
 
 /// Returns the `compression` codec name if the file at `path` begins with that
@@ -1112,6 +1116,7 @@ fn run_file_tail_task_sync(
     delimiter: Vec<u8>,
     format: FileFormat,
     ready: Arc<AtomicBool>,
+    drain_on_empty: Arc<AtomicBool>,
 ) {
     let mut last_position: u64 = initial_offset;
     let mut reader: Option<std::io::BufReader<std::fs::File>> = None;
@@ -1163,6 +1168,11 @@ fn run_file_tail_task_sync(
 
         let mut batch = Vec::with_capacity(BATCH_SIZE);
         let mut lines_read_in_batch = 0;
+        // Set when a final record without its delimiter is withheld (live tail). It
+        // suppresses the EOF marker below so a route cannot `exit_on_empty` before the
+        // record is delivered — closing the race where the reader reaches EOF before
+        // the route propagates its drain intent via `set_exit_on_empty`.
+        let mut pending_partial = false;
 
         if let Some(r) = reader.as_mut() {
             for _ in 0..BATCH_SIZE {
@@ -1171,11 +1181,38 @@ fn run_file_tail_task_sync(
                     Ok(0) => break, // EOF
                     Ok(n) => {
                         if !buf.ends_with(&delimiter) {
-                            // Torn/partial line: the writer's content reached disk
-                            // ahead of its trailing delimiter. Don't advance the
-                            // position or emit a message; drop the reader so the
-                            // next iteration reopens and re-seeks to last_position,
-                            // re-reading the line whole once the writer finishes it.
+                            if drain_on_empty.load(Ordering::SeqCst) {
+                                // Drain mode (exit_on_empty): the file is complete, so a
+                                // final record with no trailing delimiter is a whole
+                                // record. Emit it once, advancing past it; the next read
+                                // returns 0 (EOF) and the empty marker fires normally.
+                                last_position += n as u64;
+                                if delimiter.len() == 1
+                                    && delimiter[0] == b'\n'
+                                    && buf.ends_with(b"\r")
+                                {
+                                    buf.pop();
+                                }
+                                if let Some(mut msg) = parse_message(&buf, &format, &mut csv_header)
+                                {
+                                    if group_id.is_some() {
+                                        msg.metadata.insert(
+                                            "file_offset".to_string(),
+                                            last_position.to_string(),
+                                        );
+                                    }
+                                    batch.push(msg);
+                                }
+                                lines_read_in_batch += 1;
+                                break;
+                            }
+                            // Live tail (or drain intent not yet observed): torn/partial
+                            // line, the writer's content reached disk ahead of its trailing
+                            // delimiter. Don't advance the position or emit a message; drop
+                            // the reader so the next iteration reopens and re-seeks to
+                            // last_position, re-reading the line whole once the writer
+                            // finishes it (or the drain flag flips and it is emitted above).
+                            pending_partial = true;
                             reader = None;
                             break;
                         }
@@ -1213,7 +1250,8 @@ fn run_file_tail_task_sync(
         if lines_read_in_batch == 0 {
             // EOF reached. Emit an empty batch once so a drained route can pause
             // or, with exit_on_empty, terminate. Re-armed when new data arrives.
-            if !signaled_eof {
+            // Suppressed while a partial final record is pending (see pending_partial).
+            if !signaled_eof && !pending_partial {
                 if msg_tx.send_blocking(Vec::new()).is_err() {
                     break; // Consumer dropped, exit thread
                 }
@@ -1848,6 +1886,9 @@ impl FileConsumer {
                 ready,
                 pending_eof: false,
                 decode_error: Some(decode_error),
+                // Member (compressed/encrypted) readers decode framed members, not
+                // delimiter-split lines, so the trailing-partial-line rule doesn't apply.
+                drain_on_empty: Arc::new(AtomicBool::new(false)),
             }),
         })
     }
@@ -1863,6 +1904,8 @@ impl FileConsumer {
         let mut initial_offset = 0;
         let ready = Arc::new(AtomicBool::new(false));
         let ready_clone = ready.clone();
+        let drain_on_empty = Arc::new(AtomicBool::new(false));
+        let drain_on_empty_clone = drain_on_empty.clone();
         let mut offset_file = None;
 
         if let Some(gid) = &group_id {
@@ -1902,6 +1945,7 @@ impl FileConsumer {
                 delimiter,
                 format_clone,
                 ready_clone,
+                drain_on_empty_clone,
             );
         });
 
@@ -1915,6 +1959,7 @@ impl FileConsumer {
                 ready,
                 pending_eof: false,
                 decode_error: None,
+                drain_on_empty,
             }),
         })
     }
@@ -1931,6 +1976,14 @@ impl FileConsumer {
 
 #[async_trait]
 impl MessageConsumer for FileConsumer {
+    fn set_exit_on_empty(&mut self, exit_on_empty: bool) {
+        // Only the delimiter-splitting tail reader distinguishes a complete final
+        // record from a torn mid-write; propagate the drain intent to its thread.
+        if let ConsumerBackend::Tail(c) = &self.backend {
+            c.drain_on_empty.store(exit_on_empty, Ordering::SeqCst);
+        }
+    }
+
     // Intentionally keeps the ordered default: the offset-tracking backend commits
     // a cumulative byte offset (the max acked `file_offset`), so out-of-order
     // commits could advance the offset past un-acked messages and lose them.

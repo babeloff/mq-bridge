@@ -1668,3 +1668,111 @@ fn test_parse_message_payload_shapes() {
         Some("raw")
     );
 }
+
+/// Reads batches until the consumer surfaces an empty (drain) batch, returning
+/// the total record count. Fails if no batch arrives within the timeout.
+async fn drain_count(source: &mut FileConsumer) -> usize {
+    use crate::traits::MessageDisposition;
+    let mut count = 0;
+    loop {
+        let batch =
+            tokio::time::timeout(std::time::Duration::from_secs(5), source.receive_batch(64))
+                .await
+                .expect("timed out reading file")
+                .expect("receive_batch errored");
+        if batch.messages.is_empty() {
+            return count;
+        }
+        let n = batch.messages.len();
+        count += n;
+        (batch.commit)(vec![MessageDisposition::Ack; n])
+            .await
+            .unwrap();
+    }
+}
+
+fn no_trailing_newline_body(n: usize) -> Vec<u8> {
+    // `n` records joined by `n - 1` newlines: the final record has no trailing '\n'.
+    (0..n)
+        .map(|i| format!("{{\"i\":{i}}}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+        .into_bytes()
+}
+
+// Issue 4 (regression): draining a complete file whose last record has no trailing
+// newline must deliver that record. Before the fix the tail reader treated it as a
+// torn mid-write and dropped it (200 records -> only 199 delivered).
+#[tokio::test]
+async fn test_file_tail_drain_emits_final_line_without_newline() {
+    const N: usize = 200;
+    let dir = tempdir().unwrap();
+    let file_path = dir.path().join("no_trailing_newline.jsonl");
+    tokio::fs::write(&file_path, no_trailing_newline_body(N))
+        .await
+        .unwrap();
+
+    let config = FileConfig {
+        path: file_path.to_str().unwrap().to_string(),
+        format: FileFormat::Raw,
+        ..Default::default()
+    };
+    let mut source = FileConsumer::new(&config).await.unwrap();
+    // Drain mode: a final record with no delimiter is a whole record.
+    source.set_exit_on_empty(true);
+
+    assert_eq!(
+        drain_count(&mut source).await,
+        N,
+        "drain must deliver the final newline-less record"
+    );
+}
+
+// Complement: in live-tail mode (no drain intent) the final record without a
+// delimiter is withheld as a possible torn write, and no EOF marker is emitted while
+// it is pending — so the consumer delivers N-1 records and then blocks for more data.
+#[tokio::test]
+async fn test_file_tail_live_withholds_final_line_without_newline() {
+    const N: usize = 200;
+    let dir = tempdir().unwrap();
+    let file_path = dir.path().join("no_trailing_newline.jsonl");
+    tokio::fs::write(&file_path, no_trailing_newline_body(N))
+        .await
+        .unwrap();
+
+    let config = FileConfig {
+        path: file_path.to_str().unwrap().to_string(),
+        format: FileFormat::Raw,
+        ..Default::default()
+    };
+    let mut source = FileConsumer::new(&config).await.unwrap();
+    // No set_exit_on_empty(true): live tail withholds the torn final record.
+
+    let mut count = 0;
+    loop {
+        match tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            source.receive_batch(64),
+        )
+        .await
+        {
+            Ok(batch) => {
+                let batch = batch.expect("receive_batch errored");
+                // A partial final record is pending, so no empty marker is emitted;
+                // every batch that arrives carries data.
+                assert!(
+                    !batch.messages.is_empty(),
+                    "unexpected empty marker in live tail"
+                );
+                count += batch.messages.len();
+            }
+            // Blocked waiting for the writer to finish the final record.
+            Err(_) => break,
+        }
+    }
+    assert_eq!(
+        count,
+        N - 1,
+        "live tail withholds the final record until its delimiter arrives"
+    );
+}

@@ -583,6 +583,57 @@ fn test_deterministic_sqlstate_classification() {
     assert!(!is_deterministic_sqlstate("4"));
 }
 
+// Issue 3 (regression): a SQLite schema error (missing column/table) reports no
+// Postgres SQLSTATE, so it must be classified permanent via its message — otherwise
+// the consumer wraps it as a retryable Connection error and reconnect-loops forever.
+#[tokio::test]
+async fn test_classify_sqlite_schema_error_is_permanent() {
+    use sqlx::Connection;
+    sqlx::any::install_default_drivers();
+    let mut conn = sqlx::AnyConnection::connect("sqlite::memory:")
+        .await
+        .unwrap();
+    sqlx::query("CREATE TABLE items (id INTEGER PRIMARY KEY, payload BLOB)")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+
+    // Missing column (the `locked_until` lease column queue mode expects). `AnyRow`
+    // is not `Debug`, so extract the error via match rather than `unwrap_err`.
+    let missing_col = match sqlx::query("SELECT locked_until FROM items")
+        .fetch_all(&mut conn)
+        .await
+    {
+        Ok(_) => panic!("expected a missing-column error"),
+        Err(e) => e,
+    };
+    assert!(
+        matches!(
+            classify_sql_consumer_error(missing_col),
+            ConsumerError::Permanent(_)
+        ),
+        "missing column must be permanent, not a retryable Connection error"
+    );
+
+    // Missing table.
+    let missing_table = match sqlx::query("SELECT id FROM does_not_exist")
+        .fetch_all(&mut conn)
+        .await
+    {
+        Ok(_) => panic!("expected a missing-table error"),
+        Err(e) => e,
+    };
+    assert!(
+        matches!(
+            classify_sql_consumer_error(missing_table),
+            ConsumerError::Permanent(_)
+        ),
+        "missing table must be permanent"
+    );
+
+    conn.close().await.unwrap();
+}
+
 #[test]
 fn test_resolve_source_no_fallback() {
     // Payload source must NOT fall back to metadata and vice versa.

@@ -172,6 +172,25 @@ impl Default for EndpointStatus {
     }
 }
 
+/// How long a draining consumer blocks for a first message before yielding an
+/// empty batch so `exit_on_empty`/`--drain` can fire. Only applied while draining;
+/// the streaming path blocks indefinitely (event-driven, no added latency).
+pub(crate) const DRAIN_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Awaits `fut`, but in drain mode gives up after [`DRAIN_IDLE_TIMEOUT`], returning
+/// `None` so a blocking consumer can surface an empty batch instead of hanging.
+/// Outside drain mode it simply awaits, preserving the event-driven fast path.
+pub(crate) async fn drain_gated<F: std::future::Future>(
+    exit_on_empty: bool,
+    fut: F,
+) -> Option<F::Output> {
+    if exit_on_empty {
+        tokio::time::timeout(DRAIN_IDLE_TIMEOUT, fut).await.ok()
+    } else {
+        Some(fut.await)
+    }
+}
+
 #[async_trait]
 pub trait MessageConsumer: Send + Sync {
     /// Returns an optional lifecycle hook that runs once after the consumer connection is created.
@@ -254,6 +273,14 @@ pub trait MessageConsumer: Send + Sync {
             commit: batch_commit,
         })
     }
+
+    /// Informs the consumer whether the owning route will terminate on an empty
+    /// batch (`exit_on_empty` / `--drain`). Called once by the route right after
+    /// creation. Blocking transports use it to gate an idle timeout (via
+    /// [`drain_gated`]) so a quiet source surfaces an empty batch instead of
+    /// hanging the drain; the file tail reader also uses it to decide whether a
+    /// final record with no trailing delimiter is complete (drain) or torn (live tail).
+    fn set_exit_on_empty(&mut self, _exit_on_empty: bool) {}
 
     /// Whether this consumer's commits (acks) must be applied in the order the
     /// batches were received.

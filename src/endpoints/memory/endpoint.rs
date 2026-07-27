@@ -522,6 +522,8 @@ pub struct MemoryQueueConsumer {
     // Internal buffer to hold messages from a received batch.
     buffer: Vec<CanonicalMessage>,
     enable_nack: bool,
+    /// Drain mode: only then does an idle recv time out into an empty batch.
+    exit_on_empty: bool,
 }
 
 #[derive(Clone)]
@@ -538,6 +540,8 @@ pub struct TransportQueueConsumer {
     /// crash. Shared with the commit closure, which has no access to `&mut self`.
     requeue: Arc<Mutex<Vec<CanonicalMessage>>>,
     enable_nack: bool,
+    /// Drain mode: only then does an idle recv time out into an empty batch.
+    exit_on_empty: bool,
 }
 
 impl fmt::Debug for TransportQueueConsumer {
@@ -613,6 +617,7 @@ impl MemoryConsumer {
                     buffer: Vec::new(),
                     requeue: Arc::new(Mutex::new(Vec::new())),
                     enable_nack: config.enable_nack,
+                    exit_on_empty: false,
                 }))
             }
         }
@@ -673,6 +678,7 @@ impl MemoryQueueConsumer {
             receiver: channel.receiver.clone(),
             buffer,
             enable_nack: config.enable_nack,
+            exit_on_empty: false,
         })
     }
 
@@ -683,7 +689,13 @@ impl MemoryQueueConsumer {
         // If the internal buffer has messages, return them first.
         if self.buffer.is_empty() {
             // Buffer is empty. Wait for a new batch from the channel.
-            self.buffer = match self.receiver.recv().await {
+            // Drain mode: a brief idle timeout returns empty so --drain can fire.
+            let Some(recv) =
+                crate::traits::drain_gated(self.exit_on_empty, self.receiver.recv()).await
+            else {
+                return Ok(Vec::new());
+            };
+            self.buffer = match recv {
                 Ok(batch) => batch,
                 Err(_) => return Err(ConsumerError::EndOfStream),
             };
@@ -762,6 +774,9 @@ impl MessageConsumer for MemoryQueueConsumer {
     // so commits are order-independent.
     fn commit_requires_order(&self) -> bool {
         false
+    }
+    fn set_exit_on_empty(&mut self, exit_on_empty: bool) {
+        self.exit_on_empty = exit_on_empty;
     }
     async fn receive_batch(&mut self, max_messages: usize) -> Result<ReceivedBatch, ConsumerError> {
         // If the internal buffer has messages, return them first.
@@ -886,6 +901,9 @@ impl MessageConsumer for TransportQueueConsumer {
     fn commit_requires_order(&self) -> bool {
         false
     }
+    fn set_exit_on_empty(&mut self, exit_on_empty: bool) {
+        self.exit_on_empty = exit_on_empty;
+    }
     async fn receive_batch(&mut self, max_messages: usize) -> Result<ReceivedBatch, ConsumerError> {
         let mut messages = Vec::with_capacity(max_messages);
 
@@ -906,12 +924,20 @@ impl MessageConsumer for TransportQueueConsumer {
         // Only block on the transport when nothing was already pending, so a
         // redelivery is never held up waiting for a new frame to arrive.
         if messages.is_empty() {
-            let mut received = self.transport.recv_batch().await.map_err(|e| {
-                ConsumerError::Connection(anyhow!("Failed to receive via memory transport: {}", e))
-            })?;
-            messages.append(&mut received);
-            if messages.len() > max_messages {
-                self.buffer = messages.split_off(max_messages);
+            // Drain mode: a brief idle timeout leaves the batch empty so --drain can fire.
+            if let Some(r) =
+                crate::traits::drain_gated(self.exit_on_empty, self.transport.recv_batch()).await
+            {
+                let mut received = r.map_err(|e| {
+                    ConsumerError::Connection(anyhow!(
+                        "Failed to receive via memory transport: {}",
+                        e
+                    ))
+                })?;
+                messages.append(&mut received);
+                if messages.len() > max_messages {
+                    self.buffer = messages.split_off(max_messages);
+                }
             }
         }
 
@@ -1034,6 +1060,13 @@ impl MessageConsumer for MemoryConsumer {
             Self::Log { consumer, .. } => consumer.commit_requires_order(),
         }
     }
+    fn set_exit_on_empty(&mut self, exit_on_empty: bool) {
+        match self {
+            Self::Queue(q) => q.set_exit_on_empty(exit_on_empty),
+            Self::Transport(t) => t.set_exit_on_empty(exit_on_empty),
+            Self::Log { consumer, .. } => consumer.set_exit_on_empty(exit_on_empty),
+        }
+    }
     async fn receive_batch(&mut self, max_messages: usize) -> Result<ReceivedBatch, ConsumerError> {
         match self {
             Self::Queue(q) => q.receive_batch(max_messages).await,
@@ -1104,6 +1137,9 @@ impl MemorySubscriber {
 impl MessageConsumer for MemorySubscriber {
     fn commit_requires_order(&self) -> bool {
         self.consumer.commit_requires_order()
+    }
+    fn set_exit_on_empty(&mut self, exit_on_empty: bool) {
+        self.consumer.set_exit_on_empty(exit_on_empty);
     }
     async fn receive_batch(&mut self, max_messages: usize) -> Result<ReceivedBatch, ConsumerError> {
         self.consumer.receive_batch(max_messages).await

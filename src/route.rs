@@ -902,6 +902,7 @@ impl Route {
     ) -> anyhow::Result<bool> {
         let publisher = create_publisher_from_route(name, &self.output).await?;
         let mut consumer = create_consumer_from_route(name, &self.input).await?;
+        consumer.set_exit_on_empty(self.options.exit_on_empty);
         if let Err(err) = run_publisher_connect_hook(name, &publisher).await {
             run_publisher_disconnect_hook(name, &publisher).await;
             return Err(err);
@@ -1034,6 +1035,7 @@ impl Route {
     ) -> anyhow::Result<bool> {
         let publisher = create_publisher_from_route(name, &self.output).await?;
         let mut consumer = create_consumer_from_route(name, &self.input).await?;
+        consumer.set_exit_on_empty(self.options.exit_on_empty);
         if let Err(err) = run_publisher_connect_hook(name, &publisher).await {
             run_publisher_disconnect_hook(name, &publisher).await;
             return Err(err);
@@ -3321,6 +3323,144 @@ mod tests {
         assert_eq!(handle.outcome(), Some(RouteOutcome::Stopped));
 
         Route::stop("no_drain_test").await;
+    }
+
+    // A plain SQLite table with an `id`/`payload` schema but NO `locked_until` lease
+    // column — used to exercise both queue-mode failure (Issue 3) and cursor-mode
+    // full-table reads (Issue 2).
+    #[cfg(feature = "sqlx")]
+    async fn setup_plain_db(rows: usize) -> (tempfile::TempDir, String) {
+        use sqlx::Connection;
+        sqlx::any::install_default_drivers();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("plain.db");
+
+        #[cfg(windows)]
+        let url = format!("sqlite:///{}", path.to_string_lossy().replace('\\', "/"));
+        #[cfg(not(windows))]
+        let url = format!("sqlite://{}", path.to_str().unwrap());
+
+        drop(tokio::fs::File::create(&path).await.unwrap());
+
+        let mut conn = sqlx::AnyConnection::connect(&url).await.unwrap();
+        sqlx::query(
+            "CREATE TABLE items (id INTEGER PRIMARY KEY AUTOINCREMENT, payload TEXT NOT NULL)",
+        )
+        .execute(&mut conn)
+        .await
+        .unwrap();
+        for i in 0..rows {
+            sqlx::query("INSERT INTO items (payload) VALUES (?)")
+                .bind(format!("row-{i}"))
+                .execute(&mut conn)
+                .await
+                .unwrap();
+        }
+        conn.close().await.unwrap();
+        (dir, url)
+    }
+
+    // Issue 3 (regression): a queue-mode SQLx source (`delete_after_read`, no
+    // `cursor_column`) on a table lacking the `locked_until` lease column hits an
+    // unrecoverable "no such column" error. It must fail fast (RouteOutcome::Failed)
+    // instead of reconnecting every reconnect_interval_ms forever.
+    #[cfg(feature = "sqlx")]
+    #[tokio::test]
+    async fn test_route_sqlite_missing_locked_until_fails_fast() {
+        use crate::models::SqlxConfig;
+
+        let (_dir, url) = setup_plain_db(5).await;
+        let config = SqlxConfig {
+            url,
+            table: "items".to_string(),
+            delete_after_read: true, // queue-lease mode
+            ..Default::default()
+        };
+
+        let out_topic = format!("plain_fail_{}", fast_uuid_v7::gen_id());
+        let input = Endpoint::new(EndpointType::Sqlx(config));
+        let output = Endpoint::new_memory(&out_topic, 10);
+        let route = Route::new(input, output)
+            .with_exit_on_empty(true)
+            // A regression would reconnect-loop; keep the interval short so this test
+            // still finishes quickly if the fix is reverted (it would then time out).
+            .with_reconnect_interval_ms(100);
+
+        let handle = route.run("plain_fail_test").await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while handle.outcome().is_none() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("route did not fail fast on the missing-column error");
+        assert_eq!(
+            handle.outcome(),
+            Some(RouteOutcome::Failed),
+            "an unrecoverable schema error must terminate the route as Failed"
+        );
+
+        Route::stop("plain_fail_test").await;
+    }
+
+    // Issue 2: SQLite gets a full-table read via `cursor_column`, exactly like
+    // Postgres (the ETL path) — read mode is config-driven, not driver-specific. A
+    // cursor-mode drain of the plain table reads every row and exits Completed.
+    #[cfg(feature = "sqlx")]
+    #[tokio::test]
+    async fn test_route_sqlite_cursor_column_drains_full_table() {
+        use crate::models::SqlxConfig;
+
+        const N: usize = 25;
+        let (_dir, url) = setup_plain_db(N).await;
+        let config = SqlxConfig {
+            url,
+            table: "items".to_string(),
+            cursor_column: Some("id".to_string()),
+            cursor_id: Some(format!("plain-cur-{}", fast_uuid_v7::gen_id())),
+            ..Default::default()
+        };
+
+        let out_topic = format!("plain_cursor_{}", fast_uuid_v7::gen_id());
+        let input = Endpoint::new(EndpointType::Sqlx(config));
+        let output = Endpoint::new_memory(&out_topic, 10);
+        let route = Route::new(input, output)
+            .with_batch_size(10)
+            .with_exit_on_empty(true);
+
+        let mut verifier = route
+            .connect_to_output("plain_cursor_verifier")
+            .await
+            .unwrap();
+        let collector = tokio::spawn(async move {
+            let mut received = 0usize;
+            while received < N {
+                let item = tokio::time::timeout(Duration::from_secs(5), verifier.receive())
+                    .await
+                    .expect("timed out draining output")
+                    .expect("output stream closed early");
+                received += 1;
+                (item.commit)(MessageDisposition::Ack).await.unwrap();
+            }
+            received
+        });
+
+        let handle = route.run("plain_cursor_test").await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while handle.outcome().is_none() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("cursor route did not drain and exit");
+        assert_eq!(handle.outcome(), Some(RouteOutcome::Completed));
+        handle.join().await.expect("route task panicked");
+
+        let received = tokio::time::timeout(Duration::from_secs(5), collector)
+            .await
+            .expect("timed out collecting output")
+            .expect("collector task panicked");
+        assert_eq!(received, N);
     }
 
     // Regression: exit_on_empty must also terminate the route in concurrent mode
