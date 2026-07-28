@@ -313,6 +313,38 @@ The `deduplication` middleware is a complement, not a replacement: it filters du
 sink, keyed on `message_id`, but its `sled` store is single-instance — prefer the sink constraint for
 multi-writer ETL.
 
+**MongoDB — branch on insert vs. duplicate (`report_outcome`).** Sometimes you need to *act* on
+whether a record was newly inserted or already existed — enrich only fresh rows, or reply with the
+existing entry for duplicates. Set `report_outcome: true` and the Mongo publisher returns the message
+tagged with metadata `mongodb.outcome` = `inserted` (fresh write) or `existed` (dup-key on the
+unique `_id`). Wrap it in a `request` endpoint to forward that tagged message into a `switch` that
+routes on `mongodb.outcome`:
+
+```yaml
+orders_upsert_branch:
+  input: { kafka: { topic: "orders", url: "localhost:9092" } }
+  output:
+    request:                       # calls `to`, forwards its response to `forward_to`
+      to:
+        mongodb:
+          url: "mongodb://localhost:27017"
+          database: "shop"
+          collection: "orders"
+          format: json
+          id_field: "order_id"     # deterministic _id → insert-if-absent
+          report_outcome: true     # → mongodb.outcome = inserted | existed
+      forward_to:
+        switch:
+          metadata_key: "mongodb.outcome"
+          cases:
+            inserted: { ref: "enrich_new_order" }   # e.g. build entry X, reply
+            existed:  { ref: "handle_duplicate" }    # e.g. reply with parts of X
+```
+
+`report_outcome` is sink-only and pairs with `id_field`; without a deterministic `_id` there is no
+duplicate to detect. Left unwrapped by `request`, the tagged message is returned as the route's
+response as usual.
+
 
 ### Cloud Object Storage (S3 / GCS / Azure)
 The `object_store` endpoint (alias `s3`) reads and writes cloud object stores — Amazon S3, Google Cloud Storage, Azure Blob, Cloudflare R2, and anything else the [`object_store`](https://crates.io/crates/object_store) crate speaks — behind the same `receive_batch` / `send_batch` API. Enable it with the `object-store` feature. Credentials and backend options are read from the process environment (`AWS_ACCESS_KEY_ID`, `AWS_ENDPOINT`, `AWS_REGION`, `GOOGLE_SERVICE_ACCOUNT`, `AZURE_STORAGE_ACCOUNT`, ...); the URL scheme picks the backend (`s3://`, `gs://`, `az://`).

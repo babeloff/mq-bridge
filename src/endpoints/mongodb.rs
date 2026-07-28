@@ -273,7 +273,13 @@ pub struct MongoDbPublisher {
     reply_polling_interval: Duration,
     format: MongoDbFormat,
     id_field: Option<String>,
+    report_outcome: bool,
 }
+
+/// Metadata key carrying the insert outcome when `report_outcome` is enabled.
+const OUTCOME_KEY: &str = "mongodb.outcome";
+const OUTCOME_INSERTED: &str = "inserted";
+const OUTCOME_EXISTED: &str = "existed";
 
 fn mongodb_uses_sequencer(request_reply: bool, format: &MongoDbFormat) -> bool {
     !request_reply && !matches!(format, MongoDbFormat::Raw)
@@ -397,6 +403,7 @@ impl MongoDbPublisher {
             reply_polling_interval: Duration::from_millis(config.reply_polling_ms.unwrap_or(50)),
             format: config.format.clone(),
             id_field: config.id_field.clone(),
+            report_outcome: config.report_outcome,
         })
     }
 
@@ -433,6 +440,23 @@ impl MongoDbPublisher {
                 e
             ))),
         }
+    }
+
+    fn outcome_or_ack(&self, message: CanonicalMessage, outcome: &str) -> Sent {
+        tag_outcome(self.report_outcome, message, outcome)
+    }
+}
+
+/// With `report_outcome`, tag the message with `mongodb.outcome` and return it as a
+/// `Sent::Response` so a downstream `switch` can branch; otherwise a plain `Ack`.
+fn tag_outcome(report_outcome: bool, mut message: CanonicalMessage, outcome: &str) -> Sent {
+    if report_outcome {
+        message
+            .metadata
+            .insert(OUTCOME_KEY.to_string(), outcome.to_string());
+        Sent::Response(message)
+    } else {
+        Sent::Ack
     }
 }
 
@@ -486,7 +510,7 @@ impl MessagePublisher for MongoDbPublisher {
                     {
                         if w.code == 11000 {
                             warn!(message_id = %format!("{:032x}", message.message_id), "Duplicate key error inserting into MongoDB. Treating as idempotent success.");
-                            return Ok(Sent::Ack);
+                            return Ok(self.outcome_or_ack(message, OUTCOME_EXISTED));
                         }
                     }
                     return Err(PublisherError::Retryable(
@@ -495,7 +519,7 @@ impl MessagePublisher for MongoDbPublisher {
                 }
             }
 
-            return Ok(Sent::Ack);
+            return Ok(self.outcome_or_ack(message, OUTCOME_INSERTED));
         }
 
         // --- Request-Reply Logic ---
@@ -583,7 +607,8 @@ impl MessagePublisher for MongoDbPublisher {
             return Ok(SentBatch::Ack);
         }
 
-        if self.request_reply {
+        if self.request_reply || self.report_outcome {
+            // report_outcome needs a per-message Response, so fan out through single send.
             return crate::traits::send_batch_helper(self, messages, |p, m| Box::pin(p.send(m)))
                 .await;
         }
@@ -2707,6 +2732,33 @@ mod tests {
         for payload in [&br#"{"other":1}"#[..], b"not json", br#"{"order_id":null}"#] {
             let msg = CanonicalMessage::new(payload.to_vec(), None);
             assert!(message_to_document(&msg, &MongoDbFormat::Json, Some("order_id")).is_err());
+        }
+    }
+
+    #[test]
+    fn tag_outcome_off_returns_ack() {
+        let msg = CanonicalMessage::new(b"x".to_vec(), None);
+        assert!(matches!(
+            tag_outcome(false, msg, OUTCOME_INSERTED),
+            Sent::Ack
+        ));
+    }
+
+    #[test]
+    fn tag_outcome_on_returns_tagged_response() {
+        for outcome in [OUTCOME_INSERTED, OUTCOME_EXISTED] {
+            let msg = CanonicalMessage::new(b"x".to_vec(), None);
+            let id = msg.message_id;
+            match tag_outcome(true, msg, outcome) {
+                Sent::Response(m) => {
+                    assert_eq!(m.message_id, id);
+                    assert_eq!(
+                        m.metadata.get(OUTCOME_KEY).map(String::as_str),
+                        Some(outcome)
+                    );
+                }
+                Sent::Ack => panic!("expected Response when report_outcome is on"),
+            }
         }
     }
 }

@@ -2175,6 +2175,8 @@ pub struct MongoDbConfig {
     /// underlying mechanism automatically. If unset, the deprecated `change_stream` boolean is
     /// honored for backward compatibility.
     pub consume: Option<MongoConsume>,
+    /// (Consumer only) Optional custom MongoDB query to filter messages. Provided as a JSON string (e.g., '{"type": "notification"}').
+    pub receive_query: Option<String>,
     /// (Consumer only) **Deprecated** — use `consume: subscriber`. Kept for compatibility.
     #[serde(default)]
     pub change_stream: bool,
@@ -2203,10 +2205,12 @@ pub struct MongoDbConfig {
     /// (Publisher only) Top-level payload field whose value becomes the document `_id`, for
     /// idempotent inserts via the unique `_id` index. Sink collections only.
     pub id_field: Option<String>,
+    /// (Publisher only) Return the message with metadata `mongodb.outcome` = `inserted`/`existed`
+    /// (dup-key) so a `request`+`switch` can branch. Sink collections only; pair with `id_field`.
+    #[serde(default)]
+    pub report_outcome: bool,
     /// The ID used for the cursor in sequenced mode. If not provided, consumption starts from the current sequence (ephemeral).
     pub cursor_id: Option<String>,
-    /// (Consumer only) Optional custom MongoDB query to filter messages. Provided as a JSON string (e.g., '{"type": "notification"}').
-    pub receive_query: Option<String>,
     /// (Optional) Collection to store sequence counters and cursor positions. Defaults to the message collection if not set.
     pub meta_collection: Option<String>,
     /// Share one MongoDB client per connection (default: true); false forces a dedicated client.
