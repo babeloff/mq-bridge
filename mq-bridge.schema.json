@@ -2028,6 +2028,13 @@
           "$ref": "#/$defs/MongoDbFormat",
           "default": "normal"
         },
+        "id_field": {
+          "description": "(Publisher only) Top-level payload field whose value becomes the document `_id`, for\nidempotent inserts via the unique `_id` index. Sink collections only.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "meta_collection": {
           "description": "(Optional) Collection to store sequence counters and cursor positions. Defaults to the message collection if not set.",
           "type": [

@@ -234,6 +234,86 @@ re-fetch → delete on ack) buy exclusivity you aren't using, and cost ~5x.
 *   Wart: `capture_all`'s snapshot also emits the internal `<collection>:sequencer` document.
 
 
+### Deduplication & idempotent writes
+
+For ETL, at-least-once delivery plus an **idempotent write** gives you effective exactly-once: a
+replayed or retried record must not create a duplicate row. The most robust place to enforce this is
+the sink database's own **unique constraint** — it is already shared across every writer, so no extra
+state store is needed. Both database sinks lean on this instead of an application-side cache.
+
+**MongoDB — `id_field`.** Point `id_field` at a top-level payload field and its value becomes the
+document `_id`. Re-inserting the same business key then hits the unique `_id` index and is treated as
+an idempotent success (the duplicate is skipped, not errored):
+
+```yaml
+orders_to_mongo:
+  input:  { kafka:   { topic: "orders", url: "localhost:9092" } }
+  output:
+    mongodb:
+      url: "mongodb://localhost:27017"
+      database: "shop"
+      collection: "orders"
+      format: json
+      id_field: "order_id"   # payload {"order_id": "A-1", ...} → _id = "A-1"
+```
+
+The field's JSON type is preserved (a number stays a BSON integer). The payload must be JSON and
+contain the field, otherwise the message is dead-lettered rather than written with a random `_id` —
+silently minting one would defeat deduplication. Use `id_field` on **sink** collections only: a
+business-key `_id` is not compatible with the `consumer`/`subscriber` competing-consumer modes, which
+require a UUID `_id`.
+
+**SQL (`sqlx`) — `ON CONFLICT` / `ON DUPLICATE KEY`.** The `insert_query` is user-supplied, so you
+write the dialect's upsert directly. This requires a pre-existing `UNIQUE`/`PRIMARY KEY` on the key
+column, and is incompatible with `bulk_copy` (COPY cannot express `ON CONFLICT`) — so you trade peak
+throughput for deduplication.
+
+```yaml
+# PostgreSQL — insert if absent (drop duplicates):
+insert_query: "INSERT INTO orders (id, body) VALUES (${payload:id}, ${payload:body}) ON CONFLICT (id) DO NOTHING"
+
+# PostgreSQL — upsert (last write wins):
+insert_query: "INSERT INTO orders (id, body) VALUES (${payload:id}, ${payload:body}) ON CONFLICT (id) DO UPDATE SET body = EXCLUDED.body"
+
+# MySQL / MariaDB:
+insert_query: "INSERT INTO orders (id, body) VALUES (${payload:id}, ${payload:body}) ON DUPLICATE KEY UPDATE body = VALUES(body)"
+
+# SQLite:
+insert_query: "INSERT INTO orders (id, body) VALUES (${payload:id}, ${payload:body}) ON CONFLICT (id) DO NOTHING"
+```
+
+A plain `INSERT` without a conflict clause instead sends the constraint violation to the DLQ, so add
+the clause when replays are expected. `${payload:field}` binds a typed value from the JSON payload;
+`${metadata:key}` binds a metadata string.
+
+**ClickHouse — `ReplacingMergeTree`.** ClickHouse has no unique constraints; dedup is a table-engine
+property. Create the target as `ReplacingMergeTree(version)` keyed by your business key via
+`ORDER BY`, using a monotonic column as the version (e.g. an ingest timestamp, or `postgres.lsn` from
+a CDC source). ClickHouse collapses rows with the same sort key at merge time, keeping the highest
+version; read with `FINAL` (or `argMax`) to see the deduplicated result:
+
+```sql
+CREATE TABLE orders (id UInt64, body String, version UInt64)
+ENGINE = ReplacingMergeTree(version) ORDER BY id;
+-- mq-bridge just inserts rows; duplicates for the same id collapse on merge.
+SELECT * FROM orders FINAL;
+```
+
+**Postgres CDC — deterministic id + `postgres.key`.** The `postgres_cdc` source already resumes from a
+durable LSN checkpoint (no re-delivery on clean restart). For the crash window (row written, then a
+crash before the checkpoint flush) it is at-least-once, so make the sink idempotent. Each change event
+carries the full row (so the primary key is in the payload), `postgres.lsn` (a monotonic version),
+`postgres.operation`/`schema`/`table`, and — when the table has a primary key / replica identity —
+`postgres.key` (the key value). The event's `message_id` is a stable hash of `schema.table + key +
+lsn`, so a replayed change deduplicates through the `deduplication` middleware, and Mongo `id_field`
+or a SQL `ON CONFLICT` on the key column make the sink write idempotent. Use `postgres.lsn` as the
+version to drop stale replays (`... DO UPDATE ... WHERE excluded.lsn > orders.lsn`).
+
+The `deduplication` middleware is a complement, not a replacement: it filters duplicates *before* the
+sink, keyed on `message_id`, but its `sled` store is single-instance — prefer the sink constraint for
+multi-writer ETL.
+
+
 ### Cloud Object Storage (S3 / GCS / Azure)
 The `object_store` endpoint (alias `s3`) reads and writes cloud object stores — Amazon S3, Google Cloud Storage, Azure Blob, Cloudflare R2, and anything else the [`object_store`](https://crates.io/crates/object_store) crate speaks — behind the same `receive_batch` / `send_batch` API. Enable it with the `object-store` feature. Credentials and backend options are read from the process environment (`AWS_ACCESS_KEY_ID`, `AWS_ENDPOINT`, `AWS_REGION`, `GOOGLE_SERVICE_ACCOUNT`, `AZURE_STORAGE_ACCOUNT`, ...); the URL scheme picks the backend (`s3://`, `gs://`, `az://`).
 

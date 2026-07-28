@@ -186,9 +186,24 @@ impl PostgresCdcConsumer {
             }
             ReplicationEvent::Commit { end_lsn, .. } => {
                 let lsn = end_lsn.as_u64();
+                let lsn_str = format_lsn(lsn);
                 for mut msg in self.tx_buffer.drain(..) {
+                    let dedup_id = msg.metadata.get("postgres.key").map(|key| {
+                        let schema = msg
+                            .metadata
+                            .get("postgres.schema")
+                            .map_or("", |s| s.as_str());
+                        let table = msg
+                            .metadata
+                            .get("postgres.table")
+                            .map_or("", |s| s.as_str());
+                        cdc_dedup_id(schema, table, key, lsn)
+                    });
+                    if let Some(id) = dedup_id {
+                        msg.message_id = id;
+                    }
                     msg.metadata
-                        .insert("postgres.lsn".to_string(), format_lsn(lsn));
+                        .insert("postgres.lsn".to_string(), lsn_str.clone());
                     self.ready.push_back((msg, lsn));
                 }
             }
@@ -251,7 +266,13 @@ impl PostgresCdcConsumer {
 }
 
 /// Build a change-event message: JSON body + `postgres.operation`/schema/table metadata.
+/// When the relation has replica-identity key columns, their values are recorded as
+/// `postgres.key`; the deterministic dedup `message_id` is stamped later at commit (once
+/// the LSN is known) in [`PostgresCdcConsumer::handle_event`].
 fn cdc_message(rel: &Relation, operation: &str, body: serde_json::Value) -> CanonicalMessage {
+    let key = body
+        .as_object()
+        .and_then(|obj| replica_key_string(rel, obj));
     let payload = serde_json::to_vec(&body).unwrap_or_default();
     let mut msg = CanonicalMessage::new_bytes(payload.into(), None);
     msg.metadata
@@ -260,7 +281,61 @@ fn cdc_message(rel: &Relation, operation: &str, body: serde_json::Value) -> Cano
         .insert("postgres.schema".to_string(), rel.namespace.clone());
     msg.metadata
         .insert("postgres.table".to_string(), rel.name.clone());
+    if let Some(key) = key {
+        msg.metadata.insert("postgres.key".to_string(), key);
+    }
     msg
+}
+
+/// Concatenate the relation's replica-identity key column values (bit 0 of the column
+/// flags) from a decoded row. `None` when the relation exposes no key (no PK / replica
+/// identity NOTHING), in which case no deterministic id can be derived.
+fn replica_key_string(
+    rel: &Relation,
+    body: &serde_json::Map<String, serde_json::Value>,
+) -> Option<String> {
+    let mut parts = Vec::new();
+    for col in &rel.columns {
+        if col.flags & 1 == 1 {
+            let value = body.get(&col.name).unwrap_or(&serde_json::Value::Null);
+            parts.push(match value {
+                serde_json::Value::String(s) => s.clone(),
+                serde_json::Value::Null => String::new(),
+                other => other.to_string(),
+            });
+        }
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("\u{1}"))
+    }
+}
+
+/// Deterministic dedup id for a change event: FNV-1a 128-bit over
+/// `schema.table\0key\0lsn`. A replayed change (same key at the same commit LSN) hashes
+/// identically, so the dedup middleware / sink can drop it; distinct updates differ by LSN.
+fn cdc_dedup_id(schema: &str, table: &str, key: &str, lsn: u64) -> u128 {
+    const OFFSET: u128 = 0x6c62272e07bb014262b821756295c58d;
+    const PRIME: u128 = 0x0000000001000000000000000000013B;
+    let lsn_bytes = lsn.to_be_bytes();
+    let parts: [&[u8]; 7] = [
+        schema.as_bytes(),
+        b".",
+        table.as_bytes(),
+        b"\0",
+        key.as_bytes(),
+        b"\0",
+        &lsn_bytes,
+    ];
+    let mut h = OFFSET;
+    for part in parts {
+        for &b in part {
+            h ^= b as u128;
+            h = h.wrapping_mul(PRIME);
+        }
+    }
+    h
 }
 
 /// A safe Postgres identifier for a publication / replication slot: non-empty
@@ -440,5 +515,73 @@ impl Drop for PostgresCdcConsumer {
                 }
             });
         });
+    }
+}
+
+#[cfg(test)]
+mod cdc_id_tests {
+    use super::*;
+    use pgoutput::messages::{ColumnDesc, ReplicaIdentity};
+
+    fn rel_with_key() -> Relation {
+        Relation {
+            oid: 16384,
+            namespace: "public".into(),
+            name: "orders".into(),
+            replica_identity: ReplicaIdentity::Default,
+            columns: vec![
+                ColumnDesc {
+                    flags: 1,
+                    name: "id".into(),
+                    type_oid: 23,
+                    type_modifier: -1,
+                },
+                ColumnDesc {
+                    flags: 0,
+                    name: "body".into(),
+                    type_oid: 25,
+                    type_modifier: -1,
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn replica_key_uses_only_key_columns() {
+        let rel = rel_with_key();
+        let body = serde_json::json!({ "id": 42, "body": "hi" });
+        let key = replica_key_string(&rel, body.as_object().unwrap());
+        assert_eq!(key.as_deref(), Some("42"));
+    }
+
+    #[test]
+    fn replica_key_none_without_key_columns() {
+        let mut rel = rel_with_key();
+        rel.columns[0].flags = 0;
+        let body = serde_json::json!({ "id": 42 });
+        assert!(replica_key_string(&rel, body.as_object().unwrap()).is_none());
+    }
+
+    #[test]
+    fn cdc_message_sets_postgres_key() {
+        let rel = rel_with_key();
+        let body = serde_json::json!({ "id": 7, "body": "x" });
+        let msg = cdc_message(&rel, "insert", body);
+        assert_eq!(
+            msg.metadata.get("postgres.key").map(String::as_str),
+            Some("7")
+        );
+    }
+
+    #[test]
+    fn dedup_id_is_stable_and_lsn_sensitive() {
+        // Same change (key + lsn) → identical id (a replay deduplicates).
+        let a = cdc_dedup_id("public", "orders", "42", 100);
+        let b = cdc_dedup_id("public", "orders", "42", 100);
+        assert_eq!(a, b);
+        // Different lsn → different id (distinct updates are not collapsed).
+        assert_ne!(a, cdc_dedup_id("public", "orders", "42", 101));
+        // Different key → different id.
+        assert_ne!(a, cdc_dedup_id("public", "orders", "43", 100));
     }
 }

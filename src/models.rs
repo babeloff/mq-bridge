@@ -2200,6 +2200,9 @@ pub struct MongoDbConfig {
     /// Format for storing messages. Defaults to Normal.
     #[serde(default)]
     pub format: MongoDbFormat,
+    /// (Publisher only) Top-level payload field whose value becomes the document `_id`, for
+    /// idempotent inserts via the unique `_id` index. Sink collections only.
+    pub id_field: Option<String>,
     /// The ID used for the cursor in sequenced mode. If not provided, consumption starts from the current sequence (ephemeral).
     pub cursor_id: Option<String>,
     /// (Consumer only) Optional custom MongoDB query to filter messages. Provided as a JSON string (e.g., '{"type": "notification"}').

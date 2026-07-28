@@ -9,7 +9,7 @@ use anyhow::{anyhow, Context};
 use async_trait::async_trait;
 use futures::StreamExt;
 use mongodb::{
-    bson::{doc, to_document, Bson, Document},
+    bson::{doc, to_bson, to_document, Bson, Document},
     change_stream::ChangeStream,
     error::ErrorKind,
     options::{
@@ -88,17 +88,41 @@ fn document_to_canonical(doc: Document) -> anyhow::Result<CanonicalMessage> {
     Ok(msg)
 }
 
+/// Payload field → `_id`. Fails fast if the payload isn't JSON, the field is absent, or it's null.
+fn extract_id_bson(payload: &[u8], id_field: &str) -> anyhow::Result<Bson> {
+    let json: serde_json::Value = serde_json::from_slice(payload)
+        .with_context(|| format!("id_field '{}' requires a JSON payload", id_field))?;
+    let value = json
+        .get(id_field)
+        .ok_or_else(|| anyhow!("id_field '{}' not found in payload", id_field))?;
+    let bson = to_bson(value)
+        .with_context(|| format!("id_field '{}' value is not valid BSON", id_field))?;
+    if matches!(bson, Bson::Null) {
+        return Err(anyhow!("id_field '{}' resolved to null", id_field));
+    }
+    Ok(bson)
+}
+
 fn message_to_document(
     message: &CanonicalMessage,
     format: &MongoDbFormat,
+    id_field: Option<&str>,
 ) -> anyhow::Result<Document> {
     // If request-reply metadata is present, we must use the wrapped format to preserve it,
     // regardless of whether the original format was raw.
     let force_wrapped = message.metadata.contains_key("correlation_id")
         || message.metadata.contains_key("reply_to");
 
+    let explicit_id = match id_field {
+        Some(field) => Some(extract_id_bson(&message.payload, field)?),
+        None => None,
+    };
+
     if !force_wrapped && matches!(format, MongoDbFormat::Raw) {
-        if let Ok(doc) = serde_json::from_slice::<Document>(&message.payload) {
+        if let Ok(mut doc) = serde_json::from_slice::<Document>(&message.payload) {
+            if let Some(id) = &explicit_id {
+                doc.insert("_id", id.clone());
+            }
             return Ok(doc);
         }
         // If parsing fails, fall through to standard wrapping
@@ -147,8 +171,10 @@ fn message_to_document(
     let metadata_doc =
         to_document(&metadata).context("Failed to serialize metadata to BSON document")?;
 
+    let id_bson = explicit_id.unwrap_or_else(|| Bson::from(id_uuid));
+
     Ok(doc! {
-        "_id": id_uuid,
+        "_id": id_bson,
         "payload": payload_bson,
         "metadata": metadata_doc,
         "locked_until": null,
@@ -220,7 +246,7 @@ async fn handle_reply(
             resp.metadata
                 .insert("correlation_id".to_string(), cid.clone());
         }
-        let doc = message_to_document(&resp, &MongoDbFormat::Normal).map_err(|e| {
+        let doc = message_to_document(&resp, &MongoDbFormat::Normal, None).map_err(|e| {
             tracing::error!(collection = %coll_name, error = %e, "Failed to serialize MongoDB reply");
             anyhow!("Failed to serialize MongoDB reply: {}", e)
         })?;
@@ -246,6 +272,7 @@ pub struct MongoDbPublisher {
     request_timeout: Duration,
     reply_polling_interval: Duration,
     format: MongoDbFormat,
+    id_field: Option<String>,
 }
 
 fn mongodb_uses_sequencer(request_reply: bool, format: &MongoDbFormat) -> bool {
@@ -369,6 +396,7 @@ impl MongoDbPublisher {
             request_timeout: Duration::from_millis(config.request_timeout_ms.unwrap_or(30000)),
             reply_polling_interval: Duration::from_millis(config.reply_polling_ms.unwrap_or(50)),
             format: config.format.clone(),
+            id_field: config.id_field.clone(),
         })
     }
 
@@ -413,7 +441,7 @@ impl MessagePublisher for MongoDbPublisher {
     async fn send(&self, mut message: CanonicalMessage) -> Result<Sent, PublisherError> {
         if !self.request_reply {
             trace!(message_id = %format!("{:032x}", message.message_id), collection = %self.collection_name, uses_sequencer = self.uses_sequencer(), "Publishing document to MongoDB");
-            let mut doc = message_to_document(&message, &self.format)
+            let mut doc = message_to_document(&message, &self.format, self.id_field.as_deref())
                 .map_err(PublisherError::NonRetryable)?;
 
             if self.uses_sequencer() {
@@ -487,8 +515,8 @@ impl MessagePublisher for MongoDbPublisher {
             .insert("reply_to".to_string(), reply_collection_name.clone());
 
         trace!(message_id = %format!("{:032x}", message.message_id), correlation_id = %correlation_id, collection = %self.collection_name, "Publishing request document to MongoDB");
-        let doc =
-            message_to_document(&message, &self.format).map_err(PublisherError::NonRetryable)?;
+        let doc = message_to_document(&message, &self.format, self.id_field.as_deref())
+            .map_err(PublisherError::NonRetryable)?;
         match self.collection.insert_one(doc).await {
             Ok(_) => {}
             Err(e) => {
@@ -566,7 +594,7 @@ impl MessagePublisher for MongoDbPublisher {
         let mut valid_messages = Vec::with_capacity(messages.len());
 
         for message in messages {
-            match message_to_document(&message, &self.format) {
+            match message_to_document(&message, &self.format, self.id_field.as_deref()) {
                 Ok(doc) => {
                     docs.push(doc);
                     valid_messages.push(message);
@@ -2644,7 +2672,7 @@ mod tests {
         msg.metadata
             .insert("mqb.src.kafka_offset".to_string(), "42".to_string());
 
-        let doc = message_to_document(&msg, &MongoDbFormat::Text).unwrap();
+        let doc = message_to_document(&msg, &MongoDbFormat::Text, None).unwrap();
         let metadata = doc.get_document("metadata").unwrap();
 
         assert_eq!(metadata.get_str("kind").unwrap(), "order");
@@ -2652,5 +2680,33 @@ mod tests {
             !metadata.contains_key("mqb.src.kafka_offset"),
             "source/provenance keys must not be persisted to the document"
         );
+    }
+
+    #[test]
+    fn message_to_document_id_field_sets_typed_id() {
+        let msg = CanonicalMessage::new(br#"{"order_id":"A-1","qty":3}"#.to_vec(), None);
+        let doc = message_to_document(&msg, &MongoDbFormat::Json, Some("order_id")).unwrap();
+        assert_eq!(doc.get_str("_id").unwrap(), "A-1");
+
+        // Numeric key keeps its BSON integer type.
+        let msg = CanonicalMessage::new(br#"{"order_id":42}"#.to_vec(), None);
+        let doc = message_to_document(&msg, &MongoDbFormat::Json, Some("order_id")).unwrap();
+        assert_eq!(doc.get_i64("_id").unwrap(), 42);
+    }
+
+    #[test]
+    fn message_to_document_id_field_overrides_raw_id() {
+        // Raw inserts the payload verbatim; id_field still wins.
+        let msg = CanonicalMessage::new(br#"{"order_id":"A-1","_id":"ignored"}"#.to_vec(), None);
+        let doc = message_to_document(&msg, &MongoDbFormat::Raw, Some("order_id")).unwrap();
+        assert_eq!(doc.get_str("_id").unwrap(), "A-1");
+    }
+
+    #[test]
+    fn message_to_document_id_field_missing_or_non_json_errors() {
+        for payload in [&br#"{"other":1}"#[..], b"not json", br#"{"order_id":null}"#] {
+            let msg = CanonicalMessage::new(payload.to_vec(), None);
+            assert!(message_to_document(&msg, &MongoDbFormat::Json, Some("order_id")).is_err());
+        }
     }
 }

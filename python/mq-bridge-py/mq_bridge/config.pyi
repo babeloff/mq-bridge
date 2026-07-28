@@ -278,6 +278,7 @@ class MongoDbConfig(TypedDict, total=False):
     cursor_id: Optional[str]
     database: Required[str]
     format: MongoDbFormat
+    id_field: Optional[str]
     meta_collection: Optional[str]
     password: Optional[str]
     polling_interval_ms: Optional[int]
