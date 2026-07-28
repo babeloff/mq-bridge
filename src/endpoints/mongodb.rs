@@ -100,6 +100,13 @@ fn extract_id_bson(payload: &[u8], id_field: &str) -> anyhow::Result<Bson> {
     if matches!(bson, Bson::Null) {
         return Err(anyhow!("id_field '{}' resolved to null", id_field));
     }
+    // MongoDB forbids an array `_id`.
+    if matches!(bson, Bson::Array(_)) {
+        return Err(anyhow!(
+            "id_field '{}' resolved to an array, which is not a valid _id",
+            id_field
+        ));
+    }
     Ok(bson)
 }
 
@@ -411,8 +418,18 @@ impl MongoDbPublisher {
         &self,
         message: &mut CanonicalMessage,
     ) -> Result<(), PublisherError> {
-        let id_uuid = mongodb::bson::Uuid::from_bytes(message.message_id.to_be_bytes());
-        let filter = doc! { "_id": id_uuid };
+        // Look up by the same `_id` message_to_document wrote: the id_field value when
+        // configured, else the message_id UUID. Otherwise an explicit-id duplicate is
+        // never found and the request retries forever.
+        let id_bson = match self.id_field.as_deref() {
+            Some(field) => {
+                extract_id_bson(&message.payload, field).map_err(PublisherError::NonRetryable)?
+            }
+            None => Bson::from(mongodb::bson::Uuid::from_bytes(
+                message.message_id.to_be_bytes(),
+            )),
+        };
+        let filter = doc! { "_id": id_bson };
         match self.collection.find_one(filter).await {
             Ok(Some(existing_doc)) => {
                 let existing_msg = parse_mongodb_document(existing_doc).map_err(|e| {
@@ -1444,6 +1461,12 @@ impl MessageConsumer for MongoDbSubscriber {
             let doc = match result {
                 Ok(doc) => doc,
                 Err(e) => {
+                    // Surface a read failure as a connection error while the batch is
+                    // still empty (nothing consumed yet); once a partial batch exists,
+                    // deliver it and skip the failed read.
+                    if messages.is_empty() {
+                        return Err(ConsumerError::Connection(e.into()));
+                    }
                     warn!(
                         collection = %self.collection_name,
                         error = %e,
@@ -1485,16 +1508,32 @@ impl MessageConsumer for MongoDbSubscriber {
             let meta_collection = self.meta_collection.clone();
             let collection_name = self.collection_name.clone();
             let cursor_id = self.cursor_id.clone();
+            let last_seq_atomic = self.last_seq.clone();
+            // Boundary before this batch, for rollback on a nack.
+            let resume_from = last_seq;
 
             let commit = Box::new(move |dispositions: Vec<MessageDisposition>| {
                 Box::pin(async move {
+                    let mut acked = 0usize;
                     let mut highest_acked = 0;
                     for (disp, seq) in dispositions.iter().zip(seqs.iter()) {
                         if matches!(disp, MessageDisposition::Ack | MessageDisposition::Reply(_)) {
+                            acked += 1;
                             highest_acked = *seq;
                         } else {
                             break; // Stop at first Nack
                         }
+                    }
+
+                    // Not fully acked: roll the in-memory cursor back to the acked
+                    // boundary so unacked messages are redelivered instead of skipped.
+                    if acked < seqs.len() {
+                        let boundary = if acked == 0 {
+                            resume_from
+                        } else {
+                            highest_acked
+                        };
+                        last_seq_atomic.store(boundary, Ordering::Relaxed);
                     }
 
                     if highest_acked > 0 {
@@ -2733,6 +2772,12 @@ mod tests {
             let msg = CanonicalMessage::new(payload.to_vec(), None);
             assert!(message_to_document(&msg, &MongoDbFormat::Json, Some("order_id")).is_err());
         }
+    }
+
+    #[test]
+    fn extract_id_bson_rejects_array_id() {
+        // An array is not a valid MongoDB `_id`.
+        assert!(extract_id_bson(br#"{"order_id":[1,2]}"#, "order_id").is_err());
     }
 
     #[test]

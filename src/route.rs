@@ -797,19 +797,22 @@ impl Route {
                                         || e.downcast_ref::<ConsumerError>().is_some_and(|ce| matches!(ce, ConsumerError::Permanent(_)))
                                         || is_end_of_stream;
 
-                                    {
+                                    // EndOfStream is a clean terminal, not a failure, so
+                                    // it must not mark the route unhealthy.
+                                    if !is_end_of_stream {
                                         let mut s = recover_write_lock(&status_loop, "route_handle_status");
                                         s.healthy = false;
                                         s.error = Some(e.to_string());
                                     }
 
                                     if is_permanent {
-                                        outcome_guard.set(if is_end_of_stream {
-                                            RouteOutcome::Completed
+                                        if is_end_of_stream {
+                                            outcome_guard.set(RouteOutcome::Completed);
+                                            info!("Route '{}' completed: end of stream. Shutting down.", name);
                                         } else {
-                                            RouteOutcome::Failed
-                                        });
-                                        error!("Route '{}' failed with a permanent error: {}. Shutting down.", name, e);
+                                            outcome_guard.set(RouteOutcome::Failed);
+                                            error!("Route '{}' failed with a permanent error: {}. Shutting down.", name, e);
+                                        }
                                         break 'reconnect;
                                     }
 

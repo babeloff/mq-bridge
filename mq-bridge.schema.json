@@ -523,6 +523,7 @@
         "decrypt_keys": {
           "description": "Extra `key_id -> base64 key` entries accepted when decrypting (key rotation).",
           "type": "object",
+          "format": "password",
           "additionalProperties": {
             "type": "string"
           }
@@ -2075,6 +2076,11 @@
           "format": "uint64",
           "minimum": 0
         },
+        "report_outcome": {
+          "description": "(Publisher only) Return the message with metadata `mongodb.outcome` = `inserted`/`existed`\n(dup-key) so a `request`+`switch` can branch. Sink collections only; pair with `id_field`.",
+          "type": "boolean",
+          "default": false
+        },
         "request_reply": {
           "description": "(Publisher only) If true, the publisher will wait for a response in a dedicated collection. Defaults to false.",
           "type": "boolean",
@@ -2840,7 +2846,14 @@
         },
         "output": {
           "description": "The output/sink endpoint for the route.",
-          "$ref": "#/$defs/Endpoint",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Endpoint"
+            },
+            {
+              "type": "null"
+            }
+          ],
           "default": {
             "middlewares": [],
             "null": null
@@ -3281,7 +3294,13 @@
           ]
         }
       },
-      "additionalProperties": false
+      "additionalProperties": false,
+      "not": {
+        "required": [
+          "schema",
+          "schema_file"
+        ]
+      }
     },
     "WeakJoinMiddleware": {
       "description": "Weak Join middleware configuration.\n\nCorrelates messages by a metadata key and joins them within a timeout window.\nCount mode (default) waits for `expected_count` messages and emits a JSON array.\nBranch mode (set `branch_by`) waits for named branches and emits a branch-keyed object.",

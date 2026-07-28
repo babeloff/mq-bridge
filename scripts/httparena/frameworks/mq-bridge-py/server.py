@@ -76,7 +76,7 @@ def _http_route(name: str, listen: str, http_workers: int, extra: str = "") -> s
         concurrency_limit: 65536
         internal_buffer_size: 16384
         inline_response_fast_path: true
-        compression: gzip
+        compression_enabled: true
         compression_threshold_bytes: 256
 {extra}
     output:

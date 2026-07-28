@@ -282,8 +282,9 @@ insert_query: "INSERT INTO orders (id, body) VALUES (${payload:id}, ${payload:bo
 insert_query: "INSERT INTO orders (id, body) VALUES (${payload:id}, ${payload:body}) ON CONFLICT (id) DO NOTHING"
 ```
 
-A plain `INSERT` without a conflict clause instead sends the constraint violation to the DLQ, so add
-the clause when replays are expected. `${payload:field}` binds a typed value from the JSON payload;
+A plain `INSERT` without a conflict clause instead fails the row as a **non-retryable** error: a
+configured `dlq` captures it, and without one it is logged and dropped. Add the conflict clause
+when replays are expected. `${payload:field}` binds a typed value from the JSON payload;
 `${metadata:key}` binds a metadata string.
 
 **ClickHouse — `ReplacingMergeTree`.** ClickHouse has no unique constraints; dedup is a table-engine

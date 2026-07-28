@@ -775,8 +775,16 @@ impl MessageConsumer for AmqpConsumer {
         //    reliably terminate the consumer stream, so without this health check
         //    `next()` would block forever after the broker goes away and the route
         //    would never see the Connection error it needs to recreate the consumer.
+        // Keep the health poll (lapin 4 won't terminate a consumer on a dropped
+        // connection), but in drain mode shorten the wait to the drain-specific timeout so
+        // `exit_on_empty` (and its 0-latency benchmark override) fires promptly.
+        let poll_window = if self.exit_on_empty {
+            CONSUMER_HEALTH_POLL.min(crate::traits::drain_idle_timeout())
+        } else {
+            CONSUMER_HEALTH_POLL
+        };
         let first_delivery = loop {
-            match tokio::time::timeout(CONSUMER_HEALTH_POLL, self.consumer.next()).await {
+            match tokio::time::timeout(poll_window, self.consumer.next()).await {
                 Ok(Some(Ok(delivery))) => break delivery,
                 Ok(Some(Err(e))) => return Err(ConsumerError::Connection(anyhow::anyhow!(e))),
                 Ok(None) => {

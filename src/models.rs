@@ -837,6 +837,7 @@ pub struct EncryptionConfig {
     pub key: String,
     /// Extra `key_id -> base64 key` entries accepted when decrypting (key rotation).
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[cfg_attr(feature = "schema", schemars(extend("format" = "password")))]
     pub decrypt_keys: HashMap<String, String>,
 }
 
@@ -1082,6 +1083,7 @@ pub enum WeakJoinTimeout {
 /// out of the route.
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[cfg_attr(feature = "schema", schemars(transform = transform_middleware_schema_transform))]
 #[serde(deny_unknown_fields)]
 pub struct TransformMiddleware {
     /// Output field name -> source path (e.g. `firstName: "$.first_name"`). Dots nest the output.
@@ -1977,6 +1979,30 @@ fn route_schema_transform(schema: &mut schemars::Schema) {
         return;
     };
 
+    // `output: null` (the documented "no output" form) is valid; accept an Endpoint or null.
+    // Input stays endpoint-only.
+    if let Some(output) = properties
+        .get_mut("output")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        let reference = output.remove("$ref");
+        let default = output.remove("default");
+        let description = output.remove("description");
+        output.clear();
+        let mut any_of = Vec::new();
+        if let Some(reference) = reference {
+            any_of.push(serde_json::json!({ "$ref": reference }));
+        }
+        any_of.push(serde_json::json!({ "type": "null" }));
+        output.insert("anyOf".to_string(), serde_json::Value::Array(any_of));
+        if let Some(description) = description {
+            output.insert("description".to_string(), description);
+        }
+        if let Some(default) = default {
+            output.insert("default".to_string(), default);
+        }
+    }
+
     let Some(allow_fault_injection) = properties
         .get_mut("allow_fault_injection")
         .and_then(serde_json::Value::as_object_mut)
@@ -1985,6 +2011,17 @@ fn route_schema_transform(schema: &mut schemars::Schema) {
     };
 
     allow_fault_injection.insert("default".to_string(), serde_json::Value::Bool(false));
+}
+
+/// `schema` and `schema_file` are mutually exclusive; reject a config setting both.
+#[cfg(feature = "schema")]
+fn transform_middleware_schema_transform(schema: &mut schemars::Schema) {
+    if let Some(schema_obj) = schema.as_object_mut() {
+        schema_obj.insert(
+            "not".to_string(),
+            serde_json::json!({ "required": ["schema", "schema_file"] }),
+        );
+    }
 }
 
 /// Configuration for the correlated in-process stream response buffer.
@@ -3583,6 +3620,19 @@ impl SecretExtractor for EndpointType {
                 cfg.forward_to
                     .extract_secrets(&format!("{}__{}", prefix, "REQUEST__FORWARD_TO"), secrets);
             }
+            EndpointType::File(cfg) => {
+                if let Some(enc) = &mut cfg.encryption {
+                    enc.extract_secrets(&format!("{}__{}", prefix, "FILE__ENCRYPTION"), secrets);
+                }
+            }
+            EndpointType::ObjectStore(cfg) => {
+                if let Some(enc) = &mut cfg.encryption {
+                    enc.extract_secrets(
+                        &format!("{}__{}", prefix, "OBJECT_STORE__ENCRYPTION"),
+                        secrets,
+                    );
+                }
+            }
             _ => {}
         }
     }
@@ -3590,9 +3640,32 @@ impl SecretExtractor for EndpointType {
 
 impl SecretExtractor for Middleware {
     fn extract_secrets(&mut self, prefix: &str, secrets: &mut HashMap<String, String>) {
-        if let Middleware::Dlq(cfg) = self {
-            cfg.endpoint
-                .extract_secrets(&format!("{}__{}__{}", prefix, "DLQ", "ENDPOINT"), secrets);
+        match self {
+            Middleware::Dlq(cfg) => {
+                cfg.endpoint
+                    .extract_secrets(&format!("{}__{}__{}", prefix, "DLQ", "ENDPOINT"), secrets);
+            }
+            Middleware::Encryption(cfg) => {
+                cfg.extract_secrets(&format!("{}__{}", prefix, "ENCRYPTION"), secrets);
+            }
+            _ => {}
+        }
+    }
+}
+
+impl SecretExtractor for EncryptionConfig {
+    fn extract_secrets(&mut self, prefix: &str, secrets: &mut HashMap<String, String>) {
+        if !self.key.is_empty() {
+            secrets.insert(
+                sanitize_secret_key(&format!("{}__{}", prefix, "KEY")),
+                std::mem::take(&mut self.key),
+            );
+        }
+        for (id, k) in std::mem::take(&mut self.decrypt_keys) {
+            secrets.insert(
+                sanitize_secret_key(&format!("{}__{}__{}", prefix, "DECRYPT_KEYS", id)),
+                k,
+            );
         }
     }
 }

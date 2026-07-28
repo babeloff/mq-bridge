@@ -187,7 +187,7 @@ impl PostgresCdcConsumer {
             ReplicationEvent::Commit { end_lsn, .. } => {
                 let lsn = end_lsn.as_u64();
                 let lsn_str = format_lsn(lsn);
-                for mut msg in self.tx_buffer.drain(..) {
+                for (ordinal, mut msg) in self.tx_buffer.drain(..).enumerate() {
                     let dedup_id = msg.metadata.get("postgres.key").map(|key| {
                         let schema = msg
                             .metadata
@@ -197,7 +197,13 @@ impl PostgresCdcConsumer {
                             .metadata
                             .get("postgres.table")
                             .map_or("", |s| s.as_str());
-                        cdc_dedup_id(schema, table, key, lsn)
+                        let operation = msg
+                            .metadata
+                            .get("postgres.operation")
+                            .map_or("", |s| s.as_str());
+                        // Include op + in-tx ordinal so multiple changes to the same key
+                        // in one commit get distinct (still deterministic) ids.
+                        cdc_dedup_id(schema, table, key, lsn, operation, ordinal)
                     });
                     if let Some(id) = dedup_id {
                         msg.message_id = id;
@@ -287,46 +293,60 @@ fn cdc_message(rel: &Relation, operation: &str, body: serde_json::Value) -> Cano
     msg
 }
 
-/// Concatenate the relation's replica-identity key column values (bit 0 of the column
-/// flags) from a decoded row. `None` when the relation exposes no key (no PK / replica
-/// identity NOTHING), in which case no deterministic id can be derived.
+/// The relation's replica-identity key column values (bit 0 of the column flags) from a
+/// decoded row, serialized as a typed JSON array so distinct value combinations can never
+/// collide (unlike a delimiter join). `None` when the relation exposes no key (no PK /
+/// replica identity NOTHING), in which case no deterministic id can be derived.
 fn replica_key_string(
     rel: &Relation,
     body: &serde_json::Map<String, serde_json::Value>,
 ) -> Option<String> {
-    let mut parts = Vec::new();
+    let mut parts: Vec<serde_json::Value> = Vec::new();
     for col in &rel.columns {
         if col.flags & 1 == 1 {
-            let value = body.get(&col.name).unwrap_or(&serde_json::Value::Null);
-            parts.push(match value {
-                serde_json::Value::String(s) => s.clone(),
-                serde_json::Value::Null => String::new(),
-                other => other.to_string(),
-            });
+            parts.push(
+                body.get(&col.name)
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
+            );
         }
     }
     if parts.is_empty() {
         None
     } else {
-        Some(parts.join("\u{1}"))
+        Some(serde_json::Value::Array(parts).to_string())
     }
 }
 
 /// Deterministic dedup id for a change event: FNV-1a 128-bit over
-/// `schema.table\0key\0lsn`. A replayed change (same key at the same commit LSN) hashes
-/// identically, so the dedup middleware / sink can drop it; distinct updates differ by LSN.
-fn cdc_dedup_id(schema: &str, table: &str, key: &str, lsn: u64) -> u128 {
+/// `schema.table\0key\0operation\0lsn\0ordinal`. A replayed change (same key, op and
+/// in-tx position at the same commit LSN) hashes identically so the dedup middleware /
+/// sink can drop it; distinct changes — including several to one key in one transaction —
+/// differ by op, LSN, or ordinal.
+fn cdc_dedup_id(
+    schema: &str,
+    table: &str,
+    key: &str,
+    lsn: u64,
+    operation: &str,
+    ordinal: usize,
+) -> u128 {
     const OFFSET: u128 = 0x6c62272e07bb014262b821756295c58d;
     const PRIME: u128 = 0x0000000001000000000000000000013B;
     let lsn_bytes = lsn.to_be_bytes();
-    let parts: [&[u8]; 7] = [
+    let ordinal_bytes = (ordinal as u64).to_be_bytes();
+    let parts: [&[u8]; 11] = [
         schema.as_bytes(),
         b".",
         table.as_bytes(),
         b"\0",
         key.as_bytes(),
         b"\0",
+        operation.as_bytes(),
+        b"\0",
         &lsn_bytes,
+        b"\0",
+        &ordinal_bytes,
     ];
     let mut h = OFFSET;
     for part in parts {
@@ -390,6 +410,9 @@ impl MessageConsumer for PostgresCdcConsumer {
             }
             // Drain mode: a brief idle timeout yields an empty batch (no-op commit, so the
             // slot is not advanced past unconsumed changes) and lets --drain fire.
+            // `recv()` is cancel-safe — it awaits a channel; wire framing runs in a
+            // background worker with its own resumable reader — so the timeout drop here
+            // loses nothing.
             let Some(ev) = crate::traits::drain_gated(self.exit_on_empty, self.client.recv()).await
             else {
                 return Ok(ReceivedBatch::empty());
@@ -551,7 +574,7 @@ mod cdc_id_tests {
         let rel = rel_with_key();
         let body = serde_json::json!({ "id": 42, "body": "hi" });
         let key = replica_key_string(&rel, body.as_object().unwrap());
-        assert_eq!(key.as_deref(), Some("42"));
+        assert_eq!(key.as_deref(), Some("[42]"));
     }
 
     #[test]
@@ -569,19 +592,23 @@ mod cdc_id_tests {
         let msg = cdc_message(&rel, "insert", body);
         assert_eq!(
             msg.metadata.get("postgres.key").map(String::as_str),
-            Some("7")
+            Some("[7]")
         );
     }
 
     #[test]
     fn dedup_id_is_stable_and_lsn_sensitive() {
-        // Same change (key + lsn) → identical id (a replay deduplicates).
-        let a = cdc_dedup_id("public", "orders", "42", 100);
-        let b = cdc_dedup_id("public", "orders", "42", 100);
+        // Same change (key + op + lsn + ordinal) → identical id (a replay deduplicates).
+        let a = cdc_dedup_id("public", "orders", "42", 100, "insert", 0);
+        let b = cdc_dedup_id("public", "orders", "42", 100, "insert", 0);
         assert_eq!(a, b);
         // Different lsn → different id (distinct updates are not collapsed).
-        assert_ne!(a, cdc_dedup_id("public", "orders", "42", 101));
+        assert_ne!(a, cdc_dedup_id("public", "orders", "42", 101, "insert", 0));
         // Different key → different id.
-        assert_ne!(a, cdc_dedup_id("public", "orders", "43", 100));
+        assert_ne!(a, cdc_dedup_id("public", "orders", "43", 100, "insert", 0));
+        // Different operation on the same key/lsn → different id.
+        assert_ne!(a, cdc_dedup_id("public", "orders", "42", 100, "update", 0));
+        // Different in-transaction ordinal → different id (same key twice in one commit).
+        assert_ne!(a, cdc_dedup_id("public", "orders", "42", 100, "insert", 1));
     }
 }

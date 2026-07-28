@@ -422,7 +422,11 @@ fn make_http(listen: String, tls: Option<TlsConfig>) -> HttpConfig {
     // honors that and skips re-compressing them. Dynamic `/json` responses are
     // serialized fresh per request (no response caching) and compressed by the
     // library's per-request gzip when the client advertises Accept-Encoding.
-    http.compression = mq_bridge::models::Compression::Gzip;
+    // `compression` is the publisher-only codec and is ignored on a consumer, so the
+    // response path is enabled by `compression_enabled`; the server then negotiates the
+    // best codec the client's Accept-Encoding advertises (zstd here).
+    http.compression = mq_bridge::models::Compression::Zstd;
+    http.compression_enabled = Some(true);
     http.compression_threshold_bytes = Some(256);
     if let Some(tls) = tls {
         http.tls = tls;

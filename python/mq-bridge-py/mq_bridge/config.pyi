@@ -284,6 +284,7 @@ class MongoDbConfig(TypedDict, total=False):
     polling_interval_ms: Optional[int]
     receive_query: Optional[str]
     reply_polling_ms: Optional[int]
+    report_outcome: bool
     request_reply: bool
     request_timeout_ms: Optional[int]
     shared: Optional[bool]
@@ -416,7 +417,7 @@ class Route(TypedDict, total=False):
     empty_batch_delay_ms: int
     exit_on_empty: bool
     input: Required[Endpoint]
-    output: Endpoint
+    output: Optional[Endpoint]
     reconnect_interval_ms: int
     startup_timeout_ms: int
 

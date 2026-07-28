@@ -801,6 +801,28 @@ fn setup_http_state_and_channel(
         })
         .transpose()?;
 
+    // Validate custom header names/values once at startup so a malformed entry is a
+    // configuration error instead of a per-request panic in the response builders
+    // (which unwrap after `builder.header(...)`).
+    for (name, value) in &config.custom_headers {
+        hyper::header::HeaderName::from_bytes(name.as_bytes())
+            .map_err(|e| anyhow::anyhow!("Invalid custom_headers name '{name}': {e}"))?;
+        hyper::header::HeaderValue::from_str(value)
+            .map_err(|e| anyhow::anyhow!("Invalid custom_headers value for '{name}': {e}"))?;
+    }
+
+    // The `compression` codec is publisher-only and ignored on a consumer, so a codec
+    // set without `compression_enabled` would silently disable response compression.
+    if config.compression != crate::models::Compression::None
+        && config.compression_enabled.is_none()
+    {
+        tracing::warn!(
+            codec = ?config.compression,
+            "http consumer: `compression` is a publisher-only codec and is ignored here; \
+             set `compression_enabled: true` to compress responses"
+        );
+    }
+
     let inline_echo = inline_publisher.as_ref().is_some_and(|publisher| {
         publisher
             .as_any()

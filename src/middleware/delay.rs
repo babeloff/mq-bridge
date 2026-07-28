@@ -24,6 +24,10 @@ impl DelayConsumer {
 
 #[async_trait]
 impl MessageConsumer for DelayConsumer {
+    fn set_exit_on_empty(&mut self, exit_on_empty: bool) {
+        self.inner.set_exit_on_empty(exit_on_empty);
+    }
+
     fn commit_requires_order(&self) -> bool {
         self.inner.commit_requires_order()
     }

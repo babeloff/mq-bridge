@@ -510,7 +510,9 @@ fn extract_copy_columns(raw_query: &str, token_count: usize) -> anyhow::Result<V
             "bulk_copy cannot be used with ON CONFLICT/RETURNING/ON DUPLICATE clauses (COPY does not support them)."
         ));
     }
-    let values_pos = upper.rfind("VALUES").ok_or_else(|| {
+    // Locate VALUES with the ASCII-safe scanner so byte offsets index `raw_query`
+    // directly (`upper` may differ in length under non-ASCII uppercasing).
+    let values_pos = find_top_level_values(raw_query).ok_or_else(|| {
         anyhow!("bulk_copy requires an INSERT ... VALUES query with a column list.")
     })?;
 

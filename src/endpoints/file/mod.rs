@@ -1441,6 +1441,22 @@ fn run_file_member_consume_task_sync<F>(
     loop {
         let cur_len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
 
+        // The file shrank (truncated or rotated): records we already emitted no longer
+        // exist, so re-read the member stream from the start instead of skipping past
+        // live data. Mirrors the tail reader resetting its byte position to 0. Guarded by
+        // a real baseline (`last_len` is `u64::MAX` until the first clean pass) so a
+        // decode-error pass — which never advances `last_len` — is not seen as a shrink.
+        if initialized && last_len != u64::MAX && cur_len < last_len {
+            tracing::warn!(
+                "File {} was truncated; re-reading member stream from the start.",
+                path
+            );
+            records_emitted = 0;
+            decode_failures = 0;
+            failure_len = u64::MAX;
+            signaled_eof = false;
+        }
+
         // No growth since the last full pass: emit the drain marker once, then poll.
         if initialized && cur_len == last_len {
             if !signaled_eof {
@@ -1977,10 +1993,13 @@ impl FileConsumer {
 #[async_trait]
 impl MessageConsumer for FileConsumer {
     fn set_exit_on_empty(&mut self, exit_on_empty: bool) {
-        // Only the delimiter-splitting tail reader distinguishes a complete final
-        // record from a torn mid-write; propagate the drain intent to its thread.
-        if let ConsumerBackend::Tail(c) = &self.backend {
-            c.drain_on_empty.store(exit_on_empty, Ordering::SeqCst);
+        match &mut self.backend {
+            // Only the delimiter-splitting tail reader distinguishes a complete final
+            // record from a torn mid-write; propagate the drain intent to its thread.
+            ConsumerBackend::Tail(c) => c.drain_on_empty.store(exit_on_empty, Ordering::SeqCst),
+            // The event-store backend blocks for new events; forward so it can drain too.
+            ConsumerBackend::EventStore(c) => c.set_exit_on_empty(exit_on_empty),
+            ConsumerBackend::Queue(_) => {}
         }
     }
 

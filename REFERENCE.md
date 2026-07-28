@@ -119,9 +119,12 @@ errors are **not** dead-lettered — they propagate so the route can reconnect. 
 is a full endpoint, so it can itself have middleware. If the DLQ send fails with a connection
 error that error propagates rather than silently dropping the message.
 
-**Without a `dlq` (or `retry`) middleware**, a message that fails permanently — a data/type
+**Without a `dlq` middleware**, a message that fails permanently — a data/type
 error the sink rejects, a poison payload a handler rejects — is logged at `error` level and
-**dropped**, and the route keeps processing the rest of the batch. This tolerate-and-continue
+**dropped**, and the route keeps processing the rest of the batch. `dlq` is the only retention
+mechanism: `retry` alone does not retain a permanently-failed message nor prevent it from being
+dropped — it only re-attempts retryable/connection errors, then hands a still-failing message on
+to be dropped (or to a following `dlq`). This tolerate-and-continue
 policy keeps one bad message from halting the whole stream, but it means a *systematic* failure
 (e.g. every row hitting a column-type mismatch) drains the input while committing nothing and
 still ends `completed`. Add a `dlq` to capture the failures for inspection/replay, or watch the
@@ -348,7 +351,12 @@ output. Requires the `encryption` feature.
 The envelope records the cipher and `key_id`, so key rotation works by sealing with a new
 `key_id`/`key` while listing the old key under `decrypt_keys` on the consuming side. Each
 payload is authenticated independently: any bit-level tampering, a torn frame, or a
-missing/wrong key is a hard consumer error, not a silent drop. Note that this authenticates
+missing/wrong key is a hard consumer error, not a silent drop. The AEAD binds only the
+payload (empty associated data): metadata and routing keys are *not* authenticated against
+the ciphertext, since they are not guaranteed to survive transport round-trips (many
+endpoints regenerate the `message_id` or drop `kind`). A sealed payload can therefore be
+replayed under different metadata; use the `deduplication` middleware or a sink uniqueness
+constraint if that matters. Note that this authenticates
 each payload, not the file as a whole — like any append-structured file, an at-rest file
 that loses whole trailing frames (truncation at a frame boundary) reads back as a shorter
 stream with no error, so rely on the consumer's checkpoint/cursor for completeness rather

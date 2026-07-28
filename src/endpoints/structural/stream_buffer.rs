@@ -173,14 +173,26 @@ fn remove_partition_if_current(
     correlation_id: &str,
     sender: &Sender<Vec<CanonicalMessage>>,
 ) {
-    let topic = get_or_create_topic(topic);
-    let mut partitions = topic.lock().expect("stream buffer topic poisoned");
+    // Look the topic up without creating it, so a topic already removed is not resurrected.
+    let mut buffers = STREAM_BUFFERS
+        .lock()
+        .expect("stream buffer registry poisoned");
+    let Some(topic_arc) = buffers.get(topic).cloned() else {
+        return;
+    };
+    let mut partitions = topic_arc.lock().expect("stream buffer topic poisoned");
     let should_remove = partitions
         .get(correlation_id)
         .is_some_and(|partition| partition.sender.same_channel(sender));
     if should_remove {
         partitions.remove(correlation_id);
         sender.close();
+        // Drop the topic once its last partition is gone so finished topics don't linger.
+        let now_empty = partitions.is_empty();
+        drop(partitions);
+        if now_empty {
+            buffers.remove(topic);
+        }
     }
 }
 
@@ -218,11 +230,14 @@ impl MessagePublisher for StreamBufferPublisher {
                 ))
             })?;
         let partition = get_or_create_partition(&self.topic, &correlation_id, self.capacity);
-        partition
-            .sender
-            .send(vec![message])
-            .await
-            .map_err(|e| anyhow!("Failed to send to stream_buffer: {}", e))?;
+        if partition.sender.is_closed() {
+            return Err(PublisherError::Retryable(anyhow!(
+                "stream_buffer partition is closed"
+            )));
+        }
+        partition.sender.send(vec![message]).await.map_err(|e| {
+            PublisherError::Retryable(anyhow!("Failed to send to stream_buffer: {}", e))
+        })?;
         Ok(Sent::Ack)
     }
 
@@ -458,9 +473,13 @@ impl MessageConsumer for StreamBufferConsumer {
                 }
 
                 std::mem::take(&mut guard.messages);
+                // Requeue first (buffered messages stay drainable after close), then
+                // clean up: a consumed acked end marker still removes the partition even
+                // when the same batch also had nacks.
                 if !to_requeue.is_empty() {
                     requeue_messages(sender.clone(), to_requeue);
-                } else if saw_acked_end_marker {
+                }
+                if saw_acked_end_marker {
                     remove_partition_if_current(&topic, &correlation_id, &sender);
                 }
 

@@ -362,7 +362,14 @@ pub struct ObjectStoreConsumer {
     idle_delay: Duration,
     /// Reject objects larger than this many bytes rather than buffering them whole; `None` = no limit.
     max_object_bytes: Option<u64>,
+    /// Consecutive decode failures on `decode_failing_key` before it is quarantined.
+    decode_failures: u32,
+    decode_failing_key: Option<String>,
 }
+
+/// Consecutive decode failures on one object before it is quarantined (skipped) so a
+/// single poison object cannot block the source forever.
+const MAX_OBJECT_DECODE_FAILURES: u32 = 5;
 
 impl ObjectStoreConsumer {
     pub async fn new(config: &ObjectStoreConfig) -> anyhow::Result<Self> {
@@ -443,6 +450,8 @@ impl ObjectStoreConsumer {
             progress: Arc::new(Mutex::new(None)),
             idle_delay: Duration::from_millis(config.polling_interval_ms.unwrap_or(1000)),
             max_object_bytes: config.max_object_bytes,
+            decode_failures: 0,
+            decode_failing_key: None,
         })
     }
 
@@ -469,6 +478,8 @@ impl ObjectStoreConsumer {
             progress: Arc::new(Mutex::new(None)),
             idle_delay: Duration::from_millis(10),
             max_object_bytes: None,
+            decode_failures: 0,
+            decode_failing_key: None,
         }
     }
 
@@ -505,30 +516,36 @@ impl ObjectStoreConsumer {
                 .bytes()
                 .await?
                 .to_vec();
-            // Decrypt-then-decompress (the write path compressed first), whole,
-            // before splitting into records.
-            #[cfg(feature = "encryption")]
-            let data = if let Some(crypto) = &self.crypto {
-                crypto
-                    .open(&data, b"")
-                    .with_context(|| format!("decrypt object '{key}'"))?
-            } else {
-                data
-            };
-            #[cfg(feature = "compression")]
-            let data = if self.compression != Compression::None {
-                crate::support::compression::decompress_all(
-                    self.compression,
-                    &data,
-                    self.max_object_bytes,
-                )
-                .with_context(|| format!("decompress object '{key}'"))?
-            } else {
-                data
-            };
+            // Decode (decrypt/decompress) is deferred to `receive_batch` so a poison
+            // object is bounded-retried then quarantined rather than blocking forever.
             return Ok(Some((key, data)));
         }
         Ok(None)
+    }
+
+    /// Decrypt-then-decompress a fetched object whole (the write path compressed first).
+    #[allow(unused_variables)]
+    fn decode_object(&self, key: &str, data: Vec<u8>) -> anyhow::Result<Vec<u8>> {
+        #[cfg(feature = "encryption")]
+        let data = if let Some(crypto) = &self.crypto {
+            crypto
+                .open(&data, b"")
+                .with_context(|| format!("decrypt object '{key}'"))?
+        } else {
+            data
+        };
+        #[cfg(feature = "compression")]
+        let data = if self.compression != Compression::None {
+            crate::support::compression::decompress_all(
+                self.compression,
+                &data,
+                self.max_object_bytes,
+            )
+            .with_context(|| format!("decompress object '{key}'"))?
+        } else {
+            data
+        };
+        Ok(data)
     }
 
     /// Persists the resume cursor durably, then advances the in-memory cursor. The durable
@@ -569,7 +586,40 @@ impl MessageConsumer for ObjectStoreConsumer {
                         tokio::time::sleep(self.idle_delay).await;
                         return Ok(empty_batch());
                     }
-                    Some((key, data)) => {
+                    Some((key, raw)) => {
+                        // Decode here so a poison object is bounded-retried then
+                        // quarantined (cursor advanced past it) rather than looping forever.
+                        let data = match self.decode_object(&key, raw) {
+                            Ok(data) => {
+                                self.decode_failing_key = None;
+                                self.decode_failures = 0;
+                                data
+                            }
+                            Err(e) => {
+                                if self.decode_failing_key.as_deref() == Some(key.as_str()) {
+                                    self.decode_failures += 1;
+                                } else {
+                                    self.decode_failing_key = Some(key.clone());
+                                    self.decode_failures = 1;
+                                }
+                                if self.decode_failures >= MAX_OBJECT_DECODE_FAILURES {
+                                    warn!(
+                                        key = %key,
+                                        error = %e,
+                                        "object failed to decode {MAX_OBJECT_DECODE_FAILURES} times; quarantining (advancing cursor past it)"
+                                    );
+                                    self.save_cursor(&key)
+                                        .await
+                                        .map_err(ConsumerError::Connection)?;
+                                    self.decode_failing_key = None;
+                                    self.decode_failures = 0;
+                                    tokio::time::sleep(self.idle_delay).await;
+                                    return Ok(empty_batch());
+                                }
+                                // Under the limit: retry the same object next poll.
+                                return Err(ConsumerError::Connection(e));
+                            }
+                        };
                         let records = split_and_parse(&data, &self.delimiter, &self.format);
                         if records.is_empty() {
                             // No data records (e.g. a lone CSV header): advance past it so we

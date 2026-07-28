@@ -143,8 +143,13 @@ pub(super) struct ParsedSseEvent {
     pub(super) event_name: Option<String>,
 }
 
-pub(super) fn find_sse_event_end(buffer: &str) -> Option<usize> {
-    match (buffer.find("\n\n"), buffer.find("\r\n\r\n")) {
+/// Byte offset of the blank-line terminator ending the first complete SSE event.
+/// Scans raw bytes so a multi-byte UTF-8 character split across body frames is never
+/// inspected mid-sequence; decoding happens only once a full event has been framed.
+pub(super) fn find_sse_event_end(buffer: &[u8]) -> Option<usize> {
+    let lf = buffer.windows(2).position(|w| w == b"\n\n");
+    let crlf = buffer.windows(4).position(|w| w == b"\r\n\r\n");
+    match (lf, crlf) {
         (Some(a), Some(b)) => Some(a.min(b)),
         (Some(a), None) => Some(a),
         (None, Some(b)) => Some(b),
@@ -321,7 +326,9 @@ async fn receive_streamable_body(
         response_tx,
     };
     let mut stream_index = 0usize;
-    let mut text_buffer = String::new();
+    // Raw bytes accumulated across frames; records are framed on byte boundaries and
+    // decoded only once complete, so a multi-byte UTF-8 char split across frames stays intact.
+    let mut byte_buffer: Vec<u8> = Vec::new();
 
     loop {
         let next_frame = tokio::time::timeout(dispatch.request_timeout, body.frame()).await;
@@ -345,20 +352,20 @@ async fn receive_streamable_body(
                 stream_index += 1;
             }
             HttpStreamFormat::Ndjson => {
-                text_buffer.push_str(&String::from_utf8_lossy(data));
+                byte_buffer.extend_from_slice(data);
                 stream_index = drain_ndjson_stream_items(
                     &dispatch,
-                    &mut text_buffer,
+                    &mut byte_buffer,
                     metadata.clone(),
                     stream_index,
                 )
                 .await?;
             }
             HttpStreamFormat::Sse => {
-                text_buffer.push_str(&String::from_utf8_lossy(data));
+                byte_buffer.extend_from_slice(data);
                 stream_index = drain_sse_stream_items(
                     &dispatch,
-                    &mut text_buffer,
+                    &mut byte_buffer,
                     metadata.clone(),
                     stream_index,
                 )
@@ -370,11 +377,13 @@ async fn receive_streamable_body(
     match request_format {
         HttpStreamFormat::RawChunks => {}
         HttpStreamFormat::Ndjson => {
-            let tail = text_buffer.trim();
+            // Trailing record with no closing newline; the whole remainder is one
+            // complete record at EOF, so its raw bytes go through untouched.
+            let tail = byte_buffer.trim_ascii();
             if !tail.is_empty() {
                 send_stream_item(
                     &dispatch,
-                    Bytes::copy_from_slice(tail.as_bytes()),
+                    Bytes::copy_from_slice(tail),
                     metadata,
                     stream_index,
                 )
@@ -382,8 +391,9 @@ async fn receive_streamable_body(
             }
         }
         HttpStreamFormat::Sse => {
-            if !text_buffer.trim().is_empty() {
-                if let Some(event) = parse_sse_event(&text_buffer) {
+            if !byte_buffer.trim_ascii().is_empty() {
+                let raw_event = String::from_utf8_lossy(&byte_buffer);
+                if let Some(event) = parse_sse_event(&raw_event) {
                     send_sse_stream_item(&dispatch, event, metadata, stream_index).await?;
                 }
             }
@@ -395,26 +405,20 @@ async fn receive_streamable_body(
 
 async fn drain_ndjson_stream_items(
     dispatch: &HttpStreamDispatch,
-    buffer: &mut String,
+    buffer: &mut Vec<u8>,
     metadata: HashMap<String, String>,
     mut stream_index: usize,
 ) -> anyhow::Result<usize> {
-    while let Some(newline_pos) = buffer.find('\n') {
-        let mut line = buffer[..newline_pos].to_string();
-        if line.ends_with('\r') {
+    while let Some(newline_pos) = buffer.iter().position(|&b| b == b'\n') {
+        let mut line: Vec<u8> = buffer.drain(..=newline_pos).collect();
+        line.pop(); // drop the '\n'
+        if line.last() == Some(&b'\r') {
             line.pop();
         }
-        buffer.drain(..=newline_pos);
-        if line.trim().is_empty() {
+        if line.iter().all(u8::is_ascii_whitespace) {
             continue;
         }
-        send_stream_item(
-            dispatch,
-            Bytes::from(line.into_bytes()),
-            metadata.clone(),
-            stream_index,
-        )
-        .await?;
+        send_stream_item(dispatch, Bytes::from(line), metadata.clone(), stream_index).await?;
         stream_index += 1;
     }
     Ok(stream_index)
@@ -422,19 +426,19 @@ async fn drain_ndjson_stream_items(
 
 async fn drain_sse_stream_items(
     dispatch: &HttpStreamDispatch,
-    buffer: &mut String,
+    buffer: &mut Vec<u8>,
     metadata: HashMap<String, String>,
     mut stream_index: usize,
 ) -> anyhow::Result<usize> {
     while let Some(event_end) = find_sse_event_end(buffer) {
-        let raw_event = buffer[..event_end].to_string();
-        let drain_to = if buffer[event_end..].starts_with("\r\n\r\n") {
-            event_end + 4
+        let terminator_len = if buffer[event_end..].starts_with(b"\r\n\r\n") {
+            4
         } else {
-            event_end + 2
+            2
         };
-        buffer.drain(..drain_to);
-
+        let event_bytes: Vec<u8> = buffer.drain(..event_end + terminator_len).collect();
+        // The framed event is complete, so decoding here cannot split a multi-byte char.
+        let raw_event = String::from_utf8_lossy(&event_bytes[..event_end]);
         let Some(event) = parse_sse_event(&raw_event) else {
             continue;
         };
@@ -600,7 +604,9 @@ pub(super) async fn publish_response_stream(
     timeout: std::time::Duration,
 ) -> Result<(), PublishResponseStreamError> {
     let mut index = 0usize;
-    let mut text_buffer = String::new();
+    // Raw bytes accumulated across frames; framed on byte boundaries and decoded only
+    // once a record is complete, so a multi-byte UTF-8 char split across frames stays intact.
+    let mut byte_buffer: Vec<u8> = Vec::new();
     let mut published_any = false;
 
     loop {
@@ -703,10 +709,10 @@ pub(super) async fn publish_response_stream(
                 index += 1;
             }
             HttpStreamFormat::Ndjson => {
-                text_buffer.push_str(&String::from_utf8_lossy(data));
+                byte_buffer.extend_from_slice(data);
                 index = match drain_ndjson_response_items(
                     &sink,
-                    &mut text_buffer,
+                    &mut byte_buffer,
                     &base_metadata,
                     &correlation_id,
                     format,
@@ -735,10 +741,10 @@ pub(super) async fn publish_response_stream(
                 }
             }
             HttpStreamFormat::Sse => {
-                text_buffer.push_str(&String::from_utf8_lossy(data));
+                byte_buffer.extend_from_slice(data);
                 index = match drain_sse_response_items(
                     &sink,
-                    &mut text_buffer,
+                    &mut byte_buffer,
                     &base_metadata,
                     &correlation_id,
                     format,
@@ -772,11 +778,11 @@ pub(super) async fn publish_response_stream(
     match format {
         HttpStreamFormat::RawChunks => {}
         HttpStreamFormat::Ndjson => {
-            let tail = text_buffer.trim();
+            let tail = byte_buffer.trim_ascii();
             if !tail.is_empty() {
                 if let Err(error) = publish_stream_payload(
                     &sink,
-                    Bytes::copy_from_slice(tail.as_bytes()),
+                    Bytes::copy_from_slice(tail),
                     base_metadata.clone(),
                     &correlation_id,
                     format,
@@ -802,8 +808,9 @@ pub(super) async fn publish_response_stream(
             }
         }
         HttpStreamFormat::Sse => {
-            if !text_buffer.trim().is_empty() {
-                if let Some(event) = parse_sse_event(&text_buffer) {
+            if !byte_buffer.trim_ascii().is_empty() {
+                let raw_event = String::from_utf8_lossy(&byte_buffer);
+                if let Some(event) = parse_sse_event(&raw_event) {
                     if let Err(error) = publish_sse_response_item(
                         &sink,
                         event,
@@ -847,24 +854,24 @@ pub(super) async fn publish_response_stream(
 
 async fn drain_ndjson_response_items(
     sink: &Arc<dyn MessagePublisher>,
-    buffer: &mut String,
+    buffer: &mut Vec<u8>,
     base_metadata: &HashMap<String, String>,
     correlation_id: &str,
     format: HttpStreamFormat,
     mut index: usize,
 ) -> Result<usize, PublisherError> {
-    while let Some(newline_pos) = buffer.find('\n') {
-        let mut line = buffer[..newline_pos].to_string();
-        if line.ends_with('\r') {
+    while let Some(newline_pos) = buffer.iter().position(|&b| b == b'\n') {
+        let mut line: Vec<u8> = buffer.drain(..=newline_pos).collect();
+        line.pop(); // drop the '\n'
+        if line.last() == Some(&b'\r') {
             line.pop();
         }
-        buffer.drain(..=newline_pos);
-        if line.trim().is_empty() {
+        if line.iter().all(u8::is_ascii_whitespace) {
             continue;
         }
         publish_stream_payload(
             sink,
-            Bytes::from(line.into_bytes()),
+            Bytes::from(line),
             base_metadata.clone(),
             correlation_id,
             format,
@@ -878,21 +885,21 @@ async fn drain_ndjson_response_items(
 
 async fn drain_sse_response_items(
     sink: &Arc<dyn MessagePublisher>,
-    buffer: &mut String,
+    buffer: &mut Vec<u8>,
     base_metadata: &HashMap<String, String>,
     correlation_id: &str,
     format: HttpStreamFormat,
     mut index: usize,
 ) -> Result<usize, PublisherError> {
     while let Some(event_end) = find_sse_event_end(buffer) {
-        let raw_event = buffer[..event_end].to_string();
-        let drain_to = if buffer[event_end..].starts_with("\r\n\r\n") {
-            event_end + 4
+        let terminator_len = if buffer[event_end..].starts_with(b"\r\n\r\n") {
+            4
         } else {
-            event_end + 2
+            2
         };
-        buffer.drain(..drain_to);
-
+        let event_bytes: Vec<u8> = buffer.drain(..event_end + terminator_len).collect();
+        // Complete framed event; safe to decode.
+        let raw_event = String::from_utf8_lossy(&event_bytes[..event_end]);
         let Some(event) = parse_sse_event(&raw_event) else {
             continue;
         };
