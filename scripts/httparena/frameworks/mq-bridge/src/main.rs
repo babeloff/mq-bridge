@@ -421,7 +421,7 @@ fn make_http(listen: String, tls: Option<TlsConfig>) -> HttpConfig {
     // carries `content-encoding: gzip` when the client accepts it — the library
     // honors that and skips re-compressing them. Dynamic `/json` responses are
     // serialized fresh per request (no response caching) and compressed by the
-    // library's per-request gzip when the client advertises Accept-Encoding.
+    // library via codec negotiation on the client's Accept-Encoding (Zstd here).
     // `compression` is the publisher-only codec and is ignored on a consumer, so the
     // response path is enabled by `compression_enabled`; the server then negotiates the
     // best codec the client's Accept-Encoding advertises (zstd here).

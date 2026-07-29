@@ -2017,9 +2017,14 @@ fn route_schema_transform(schema: &mut schemars::Schema) {
 #[cfg(feature = "schema")]
 fn transform_middleware_schema_transform(schema: &mut schemars::Schema) {
     if let Some(schema_obj) = schema.as_object_mut() {
+        // Only reject a non-null `schema_file` alongside `schema`; `schema_file: null`
+        // is allowed with `schema`, matching the runtime compiler (Option is None).
         schema_obj.insert(
             "not".to_string(),
-            serde_json::json!({ "required": ["schema", "schema_file"] }),
+            serde_json::json!({
+                "required": ["schema", "schema_file"],
+                "properties": { "schema_file": { "type": "string" } }
+            }),
         );
     }
 }

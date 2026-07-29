@@ -3296,6 +3296,11 @@
       },
       "additionalProperties": false,
       "not": {
+        "properties": {
+          "schema_file": {
+            "type": "string"
+          }
+        },
         "required": [
           "schema",
           "schema_file"
