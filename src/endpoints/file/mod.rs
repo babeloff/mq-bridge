@@ -1108,6 +1108,7 @@ fn read_until_bytes_sync<R: std::io::BufRead>(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_file_tail_task_sync(
     path: String,
     msg_tx: async_channel::Sender<Vec<CanonicalMessage>>,

@@ -1749,26 +1749,21 @@ async fn test_file_tail_live_withholds_final_line_without_newline() {
     // No set_exit_on_empty(true): live tail withholds the torn final record.
 
     let mut count = 0;
-    loop {
-        match tokio::time::timeout(
-            std::time::Duration::from_millis(500),
-            source.receive_batch(64),
-        )
-        .await
-        {
-            Ok(batch) => {
-                let batch = batch.expect("receive_batch errored");
-                // A partial final record is pending, so no empty marker is emitted;
-                // every batch that arrives carries data.
-                assert!(
-                    !batch.messages.is_empty(),
-                    "unexpected empty marker in live tail"
-                );
-                count += batch.messages.len();
-            }
-            // Blocked waiting for the writer to finish the final record.
-            Err(_) => break,
-        }
+    // Loops until the timeout elapses: blocked waiting for the writer to finish the final record.
+    while let Ok(batch) = tokio::time::timeout(
+        std::time::Duration::from_millis(500),
+        source.receive_batch(64),
+    )
+    .await
+    {
+        let batch = batch.expect("receive_batch errored");
+        // A partial final record is pending, so no empty marker is emitted;
+        // every batch that arrives carries data.
+        assert!(
+            !batch.messages.is_empty(),
+            "unexpected empty marker in live tail"
+        );
+        count += batch.messages.len();
     }
     assert_eq!(
         count,

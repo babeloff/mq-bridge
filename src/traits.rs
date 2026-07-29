@@ -292,7 +292,7 @@ pub trait MessageConsumer: Send + Sync {
     /// Informs the consumer whether the owning route will terminate on an empty
     /// batch (`exit_on_empty` / `--drain`). Called once by the route right after
     /// creation. Blocking transports use it to gate an idle timeout (via
-    /// [`drain_gated`]) so a quiet source surfaces an empty batch instead of
+    /// `drain_gated`) so a quiet source surfaces an empty batch instead of
     /// hanging the drain; the file tail reader also uses it to decide whether a
     /// final record with no trailing delimiter is complete (drain) or torn (live tail).
     fn set_exit_on_empty(&mut self, _exit_on_empty: bool) {}

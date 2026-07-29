@@ -881,19 +881,21 @@ async fn test_classify_sql_error_constraint_is_nonretryable_others_retryable() {
         PublisherError::NonRetryable(_)
     ));
 
-    // A non-constraint database error (kind `Other`) models a transient operational failure such
-    // as a server restart -> must be Retryable, never dropped.
-    let other = sqlx::query("INSERT INTO no_such_table (id) VALUES (1)")
+    // A missing table is a deterministic schema error: every retry fails identically, so it
+    // dead-letters instead of wedging the route -> NonRetryable. (SQLite reports it as a bare
+    // SQLITE_ERROR with no SQLSTATE, so this exercises the message-based fallback.)
+    let schema = sqlx::query("INSERT INTO no_such_table (id) VALUES (1)")
         .execute(&pool)
         .await
         .unwrap_err();
-    assert!(other.as_database_error().is_some());
+    assert!(schema.as_database_error().is_some());
     assert!(matches!(
-        classify_sql_error(other),
-        PublisherError::Retryable(_)
+        classify_sql_error(schema),
+        PublisherError::NonRetryable(_)
     ));
 
-    // Transport-level errors (pool exhaustion, I/O) are transient too.
+    // Operational failures (a broker restart/failover, e.g. MySQL 1053 SQLSTATE `08S01`) and
+    // transport-level errors (pool exhaustion, I/O) are transient -> must stay Retryable.
     assert!(matches!(
         classify_sql_error(sqlx::Error::PoolTimedOut),
         PublisherError::Retryable(_)

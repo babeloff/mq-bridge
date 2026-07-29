@@ -435,6 +435,7 @@ fn copy_escape_text(s: &str) -> String {
 ///     `42804` datatype_mismatch (text bound into a `numeric`/`timestamptz` column).
 ///   - `22` data exception — invalid text representation, numeric overflow, bad datetime.
 ///   - `23` integrity constraint violation (also caught by `ErrorKind` below).
+///
 /// Everything else (08 connection, 40 deadlock/serialization, 53 resources,
 /// 55 object-not-ready, 57 operator-intervention, 58 system) is transient and retried.
 fn is_deterministic_sqlstate(code: &str) -> bool {

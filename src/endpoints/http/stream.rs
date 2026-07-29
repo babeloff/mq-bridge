@@ -1,3 +1,7 @@
+// The `http` feature requires Rust 1.85 (see Cargo.toml), so slice `trim_ascii`
+// (stable since 1.80) is always available here; the crate-wide 1.75 MSRV doesn't apply.
+#![allow(clippy::incompatible_msrv)]
+
 use crate::traits::{
     BoxFuture, CommitFunc, MessageDisposition, MessagePublisher, PublisherError, Sent,
 };
