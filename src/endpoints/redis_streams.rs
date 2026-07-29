@@ -371,7 +371,7 @@ fn spawn_stream_reader(ctx: ReaderCtx) {
         loop {
             // Redeliver entries left pending past redelivery_ms (Nacked, or
             // orphaned by a crashed/renamed consumer) via XAUTOCLAIM.
-            if reclaim_enabled && last_reclaim.map_or(true, |t| t.elapsed() >= reclaim_interval) {
+            if reclaim_enabled && last_reclaim.is_none_or(|t| t.elapsed() >= reclaim_interval) {
                 last_reclaim = Some(Instant::now());
                 if let Some(group) = &task_group {
                     let claim_opts = StreamAutoClaimOptions::default().count(count);

@@ -1,5 +1,5 @@
 //! ZeroMQ endpoints. Two interchangeable backends share the framing/format
-//! [`codec`]:
+//! `codec`:
 //!
 //! * [`zmq`] — the default backend on the `zeromq` crate (zmq.rs). Enabled by
 //!   the `zeromq` feature.

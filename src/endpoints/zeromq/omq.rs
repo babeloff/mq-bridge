@@ -1,6 +1,6 @@
 //! Proof-of-concept alternative ZeroMQ backend built on omq.rs (`omq-tokio`),
 //! behind the opt-in `zeromq-omq` feature. It reuses the shared framing/format
-//! codec ([`super::codec`]) and the same [`ZeroMqConfig`] surface as the default
+//! codec (`super::codec`) and the same [`ZeroMqConfig`] surface as the default
 //! zmq.rs backend, but only covers **PUSH/PULL + PUB/SUB** — REQ/REP and
 //! request-reply are out of scope. Selected from config via `backend: omq` on a
 //! `zeromq` endpoint (see [`ZeroMqBackend`](crate::models::ZeroMqBackend)).

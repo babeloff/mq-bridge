@@ -1906,7 +1906,7 @@ impl<'de> Deserialize<'de> for MemoryConfig {
         }
 
         let raw = MemoryConfigSerde::deserialize(deserializer)?;
-        if raw.topic.is_empty() && raw.url.as_deref().map_or(true, str::is_empty) {
+        if raw.topic.is_empty() && raw.url.as_deref().is_none_or(str::is_empty) {
             return Err(serde::de::Error::custom(
                 "MemoryConfig: 'topic' (or 'url' alias) is required.",
             ));
