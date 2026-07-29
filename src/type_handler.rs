@@ -499,7 +499,6 @@ mod tests {
             id: u32,
         }
 
-        // 1. Command Handler (Write Side)
         let command_bus = TypeHandler::new().add("submit_order", |cmd: SubmitOrder| async move {
             // Execute business logic...
             // Emit event
@@ -507,7 +506,7 @@ mod tests {
             Ok(Handled::Publish(msg!(&evt, "order_submitted")))
         });
 
-        // 2. Event Handler (Read Side / Projection)
+        // Event Handler (Read Side / Projection)
         let projection_handler =
             TypeHandler::new().add("order_submitted", |evt: OrderSubmitted| async move {
                 // Update read database / cache
@@ -556,14 +555,12 @@ mod tests {
         let read_model_state = Arc::new(AtomicU32::new(0));
         let read_model_clone = read_model_state.clone();
 
-        // 1. Command Handler (Write Side)
         let command_handler =
             TypeHandler::new().add("submit_order", |cmd: SubmitOrder| async move {
                 let evt = OrderSubmitted { id: cmd.id };
                 Ok(Handled::Publish(msg!(&evt, "order_submitted")))
             });
 
-        // 2. Event Handler (Read Side)
         let event_handler =
             TypeHandler::new().add("order_submitted", move |evt: OrderSubmitted| {
                 let state = read_model_clone.clone();
@@ -573,7 +570,6 @@ mod tests {
                 }
             });
 
-        // 3. Define Endpoints & Routes
         let cmd_in_ep = Endpoint::new_memory("cmd_in", 10);
         let event_bus_ep = Endpoint::new_memory("event_bus", 10);
         let proj_out_ep = Endpoint::new_memory("proj_out", 10);
@@ -584,7 +580,6 @@ mod tests {
         let event_route =
             Route::new(event_bus_ep.clone(), proj_out_ep.clone()).with_handler(event_handler);
 
-        // 4. Run Routes
         let h1 = tokio::spawn(async move {
             command_route
                 .run_until_err("command_route", None, None)
@@ -593,7 +588,6 @@ mod tests {
         let h2 =
             tokio::spawn(async move { event_route.run_until_err("event_route", None, None).await });
 
-        // 5. Send Command
         let cmd_channel = cmd_in_ep.channel().unwrap();
         let cmd = SubmitOrder { id: 777 };
         let msg = CanonicalMessage::from_type(&cmd)
@@ -601,7 +595,6 @@ mod tests {
             .with_type_key("submit_order");
         cmd_channel.send_message(msg).await.unwrap();
 
-        // 6. Wait for consistency
         let mut attempts = 0;
         while read_model_state.load(Ordering::SeqCst) != 777 && attempts < 50 {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;

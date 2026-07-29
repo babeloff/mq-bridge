@@ -84,14 +84,10 @@ impl MessagePublisher for CommandPublisher {
             )));
         }
 
-        // Sort handler output into messages to publish vs. messages the handler
-        // already failed/ack'd, then hand everything to publish to the inner
-        // publisher's own `send_batch` in one call. The previous version called
-        // `self.inner.send()` once per message here, which silently defeated
-        // batching for every route with a handler attached (mq-bridge-app
-        // attaches one to every consumer route, for UI throughput counting/
-        // capture) — a batch_size of 1024 still produced 1024 individual
-        // publish round trips.
+        // Sort handler output into messages to publish vs. already failed/ack'd, then hand
+        // the publishable ones to the inner `send_batch` in one call. Per-message `send()`
+        // here silently defeats batching on any handler route (mq-bridge-app attaches one to
+        // every consumer route), turning a batch_size of 1024 into 1024 publish round trips.
         let mut to_publish = Vec::with_capacity(messages.len());
         let mut failed: Vec<(CanonicalMessage, PublisherError)> = Vec::new();
 
@@ -230,15 +226,14 @@ mod tests {
         use crate::endpoints::memory::MemoryConsumer;
         use crate::traits::MessageConsumer;
 
-        // 1. Setup Input (MemoryConsumer)
         let mut consumer = MemoryConsumer::new_local("cmd_input", 10);
         let input_channel = consumer.channel();
 
-        // 2. Setup Output (MemoryPublisher wrapped by CommandPublisher)
+        // Setup Output (MemoryPublisher wrapped by CommandPublisher)
         let memory_publisher = MemoryPublisher::new_local("cmd_output", 10);
         let output_channel = memory_publisher.channel();
 
-        // 3. Create Publisher Middleware with inline handler
+        // Create Publisher Middleware with inline handler
         let publisher =
             CommandPublisher::new(memory_publisher, |msg: CanonicalMessage| async move {
                 let payload = String::from_utf8_lossy(&msg.payload);
@@ -246,17 +241,15 @@ mod tests {
                 Ok(Handled::Publish(response.into()))
             });
 
-        // 4. Inject message into input
         input_channel
             .send_message("test_data".into())
             .await
             .unwrap();
 
-        // 5. Simulate Bridge Loop (Consume -> Publish)
+        // Simulate Bridge Loop (Consume -> Publish)
         let received = consumer.receive().await.unwrap();
         let result = publisher.send(received.message).await.unwrap();
 
-        // 6. Verify
         assert!(matches!(result, Sent::Ack));
 
         let output_msgs = output_channel.drain_messages();
@@ -273,27 +266,22 @@ mod tests {
         let success = Arc::new(AtomicBool::new(false));
         let success_clone = success.clone();
 
-        // 1. Define Handler
         let handler = move |mut msg: CanonicalMessage| {
             success_clone.store(true, Ordering::SeqCst);
             msg.set_payload_str(format!("modified {}", msg.get_payload_str()));
             async move { Ok(Handled::Publish(msg)) }
         };
-        // 2. Define Route
         let route = Route::new(
             Endpoint::new_memory("route_in", 100),
             Endpoint::new_memory("route_out", 100),
         )
         .with_handler(handler);
 
-        // 3. Deploy Route
         route.deploy("command_handler_test_route").await.unwrap();
 
-        // 4. Inject Data
         let input_channel = route.input.channel().unwrap();
         input_channel.send_message("hello".into()).await.unwrap();
 
-        // 5. Verify
         let mut verifier = route.connect_to_output("verifier").await.unwrap();
         let received = verifier.receive().await.unwrap();
         assert_eq!(received.message.get_payload_str(), "modified hello");
@@ -474,10 +462,8 @@ mod tests {
             }
         }
 
-        // Publishing must go through a single inner `send_batch` call rather than
-        // one `send()` round trip per message — the latter used to silently
-        // defeat batching for any route with a handler attached (every
-        // mq-bridge-app consumer route has one, for UI throughput counting).
+        // Publish via a single inner `send_batch`, not per-message `send()`, which
+        // silently defeats batching on any handler route.
         struct RetryableSecondMessagePublisher {
             batch_calls: Arc<AtomicUsize>,
         }

@@ -45,7 +45,6 @@ fn armature_messaging_test() {
     let branch = "develop";
     let subdirectory = "armature-messaging";
 
-    // 1. Clone Repo
     println!("Cloning {} (branch: {})...", repo_url, branch);
     let status = Command::new("git")
         .args([
@@ -87,13 +86,13 @@ fn armature_messaging_test() {
         .canonicalize()
         .expect("Failed to canonicalize project dir");
 
-    // 2. Get absolute path to current mq-bridge
+    // Get absolute path to current mq-bridge
     let mq_bridge_path = env::current_dir()
         .expect("Failed to get current dir")
         .canonicalize()
         .expect("Failed to canonicalize path");
 
-    // 3. Patch dependency using cargo add to point to local version
+    // Patch dependency using cargo add to point to local version
     let cargo_bin = env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
     println!(
         "Patching mq-bridge dependency to local path: {:?}",
@@ -166,7 +165,6 @@ fn armature_messaging_test() {
     );
     fs::write(&source_path, new_content).expect("Failed to write patched mq_bridge.rs");
 
-    // 4. Run tests
     println!(
         "Running armature-messaging tests in {:?} using {}...",
         project_dir, cargo_bin

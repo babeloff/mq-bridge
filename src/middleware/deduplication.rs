@@ -367,15 +367,12 @@ mod tests {
         let mem_consumer = MemoryConsumer::new_local("dedup_topic", 10);
         let channel = mem_consumer.channel();
 
-        // 1. Send a message
         let msg1 = CanonicalMessage::new(b"data1".to_vec(), Some(100));
         channel.send_message(msg1).await.unwrap();
 
-        // 2. Send a duplicate message
         let msg2 = CanonicalMessage::new(b"data1_dup".to_vec(), Some(100));
         channel.send_message(msg2).await.unwrap();
 
-        // 3. Send a new message
         let msg3 = CanonicalMessage::new(b"data2".to_vec(), Some(101));
         channel.send_message(msg3).await.unwrap();
 

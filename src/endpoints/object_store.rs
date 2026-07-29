@@ -988,7 +988,7 @@ mod tests {
             .await
             .unwrap();
 
-        // One object should now exist under the prefix.
+        // One object exists under the prefix.
         let mut listed = store.list(Some(&ObjPath::from("data")));
         let first = listed.next().await.unwrap().unwrap();
         assert!(first.location.to_string().starts_with("data/"));

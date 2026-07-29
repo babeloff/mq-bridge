@@ -1048,7 +1048,6 @@ impl SqlxConsumer {
             .await
             .map_err(classify_sql_consumer_error)?;
 
-        // 1. Find and lock rows
         let lock_query = format!(
             "SELECT id FROM {} WHERE locked_until IS NULL OR locked_until < NOW() ORDER BY id LIMIT ? FOR UPDATE SKIP LOCKED",
             self.table
@@ -1068,7 +1067,7 @@ impl SqlxConsumer {
             return Ok(vec![]);
         }
 
-        // 2. Update the `locked_until` for the locked rows
+        // Update the `locked_until` for the locked rows
         let placeholders = locked_ids
             .iter()
             .map(|_| "?")
@@ -1089,7 +1088,7 @@ impl SqlxConsumer {
             .await
             .map_err(classify_sql_consumer_error)?;
 
-        // 3. Select the full rows that we just locked
+        // Select the full rows that we just locked
         let select_query = format!(
             "SELECT id, payload FROM {} WHERE id IN ({})",
             self.table, placeholders
@@ -1105,7 +1104,6 @@ impl SqlxConsumer {
             .await
             .map_err(classify_sql_consumer_error)?;
 
-        // 4. Commit the transaction
         tx.commit().await.map_err(classify_sql_consumer_error)?;
 
         Ok(rows)

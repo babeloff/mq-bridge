@@ -122,12 +122,10 @@ impl KafkaPublisher {
             }
         }
 
-        // Share one producer across publishers with the same connection settings. The
-        // topic is chosen per-record, so a single producer serves every topic; sharing
-        // consolidates broker connections, the background poll thread, and batching.
-        // Producer-level settings (creds, TLS, producer_options) form the cache key.
-        // Sort producer_options first: the identity is order-sensitive, so equivalent
-        // configs listing the same options in a different order must still share.
+        // Share one producer across publishers with matching connection settings: the topic is
+        // per-record, so one producer serves all topics and consolidates connections, the poll
+        // thread, and batching. Cache key = producer-level settings (creds, TLS, producer_options);
+        // sort producer_options first so order-different-but-equivalent configs still share.
         let producer_options = config.producer_options.as_ref().map(|opts| {
             let mut sorted = opts.clone();
             sorted.sort();

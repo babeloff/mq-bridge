@@ -2874,13 +2874,11 @@ mod tests {
         let input_ch = input.channel().unwrap();
         let out_channel = route.output.channel().unwrap();
 
-        // 1. Send poison message
         input_ch.send_message("poison".into()).await.unwrap();
 
-        // 2. Send valid message
         input_ch.send_message("valid".into()).await.unwrap();
 
-        // 3. Verify the valid message was processed and published
+        // Verify the valid message was processed and published
         let received = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
                 if let Some(msg) = out_channel.drain_messages().pop() {
@@ -2956,7 +2954,6 @@ mod tests {
             }
         }
 
-        // 1. Setup
         let in_topic = "batch_retry_dlq_in";
         let out_topic = "batch_retry_dlq_out";
         let dlq_topic = "batch_retry_dlq_dlq";
@@ -3022,7 +3019,6 @@ mod tests {
             }
         });
 
-        // 2. Send a batch of messages
         let mut messages = Vec::new();
         for i in 1..=4 {
             // 1 (ok), 2 (fail), 3 (ok), 4 (fail)
@@ -3031,7 +3027,6 @@ mod tests {
         let commit = wrap_commit(Box::new(|_| Box::pin(async { Ok(()) })), 0, seq_tx.clone());
         work_tx.send((messages, commit)).await.unwrap();
 
-        // 3. Verify
         let dlq_channel = dlq_endpoint.channel().unwrap();
 
         let start = std::time::Instant::now();
@@ -3111,8 +3106,8 @@ mod tests {
         input_ch.send_message("fail_msg".into()).await.unwrap();
 
         // Verify:
-        // 1. Output channel is empty (msg failed to go there)
-        // 2. DLQ channel has message
+        // Output channel is empty (msg failed to go there)
+        // DLQ channel has message
 
         let dlq_ch = dlq_endpoint.channel().unwrap();
 
@@ -3385,8 +3380,7 @@ mod tests {
         let output = Endpoint::new_memory(&out_topic, 10);
         let route = Route::new(input, output)
             .with_exit_on_empty(true)
-            // A regression would reconnect-loop; keep the interval short so this test
-            // still finishes quickly if the fix is reverted (it would then time out).
+            // Short interval: a reconnect-loop regression times out fast instead of hanging.
             .with_reconnect_interval_ms(100);
 
         let handle = route.run("plain_fail_test").await.unwrap();
@@ -3466,10 +3460,8 @@ mod tests {
         assert_eq!(received, N);
     }
 
-    // Regression: exit_on_empty must also terminate the route in concurrent mode
-    // (concurrency > 1). The concurrent runner previously reported the drain as
-    // `Ok(true)`, which the reconnect loop treats as "keep running", so the route
-    // busy-reconnected forever instead of stopping.
+    // exit_on_empty must stop the route in concurrent mode too, not just sequential:
+    // the drain reports empty so the reconnect loop stops instead of looping forever.
     #[cfg(feature = "sqlx")]
     #[tokio::test]
     async fn test_route_exit_on_empty_drains_and_stops_concurrent() {

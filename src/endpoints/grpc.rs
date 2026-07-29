@@ -1179,7 +1179,6 @@ mod tests {
             ..Default::default()
         };
 
-        // 1. Test Publisher
         let publisher_ep = Endpoint {
             endpoint_type: EndpointType::Grpc(config.clone()),
             middlewares: vec![],
@@ -1200,7 +1199,6 @@ mod tests {
         let received_msg = rx_for_pub_test.recv().await.unwrap();
         assert_eq!(received_msg.payload, sent_payload.as_bytes());
 
-        // 2. Test Consumer
         let consumer_ep = Endpoint {
             endpoint_type: EndpointType::Grpc(config),
             middlewares: vec![],
@@ -1209,7 +1207,6 @@ mod tests {
         // Create the consumer first. This will establish the subscription inside `new()`.
         let mut consumer = consumer_ep.create_consumer("test_route").await.unwrap();
 
-        // Now send messages for the consumer to receive.
         tx.send(BridgeMessage {
             payload: b"grpc_payload_1".to_vec(),
             id: "0190163d-8694-739b-aea5-966c26f8ad90".to_string(),
@@ -1233,7 +1230,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_grpc_route_end_to_end() {
-        // 1. Setup Mock Server on a unique port
+        // Setup Mock Server on a unique port
         let addr = "[::1]:50052".parse().unwrap();
         let (tx, _) = broadcast::channel(32);
         let bridge = MockBridge { tx };
@@ -1246,7 +1243,6 @@ mod tests {
         });
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-        // 2. Setup Config and Endpoints
         let config = GrpcConfig {
             url: format!("http://{}", addr),
             timeout_ms: None,
@@ -1278,7 +1274,7 @@ mod tests {
         let mem_dest_ep = Endpoint::new_memory(&mem_dest_topic, 10);
         let mut mem_dest_consumer = mem_dest_ep.create_consumer("test_route").await.unwrap();
 
-        // 3. Setup and run routes using deploy()
+        // Setup and run routes using deploy()
         // Route 1: Memory -> gRPC (tests GrpcPublisher::send_batch)
         let route_to_grpc = Route::new(mem_source_ep, grpc_publisher_ep);
         route_to_grpc.deploy("route_to_grpc").await.unwrap();
@@ -1287,7 +1283,7 @@ mod tests {
         let route_from_grpc = Route::new(grpc_consumer_ep, mem_dest_ep);
         route_from_grpc.deploy("route_from_grpc").await.unwrap();
 
-        // 4. Execute test: Send a batch of messages into the first route
+        // Execute test: Send a batch of messages into the first route
         let messages_to_send = vec![
             CanonicalMessage::new("e2e_payload_1".into(), None),
             CanonicalMessage::new("e2e_payload_2".into(), None),
@@ -1297,7 +1293,7 @@ mod tests {
             .await
             .unwrap();
 
-        // 5. Verify: Receive the batch from the second route's destination
+        // Verify: Receive the batch from the second route's destination
         let mut received_messages = Vec::new();
         while received_messages.len() < messages_to_send.len() {
             let batch = mem_dest_consumer.receive_batch(5).await.unwrap();
@@ -1314,7 +1310,6 @@ mod tests {
             messages_to_send[1].get_payload_str()
         );
 
-        // 6. Teardown
         server_handle.abort();
     }
     #[tokio::test]

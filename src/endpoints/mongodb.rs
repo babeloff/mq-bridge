@@ -210,9 +210,8 @@ fn is_wrapped_message(doc: &Document) -> bool {
 }
 
 fn parse_mongodb_document(mut doc: Document) -> anyhow::Result<CanonicalMessage> {
-    // Move the three wrapped fields out of the document. `from_document` consumes what it
-    // deserializes, so keeping the raw fallback alive used to cost a deep clone of every
-    // document — including the ones that then went on to deserialize fine.
+    // Remove the wrapped fields in place; `from_document` consumes them, so this
+    // avoids cloning every document to keep a rarely-used raw fallback.
     if is_wrapped_message(&doc) {
         if let (Some(Bson::Binary(bin)), Some(payload)) = (doc.remove("_id"), doc.remove("payload"))
         {
@@ -1058,7 +1057,7 @@ impl MongoDbConsumer {
         let update = doc! { "$set": { "locked_until": locked_until } };
         let update_result = self.collection.update_many(update_filter, update).await?;
 
-        // 3. If we successfully modified any documents, retrieve their full content.
+        // If we successfully modified any documents, retrieve their full content.
         if update_result.modified_count > 0 {
             self.get_documents_by_ids(&ids_to_claim).await
         } else {

@@ -1330,17 +1330,16 @@ mod tests {
         let msg2 = msg!(json!({"message": "two"}));
         let msg3 = msg!(json!({"message": "three"}));
 
-        // 3. Send messages via the publisher
         publisher
             .send_batch(vec![msg1.clone(), msg2.clone()])
             .await
             .unwrap();
         publisher.send(msg3.clone()).await.unwrap();
 
-        // 4. Verify the channel has the messages
+        // Verify the channel has the messages
         assert_eq!(publisher.channel().len(), 2);
 
-        // 5. Receive the messages and verify them
+        // Receive the messages and verify them
         let received1 = consumer.receive().await.unwrap();
         let _ = (received1.commit)(MessageDisposition::Ack).await;
         assert_eq!(received1.message.payload, msg1.payload);
@@ -1355,10 +1354,10 @@ mod tests {
         let _ = commit3(vec![MessageDisposition::Ack; received_msg3.len()]).await;
         assert_eq!(received_msg3.first().unwrap().payload, msg3.payload);
 
-        // 6. Verify that the channel is now empty
+        // Verify the channel is empty
         assert_eq!(publisher.channel().len(), 0);
 
-        // 7. Verify that reading again results in an error because the channel is empty and we are not closing it
+        // Verify that reading again results in an error because the channel is empty and we are not closing it
         // In a real scenario with a closed channel, this would error out. Here we can just check it's empty.
         // A `receive` call would just hang, waiting for a message.
     }
@@ -1472,26 +1471,22 @@ mod tests {
 
         publisher.send("to_be_nacked".into()).await.unwrap();
 
-        // 1. Receive and Nack
         let received1 = consumer.receive().await.unwrap();
         assert_eq!(received1.message.get_payload_str(), "to_be_nacked");
         (received1.commit)(crate::traits::MessageDisposition::Nack)
             .await
             .unwrap();
 
-        // 2. Receive again (should be re-queued)
         let received2 = tokio::time::timeout(std::time::Duration::from_secs(1), consumer.receive())
             .await
             .expect("Timed out waiting for re-queued message")
             .unwrap();
         assert_eq!(received2.message.get_payload_str(), "to_be_nacked");
 
-        // 3. Ack
         (received2.commit)(crate::traits::MessageDisposition::Ack)
             .await
             .unwrap();
 
-        // 4. Verify empty
         let result =
             tokio::time::timeout(std::time::Duration::from_millis(100), consumer.receive()).await;
         assert!(result.is_err(), "Channel should be empty");
@@ -1709,14 +1704,11 @@ mod tests {
             ..Default::default()
         };
 
-        // 1. Create Publisher (Log mode)
         let publisher = MemoryPublisher::new(&pub_config).unwrap();
 
-        // 2. Publish messages with no subscribers
         publisher.send("msg1".into()).await.unwrap();
         publisher.send("msg2".into()).await.unwrap();
 
-        // 3. Create Subscriber (Late joiner)
         let sub_config = MemoryConfig {
             topic: topic.clone(),
             subscribe_mode: true,
@@ -1724,7 +1716,6 @@ mod tests {
         };
         let mut subscriber = MemorySubscriber::new(&sub_config, "late_sub").unwrap();
 
-        // 4. Verify messages are received
         let received1 = subscriber.receive().await.unwrap();
         assert_eq!(received1.message.get_payload_str(), "msg1");
         (received1.commit)(MessageDisposition::Ack).await.unwrap();
@@ -1779,10 +1770,10 @@ mod tests {
     async fn test_memory_publisher_mixed_mode_error() {
         let topic_q = format!("pub_mixed_q_{}", fast_uuid_v7::gen_id_str());
 
-        // 1. Create a Queue Consumer to establish the channel
+        // Create a Queue Consumer to establish the channel
         let _cons_q = MemoryConsumer::new_local(&topic_q, 10);
 
-        // 2. Try to create a Log Publisher on the same topic
+        // Try to create a Log Publisher on the same topic
         let log_conf = MemoryConfig {
             topic: topic_q.clone(),
             subscribe_mode: true,
@@ -1800,7 +1791,7 @@ mod tests {
     async fn test_memory_publisher_adaptive_behavior() {
         let topic = format!("adaptive_{}", fast_uuid_v7::gen_id_str());
 
-        // 1. Create a Log Consumer (Subscriber) to establish the EventStore
+        // Create a Log Consumer (Subscriber) to establish the EventStore
         let sub_config = MemoryConfig {
             topic: topic.clone(),
             subscribe_mode: true,
@@ -1808,7 +1799,7 @@ mod tests {
         };
         let mut subscriber = MemorySubscriber::new(&sub_config, "sub1").unwrap();
 
-        // 2. Create a Publisher WITHOUT subscribe_mode explicitly set
+        // Create a Publisher WITHOUT subscribe_mode explicitly set
         let pub_config = MemoryConfig {
             topic: topic.clone(),
             subscribe_mode: false, // Default is false
@@ -1817,7 +1808,7 @@ mod tests {
         // This should succeed and adapt to Log mode because the store exists
         let publisher = MemoryPublisher::new(&pub_config).unwrap();
 
-        // 3. Verify it publishes to the store (subscriber receives it)
+        // Verify it publishes to the store (subscriber receives it)
         publisher.send("adaptive_msg".into()).await.unwrap();
 
         let received = subscriber.receive().await.unwrap();

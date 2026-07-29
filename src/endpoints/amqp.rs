@@ -563,9 +563,7 @@ impl AmqpConsumer {
             queue_or_exchange.to_string()
         };
 
-        // Set prefetch count. This acts as a buffer and is crucial for concurrent processing.
-        // We'll get the concurrency from the route config, but for now, let's use a reasonable default
-        // that can be overridden by a new method.
+        // Prefetch buffers for concurrent processing; defaults to 100.
         let prefetch_count = config.prefetch_count.unwrap_or(100);
         with_setup_timeout(
             "basic_qos",
@@ -769,15 +767,10 @@ impl MessageConsumer for AmqpConsumer {
             });
         }
 
-        // 1. Wait for the first message. This blocks until a message is available,
-        //    but each wait is bounded so we can periodically verify the broker
-        //    connection is still alive. In lapin 4 a dropped connection does not
-        //    reliably terminate the consumer stream, so without this health check
-        //    `next()` would block forever after the broker goes away and the route
-        //    would never see the Connection error it needs to recreate the consumer.
-        // Keep the health poll (lapin 4 won't terminate a consumer on a dropped
-        // connection), but in drain mode shorten the wait to the drain-specific timeout so
-        // `exit_on_empty` (and its 0-latency benchmark override) fires promptly.
+        // 1. Wait for the first message, bounded so we can periodically check the broker is
+        //    alive: in lapin 4 a dropped connection doesn't terminate the stream, so an unbounded
+        //    `next()` would block forever and the route would never see the Connection error.
+        //    In drain mode the wait shortens to the drain timeout so `exit_on_empty` fires promptly.
         let poll_window = if self.exit_on_empty {
             CONSUMER_HEALTH_POLL.min(crate::traits::drain_idle_timeout())
         } else {

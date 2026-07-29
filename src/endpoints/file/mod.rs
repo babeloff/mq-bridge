@@ -422,14 +422,11 @@ impl FilePublisher {
         &self,
         messages: Vec<CanonicalMessage>,
     ) -> Result<SentBatch, PublisherError> {
-        // Opened up front, before the CPU-bound encode/compress/seal below, and kept
-        // open until the append. The order matters for throughput, not just tidiness:
-        // this task is woken by the route's producer and lands in that thread's LIFO
-        // slot, so any CPU it runs before its first suspension point holds the producer
-        // there. `open` is a blocking-pool hop that always suspends, which is why the
-        // plain path (which opens first) never stalls; building the member first cost
-        // ~1.9ms of producer dead time per batch, made compressed writes ~35% slower
-        // and pinned the pipeline to one core regardless of `concurrency`.
+        // Open up front, before the CPU-bound encode/compress/seal below. Order matters for
+        // throughput: this task lands in the producer thread's LIFO slot, so any CPU before its
+        // first suspension holds the producer there. `open` always suspends (blocking-pool hop);
+        // building the member first cost ~1.9ms/batch of producer stall, ~35% slower compressed
+        // writes, and pinned the pipeline to one core regardless of `concurrency`.
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -662,10 +659,8 @@ impl MessagePublisher for FilePublisher {
         trace!(count = messages.len(), path = %self.path, message_ids = ?LazyMessageIds(&messages), "Writing batch to file");
         let _file_guard = self.file_lock.lock().await;
 
-        // We open the file for every batch to ensure we are writing to the current file path.
-        // This handles external file rotation/deletion (e.g. by the consumer in delete mode)
-        // where the old file handle would point to a deleted inode.
-        // While this has a performance cost, it ensures correctness.
+        // Reopen per batch so external rotation/deletion (e.g. consumer delete mode) can't leave
+        // us writing to a stale handle on a deleted inode. Costs some throughput for correctness.
         let file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -673,10 +668,9 @@ impl MessagePublisher for FilePublisher {
             .await
             .context("Failed to open file for writing batch")?;
 
-        // Length before the batch. The 1 MiB BufWriter auto-flushes full chunks mid-loop, so a
-        // failure partway through a large batch can leave a partial prefix on disk; truncate back
-        // to here on failure so the Retryable re-append starts clean instead of duplicating it.
-        // `None` (stat failed) degrades to the old behaviour: no rollback.
+        // Length before the batch: the BufWriter auto-flushes mid-loop, so a mid-batch failure can
+        // leave a partial prefix. Truncate back here on failure so the retry re-appends cleanly.
+        // `None` (stat failed) means no rollback point, so a failed batch is left as-is.
         let pre_len = file.metadata().await.ok().map(|m| m.len());
         let file_is_empty = matches!(self.format, FileFormat::Csv) && pre_len == Some(0);
         // 1 MiB, not tokio's 8 KiB default: at ~100 B/record a small buffer turns a

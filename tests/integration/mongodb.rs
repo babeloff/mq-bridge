@@ -125,7 +125,6 @@ async fn test_mongodb_subscriber_no_duplicates() {
                 .await
                 .ok();
 
-            // 1. Setup Input Endpoint (MongoDB Subscriber)
             let input_config = mq_bridge::models::MongoDbConfig {
                 url: url.to_string(),
                 database: db_name.to_string(),
@@ -139,10 +138,9 @@ async fn test_mongodb_subscriber_no_duplicates() {
                 input_config.clone(),
             ));
 
-            // 2. Setup Output Endpoint (Memory to verify)
+            // Setup Output Endpoint (Memory to verify)
             let output = Endpoint::new_memory("out_no_dupes", 20);
 
-            // 3. Setup TypeHandler
             let counter = Arc::new(AtomicUsize::new(0));
             let counter_clone = counter.clone();
 
@@ -155,13 +153,10 @@ async fn test_mongodb_subscriber_no_duplicates() {
                 }
             });
 
-            // 4. Create Route
             let route = Route::new(input, output).with_handler(type_handler);
 
-            // 5. Run Route (Start subscriber)
             route.deploy("test_no_dupes_route").await.unwrap();
 
-            // 6. Publish messages
             let publisher = MongoDbPublisher::new(&input_config).await.unwrap();
             let msg1 = TestMsg {
                 id: 1,
@@ -236,15 +231,11 @@ pub async fn test_mongodb_performance_pipeline() {
     .await;
 }
 
-// CDC pipeline: the read side watches the collection via a `$changeStream` (`consume: capture_new`)
-// instead of the destructive queue-drain consumer — it never deletes documents. The reader's change
-// stream is opened when the route is deployed (before the producer writes), so no inserts are missed.
-// Requires a replica set (change streams are unsupported on a standalone mongod).
-//
-// The write side uses `format: raw` so the collection holds plain business documents (the message's
-// own JSON), not the wrapped `{_id, payload, metadata}` envelope. The CDC reader emits stored
-// documents verbatim (it never unwraps the envelope, unlike the queue consumer), so raw storage is
-// what lets the drained payloads round-trip back to `message_num`.
+// CDC pipeline: the read side watches the collection via `$changeStream` (`consume: capture_new`),
+// never deleting documents; the stream opens at deploy time (before writes) so no inserts are missed.
+// Requires a replica set. The write side uses `format: raw` so the collection holds plain business
+// documents, not the `{_id, payload, metadata}` envelope — the CDC reader emits documents verbatim,
+// so raw storage is what lets payloads round-trip back to `message_num`.
 const CDC_CONFIG_YAML: &str = r#"
 routes:
   memory_to_mongodb_cdc:

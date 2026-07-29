@@ -1899,14 +1899,10 @@ fn make_response(
                     continue; // source/provenance keys must not leak as response headers
                 }
                 let is_content_type = key.eq_ignore_ascii_case("content-type");
-                // Request-echo suppression drops reply metadata that byte-matches the
-                // incoming request header of the same name, so pure passthrough/echo
-                // routes don't re-emit unchanged request headers (e.g. `x-request-id`).
-                // `content-type` is exempt: it describes the *response* representation,
-                // so when it is present on the reply it must always be sent — even when
-                // it happens to equal the request's `Content-Type` (e.g. a handler that
-                // explicitly replies `text/plain` to a `text/plain` request). Without
-                // this exemption such a reply would be suppressed and fall back to
+                // Request-echo suppression drops reply metadata that byte-matches the incoming
+                // request header of the same name (so echo routes don't re-emit `x-request-id`).
+                // `content-type` is exempt: it describes the response, so it must always be sent
+                // even when it equals the request's — otherwise the reply falls back to
                 // `application/octet-stream`.
                 if !is_content_type
                     && request_metadata

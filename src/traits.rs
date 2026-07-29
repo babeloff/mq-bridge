@@ -699,13 +699,12 @@ mod tests {
 
         match result {
             Ok(SentBatch::Partial { responses, failed }) => {
-                // 1. Verify response from first message
                 assert!(responses.is_some());
                 let resps = responses.unwrap();
                 assert_eq!(resps.len(), 1);
                 assert_eq!(resps[0].get_payload_str(), "resp1");
 
-                // 2. Verify failures. Sends are pipelined and awaited independently,
+                // Verify failures. Sends are pipelined and awaited independently,
                 // so only message 2 (the one that errored) is reported failed;
                 // message 3 still succeeds (Ack) and is not needlessly resent.
                 assert_eq!(failed.len(), 1);

@@ -6,13 +6,12 @@ use std::time::Duration;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_ref_endpoint_consumer_and_publisher() {
-    // 1. Register a shared memory endpoint
     let shared_topic = "shared_memory_topic";
     let base_endpoint = Endpoint::new_memory(shared_topic, 100);
 
     register_endpoint("common_queue", base_endpoint);
 
-    // 2. Create a route using 'ref' for both input and output
+    // Create a route using 'ref' for both input and output
     // Input Ref: Adds a metadata middleware to verify wrapping order
     let input = Endpoint::new(mq_bridge::models::EndpointType::Ref(
         "common_queue".to_string(),
@@ -26,7 +25,7 @@ async fn test_ref_endpoint_consumer_and_publisher() {
     let route = Route::new(input, output);
     route.deploy("ref_test_route").await.unwrap();
 
-    // 3. Send a message to the underlying channel
+    // Send a message to the underlying channel
     let channel = mq_bridge::get_or_create_channel(&mq_bridge::models::MemoryConfig {
         topic: shared_topic.to_string(),
         ..Default::default()
@@ -35,7 +34,7 @@ async fn test_ref_endpoint_consumer_and_publisher() {
     let msg = CanonicalMessage::from("hello ref");
     channel.send_message(msg).await.unwrap();
 
-    // 4. Wait for the message to be processed (consumed and republished to the same queue)
+    // Wait for the message to be processed (consumed and republished to the same queue)
     // Since input and output are the same queue, we expect to see the message appear again.
     // We consume it manually to verify.
     let received = tokio::time::timeout(Duration::from_secs(2), async {
@@ -134,32 +133,30 @@ async fn test_ref_middleware_ordering() {
         }),
     );
 
-    // 1. Define Inner Endpoint with "inner" middleware
+    // Define Inner Endpoint with "inner" middleware
     let inner_ep = Endpoint::new_memory("order_test", 10).add_middleware(Middleware::Custom {
         name: "log_inner".into(),
         config: serde_json::Value::Null,
     });
     register_endpoint("inner_target", inner_ep);
 
-    // 2. Define Ref Endpoint with "outer" middleware
+    // Define Ref Endpoint with "outer" middleware
     let ref_ep = Endpoint::new(mq_bridge::models::EndpointType::Ref("inner_target".into()))
         .add_middleware(Middleware::Custom {
             name: "log_outer".into(),
             config: serde_json::Value::Null,
         });
 
-    // 3. Create publisher from Ref
     let publisher = mq_bridge::endpoints::create_publisher_from_route("test", &ref_ep)
         .await
         .unwrap();
 
-    // 4. Send message
     publisher
         .send(CanonicalMessage::from("test"))
         .await
         .unwrap();
 
-    // 5. Verify Order: Outer should run before Inner
+    // Verify Order: Outer should run before Inner
     let entries = log_clone.lock().unwrap();
     assert_eq!(*entries, vec!["outer".to_string(), "inner".to_string()]);
 }
