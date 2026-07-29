@@ -300,6 +300,12 @@ ENGINE = ReplacingMergeTree(version) ORDER BY id;
 SELECT * FROM orders FINAL;
 ```
 
+`ReplacingMergeTree` deduplicates by business key at merge time. Separately, ClickHouse also dedupes
+identical *re-inserted blocks* natively: a retried `send_batch` that resends the same block is dropped
+server-side (default one-hour window) — `insert_deduplication_token` lets you make that explicit, but
+mq-bridge does not set one, so rely on `ReplacingMergeTree` for logical dedup and treat block-level
+dedup only as retry-safety.
+
 **Postgres CDC — deterministic id + `postgres.key`.** The `postgres_cdc` source already resumes from a
 durable LSN checkpoint (no re-delivery on clean restart). For the crash window (row written, then a
 crash before the checkpoint flush) it is at-least-once, so make the sink idempotent. Each change event
@@ -309,6 +315,12 @@ carries the full row (so the primary key is in the payload), `postgres.lsn` (a m
 lsn`, so a replayed change deduplicates through the `deduplication` middleware, and Mongo `id_field`
 or a SQL `ON CONFLICT` on the key column make the sink write idempotent. Use `postgres.lsn` as the
 version to drop stale replays (`... DO UPDATE ... WHERE excluded.lsn > orders.lsn`).
+
+*Known edge:* if the same primary key is changed twice **within a single transaction**, both events
+share that transaction's commit LSN, so they produce the same `message_id`. The `deduplication`
+middleware then treats the second as a duplicate and drops it. The sink still converges to the final
+row state, but the intermediate change is not delivered — if you need every intra-txn revision, do not
+rely on the `message_id`/middleware path for those rows.
 
 The `deduplication` middleware is a complement, not a replacement: it filters duplicates *before* the
 sink, keyed on `message_id`, but its `sled` store is single-instance — prefer the sink constraint for

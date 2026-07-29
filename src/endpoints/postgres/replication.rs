@@ -381,21 +381,19 @@ pub async fn start_replication(
     let coords = parse_url(&config.url)?;
     let status_interval = Duration::from_millis(config.status_interval_ms.max(1));
 
-    let cfg = ReplicationConfig {
-        host: coords.host,
-        port: coords.port,
-        user: coords.user,
-        password: coords.password,
-        database: coords.dbname,
-        tls: map_tls(&config.tls),
-        slot: config.slot_name.clone(),
-        publication: config.publication.clone(),
-        start_lsn: Lsn::from_u64(start_lsn.unwrap_or(0)),
-        stop_at_lsn: None,
-        status_interval,
-        idle_wakeup_interval: status_interval,
-        buffer_events: 8192,
-    };
+    let cfg = ReplicationConfig::new(
+        coords.host,
+        coords.user,
+        coords.password,
+        coords.dbname,
+        config.slot_name.clone(),
+        config.publication.clone(),
+    )
+    .with_port(coords.port)
+    .with_tls(map_tls(&config.tls))
+    .with_start_lsn(Lsn::from_u64(start_lsn.unwrap_or(0)))
+    .with_status_interval(status_interval)
+    .with_wakeup_interval(status_interval);
 
     ReplicationClient::connect(cfg)
         .await
