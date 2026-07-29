@@ -512,6 +512,7 @@ class WebSocketConfig(TypedDict, total=False):
 
 
 class ZeroMqConfig(TypedDict, total=False):
+    backend: ZeroMqBackend
     bind: bool
     format: ZeroMqFormat
     internal_buffer_size: Optional[int]
@@ -534,6 +535,7 @@ StaticConfig = Union[str, Dict[str, Any]]
 TransformErrorPolicy = Literal["reject", "pass_through"]
 WeakJoinTimeout = Literal["fire", "discard"]
 WebSocketExecutionMode = Literal["auto", "direct_only", "routed"]
+ZeroMqBackend = Literal["zmq", "omq"]
 ZeroMqFormat = Literal["json", "raw", "raw_framed"]
 ZeroMqSocketType = Literal["push", "pull", "pub", "sub", "req", "rep"]
 

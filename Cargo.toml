@@ -157,6 +157,12 @@ reqwest = { version = "0.13", default-features = false, features = ["rustls", "h
 # ZeroMQ
 zeromq = { version = "0.6", optional = true }
 
+# Alternative pure-Rust ZeroMQ backend (PoC). Faster than libzmq per its
+# benchmarks and adds CURVE/PLAIN security, but requires MSRV 1.93 / edition
+# 2024 — so it is kept behind its own opt-in feature and out of `full`/`portable`
+# to preserve the crate's 1.75 MSRV on the default build.
+omq-tokio = { version = "0.20", optional = true }
+
 # Redis Streams. Pure-Rust client (no C bindings). TLS via rustls (ring), so
 # `rediss://` URLs work; webpki-roots ships the CA bundle so there's no system
 # cert dependency. redis-rs wires its own ring-backed rustls config.
@@ -260,6 +266,9 @@ ibm-mq = ["dep:mqi", "mqi/dlopen2", "mqi/mqai", "mqi/mqc_9_3_0_0", "dep:libmqm-s
 # at build.
 ibm-mq-static = ["dep:mqi", "mqi/link", "mqi/mqc_9_3_0_0"]
 zeromq = ["dep:zeromq"]
+# PoC alternative ZeroMQ backend (omq.rs). Opt-in only; NOT in `full`/`portable`
+# because omq-tokio needs MSRV 1.93 / edition 2024. Covers PUSH/PULL + PUB/SUB.
+zeromq-omq = ["dep:omq-tokio"]
 redis-streams = ["dep:redis"]
 # Note: The grpc feature requires protobuf-src which can significantly increase build times.
 grpc = ["tonic", "prost", "tokio-stream", "tonic-prost", "tonic-prost-build", "protoc-bin-vendored", "rustls"]
@@ -301,6 +310,14 @@ required-features = ["test-utils"]
 [[bench]]
 name = "router_bench"
 harness = false
+
+# A/B throughput: omq.rs (`zeromq-omq`) vs zmq.rs (`zeromq`) PUSH/PULL. Needs
+# both backends enabled; run with `cargo run --release --bench zeromq_backends
+# --no-default-features --features zeromq,zeromq-omq`.
+[[bench]]
+name = "zeromq_backends"
+harness = false
+required-features = ["zeromq", "zeromq-omq"]
 
 [[test]]
 name = "integration_test"

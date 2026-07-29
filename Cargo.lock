@@ -2151,6 +2151,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "generator"
+version = "0.8.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b3b854b0e584ead1a33f18b2fcad7cf7be18b3875c78816b753639aa501513ae"
+dependencies = [
+ "cc",
+ "cfg-if",
+ "libc",
+ "log",
+ "rustversion",
+ "windows-link",
+ "windows-result",
+]
+
+[[package]]
 name = "generic-array"
 version = "0.14.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3042,6 +3057,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
 
 [[package]]
+name = "loom"
+version = "0.7.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "419e0dc8046cb947daa77eb95ae174acfbddb7673b4151f56d1eed8e93fbfaca"
+dependencies = [
+ "cfg-if",
+ "generator",
+ "scoped-tls",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "lru-slab"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3339,6 +3367,7 @@ dependencies = [
  "mq-bridge",
  "mqi",
  "object_store",
+ "omq-tokio",
  "once_cell",
  "percent-encoding",
  "pgwire-replication",
@@ -3694,6 +3723,42 @@ dependencies = [
 ]
 
 [[package]]
+name = "omq-proto"
+version = "0.24.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c9335ef21d570294464c491837af5477caddb05cf3c7223af1c4341a127e6035"
+dependencies = [
+ "bytes",
+ "patricia_tree",
+ "rand 0.10.2",
+ "smallvec",
+ "socket2 0.6.5",
+ "thiserror 2.0.19",
+]
+
+[[package]]
+name = "omq-tokio"
+version = "0.20.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4a9d9c6caa88d29df5b9dc9638ea9f0f33b087ecc0f149b70e61149f97bcdb80"
+dependencies = [
+ "arc-swap",
+ "bytes",
+ "concurrent-queue",
+ "futures",
+ "libc",
+ "omq-proto",
+ "rand 0.10.2",
+ "rustc-hash",
+ "smallvec",
+ "socket2 0.6.5",
+ "thiserror 2.0.19",
+ "tokio",
+ "tokio-util",
+ "yring",
+]
+
+[[package]]
 name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3832,6 +3897,12 @@ name = "pathdiff"
 version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "df94ce210e5bc13cb6651479fa48d14f601d9858cfe0467f43ae157023b938d3"
+
+[[package]]
+name = "patricia_tree"
+version = "0.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4df0e43512f12f23a6b08c7b893192b7d6ec937b95ee03af040847907fe5cef7"
 
 [[package]]
 name = "pbkdf2"
@@ -5199,6 +5270,12 @@ dependencies = [
  "serde_derive_internals",
  "syn 3.0.3",
 ]
+
+[[package]]
+name = "scoped-tls"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e1cf6437eb19a8f4a6cc0f7dca544973b0b78843adbfeb3683d1a94a0024a294"
 
 [[package]]
 name = "scopeguard"
@@ -7109,6 +7186,15 @@ dependencies = [
  "quote",
  "syn 2.0.119",
  "synstructure",
+]
+
+[[package]]
+name = "yring"
+version = "0.3.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "39146d2147cfb9f71b9f071f93f7b5dbcfb28eee528dafcaf5f500f4917cb69f"
+dependencies = [
+ "loom",
 ]
 
 [[package]]

@@ -2417,6 +2417,9 @@ pub struct ZeroMqConfig {
     /// Wire format: `json` wraps the CanonicalMessage; `raw` sends payload bytes per frame; `raw_framed` adds a JSON metadata frame. Default `json`.
     #[serde(default)]
     pub format: ZeroMqFormat,
+    /// Backend: `zmq` (default, the `zeromq` crate) or `omq` (the `omq-tokio` PoC — PUSH/PULL + PUB/SUB only). `omq` needs the `zeromq-omq` build feature.
+    #[serde(default)]
+    pub backend: ZeroMqBackend,
 }
 
 impl ZeroMqConfig {
@@ -2470,6 +2473,21 @@ pub enum ZeroMqSocketType {
     Sub,
     Req,
     Rep,
+}
+
+/// ZeroMQ backend implementation.
+///
+/// `zmq` (default) uses the `zeromq` crate (pure-Rust zmq.rs). `omq` uses
+/// `omq-tokio` (omq.rs) — much faster on the per-message `raw`/`raw_framed`
+/// path and adds CURVE/PLAIN security, but currently covers PUSH/PULL + PUB/SUB
+/// only and requires the `zeromq-omq` build feature (MSRV 1.93).
+#[derive(Debug, Deserialize, Serialize, Clone, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "lowercase")]
+pub enum ZeroMqBackend {
+    #[default]
+    Zmq,
+    Omq,
 }
 
 // --- Redis Streams Specific Configuration ---
