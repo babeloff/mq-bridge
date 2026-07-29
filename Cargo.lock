@@ -1900,9 +1900,9 @@ dependencies = [
 
 [[package]]
 name = "fast-uuid-v7"
-version = "0.1.7"
+version = "0.1.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f7782b75bbdb10357975dcb8979e218f43dbcef992ff8fd65309d200cd6778be"
+checksum = "65d7a30239eba18ae6a60dc3c3df98af18f00bba69d2b1d5f2816a831e83bff3"
 dependencies = [
  "rand 0.10.2",
 ]
