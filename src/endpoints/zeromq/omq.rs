@@ -206,7 +206,12 @@ impl ZeroMqOmqConsumer {
         else {
             return Ok(());
         };
-        let msg = res.map_err(|e| ConsumerError::Connection(anyhow!(e)))?;
+        // A closed socket is end-of-stream, not a connection fault, mirroring the
+        // closed-channel handling in the zmq.rs backend.
+        let msg = res.map_err(|e| match e {
+            omq_tokio::Error::Closed => ConsumerError::EndOfStream,
+            other => ConsumerError::Connection(anyhow!(other)),
+        })?;
         let msgs = codec::decode_frames(message_frames(&msg), self.is_sub, &self.format)
             .map_err(|e| ConsumerError::Connection(anyhow!(e)))?;
         self.buffer.extend(msgs);

@@ -57,7 +57,15 @@ async fn run(mut consumer: Box<dyn MessageConsumer>, publisher: Box<dyn MessageP
     let drain = tokio::spawn(async move {
         let mut got = 0usize;
         while got < N {
-            let batch = consumer.receive_batch(BATCH).await.expect("receive_batch");
+            // Bound each receive so a stalled/lossy transport fails fast instead of
+            // hanging the whole bench forever.
+            let batch = tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                consumer.receive_batch(BATCH),
+            )
+            .await
+            .expect("drain stalled: no batch within 30s")
+            .expect("receive_batch");
             got += batch.messages.len();
         }
     });

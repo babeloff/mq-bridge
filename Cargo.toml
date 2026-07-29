@@ -161,7 +161,7 @@ zeromq = { version = "0.6", optional = true }
 # Alternative pure-Rust ZeroMQ backend (PoC). Faster than libzmq per its
 # benchmarks and adds CURVE/PLAIN security, but requires MSRV 1.93 / edition
 # 2024 — so it is kept behind its own opt-in feature and out of `full`/`portable`
-# to preserve the crate's 1.75 MSRV on the default build.
+# to preserve the crate's 1.85 MSRV on the default build.
 omq-tokio = { version = "0.20", optional = true }
 
 # Redis Streams. Pure-Rust client (no C bindings). TLS via rustls (ring), so

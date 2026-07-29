@@ -568,8 +568,9 @@ pub async fn run_chaos_pipeline_test(
     // Chaos restarts the broker mid-stream. Most brokers redeliver in-flight messages on
     // reconnect, so they must reach zero loss. MQTT is the spec-sanctioned exception: QoS 1/2
     // redelivery is only guaranteed across a surviving session, so Mosquitto can drop a few
-    // in-flight messages the consumer can never recover after a restart. Loss is bounded by one
-    // ~2s restart window, so a small tolerance (5) stays below systemic loss yet catches regressions.
+    // in-flight messages the consumer can never recover after a restart. The tests enforce the
+    // configured `allowed_loss` bound rather than exact delivery; 5 is an empirical tolerance
+    // that stays below systemic loss yet still catches regressions.
     let allowed_loss = if broker_name.eq_ignore_ascii_case("mqtt") {
         5
     } else {
