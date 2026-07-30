@@ -991,12 +991,22 @@ async fn get_or_create_shared_http_server(
 /// via `MQ_BRIDGE_HTTP_REUSEPORT` (`0`/`false`/`off`/`no` to force the shared
 /// listener).
 fn http_reuseport_enabled() -> bool {
-    match std::env::var("MQ_BRIDGE_HTTP_REUSEPORT") {
-        Ok(value) => !matches!(
-            value.trim().to_ascii_lowercase().as_str(),
-            "0" | "false" | "off" | "no"
-        ),
-        Err(_) => cfg!(unix),
+    // `SO_REUSEPORT` only exists on Unix, and `bind_reuseport_listener` only applies the
+    // socket option there; the env override must not be able to enable per-worker binds on
+    // a non-Unix target (where they would bind with SO_REUSEADDR semantics only).
+    #[cfg(unix)]
+    {
+        match std::env::var("MQ_BRIDGE_HTTP_REUSEPORT") {
+            Ok(value) => !matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "off" | "no"
+            ),
+            Err(_) => true,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        false
     }
 }
 
@@ -1473,7 +1483,7 @@ async fn handle_request_internal(
                             StatusCode::UNAUTHORIZED,
                             "Missing Basic authentication scheme",
                             accepts_text,
-                            None,
+                            Some(&basic_auth_challenge_headers()),
                         ));
                     }
                 }
@@ -1491,7 +1501,7 @@ async fn handle_request_internal(
                 StatusCode::UNAUTHORIZED,
                 "Missing authorization header",
                 accepts_text,
-                None,
+                Some(&basic_auth_challenge_headers()),
             ));
         }
     }
@@ -1623,9 +1633,20 @@ async fn handle_request_internal(
     // Read body with a timeout to prevent hanging on abandoned client connections.
     // This prevents "zombie" tasks from saturating the runtime during retry storms.
     let body_collect_timeout = state.request_timeout;
-    let body_bytes = match tokio::time::timeout(body_collect_timeout, body.collect()).await {
+    let limited = http_body_util::Limited::new(body, MAX_HTTP_BODY_BYTES as usize);
+    let body_bytes = match tokio::time::timeout(body_collect_timeout, limited.collect()).await {
         Ok(Ok(b)) => b.to_bytes(),
         Ok(Err(e)) => {
+            if e.downcast_ref::<http_body_util::LengthLimitError>()
+                .is_some()
+            {
+                return Ok(text_error_response(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    format!("Request body exceeds maximum of {MAX_HTTP_BODY_BYTES} bytes"),
+                    accepts_text,
+                    None,
+                ));
+            }
             return Ok(text_error_response(
                 StatusCode::BAD_REQUEST,
                 format!("Failed to read body: {}", e),
@@ -1643,9 +1664,20 @@ async fn handle_request_internal(
         }
     };
 
-    // Decompress if needed
-    let payload = decompress_if_needed(body_bytes, content_encoding.as_deref())
-        .map_err(|e| anyhow!("Failed to decompress request body: {}", e))?;
+    // Decompress if needed. A malformed or oversized client-controlled body is a client
+    // error (4xx), not a server failure — surface it as such instead of letting it bubble
+    // up to handle_request's 500 handler.
+    let payload = match decompress_if_needed(body_bytes, content_encoding.as_deref()) {
+        Ok(payload) => payload,
+        Err(e) => {
+            return Ok(text_error_response(
+                StatusCode::BAD_REQUEST,
+                format!("Failed to decompress request body: {}", e),
+                accepts_text,
+                None,
+            ));
+        }
+    };
 
     let mut message = CanonicalMessage::new_bytes(payload, message_id);
     trace!(
@@ -1821,9 +1853,20 @@ async fn inline_echo_response(
     accepts_text: bool,
     permit: tokio::sync::OwnedSemaphorePermit,
 ) -> anyhow::Result<Response<BoxBody>> {
-    let body_bytes = match tokio::time::timeout(state.request_timeout, body.collect()).await {
+    let limited = http_body_util::Limited::new(body, MAX_HTTP_BODY_BYTES as usize);
+    let body_bytes = match tokio::time::timeout(state.request_timeout, limited.collect()).await {
         Ok(Ok(collected)) => collected.to_bytes(),
         Ok(Err(e)) => {
+            if e.downcast_ref::<http_body_util::LengthLimitError>()
+                .is_some()
+            {
+                return Ok(text_error_response(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    format!("Request body exceeds maximum of {MAX_HTTP_BODY_BYTES} bytes"),
+                    accepts_text,
+                    None,
+                ));
+            }
             return Ok(text_error_response(
                 StatusCode::BAD_REQUEST,
                 format!("Failed to read body: {}", e),
@@ -2079,14 +2122,74 @@ fn create_rustls_client_config(tls_config: &TlsConfig) -> anyhow::Result<rustls:
             .with_safe_default_protocol_versions()?
             .with_root_certificates(root_cert_store);
 
-    if let (Some(cert_file), Some(key_file)) = (&tls_config.cert_file, &tls_config.key_file) {
-        let certs = load_certs(cert_file)?;
-        let key = load_private_key(key_file)?;
-        config_builder
-            .with_client_auth_cert(certs, key)
-            .context("Failed to build mTLS client config")
-    } else {
-        Ok(config_builder.with_no_client_auth())
+    let mut config =
+        if let (Some(cert_file), Some(key_file)) = (&tls_config.cert_file, &tls_config.key_file) {
+            let certs = load_certs(cert_file)?;
+            let key = load_private_key(key_file)?;
+            config_builder
+                .with_client_auth_cert(certs, key)
+                .context("Failed to build mTLS client config")?
+        } else {
+            config_builder.with_no_client_auth()
+        };
+
+    if tls_config.accept_invalid_certs {
+        // INSECURE: disables server certificate and hostname verification, so the
+        // connection is open to man-in-the-middle attacks. Honoured only because the
+        // caller explicitly opted in via `accept_invalid_certs`; never for production.
+        warn!("HTTP client TLS is configured to accept invalid certificates. This is insecure and must not be used in production.");
+        let schemes = crate::endpoints::get_crypto_provider()?
+            .signature_verification_algorithms
+            .supported_schemes();
+        config
+            .dangerous()
+            .set_certificate_verifier(Arc::new(NoopClientCertVerifier {
+                supported_schemes: schemes,
+            }));
+    }
+
+    Ok(config)
+}
+
+/// A rustls server-certificate verifier that performs no validation. Used only when
+/// `accept_invalid_certs` is set on an HTTP publisher's TLS config.
+#[derive(Debug)]
+struct NoopClientCertVerifier {
+    supported_schemes: Vec<rustls::SignatureScheme>,
+}
+
+impl rustls::client::danger::ServerCertVerifier for NoopClientCertVerifier {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.supported_schemes.clone()
     }
 }
 
@@ -2222,6 +2325,17 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
         diff |= x ^ y;
     }
     diff == 0
+}
+
+/// Header map carrying the `WWW-Authenticate` Basic challenge, so a 401 tells the client
+/// how to authenticate (RFC 7235 §4.1) instead of failing opaquely.
+fn basic_auth_challenge_headers() -> HashMap<String, String> {
+    let mut headers = HashMap::with_capacity(1);
+    headers.insert(
+        "WWW-Authenticate".to_string(),
+        "Basic realm=\"mq-bridge\"".to_string(),
+    );
+    headers
 }
 
 fn configured_basic_auth(basic_auth: Option<&(String, String)>) -> Option<(&str, &str)> {

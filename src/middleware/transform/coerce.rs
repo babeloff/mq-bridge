@@ -112,12 +112,10 @@ pub(super) fn coerce(
         None => Err(TransformError::new(
             render_path(crumbs),
             ErrorKind::Coercion,
-            format!(
-                "cannot coerce {} {} to {}",
-                type_name(value),
-                value,
-                ty.name()
-            ),
+            // Report only the source and target types, never the offending value itself:
+            // the value may hold sensitive data and this error can surface in logs and in
+            // pass-through error metadata. The rendered path already locates the field.
+            format!("cannot coerce {} to {}", type_name(value), ty.name()),
         )),
     }
 }

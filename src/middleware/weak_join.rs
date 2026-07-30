@@ -19,6 +19,9 @@ pub struct WeakJoinConsumer {
     inner: Box<dyn MessageConsumer>,
     config: WeakJoinMiddleware,
     state: Arc<Mutex<JoinState>>,
+    /// Drain flag, tracked locally: on drain we must flush buffered pending groups before
+    /// exposing an empty batch, so exit only happens once every group is drained.
+    exit_on_empty: bool,
 }
 
 impl WeakJoinConsumer {
@@ -35,6 +38,7 @@ impl WeakJoinConsumer {
                 pending: HashMap::new(),
                 ready_buffer: Vec::new(),
             })),
+            exit_on_empty: false,
         }
     }
 
@@ -146,6 +150,21 @@ impl WeakJoinConsumer {
             }
         }
     }
+
+    /// Drains every remaining pending group, used when the upstream is exhausted (drain
+    /// mode) so no buffered group is stranded when the empty batch propagates up. Honours
+    /// `on_timeout`: incomplete groups are emitted unless configured to discard.
+    fn flush_all_pending(&self, state: &mut JoinState, ready_messages: &mut Vec<CanonicalMessage>) {
+        let keys: Vec<String> = state.pending.keys().cloned().collect();
+        for key in keys {
+            if let Some((_, msgs)) = state.pending.remove(&key) {
+                if self.config.on_timeout == WeakJoinTimeout::Discard {
+                    continue;
+                }
+                ready_messages.push(self.emit_join(&key, &msgs));
+            }
+        }
+    }
 }
 
 /// Deserializes a message payload as JSON, falling back to a lossy UTF-8 string.
@@ -159,6 +178,9 @@ fn payload_to_value(m: &CanonicalMessage) -> Value {
 #[async_trait]
 impl MessageConsumer for WeakJoinConsumer {
     fn set_exit_on_empty(&mut self, exit_on_empty: bool) {
+        // Track the flag locally so receive_batch can flush pending groups before exposing
+        // an empty batch, and still forward it so the inner source actually reports drained.
+        self.exit_on_empty = exit_on_empty;
         self.inner.set_exit_on_empty(exit_on_empty);
     }
 
@@ -218,6 +240,13 @@ impl MessageConsumer for WeakJoinConsumer {
                         // fresh message for an expired key starts a new group rather
                         // than joining a stale one.
                         self.check_timeouts(&mut state, &mut ready_messages);
+
+                        // An empty upstream batch under exit_on_empty means the source is
+                        // drained: flush every remaining pending group so none is stranded,
+                        // and only then let an empty batch propagate up to end the route.
+                        if count == 0 && self.exit_on_empty {
+                            self.flush_all_pending(&mut state, &mut ready_messages);
+                        }
 
                         let now = Instant::now();
                         for msg in batch.messages {

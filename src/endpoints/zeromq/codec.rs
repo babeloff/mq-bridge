@@ -9,6 +9,7 @@ use crate::traits::PublisherError;
 use crate::CanonicalMessage;
 use anyhow::anyhow;
 use bytes::Bytes;
+use tracing::{debug, warn};
 
 /// Build the wire frames for one message in `raw`/`raw_framed` mode. `raw` sends
 /// the payload as a single frame; `raw_framed` prepends a JSON metadata frame so
@@ -44,11 +45,11 @@ pub(crate) fn decode_frames(
     if payload.is_empty() && frames.len() <= 1 {
         return Ok(vec![]);
     }
-    // Only SUB traffic prepends the subscription topic as a leading frame;
-    // PUSH/PULL and REP carry payload frames only, so a leading frame there is
-    // not a topic. In raw_framed the leading frame is the metadata frame, not a
-    // topic, so no cursor applies there either.
-    let topic = if is_sub && frames.len() > 1 && !matches!(format, ZeroMqFormat::RawFramed) {
+    // Only SUB traffic prepends the subscription topic as a leading frame; PUSH/PULL and
+    // REP carry payload frames only, so a leading frame there is not a topic. This holds for
+    // raw_framed too: on SUB the topic still comes first, ahead of the metadata frame, so it
+    // is skipped before metadata parsing below.
+    let topic = if is_sub && frames.len() > 1 {
         Some(String::from_utf8_lossy(frames[0].as_ref()).into_owned())
     } else {
         None
@@ -70,12 +71,33 @@ pub(crate) fn decode_frames(
         // Two-frame layout: [metadata JSON, raw payload]. Degrade to payload-only
         // when a single frame arrives (e.g. a plain raw producer).
         ZeroMqFormat::RawFramed => {
-            let mut msg = CanonicalMessage::new_bytes(payload.clone(), None);
-            if frames.len() > 1 {
-                if let Ok(meta) = serde_json::from_slice::<std::collections::HashMap<String, String>>(
-                    frames[0].as_ref(),
+            // Skip the SUB subscription-topic frame first, so the [metadata, payload]
+            // framing below lines up rather than mis-reading the topic as metadata.
+            let framed: &[Bytes] = if is_sub && frames.len() > 1 {
+                &frames[1..]
+            } else {
+                &frames[..]
+            };
+            let payload = framed.last().cloned().unwrap_or_default();
+            let mut msg = CanonicalMessage::new_bytes(payload, None);
+            if framed.len() > 1 {
+                match serde_json::from_slice::<std::collections::HashMap<String, String>>(
+                    framed[0].as_ref(),
                 ) {
-                    msg.metadata = meta;
+                    Ok(meta) => msg.metadata = meta,
+                    Err(e) => warn!(
+                        is_sub,
+                        frames = frames.len(),
+                        error = %e,
+                        "zeromq raw_framed: leading frame is not valid JSON metadata; treating the message as payload-only. Check the producer's framing."
+                    ),
+                }
+                if framed.len() > 2 {
+                    debug!(
+                        is_sub,
+                        discarded = framed.len() - 2,
+                        "zeromq raw_framed: discarding frames beyond [metadata, payload]; a raw_framed message carries at most two payload frames. Check the producer's framing."
+                    );
                 }
             }
             vec![msg]

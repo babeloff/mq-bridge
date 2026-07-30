@@ -900,15 +900,9 @@
           ]
         },
         {
-          "type": "object",
-          "properties": {
-            "null": {
-              "type": "null"
-            }
-          },
-          "required": [
-            "null"
-          ]
+          "type": "string",
+          "format": "structural_endpoint",
+          "const": "null"
         }
       ],
       "unevaluatedProperties": false
@@ -3487,6 +3481,16 @@
             "null"
           ],
           "format": "uint",
+          "default": null,
+          "minimum": 0
+        },
+        "request_timeout_ms": {
+          "description": "(REQ publisher only) Timeout in ms for one request/reply exchange before it is reported as failed. Defaults to 30000.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
           "default": null,
           "minimum": 0
         },

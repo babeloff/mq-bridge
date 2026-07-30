@@ -39,6 +39,19 @@ where
     StreamBody::new(stream).boxed()
 }
 
+/// Rejects an NDJSON/SSE stream whose un-drained accumulation (a single record with no
+/// record delimiter yet) has grown past the shared body cap, so a client cannot force
+/// unbounded memory growth by streaming one endless "record".
+fn bound_stream_buffer(buffer: &[u8]) -> anyhow::Result<()> {
+    if buffer.len() as u64 > super::MAX_HTTP_BODY_BYTES {
+        return Err(anyhow!(
+            "stream record exceeds maximum buffered size of {} bytes",
+            super::MAX_HTTP_BODY_BYTES
+        ));
+    }
+    Ok(())
+}
+
 fn has_content_type_header(headers: &HashMap<String, String>) -> bool {
     headers
         .keys()
@@ -364,6 +377,7 @@ async fn receive_streamable_body(
                     stream_index,
                 )
                 .await?;
+                bound_stream_buffer(&byte_buffer)?;
             }
             HttpStreamFormat::Sse => {
                 byte_buffer.extend_from_slice(data);
@@ -374,6 +388,7 @@ async fn receive_streamable_body(
                     stream_index,
                 )
                 .await?;
+                bound_stream_buffer(&byte_buffer)?;
             }
         }
     }

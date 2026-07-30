@@ -2425,6 +2425,9 @@ pub struct ZeroMqConfig {
     /// Backend: `zmq` (default, the `zeromq` crate) or `omq` (the `omq-tokio` PoC — PUSH/PULL + PUB/SUB only). `omq` needs the `zeromq-omq` build feature.
     #[serde(default)]
     pub backend: ZeroMqBackend,
+    /// (REQ publisher only) Timeout in ms for one request/reply exchange before it is reported as failed. Defaults to 30000.
+    #[serde(default)]
+    pub request_timeout_ms: Option<u64>,
 }
 
 impl ZeroMqConfig {

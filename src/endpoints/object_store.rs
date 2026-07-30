@@ -616,8 +616,21 @@ impl MessageConsumer for ObjectStoreConsumer {
                                     tokio::time::sleep(self.idle_delay).await;
                                     return Ok(empty_batch());
                                 }
-                                // Under the limit: retry the same object next poll.
-                                return Err(ConsumerError::Connection(e));
+                                // Under the limit: retry the same object next poll, but do
+                                // NOT surface a Connection error — that would rebuild the
+                                // consumer (resetting decode_failures/decode_failing_key) and
+                                // let a poison object loop forever without ever quarantining.
+                                // Idle instead so the in-instance counter keeps climbing to
+                                // MAX_OBJECT_DECODE_FAILURES.
+                                warn!(
+                                    key = %key,
+                                    error = %e,
+                                    attempt = self.decode_failures,
+                                    max = MAX_OBJECT_DECODE_FAILURES,
+                                    "object failed to decode; will retry before quarantining"
+                                );
+                                tokio::time::sleep(self.idle_delay).await;
+                                return Ok(empty_batch());
                             }
                         };
                         let records = split_and_parse(&data, &self.delimiter, &self.format);
@@ -944,14 +957,24 @@ mod tests {
             ..Default::default()
         };
         wrong.crypto = Some(Arc::new(Crypto::new(&wrong_cfg).unwrap()));
-        assert!(wrong.receive_batch(10).await.is_err());
+        // A wrong-key object is bounded-retried then quarantined: it never delivers
+        // garbage and never surfaces a Connection error (which would rebuild the consumer,
+        // reset the failure counter, and loop the poison object forever).
+        for _ in 0..=MAX_OBJECT_DECODE_FAILURES {
+            let batch = wrong
+                .receive_batch(10)
+                .await
+                .expect("wrong-key object must not error out the source");
+            assert!(batch.messages.is_empty());
+        }
     }
 
     #[cfg(feature = "compression")]
     #[tokio::test]
-    async fn gzip_source_errors_on_non_gzip_object() {
-        // A gzip source must fail cleanly (not panic) if an object under the
-        // prefix is not valid gzip.
+    async fn gzip_source_quarantines_non_gzip_object() {
+        // A gzip source must handle a non-gzip object cleanly (not panic): the object is
+        // bounded-retried then quarantined, never delivered as data and never surfaced as a
+        // Connection error that would rebuild the consumer and loop the poison object.
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         store
             .put(
@@ -969,10 +992,13 @@ mod tests {
             None,
         );
         consumer.compression = Compression::Gzip;
-        assert!(
-            consumer.receive_batch(10).await.is_err(),
-            "expected a decode error for a non-gzip object"
-        );
+        for _ in 0..=MAX_OBJECT_DECODE_FAILURES {
+            let batch = consumer
+                .receive_batch(10)
+                .await
+                .expect("non-gzip object must not error out the source");
+            assert!(batch.messages.is_empty());
+        }
     }
 
     #[tokio::test]

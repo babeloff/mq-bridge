@@ -86,6 +86,8 @@ impl ZeroMqPublisher {
 
         let buffer_size = config.internal_buffer_size.unwrap_or(128).max(1);
         let (tx, rx) = bounded::<PublisherJob>(buffer_size);
+        let request_timeout =
+            std::time::Duration::from_millis(config.request_timeout_ms.unwrap_or(30_000));
         tokio::spawn(async move {
             while let Ok(job) = rx.recv().await {
                 match job {
@@ -104,11 +106,21 @@ impl ZeroMqPublisher {
                     },
                     PublisherJob::Request(msg, reply_tx) => match &mut socket {
                         SenderSocket::Req(s) => {
-                            if let Err(e) = s.send(msg).await {
-                                let _ = reply_tx.send(Err(e));
-                            } else {
-                                let res = s.recv().await;
-                                let _ = reply_tx.send(res);
+                            // Bound the send+recv exchange so an unresponsive REP peer can't
+                            // stall this task (and every queued job behind it) indefinitely.
+                            let exchange = async {
+                                s.send(msg).await?;
+                                s.recv().await
+                            };
+                            match tokio::time::timeout(request_timeout, exchange).await {
+                                Ok(res) => {
+                                    let _ = reply_tx.send(res);
+                                }
+                                Err(_) => {
+                                    let _ = reply_tx.send(Err(zeromq::ZmqError::Other(
+                                        "ZeroMQ REQ/REP exchange timed out",
+                                    )));
+                                }
                             }
                         }
                         _ => {
@@ -395,59 +407,71 @@ impl ZeroMqConsumer {
         let (tx, rx) = bounded::<Result<ConsumerItem, ConsumerError>>(buffer_size);
         tokio::spawn(async move {
             loop {
-                let res = match &mut socket {
-                    ReceiverSocket::Pull(s) => s.recv().await.map(|msg| ConsumerItem {
-                        msg,
-                        reply_tx: None,
-                    }),
-                    ReceiverSocket::Sub(s) => s.recv().await.map(|msg| ConsumerItem {
-                        msg,
-                        reply_tx: None,
-                    }),
-                    ReceiverSocket::Rep(s) => {
-                        match s.recv().await {
-                            Ok(msg) => {
-                                let (reply_tx, reply_rx) = oneshot::channel();
-                                let item = ConsumerItem {
-                                    msg,
-                                    reply_tx: Some(reply_tx),
-                                };
-                                if tx.send(Ok(item)).await.is_err() {
-                                    break;
-                                }
-                                // Wait for the reply from the consumer logic
-                                let reply = match reply_rx.await {
-                                    Ok(msg) => msg,
-                                    Err(e) => {
-                                        tracing::error!(
-                                            "Failed to receive reply from consumer logic: {}",
-                                            e
-                                        );
-                                        ZmqMessage::from(bytes::Bytes::from("consumer_failed"))
-                                    }
-                                };
-                                s.send(reply).await.map(|_| ConsumerItem {
-                                    msg: ZmqMessage::from(bytes::Bytes::new()),
-                                    reply_tx: None,
-                                }) // Dummy return to satisfy type, we loop anyway
-                            }
-                            Err(e) => Err(e),
+                match &mut socket {
+                    ReceiverSocket::Pull(s) => {
+                        let item_res = s
+                            .recv()
+                            .await
+                            .map(|msg| ConsumerItem {
+                                msg,
+                                reply_tx: None,
+                            })
+                            .map_err(|e| ConsumerError::Connection(anyhow!(e)));
+                        if tx.send(item_res).await.is_err() {
+                            break;
                         }
                     }
-                };
-
-                // For Rep, we already handled the send inside the match. For others, we send here.
-                // Actually, let's restructure to avoid the dummy return.
-                if let ReceiverSocket::Rep(_) = socket {
-                    if let Err(e) = res {
-                        let _ = tx.send(Err(ConsumerError::Connection(anyhow!(e)))).await;
+                    ReceiverSocket::Sub(s) => {
+                        let item_res = s
+                            .recv()
+                            .await
+                            .map(|msg| ConsumerItem {
+                                msg,
+                                reply_tx: None,
+                            })
+                            .map_err(|e| ConsumerError::Connection(anyhow!(e)));
+                        if tx.send(item_res).await.is_err() {
+                            break;
+                        }
                     }
-                    continue;
-                }
-
-                let item_res = res.map_err(|e| ConsumerError::Connection(anyhow!(e)));
-                if tx.send(item_res).await.is_err() {
-                    break;
+                    ReceiverSocket::Rep(s) => {
+                        // Keep the whole request/reply exchange in one branch: receive the
+                        // request, deliver it, await the consumer's reply, and send it back —
+                        // with no dummy ConsumerItem and no re-inspection of the socket after.
+                        let msg = match s.recv().await {
+                            Ok(msg) => msg,
+                            Err(e) => {
+                                // A failed receive is a genuine new connection error.
+                                let _ = tx.send(Err(ConsumerError::Connection(anyhow!(e)))).await;
+                                continue;
+                            }
+                        };
+                        let (reply_tx, reply_rx) = oneshot::channel();
+                        let item = ConsumerItem {
+                            msg,
+                            reply_tx: Some(reply_tx),
+                        };
+                        if tx.send(Ok(item)).await.is_err() {
+                            break;
+                        }
+                        // Wait for the consumer logic to produce the reply for THIS request.
+                        let reply = match reply_rx.await {
+                            Ok(reply) => reply,
+                            Err(e) => {
+                                tracing::error!(
+                                    "Failed to receive reply from consumer logic: {}",
+                                    e
+                                );
+                                ZmqMessage::from(bytes::Bytes::from("consumer_failed"))
+                            }
+                        };
+                        // A failed reply-send belongs to the request already delivered above,
+                        // not to a later unrelated one, so log it here rather than enqueueing
+                        // a stray ConsumerError into the stream.
+                        if let Err(e) = s.send(reply).await {
+                            tracing::error!("Failed to send ZeroMQ REP reply: {}", e);
+                        }
+                    }
                 }
             }
         });
@@ -481,6 +505,16 @@ impl ZeroMqConsumer {
 
         if let Some(tx) = item.reply_tx {
             let count = msgs.len();
+            if count == 0 {
+                // No decoded messages means no per-message commit will ever fire to
+                // resolve the reply. Answer the pending REP request immediately (with an
+                // empty JSON array, matching the commit path's wire format) so the REQ
+                // peer isn't left blocking forever.
+                let payload =
+                    serde_json::to_vec(&Vec::<CanonicalMessage>::new()).unwrap_or_default();
+                let _ = tx.send(ZmqMessage::from(bytes::Bytes::from(payload)));
+                return Ok(());
+            }
             let state = Arc::new(Mutex::new(BatchReplyState {
                 tx: Some(tx),
                 responses: vec![None; count],

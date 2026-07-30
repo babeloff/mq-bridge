@@ -288,8 +288,7 @@ async fn handle_reply(
 }
 
 /// A publisher that inserts messages into a MongoDB collection.
-// --- Non-destructive `_id`-cursor reader (arbitrary collections) ---
-
+/// --- Non-destructive `_id`-cursor reader (arbitrary collections) ---
 /// Encodes a BSON `_id` into a portable, tagged string for checkpoint persistence.
 /// Supports the homogeneous `_id` types a real collection uses: ObjectId, BSON UUID
 /// (subtype 4, as mq-bridge's own publisher writes), and integers. Returns `None` for

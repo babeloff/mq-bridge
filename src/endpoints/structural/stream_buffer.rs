@@ -276,7 +276,9 @@ impl MessagePublisher for StreamBufferPublisher {
             .sender
             .send(std::mem::take(&mut messages))
             .await
-            .map_err(|e| anyhow!("Failed to send to stream_buffer: {}", e))?;
+            .map_err(|e| {
+                PublisherError::Retryable(anyhow!("Failed to send to stream_buffer: {}", e))
+            })?;
         Ok(SentBatch::Ack)
     }
 
@@ -349,9 +351,15 @@ impl StreamBufferConsumer {
 
 impl Drop for StreamBufferConsumer {
     fn drop(&mut self) {
-        if !self.buffer.is_empty() {
-            requeue_messages(self.sender.clone(), std::mem::take(&mut self.buffer));
-        }
+        // The consumer is the only reader of its `(topic, correlation_id)` partition. When
+        // it goes away, remove that partition from STREAM_BUFFERS so an abandoned stream
+        // (e.g. an end marker that was never acked) does not leak the partition forever and
+        // grow the global registry unboundedly. There is no other out-of-band expiry.
+        //
+        // Any still-buffered, uncommitted messages are discarded rather than requeued: with
+        // the sole reader gone, a requeue would only re-fill a partition nobody will drain.
+        self.buffer.clear();
+        remove_partition_if_current(&self.topic, &self.correlation_id, &self.sender);
     }
 }
 

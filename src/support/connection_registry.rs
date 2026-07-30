@@ -45,8 +45,14 @@ fn inflight() -> &'static Mutex<HashMap<Key, Arc<tokio::sync::Mutex<()>>>> {
 }
 
 /// Build the canonical connection identity used in the cache key from any
-/// `Debug`able value. The `Debug` representation is a complete, lossless encoding
-/// of the identity, so — unlike a hash — distinct connections never collide.
+/// `Debug`able value.
+///
+/// The `Debug` representation can carry secrets (URL passwords, TLS key passwords), and
+/// keys live in the process-wide `REGISTRY`/`INFLIGHT` maps where they could leak via key
+/// `Debug` output. So the debug encoding is passed through SHA-256 rather than stored
+/// verbatim: the returned identity binds the same connection to the same key without ever
+/// retaining the plaintext, and SHA-256's collision resistance keeps distinct connections
+/// from sharing a cache entry.
 ///
 /// Pass only fields that determine which underlying client is appropriate, e.g.
 /// `(url, username, &tls)`. Two callers with the same tag and identity share a client.
@@ -55,7 +61,14 @@ fn inflight() -> &'static Mutex<HashMap<Key, Arc<tokio::sync::Mutex<()>>>> {
 /// pairs) must be canonicalized — typically sorted — by the caller first, so that
 /// configs that differ only in field order still resolve to the same client.
 pub fn connection_identity<H: Debug>(identity: H) -> String {
-    format!("{identity:?}")
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(format!("{identity:?}").as_bytes());
+    let mut out = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
 }
 
 /// Return the cached shared client of type `T` for `(tag, identity)`, or build one with

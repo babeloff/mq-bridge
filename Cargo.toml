@@ -61,6 +61,9 @@ async-channel = { version = "2.5" }
 # Unix sockets and Windows named pipes). Already in the tree transitively.
 tokio-util = { version = "0.7", features = ["codec"] }
 once_cell = { version = "1.21" }
+# SHA-256 for hashing connection-registry identities so secret-bearing fields
+# (URL/TLS passwords) are never retained verbatim in cache keys.
+sha2 = "0.11"
 uuid = { version = "1.24" }
 fast-uuid-v7.workspace = true
 rmp-serde = "1.3"
