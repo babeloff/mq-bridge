@@ -338,7 +338,7 @@ pub async fn test_nats_request_reply() {
         let subject = "req_rep_subject";
         let stream_name = "req_rep_stream";
 
-        // 1. Create publisher first (ensures JetStream stream exists)
+        // Create publisher first (ensures JetStream stream exists)
         let mut pub_config = mq_bridge::models::NatsConfig {
             url: "nats://localhost:4222".to_string(),
             request_reply: true,
@@ -349,7 +349,7 @@ pub async fn test_nats_request_reply() {
         // JetStream enabled (default)
         let publisher = NatsPublisher::new(&pub_config).await.unwrap();
 
-        // 2. Now create the JetStream consumer (service side)
+        // Now create the JetStream consumer (service side)
         let mut service_endpoint = mq_bridge::models::NatsConfig {
             url: "nats://localhost:4222".to_string(),
             no_jetstream: true,
@@ -360,7 +360,7 @@ pub async fn test_nats_request_reply() {
         // Native NATS request-reply needs a live Core subscription as the responder.
         let service_consumer = NatsConsumer::new(&service_endpoint).await.unwrap();
 
-        // 3. Spawn the reply service after both publisher and consumer are ready
+        // Spawn the reply service after both publisher and consumer are ready
         let (service_ready_tx, service_ready_rx) = tokio::sync::oneshot::channel();
         let service_task = tokio::spawn(async move {
             let _ = service_ready_tx.send(());
@@ -368,7 +368,7 @@ pub async fn test_nats_request_reply() {
         });
         service_ready_rx.await.unwrap();
 
-        // 4. Send the request and check the response
+        // Send the request and check the response
         let result = nats_request_with_retry(&publisher, b"ping").await;
 
         match result {
@@ -443,7 +443,7 @@ pub async fn test_mongodb_request_reply_pattern() {
         let req_collection = "req_rep_collection";
         let db_name = "mq_bridge_test_req_rep";
 
-        // 1. Setup the "service" side (the consumer that replies)
+        // Setup the "service" side (the consumer that replies)
         let service_config = mq_bridge::models::MongoDbConfig {
             url: "mongodb://localhost:27017".to_string(),
             database: db_name.to_string(),
@@ -457,7 +457,7 @@ pub async fn test_mongodb_request_reply_pattern() {
             run_service_reply(Box::new(service_consumer), b"mongo_response").await;
         });
 
-        // 2. Setup the "client" side (the publisher that sends and waits)
+        // Setup the "client" side (the publisher that sends and waits)
         let client_config = mq_bridge::models::MongoDbConfig {
             url: "mongodb://localhost:27017".to_string(),
             database: db_name.to_string(),
@@ -468,7 +468,7 @@ pub async fn test_mongodb_request_reply_pattern() {
         pub_config.collection = Some(req_collection.to_string());
         let client_publisher = MongoDbPublisher::new(&pub_config).await.unwrap();
 
-        // 3. Send request and wait for response
+        // Send request and wait for response
         let request_msg = CanonicalMessage::new(b"mongo_request".to_vec(), None);
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(5),
@@ -478,7 +478,6 @@ pub async fn test_mongodb_request_reply_pattern() {
         .expect("Timed out waiting for MongoDB response")
         .unwrap();
 
-        // 4. Assert the response
         match result {
             Sent::Response(resp) => {
                 assert_eq!(resp.get_payload_str(), "mongo_response");
@@ -1242,7 +1241,7 @@ async fn test_custom_components_yaml_configuration() {
         Arc,
     };
 
-    // 1. Define Custom Factories
+    // Define Custom Factories
     #[derive(Debug)]
     struct YamlEndpointFactory;
     #[async_trait::async_trait]
@@ -1293,7 +1292,6 @@ async fn test_custom_components_yaml_configuration() {
         }
     }
 
-    // 2. Register Factories
     let mw_flag = Arc::new(AtomicBool::new(false));
     register_endpoint_factory("my_yaml_endpoint", Arc::new(YamlEndpointFactory));
     register_middleware_factory(
@@ -1303,7 +1301,6 @@ async fn test_custom_components_yaml_configuration() {
         }),
     );
 
-    // 3. Define YAML
     let yaml = r#"
     yaml_test_route:
       input:
@@ -1316,14 +1313,12 @@ async fn test_custom_components_yaml_configuration() {
         my_yaml_endpoint: {}
     "#;
 
-    // 4. Parse YAML
     let config: Config = serde_yaml_ng::from_str(yaml).expect("Failed to parse YAML");
     let route = config
         .get("yaml_test_route")
         .expect("Route not found")
         .clone();
 
-    // 5. Verify Deserialization
     if let EndpointType::Custom { name, config } = &route.input.endpoint_type {
         assert_eq!(name, "my_yaml_endpoint");
         assert_eq!(config["content"], "yaml_msg");
@@ -1338,7 +1333,7 @@ async fn test_custom_components_yaml_configuration() {
         panic!("Input middleware should be Custom");
     }
 
-    // 6. Run Route to verify factory resolution
+    // Run Route to verify factory resolution
     let handle = tokio::spawn(async move { route.run_until_err("yaml_test", None, None).await });
 
     // Give it a moment to initialize and process one message

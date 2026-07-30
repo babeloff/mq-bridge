@@ -119,6 +119,20 @@ errors are **not** dead-lettered — they propagate so the route can reconnect. 
 is a full endpoint, so it can itself have middleware. If the DLQ send fails with a connection
 error that error propagates rather than silently dropping the message.
 
+**Without a `dlq` middleware**, a message that fails permanently — a data/type
+error the sink rejects, a poison payload a handler rejects — is logged at `error` level and
+**dropped**, and the route keeps processing the rest of the batch. `dlq` is the only retention
+mechanism: `retry` alone does not retain a permanently-failed message nor prevent it from being
+dropped — it only re-attempts retryable/connection errors, then hands a still-failing message on
+to be dropped (or to a following `dlq`). This tolerate-and-continue
+policy keeps one bad message from halting the whole stream, but it means a *systematic* failure
+(e.g. every row hitting a column-type mismatch) drains the input while committing nothing and
+still ends `completed`. Add a `dlq` to capture the failures for inspection/replay, or watch the
+route's logs — a burst of `Dropping message … due to non-retryable error` is the signal. Note
+that transient errors are handled separately: several endpoints retry connection/timeout errors
+internally, and the `retry` middleware adds backoff on top, so only genuinely permanent errors
+reach this drop path.
+
 ### `transform`
 
 Declarative JSON reshaping: field mapping, then schema-directed coercion, defaults and
@@ -207,14 +221,39 @@ feature (pulls `sled`).
 
 | Field | Type | Required |
 |---|---|---|
-| `sled_path` | string | yes |
+| `store` | string | one of `store`/`sled_path` |
+| `sled_path` | string | one of `store`/`sled_path` |
 | `ttl_seconds` | integer | yes |
 
+`store` selects the backend by URL scheme:
+
+- `sled:///path` (or a bare path) — a local sled database; per-process, not cluster-wide.
+- `mongodb://host/db[/collection]` — a shared collection, so multiple instances of a route
+  deduplicate against one another. Requires the `mongodb` feature. Entries expire via a
+  MongoDB TTL index; the collection defaults to `mqb_dedup_<route>`. Point it at the same
+  deployment your sink already uses to avoid running extra infrastructure.
+- `postgres|mysql|mariadb|sqlite://…[/table]` — a shared SQL table (`dedup_key` PK,
+  `expire_at`), so multiple instances deduplicate against one another. Requires the `sqlx`
+  feature. SQL has no native TTL, so expired rows are swept periodically; the table defaults
+  to `mqb_dedup_<route>`.
+
+`sled_path` is the legacy spelling of a local sled store and is equivalent to `store: "sled://<path>"`.
+
 ```yaml
-- deduplication: { sled_path: "/var/lib/mq-bridge/dedup", ttl_seconds: 3600 }
+- deduplication: { store: "sled:///var/lib/mq-bridge/dedup", ttl_seconds: 3600 }
 ```
 
-State is a local sled database, so deduplication is per-process, not cluster-wide.
+```yaml
+- deduplication: { store: "mongodb://localhost:27017/etl", ttl_seconds: 3600 }
+```
+
+```yaml
+- deduplication: { store: "postgres://user:pass@localhost/etl", ttl_seconds: 3600 }
+```
+
+When MongoDB is your sink and messages carry a business key, prefer the sink's own unique
+index (`id_field` on the mongodb output) over this middleware — the target collection then
+*is* the deduplication authority, with no second write. See the idempotency notes in README.
 
 ### `weak_join`
 
@@ -337,7 +376,12 @@ output. Requires the `encryption` feature.
 The envelope records the cipher and `key_id`, so key rotation works by sealing with a new
 `key_id`/`key` while listing the old key under `decrypt_keys` on the consuming side. Each
 payload is authenticated independently: any bit-level tampering, a torn frame, or a
-missing/wrong key is a hard consumer error, not a silent drop. Note that this authenticates
+missing/wrong key is a hard consumer error, not a silent drop. The AEAD binds only the
+payload (empty associated data): metadata and routing keys are *not* authenticated against
+the ciphertext, since they are not guaranteed to survive transport round-trips (many
+endpoints regenerate the `message_id` or drop `kind`). A sealed payload can therefore be
+replayed under different metadata; use the `deduplication` middleware or a sink uniqueness
+constraint if that matters. Note that this authenticates
 each payload, not the file as a whole — like any append-structured file, an at-rest file
 that loses whole trailing frames (truncation at a frame boundary) reads back as a shorter
 stream with no error, so rely on the consumer's checkpoint/cursor for completeness rather
@@ -365,6 +409,17 @@ readable through a matching consumer; a compressed-only file stays a standard `.
 stream. File compression/encryption supports only the default `consume` mode. `csv` works
 too: the header row is written into the first member, so the decoded stream is a normal CSV
 file.
+
+A file **source** must declare the same `compression`/`encryption` the data was written with.
+A mismatch (wrong key, wrong codec, or a missing field) is a permanent decode failure: the
+route ends `failed` with the error in its status, rather than completing as if the file were
+empty. Reading a compressed file with no `compression` set is likewise rejected up front by
+sniffing the leading magic bytes, so raw compressed bytes are never emitted as messages.
+
+> **f64 precision.** Numbers move through payloads as JSON. serde_json's default parser shifts
+> ~1 ULP on ~19% of 17-significant-digit doubles, so a `postgres → file → postgres` hop of a
+> `double precision` column can change the last bit. Build with the `float-roundtrip` feature
+> for bit-exact float parsing across every endpoint (it trades a little parse speed for it).
 
 ### `metrics`
 

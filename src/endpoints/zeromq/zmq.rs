@@ -15,6 +15,19 @@ use tokio::sync::oneshot;
 use tracing::trace;
 use zeromq::{Socket, SocketRecv, SocketSend, ZmqMessage};
 
+use super::codec;
+
+/// Pack codec frames (always at least one) into a `ZmqMessage`.
+fn frames_to_zmq(frames: Vec<bytes::Bytes>) -> ZmqMessage {
+    let mut it = frames.into_iter();
+    let first = it.next().unwrap_or_default();
+    let mut msg = ZmqMessage::from(first);
+    for frame in it {
+        msg.push_back(frame);
+    }
+    msg
+}
+
 enum SenderSocket {
     Push(zeromq::PushSocket),
     Pub(zeromq::PubSocket),
@@ -73,6 +86,8 @@ impl ZeroMqPublisher {
 
         let buffer_size = config.internal_buffer_size.unwrap_or(128).max(1);
         let (tx, rx) = bounded::<PublisherJob>(buffer_size);
+        let request_timeout =
+            std::time::Duration::from_millis(config.request_timeout_ms.unwrap_or(30_000));
         tokio::spawn(async move {
             while let Ok(job) = rx.recv().await {
                 match job {
@@ -91,11 +106,21 @@ impl ZeroMqPublisher {
                     },
                     PublisherJob::Request(msg, reply_tx) => match &mut socket {
                         SenderSocket::Req(s) => {
-                            if let Err(e) = s.send(msg).await {
-                                let _ = reply_tx.send(Err(e));
-                            } else {
-                                let res = s.recv().await;
-                                let _ = reply_tx.send(res);
+                            // Bound the send+recv exchange so an unresponsive REP peer can't
+                            // stall this task (and every queued job behind it) indefinitely.
+                            let exchange = async {
+                                s.send(msg).await?;
+                                s.recv().await
+                            };
+                            match tokio::time::timeout(request_timeout, exchange).await {
+                                Ok(res) => {
+                                    let _ = reply_tx.send(res);
+                                }
+                                Err(_) => {
+                                    let _ = reply_tx.send(Err(zeromq::ZmqError::Other(
+                                        "ZeroMQ REQ/REP exchange timed out",
+                                    )));
+                                }
                             }
                         }
                         _ => {
@@ -115,21 +140,12 @@ impl ZeroMqPublisher {
         })
     }
 
-    /// Build the wire frames for one message in `raw`/`raw_framed` mode. `raw` sends the
-    /// payload as a single frame; `raw_framed` prepends a JSON metadata frame so the
-    /// payload stays binary-safe while headers still travel.
+    /// Build the wire frames for one message in `raw`/`raw_framed` mode, then pack
+    /// them into a [`ZmqMessage`]. See [`codec::encode_frames`] for the
+    /// per-format framing.
     fn frame_message(&self, message: &mut CanonicalMessage) -> Result<ZmqMessage, PublisherError> {
-        if matches!(self.format, ZeroMqFormat::RawFramed) {
-            // Source/provenance keys are per-hop context and must not be forwarded.
-            message.strip_source_metadata();
-            let meta = serde_json::to_vec(&message.metadata)
-                .map_err(|e| PublisherError::NonRetryable(anyhow!(e)))?;
-            let mut zmq_msg = ZmqMessage::from(bytes::Bytes::from(meta));
-            zmq_msg.push_back(message.payload.clone());
-            Ok(zmq_msg)
-        } else {
-            Ok(ZmqMessage::from(message.payload.clone()))
-        }
+        let frames = codec::encode_frames(message, &self.format)?;
+        Ok(frames_to_zmq(frames))
     }
 
     /// Send each message as its own ZMQ message (one per message, not batched), used
@@ -340,6 +356,8 @@ pub struct ZeroMqConsumer {
     // frame is payload, not a topic, so the cursor must not be attached there.
     is_sub: bool,
     format: ZeroMqFormat,
+    /// Drain mode: only then does an idle recv return without filling (empty batch).
+    exit_on_empty: bool,
 }
 
 impl ZeroMqConsumer {
@@ -389,59 +407,71 @@ impl ZeroMqConsumer {
         let (tx, rx) = bounded::<Result<ConsumerItem, ConsumerError>>(buffer_size);
         tokio::spawn(async move {
             loop {
-                let res = match &mut socket {
-                    ReceiverSocket::Pull(s) => s.recv().await.map(|msg| ConsumerItem {
-                        msg,
-                        reply_tx: None,
-                    }),
-                    ReceiverSocket::Sub(s) => s.recv().await.map(|msg| ConsumerItem {
-                        msg,
-                        reply_tx: None,
-                    }),
-                    ReceiverSocket::Rep(s) => {
-                        match s.recv().await {
-                            Ok(msg) => {
-                                let (reply_tx, reply_rx) = oneshot::channel();
-                                let item = ConsumerItem {
-                                    msg,
-                                    reply_tx: Some(reply_tx),
-                                };
-                                if tx.send(Ok(item)).await.is_err() {
-                                    break;
-                                }
-                                // Wait for the reply from the consumer logic
-                                let reply = match reply_rx.await {
-                                    Ok(msg) => msg,
-                                    Err(e) => {
-                                        tracing::error!(
-                                            "Failed to receive reply from consumer logic: {}",
-                                            e
-                                        );
-                                        ZmqMessage::from(bytes::Bytes::from("consumer_failed"))
-                                    }
-                                };
-                                s.send(reply).await.map(|_| ConsumerItem {
-                                    msg: ZmqMessage::from(bytes::Bytes::new()),
-                                    reply_tx: None,
-                                }) // Dummy return to satisfy type, we loop anyway
-                            }
-                            Err(e) => Err(e),
+                match &mut socket {
+                    ReceiverSocket::Pull(s) => {
+                        let item_res = s
+                            .recv()
+                            .await
+                            .map(|msg| ConsumerItem {
+                                msg,
+                                reply_tx: None,
+                            })
+                            .map_err(|e| ConsumerError::Connection(anyhow!(e)));
+                        if tx.send(item_res).await.is_err() {
+                            break;
                         }
                     }
-                };
-
-                // For Rep, we already handled the send inside the match. For others, we send here.
-                // Actually, let's restructure to avoid the dummy return.
-                if let ReceiverSocket::Rep(_) = socket {
-                    if let Err(e) = res {
-                        let _ = tx.send(Err(ConsumerError::Connection(anyhow!(e)))).await;
+                    ReceiverSocket::Sub(s) => {
+                        let item_res = s
+                            .recv()
+                            .await
+                            .map(|msg| ConsumerItem {
+                                msg,
+                                reply_tx: None,
+                            })
+                            .map_err(|e| ConsumerError::Connection(anyhow!(e)));
+                        if tx.send(item_res).await.is_err() {
+                            break;
+                        }
                     }
-                    continue;
-                }
-
-                let item_res = res.map_err(|e| ConsumerError::Connection(anyhow!(e)));
-                if tx.send(item_res).await.is_err() {
-                    break;
+                    ReceiverSocket::Rep(s) => {
+                        // Keep the whole request/reply exchange in one branch: receive the
+                        // request, deliver it, await the consumer's reply, and send it back —
+                        // with no dummy ConsumerItem and no re-inspection of the socket after.
+                        let msg = match s.recv().await {
+                            Ok(msg) => msg,
+                            Err(e) => {
+                                // A failed receive is a genuine new connection error.
+                                let _ = tx.send(Err(ConsumerError::Connection(anyhow!(e)))).await;
+                                continue;
+                            }
+                        };
+                        let (reply_tx, reply_rx) = oneshot::channel();
+                        let item = ConsumerItem {
+                            msg,
+                            reply_tx: Some(reply_tx),
+                        };
+                        if tx.send(Ok(item)).await.is_err() {
+                            break;
+                        }
+                        // Wait for the consumer logic to produce the reply for THIS request.
+                        let reply = match reply_rx.await {
+                            Ok(reply) => reply,
+                            Err(e) => {
+                                tracing::error!(
+                                    "Failed to receive reply from consumer logic: {}",
+                                    e
+                                );
+                                ZmqMessage::from(bytes::Bytes::from("consumer_failed"))
+                            }
+                        };
+                        // A failed reply-send belongs to the request already delivered above,
+                        // not to a later unrelated one, so log it here rather than enqueueing
+                        // a stray ConsumerError into the stream.
+                        if let Err(e) = s.send(reply).await {
+                            tracing::error!("Failed to send ZeroMQ REP reply: {}", e);
+                        }
+                    }
                 }
             }
         });
@@ -451,6 +481,7 @@ impl ZeroMqConsumer {
             buffer: VecDeque::new(),
             is_sub,
             format,
+            exit_on_empty: false,
         })
     }
 
@@ -459,90 +490,31 @@ impl ZeroMqConsumer {
         is_sub: bool,
         format: &ZeroMqFormat,
     ) -> anyhow::Result<Vec<CanonicalMessage>> {
-        let frames = zmq_msg.into_vec();
-        let payload = frames.last().cloned().unwrap_or_default();
-        // Only short-circuit genuinely empty single-frame inputs. Multipart Raw/RawFramed
-        // messages may carry a trailing empty payload (or leading metadata) that still
-        // needs to be emitted, so don't drop them here.
-        if payload.is_empty() && frames.len() <= 1 {
-            return Ok(vec![]);
-        }
-        // Only SUB traffic prepends the subscription topic as a leading frame;
-        // PUSH/PULL and REP carry payload frames only, so a leading frame there is
-        // not a topic. In raw_framed the leading frame is the metadata frame, not a
-        // topic, so no cursor applies there either.
-        let topic = if is_sub && frames.len() > 1 && !matches!(format, ZeroMqFormat::RawFramed) {
-            Some(String::from_utf8_lossy(frames[0].as_ref()).into_owned())
-        } else {
-            None
-        };
-        let mut messages = match format {
-            // Opaque bytes; never JSON-decode. A raw producer may send multipart, so
-            // emit one message per payload frame (dropping the SUB topic frame).
-            ZeroMqFormat::Raw => {
-                let payload_frames = if is_sub && frames.len() > 1 {
-                    &frames[1..]
-                } else {
-                    &frames[..]
-                };
-                payload_frames
-                    .iter()
-                    .map(|f| CanonicalMessage::new_bytes(f.clone(), None))
-                    .collect()
-            }
-            // Two-frame layout: [metadata JSON, raw payload]. Degrade to payload-only
-            // when a single frame arrives (e.g. a plain raw producer).
-            ZeroMqFormat::RawFramed => {
-                let mut msg = CanonicalMessage::new_bytes(payload.clone(), None);
-                if frames.len() > 1 {
-                    if let Ok(meta) = serde_json::from_slice::<
-                        std::collections::HashMap<String, String>,
-                    >(frames[0].as_ref())
-                    {
-                        msg.metadata = meta;
-                    }
-                }
-                vec![msg]
-            }
-            ZeroMqFormat::Json => {
-                if let Ok(messages) = serde_json::from_slice::<Vec<CanonicalMessage>>(&payload) {
-                    messages
-                } else if let Ok(message) = serde_json::from_slice::<CanonicalMessage>(&payload) {
-                    vec![message]
-                } else {
-                    vec![CanonicalMessage::new(payload.to_vec(), None)]
-                }
-            }
-        };
-        for message in &mut messages {
-            // Never let a spoofed `mqb.src.*` key in the inbound payload survive;
-            // the authoritative topic cursor (SUB only) is injected below.
-            message.strip_source_metadata();
-        }
-        // Opt-in via the MQB_SOURCE_METADATA env var; off by default.
-        if crate::canonical_message::source_metadata_enabled() {
-            if let Some(topic) = topic {
-                for message in &mut messages {
-                    message
-                        .metadata
-                        .insert("mqb.src.zeromq_topic".to_string(), topic.clone());
-                }
-            }
-        }
-        Ok(messages)
+        codec::decode_frames(zmq_msg.into_vec(), is_sub, format)
     }
 
     async fn fill_buffer(&mut self) -> Result<(), ConsumerError> {
-        let item = self
-            .rx
-            .recv()
-            .await
-            .map_err(|_| ConsumerError::EndOfStream)??;
+        // Drain mode: a brief idle timeout returns empty-handed so --drain can fire.
+        let Some(item) = crate::traits::drain_gated(self.exit_on_empty, self.rx.recv()).await
+        else {
+            return Ok(());
+        };
+        let item = item.map_err(|_| ConsumerError::EndOfStream)??;
         let msgs = Self::decode_batch(item.msg, self.is_sub, &self.format)
             .map_err(|e| ConsumerError::Connection(anyhow!(e)))?;
 
         if let Some(tx) = item.reply_tx {
             let count = msgs.len();
+            if count == 0 {
+                // No decoded messages means no per-message commit will ever fire to
+                // resolve the reply. Answer the pending REP request immediately (with an
+                // empty JSON array, matching the commit path's wire format) so the REQ
+                // peer isn't left blocking forever.
+                let payload =
+                    serde_json::to_vec(&Vec::<CanonicalMessage>::new()).unwrap_or_default();
+                let _ = tx.send(ZmqMessage::from(bytes::Bytes::from(payload)));
+                return Ok(());
+            }
             let state = Arc::new(Mutex::new(BatchReplyState {
                 tx: Some(tx),
                 responses: vec![None; count],
@@ -575,6 +547,9 @@ impl MessageConsumer for ZeroMqConsumer {
     // replies or is a no-op), so commits are order-independent.
     fn commit_requires_order(&self) -> bool {
         false
+    }
+    fn set_exit_on_empty(&mut self, exit_on_empty: bool) {
+        self.exit_on_empty = exit_on_empty;
     }
     async fn receive_batch(&mut self, max_messages: usize) -> Result<ReceivedBatch, ConsumerError> {
         if max_messages == 0 {

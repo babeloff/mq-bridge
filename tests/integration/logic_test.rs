@@ -9,7 +9,7 @@ async fn test_memory_request_reply_logic() {
     // This test verifies the Request -> Route -> Handler -> Response Endpoint flow.
     let in_topic = "req_rep_in";
 
-    // 1. Define a route with a handler that produces a reply.
+    // Define a route with a handler that produces a reply.
     let handler = |mut msg: CanonicalMessage| async move {
         let payload = msg.get_payload_str();
         msg.set_payload_str(format!("reply_to_{}", payload));
@@ -24,7 +24,7 @@ async fn test_memory_request_reply_logic() {
 
     route.deploy("logic_req_rep").await.unwrap();
 
-    // 2. Create a publisher with request_reply mode enabled.
+    // Create a publisher with request_reply mode enabled.
     let mut config = mq_bridge::models::MemoryConfig::new(in_topic, Some(100));
     config.request_reply = true;
     config.request_timeout_ms = Some(2000);
@@ -36,7 +36,6 @@ async fn test_memory_request_reply_logic() {
     .await
     .unwrap();
 
-    // 3. Send request and verify response.
     let result = publisher.send("hello".into()).await.unwrap();
 
     if let Sent::Response(resp) = result {

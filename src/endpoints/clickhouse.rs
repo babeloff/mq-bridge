@@ -213,8 +213,10 @@ impl ChClient {
             .await
             .with_context(|| format!("ClickHouse request to '{}' failed", self.url))?;
         let status = resp.status();
-        // reqwest strips `Content-Encoding` after auto-gunzipping, so a surviving `lz4`/`zstd` here
-        // means the raw body still needs decoding; anything else (incl. gunzipped gzip) is plain.
+        // reqwest strips `Content-Encoding` after auto-gunzipping, so a surviving encoding here
+        // means the raw body still needs decoding: `gzip` (only reachable when we asked for
+        // lz4/zstd and the server ignored it), `lz4`, and `zstd` are decoded below; anything
+        // else is treated as plain.
         let resp_encoding = resp
             .headers()
             .get(reqwest::header::CONTENT_ENCODING)
@@ -227,6 +229,21 @@ impl ChClient {
             )
         })?;
         let text = match resp_encoding.as_deref() {
+            Some("gzip") => {
+                // When we asked for lz4/zstd, reqwest's auto-gunzip is disabled, so a server
+                // that still answers with gzip leaves a live `Content-Encoding: gzip` we must
+                // decode ourselves (using the clickhouse feature's flate2 dependency).
+                use std::io::Read;
+                let mut decoder = flate2::read::GzDecoder::new(&bytes[..]);
+                let mut decoded = Vec::new();
+                decoder.read_to_end(&mut decoded).with_context(|| {
+                    format!(
+                        "Failed to gzip-decode ClickHouse response from '{}'",
+                        self.url
+                    )
+                })?;
+                String::from_utf8_lossy(&decoded).into_owned()
+            }
             Some("lz4") => {
                 let decoded = lz4_decode_all(&bytes).with_context(|| {
                     format!(

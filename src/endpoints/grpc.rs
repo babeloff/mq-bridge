@@ -83,6 +83,13 @@ impl MessageConsumer for GrpcConsumer {
         false
     }
 
+    fn set_exit_on_empty(&mut self, exit_on_empty: bool) {
+        match &mut self.inner {
+            GrpcConsumerInner::Client(c) => c.set_exit_on_empty(exit_on_empty),
+            GrpcConsumerInner::Server(s) => s.set_exit_on_empty(exit_on_empty),
+        }
+    }
+
     async fn receive_batch(
         &mut self,
         max_messages: usize,
@@ -125,6 +132,8 @@ impl MessageConsumer for GrpcConsumer {
 struct ClientModeConsumer {
     _client: BridgeClient<Channel>,
     stream: tonic::Streaming<BridgeMessage>,
+    /// Drain mode: only then does an idle first-message read time out into an empty batch.
+    exit_on_empty: bool,
 }
 
 impl ClientModeConsumer {
@@ -150,17 +159,21 @@ impl ClientModeConsumer {
         Ok(Self {
             _client: client,
             stream,
+            exit_on_empty: false,
         })
     }
 }
 
 #[async_trait]
 impl MessageConsumer for ClientModeConsumer {
+    fn set_exit_on_empty(&mut self, exit_on_empty: bool) {
+        self.exit_on_empty = exit_on_empty;
+    }
     async fn receive_batch(
         &mut self,
         max_messages: usize,
     ) -> Result<crate::outcomes::ReceivedBatch, ConsumerError> {
-        receive_from_stream(&mut self.stream, max_messages).await
+        receive_from_stream(&mut self.stream, max_messages, self.exit_on_empty).await
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -173,11 +186,16 @@ impl MessageConsumer for ClientModeConsumer {
 async fn receive_from_stream(
     stream: &mut tonic::Streaming<BridgeMessage>,
     max_messages: usize,
+    exit_on_empty: bool,
 ) -> Result<crate::outcomes::ReceivedBatch, ConsumerError> {
     let mut messages = Vec::with_capacity(max_messages);
     loop {
         let result = if messages.is_empty() {
-            Ok(stream.message().await)
+            // Drain mode: a brief idle timeout on the first message yields an empty batch.
+            match crate::traits::drain_gated(exit_on_empty, stream.message()).await {
+                Some(r) => Ok(r),
+                None => return Ok(crate::outcomes::ReceivedBatch::empty()),
+            }
         } else {
             tokio::time::timeout(Duration::from_millis(GRPC_BATCH_POLL_MS), stream.message()).await
         };
@@ -223,6 +241,8 @@ struct ServerModeConsumer {
     rxs: Vec<mpsc::Receiver<BridgeMessage>>,
     // Round-robin cursor for the next shard to drain first, so none starves.
     drain_start: usize,
+    /// Drain mode: only then does an idle first-message poll time out into an empty batch.
+    exit_on_empty: bool,
 }
 
 /// Tonic service implementation that fans incoming messages into a subscriber
@@ -521,6 +541,7 @@ impl ServerModeConsumer {
             shared_server,
             rxs,
             drain_start: 0,
+            exit_on_empty: false,
         })
     }
 
@@ -670,6 +691,9 @@ impl Drop for ServerModeConsumer {
 
 #[async_trait]
 impl MessageConsumer for ServerModeConsumer {
+    fn set_exit_on_empty(&mut self, exit_on_empty: bool) {
+        self.exit_on_empty = exit_on_empty;
+    }
     async fn receive_batch(
         &mut self,
         max_messages: usize,
@@ -718,7 +742,11 @@ impl MessageConsumer for ServerModeConsumer {
                 }
             });
             let next = if messages.is_empty() {
-                poll.await
+                // Drain mode: a brief idle timeout on the first message yields an empty batch.
+                match crate::traits::drain_gated(self.exit_on_empty, poll).await {
+                    Some(value) => value,
+                    None => return Ok(crate::outcomes::ReceivedBatch::empty()),
+                }
             } else {
                 match tokio::time::timeout(Duration::from_millis(GRPC_BATCH_POLL_MS), poll).await {
                     Ok(value) => value,
@@ -1151,7 +1179,6 @@ mod tests {
             ..Default::default()
         };
 
-        // 1. Test Publisher
         let publisher_ep = Endpoint {
             endpoint_type: EndpointType::Grpc(config.clone()),
             middlewares: vec![],
@@ -1172,7 +1199,6 @@ mod tests {
         let received_msg = rx_for_pub_test.recv().await.unwrap();
         assert_eq!(received_msg.payload, sent_payload.as_bytes());
 
-        // 2. Test Consumer
         let consumer_ep = Endpoint {
             endpoint_type: EndpointType::Grpc(config),
             middlewares: vec![],
@@ -1181,7 +1207,6 @@ mod tests {
         // Create the consumer first. This will establish the subscription inside `new()`.
         let mut consumer = consumer_ep.create_consumer("test_route").await.unwrap();
 
-        // Now send messages for the consumer to receive.
         tx.send(BridgeMessage {
             payload: b"grpc_payload_1".to_vec(),
             id: "0190163d-8694-739b-aea5-966c26f8ad90".to_string(),
@@ -1205,7 +1230,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_grpc_route_end_to_end() {
-        // 1. Setup Mock Server on a unique port
+        // Setup Mock Server on a unique port
         let addr = "[::1]:50052".parse().unwrap();
         let (tx, _) = broadcast::channel(32);
         let bridge = MockBridge { tx };
@@ -1218,7 +1243,6 @@ mod tests {
         });
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-        // 2. Setup Config and Endpoints
         let config = GrpcConfig {
             url: format!("http://{}", addr),
             timeout_ms: None,
@@ -1250,7 +1274,7 @@ mod tests {
         let mem_dest_ep = Endpoint::new_memory(&mem_dest_topic, 10);
         let mut mem_dest_consumer = mem_dest_ep.create_consumer("test_route").await.unwrap();
 
-        // 3. Setup and run routes using deploy()
+        // Setup and run routes using deploy()
         // Route 1: Memory -> gRPC (tests GrpcPublisher::send_batch)
         let route_to_grpc = Route::new(mem_source_ep, grpc_publisher_ep);
         route_to_grpc.deploy("route_to_grpc").await.unwrap();
@@ -1259,7 +1283,7 @@ mod tests {
         let route_from_grpc = Route::new(grpc_consumer_ep, mem_dest_ep);
         route_from_grpc.deploy("route_from_grpc").await.unwrap();
 
-        // 4. Execute test: Send a batch of messages into the first route
+        // Execute test: Send a batch of messages into the first route
         let messages_to_send = vec![
             CanonicalMessage::new("e2e_payload_1".into(), None),
             CanonicalMessage::new("e2e_payload_2".into(), None),
@@ -1269,7 +1293,7 @@ mod tests {
             .await
             .unwrap();
 
-        // 5. Verify: Receive the batch from the second route's destination
+        // Verify: Receive the batch from the second route's destination
         let mut received_messages = Vec::new();
         while received_messages.len() < messages_to_send.len() {
             let batch = mem_dest_consumer.receive_batch(5).await.unwrap();
@@ -1286,7 +1310,6 @@ mod tests {
             messages_to_send[1].get_payload_str()
         );
 
-        // 6. Teardown
         server_handle.abort();
     }
     #[tokio::test]

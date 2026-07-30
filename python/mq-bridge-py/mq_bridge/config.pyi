@@ -80,7 +80,8 @@ class DeadLetterQueueMiddleware(TypedDict, total=False):
 
 class DeduplicationMiddleware(TypedDict, total=False):
     """Deduplication middleware configuration."""
-    sled_path: Required[str]
+    sled_path: Optional[str]
+    store: Optional[str]
     ttl_seconds: Required[int]
 
 
@@ -106,36 +107,7 @@ class EncryptionConfig(TypedDict, total=False):
 
 class Endpoint(TypedDict, total=False):
     """Represents a connection point for messages, which can be a source (input) or a sink (output)."""
-    amqp: AmqpConfig
-    aws: AwsConfig
-    clickhouse: ClickHouseConfig
-    custom: Dict[str, Any]
-    fanout: List[Endpoint]
-    file: FileConfig
-    grpc: GrpcConfig
-    http: HttpConfig
-    ibmmq: IbmMqConfig
-    kafka: KafkaConfig
-    memory: MemoryConfig
     middlewares: List[Middleware]
-    mongodb: MongoDbConfig
-    mqtt: MqttConfig
-    nats: NatsConfig
-    null: Any
-    object_store: ObjectStoreConfig
-    postgres_cdc: PostgresCdcConfig
-    reader: Endpoint
-    redis_streams: RedisStreamsConfig
-    ref: str
-    request: RequestForwardConfig
-    response: ResponseConfig
-    sled: SledConfig
-    sqlx: SqlxConfig
-    static: StaticConfig
-    stream_buffer: StreamBufferConfig
-    switch: SwitchConfig
-    websocket: WebSocketConfig
-    zeromq: ZeroMqConfig
 
 
 class FileConfig(TypedDict, total=False):
@@ -278,11 +250,13 @@ class MongoDbConfig(TypedDict, total=False):
     cursor_id: Optional[str]
     database: Required[str]
     format: MongoDbFormat
+    id_field: Optional[str]
     meta_collection: Optional[str]
     password: Optional[str]
     polling_interval_ms: Optional[int]
     receive_query: Optional[str]
     reply_polling_ms: Optional[int]
+    report_outcome: bool
     request_reply: bool
     request_timeout_ms: Optional[int]
     shared: Optional[bool]
@@ -415,7 +389,7 @@ class Route(TypedDict, total=False):
     empty_batch_delay_ms: int
     exit_on_empty: bool
     input: Required[Endpoint]
-    output: Endpoint
+    output: Optional[Endpoint]
     reconnect_interval_ms: int
     startup_timeout_ms: int
 
@@ -510,9 +484,11 @@ class WebSocketConfig(TypedDict, total=False):
 
 
 class ZeroMqConfig(TypedDict, total=False):
+    backend: ZeroMqBackend
     bind: bool
     format: ZeroMqFormat
     internal_buffer_size: Optional[int]
+    request_timeout_ms: Optional[int]
     socket_type: Optional[ZeroMqSocketType]
     topic: Optional[str]
     url: Required[str]
@@ -532,6 +508,7 @@ StaticConfig = Union[str, Dict[str, Any]]
 TransformErrorPolicy = Literal["reject", "pass_through"]
 WeakJoinTimeout = Literal["fire", "discard"]
 WebSocketExecutionMode = Literal["auto", "direct_only", "routed"]
+ZeroMqBackend = Literal["zmq", "omq"]
 ZeroMqFormat = Literal["json", "raw", "raw_framed"]
 ZeroMqSocketType = Literal["push", "pull", "pub", "sub", "req", "rep"]
 

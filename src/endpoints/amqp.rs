@@ -482,6 +482,8 @@ pub struct AmqpConsumer {
     is_poisoned: Arc<AtomicBool>,
     reply_confirms_selected: Arc<tokio::sync::OnceCell<()>>,
     prefetch: u16,
+    /// Drain mode: only then does an idle wait surface an empty batch.
+    exit_on_empty: bool,
 }
 
 impl AmqpConsumer {
@@ -561,9 +563,7 @@ impl AmqpConsumer {
             queue_or_exchange.to_string()
         };
 
-        // Set prefetch count. This acts as a buffer and is crucial for concurrent processing.
-        // We'll get the concurrency from the route config, but for now, let's use a reasonable default
-        // that can be overridden by a new method.
+        // Prefetch buffers for concurrent processing; defaults to 100.
         let prefetch_count = config.prefetch_count.unwrap_or(100);
         with_setup_timeout(
             "basic_qos",
@@ -597,6 +597,7 @@ impl AmqpConsumer {
             is_poisoned: Arc::new(AtomicBool::new(false)),
             reply_confirms_selected: Arc::new(tokio::sync::OnceCell::new()),
             prefetch: prefetch_count,
+            exit_on_empty: false,
         })
     }
 }
@@ -749,6 +750,9 @@ impl MessageConsumer for AmqpConsumer {
     fn commit_requires_order(&self) -> bool {
         false
     }
+    fn set_exit_on_empty(&mut self, exit_on_empty: bool) {
+        self.exit_on_empty = exit_on_empty;
+    }
     async fn receive_batch(&mut self, max_messages: usize) -> Result<ReceivedBatch, ConsumerError> {
         if self.is_poisoned.load(Ordering::Relaxed) {
             return Err(ConsumerError::Connection(anyhow::anyhow!(
@@ -763,14 +767,17 @@ impl MessageConsumer for AmqpConsumer {
             });
         }
 
-        // 1. Wait for the first message. This blocks until a message is available,
-        //    but each wait is bounded so we can periodically verify the broker
-        //    connection is still alive. In lapin 4 a dropped connection does not
-        //    reliably terminate the consumer stream, so without this health check
-        //    `next()` would block forever after the broker goes away and the route
-        //    would never see the Connection error it needs to recreate the consumer.
+        // 1. Wait for the first message, bounded so we can periodically check the broker is
+        //    alive: in lapin 4 a dropped connection doesn't terminate the stream, so an unbounded
+        //    `next()` would block forever and the route would never see the Connection error.
+        //    In drain mode the wait shortens to the drain timeout so `exit_on_empty` fires promptly.
+        let poll_window = if self.exit_on_empty {
+            CONSUMER_HEALTH_POLL.min(crate::traits::drain_idle_timeout())
+        } else {
+            CONSUMER_HEALTH_POLL
+        };
         let first_delivery = loop {
-            match tokio::time::timeout(CONSUMER_HEALTH_POLL, self.consumer.next()).await {
+            match tokio::time::timeout(poll_window, self.consumer.next()).await {
                 Ok(Some(Ok(delivery))) => break delivery,
                 Ok(Some(Err(e))) => return Err(ConsumerError::Connection(anyhow::anyhow!(e))),
                 Ok(None) => {
@@ -786,6 +793,10 @@ impl MessageConsumer for AmqpConsumer {
                         return Err(ConsumerError::Connection(anyhow::anyhow!(
                             "AMQP connection lost while waiting for messages"
                         )));
+                    }
+                    // Drain mode: surface an empty batch instead of looping on an idle queue.
+                    if self.exit_on_empty {
+                        return Ok(ReceivedBatch::empty());
                     }
                 }
             }

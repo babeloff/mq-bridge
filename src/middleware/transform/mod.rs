@@ -153,6 +153,10 @@ impl TransformConsumer {
 
 #[async_trait]
 impl MessageConsumer for TransformConsumer {
+    fn set_exit_on_empty(&mut self, exit_on_empty: bool) {
+        self.inner.set_exit_on_empty(exit_on_empty);
+    }
+
     fn commit_requires_order(&self) -> bool {
         self.inner.commit_requires_order()
     }
@@ -198,59 +202,73 @@ impl MessageConsumer for TransformConsumer {
     }
 
     async fn receive_batch(&mut self, max_messages: usize) -> Result<ReceivedBatch, ConsumerError> {
-        let batch = self.inner.receive_batch(max_messages).await?;
-        if self.compiled.is_noop() {
-            return Ok(batch);
-        }
+        loop {
+            let batch = self.inner.receive_batch(max_messages).await?;
+            if self.compiled.is_noop() {
+                return Ok(batch);
+            }
 
-        let ReceivedBatch { messages, commit } = batch;
-        let original_len = messages.len();
-        let mut kept = Vec::with_capacity(original_len);
-        let mut kept_indices: Vec<usize> = Vec::with_capacity(original_len);
+            let ReceivedBatch { messages, commit } = batch;
+            let original_len = messages.len();
+            let mut kept = Vec::with_capacity(original_len);
+            let mut kept_indices: Vec<usize> = Vec::with_capacity(original_len);
 
-        for (index, mut message) in messages.into_iter().enumerate() {
-            match self.compiled.transform(&mut message) {
-                Ok(()) => {
-                    kept_indices.push(index);
-                    kept.push(message);
-                }
-                Err(error) => match self.compiled.handle_failure(&mut message, error) {
+            for (index, mut message) in messages.into_iter().enumerate() {
+                match self.compiled.transform(&mut message) {
                     Ok(()) => {
                         kept_indices.push(index);
                         kept.push(message);
                     }
-                    Err(error) => {
-                        tracing::error!(
-                            message_id = format_args!("{:032x}", message.message_id),
-                            "Rejecting invalid input message: {error}"
-                        );
-                    }
-                },
+                    Err(error) => match self.compiled.handle_failure(&mut message, error) {
+                        Ok(()) => {
+                            kept_indices.push(index);
+                            kept.push(message);
+                        }
+                        Err(error) => {
+                            tracing::error!(
+                                message_id = format_args!("{:032x}", message.message_id),
+                                "Rejecting invalid input message: {error}"
+                            );
+                        }
+                    },
+                }
             }
-        }
 
-        if kept.len() == original_len {
+            if kept.len() == original_len {
+                return Ok(ReceivedBatch {
+                    messages: kept,
+                    commit,
+                });
+            }
+
+            if kept.is_empty() {
+                // Every message in a non-empty batch was rejected. Ack them so they are not
+                // redelivered forever, then loop to fetch the next batch rather than surfacing
+                // an empty (idle-looking) one — mirroring the `receive()` path above.
+                if original_len > 0 {
+                    commit(vec![MessageDisposition::Ack; original_len])
+                        .await
+                        .map_err(ConsumerError::Connection)?;
+                }
+                continue;
+            }
+
+            // Partial retention: rejected slots are acked and the caller's dispositions are
+            // placed back at the indices they actually came from, which keeps at-least-once
+            // intact for the surviving messages.
+            let remapped = Box::new(move |dispositions: Vec<MessageDisposition>| {
+                let mut full = vec![MessageDisposition::Ack; original_len];
+                for (slot, disposition) in kept_indices.into_iter().zip(dispositions) {
+                    full[slot] = disposition;
+                }
+                commit(full)
+            });
+
             return Ok(ReceivedBatch {
                 messages: kept,
-                commit,
+                commit: remapped,
             });
         }
-
-        // Rejected slots are acked so they are not redelivered forever; the caller's
-        // dispositions are placed back at the indices they actually came from, which
-        // keeps at-least-once intact for the surviving messages.
-        let remapped = Box::new(move |dispositions: Vec<MessageDisposition>| {
-            let mut full = vec![MessageDisposition::Ack; original_len];
-            for (slot, disposition) in kept_indices.into_iter().zip(dispositions) {
-                full[slot] = disposition;
-            }
-            commit(full)
-        });
-
-        Ok(ReceivedBatch {
-            messages: kept,
-            commit: remapped,
-        })
     }
 
     fn as_any(&self) -> &dyn Any {

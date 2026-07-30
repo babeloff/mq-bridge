@@ -797,19 +797,22 @@ impl Route {
                                         || e.downcast_ref::<ConsumerError>().is_some_and(|ce| matches!(ce, ConsumerError::Permanent(_)))
                                         || is_end_of_stream;
 
-                                    {
+                                    // EndOfStream is a clean terminal, not a failure, so
+                                    // it must not mark the route unhealthy.
+                                    if !is_end_of_stream {
                                         let mut s = recover_write_lock(&status_loop, "route_handle_status");
                                         s.healthy = false;
                                         s.error = Some(e.to_string());
                                     }
 
                                     if is_permanent {
-                                        outcome_guard.set(if is_end_of_stream {
-                                            RouteOutcome::Completed
+                                        if is_end_of_stream {
+                                            outcome_guard.set(RouteOutcome::Completed);
+                                            info!("Route '{}' completed: end of stream. Shutting down.", name);
                                         } else {
-                                            RouteOutcome::Failed
-                                        });
-                                        error!("Route '{}' failed with a permanent error: {}. Shutting down.", name, e);
+                                            outcome_guard.set(RouteOutcome::Failed);
+                                            error!("Route '{}' failed with a permanent error: {}. Shutting down.", name, e);
+                                        }
                                         break 'reconnect;
                                     }
 
@@ -902,6 +905,7 @@ impl Route {
     ) -> anyhow::Result<bool> {
         let publisher = create_publisher_from_route(name, &self.output).await?;
         let mut consumer = create_consumer_from_route(name, &self.input).await?;
+        consumer.set_exit_on_empty(self.options.exit_on_empty);
         if let Err(err) = run_publisher_connect_hook(name, &publisher).await {
             run_publisher_disconnect_hook(name, &publisher).await;
             return Err(err);
@@ -1034,6 +1038,7 @@ impl Route {
     ) -> anyhow::Result<bool> {
         let publisher = create_publisher_from_route(name, &self.output).await?;
         let mut consumer = create_consumer_from_route(name, &self.input).await?;
+        consumer.set_exit_on_empty(self.options.exit_on_empty);
         if let Err(err) = run_publisher_connect_hook(name, &publisher).await {
             run_publisher_disconnect_hook(name, &publisher).await;
             return Err(err);
@@ -2869,13 +2874,11 @@ mod tests {
         let input_ch = input.channel().unwrap();
         let out_channel = route.output.channel().unwrap();
 
-        // 1. Send poison message
         input_ch.send_message("poison".into()).await.unwrap();
 
-        // 2. Send valid message
         input_ch.send_message("valid".into()).await.unwrap();
 
-        // 3. Verify the valid message was processed and published
+        // Verify the valid message was processed and published
         let received = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
                 if let Some(msg) = out_channel.drain_messages().pop() {
@@ -2951,7 +2954,6 @@ mod tests {
             }
         }
 
-        // 1. Setup
         let in_topic = "batch_retry_dlq_in";
         let out_topic = "batch_retry_dlq_out";
         let dlq_topic = "batch_retry_dlq_dlq";
@@ -3017,7 +3019,6 @@ mod tests {
             }
         });
 
-        // 2. Send a batch of messages
         let mut messages = Vec::new();
         for i in 1..=4 {
             // 1 (ok), 2 (fail), 3 (ok), 4 (fail)
@@ -3026,7 +3027,6 @@ mod tests {
         let commit = wrap_commit(Box::new(|_| Box::pin(async { Ok(()) })), 0, seq_tx.clone());
         work_tx.send((messages, commit)).await.unwrap();
 
-        // 3. Verify
         let dlq_channel = dlq_endpoint.channel().unwrap();
 
         let start = std::time::Instant::now();
@@ -3106,8 +3106,8 @@ mod tests {
         input_ch.send_message("fail_msg".into()).await.unwrap();
 
         // Verify:
-        // 1. Output channel is empty (msg failed to go there)
-        // 2. DLQ channel has message
+        // Output channel is empty (msg failed to go there)
+        // DLQ channel has message
 
         let dlq_ch = dlq_endpoint.channel().unwrap();
 
@@ -3323,10 +3323,145 @@ mod tests {
         Route::stop("no_drain_test").await;
     }
 
-    // Regression: exit_on_empty must also terminate the route in concurrent mode
-    // (concurrency > 1). The concurrent runner previously reported the drain as
-    // `Ok(true)`, which the reconnect loop treats as "keep running", so the route
-    // busy-reconnected forever instead of stopping.
+    // A plain SQLite table with an `id`/`payload` schema but NO `locked_until` lease
+    // column — used to exercise both queue-mode failure (Issue 3) and cursor-mode
+    // full-table reads (Issue 2).
+    #[cfg(feature = "sqlx")]
+    async fn setup_plain_db(rows: usize) -> (tempfile::TempDir, String) {
+        use sqlx::Connection;
+        sqlx::any::install_default_drivers();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("plain.db");
+
+        #[cfg(windows)]
+        let url = format!("sqlite:///{}", path.to_string_lossy().replace('\\', "/"));
+        #[cfg(not(windows))]
+        let url = format!("sqlite://{}", path.to_str().unwrap());
+
+        drop(tokio::fs::File::create(&path).await.unwrap());
+
+        let mut conn = sqlx::AnyConnection::connect(&url).await.unwrap();
+        sqlx::query(
+            "CREATE TABLE items (id INTEGER PRIMARY KEY AUTOINCREMENT, payload TEXT NOT NULL)",
+        )
+        .execute(&mut conn)
+        .await
+        .unwrap();
+        for i in 0..rows {
+            sqlx::query("INSERT INTO items (payload) VALUES (?)")
+                .bind(format!("row-{i}"))
+                .execute(&mut conn)
+                .await
+                .unwrap();
+        }
+        conn.close().await.unwrap();
+        (dir, url)
+    }
+
+    // Issue 3 (regression): a queue-mode SQLx source (`delete_after_read`, no
+    // `cursor_column`) on a table lacking the `locked_until` lease column hits an
+    // unrecoverable "no such column" error. It must fail fast (RouteOutcome::Failed)
+    // instead of reconnecting every reconnect_interval_ms forever.
+    #[cfg(feature = "sqlx")]
+    #[tokio::test]
+    async fn test_route_sqlite_missing_locked_until_fails_fast() {
+        use crate::models::SqlxConfig;
+
+        let (_dir, url) = setup_plain_db(5).await;
+        let config = SqlxConfig {
+            url,
+            table: "items".to_string(),
+            delete_after_read: true, // queue-lease mode
+            ..Default::default()
+        };
+
+        let out_topic = format!("plain_fail_{}", fast_uuid_v7::gen_id());
+        let input = Endpoint::new(EndpointType::Sqlx(config));
+        let output = Endpoint::new_memory(&out_topic, 10);
+        let route = Route::new(input, output)
+            .with_exit_on_empty(true)
+            // Short interval: a reconnect-loop regression times out fast instead of hanging.
+            .with_reconnect_interval_ms(100);
+
+        let handle = route.run("plain_fail_test").await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while handle.outcome().is_none() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("route did not fail fast on the missing-column error");
+        assert_eq!(
+            handle.outcome(),
+            Some(RouteOutcome::Failed),
+            "an unrecoverable schema error must terminate the route as Failed"
+        );
+
+        Route::stop("plain_fail_test").await;
+    }
+
+    // Issue 2: SQLite gets a full-table read via `cursor_column`, exactly like
+    // Postgres (the ETL path) — read mode is config-driven, not driver-specific. A
+    // cursor-mode drain of the plain table reads every row and exits Completed.
+    #[cfg(feature = "sqlx")]
+    #[tokio::test]
+    async fn test_route_sqlite_cursor_column_drains_full_table() {
+        use crate::models::SqlxConfig;
+
+        const N: usize = 25;
+        let (_dir, url) = setup_plain_db(N).await;
+        let config = SqlxConfig {
+            url,
+            table: "items".to_string(),
+            cursor_column: Some("id".to_string()),
+            cursor_id: Some(format!("plain-cur-{}", fast_uuid_v7::gen_id())),
+            ..Default::default()
+        };
+
+        let out_topic = format!("plain_cursor_{}", fast_uuid_v7::gen_id());
+        let input = Endpoint::new(EndpointType::Sqlx(config));
+        let output = Endpoint::new_memory(&out_topic, 10);
+        let route = Route::new(input, output)
+            .with_batch_size(10)
+            .with_exit_on_empty(true);
+
+        let mut verifier = route
+            .connect_to_output("plain_cursor_verifier")
+            .await
+            .unwrap();
+        let collector = tokio::spawn(async move {
+            let mut received = 0usize;
+            while received < N {
+                let item = tokio::time::timeout(Duration::from_secs(5), verifier.receive())
+                    .await
+                    .expect("timed out draining output")
+                    .expect("output stream closed early");
+                received += 1;
+                (item.commit)(MessageDisposition::Ack).await.unwrap();
+            }
+            received
+        });
+
+        let handle = route.run("plain_cursor_test").await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while handle.outcome().is_none() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("cursor route did not drain and exit");
+        assert_eq!(handle.outcome(), Some(RouteOutcome::Completed));
+        handle.join().await.expect("route task panicked");
+
+        let received = tokio::time::timeout(Duration::from_secs(5), collector)
+            .await
+            .expect("timed out collecting output")
+            .expect("collector task panicked");
+        assert_eq!(received, N);
+    }
+
+    // exit_on_empty must stop the route in concurrent mode too, not just sequential:
+    // the drain reports empty so the reconnect loop stops instead of looping forever.
     #[cfg(feature = "sqlx")]
     #[tokio::test]
     async fn test_route_exit_on_empty_drains_and_stops_concurrent() {

@@ -62,7 +62,7 @@ src/
 │   ├── sled.rs          # Embedded sled queue
 │   ├── sqlx/            # PostgreSQL / MySQL / SQLite
 │   ├── websocket.rs     # WebSocket consumer/publisher
-│   ├── zeromq.rs        # ZeroMQ consumer/publisher
+│   ├── zeromq/          # ZeroMQ consumer/publisher backends and codecs
 │   └── structural/      # Structural endpoints (no external system)
 │       ├── fanout.rs          # Broadcast to every listed endpoint
 │       ├── switch.rs          # Content-based routing

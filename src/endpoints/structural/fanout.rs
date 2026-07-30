@@ -42,12 +42,10 @@ impl MessagePublisher for FanoutPublisher {
 
         let results = join_all(batch_sends).await;
 
-        // A hard error from any publisher is propagated. Otherwise the per-destination
-        // partial failures are merged: a message that failed at any destination is
-        // reported as failed for the whole fan-out, so the route nacks it. Duplicate
-        // entries for the same message across destinations are harmless (the route
-        // keys failures by message_id). Responses are not forwarded: with several
-        // destinations there is no single response to attribute to an input message.
+        // A hard error from any publisher propagates. Otherwise per-destination failures merge:
+        // a message that failed at any destination is nacked for the whole fan-out (duplicate
+        // failures across destinations are harmless — the route keys by message_id). Responses
+        // aren't forwarded: with several destinations there's no single response to attribute.
         let mut failed = Vec::new();
         for result in results {
             match result? {

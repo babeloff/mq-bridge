@@ -422,14 +422,11 @@ impl FilePublisher {
         &self,
         messages: Vec<CanonicalMessage>,
     ) -> Result<SentBatch, PublisherError> {
-        // Opened up front, before the CPU-bound encode/compress/seal below, and kept
-        // open until the append. The order matters for throughput, not just tidiness:
-        // this task is woken by the route's producer and lands in that thread's LIFO
-        // slot, so any CPU it runs before its first suspension point holds the producer
-        // there. `open` is a blocking-pool hop that always suspends, which is why the
-        // plain path (which opens first) never stalls; building the member first cost
-        // ~1.9ms of producer dead time per batch, made compressed writes ~35% slower
-        // and pinned the pipeline to one core regardless of `concurrency`.
+        // Open up front, before the CPU-bound encode/compress/seal below. Order matters for
+        // throughput: this task lands in the producer thread's LIFO slot, so any CPU before its
+        // first suspension holds the producer there. `open` always suspends (blocking-pool hop);
+        // building the member first cost ~1.9ms/batch of producer stall, ~35% slower compressed
+        // writes, and pinned the pipeline to one core regardless of `concurrency`.
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -662,10 +659,8 @@ impl MessagePublisher for FilePublisher {
         trace!(count = messages.len(), path = %self.path, message_ids = ?LazyMessageIds(&messages), "Writing batch to file");
         let _file_guard = self.file_lock.lock().await;
 
-        // We open the file for every batch to ensure we are writing to the current file path.
-        // This handles external file rotation/deletion (e.g. by the consumer in delete mode)
-        // where the old file handle would point to a deleted inode.
-        // While this has a performance cost, it ensures correctness.
+        // Reopen per batch so external rotation/deletion (e.g. consumer delete mode) can't leave
+        // us writing to a stale handle on a deleted inode. Costs some throughput for correctness.
         let file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -673,10 +668,9 @@ impl MessagePublisher for FilePublisher {
             .await
             .context("Failed to open file for writing batch")?;
 
-        // Length before the batch. The 1 MiB BufWriter auto-flushes full chunks mid-loop, so a
-        // failure partway through a large batch can leave a partial prefix on disk; truncate back
-        // to here on failure so the Retryable re-append starts clean instead of duplicating it.
-        // `None` (stat failed) degrades to the old behaviour: no rollback.
+        // Length before the batch: the BufWriter auto-flushes mid-loop, so a mid-batch failure can
+        // leave a partial prefix. Truncate back here on failure so the retry re-appends cleanly.
+        // `None` (stat failed) means no rollback point, so a failed batch is left as-is.
         let pre_len = file.metadata().await.ok().map(|m| m.len());
         let file_is_empty = matches!(self.format, FileFormat::Csv) && pre_len == Some(0);
         // 1 MiB, not tokio's 8 KiB default: at ~100 B/record a small buffer turns a
@@ -1052,6 +1046,38 @@ struct FileTailConsumer {
     /// data; the next `receive_batch` surfaces it as an empty batch so a route
     /// with `exit_on_empty` can drain-then-exit.
     pending_eof: bool,
+    /// Member (compressed/encrypted) readers publish the reason they gave up
+    /// decoding here before closing the channel. When set, a closed channel is a
+    /// permanent decode failure (wrong codec/key), reported as
+    /// `ConsumerError::Permanent` so the route fails instead of completing cleanly.
+    /// `None` for plain readers, whose closed channel is a normal end-of-stream.
+    decode_error: Option<Arc<StdMutex<Option<String>>>>,
+    /// Set by the route when `exit_on_empty` is active. Tells the reader thread a
+    /// final record without a trailing delimiter is a complete record to emit
+    /// (the file is done), not a torn mid-write to withhold. Shared with the thread.
+    drain_on_empty: Arc<AtomicBool>,
+}
+
+/// Returns the `compression` codec name if the file at `path` begins with that
+/// compressor's magic bytes. Used to reject reading a compressed file with no
+/// `compression` configured (which would emit undecoded garbage). Names match the
+/// `Compression` config spelling. `None` if the file is absent, empty, too short,
+/// or has no recognized magic.
+fn sniff_compression_magic(path: &str) -> Option<&'static str> {
+    use std::io::Read;
+    let mut head = [0u8; 4];
+    let mut f = std::fs::File::open(path).ok()?;
+    let n = f.read(&mut head).ok()?;
+    let head = &head[..n];
+    if head.starts_with(&[0x1f, 0x8b]) {
+        Some("gzip")
+    } else if head.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]) {
+        Some("zstd")
+    } else if head.starts_with(&[0x04, 0x22, 0x4d, 0x18]) {
+        Some("lz4")
+    } else {
+        None
+    }
 }
 
 fn read_until_bytes_sync<R: std::io::BufRead>(
@@ -1076,6 +1102,7 @@ fn read_until_bytes_sync<R: std::io::BufRead>(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_file_tail_task_sync(
     path: String,
     msg_tx: async_channel::Sender<Vec<CanonicalMessage>>,
@@ -1084,6 +1111,7 @@ fn run_file_tail_task_sync(
     delimiter: Vec<u8>,
     format: FileFormat,
     ready: Arc<AtomicBool>,
+    drain_on_empty: Arc<AtomicBool>,
 ) {
     let mut last_position: u64 = initial_offset;
     let mut reader: Option<std::io::BufReader<std::fs::File>> = None;
@@ -1135,6 +1163,11 @@ fn run_file_tail_task_sync(
 
         let mut batch = Vec::with_capacity(BATCH_SIZE);
         let mut lines_read_in_batch = 0;
+        // Set when a final record without its delimiter is withheld (live tail). It
+        // suppresses the EOF marker below so a route cannot `exit_on_empty` before the
+        // record is delivered — closing the race where the reader reaches EOF before
+        // the route propagates its drain intent via `set_exit_on_empty`.
+        let mut pending_partial = false;
 
         if let Some(r) = reader.as_mut() {
             for _ in 0..BATCH_SIZE {
@@ -1143,11 +1176,38 @@ fn run_file_tail_task_sync(
                     Ok(0) => break, // EOF
                     Ok(n) => {
                         if !buf.ends_with(&delimiter) {
-                            // Torn/partial line: the writer's content reached disk
-                            // ahead of its trailing delimiter. Don't advance the
-                            // position or emit a message; drop the reader so the
-                            // next iteration reopens and re-seeks to last_position,
-                            // re-reading the line whole once the writer finishes it.
+                            if drain_on_empty.load(Ordering::SeqCst) {
+                                // Drain mode (exit_on_empty): the file is complete, so a
+                                // final record with no trailing delimiter is a whole
+                                // record. Emit it once, advancing past it; the next read
+                                // returns 0 (EOF) and the empty marker fires normally.
+                                last_position += n as u64;
+                                if delimiter.len() == 1
+                                    && delimiter[0] == b'\n'
+                                    && buf.ends_with(b"\r")
+                                {
+                                    buf.pop();
+                                }
+                                if let Some(mut msg) = parse_message(&buf, &format, &mut csv_header)
+                                {
+                                    if group_id.is_some() {
+                                        msg.metadata.insert(
+                                            "file_offset".to_string(),
+                                            last_position.to_string(),
+                                        );
+                                    }
+                                    batch.push(msg);
+                                }
+                                lines_read_in_batch += 1;
+                                break;
+                            }
+                            // Live tail (or drain intent not yet observed): torn/partial
+                            // line, the writer's content reached disk ahead of its trailing
+                            // delimiter. Don't advance the position or emit a message; drop
+                            // the reader so the next iteration reopens and re-seeks to
+                            // last_position, re-reading the line whole once the writer
+                            // finishes it (or the drain flag flips and it is emitted above).
+                            pending_partial = true;
                             reader = None;
                             break;
                         }
@@ -1185,7 +1245,8 @@ fn run_file_tail_task_sync(
         if lines_read_in_batch == 0 {
             // EOF reached. Emit an empty batch once so a drained route can pause
             // or, with exit_on_empty, terminate. Re-armed when new data arrives.
-            if !signaled_eof {
+            // Suppressed while a partial final record is pending (see pending_partial).
+            if !signaled_eof && !pending_partial {
                 if msg_tx.send_blocking(Vec::new()).is_err() {
                     break; // Consumer dropped, exit thread
                 }
@@ -1352,6 +1413,7 @@ fn run_file_member_consume_task_sync<F>(
     delimiter: Vec<u8>,
     format: FileFormat,
     ready: Arc<AtomicBool>,
+    decode_error_slot: Arc<StdMutex<Option<String>>>,
     make_reader: F,
 ) where
     F: Fn(std::fs::File) -> Box<dyn std::io::Read>,
@@ -1373,6 +1435,22 @@ fn run_file_member_consume_task_sync<F>(
 
     loop {
         let cur_len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+
+        // The file shrank (truncated or rotated): records we already emitted no longer
+        // exist, so re-read the member stream from the start instead of skipping past
+        // live data. Mirrors the tail reader resetting its byte position to 0. Guarded by
+        // a real baseline (`last_len` is `u64::MAX` until the first clean pass) so a
+        // decode-error pass — which never advances `last_len` — is not seen as a shrink.
+        if initialized && last_len != u64::MAX && cur_len < last_len {
+            tracing::warn!(
+                "File {} was truncated; re-reading member stream from the start.",
+                path
+            );
+            records_emitted = 0;
+            decode_failures = 0;
+            failure_len = u64::MAX;
+            signaled_eof = false;
+        }
 
         // No growth since the last full pass: emit the drain marker once, then poll.
         if initialized && cur_len == last_len {
@@ -1423,12 +1501,12 @@ fn run_file_member_consume_task_sync<F>(
                 decode_failures = 1;
             }
             if decode_failures >= MAX_DECODE_FAILURES {
-                tracing::error!(
-                    "Giving up decoding {} after {} failed attempts at {} bytes; closing stream",
-                    path,
-                    decode_failures,
-                    cur_len
+                let msg = format!(
+                    "Giving up decoding {path} after {decode_failures} failed attempts at {cur_len} bytes; \
+                     the file's compression/encryption likely does not match this endpoint's config"
                 );
+                tracing::error!("{msg}; closing stream");
+                *decode_error_slot.lock().unwrap() = Some(msg);
                 break;
             }
             std::thread::sleep(std::time::Duration::from_secs(1));
@@ -1496,12 +1574,12 @@ fn run_file_member_consume_task_sync<F>(
                 decode_failures = 1;
             }
             if decode_failures >= MAX_DECODE_FAILURES {
-                tracing::error!(
-                    "Giving up decoding {} after {} failed attempts at {} bytes; closing stream",
-                    path,
-                    decode_failures,
-                    cur_len
+                let msg = format!(
+                    "Giving up decoding {path} after {decode_failures} failed attempts at {cur_len} bytes; \
+                     the file's compression/encryption likely does not match this endpoint's config"
                 );
+                tracing::error!("{msg}; closing stream");
+                *decode_error_slot.lock().unwrap() = Some(msg);
                 break;
             }
             std::thread::sleep(std::time::Duration::from_secs(1));
@@ -1648,6 +1726,17 @@ impl FileConsumer {
             #[cfg(any(feature = "compression", feature = "encryption"))]
             return Self::new_member_consumer(config, delimiter, format).await;
         }
+        // No codec configured: guard against reading a compressed file as plaintext,
+        // which would otherwise split the raw bytes on newlines and emit binary garbage
+        // as "messages" under a clean success. A known compressor magic at offset 0 is
+        // unambiguous here (a JSON/text member never starts with these bytes).
+        if let Some(codec) = sniff_compression_magic(&config.path) {
+            return Err(anyhow::anyhow!(
+                "file '{}' begins with a {codec} magic header but no `compression` is configured; \
+                 set `compression: {codec}` (and any `encryption`) to match how it was written",
+                config.path
+            ));
+        }
         match &config.mode {
             None | Some(FileConsumerMode::Consume { delete: false }) => {
                 Self::new_tail(&config.path, false, None, delimiter.clone(), format).await
@@ -1757,6 +1846,8 @@ impl FileConsumer {
         let (msg_tx, msg_rx) = async_channel::bounded(100);
         let ready = Arc::new(AtomicBool::new(false));
         let ready_clone = ready.clone();
+        let decode_error: Arc<StdMutex<Option<String>>> = Arc::new(StdMutex::new(None));
+        let decode_error_clone = decode_error.clone();
 
         let compression = config.compression;
         #[cfg(feature = "encryption")]
@@ -1793,6 +1884,7 @@ impl FileConsumer {
                 delimiter,
                 format_clone,
                 ready_clone,
+                decode_error_clone,
                 make_reader,
             );
         });
@@ -1804,6 +1896,10 @@ impl FileConsumer {
                 offset_file: None,
                 ready,
                 pending_eof: false,
+                decode_error: Some(decode_error),
+                // Member (compressed/encrypted) readers decode framed members, not
+                // delimiter-split lines, so the trailing-partial-line rule doesn't apply.
+                drain_on_empty: Arc::new(AtomicBool::new(false)),
             }),
         })
     }
@@ -1819,6 +1915,8 @@ impl FileConsumer {
         let mut initial_offset = 0;
         let ready = Arc::new(AtomicBool::new(false));
         let ready_clone = ready.clone();
+        let drain_on_empty = Arc::new(AtomicBool::new(false));
+        let drain_on_empty_clone = drain_on_empty.clone();
         let mut offset_file = None;
 
         if let Some(gid) = &group_id {
@@ -1858,6 +1956,7 @@ impl FileConsumer {
                 delimiter,
                 format_clone,
                 ready_clone,
+                drain_on_empty_clone,
             );
         });
 
@@ -1870,6 +1969,8 @@ impl FileConsumer {
                 offset_file,
                 ready,
                 pending_eof: false,
+                decode_error: None,
+                drain_on_empty,
             }),
         })
     }
@@ -1886,6 +1987,17 @@ impl FileConsumer {
 
 #[async_trait]
 impl MessageConsumer for FileConsumer {
+    fn set_exit_on_empty(&mut self, exit_on_empty: bool) {
+        match &mut self.backend {
+            // Only the delimiter-splitting tail reader distinguishes a complete final
+            // record from a torn mid-write; propagate the drain intent to its thread.
+            ConsumerBackend::Tail(c) => c.drain_on_empty.store(exit_on_empty, Ordering::SeqCst),
+            // The event-store backend blocks for new events; forward so it can drain too.
+            ConsumerBackend::EventStore(c) => c.set_exit_on_empty(exit_on_empty),
+            ConsumerBackend::Queue(_) => {}
+        }
+    }
+
     // Intentionally keeps the ordered default: the offset-tracking backend commits
     // a cumulative byte offset (the max acked `file_offset`), so out-of-order
     // commits could advance the offset past un-acked messages and lose them.
@@ -1908,7 +2020,19 @@ impl MessageConsumer for FileConsumer {
                         // An empty batch is the watcher's end-of-file marker; fall
                         // through to return it as an empty batch.
                         Ok(batch) => c.buffer = batch,
-                        Err(_) => return Err(ConsumerError::EndOfStream),
+                        // Channel closed. For a member reader, a recorded decode
+                        // error means the codec/key didn't match — fail the route
+                        // rather than masquerade as a clean end-of-stream.
+                        Err(_) => {
+                            if let Some(reason) = c
+                                .decode_error
+                                .as_ref()
+                                .and_then(|slot| slot.lock().unwrap().take())
+                            {
+                                return Err(ConsumerError::Permanent(anyhow::anyhow!(reason)));
+                            }
+                            return Err(ConsumerError::EndOfStream);
+                        }
                     }
                 }
 

@@ -232,6 +232,13 @@ impl HttpPublisher {
                 || key == HTTP_VERSION
                 || key == "tls_cipher_suite"
                 || key == "tls_protocol_version"
+                // Drop stale framing headers carried over as metadata: the body is re-framed
+                // here (compress_if_needed sets Content-Encoding, hyper sets the length), so a
+                // forwarded content-length/transfer-encoding/content-encoding would be wrong.
+                // Mirrors make_response's filtering on the consumer side.
+                || key.eq_ignore_ascii_case("content-length")
+                || key.eq_ignore_ascii_case("transfer-encoding")
+                || key.eq_ignore_ascii_case("content-encoding")
                 || crate::canonical_message::is_source_metadata_key(key)
             {
                 continue;
@@ -403,7 +410,12 @@ impl HttpPublisher {
             );
 
             if response_status.is_client_error() {
-                return Err(PublisherError::NonRetryable(error));
+                // 408 Request Timeout and 429 Too Many Requests are transient: the same
+                // request may well succeed on a later attempt, so let the route retry them.
+                return match response_status.as_u16() {
+                    408 | 429 => Err(PublisherError::Retryable(error)),
+                    _ => Err(PublisherError::NonRetryable(error)),
+                };
             } else if response_status.is_server_error() {
                 match response_status.as_u16() {
                     501 | 505 => return Err(PublisherError::NonRetryable(error)),

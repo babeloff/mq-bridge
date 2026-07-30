@@ -70,6 +70,9 @@ fn documented_middleware_snippets_parse() {
               qty: { type: integer }
 "#,
         r#"- deduplication: { sled_path: "/var/lib/mq-bridge/dedup", ttl_seconds: 3600 }"#,
+        r#"- deduplication: { store: "sled:///var/lib/mq-bridge/dedup", ttl_seconds: 3600 }"#,
+        r#"- deduplication: { store: "mongodb://localhost:27017/etl", ttl_seconds: 3600 }"#,
+        r#"- deduplication: { store: "postgres://user:pass@localhost/etl", ttl_seconds: 3600 }"#,
         r#"- weak_join: { group_by: "correlation_id", expected_count: 3, timeout_ms: 5000 }"#,
         r#"
 - weak_join:

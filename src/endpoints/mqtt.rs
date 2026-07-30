@@ -466,6 +466,9 @@ impl MessageConsumer for MqttConsumer {
     fn commit_requires_order(&self) -> bool {
         false
     }
+    fn set_exit_on_empty(&mut self, exit_on_empty: bool) {
+        self.0.set_exit_on_empty(exit_on_empty);
+    }
     async fn receive(&mut self) -> Result<Received, ConsumerError> {
         self.0.receive().await
     }
@@ -509,6 +512,8 @@ struct MqttListener {
     capacity: usize,
     is_connected: Arc<AtomicBool>,
     topic: String,
+    /// Drain mode: only then does an idle recv time out into an empty batch.
+    exit_on_empty: bool,
 }
 
 impl MqttListener {
@@ -584,6 +589,7 @@ impl MqttListener {
             capacity: queue_capacity,
             is_connected,
             topic: topic.to_string(),
+            exit_on_empty: false,
         })
     }
 }
@@ -593,6 +599,9 @@ impl MessageConsumer for MqttListener {
     // MQTT acks per packet id (PUBACK), so commits are order-independent.
     fn commit_requires_order(&self) -> bool {
         false
+    }
+    fn set_exit_on_empty(&mut self, exit_on_empty: bool) {
+        self.exit_on_empty = exit_on_empty;
     }
     async fn receive(&mut self) -> Result<Received, ConsumerError> {
         let internal = self
@@ -636,8 +645,13 @@ impl MessageConsumer for MqttListener {
         let mut reply_infos = Vec::with_capacity(max_messages);
         let mut acks = Vec::with_capacity(max_messages);
 
-        // Block for the first message
-        match self.message_rx.recv().await {
+        // Block for the first message; drain mode times out into an empty batch.
+        let Some(first) =
+            crate::traits::drain_gated(self.exit_on_empty, self.message_rx.recv()).await
+        else {
+            return Ok(ReceivedBatch::empty());
+        };
+        match first {
             Ok(internal) => {
                 reply_infos.push((
                     internal.msg.metadata.get("reply_to").cloned(),

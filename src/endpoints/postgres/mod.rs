@@ -60,6 +60,8 @@ pub struct PostgresCdcConsumer {
     /// TLS config used on teardown to reopen the control-plane connection (see `Drop`).
     tls: crate::models::TlsConfig,
     ended: bool,
+    /// Drain mode: only then does an idle replication read time out into an empty batch.
+    exit_on_empty: bool,
 }
 
 impl PostgresCdcConsumer {
@@ -165,6 +167,7 @@ impl PostgresCdcConsumer {
             slot_name: config.slot_name.clone(),
             tls: config.tls.clone(),
             ended: false,
+            exit_on_empty: false,
         })
     }
 
@@ -183,9 +186,30 @@ impl PostgresCdcConsumer {
             }
             ReplicationEvent::Commit { end_lsn, .. } => {
                 let lsn = end_lsn.as_u64();
-                for mut msg in self.tx_buffer.drain(..) {
+                let lsn_str = format_lsn(lsn);
+                for (ordinal, mut msg) in self.tx_buffer.drain(..).enumerate() {
+                    let dedup_id = msg.metadata.get("postgres.key").map(|key| {
+                        let schema = msg
+                            .metadata
+                            .get("postgres.schema")
+                            .map_or("", |s| s.as_str());
+                        let table = msg
+                            .metadata
+                            .get("postgres.table")
+                            .map_or("", |s| s.as_str());
+                        let operation = msg
+                            .metadata
+                            .get("postgres.operation")
+                            .map_or("", |s| s.as_str());
+                        // Include op + in-tx ordinal so multiple changes to the same key
+                        // in one commit get distinct (still deterministic) ids.
+                        cdc_dedup_id(schema, table, key, lsn, operation, ordinal)
+                    });
+                    if let Some(id) = dedup_id {
+                        msg.message_id = id;
+                    }
                     msg.metadata
-                        .insert("postgres.lsn".to_string(), format_lsn(lsn));
+                        .insert("postgres.lsn".to_string(), lsn_str.clone());
                     self.ready.push_back((msg, lsn));
                 }
             }
@@ -248,7 +272,13 @@ impl PostgresCdcConsumer {
 }
 
 /// Build a change-event message: JSON body + `postgres.operation`/schema/table metadata.
+/// When the relation has replica-identity key columns, their values are recorded as
+/// `postgres.key`; the deterministic dedup `message_id` is stamped later at commit (once
+/// the LSN is known) in [`PostgresCdcConsumer::handle_event`].
 fn cdc_message(rel: &Relation, operation: &str, body: serde_json::Value) -> CanonicalMessage {
+    let key = body
+        .as_object()
+        .and_then(|obj| replica_key_string(rel, obj));
     let payload = serde_json::to_vec(&body).unwrap_or_default();
     let mut msg = CanonicalMessage::new_bytes(payload.into(), None);
     msg.metadata
@@ -257,7 +287,75 @@ fn cdc_message(rel: &Relation, operation: &str, body: serde_json::Value) -> Cano
         .insert("postgres.schema".to_string(), rel.namespace.clone());
     msg.metadata
         .insert("postgres.table".to_string(), rel.name.clone());
+    if let Some(key) = key {
+        msg.metadata.insert("postgres.key".to_string(), key);
+    }
     msg
+}
+
+/// The relation's replica-identity key column values (bit 0 of the column flags) from a
+/// decoded row, serialized as a typed JSON array so distinct value combinations can never
+/// collide (unlike a delimiter join). `None` when the relation exposes no key (no PK /
+/// replica identity NOTHING), in which case no deterministic id can be derived.
+fn replica_key_string(
+    rel: &Relation,
+    body: &serde_json::Map<String, serde_json::Value>,
+) -> Option<String> {
+    let mut parts: Vec<serde_json::Value> = Vec::new();
+    for col in &rel.columns {
+        if col.flags & 1 == 1 {
+            parts.push(
+                body.get(&col.name)
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
+            );
+        }
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(serde_json::Value::Array(parts).to_string())
+    }
+}
+
+/// Deterministic dedup id for a change event: FNV-1a 128-bit over
+/// `schema.table\0key\0operation\0lsn\0ordinal`. A replayed change (same key, op and
+/// in-tx position at the same commit LSN) hashes identically so the dedup middleware /
+/// sink can drop it; distinct changes — including several to one key in one transaction —
+/// differ by op, LSN, or ordinal.
+fn cdc_dedup_id(
+    schema: &str,
+    table: &str,
+    key: &str,
+    lsn: u64,
+    operation: &str,
+    ordinal: usize,
+) -> u128 {
+    const OFFSET: u128 = 0x6c62272e07bb014262b821756295c58d;
+    const PRIME: u128 = 0x0000000001000000000000000000013B;
+    let lsn_bytes = lsn.to_be_bytes();
+    let ordinal_bytes = (ordinal as u64).to_be_bytes();
+    let parts: [&[u8]; 11] = [
+        schema.as_bytes(),
+        b".",
+        table.as_bytes(),
+        b"\0",
+        key.as_bytes(),
+        b"\0",
+        operation.as_bytes(),
+        b"\0",
+        &lsn_bytes,
+        b"\0",
+        &ordinal_bytes,
+    ];
+    let mut h = OFFSET;
+    for part in parts {
+        for &b in part {
+            h ^= b as u128;
+            h = h.wrapping_mul(PRIME);
+        }
+    }
+    h
 }
 
 /// A safe Postgres identifier for a publication / replication slot: non-empty
@@ -291,6 +389,9 @@ fn stage_truncate(rel: &Relation, _t: &Truncate) -> CanonicalMessage {
 
 #[async_trait]
 impl MessageConsumer for PostgresCdcConsumer {
+    fn set_exit_on_empty(&mut self, exit_on_empty: bool) {
+        self.exit_on_empty = exit_on_empty;
+    }
     async fn receive_batch(&mut self, max_messages: usize) -> Result<ReceivedBatch, ConsumerError> {
         if max_messages == 0 {
             return Ok(ReceivedBatch {
@@ -307,7 +408,16 @@ impl MessageConsumer for PostgresCdcConsumer {
             if self.ended {
                 return Err(ConsumerError::EndOfStream);
             }
-            match self.client.recv().await {
+            // Drain mode: a brief idle timeout yields an empty batch (no-op commit, so the
+            // slot is not advanced past unconsumed changes) and lets --drain fire.
+            // `recv()` is cancel-safe — it awaits a channel; wire framing runs in a
+            // background worker with its own resumable reader — so the timeout drop here
+            // loses nothing.
+            let Some(ev) = crate::traits::drain_gated(self.exit_on_empty, self.client.recv()).await
+            else {
+                return Ok(ReceivedBatch::empty());
+            };
+            match ev {
                 Ok(None) | Ok(Some(ReplicationEvent::StoppedAt { .. })) => {
                     self.ended = true;
                     return Err(ConsumerError::EndOfStream);
@@ -428,5 +538,77 @@ impl Drop for PostgresCdcConsumer {
                 }
             });
         });
+    }
+}
+
+#[cfg(test)]
+mod cdc_id_tests {
+    use super::*;
+    use pgoutput::messages::{ColumnDesc, ReplicaIdentity};
+
+    fn rel_with_key() -> Relation {
+        Relation {
+            oid: 16384,
+            namespace: "public".into(),
+            name: "orders".into(),
+            replica_identity: ReplicaIdentity::Default,
+            columns: vec![
+                ColumnDesc {
+                    flags: 1,
+                    name: "id".into(),
+                    type_oid: 23,
+                    type_modifier: -1,
+                },
+                ColumnDesc {
+                    flags: 0,
+                    name: "body".into(),
+                    type_oid: 25,
+                    type_modifier: -1,
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn replica_key_uses_only_key_columns() {
+        let rel = rel_with_key();
+        let body = serde_json::json!({ "id": 42, "body": "hi" });
+        let key = replica_key_string(&rel, body.as_object().unwrap());
+        assert_eq!(key.as_deref(), Some("[42]"));
+    }
+
+    #[test]
+    fn replica_key_none_without_key_columns() {
+        let mut rel = rel_with_key();
+        rel.columns[0].flags = 0;
+        let body = serde_json::json!({ "id": 42 });
+        assert!(replica_key_string(&rel, body.as_object().unwrap()).is_none());
+    }
+
+    #[test]
+    fn cdc_message_sets_postgres_key() {
+        let rel = rel_with_key();
+        let body = serde_json::json!({ "id": 7, "body": "x" });
+        let msg = cdc_message(&rel, "insert", body);
+        assert_eq!(
+            msg.metadata.get("postgres.key").map(String::as_str),
+            Some("[7]")
+        );
+    }
+
+    #[test]
+    fn dedup_id_is_stable_and_lsn_sensitive() {
+        // Same change (key + op + lsn + ordinal) → identical id (a replay deduplicates).
+        let a = cdc_dedup_id("public", "orders", "42", 100, "insert", 0);
+        let b = cdc_dedup_id("public", "orders", "42", 100, "insert", 0);
+        assert_eq!(a, b);
+        // Different lsn → different id (distinct updates are not collapsed).
+        assert_ne!(a, cdc_dedup_id("public", "orders", "42", 101, "insert", 0));
+        // Different key → different id.
+        assert_ne!(a, cdc_dedup_id("public", "orders", "43", 100, "insert", 0));
+        // Different operation on the same key/lsn → different id.
+        assert_ne!(a, cdc_dedup_id("public", "orders", "42", 100, "update", 0));
+        // Different in-transaction ordinal → different id (same key twice in one commit).
+        assert_ne!(a, cdc_dedup_id("public", "orders", "42", 100, "insert", 1));
     }
 }

@@ -122,12 +122,10 @@ impl KafkaPublisher {
             }
         }
 
-        // Share one producer across publishers with the same connection settings. The
-        // topic is chosen per-record, so a single producer serves every topic; sharing
-        // consolidates broker connections, the background poll thread, and batching.
-        // Producer-level settings (creds, TLS, producer_options) form the cache key.
-        // Sort producer_options first: the identity is order-sensitive, so equivalent
-        // configs listing the same options in a different order must still share.
+        // Share one producer across publishers with matching connection settings: the topic is
+        // per-record, so one producer serves all topics and consolidates connections, the poll
+        // thread, and batching. Cache key = producer-level settings (creds, TLS, producer_options);
+        // sort producer_options first so order-different-but-equivalent configs still share.
         let producer_options = config.producer_options.as_ref().map(|opts| {
             let mut sorted = opts.clone();
             sorted.sort();
@@ -363,6 +361,8 @@ pub struct KafkaConsumer {
     consumer: Arc<StreamConsumer>,
     producer: Option<FutureProducer>,
     topic: String,
+    /// Drain mode: only then does an idle fetch time out into an empty batch.
+    exit_on_empty: bool,
 }
 use std::any::Any;
 
@@ -448,6 +448,7 @@ impl KafkaConsumer {
             consumer,
             producer,
             topic: topic.to_string(),
+            exit_on_empty: false,
         })
     }
 }
@@ -523,12 +524,17 @@ impl MessageConsumer for KafkaConsumer {
         })
     }
 
+    fn set_exit_on_empty(&mut self, exit_on_empty: bool) {
+        self.exit_on_empty = exit_on_empty;
+    }
+
     async fn receive_batch(&mut self, max_messages: usize) -> Result<ReceivedBatch, ConsumerError> {
         receive_batch_internal(
             &self.consumer,
             self.producer.as_ref(),
             max_messages,
             &self.topic,
+            self.exit_on_empty,
         )
         .await
     }
@@ -776,6 +782,7 @@ async fn receive_batch_internal(
     producer: impl Into<Option<&FutureProducer>>,
     max_messages: usize,
     topic: &str,
+    exit_on_empty: bool,
 ) -> Result<ReceivedBatch, ConsumerError> {
     let mut messages = Vec::with_capacity(max_messages);
     let mut last_offset_tpl = TopicPartitionList::new();
@@ -787,7 +794,13 @@ async fn receive_batch_internal(
         // This waits for at least one message, then consumes all currently available messages up to max_messages.
         let mut chunk_stream = stream.ready_chunks(max_messages);
 
-        if let Some(chunk) = chunk_stream.next().await {
+        // Drain mode: brief timeout → empty batch so --drain fires; else block (cancel-safe).
+        let Some(next_chunk) = crate::traits::drain_gated(exit_on_empty, chunk_stream.next()).await
+        else {
+            return Ok(ReceivedBatch::empty());
+        };
+
+        if let Some(chunk) = next_chunk {
             for message_result in chunk {
                 match message_result {
                     Ok(message) => {

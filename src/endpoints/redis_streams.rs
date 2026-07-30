@@ -38,6 +38,7 @@ use tracing::trace;
 const PAYLOAD_FIELD: &str = "payload";
 /// The stream field used to carry the mq-bridge message id (hex).
 const MESSAGE_ID_FIELD: &str = "mqb_message_id";
+
 const DEFAULT_BLOCK_MS: u64 = 5000;
 const DEFAULT_BUFFER: usize = 128;
 /// Default idle time before a pending entry is reclaimed and redelivered.
@@ -210,6 +211,10 @@ pub struct RedisStreamsConsumer {
     /// `Some` in consumer-group mode (entries are acked); `None` in subscriber mode.
     group: Option<String>,
     buffer: VecDeque<StreamEntry>,
+    /// Set by the route when `exit_on_empty`/`--drain` is active. Only then does an
+    /// idle read time out into an empty batch; otherwise it blocks indefinitely
+    /// (event-driven, no added latency) as a streaming source should.
+    exit_on_empty: bool,
 }
 
 impl RedisStreamsConsumer {
@@ -318,6 +323,7 @@ impl RedisStreamsConsumer {
             stream,
             group,
             buffer: VecDeque::new(),
+            exit_on_empty: false,
         })
     }
 }
@@ -365,7 +371,7 @@ fn spawn_stream_reader(ctx: ReaderCtx) {
         loop {
             // Redeliver entries left pending past redelivery_ms (Nacked, or
             // orphaned by a crashed/renamed consumer) via XAUTOCLAIM.
-            if reclaim_enabled && last_reclaim.map_or(true, |t| t.elapsed() >= reclaim_interval) {
+            if reclaim_enabled && last_reclaim.is_none_or(|t| t.elapsed() >= reclaim_interval) {
                 last_reclaim = Some(Instant::now());
                 if let Some(group) = &task_group {
                     let claim_opts = StreamAutoClaimOptions::default().count(count);
@@ -494,6 +500,10 @@ impl MessageConsumer for RedisStreamsConsumer {
         false
     }
 
+    fn set_exit_on_empty(&mut self, exit_on_empty: bool) {
+        self.exit_on_empty = exit_on_empty;
+    }
+
     async fn receive_batch(&mut self, max_messages: usize) -> Result<ReceivedBatch, ConsumerError> {
         if max_messages == 0 {
             return Ok(ReceivedBatch {
@@ -503,12 +513,13 @@ impl MessageConsumer for RedisStreamsConsumer {
         }
 
         if self.buffer.is_empty() {
-            // Block for the first entry.
-            let entry = self
-                .rx
-                .recv()
-                .await
-                .map_err(|_| ConsumerError::EndOfStream)??;
+            // Drain mode times out into an empty batch (async_channel recv is cancel-safe,
+            // so no entry is lost); streaming blocks indefinitely for the first entry.
+            let Some(res) = crate::traits::drain_gated(self.exit_on_empty, self.rx.recv()).await
+            else {
+                return Ok(ReceivedBatch::empty());
+            };
+            let entry = res.map_err(|_| ConsumerError::EndOfStream)??;
             self.buffer.push_back(entry);
         }
 

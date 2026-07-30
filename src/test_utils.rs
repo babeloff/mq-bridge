@@ -565,19 +565,12 @@ pub async fn run_chaos_pipeline_test(
         PERF_TEST_MESSAGE_COUNT / 2
     };
 
-    // Chaos restarts the broker mid-stream. Most brokers redeliver all in-flight messages on
-    // reconnect, so they must deliver 100% (zero loss).
-    //
-    // MQTT is the exception, and this is within the MQTT spec rather than a bug. QoS 1/2
-    // redelivery is only guaranteed across a *persistent session that survives*; the protocol
-    // makes no durability guarantee across a broker crash/restart, and Mosquitto can drop a few
-    // in-flight QoS 1/2 messages when its session state doesn't fully resume after restart. The
-    // consumer has no recourse for these — the message simply never arrives, so there is nothing
-    // to retry or redeliver. (The publisher side still reaches 0 because it re-publishes on
-    // confirmation failure; this tolerance covers consumer-side restart loss only.) The loss is
-    // bounded by the in-flight window of a single ~2s restart, not by message count, so a small
-    // absolute tolerance is correct here. The old enqueue-ack bug lost ~5000, so 5 still catches
-    // any real regression.
+    // Chaos restarts the broker mid-stream. Most brokers redeliver in-flight messages on
+    // reconnect, so they must reach zero loss. MQTT is the spec-sanctioned exception: QoS 1/2
+    // redelivery is only guaranteed across a surviving session, so Mosquitto can drop a few
+    // in-flight messages the consumer can never recover after a restart. The tests enforce the
+    // configured `allowed_loss` bound rather than exact delivery; 5 is an empirical tolerance
+    // that stays below systemic loss yet still catches regressions.
     let allowed_loss = if broker_name.eq_ignore_ascii_case("mqtt") {
         5
     } else {
@@ -641,12 +634,10 @@ async fn run_pipeline_test_internal(
         .await
         .expect("Failed to deploy out_route");
 
-    // Warm up before timing: push a small probe batch and wait until it has traversed the
-    // whole path, forcing the one-time broker connect / consumer-group join / topic creation
-    // / partition assignment to complete. Without this the clock would start on a cold route
-    // and the first messages would pay that startup, understating sustained throughput. The
-    // direct perf tests and criterion both warm up the same way; this brings the pipeline
-    // test in line. Perf tests only — chaos/functional runs assert exact delivery counts.
+    // Warm up before timing: push a probe batch through the whole path so the one-time connect /
+    // consumer-group join / topic creation / partition assignment completes, otherwise the clock
+    // starts cold and understates sustained throughput. Matches the direct perf tests and criterion.
+    // Perf tests only — chaos/functional runs assert exact delivery counts.
     if is_performance_test {
         let warmup_count = 500.min(num_messages);
         harness

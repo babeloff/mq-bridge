@@ -191,11 +191,59 @@ async fn test_file_encrypted_compressed_roundtrip() {
         }
     })
     .await;
-    // Bounded decode failures surface as a closed stream (EndOfStream), never data.
+    // A codec/key mismatch is a permanent decode failure: it must surface as
+    // ConsumerError::Permanent (which fails the route), never as data or a clean
+    // EndOfStream that would masquerade as success.
     assert!(
-        matches!(got, Ok(Err(_))),
-        "expected a consume error, got {got:?}"
+        matches!(got, Ok(Err(crate::traits::ConsumerError::Permanent(_)))),
+        "expected ConsumerError::Permanent, got {got:?}"
     );
+}
+
+#[tokio::test]
+async fn test_reading_compressed_file_without_codec_is_rejected() {
+    // A gzip file read with no `compression` configured must be rejected at connect,
+    // not read as plaintext and split into binary "messages" under a clean success.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("data.bin");
+    // gzip magic + arbitrary bytes.
+    std::fs::write(&path, [0x1f, 0x8b, 0x08, 0x00, 0x11, 0x22]).unwrap();
+    let config = FileConfig {
+        path: path.to_string_lossy().to_string(),
+        ..Default::default()
+    };
+    let err = match FileConsumer::new(&config).await {
+        Ok(_) => panic!("expected a rejection reading a gzip file without `compression`"),
+        Err(e) => e.to_string(),
+    };
+    assert!(err.contains("gzip"), "unexpected error: {err}");
+    // A plaintext JSON file is accepted.
+    std::fs::write(&path, b"{\"a\":1}\n").unwrap();
+    assert!(FileConsumer::new(&config).await.is_ok());
+}
+
+#[test]
+fn test_sniff_compression_magic() {
+    use super::sniff_compression_magic;
+    let dir = tempdir().unwrap();
+    let cases: &[(&[u8], Option<&str>)] = &[
+        (&[0x1f, 0x8b, 0x08], Some("gzip")),
+        (&[0x28, 0xb5, 0x2f, 0xfd], Some("zstd")),
+        (&[0x04, 0x22, 0x4d, 0x18], Some("lz4")),
+        (b"{\"json\":1}", None),
+        (&[0x1f], None), // too short to be gzip
+        (b"", None),
+    ];
+    for (i, (bytes, want)) in cases.iter().enumerate() {
+        let p = dir.path().join(format!("f{i}"));
+        std::fs::write(&p, bytes).unwrap();
+        assert_eq!(
+            sniff_compression_magic(&p.to_string_lossy()),
+            *want,
+            "case {i}"
+        );
+    }
+    assert_eq!(sniff_compression_magic("/no/such/file"), None);
 }
 
 #[cfg(feature = "compression")]
@@ -265,12 +313,11 @@ async fn test_file_compression_rejects_unsupported_modes() {
 
 #[tokio::test]
 async fn test_file_sink_and_source_integration() {
-    // 1. Setup a temporary directory and file path
+    // Setup a temporary directory and file path
     let dir = tempdir().unwrap();
     let file_path = dir.path().join("test.log");
     let file_path_str = file_path.to_str().unwrap().to_string();
 
-    // 2. Create a FileSink
     let config = FileConfig {
         path: file_path_str.clone(),
         ..Default::default()
@@ -288,10 +335,10 @@ async fn test_file_sink_and_source_integration() {
     // Drop the sink to release the file lock on some OSes before the source tries to open it.
     drop(sink);
 
-    // 4. Create a FileConsumer to read from the same file
+    // Create a FileConsumer to read from the same file
     let mut source = FileConsumer::new(&config).await.unwrap();
 
-    // 5. Receive the messages and verify them
+    // Receive the messages and verify them
     let received1 = source.receive().await.unwrap();
     let _ = (received1.commit)(crate::traits::MessageDisposition::Ack).await; // Commit is a no-op, but we should call it
 
@@ -306,7 +353,7 @@ async fn test_file_sink_and_source_integration() {
     assert_eq!(received_msg2.message_id, msg2.message_id);
     assert_eq!(received_msg2.payload, msg2.payload);
 
-    // 6. After draining, the consumer surfaces a one-shot empty batch (the
+    // After draining, the consumer surfaces a one-shot empty batch (the
     //    drain marker) so a route can pause or exit_on_empty can fire.
     let drained = source.receive_batch(1).await.unwrap();
     assert!(
@@ -314,7 +361,7 @@ async fn test_file_sink_and_source_integration() {
         "Expected an empty drain marker after the file was drained"
     );
 
-    // 7. With the marker already emitted and no new data, a further read
+    // With the marker already emitted and no new data, a further read
     //    blocks (times out) until new data arrives.
     let result = tokio::time::timeout(
         std::time::Duration::from_millis(200),
@@ -420,27 +467,24 @@ async fn test_file_consumer_nack_behavior() {
     };
     let mut consumer = FileConsumer::new(&config).await.unwrap();
 
-    // 1. Receive batch (should get msg1)
     let batch1 = consumer.receive_batch(1).await.unwrap();
     assert_eq!(batch1.messages.len(), 1);
     assert_eq!(batch1.messages[0].payload.as_ref(), b"msg1");
 
-    // 2. Nack the batch
     (batch1.commit)(vec![crate::traits::MessageDisposition::Nack])
         .await
         .unwrap();
 
-    // 3. Receive again - should get msg1 again because it wasn't removed
+    // Receive again - should get msg1 again because it wasn't removed
     let batch2 = consumer.receive_batch(1).await.unwrap();
     assert_eq!(batch2.messages.len(), 1);
     assert_eq!(batch2.messages[0].payload.as_ref(), b"msg1");
 
-    // 4. Ack
     (batch2.commit)(vec![crate::traits::MessageDisposition::Ack])
         .await
         .unwrap();
 
-    // 5. Receive next - should get msg2
+    // Receive next - should get msg2
     let batch3 = consumer.receive_batch(1).await.unwrap();
     assert_eq!(batch3.messages.len(), 1);
     assert_eq!(batch3.messages[0].payload.as_ref(), b"msg2");
@@ -851,7 +895,6 @@ async fn test_file_consumer_group_id_persistence() {
         ..Default::default()
     };
 
-    // 1. First consumer reads msg1
     let mut consumer1 = FileConsumer::new(&config).await.unwrap();
     // Allow thread to start
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -870,7 +913,7 @@ async fn test_file_consumer_group_id_persistence() {
 
     drop(consumer1);
 
-    // 2. Second consumer (simulating restart) should start from offset 5 (msg2)
+    // Second consumer (simulating restart) should start from offset 5 (msg2)
     let mut consumer2 = FileConsumer::new(&config).await.unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
@@ -1153,7 +1196,6 @@ async fn test_file_xml_delimiter() {
 async fn test_file_formats_and_fallbacks() {
     let dir = tempdir().unwrap();
 
-    // 1. Test JSON Format Roundtrip
     let json_path = dir.path().join("json.log");
     let json_config = FileConfig {
         path: json_path.to_str().unwrap().to_string(),
@@ -1179,7 +1221,6 @@ async fn test_file_formats_and_fallbacks() {
         .await
         .unwrap();
 
-    // 2. Test Text Format Roundtrip
     let text_path = dir.path().join("text.log");
     let text_config = FileConfig {
         path: text_path.to_str().unwrap().to_string(),
@@ -1203,7 +1244,7 @@ async fn test_file_formats_and_fallbacks() {
         .await
         .unwrap();
 
-    // 3. Test Fallback (Corrupted/Raw line in Json format)
+    // Test Fallback (Corrupted/Raw line in Json format)
     // We append a raw line that isn't the expected JSON wrapper structure
     {
         let mut file = OpenOptions::new()
@@ -1618,5 +1659,108 @@ fn test_parse_message_payload_shapes() {
             .get("mq_bridge.original_format")
             .map(String::as_str),
         Some("raw")
+    );
+}
+
+/// Reads batches until the consumer surfaces an empty (drain) batch, returning
+/// the total record count. Fails if no batch arrives within the timeout.
+async fn drain_count(source: &mut FileConsumer) -> usize {
+    use crate::traits::MessageDisposition;
+    let mut count = 0;
+    loop {
+        let batch =
+            tokio::time::timeout(std::time::Duration::from_secs(5), source.receive_batch(64))
+                .await
+                .expect("timed out reading file")
+                .expect("receive_batch errored");
+        if batch.messages.is_empty() {
+            return count;
+        }
+        let n = batch.messages.len();
+        count += n;
+        (batch.commit)(vec![MessageDisposition::Ack; n])
+            .await
+            .unwrap();
+    }
+}
+
+fn no_trailing_newline_body(n: usize) -> Vec<u8> {
+    // `n` records joined by `n - 1` newlines: the final record has no trailing '\n'.
+    (0..n)
+        .map(|i| format!("{{\"i\":{i}}}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+        .into_bytes()
+}
+
+// Issue 4 (regression): draining a complete file whose last record has no trailing
+// newline must deliver that record. Before the fix the tail reader treated it as a
+// torn mid-write and dropped it (200 records -> only 199 delivered).
+#[tokio::test]
+async fn test_file_tail_drain_emits_final_line_without_newline() {
+    const N: usize = 200;
+    let dir = tempdir().unwrap();
+    let file_path = dir.path().join("no_trailing_newline.jsonl");
+    tokio::fs::write(&file_path, no_trailing_newline_body(N))
+        .await
+        .unwrap();
+
+    let config = FileConfig {
+        path: file_path.to_str().unwrap().to_string(),
+        format: FileFormat::Raw,
+        ..Default::default()
+    };
+    let mut source = FileConsumer::new(&config).await.unwrap();
+    // Drain mode: a final record with no delimiter is a whole record.
+    source.set_exit_on_empty(true);
+
+    assert_eq!(
+        drain_count(&mut source).await,
+        N,
+        "drain must deliver the final newline-less record"
+    );
+}
+
+// Complement: in live-tail mode (no drain intent) the final record without a
+// delimiter is withheld as a possible torn write, and no EOF marker is emitted while
+// it is pending — so the consumer delivers N-1 records and then blocks for more data.
+#[tokio::test]
+async fn test_file_tail_live_withholds_final_line_without_newline() {
+    const N: usize = 200;
+    let dir = tempdir().unwrap();
+    let file_path = dir.path().join("no_trailing_newline.jsonl");
+    tokio::fs::write(&file_path, no_trailing_newline_body(N))
+        .await
+        .unwrap();
+
+    let config = FileConfig {
+        path: file_path.to_str().unwrap().to_string(),
+        format: FileFormat::Raw,
+        ..Default::default()
+    };
+    let mut source = FileConsumer::new(&config).await.unwrap();
+    // No set_exit_on_empty(true): live tail withholds the torn final record.
+
+    let mut count = 0;
+    // Loops until the timeout elapses: blocked waiting for the writer to finish the final record.
+    while let Ok(batch) = tokio::time::timeout(
+        std::time::Duration::from_millis(500),
+        source.receive_batch(64),
+    )
+    .await
+    {
+        let batch = batch.expect("receive_batch errored");
+        // A partial final record is pending, so no empty marker is emitted;
+        // every batch that arrives carries data.
+        assert!(
+            !batch.messages.is_empty(),
+            "unexpected empty marker in live tail"
+        );
+        count += batch.messages.len();
+    }
+    assert_eq!(
+        count,
+        N - 1,
+        "live tail withholds the final record until its delimiter arrives"
     );
 }

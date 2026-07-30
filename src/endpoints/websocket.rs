@@ -136,6 +136,8 @@ pub struct WebSocketConsumer {
     queue_capacity: usize,
     url: String,
     bound_addr: SocketAddr,
+    /// Drain mode: only then does an idle recv time out into an empty batch.
+    exit_on_empty: bool,
 }
 
 impl WebSocketConsumer {
@@ -176,6 +178,7 @@ impl WebSocketConsumer {
             queue_capacity,
             url,
             bound_addr,
+            exit_on_empty: false,
         })
     }
 
@@ -712,11 +715,19 @@ impl MessageConsumer for WebSocketConsumer {
     fn commit_requires_order(&self) -> bool {
         false
     }
+    fn set_exit_on_empty(&mut self, exit_on_empty: bool) {
+        self.exit_on_empty = exit_on_empty;
+    }
     async fn receive_batch(&mut self, max_messages: usize) -> Result<ReceivedBatch, ConsumerError> {
         let max_messages = max_messages.max(1);
 
         let mut batch: Vec<WebSocketSourceMessage> = Vec::with_capacity(max_messages);
-        if self.request_rx.recv_many(&mut batch, max_messages).await == 0 {
+        let received = self.request_rx.recv_many(&mut batch, max_messages);
+        // Drain mode: a brief idle timeout yields an empty batch so --drain can fire.
+        let Some(count) = crate::traits::drain_gated(self.exit_on_empty, received).await else {
+            return Ok(ReceivedBatch::empty());
+        };
+        if count == 0 {
             return Err(ConsumerError::EndOfStream);
         }
 

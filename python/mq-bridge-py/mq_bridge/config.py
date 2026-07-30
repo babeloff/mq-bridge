@@ -58,6 +58,7 @@ StaticConfig = str
 TransformErrorPolicy = str
 WeakJoinTimeout = str
 WebSocketExecutionMode = str
+ZeroMqBackend = str
 ZeroMqFormat = str
 ZeroMqSocketType = str
 RouteConfig = Route
@@ -124,6 +125,7 @@ __all__ = [
     "WeakJoinTimeout",
     "WebSocketConfig",
     "WebSocketExecutionMode",
+    "ZeroMqBackend",
     "ZeroMqConfig",
     "ZeroMqFormat",
     "ZeroMqSocketType",

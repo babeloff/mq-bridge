@@ -201,6 +201,8 @@ Databases have no native pub/sub, so `mq-bridge` reads them as a source in one o
     *   On **MongoDB**, set `consume: capture_new` to watch an existing collection for changes from now on, or `consume: capture_all` to read the existing documents first and then keep capturing changes (no gap, at-least-once). It emits `insert`/`update`/`replace`/`delete` events tagged with `mongodb.operation` metadata and checkpoints progress under `cursor_id`. These use the change stream (full post-image via `updateLookup`) and need a replica set; on a standalone server `capture_all` falls back to an insert-only read.
 *   **Cursor polling** — pages an existing table by a monotonic `cursor_column` (`WHERE col > $last ORDER BY col ASC`), persisting the last read value under `cursor_id`. Captures **appends only** — updates and deletes are not observed. Available on **SQLx** (PostgreSQL / MySQL / MariaDB / SQLite) and **ClickHouse**; while idle the poll interval backs off exponentially between `polling_interval_ms` and `max_polling_interval_ms`. **SQLite** and **ClickHouse** are polling-only — they have no server-side change log.
 
+> **SQLx read mode is chosen by config, not by driver.** With **no** `cursor_column`, an SQLx source (`?table=` / `table:`) is a **competing-consumers work queue**: it atomically claims rows via a `locked_until` lease and deletes them on ack, so several readers drain the same table as competing consumers — each row goes to one reader at a time, at-least-once (a lease that expires before ack, e.g. after a crash, redelivers the row), not exactly once. This requires the table to carry the queue schema — an `id`, a `payload`, and a `locked_until` column — on **every** driver (PostgreSQL, MySQL/MariaDB, and SQLite behave identically here); it is **not** a plain full-table read. To read an existing or arbitrary table non-destructively (the ETL path), set **`cursor_column`** to switch to the cursor polling above. A source table missing `locked_until` fails fast with a permanent error rather than reconnecting forever.
+
 #### Choosing a MongoDB consume mode
 
 These are not interchangeable. The default `consumer` is a **competing-consumers work queue**: its
@@ -230,6 +232,132 @@ re-fetch → delete on ack) buy exclusivity you aren't using, and cost ~5x.
     insert-only `_id` read that terminates on drain. On a replica set it streams indefinitely after
     the snapshot — plan an external stop, not `exit_on_empty`.
 *   Wart: `capture_all`'s snapshot also emits the internal `<collection>:sequencer` document.
+
+
+### Deduplication & idempotent writes
+
+For ETL, at-least-once delivery plus an **idempotent write** gives you effective exactly-once: a
+replayed or retried record must not create a duplicate row. The most robust place to enforce this is
+the sink database's own **unique constraint** — it is already shared across every writer, so no extra
+state store is needed. Both database sinks lean on this instead of an application-side cache.
+
+**MongoDB — `id_field`.** Point `id_field` at a top-level payload field and its value becomes the
+document `_id`. Re-inserting the same business key then hits the unique `_id` index and is treated as
+an idempotent success (the duplicate is skipped, not errored):
+
+```yaml
+orders_to_mongo:
+  input:  { kafka:   { topic: "orders", url: "localhost:9092" } }
+  output:
+    mongodb:
+      url: "mongodb://localhost:27017"
+      database: "shop"
+      collection: "orders"
+      format: json
+      id_field: "order_id"   # payload {"order_id": "A-1", ...} → _id = "A-1"
+```
+
+The field's JSON type is preserved (a number stays a BSON integer). The payload must be JSON and
+contain the field, otherwise the message is dead-lettered rather than written with a random `_id` —
+silently minting one would defeat deduplication. Use `id_field` on **sink** collections only: a
+business-key `_id` is not compatible with the `consumer`/`subscriber` competing-consumer modes, which
+require a UUID `_id`.
+
+**SQL (`sqlx`) — `ON CONFLICT` / `ON DUPLICATE KEY`.** The `insert_query` is user-supplied, so you
+write the dialect's upsert directly. This requires a pre-existing `UNIQUE`/`PRIMARY KEY` on the key
+column, and is incompatible with `bulk_copy` (COPY cannot express `ON CONFLICT`) — so you trade peak
+throughput for deduplication.
+
+```yaml
+# PostgreSQL — insert if absent (drop duplicates):
+insert_query: "INSERT INTO orders (id, body) VALUES (${payload:id}, ${payload:body}) ON CONFLICT (id) DO NOTHING"
+
+# PostgreSQL — upsert (last write wins):
+insert_query: "INSERT INTO orders (id, body) VALUES (${payload:id}, ${payload:body}) ON CONFLICT (id) DO UPDATE SET body = EXCLUDED.body"
+
+# MySQL / MariaDB:
+insert_query: "INSERT INTO orders (id, body) VALUES (${payload:id}, ${payload:body}) ON DUPLICATE KEY UPDATE body = VALUES(body)"
+
+# SQLite:
+insert_query: "INSERT INTO orders (id, body) VALUES (${payload:id}, ${payload:body}) ON CONFLICT (id) DO NOTHING"
+```
+
+A plain `INSERT` without a conflict clause instead fails the row as a **non-retryable** error: a
+configured `dlq` captures it, and without one it is logged and dropped. Add the conflict clause
+when replays are expected. `${payload:field}` binds a typed value from the JSON payload;
+`${metadata:key}` binds a metadata string.
+
+**ClickHouse — `ReplacingMergeTree`.** ClickHouse has no unique constraints; dedup is a table-engine
+property. Create the target as `ReplacingMergeTree(version)` keyed by your business key via
+`ORDER BY`, using a monotonic column as the version (e.g. an ingest timestamp, or `postgres.lsn` from
+a CDC source). ClickHouse collapses rows with the same sort key at merge time, keeping the highest
+version; read with `FINAL` (or `argMax`) to see the deduplicated result:
+
+```sql
+CREATE TABLE orders (id UInt64, body String, version UInt64)
+ENGINE = ReplacingMergeTree(version) ORDER BY id;
+-- mq-bridge just inserts rows; duplicates for the same id collapse on merge.
+SELECT * FROM orders FINAL;
+```
+
+`ReplacingMergeTree` deduplicates by business key at merge time. Separately, ClickHouse also dedupes
+identical *re-inserted blocks* natively: a retried `send_batch` that resends the same block is dropped
+server-side (default one-hour window) — `insert_deduplication_token` lets you make that explicit, but
+mq-bridge does not set one, so rely on `ReplacingMergeTree` for logical dedup and treat block-level
+dedup only as retry-safety.
+
+**Postgres CDC — deterministic id + `postgres.key`.** The `postgres_cdc` source already resumes from a
+durable LSN checkpoint (no re-delivery on clean restart). For the crash window (row written, then a
+crash before the checkpoint flush) it is at-least-once, so make the sink idempotent. Each change event
+carries the full row (so the primary key is in the payload), `postgres.lsn` (a monotonic version),
+`postgres.operation`/`schema`/`table`, and — when the table has a primary key / replica identity —
+`postgres.key` (the key value). The event's `message_id` is a stable hash of `schema.table + key +
+lsn`, so a replayed change deduplicates through the `deduplication` middleware, and Mongo `id_field`
+or a SQL `ON CONFLICT` on the key column make the sink write idempotent. Use `postgres.lsn` as the
+version to drop stale replays (`... DO UPDATE ... WHERE excluded.lsn > orders.lsn`).
+
+*Known edge:* if the same primary key is changed twice **within a single transaction**, both events
+share that transaction's commit LSN, so they produce the same `message_id`. The `deduplication`
+middleware then treats the second as a duplicate and drops it. The sink still converges to the final
+row state, but the intermediate change is not delivered — if you need every intra-txn revision, do not
+rely on the `message_id`/middleware path for those rows.
+
+The `deduplication` middleware is a complement, not a replacement: it filters duplicates *before* the
+sink, keyed on `message_id`, but its `sled` store is single-instance — prefer the sink constraint for
+multi-writer ETL.
+
+**MongoDB — branch on insert vs. duplicate (`report_outcome`).** Sometimes you need to *act* on
+whether a record was newly inserted or already existed — enrich only fresh rows, or reply with the
+existing entry for duplicates. Set `report_outcome: true` and the Mongo publisher returns the message
+tagged with metadata `mongodb.outcome` = `inserted` (fresh write) or `existed` (dup-key on the
+unique `_id`). Wrap it in a `request` endpoint to forward that tagged message into a `switch` that
+routes on `mongodb.outcome`:
+
+```yaml
+orders_upsert_branch:
+  input: { kafka: { topic: "orders", url: "localhost:9092" } }
+  output:
+    request:                       # calls `to`, forwards its response to `forward_to`
+      to:
+        mongodb:
+          url: "mongodb://localhost:27017"
+          database: "shop"
+          collection: "orders"
+          format: json
+          id_field: "order_id"     # deterministic _id → insert-if-absent
+          report_outcome: true     # → mongodb.outcome = inserted | existed
+          request_reply: true
+      forward_to:
+        switch:
+          metadata_key: "mongodb.outcome"
+          cases:
+            inserted: { ref: "enrich_new_order" }   # e.g. build entry X, reply
+            existed:  { ref: "handle_duplicate" }    # e.g. reply with parts of X
+```
+
+`report_outcome` is sink-only and pairs with `id_field`; without a deterministic `_id` there is no
+duplicate to detect. Left unwrapped by `request`, the tagged message is returned as the route's
+response as usual.
 
 
 ### Cloud Object Storage (S3 / GCS / Azure)

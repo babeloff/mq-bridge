@@ -161,7 +161,7 @@ impl CompiledSchema {
             match (opts.apply_defaults, &self.default) {
                 (true, Some(default)) => *value = default.clone(),
                 // Reported directly rather than falling through to coercion, which would
-                // render the far less helpful "cannot coerce null null to integer".
+                // render the far less helpful "cannot coerce null to integer".
                 _ => {
                     if self.ty.is_some_and(|ty| ty != Ty::Null) {
                         return Err(TransformError::new(

@@ -398,18 +398,15 @@ mod tests {
     async fn test_dlq_integration_with_memory() {
         use crate::endpoints::memory::MemoryPublisher;
 
-        // 1. Setup DLQ destination (Memory)
         let dlq_topic = "dlq_topic";
         let dlq_publisher = MemoryPublisher::new_local(dlq_topic, 10);
         let dlq_channel = dlq_publisher.channel();
 
-        // 2. Setup Failing Primary (Mock)
         let target_calls = Arc::new(Mutex::new(0));
         let failing_target = MockFailingPublisher {
             calls: target_calls.clone(),
         };
 
-        // 3. Setup Retry (max_attempts = 3)
         let retry_config = RetryMiddleware {
             max_attempts: 3,
             initial_interval_ms: 1,
@@ -418,7 +415,6 @@ mod tests {
         };
         let retry_publisher = RetryPublisher::new(Box::new(failing_target), retry_config);
 
-        // 4. Setup DLQ Middleware
         let dlq_middleware = DlqPublisher {
             inner: Box::new(retry_publisher),
             dlq_publisher: Arc::new(dlq_publisher),
@@ -427,10 +423,8 @@ mod tests {
         let msg_payload = b"failed_message";
         let msg = CanonicalMessage::new(msg_payload.to_vec(), None);
 
-        // 5. Send
         let result = dlq_middleware.send(msg).await;
 
-        // 6. Verify
         assert!(result.is_ok(), "Send should succeed (handled by DLQ)");
 
         // Check retries happened

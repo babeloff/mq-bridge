@@ -43,7 +43,7 @@ pub mod sqlx;
 pub mod structural;
 #[cfg(feature = "websocket")]
 pub mod websocket;
-#[cfg(feature = "zeromq")]
+#[cfg(any(feature = "zeromq", feature = "zeromq-omq"))]
 pub mod zeromq;
 use crate::endpoints::memory::{get_or_create_channel, MemoryChannel};
 /// Backwards-compatible aliases for the structural endpoints, which used to live
@@ -895,8 +895,8 @@ async fn create_base_consumer(
             }
             Ok(boxed(ibm_mq::IbmMqConsumer::new(&config).await?))
         }
-        #[cfg(feature = "zeromq")]
-        EndpointType::ZeroMq(cfg) => Ok(boxed(zeromq::ZeroMqConsumer::new(cfg).await?)),
+        #[cfg(any(feature = "zeromq", feature = "zeromq-omq"))]
+        EndpointType::ZeroMq(cfg) => zeromq::create_consumer(cfg).await,
         #[cfg(feature = "redis-streams")]
         EndpointType::RedisStreams(cfg) => {
             let mut config = cfg.clone();
@@ -1589,10 +1589,8 @@ async fn create_base_publisher(
             }
             Ok(Box::new(mqtt::MqttPublisher::new(&config).await?) as Box<dyn MessagePublisher>)
         }
-        #[cfg(feature = "zeromq")]
-        EndpointType::ZeroMq(cfg) => {
-            Ok(Box::new(zeromq::ZeroMqPublisher::new(cfg).await?) as Box<dyn MessagePublisher>)
-        }
+        #[cfg(any(feature = "zeromq", feature = "zeromq-omq"))]
+        EndpointType::ZeroMq(cfg) => zeromq::create_publisher(cfg).await,
         #[cfg(feature = "redis-streams")]
         EndpointType::RedisStreams(cfg) => {
             let mut config = cfg.clone();
@@ -1908,7 +1906,8 @@ mod tests {
     fn test_consumer_middleware_ordering() {
         let endpoint = Endpoint::new_memory("test", 10)
             .with_deduplication(crate::models::DeduplicationMiddleware {
-                sled_path: "".into(),
+                store: None,
+                sled_path: Some("".into()),
                 ttl_seconds: 10,
             })
             .with_consumer_metrics();

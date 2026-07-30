@@ -22,7 +22,7 @@ async fn test_static_to_null_performance() {
     let output = Endpoint::new(EndpointType::Null);
 
     // Route with a handler that just increments a counter.
-    // Now that batching is implemented, concurrency and batch_size will scale throughput.
+    // Concurrency and batch_size scale throughput here.
     let route = Route::new(input, output)
         .with_handler(move |_msg| {
             counter_clone.fetch_add(1, Ordering::Relaxed);

@@ -140,10 +140,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_switch_publisher_routing() {
-        // Setup destinations
-        let pub_a = MemoryPublisher::new_local("topic_a", 10);
-        let pub_b = MemoryPublisher::new_local("topic_b", 10);
-        let pub_default = MemoryPublisher::new_local("topic_default", 10);
+        // Unique topic names: memory topics resolve through a process-global registry,
+        // so shared names would collide with parallel tests.
+        let pub_a = MemoryPublisher::new_local("switch_routing_topic_a", 10);
+        let pub_b = MemoryPublisher::new_local("switch_routing_topic_b", 10);
+        let pub_default = MemoryPublisher::new_local("switch_routing_topic_default", 10);
 
         let chan_a = pub_a.channel();
         let chan_b = pub_b.channel();

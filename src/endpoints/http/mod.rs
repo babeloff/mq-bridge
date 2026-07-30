@@ -155,6 +155,8 @@ pub struct HttpConsumer {
     buffer_size: usize,
     url: String,
     bound_addr: Option<SocketAddr>,
+    /// Drain mode: only then does an idle recv time out into an empty batch.
+    exit_on_empty: bool,
 }
 
 impl HttpConsumer {
@@ -762,6 +764,7 @@ impl HttpConsumer {
             buffer_size,
             url: build_consumer_target_url(config, shared_server.bound_addr),
             bound_addr: shared_server.bound_addr,
+            exit_on_empty: false,
         })
     }
 }
@@ -797,6 +800,28 @@ fn setup_http_state_and_channel(
                 .map_err(|_| anyhow::anyhow!("Invalid config.method: '{}'", m))
         })
         .transpose()?;
+
+    // Validate custom header names/values once at startup so a malformed entry is a
+    // configuration error instead of a per-request panic in the response builders
+    // (which unwrap after `builder.header(...)`).
+    for (name, value) in &config.custom_headers {
+        hyper::header::HeaderName::from_bytes(name.as_bytes())
+            .map_err(|e| anyhow::anyhow!("Invalid custom_headers name '{name}': {e}"))?;
+        hyper::header::HeaderValue::from_str(value)
+            .map_err(|e| anyhow::anyhow!("Invalid custom_headers value for '{name}': {e}"))?;
+    }
+
+    // The `compression` codec is publisher-only and ignored on a consumer, so a codec
+    // set without `compression_enabled` would silently disable response compression.
+    if config.compression != crate::models::Compression::None
+        && config.compression_enabled.is_none()
+    {
+        tracing::warn!(
+            codec = ?config.compression,
+            "http consumer: `compression` is a publisher-only codec and is ignored here; \
+             set `compression_enabled: true` to compress responses"
+        );
+    }
 
     let inline_echo = inline_publisher.as_ref().is_some_and(|publisher| {
         publisher
@@ -966,12 +991,22 @@ async fn get_or_create_shared_http_server(
 /// via `MQ_BRIDGE_HTTP_REUSEPORT` (`0`/`false`/`off`/`no` to force the shared
 /// listener).
 fn http_reuseport_enabled() -> bool {
-    match std::env::var("MQ_BRIDGE_HTTP_REUSEPORT") {
-        Ok(value) => !matches!(
-            value.trim().to_ascii_lowercase().as_str(),
-            "0" | "false" | "off" | "no"
-        ),
-        Err(_) => cfg!(unix),
+    // `SO_REUSEPORT` only exists on Unix, and `bind_reuseport_listener` only applies the
+    // socket option there; the env override must not be able to enable per-worker binds on
+    // a non-Unix target (where they would bind with SO_REUSEADDR semantics only).
+    #[cfg(unix)]
+    {
+        match std::env::var("MQ_BRIDGE_HTTP_REUSEPORT") {
+            Ok(value) => !matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "off" | "no"
+            ),
+            Err(_) => true,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        false
     }
 }
 
@@ -1271,6 +1306,9 @@ impl MessageConsumer for HttpConsumer {
     fn commit_requires_order(&self) -> bool {
         false
     }
+    fn set_exit_on_empty(&mut self, exit_on_empty: bool) {
+        self.exit_on_empty = exit_on_empty;
+    }
     async fn receive_batch(&mut self, max_messages: usize) -> Result<ReceivedBatch, ConsumerError> {
         let max_messages = max_messages.max(1);
 
@@ -1280,7 +1318,12 @@ impl MessageConsumer for HttpConsumer {
         // channel operation instead of N) and coalesces bursts more tightly — the
         // single per-route receiver is otherwise a per-message wake-up point.
         let mut batch: Vec<HttpSourceMessage> = Vec::with_capacity(max_messages);
-        if self.request_rx.recv_many(&mut batch, max_messages).await == 0 {
+        let received = self.request_rx.recv_many(&mut batch, max_messages);
+        // Drain mode: a brief idle timeout yields an empty batch so --drain can fire.
+        let Some(count) = crate::traits::drain_gated(self.exit_on_empty, received).await else {
+            return Ok(ReceivedBatch::empty());
+        };
+        if count == 0 {
             return Err(anyhow!("HTTP source channel closed").into());
         }
 
@@ -1440,7 +1483,7 @@ async fn handle_request_internal(
                             StatusCode::UNAUTHORIZED,
                             "Missing Basic authentication scheme",
                             accepts_text,
-                            None,
+                            Some(&basic_auth_challenge_headers()),
                         ));
                     }
                 }
@@ -1458,7 +1501,7 @@ async fn handle_request_internal(
                 StatusCode::UNAUTHORIZED,
                 "Missing authorization header",
                 accepts_text,
-                None,
+                Some(&basic_auth_challenge_headers()),
             ));
         }
     }
@@ -1590,9 +1633,20 @@ async fn handle_request_internal(
     // Read body with a timeout to prevent hanging on abandoned client connections.
     // This prevents "zombie" tasks from saturating the runtime during retry storms.
     let body_collect_timeout = state.request_timeout;
-    let body_bytes = match tokio::time::timeout(body_collect_timeout, body.collect()).await {
+    let limited = http_body_util::Limited::new(body, MAX_HTTP_BODY_BYTES as usize);
+    let body_bytes = match tokio::time::timeout(body_collect_timeout, limited.collect()).await {
         Ok(Ok(b)) => b.to_bytes(),
         Ok(Err(e)) => {
+            if e.downcast_ref::<http_body_util::LengthLimitError>()
+                .is_some()
+            {
+                return Ok(text_error_response(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    format!("Request body exceeds maximum of {MAX_HTTP_BODY_BYTES} bytes"),
+                    accepts_text,
+                    None,
+                ));
+            }
             return Ok(text_error_response(
                 StatusCode::BAD_REQUEST,
                 format!("Failed to read body: {}", e),
@@ -1610,9 +1664,20 @@ async fn handle_request_internal(
         }
     };
 
-    // Decompress if needed
-    let payload = decompress_if_needed(body_bytes, content_encoding.as_deref())
-        .map_err(|e| anyhow!("Failed to decompress request body: {}", e))?;
+    // Decompress if needed. A malformed or oversized client-controlled body is a client
+    // error (4xx), not a server failure — surface it as such instead of letting it bubble
+    // up to handle_request's 500 handler.
+    let payload = match decompress_if_needed(body_bytes, content_encoding.as_deref()) {
+        Ok(payload) => payload,
+        Err(e) => {
+            return Ok(text_error_response(
+                StatusCode::BAD_REQUEST,
+                format!("Failed to decompress request body: {}", e),
+                accepts_text,
+                None,
+            ));
+        }
+    };
 
     let mut message = CanonicalMessage::new_bytes(payload, message_id);
     trace!(
@@ -1788,9 +1853,20 @@ async fn inline_echo_response(
     accepts_text: bool,
     permit: tokio::sync::OwnedSemaphorePermit,
 ) -> anyhow::Result<Response<BoxBody>> {
-    let body_bytes = match tokio::time::timeout(state.request_timeout, body.collect()).await {
+    let limited = http_body_util::Limited::new(body, MAX_HTTP_BODY_BYTES as usize);
+    let body_bytes = match tokio::time::timeout(state.request_timeout, limited.collect()).await {
         Ok(Ok(collected)) => collected.to_bytes(),
         Ok(Err(e)) => {
+            if e.downcast_ref::<http_body_util::LengthLimitError>()
+                .is_some()
+            {
+                return Ok(text_error_response(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    format!("Request body exceeds maximum of {MAX_HTTP_BODY_BYTES} bytes"),
+                    accepts_text,
+                    None,
+                ));
+            }
             return Ok(text_error_response(
                 StatusCode::BAD_REQUEST,
                 format!("Failed to read body: {}", e),
@@ -1866,14 +1942,10 @@ fn make_response(
                     continue; // source/provenance keys must not leak as response headers
                 }
                 let is_content_type = key.eq_ignore_ascii_case("content-type");
-                // Request-echo suppression drops reply metadata that byte-matches the
-                // incoming request header of the same name, so pure passthrough/echo
-                // routes don't re-emit unchanged request headers (e.g. `x-request-id`).
-                // `content-type` is exempt: it describes the *response* representation,
-                // so when it is present on the reply it must always be sent — even when
-                // it happens to equal the request's `Content-Type` (e.g. a handler that
-                // explicitly replies `text/plain` to a `text/plain` request). Without
-                // this exemption such a reply would be suppressed and fall back to
+                // Request-echo suppression drops reply metadata that byte-matches the incoming
+                // request header of the same name (so echo routes don't re-emit `x-request-id`).
+                // `content-type` is exempt: it describes the response, so it must always be sent
+                // even when it equals the request's — otherwise the reply falls back to
                 // `application/octet-stream`.
                 if !is_content_type
                     && request_metadata
@@ -2050,14 +2122,74 @@ fn create_rustls_client_config(tls_config: &TlsConfig) -> anyhow::Result<rustls:
             .with_safe_default_protocol_versions()?
             .with_root_certificates(root_cert_store);
 
-    if let (Some(cert_file), Some(key_file)) = (&tls_config.cert_file, &tls_config.key_file) {
-        let certs = load_certs(cert_file)?;
-        let key = load_private_key(key_file)?;
-        config_builder
-            .with_client_auth_cert(certs, key)
-            .context("Failed to build mTLS client config")
-    } else {
-        Ok(config_builder.with_no_client_auth())
+    let mut config =
+        if let (Some(cert_file), Some(key_file)) = (&tls_config.cert_file, &tls_config.key_file) {
+            let certs = load_certs(cert_file)?;
+            let key = load_private_key(key_file)?;
+            config_builder
+                .with_client_auth_cert(certs, key)
+                .context("Failed to build mTLS client config")?
+        } else {
+            config_builder.with_no_client_auth()
+        };
+
+    if tls_config.accept_invalid_certs {
+        // INSECURE: disables server certificate and hostname verification, so the
+        // connection is open to man-in-the-middle attacks. Honoured only because the
+        // caller explicitly opted in via `accept_invalid_certs`; never for production.
+        warn!("HTTP client TLS is configured to accept invalid certificates. This is insecure and must not be used in production.");
+        let schemes = crate::endpoints::get_crypto_provider()?
+            .signature_verification_algorithms
+            .supported_schemes();
+        config
+            .dangerous()
+            .set_certificate_verifier(Arc::new(NoopClientCertVerifier {
+                supported_schemes: schemes,
+            }));
+    }
+
+    Ok(config)
+}
+
+/// A rustls server-certificate verifier that performs no validation. Used only when
+/// `accept_invalid_certs` is set on an HTTP publisher's TLS config.
+#[derive(Debug)]
+struct NoopClientCertVerifier {
+    supported_schemes: Vec<rustls::SignatureScheme>,
+}
+
+impl rustls::client::danger::ServerCertVerifier for NoopClientCertVerifier {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.supported_schemes.clone()
     }
 }
 
@@ -2193,6 +2325,17 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
         diff |= x ^ y;
     }
     diff == 0
+}
+
+/// Header map carrying the `WWW-Authenticate` Basic challenge, so a 401 tells the client
+/// how to authenticate (RFC 7235 §4.1) instead of failing opaquely.
+fn basic_auth_challenge_headers() -> HashMap<String, String> {
+    let mut headers = HashMap::with_capacity(1);
+    headers.insert(
+        "WWW-Authenticate".to_string(),
+        "Basic realm=\"mq-bridge\"".to_string(),
+    );
+    headers
 }
 
 fn configured_basic_auth(basic_auth: Option<&(String, String)>) -> Option<(&str, &str)> {

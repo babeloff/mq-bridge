@@ -531,6 +531,109 @@ fn test_resolve_source_payload_types() {
     assert_eq!(p("missing"), BindValue::Null);
 }
 
+#[cfg(feature = "float-roundtrip")]
+#[test]
+fn test_resolve_source_f64_bit_exact() {
+    // A JSON payload number survives parse+bind bit-for-bit *only* with the
+    // opt-in `float-roundtrip` feature. Default serde_json parsing loses ~1 ULP
+    // on ~19% of 17-significant-digit doubles, so this test is gated on the feature.
+    for g in 1..20_000i64 {
+        let truth = (g as f64) / 7.0;
+        // Written the way ryu-shortest (serde_json output, Postgres text) does.
+        let payload = format!(r#"{{"ratio":{truth}}}"#);
+        let msg = CanonicalMessage::new(payload.into_bytes(), None);
+        let json = serde_json::from_slice(&msg.payload).ok();
+        let bound = resolve_source(&msg, &ColumnSource::Payload("ratio".to_string()), &json);
+        // g divisible by 7 renders as an integer literal ("1", not "1.0") and binds
+        // as Int; every other value must survive parse+bind bit-for-bit as a Float.
+        match bound {
+            BindValue::Int(i) => assert_eq!(i as f64, truth, "int mismatch g={g}"),
+            BindValue::Float(f) => assert_eq!(
+                f.to_bits(),
+                truth.to_bits(),
+                "ULP loss binding g={g}: got {f}, want {truth}"
+            ),
+            other => panic!("expected numeric for g={g}, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn test_deterministic_sqlstate_classification() {
+    // Deterministic (dead-letter, never retry): syntax/type, data-exception, integrity.
+    for code in [
+        "42804", "42601", "42703", "42P01", "22P02", "22003", "23505",
+    ] {
+        assert!(
+            is_deterministic_sqlstate(code),
+            "{code} should be permanent"
+        );
+    }
+    // Transient (retry): connection, deadlock/serialization, resources, operator intervention.
+    for code in [
+        "08006", "08003", "40001", "40P01", "53300", "57P03", "55006",
+    ] {
+        assert!(
+            !is_deterministic_sqlstate(code),
+            "{code} should be transient"
+        );
+    }
+    // Too-short / unknown codes must not be misclassified as permanent.
+    assert!(!is_deterministic_sqlstate(""));
+    assert!(!is_deterministic_sqlstate("4"));
+}
+
+// Issue 3 (regression): a SQLite schema error (missing column/table) reports no
+// Postgres SQLSTATE, so it must be classified permanent via its message — otherwise
+// the consumer wraps it as a retryable Connection error and reconnect-loops forever.
+#[tokio::test]
+async fn test_classify_sqlite_schema_error_is_permanent() {
+    use sqlx::Connection;
+    sqlx::any::install_default_drivers();
+    let mut conn = sqlx::AnyConnection::connect("sqlite::memory:")
+        .await
+        .unwrap();
+    sqlx::query("CREATE TABLE items (id INTEGER PRIMARY KEY, payload BLOB)")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+
+    // Missing column (the `locked_until` lease column queue mode expects). `AnyRow`
+    // is not `Debug`, so extract the error via match rather than `unwrap_err`.
+    let missing_col = match sqlx::query("SELECT locked_until FROM items")
+        .fetch_all(&mut conn)
+        .await
+    {
+        Ok(_) => panic!("expected a missing-column error"),
+        Err(e) => e,
+    };
+    assert!(
+        matches!(
+            classify_sql_consumer_error(missing_col),
+            ConsumerError::Permanent(_)
+        ),
+        "missing column must be permanent, not a retryable Connection error"
+    );
+
+    // Missing table.
+    let missing_table = match sqlx::query("SELECT id FROM does_not_exist")
+        .fetch_all(&mut conn)
+        .await
+    {
+        Ok(_) => panic!("expected a missing-table error"),
+        Err(e) => e,
+    };
+    assert!(
+        matches!(
+            classify_sql_consumer_error(missing_table),
+            ConsumerError::Permanent(_)
+        ),
+        "missing table must be permanent"
+    );
+
+    conn.close().await.unwrap();
+}
+
 #[test]
 fn test_resolve_source_no_fallback() {
     // Payload source must NOT fall back to metadata and vice versa.
@@ -542,6 +645,83 @@ fn test_resolve_source_no_fallback() {
     assert_eq!(
         resolve_source(&msg, &ColumnSource::Payload("k".to_string()), &json),
         BindValue::Null
+    );
+}
+
+#[test]
+fn test_insert_template_preserves_explicit_cast() {
+    // Regression for numeric/timestamptz round-trips: an explicit `::type` cast written
+    // next to a token must survive verbatim into the generated SQL. The sqlx `Any` driver
+    // reads Postgres numeric/timestamptz as text, so the payload carries a JSON string that
+    // Postgres won't implicitly cast on insert — the `::cast` is the supported escape hatch.
+    let (sql, sources) = parse_insert_template(
+        "INSERT INTO dst (id, amount, created_at) \
+         VALUES (${payload:id}, ${payload:amount}::numeric, ${payload:created_at}::timestamptz)",
+        "PostgreSQL",
+    )
+    .unwrap();
+    assert_eq!(
+        sql,
+        "INSERT INTO dst (id, amount, created_at) VALUES ($1, $2::numeric, $3::timestamptz)"
+    );
+    assert_eq!(sources.len(), 3);
+}
+
+// Live round-trip proving text -> numeric/timestamptz works via the `::cast` escape hatch
+// through the real publisher. Requires a Postgres reachable at MQB_PG_TEST_URL.
+// e.g. MQB_PG_TEST_URL=postgres://postgres:pw@localhost:55432/t cargo test --features sqlx \
+//        --lib sqlx_numeric_timestamptz_roundtrip -- --ignored --nocapture
+#[tokio::test]
+#[ignore]
+async fn sqlx_numeric_timestamptz_roundtrip() {
+    let Ok(url) = std::env::var("MQB_PG_TEST_URL") else {
+        eprintln!("MQB_PG_TEST_URL not set; skipping");
+        return;
+    };
+    sqlx::any::install_default_drivers();
+    let pool = AnyPool::connect(&url).await.unwrap();
+    sqlx::query("DROP TABLE IF EXISTS dst_rt")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("CREATE TABLE dst_rt (id bigint, amount numeric, created_at timestamptz)")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let config = SqlxConfig {
+        url: url.clone(),
+        table: "dst_rt".to_string(),
+        insert_query: Some(
+            "INSERT INTO dst_rt (id, amount, created_at) VALUES \
+             (${payload:id}, ${payload:amount}::numeric, ${payload:created_at}::timestamptz)"
+                .to_string(),
+        ),
+        ..Default::default()
+    };
+    let publisher = SqlxPublisher::new(&config).await.unwrap();
+
+    // The sqlx source serializes numeric/timestamptz as JSON *strings* (text projection).
+    let msg = CanonicalMessage::new(
+        br#"{"id":1,"amount":"1.25","created_at":"2020-01-01 00:00:01+00"}"#.to_vec(),
+        None,
+    );
+    publisher.send(msg).await.unwrap();
+
+    let row = sqlx::query(
+        "SELECT id, amount::text AS amount, created_at::text AS created_at FROM dst_rt",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let id: i64 = row.get("id");
+    let amount: String = row.get("amount");
+    let created_at: String = row.get("created_at");
+    assert_eq!(id, 1);
+    assert_eq!(amount, "1.25");
+    assert!(
+        created_at.starts_with("2020-01-01 00:00:01"),
+        "got {created_at}"
     );
 }
 
@@ -701,19 +881,21 @@ async fn test_classify_sql_error_constraint_is_nonretryable_others_retryable() {
         PublisherError::NonRetryable(_)
     ));
 
-    // A non-constraint database error (kind `Other`) models a transient operational failure such
-    // as a server restart -> must be Retryable, never dropped.
-    let other = sqlx::query("INSERT INTO no_such_table (id) VALUES (1)")
+    // A missing table is a deterministic schema error: every retry fails identically, so it
+    // dead-letters instead of wedging the route -> NonRetryable. (SQLite reports it as a bare
+    // SQLITE_ERROR with no SQLSTATE, so this exercises the message-based fallback.)
+    let schema = sqlx::query("INSERT INTO no_such_table (id) VALUES (1)")
         .execute(&pool)
         .await
         .unwrap_err();
-    assert!(other.as_database_error().is_some());
+    assert!(schema.as_database_error().is_some());
     assert!(matches!(
-        classify_sql_error(other),
-        PublisherError::Retryable(_)
+        classify_sql_error(schema),
+        PublisherError::NonRetryable(_)
     ));
 
-    // Transport-level errors (pool exhaustion, I/O) are transient too.
+    // Operational failures (a broker restart/failover, e.g. MySQL 1053 SQLSTATE `08S01`) and
+    // transport-level errors (pool exhaustion, I/O) are transient -> must stay Retryable.
     assert!(matches!(
         classify_sql_error(sqlx::Error::PoolTimedOut),
         PublisherError::Retryable(_)
@@ -734,4 +916,36 @@ async fn test_sqlx_status() {
     assert!(status.healthy);
     assert_eq!(status.target, "messages");
     assert!(status.details.get("driver").is_some());
+}
+
+#[cfg(feature = "dedup")]
+#[tokio::test]
+async fn sql_dedup_store_reserve_mark_and_expire() {
+    sqlx::any::install_default_drivers();
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("dedup.db");
+    drop(tokio::fs::File::create(&path).await.unwrap());
+    let url = sqlite_url(&path);
+
+    let store = build_sql_dedup_store(&url, None, 60, "test_route")
+        .await
+        .unwrap();
+
+    let key = 12345u128.to_be_bytes();
+    let now = 1_000u64;
+
+    // First sight -> reserved (not a duplicate).
+    assert!(!store.reserve(&key, now).await.unwrap());
+    // Same key while the pending reservation is live -> duplicate.
+    assert!(store.reserve(&key, now).await.unwrap());
+    // Promote to processed; still a duplicate within the 60s TTL.
+    store.mark_processed(&key, now).await;
+    assert!(store.reserve(&key, now).await.unwrap());
+
+    // A different key is unaffected.
+    let other = 999u128.to_be_bytes();
+    assert!(!store.reserve(&other, now).await.unwrap());
+
+    // Once the processed TTL has elapsed, the key is reclaimable.
+    assert!(!store.reserve(&key, now + 61).await.unwrap());
 }

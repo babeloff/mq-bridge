@@ -153,13 +153,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_publisher_config_usage() {
-        // 1. Create a PublisherConfig (simulating loading from config)
+        // Create a PublisherConfig (simulating loading from config)
         let mut publisher_config: PublisherConfig = HashMap::new();
         let endpoint = Endpoint::new_memory("pub_test_topic", 10);
         let channel = endpoint.channel().unwrap();
         publisher_config.insert("my_publisher".to_string(), endpoint);
 
-        // 2. Initialize publishers from config
         let mut publishers = HashMap::new();
         for (name, endpoint) in publisher_config {
             let publisher = Publisher::new(endpoint)
@@ -168,13 +167,11 @@ mod tests {
             publishers.insert(name, publisher);
         }
 
-        // 3. Retrieve and use the publisher
         let publisher = publishers.get("my_publisher").expect("Publisher not found");
         let msg = CanonicalMessage::from("hello world");
 
         publisher.send(msg).await.expect("Failed to send message");
 
-        // 4. Verify with underlying channel
         let received = channel.drain_messages();
         assert_eq!(received.len(), 1);
         assert_eq!(received[0].get_payload_str(), "hello world");

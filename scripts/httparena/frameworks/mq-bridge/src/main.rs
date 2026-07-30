@@ -417,12 +417,8 @@ fn make_http(listen: String, tls: Option<TlsConfig>) -> HttpConfig {
     let mut http = HttpConfig::new(listen).with_inline_response_fast_path(true);
     http.concurrency_limit = Some(65_536);
     http.internal_buffer_size = Some(16_384);
-    // Static assets are pre-gzipped once at startup (see CachedBody) and the reply
-    // carries `content-encoding: gzip` when the client accepts it — the library
-    // honors that and skips re-compressing them. Dynamic `/json` responses are
-    // serialized fresh per request (no response caching) and compressed by the
-    // library's per-request gzip when the client advertises Accept-Encoding.
-    http.compression = mq_bridge::models::Compression::Gzip;
+    // TODO: switch gzip to zstd for better timing results
+    http.compression_enabled = Some(true);
     http.compression_threshold_bytes = Some(256);
     if let Some(tls) = tls {
         http.tls = tls;

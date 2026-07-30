@@ -172,6 +172,40 @@ impl Default for EndpointStatus {
     }
 }
 
+/// How long a draining consumer blocks for a first message before yielding an
+/// empty batch so `exit_on_empty`/`--drain` can fire. Only applied while draining;
+/// the streaming path blocks indefinitely (event-driven, no added latency).
+///
+/// Defaults to 1s — a safety margin so a source with a momentary gap isn't declared
+/// drained prematurely. Override once at process start via the
+/// `MQ_BRIDGE_DRAIN_IDLE_TIMEOUT_MS` env var (e.g. `0` to yield immediately, which
+/// benchmarks want so the drain tail doesn't skew wall-clock timing). Read once and
+/// cached; changing the env var after first use has no effect.
+pub(crate) fn drain_idle_timeout() -> std::time::Duration {
+    static V: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("MQ_BRIDGE_DRAIN_IDLE_TIMEOUT_MS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .map(std::time::Duration::from_millis)
+            .unwrap_or(std::time::Duration::from_millis(1000))
+    })
+}
+
+/// Awaits `fut`, but in drain mode gives up after [`drain_idle_timeout`], returning
+/// `None` so a blocking consumer can surface an empty batch instead of hanging.
+/// Outside drain mode it simply awaits, preserving the event-driven fast path.
+pub(crate) async fn drain_gated<F: std::future::Future>(
+    exit_on_empty: bool,
+    fut: F,
+) -> Option<F::Output> {
+    if exit_on_empty {
+        tokio::time::timeout(drain_idle_timeout(), fut).await.ok()
+    } else {
+        Some(fut.await)
+    }
+}
+
 #[async_trait]
 pub trait MessageConsumer: Send + Sync {
     /// Returns an optional lifecycle hook that runs once after the consumer connection is created.
@@ -254,6 +288,14 @@ pub trait MessageConsumer: Send + Sync {
             commit: batch_commit,
         })
     }
+
+    /// Informs the consumer whether the owning route will terminate on an empty
+    /// batch (`exit_on_empty` / `--drain`). Called once by the route right after
+    /// creation. Blocking transports use it to gate an idle timeout (via
+    /// `drain_gated`) so a quiet source surfaces an empty batch instead of
+    /// hanging the drain; the file tail reader also uses it to decide whether a
+    /// final record with no trailing delimiter is complete (drain) or torn (live tail).
+    fn set_exit_on_empty(&mut self, _exit_on_empty: bool) {}
 
     /// Whether this consumer's commits (acks) must be applied in the order the
     /// batches were received.
@@ -657,13 +699,12 @@ mod tests {
 
         match result {
             Ok(SentBatch::Partial { responses, failed }) => {
-                // 1. Verify response from first message
                 assert!(responses.is_some());
                 let resps = responses.unwrap();
                 assert_eq!(resps.len(), 1);
                 assert_eq!(resps[0].get_payload_str(), "resp1");
 
-                // 2. Verify failures. Sends are pipelined and awaited independently,
+                // Verify failures. Sends are pipelined and awaited independently,
                 // so only message 2 (the one that errored) is reported failed;
                 // message 3 still succeeds (Ack) and is not needlessly resent.
                 assert_eq!(failed.len(), 1);

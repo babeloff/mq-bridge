@@ -750,6 +750,7 @@ pub enum EndpointType {
         config: serde_json::Value,
     },
     #[default]
+    #[cfg_attr(feature = "schema", schemars(extend("format" = "structural_endpoint")))]
     Null,
 }
 
@@ -837,6 +838,7 @@ pub struct EncryptionConfig {
     pub key: String,
     /// Extra `key_id -> base64 key` entries accepted when decrypting (key rotation).
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[cfg_attr(feature = "schema", schemars(extend("format" = "password")))]
     pub decrypt_keys: HashMap<String, String>,
 }
 
@@ -880,14 +882,18 @@ pub enum Middleware {
 
 /// Deduplication middleware configuration.
 ///
-/// Prevents duplicate messages from being processed using a Sled-backed database.
+/// Prevents duplicate messages from being processed using a sled, MongoDB, or SQL backend.
 /// Messages are identified by their deduplication key and removed after the TTL expires.
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct DeduplicationMiddleware {
-    /// Path to the Sled database directory.
-    pub sled_path: String,
+    /// Store URL: `sled:///path` (local), `mongodb://host/db[/collection]`, or `postgres|mysql|mariadb|sqlite://…[/table]` (shared).
+    #[serde(default)]
+    pub store: Option<String>,
+    /// Local Sled directory (legacy). Prefer `store`.
+    #[serde(default)]
+    pub sled_path: Option<String>,
     /// Time-to-live for deduplication entries in seconds.
     pub ttl_seconds: u64,
 }
@@ -1082,6 +1088,7 @@ pub enum WeakJoinTimeout {
 /// out of the route.
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[cfg_attr(feature = "schema", schemars(transform = transform_middleware_schema_transform))]
 #[serde(deny_unknown_fields)]
 pub struct TransformMiddleware {
     /// Output field name -> source path (e.g. `firstName: "$.first_name"`). Dots nest the output.
@@ -1904,7 +1911,7 @@ impl<'de> Deserialize<'de> for MemoryConfig {
         }
 
         let raw = MemoryConfigSerde::deserialize(deserializer)?;
-        if raw.topic.is_empty() && raw.url.as_deref().map_or(true, str::is_empty) {
+        if raw.topic.is_empty() && raw.url.as_deref().is_none_or(str::is_empty) {
             return Err(serde::de::Error::custom(
                 "MemoryConfig: 'topic' (or 'url' alias) is required.",
             ));
@@ -1977,6 +1984,30 @@ fn route_schema_transform(schema: &mut schemars::Schema) {
         return;
     };
 
+    // `output: null` (the documented "no output" form) is valid; accept an Endpoint or null.
+    // Input stays endpoint-only.
+    if let Some(output) = properties
+        .get_mut("output")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        let reference = output.remove("$ref");
+        let default = output.remove("default");
+        let description = output.remove("description");
+        output.clear();
+        let mut any_of = Vec::new();
+        if let Some(reference) = reference {
+            any_of.push(serde_json::json!({ "$ref": reference }));
+        }
+        any_of.push(serde_json::json!({ "type": "null" }));
+        output.insert("anyOf".to_string(), serde_json::Value::Array(any_of));
+        if let Some(description) = description {
+            output.insert("description".to_string(), description);
+        }
+        if let Some(default) = default {
+            output.insert("default".to_string(), default);
+        }
+    }
+
     let Some(allow_fault_injection) = properties
         .get_mut("allow_fault_injection")
         .and_then(serde_json::Value::as_object_mut)
@@ -1985,6 +2016,22 @@ fn route_schema_transform(schema: &mut schemars::Schema) {
     };
 
     allow_fault_injection.insert("default".to_string(), serde_json::Value::Bool(false));
+}
+
+/// `schema` and `schema_file` are mutually exclusive; reject a config setting both.
+#[cfg(feature = "schema")]
+fn transform_middleware_schema_transform(schema: &mut schemars::Schema) {
+    if let Some(schema_obj) = schema.as_object_mut() {
+        // Only reject a non-null `schema_file` alongside `schema`; `schema_file: null`
+        // is allowed with `schema`, matching the runtime compiler (Option is None).
+        schema_obj.insert(
+            "not".to_string(),
+            serde_json::json!({
+                "required": ["schema", "schema_file"],
+                "properties": { "schema_file": { "type": "string" } }
+            }),
+        );
+    }
 }
 
 /// Configuration for the correlated in-process stream response buffer.
@@ -2175,6 +2222,8 @@ pub struct MongoDbConfig {
     /// underlying mechanism automatically. If unset, the deprecated `change_stream` boolean is
     /// honored for backward compatibility.
     pub consume: Option<MongoConsume>,
+    /// (Consumer only) Optional custom MongoDB query to filter messages. Provided as a JSON string (e.g., '{"type": "notification"}').
+    pub receive_query: Option<String>,
     /// (Consumer only) **Deprecated** — use `consume: subscriber`. Kept for compatibility.
     #[serde(default)]
     pub change_stream: bool,
@@ -2200,10 +2249,15 @@ pub struct MongoDbConfig {
     /// Format for storing messages. Defaults to Normal.
     #[serde(default)]
     pub format: MongoDbFormat,
+    /// (Publisher only) Top-level payload field whose value becomes the document `_id`, for
+    /// idempotent inserts via the unique `_id` index. Sink collections only.
+    pub id_field: Option<String>,
+    /// (Publisher only) Return the message with metadata `mongodb.outcome` = `inserted`/`existed`
+    /// (dup-key) so a `request`+`switch` can branch. Sink collections only; pair with `id_field`.
+    #[serde(default)]
+    pub report_outcome: bool,
     /// The ID used for the cursor in sequenced mode. If not provided, consumption starts from the current sequence (ephemeral).
     pub cursor_id: Option<String>,
-    /// (Consumer only) Optional custom MongoDB query to filter messages. Provided as a JSON string (e.g., '{"type": "notification"}').
-    pub receive_query: Option<String>,
     /// (Optional) Collection to store sequence counters and cursor positions. Defaults to the message collection if not set.
     pub meta_collection: Option<String>,
     /// Share one MongoDB client per connection (default: true); false forces a dedicated client.
@@ -2368,6 +2422,12 @@ pub struct ZeroMqConfig {
     /// Wire format: `json` wraps the CanonicalMessage; `raw` sends payload bytes per frame; `raw_framed` adds a JSON metadata frame. Default `json`.
     #[serde(default)]
     pub format: ZeroMqFormat,
+    /// Backend: `zmq` (default, the `zeromq` crate) or `omq` (the `omq-tokio` PoC — PUSH/PULL + PUB/SUB only). `omq` needs the `zeromq-omq` build feature.
+    #[serde(default)]
+    pub backend: ZeroMqBackend,
+    /// (REQ publisher only) Timeout in ms for one request/reply exchange before it is reported as failed. Defaults to 30000.
+    #[serde(default)]
+    pub request_timeout_ms: Option<u64>,
 }
 
 impl ZeroMqConfig {
@@ -2421,6 +2481,21 @@ pub enum ZeroMqSocketType {
     Sub,
     Req,
     Rep,
+}
+
+/// ZeroMQ backend implementation.
+///
+/// `zmq` (default) uses the `zeromq` crate (pure-Rust zmq.rs). `omq` uses
+/// `omq-tokio` (omq.rs) — much faster on the per-message `raw`/`raw_framed`
+/// path and adds CURVE/PLAIN security, but currently covers PUSH/PULL + PUB/SUB
+/// only and requires the `zeromq-omq` build feature (MSRV 1.93).
+#[derive(Debug, Deserialize, Serialize, Clone, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "lowercase")]
+pub enum ZeroMqBackend {
+    #[default]
+    Zmq,
+    Omq,
 }
 
 // --- Redis Streams Specific Configuration ---
@@ -3132,6 +3207,11 @@ pub struct SqlxConfig {
     /// Example: `INSERT INTO orders (customer_id, sku, qty) VALUES (${metadata:customer_id}, ${payload:sku}, ${payload:qty})`.
     /// A query with no `${...}` tokens behaves exactly as before (whole payload bound once).
     /// `auto_create_table` is not supported together with a token-based query.
+    ///
+    /// Tokens bind as text/number/bool; Postgres won't implicitly cast text into a
+    /// `numeric`/`timestamptz` column (these arrive as JSON strings from a sql source).
+    /// Add an explicit cast next to the token — it is preserved verbatim in the SQL:
+    /// `VALUES (${payload:amount}::numeric, ${payload:created_at}::timestamptz)`.
     pub insert_query: Option<String>,
     /// (Consumer only) Optional. A custom SQL SELECT query to fetch messages. This is only supported for PostgreSQL and Microsoft SQL Server.
     /// The query must include a placeholder for the batch size (`$1` for PostgreSQL, `@p1` for SQL Server).
@@ -3571,6 +3651,19 @@ impl SecretExtractor for EndpointType {
                 cfg.forward_to
                     .extract_secrets(&format!("{}__{}", prefix, "REQUEST__FORWARD_TO"), secrets);
             }
+            EndpointType::File(cfg) => {
+                if let Some(enc) = &mut cfg.encryption {
+                    enc.extract_secrets(&format!("{}__{}", prefix, "FILE__ENCRYPTION"), secrets);
+                }
+            }
+            EndpointType::ObjectStore(cfg) => {
+                if let Some(enc) = &mut cfg.encryption {
+                    enc.extract_secrets(
+                        &format!("{}__{}", prefix, "OBJECT_STORE__ENCRYPTION"),
+                        secrets,
+                    );
+                }
+            }
             _ => {}
         }
     }
@@ -3578,9 +3671,32 @@ impl SecretExtractor for EndpointType {
 
 impl SecretExtractor for Middleware {
     fn extract_secrets(&mut self, prefix: &str, secrets: &mut HashMap<String, String>) {
-        if let Middleware::Dlq(cfg) = self {
-            cfg.endpoint
-                .extract_secrets(&format!("{}__{}__{}", prefix, "DLQ", "ENDPOINT"), secrets);
+        match self {
+            Middleware::Dlq(cfg) => {
+                cfg.endpoint
+                    .extract_secrets(&format!("{}__{}__{}", prefix, "DLQ", "ENDPOINT"), secrets);
+            }
+            Middleware::Encryption(cfg) => {
+                cfg.extract_secrets(&format!("{}__{}", prefix, "ENCRYPTION"), secrets);
+            }
+            _ => {}
+        }
+    }
+}
+
+impl SecretExtractor for EncryptionConfig {
+    fn extract_secrets(&mut self, prefix: &str, secrets: &mut HashMap<String, String>) {
+        if !self.key.is_empty() {
+            secrets.insert(
+                sanitize_secret_key(&format!("{}__{}", prefix, "KEY")),
+                std::mem::take(&mut self.key),
+            );
+        }
+        for (id, k) in std::mem::take(&mut self.decrypt_keys) {
+            secrets.insert(
+                sanitize_secret_key(&format!("{}__{}__{}", prefix, "DECRYPT_KEYS", id)),
+                k,
+            );
         }
     }
 }
@@ -3888,7 +4004,7 @@ kafka_to_nats:
         for middleware in &input.middlewares {
             match middleware {
                 Middleware::Deduplication(dedup) => {
-                    assert_eq!(dedup.sled_path, "/tmp/mq-bridge/dedup_db");
+                    assert_eq!(dedup.sled_path.as_deref(), Some("/tmp/mq-bridge/dedup_db"));
                     assert_eq!(dedup.ttl_seconds, 3600);
                     has_dedup = true;
                 }
