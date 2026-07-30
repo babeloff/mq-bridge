@@ -382,7 +382,7 @@ pub mod zeromq_helper {
             internal_buffer_size: Some(PERF_TEST_MESSAGE_COUNT + 1),
             topic: None,
             format: ZeroMqFormat::Json,
-            backend: Default::default(),
+            ..Default::default()
         };
         Arc::new(ZeroMqPublisher::new(&config).await.unwrap())
     }
@@ -398,7 +398,7 @@ pub mod zeromq_helper {
             internal_buffer_size: Some(PERF_TEST_MESSAGE_COUNT + 1),
             topic: None,
             format: ZeroMqFormat::Json,
-            backend: Default::default(),
+            ..Default::default()
         };
         Arc::new(Mutex::new(ZeroMqConsumer::new(&config).await.unwrap()))
     }
