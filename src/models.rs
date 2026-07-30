@@ -881,13 +881,13 @@ pub enum Middleware {
 
 /// Deduplication middleware configuration.
 ///
-/// Prevents duplicate messages from being processed using a Sled-backed database.
+/// Prevents duplicate messages from being processed using a sled, MongoDB, or SQL backend.
 /// Messages are identified by their deduplication key and removed after the TTL expires.
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct DeduplicationMiddleware {
-    /// Store URL: `sled:///path` (local) or `mongodb://host/db[/collection]` (shared).
+    /// Store URL: `sled:///path` (local), `mongodb://host/db[/collection]`, or `postgres|mysql|mariadb|sqlite://…[/table]` (shared).
     #[serde(default)]
     pub store: Option<String>,
     /// Local Sled directory (legacy). Prefer `store`.
