@@ -1,30 +1,6 @@
 use std::env;
 use std::fs;
-use std::path::Path;
 use std::process::Command;
-
-fn replace_optional(
-    content: &str,
-    from: &str,
-    to: &str,
-    label: &str,
-    source_path: &Path,
-) -> String {
-    let count = content.matches(from).count();
-    if count == 0 {
-        // Downstream has already adopted the new API for this construct; nothing to patch.
-        println!(
-            "No patch target for {} in {:?} (already API-compatible), skipping",
-            label, source_path
-        );
-        return content.to_string();
-    }
-    println!(
-        "Patching {} occurrence(s) of {} in {:?}",
-        count, label, source_path
-    );
-    content.replacen(from, to, count)
-}
 
 #[test]
 #[ignore = "Requires git, internet access, and takes time. Runs downstream integration tests."]
@@ -112,61 +88,6 @@ fn armature_messaging_test() {
         .status()
         .expect("Failed to execute cargo add");
     assert!(status.success(), "Failed to patch mq-bridge dependency");
-
-    // Patch armature-messaging source code to be compatible with mq-bridge 0.2.0 breaking changes
-    // We need to convert Option<CanonicalMessage> to MessageDisposition using .into()
-    let source_path = project_dir.join("src/mq_bridge.rs");
-    assert!(
-        source_path.exists(),
-        "expected mq_bridge.rs at {:?}",
-        source_path
-    );
-
-    println!("Patching {:?} for API compatibility...", source_path);
-    let content = fs::read_to_string(&source_path).expect("Failed to read mq_bridge.rs");
-    let new_content = replace_optional(
-        &content,
-        "(received.commit)(None)",
-        "(received.commit)(None.into())",
-        "(received.commit)(None)",
-        &source_path,
-    );
-    let new_content = replace_optional(
-        &new_content,
-        "(received.commit)(Some(response))",
-        "(received.commit)(Some(response).into())",
-        "(received.commit)(Some(response))",
-        &source_path,
-    );
-    let new_content = replace_optional(
-        &new_content,
-        "topic: self.topic.clone(),\n                capacity: Some(self.buffer_size),",
-        "topic: self.topic.clone(),\n                url: None,\n                capacity: Some(self.buffer_size),\n                request_reply: false,\n                request_timeout_ms: None,\n                subscribe_mode: false,\n                enable_nack: false,\n                enable_nack_overridden: false,",
-        "memory config using self.topic.clone()",
-        &source_path,
-    );
-    let new_content = replace_optional(
-        &new_content,
-        "topic: topic.into(),\n            capacity: Some(buffer_size),",
-        "topic: topic.into(),\n            url: None,\n            capacity: Some(buffer_size),\n            request_reply: false,\n            request_timeout_ms: None,\n            subscribe_mode: false,\n            enable_nack: false,\n            enable_nack_overridden: false,",
-        "memory config using topic.into()",
-        &source_path,
-    );
-    let new_content = replace_optional(
-        &new_content,
-        "EndpointType::File(self.topic.clone())",
-        "EndpointType::File(mq_bridge::models::FileConfig { path: self.topic.clone(), ..Default::default() })",
-        "EndpointType::File(self.topic.clone())",
-        &source_path,
-    );
-    let new_content = replace_optional(
-        &new_content,
-        "            concurrency: 1,\n            batch_size: 128,",
-        "            options: mq_bridge::models::RouteOptions {\n                concurrency: 1,\n                batch_size: 128,\n                ..Default::default()\n            },",
-        "route concurrency/batch_size fields",
-        &source_path,
-    );
-    fs::write(&source_path, new_content).expect("Failed to write patched mq_bridge.rs");
 
     println!(
         "Running armature-messaging tests in {:?} using {}...",
