@@ -63,6 +63,12 @@ class ClickHouseConfig(TypedDict, total=False):
     wait_for_async_insert: Optional[bool]
 
 
+class CompressionMiddleware(TypedDict, total=False):
+    """Payload-compression middleware configuration."""
+    algorithm: Compression
+    max_decompressed_bytes: Optional[int]
+
+
 class CookieJarMiddleware(TypedDict, total=False):
     """Cookie/session jar middleware configuration."""
     capture_metadata_keys: List[str]
@@ -226,6 +232,7 @@ class MetricsMiddleware(TypedDict, total=False):
 class Middleware(TypedDict, total=False):
     """An enumeration of all supported middleware types."""
     buffer: BufferMiddleware
+    compression: CompressionMiddleware
     cookie_jar: CookieJarMiddleware
     custom: Dict[str, Any]
     deduplication: DeduplicationMiddleware

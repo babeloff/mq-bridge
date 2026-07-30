@@ -7,6 +7,7 @@ AmqpConfig = dict
 AwsConfig = dict
 BufferMiddleware = dict
 ClickHouseConfig = dict
+CompressionMiddleware = dict
 CookieJarMiddleware = dict
 DeadLetterQueueMiddleware = dict
 DeduplicationMiddleware = dict
@@ -73,6 +74,7 @@ __all__ = [
     "CipherKind",
     "ClickHouseConfig",
     "Compression",
+    "CompressionMiddleware",
     "ConfigDocument",
     "CookieJarMiddleware",
     "DeadLetterQueueMiddleware",

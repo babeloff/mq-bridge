@@ -389,6 +389,28 @@
         }
       ]
     },
+    "CompressionMiddleware": {
+      "description": "Payload-compression middleware configuration.\n\nCompresses each message payload on the output side and decompresses it on the input\nside; metadata and routing keys are left untouched. Requires the `compression` feature.\nDistinct from the `file`/`object_store` batch `compression` field, which stays\nCLI-decodable at rest — this operates per message on any transport.",
+      "type": "object",
+      "properties": {
+        "algorithm": {
+          "description": "Algorithm: `none`, `gzip`, `lz4`, or `zstd`. Defaults to `zstd`.",
+          "$ref": "#/$defs/Compression",
+          "default": "zstd"
+        },
+        "max_decompressed_bytes": {
+          "description": "Reject a decompressed payload larger than this many bytes (decompression-bomb guard).\nConsumer side only; unset means no limit.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "default": null,
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
+    },
     "CookieJarMiddleware": {
       "description": "Cookie/session jar middleware configuration.\n\nOptimized for HTTP by default: it can read `cookie` and `set-cookie` metadata,\npersist session cookies, and inject them into later outgoing requests.\n\nThe middleware can also capture arbitrary metadata values into the same session store\nand optionally expose stored values back into message metadata.",
       "type": "object",
@@ -1924,6 +1946,18 @@
           "additionalProperties": false,
           "required": [
             "encryption"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "compression": {
+              "$ref": "#/$defs/CompressionMiddleware"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "compression"
           ]
         },
         {
