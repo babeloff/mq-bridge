@@ -80,7 +80,8 @@ class DeadLetterQueueMiddleware(TypedDict, total=False):
 
 class DeduplicationMiddleware(TypedDict, total=False):
     """Deduplication middleware configuration."""
-    sled_path: Required[str]
+    sled_path: Optional[str]
+    store: Optional[str]
     ttl_seconds: Required[int]
 
 

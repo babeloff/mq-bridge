@@ -12,7 +12,7 @@ use std::sync::Arc;
 mod buffer;
 mod cookie_jar;
 #[cfg(feature = "dedup")]
-mod deduplication;
+pub(crate) mod deduplication;
 mod delay;
 mod dlq;
 #[cfg(feature = "encryption")]
@@ -54,7 +54,7 @@ pub async fn apply_middlewares_to_consumer(
         consumer = match middleware {
             #[cfg(feature = "dedup")]
             Middleware::Deduplication(cfg) => {
-                Box::new(DeduplicationConsumer::new(consumer, cfg, route_name)?)
+                Box::new(DeduplicationConsumer::new(consumer, cfg, route_name).await?)
             }
             #[cfg(feature = "metrics")]
             Middleware::Metrics(cfg) => {

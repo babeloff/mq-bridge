@@ -221,14 +221,39 @@ feature (pulls `sled`).
 
 | Field | Type | Required |
 |---|---|---|
-| `sled_path` | string | yes |
+| `store` | string | one of `store`/`sled_path` |
+| `sled_path` | string | one of `store`/`sled_path` |
 | `ttl_seconds` | integer | yes |
 
+`store` selects the backend by URL scheme:
+
+- `sled:///path` (or a bare path) — a local sled database; per-process, not cluster-wide.
+- `mongodb://host/db[/collection]` — a shared collection, so multiple instances of a route
+  deduplicate against one another. Requires the `mongodb` feature. Entries expire via a
+  MongoDB TTL index; the collection defaults to `mqb_dedup_<route>`. Point it at the same
+  deployment your sink already uses to avoid running extra infrastructure.
+- `postgres|mysql|mariadb|sqlite://…[/table]` — a shared SQL table (`dedup_key` PK,
+  `expire_at`), so multiple instances deduplicate against one another. Requires the `sqlx`
+  feature. SQL has no native TTL, so expired rows are swept periodically; the table defaults
+  to `mqb_dedup_<route>`.
+
+`sled_path` is the legacy spelling of a local sled store and is equivalent to `store: "sled://<path>"`.
+
 ```yaml
-- deduplication: { sled_path: "/var/lib/mq-bridge/dedup", ttl_seconds: 3600 }
+- deduplication: { store: "sled:///var/lib/mq-bridge/dedup", ttl_seconds: 3600 }
 ```
 
-State is a local sled database, so deduplication is per-process, not cluster-wide.
+```yaml
+- deduplication: { store: "mongodb://localhost:27017/etl", ttl_seconds: 3600 }
+```
+
+```yaml
+- deduplication: { store: "postgres://user:pass@localhost/etl", ttl_seconds: 3600 }
+```
+
+When MongoDB is your sink and messages carry a business key, prefer the sink's own unique
+index (`id_field` on the mongodb output) over this middleware — the target collection then
+*is* the deduplication authority, with no second write. See the idempotency notes in README.
 
 ### `weak_join`
 

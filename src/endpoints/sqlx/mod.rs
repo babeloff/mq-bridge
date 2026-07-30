@@ -20,6 +20,11 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tracing::{info, trace, warn};
 
+#[cfg(feature = "dedup")]
+mod dedup;
+#[cfg(feature = "dedup")]
+pub(crate) use dedup::build_sql_dedup_store;
+
 fn is_deadlock_error(e: &sqlx::Error) -> bool {
     if let Some(db_err) = e.as_database_error() {
         match db_err.code() {

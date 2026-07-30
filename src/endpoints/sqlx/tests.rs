@@ -917,3 +917,35 @@ async fn test_sqlx_status() {
     assert_eq!(status.target, "messages");
     assert!(status.details.get("driver").is_some());
 }
+
+#[cfg(feature = "dedup")]
+#[tokio::test]
+async fn sql_dedup_store_reserve_mark_and_expire() {
+    sqlx::any::install_default_drivers();
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("dedup.db");
+    drop(tokio::fs::File::create(&path).await.unwrap());
+    let url = sqlite_url(&path);
+
+    let store = build_sql_dedup_store(&url, None, 60, "test_route")
+        .await
+        .unwrap();
+
+    let key = 12345u128.to_be_bytes();
+    let now = 1_000u64;
+
+    // First sight -> reserved (not a duplicate).
+    assert!(!store.reserve(&key, now).await.unwrap());
+    // Same key while the pending reservation is live -> duplicate.
+    assert!(store.reserve(&key, now).await.unwrap());
+    // Promote to processed; still a duplicate within the 60s TTL.
+    store.mark_processed(&key, now).await;
+    assert!(store.reserve(&key, now).await.unwrap());
+
+    // A different key is unaffected.
+    let other = 999u128.to_be_bytes();
+    assert!(!store.reserve(&other, now).await.unwrap());
+
+    // Once the processed TTL has elapsed, the key is reclaimable.
+    assert!(!store.reserve(&key, now + 61).await.unwrap());
+}

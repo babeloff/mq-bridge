@@ -887,8 +887,12 @@ pub enum Middleware {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct DeduplicationMiddleware {
-    /// Path to the Sled database directory.
-    pub sled_path: String,
+    /// Store URL: `sled:///path` (local) or `mongodb://host/db[/collection]` (shared).
+    #[serde(default)]
+    pub store: Option<String>,
+    /// Local Sled directory (legacy). Prefer `store`.
+    #[serde(default)]
+    pub sled_path: Option<String>,
     /// Time-to-live for deduplication entries in seconds.
     pub ttl_seconds: u64,
 }
@@ -3996,7 +4000,7 @@ kafka_to_nats:
         for middleware in &input.middlewares {
             match middleware {
                 Middleware::Deduplication(dedup) => {
-                    assert_eq!(dedup.sled_path, "/tmp/mq-bridge/dedup_db");
+                    assert_eq!(dedup.sled_path.as_deref(), Some("/tmp/mq-bridge/dedup_db"));
                     assert_eq!(dedup.ttl_seconds, 3600);
                     has_dedup = true;
                 }

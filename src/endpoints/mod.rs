@@ -1906,7 +1906,8 @@ mod tests {
     fn test_consumer_middleware_ordering() {
         let endpoint = Endpoint::new_memory("test", 10)
             .with_deduplication(crate::models::DeduplicationMiddleware {
-                sled_path: "".into(),
+                store: None,
+                sled_path: Some("".into()),
                 ttl_seconds: 10,
             })
             .with_consumer_metrics();
