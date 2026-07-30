@@ -358,7 +358,7 @@ impl<'de> Deserialize<'de> for Endpoint {
             type Value = Endpoint;
 
             fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-                formatter.write_str("a map representing an endpoint or null")
+                formatter.write_str("a map representing an endpoint, the string \"null\", or null")
             }
 
             fn visit_unit<E>(self) -> Result<Self::Value, E>
@@ -366,6 +366,26 @@ impl<'de> Deserialize<'de> for Endpoint {
                 E: serde::de::Error,
             {
                 Ok(Endpoint::new(EndpointType::Null))
+            }
+
+            /// Unit variants of `EndpointType` serialize as a bare string (and are advertised
+            /// that way in the JSON schema). `Null` is currently the only one.
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                if value == "null" {
+                    Ok(Endpoint::new(EndpointType::Null))
+                } else {
+                    Err(serde::de::Error::unknown_variant(value, &["null"]))
+                }
+            }
+
+            fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                self.visit_str(&value)
             }
 
             fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
@@ -3970,6 +3990,80 @@ pub fn extract_config_secrets(config: &mut Config) -> HashMap<String, String> {
         route.extract_secrets(&prefix, &mut secrets);
     }
     secrets
+}
+
+#[cfg(test)]
+mod null_endpoint_tests {
+    use super::*;
+
+    #[test]
+    fn null_endpoint_json_round_trip() {
+        let value = serde_json::to_value(Endpoint::null()).expect("serialize");
+        let back: Endpoint = serde_json::from_value(value).expect("deserialize");
+        assert!(matches!(back.endpoint_type, EndpointType::Null));
+    }
+
+    /// The schema advertises unit variants as bare strings, so `"null"` must parse.
+    #[test]
+    fn null_endpoint_accepts_string_and_unit_forms() {
+        for input in ["\"null\"", "null", "{}"] {
+            let endpoint: Endpoint = serde_json::from_str(input).unwrap_or_else(|e| {
+                panic!("failed to parse {input}: {e}");
+            });
+            assert!(matches!(endpoint.endpoint_type, EndpointType::Null));
+        }
+    }
+
+    #[test]
+    fn unknown_endpoint_string_is_rejected() {
+        let err = serde_json::from_str::<Endpoint>("\"kafka\"").expect_err("should fail");
+        assert!(
+            err.to_string().contains("unknown variant"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn nested_null_endpoint_json_round_trip() {
+        let config =
+            HttpConfig::new("http://localhost:8080").with_stream_response_to(Endpoint::null());
+        let value = serde_json::to_value(&config).expect("serialize");
+        let back: HttpConfig = serde_json::from_value(value).expect("deserialize");
+        let nested = back.stream_response_to.expect("stream_response_to present");
+        assert!(matches!(nested.endpoint_type, EndpointType::Null));
+    }
+
+    #[test]
+    fn nested_null_endpoint_yaml_forms() {
+        for yaml in [
+            "url: http://localhost:8080\nstream_response_to: \"null\"\n",
+            "url: http://localhost:8080\nstream_response_to: {}\n",
+        ] {
+            let config: HttpConfig = serde_yaml_ng::from_str(yaml)
+                .unwrap_or_else(|e| panic!("failed to parse {yaml:?}: {e}"));
+            let nested = config
+                .stream_response_to
+                .expect("stream_response_to present");
+            assert!(matches!(nested.endpoint_type, EndpointType::Null));
+        }
+    }
+
+    /// In an `Option<Box<Endpoint>>` field, a bare `null` is consumed by serde's `Option`
+    /// layer as `None` and never reaches the endpoint visitor.
+    #[test]
+    fn nested_bare_null_yaml_is_none() {
+        let config: HttpConfig =
+            serde_yaml_ng::from_str("url: http://localhost:8080\nstream_response_to: null\n")
+                .expect("deserialize");
+        assert!(config.stream_response_to.is_none());
+    }
+
+    #[test]
+    fn null_endpoint_yaml_round_trip() {
+        let yaml = serde_yaml_ng::to_string(&Endpoint::null()).expect("serialize");
+        let back: Endpoint = serde_yaml_ng::from_str(&yaml).expect("deserialize");
+        assert!(matches!(back.endpoint_type, EndpointType::Null));
+    }
 }
 
 #[cfg(test)]
