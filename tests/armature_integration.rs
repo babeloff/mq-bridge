@@ -11,12 +11,14 @@ fn replace_optional(
     source_path: &Path,
 ) -> String {
     let count = content.matches(from).count();
-    assert!(
-        count > 0,
-        "No patch target found for {} in {:?}",
-        label,
-        source_path
-    );
+    if count == 0 {
+        // Downstream has already adopted the new API for this construct; nothing to patch.
+        println!(
+            "No patch target for {} in {:?} (already API-compatible), skipping",
+            label, source_path
+        );
+        return content.to_string();
+    }
     println!(
         "Patching {} occurrence(s) of {} in {:?}",
         count, label, source_path
