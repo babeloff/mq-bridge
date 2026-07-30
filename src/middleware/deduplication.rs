@@ -71,6 +71,12 @@ pub(crate) fn parse_dedup_store(spec: &str) -> anyhow::Result<DedupBackend> {
         .split_once(':')
         .map(|(s, _)| s.to_ascii_lowercase())
         .unwrap_or_default();
+    // `C:\path` / `C:/path` is a Windows drive letter, not a URL scheme.
+    if scheme.len() == 1 && scheme.chars().all(|c| c.is_ascii_alphabetic()) {
+        return Ok(DedupBackend::Sled {
+            path: spec.to_string(),
+        });
+    }
     match scheme.as_str() {
         "sled" => {
             let path = spec

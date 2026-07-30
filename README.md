@@ -346,6 +346,7 @@ orders_upsert_branch:
           format: json
           id_field: "order_id"     # deterministic _id → insert-if-absent
           report_outcome: true     # → mongodb.outcome = inserted | existed
+          request_reply: true
       forward_to:
         switch:
           metadata_key: "mongodb.outcome"

@@ -750,6 +750,7 @@ pub enum EndpointType {
         config: serde_json::Value,
     },
     #[default]
+    #[cfg_attr(feature = "schema", schemars(extend("format" = "structural_endpoint")))]
     Null,
 }
 

@@ -1060,7 +1060,29 @@ async fn test_http_to_static_response() {
         }
     });
 
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(wait_for_server_ready(&addr, Duration::from_secs(5)).await);
+
+    let mut stream = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    stream
+        .write_all(
+            format!("GET /static HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n").as_bytes(),
+        )
+        .await
+        .unwrap();
+    let mut response = vec![0; 1024];
+    let bytes_read = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut response))
+        .await
+        .expect("static response should arrive promptly")
+        .unwrap();
+    let text = String::from_utf8_lossy(&response[..bytes_read]);
+    assert!(
+        text.starts_with("HTTP/1.1 200"),
+        "static endpoint did not reply 200: {text:?}"
+    );
+    assert!(
+        text.contains(static_content),
+        "static endpoint reply missing body: {text:?}"
+    );
 }
 
 #[tokio::test]
@@ -1091,7 +1113,34 @@ async fn test_http_to_response_endpoint() {
         }
     });
 
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(wait_for_server_ready(&addr, Duration::from_secs(5)).await);
+
+    let body = "echo me";
+    let mut stream = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    stream
+        .write_all(
+            format!(
+                "POST /echo HTTP/1.1\r\nHost: {addr}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let mut response = vec![0; 1024];
+    let bytes_read = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut response))
+        .await
+        .expect("response should arrive promptly")
+        .unwrap();
+    let text = String::from_utf8_lossy(&response[..bytes_read]);
+    assert!(
+        text.starts_with("HTTP/1.1 200"),
+        "response endpoint did not reply 200: {text:?}"
+    );
+    assert!(
+        text.contains(body),
+        "response endpoint did not echo the request body: {text:?}"
+    );
 }
 
 #[tokio::test]
