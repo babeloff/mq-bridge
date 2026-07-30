@@ -874,6 +874,7 @@ pub enum Middleware {
     CookieJar(CookieJarMiddleware),
     Transform(TransformMiddleware),
     Encryption(EncryptionConfig),
+    Compression(CompressionMiddleware),
     Custom {
         name: String,
         config: serde_json::Value,
@@ -1504,6 +1505,38 @@ pub enum Compression {
     /// zstd; each batch is a self-contained frame, concatenated frames decode as one
     /// stream (`zstd -d` compatible). Better ratio than lz4, still fast.
     Zstd,
+}
+
+fn default_compression_algorithm() -> Compression {
+    Compression::Zstd
+}
+
+/// Payload-compression middleware configuration.
+///
+/// Compresses each message payload on the output side and decompresses it on the input
+/// side; metadata and routing keys are left untouched. Requires the `compression` feature.
+/// Distinct from the `file`/`object_store` batch `compression` field, which stays
+/// CLI-decodable at rest — this operates per message on any transport.
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct CompressionMiddleware {
+    /// Algorithm: `none`, `gzip`, `lz4`, or `zstd`. Defaults to `zstd`.
+    #[serde(default = "default_compression_algorithm")]
+    pub algorithm: Compression,
+    /// Reject a decompressed payload larger than this many bytes (decompression-bomb guard).
+    /// Consumer side only; unset means no limit.
+    #[serde(default)]
+    pub max_decompressed_bytes: Option<u64>,
+}
+
+impl Default for CompressionMiddleware {
+    fn default() -> Self {
+        Self {
+            algorithm: default_compression_algorithm(),
+            max_decompressed_bytes: None,
+        }
+    }
 }
 
 // --- File Specific Configuration ---
@@ -4036,6 +4069,7 @@ kafka_to_nats:
                 Middleware::CookieJar(_) => {}
                 Middleware::Transform(_) => {}
                 Middleware::Encryption(_) => {}
+                Middleware::Compression(_) => {}
             }
         }
 

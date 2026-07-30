@@ -10,6 +10,8 @@ use anyhow::Result;
 use std::sync::Arc;
 
 mod buffer;
+#[cfg(feature = "compression")]
+mod compression;
 mod cookie_jar;
 #[cfg(feature = "dedup")]
 pub(crate) mod deduplication;
@@ -26,6 +28,8 @@ mod transform;
 mod weak_join;
 
 use buffer::{BufferConsumer, BufferPublisher};
+#[cfg(feature = "compression")]
+use compression::{CompressionConsumer, CompressionPublisher};
 use cookie_jar::{CookieJarConsumer, CookieJarPublisher};
 #[cfg(feature = "dedup")]
 use deduplication::DeduplicationConsumer;
@@ -77,6 +81,8 @@ pub async fn apply_middlewares_to_consumer(
             Middleware::Transform(cfg) => Box::new(TransformConsumer::new(consumer, cfg)?),
             #[cfg(feature = "encryption")]
             Middleware::Encryption(cfg) => Box::new(EncryptionConsumer::new(consumer, cfg)?),
+            #[cfg(feature = "compression")]
+            Middleware::Compression(cfg) => Box::new(CompressionConsumer::new(consumer, cfg)),
             Middleware::Custom { name, config } => {
                 let factory = get_middleware_factory(name).ok_or_else(|| {
                     anyhow::anyhow!("Custom middleware factory '{}' not found", name)
@@ -140,6 +146,8 @@ pub async fn apply_middlewares_to_publisher(
             Middleware::Transform(cfg) => Box::new(TransformPublisher::new(publisher, cfg)?),
             #[cfg(feature = "encryption")]
             Middleware::Encryption(cfg) => Box::new(EncryptionPublisher::new(publisher, cfg)?),
+            #[cfg(feature = "compression")]
+            Middleware::Compression(cfg) => Box::new(CompressionPublisher::new(publisher, cfg)),
             Middleware::Custom { name, config } => {
                 let factory = get_middleware_factory(name).ok_or_else(|| {
                     anyhow::anyhow!("Custom middleware factory '{}' not found", name)
