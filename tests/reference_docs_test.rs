@@ -100,6 +100,8 @@ fn documented_middleware_snippets_parse() {
     key: "${env:MQB_ENC_KEY}"
     decrypt_keys: { k1: "${env:MQB_OLD_ENC_KEY}" }
 "#,
+        r#"- compression: { algorithm: zstd }"#,
+        r#"- compression: { algorithm: gzip, max_decompressed_bytes: 1048576 }"#,
         r#"- metrics: {}"#,
         r#"- random_panic: { mode: disconnect, trigger_on_message: 500 }"#,
         r#"

@@ -65,9 +65,20 @@ middlewares:
 | [`delay`](#delay) | ✅ | ✅ | – | Fixed delay per receive/send |
 | [`cookie_jar`](#cookie_jar) | ✅ | ✅ | – | Persist HTTP cookies / session values across messages |
 | [`encryption`](#encryption) | ✅ | ✅ | `encryption` | AEAD-encrypt payloads on send, decrypt on receive |
+| [`compression`](#compression) | ✅ | ✅ | `compression` | Compress payloads on send, decompress on receive |
 | [`metrics`](#metrics) | ✅ | ✅ | `metrics` | Emit throughput/latency/error metrics |
 | [`random_panic`](#random_panic) | ✅ | ✅ | – | Fault injection for testing |
 | [`custom`](#custom-middleware) | ✅ | ✅ | – | Your own middleware via a registered factory |
+
+> **Two kinds of compression.** The [`compression`](#compression) *middleware* compresses
+> each message **payload** on any transport and decompresses it on the far side. Separately,
+> the batch `compression` *field* on the `file` and `object_store` endpoints (`none` / `gzip`
+> / `lz4` / `zstd`, same `compression` feature) compresses whole write batches so the file
+> stays decodable with `zcat` / `lz4 -d`. Use the field for CLI-readable data at rest, the
+> middleware for over-the-wire payloads. Don't stack either compression with the
+> [`encryption`](#encryption) middleware on the same route — ciphertext does not compress; for
+> compressed-and-encrypted data at rest use the endpoints' own `compression`/`encryption`
+> fields (compress-then-encrypt per batch).
 
 **Putting a middleware on the wrong side behaves in two different ways**, so check the table
 above rather than assuming:
@@ -420,6 +431,33 @@ sniffing the leading magic bytes, so raw compressed bytes are never emitted as m
 > ~1 ULP on ~19% of 17-significant-digit doubles, so a `postgres → file → postgres` hop of a
 > `double precision` column can change the last bit. Build with the `float-roundtrip` feature
 > for bit-exact float parsing across every endpoint (it trades a little parse speed for it).
+
+### `compression`
+
+Compresses each message **payload** on the output side and decompresses it on the input
+side. Metadata and routing keys are untouched. Input and output. Requires the `compression`
+feature.
+
+| Field | Type | Default |
+|---|---|---|
+| `algorithm` | `none` \| `gzip` \| `lz4` \| `zstd` | `zstd` |
+| `max_decompressed_bytes` | integer — reject a payload that decompresses larger than this (bomb guard); consumer side only | unset (no limit) |
+
+```yaml
+- compression: { algorithm: zstd }
+```
+
+Each payload is compressed independently into a single self-contained member, so this works
+over any transport, not just files. `algorithm: none` is a passthrough. A truncated or
+corrupt frame is a **permanent** consumer error (the poison message is not re-read
+indefinitely), as is a payload that exceeds `max_decompressed_bytes`. Put the same
+`algorithm` on both the input and output side of a route.
+
+Unlike the `file` / `object_store` batch `compression` field — which keeps whole write
+batches decodable with `zcat` / `lz4 -d` — this middleware frames per message and is only
+readable through a matching consumer. Do not combine it with the [`encryption`](#encryption)
+middleware (ciphertext does not compress); for compressed-and-encrypted data at rest, use the
+endpoints' own `compression`/`encryption` fields instead.
 
 ### `metrics`
 
