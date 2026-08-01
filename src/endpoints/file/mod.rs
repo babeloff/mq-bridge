@@ -1738,15 +1738,14 @@ enum ConsumerBackend {
 /// `Ok(Some(reason))` for one that is unopenable now but could still appear
 /// (missing file, missing parent directory, not yet readable).
 fn probe_source_path(path: &str) -> anyhow::Result<Option<String>> {
+    // Checked before opening: Windows refuses to open a directory at all, while
+    // on Unix the open succeeds and only the read fails, which the reader threads
+    // report as an ordinary end-of-file.
+    if std::fs::metadata(path).map(|m| m.is_dir()).unwrap_or(false) {
+        anyhow::bail!("file source '{path}' is a directory, not a file");
+    }
     match std::fs::File::open(path) {
-        Ok(f) => {
-            // open(2) succeeds on a directory; only the read fails, and the reader
-            // threads report that as an ordinary end-of-file.
-            if f.metadata().map(|m| m.is_dir()).unwrap_or(false) {
-                anyhow::bail!("file source '{path}' is a directory, not a file");
-            }
-            Ok(None)
-        }
+        Ok(_) => Ok(None),
         Err(e) => Ok(Some(format!("cannot open file source '{path}': {e}"))),
     }
 }

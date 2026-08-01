@@ -273,23 +273,26 @@ pub async fn test_redis_reclaims_backlog_with_drained_stream() {
 
         // Two consumers read the whole stream and are dropped without acking: the backlog
         // ends up pending under two now-dead names and `>` has nothing left to deliver.
-        let mut drained = 0usize;
+        // Counted as distinct payloads: the second dead consumer may reclaim entries that
+        // are already pending under `dead-0`, so deliveries overcount the backlog.
+        let mut drained_ids = std::collections::HashSet::new();
         for i in 0..2 {
             let mut dead = RedisStreamsConsumer::new(&base(Some(format!("dead-{i}"))))
                 .await
                 .unwrap();
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-            while drained < N * (i + 1) / 2 && std::time::Instant::now() < deadline {
+            while drained_ids.len() < N * (i + 1) / 2 && std::time::Instant::now() < deadline {
                 let batch =
                     tokio::time::timeout(std::time::Duration::from_secs(5), dead.receive_batch(16))
                         .await;
                 match batch {
-                    Ok(Ok(b)) => drained += b.messages.len(),
+                    Ok(Ok(b)) => drained_ids.extend(b.messages.iter().map(|m| m.payload.clone())),
                     _ => break,
                 }
             }
             drop(dead);
         }
+        let drained = drained_ids.len();
         assert!(drained > 0, "seeding left no pending entries");
 
         // The replacement: batch_size well above the backlog, several reader connections.
@@ -307,9 +310,10 @@ pub async fn test_redis_reclaims_backlog_with_drained_stream() {
         let mut sink = output.create_consumer("reclaim_sink").await.unwrap();
         let handle = route.run("redis_reclaim_test").await.unwrap();
 
-        let mut received = 0usize;
+        let mut received_ids = std::collections::HashSet::new();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-        while received < drained {
+        while received_ids.len() < drained {
+            let received = received_ids.len();
             let batch =
                 tokio::time::timeout(std::time::Duration::from_secs(20), sink.receive_batch(512))
                     .await
@@ -317,7 +321,7 @@ pub async fn test_redis_reclaims_backlog_with_drained_stream() {
                         panic!("reclaim wedged: {received}/{drained} entries redelivered")
                     })
                     .unwrap();
-            received += batch.messages.len();
+            received_ids.extend(batch.messages.iter().map(|m| m.payload.clone()));
             (batch.commit)(vec![
                 mq_bridge::traits::MessageDisposition::Ack;
                 batch.messages.len()
@@ -326,11 +330,15 @@ pub async fn test_redis_reclaims_backlog_with_drained_stream() {
             .unwrap();
             assert!(
                 std::time::Instant::now() < deadline,
-                "reclaim wedged: {received}/{drained} entries redelivered"
+                "reclaim wedged: {}/{drained} entries redelivered",
+                received_ids.len()
             );
         }
         handle.stop().await;
-        println!("[Redis] Reclaim-with-drained-stream test successful ({received} entries).");
+        println!(
+            "[Redis] Reclaim-with-drained-stream test successful ({} entries).",
+            received_ids.len()
+        );
     })
     .await;
 }
