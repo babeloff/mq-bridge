@@ -607,7 +607,8 @@ impl MessageConsumer for ClickHouseCursorReader {
                 ConsumerError::Connection(anyhow!("Invalid JSONEachRow row: {}", e))
             })?;
             let cursor = extract_cursor(&row, &self.cursor_column).ok_or_else(|| {
-                ConsumerError::Connection(anyhow!(
+                // Schema-level, so re-polling fails identically: permanent, not a reconnect.
+                ConsumerError::Permanent(anyhow!(
                     "cursor_column '{}' missing or of unsupported type in result row",
                     self.cursor_column
                 ))
