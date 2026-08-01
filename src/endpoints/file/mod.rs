@@ -1691,13 +1691,53 @@ enum ConsumerBackend {
     Queue(FileQueueConsumer),
 }
 
+/// Probes a file source path. `Err` for a path that can never yield data;
+/// `Ok(Some(reason))` for one that is unopenable now but could still appear
+/// (missing file, missing parent directory, not yet readable).
+fn probe_source_path(path: &str) -> anyhow::Result<Option<String>> {
+    match std::fs::File::open(path) {
+        Ok(f) => {
+            // open(2) succeeds on a directory; only the read fails, and the reader
+            // threads report that as an ordinary end-of-file.
+            if f.metadata().map(|m| m.is_dir()).unwrap_or(false) {
+                anyhow::bail!("file source '{path}' is a directory, not a file");
+            }
+            Ok(None)
+        }
+        Err(e) => Ok(Some(format!("cannot open file source '{path}': {e}"))),
+    }
+}
+
 /// A consumer that reads messages from a file and removes them upon commit.
 pub struct FileConsumer {
     backend: ConsumerBackend,
+    path: String,
+    /// Why the source path could not be opened at construction, if it could not.
+    /// A live tail keeps waiting for the file to appear; a drain (`exit_on_empty`)
+    /// cannot, so it fails with this instead of blocking forever.
+    startup_open_error: Option<String>,
+    exit_on_empty: bool,
 }
 
 impl FileConsumer {
+    fn wrap(backend: ConsumerBackend) -> Self {
+        Self {
+            backend,
+            path: String::new(),
+            startup_open_error: None,
+            exit_on_empty: false,
+        }
+    }
+
     pub async fn new(config: &FileConfig) -> anyhow::Result<Self> {
+        let startup_open_error = probe_source_path(&config.path)?;
+        let mut consumer = Self::new_backend(config).await?;
+        consumer.path = config.path.clone();
+        consumer.startup_open_error = startup_open_error;
+        Ok(consumer)
+    }
+
+    async fn new_backend(config: &FileConfig) -> anyhow::Result<Self> {
         let delimiter = parse_delimiter(config.delimiter.as_deref())?;
         let format = config.format.clone();
         if matches!(format, FileFormat::Csv)
@@ -1785,18 +1825,16 @@ impl FileConsumer {
                 });
 
                 info!(path = %config.path, mode = "queue (delete, optimized)", "File consumer connected");
-                Ok(Self {
-                    backend: ConsumerBackend::Queue(FileQueueConsumer {
-                        msg_rx,
-                        lines_in_memory,
-                        path: config.path.clone(),
-                        file_lock,
-                        buffer: Arc::new(Mutex::new(Vec::new())),
-                        delimiter,
-                        ready,
-                        pending_eof: false,
-                    }),
-                })
+                Ok(Self::wrap(ConsumerBackend::Queue(FileQueueConsumer {
+                    msg_rx,
+                    lines_in_memory,
+                    path: config.path.clone(),
+                    file_lock,
+                    buffer: Arc::new(Mutex::new(Vec::new())),
+                    delimiter,
+                    ready,
+                    pending_eof: false,
+                })))
             }
             Some(FileConsumerMode::Subscribe { delete: true }) => {
                 let key = format!(
@@ -1827,9 +1865,9 @@ impl FileConsumer {
                 let subscriber_id = format!("file-sub-{}", fast_uuid_v7::gen_id_str());
                 info!(path = %config.path, mode = "subscribe (delete)", subscriber_id = %subscriber_id, "File consumer connected");
 
-                Ok(Self {
-                    backend: ConsumerBackend::EventStore(store.consumer(subscriber_id)),
-                })
+                Ok(Self::wrap(ConsumerBackend::EventStore(
+                    store.consumer(subscriber_id),
+                )))
             }
         }
     }
@@ -1889,19 +1927,17 @@ impl FileConsumer {
             );
         });
         info!(path = %config.path, mode = "member consume (compressed/encrypted)", "File consumer connected");
-        Ok(Self {
-            backend: ConsumerBackend::Tail(FileTailConsumer {
-                msg_rx,
-                buffer: Vec::new(),
-                offset_file: None,
-                ready,
-                pending_eof: false,
-                decode_error: Some(decode_error),
-                // Member (compressed/encrypted) readers decode framed members, not
-                // delimiter-split lines, so the trailing-partial-line rule doesn't apply.
-                drain_on_empty: Arc::new(AtomicBool::new(false)),
-            }),
-        })
+        Ok(Self::wrap(ConsumerBackend::Tail(FileTailConsumer {
+            msg_rx,
+            buffer: Vec::new(),
+            offset_file: None,
+            ready,
+            pending_eof: false,
+            decode_error: Some(decode_error),
+            // Member (compressed/encrypted) readers decode framed members, not
+            // delimiter-split lines, so the trailing-partial-line rule doesn't apply.
+            drain_on_empty: Arc::new(AtomicBool::new(false)),
+        })))
     }
 
     async fn new_tail(
@@ -1962,17 +1998,15 @@ impl FileConsumer {
 
         info!(path = %path, mode = "tail (no-delete, optimized)", "File consumer connected");
 
-        Ok(Self {
-            backend: ConsumerBackend::Tail(FileTailConsumer {
-                msg_rx,
-                buffer: Vec::new(),
-                offset_file,
-                ready,
-                pending_eof: false,
-                decode_error: None,
-                drain_on_empty,
-            }),
-        })
+        Ok(Self::wrap(ConsumerBackend::Tail(FileTailConsumer {
+            msg_rx,
+            buffer: Vec::new(),
+            offset_file,
+            ready,
+            pending_eof: false,
+            decode_error: None,
+            drain_on_empty,
+        })))
     }
 
     /// Returns true if the consumer is ready to receive messages.
@@ -1988,6 +2022,7 @@ impl FileConsumer {
 #[async_trait]
 impl MessageConsumer for FileConsumer {
     fn set_exit_on_empty(&mut self, exit_on_empty: bool) {
+        self.exit_on_empty = exit_on_empty;
         match &mut self.backend {
             // Only the delimiter-splitting tail reader distinguishes a complete final
             // record from a torn mid-write; propagate the drain intent to its thread.
@@ -2002,6 +2037,17 @@ impl MessageConsumer for FileConsumer {
     // a cumulative byte offset (the max acked `file_offset`), so out-of-order
     // commits could advance the offset past un-acked messages and lose them.
     async fn receive_batch(&mut self, max_messages: usize) -> Result<ReceivedBatch, ConsumerError> {
+        // The path was unopenable at startup. A live tail waits for it (rotation,
+        // a writer that hasn't created it yet), but a drain has nothing to wait
+        // for, so re-probe and fail rather than block forever on a typo'd path.
+        if self.exit_on_empty && self.startup_open_error.is_some() {
+            match probe_source_path(&self.path) {
+                Ok(None) => self.startup_open_error = None,
+                Ok(Some(reason)) => return Err(ConsumerError::Permanent(anyhow::anyhow!(reason))),
+                Err(e) => return Err(ConsumerError::Permanent(e)),
+            }
+        }
+
         match &mut self.backend {
             ConsumerBackend::EventStore(c) => c.receive_batch(max_messages).await,
             ConsumerBackend::Tail(c) => {

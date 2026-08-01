@@ -1764,3 +1764,97 @@ async fn test_file_tail_live_withholds_final_line_without_newline() {
         "live tail withholds the final record until its delimiter arrives"
     );
 }
+
+/// A source path that cannot be opened must end a drain with a permanent error,
+/// not block forever (missing file, missing parent directory, unreadable file).
+#[tokio::test]
+async fn drain_fails_on_unopenable_source_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let unreadable = dir.path().join("locked.jsonl");
+    std::fs::write(&unreadable, b"{\"a\":1}\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000)).unwrap();
+    }
+
+    let mut paths = vec![
+        dir.path().join("missing.jsonl").display().to_string(),
+        dir.path()
+            .join("no-such-dir/in.jsonl")
+            .display()
+            .to_string(),
+    ];
+    // A mode-000 file is still readable by root; only assert on it where the
+    // permission actually bites.
+    if std::fs::File::open(&unreadable).is_err() {
+        paths.push(unreadable.display().to_string());
+    }
+
+    for path in paths {
+        let mut source = FileConsumer::new(&FileConfig {
+            path: path.clone(),
+            ..Default::default()
+        })
+        .await
+        .unwrap_or_else(|e| panic!("construction should succeed for {path}: {e}"));
+        source.set_exit_on_empty(true);
+
+        let result =
+            tokio::time::timeout(std::time::Duration::from_secs(2), source.receive_batch(16))
+                .await
+                .unwrap_or_else(|_| panic!("receive_batch hung on {path}"));
+
+        match result {
+            Err(crate::errors::ConsumerError::Permanent(e)) => {
+                assert!(
+                    e.to_string().contains(&path),
+                    "error should name the path: {e}"
+                );
+            }
+            other => panic!("expected a permanent error for {path}, got {other:?}"),
+        }
+    }
+}
+
+/// A directory given as a file source is permanent nonsense: reject it at
+/// construction rather than reporting a clean, empty drain.
+#[tokio::test]
+async fn directory_as_source_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let err = match FileConsumer::new(&FileConfig {
+        path: dir.path().display().to_string(),
+        ..Default::default()
+    })
+    .await
+    {
+        Ok(_) => panic!("a directory is not a readable file source"),
+        Err(e) => e,
+    };
+    assert!(err.to_string().contains("is a directory"), "got: {err}");
+}
+
+/// A live tail (no drain) still waits for a file that does not exist yet.
+#[tokio::test]
+async fn live_tail_waits_for_a_missing_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("later.jsonl");
+    let mut source = FileConsumer::new(&FileConfig {
+        path: path.display().to_string(),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+
+    let writer = path.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        std::fs::write(&writer, b"{\"a\":1}\n").unwrap();
+    });
+
+    let batch = tokio::time::timeout(std::time::Duration::from_secs(5), source.receive_batch(16))
+        .await
+        .expect("live tail should pick the file up once it appears")
+        .expect("receive_batch errored");
+    assert_eq!(batch.messages.len(), 1);
+}

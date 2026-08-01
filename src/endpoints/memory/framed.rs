@@ -324,7 +324,7 @@ mod tests {
 
         // A payload whose leading bytes would themselves read as a plausible length
         // prefix if mistaken for the start of a frame.
-        let messages = vec![CanonicalMessage::from_vec(&[0u8; 64])];
+        let messages = vec![CanonicalMessage::from_vec([0u8; 64])];
         let encoded = rmp_serde::to_vec(&messages).unwrap();
 
         {
