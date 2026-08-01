@@ -516,6 +516,18 @@ impl ObjectStoreConsumer {
         Ok(None)
     }
 
+    /// Bound on decompressed output.
+    ///
+    /// `max_object_bytes` caps the *stored* size (see `next_object`), so reusing it here
+    /// would reject any object that compressed better than 1:1 — i.e. most of them. Scale
+    /// it instead; the result is still bounded, so a decompression bomb cannot run away.
+    #[cfg(feature = "compression")]
+    fn decompressed_limit(&self) -> Option<u64> {
+        const MAX_DECOMPRESSED_EXPANSION: u64 = 20;
+        self.max_object_bytes
+            .map(|limit| limit.saturating_mul(MAX_DECOMPRESSED_EXPANSION))
+    }
+
     /// Decrypt-then-decompress a fetched object whole (the write path compressed first).
     #[allow(unused_variables)]
     fn decode_object(&self, key: &str, data: Vec<u8>) -> anyhow::Result<Vec<u8>> {
@@ -532,7 +544,7 @@ impl ObjectStoreConsumer {
             crate::support::compression::decompress_all(
                 self.compression,
                 &data,
-                self.max_object_bytes,
+                self.decompressed_limit(),
             )
             .with_context(|| format!("decompress object '{key}'"))?
         } else {

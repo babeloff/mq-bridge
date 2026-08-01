@@ -140,6 +140,21 @@ fn positional_placeholder(driver_name: &str, index: usize) -> String {
     }
 }
 
+/// True when `sql` still binds a value: an unrewritten `${…}` token, or a positional
+/// placeholder in any of the driver spellings (`?`, `$N`, `@pN`).
+fn binds_after_values(sql: &str) -> bool {
+    if sql.contains("${") {
+        return true;
+    }
+    let bytes = sql.as_bytes();
+    bytes.iter().enumerate().any(|(i, &b)| match b {
+        b'?' => true,
+        b'$' => bytes.get(i + 1).is_some_and(|c| c.is_ascii_digit()),
+        b'@' => bytes.get(i + 1) == Some(&b'p'),
+        _ => false,
+    })
+}
+
 /// Parse `${metadata:<key>}` / `${payload:<field>}` tokens out of an `insert_query`,
 /// rewriting each into a driver-appropriate positional placeholder assigned a running
 /// 1-based index in encounter order. Returns the rewritten query and the ordered
@@ -803,6 +818,16 @@ impl MessagePublisher for SqlxPublisher {
             None => "",
         };
 
+        // A token after the VALUES tuple (e.g. `ON CONFLICT … DO UPDATE SET v = ${payload:v}`)
+        // was already rewritten to a placeholder by `parse_insert_template`, numbered for the
+        // single-row query. The rebuild below renumbers only the row tuples, so the suffix
+        // would keep a stale index and the bind count would not line up. Single-row `send()`
+        // handles these correctly.
+        if binds_after_values(values_suffix) {
+            warn!("insert_query binds a value after the VALUES tuple. Falling back to iterative inserts.");
+            return self.send_batch_iterative(messages).await;
+        }
+
         // The `(payload)` single-column guard only applies to legacy mode; a
         // token-based query is already known-correct from `parse_insert_template`.
         if self.column_sources.is_empty() && !contains_payload_clause(base_query) {
@@ -906,10 +931,13 @@ impl SqlxPublisher {
             .copy_in_raw(&stmt)
             .await
             .map_err(classify_sql_error)?;
-        copier
-            .send(buf.as_bytes())
-            .await
-            .map_err(classify_sql_error)?;
+        if let Err(e) = copier.send(buf.as_bytes()).await {
+            // Tear the COPY down explicitly. `Drop` only buffers a CopyFail without
+            // awaiting the reply, so the connection could go back to the pool still in
+            // COPY-in state and poison the next query on it.
+            let _ = copier.abort("mq-bridge: COPY send failed").await;
+            return Err(classify_sql_error(e));
+        }
         copier.finish().await.map_err(classify_sql_error)?;
 
         trace!(count = messages.len(), table = %sink.table, "Bulk-copied batch to PostgreSQL");

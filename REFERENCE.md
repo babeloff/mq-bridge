@@ -17,7 +17,7 @@ endpoints, shape routing, or terminate a request. Data endpoints (`kafka`, `nats
 Middleware attaches to an endpoint via a `middlewares:` list, on the **input**, the
 **output**, or both:
 
-```yaml
+```yaml route
 my_route:
   input:
     middlewares:
@@ -103,7 +103,7 @@ Retries failed sends with exponential backoff. Output only.
 | `max_interval_ms` | integer | `5000` |
 | `multiplier` | float | `2.0` |
 
-```yaml
+```yaml middleware
 - retry: { max_attempts: 5, initial_interval_ms: 200, max_interval_ms: 10000, multiplier: 2.0 }
 ```
 
@@ -119,7 +119,7 @@ Sends permanently-failed messages to a separate endpoint instead of failing the 
 |---|---|---|
 | `endpoint` | Endpoint | yes |
 
-```yaml
+```yaml middleware
 - dlq:
     endpoint:
       file: { path: "dead-letters.jsonl" }
@@ -161,7 +161,7 @@ validation — over a single parse. Input and output.
 `schema` and `schema_file` are mutually exclusive. A mapping rule is either a bare path
 string or `{ path, default, required }`.
 
-```yaml
+```yaml middleware
 - transform:
     mapping:
       firstName: "$.first_name"
@@ -185,7 +185,7 @@ lossless ones: `string → integer`, `string → number`, `string → boolean` (
 A field carrying a JSON document as a string is decoded by `contentMediaType`, following
 JSON Schema 2020-12:
 
-```yaml
+```yaml middleware
 - transform:
     schema:
       type: object
@@ -252,15 +252,15 @@ feature (pulls `sled`).
 
 `sled_path` is the legacy spelling of a local sled store and is equivalent to `store: "sled://<path>"`.
 
-```yaml
+```yaml middleware
 - deduplication: { store: "sled:///var/lib/mq-bridge/dedup", ttl_seconds: 3600 }
 ```
 
-```yaml
+```yaml middleware
 - deduplication: { store: "mongodb://localhost:27017/etl", ttl_seconds: 3600 }
 ```
 
-```yaml
+```yaml middleware
 - deduplication: { store: "postgres://user:pass@localhost/etl", ttl_seconds: 3600 }
 ```
 
@@ -281,7 +281,7 @@ Correlates messages by a metadata key and emits them as one joined message. Inpu
 | `required` | list of branch names | `[]` |
 | `on_timeout` | `fire` \| `discard` | `fire` |
 
-```yaml
+```yaml middleware
 # Count mode: wait for any 3 messages sharing a correlation_id, emit a JSON array.
 - weak_join: { group_by: "correlation_id", expected_count: 3, timeout_ms: 5000 }
 
@@ -309,7 +309,7 @@ Accumulates single sends and forwards them as one batch. Input and output.
 | `max_messages` | integer | yes |
 | `max_delay_ms` | integer | yes |
 
-```yaml
+```yaml middleware
 - buffer: { max_messages: 500, max_delay_ms: 20 }
 ```
 
@@ -324,7 +324,7 @@ Paces throughput to a target rate. Input and output.
 |---|---|---|
 | `messages_per_second` | float (> 0) | yes |
 
-```yaml
+```yaml middleware
 - limiter: { messages_per_second: 250 }
 ```
 
@@ -338,7 +338,7 @@ Sleeps a fixed duration before each receive or send. Input and output.
 |---|---|---|
 | `delay_ms` | integer | yes |
 
-```yaml
+```yaml middleware
 - delay: { delay_ms: 100 }
 ```
 
@@ -358,7 +358,7 @@ Persists HTTP cookies and arbitrary session values across messages. Input and ou
 | `export_metadata_prefix` | string | – |
 | `inject_metadata` | map string→string | `{}` |
 
-```yaml
+```yaml middleware
 - cookie_jar:
     shared_scope: "login-session"
     capture_metadata_keys: ["x-csrf-token"]
@@ -382,7 +382,7 @@ output. Requires the `encryption` feature.
 | `key` | string — base64-encoded 32-byte key; `${env:VAR}` reads it from the environment | required |
 | `decrypt_keys` | map key_id → key | `{}` |
 
-```yaml
+```yaml middleware
 - encryption: { key: "${env:MQB_ENC_KEY}" }
 ```
 
@@ -404,7 +404,7 @@ Do **not** combine this middleware with a sink's batch `compression` on the same
 ciphertext does not compress. For compressed *and* encrypted data at rest, use the `file` /
 `object_store` endpoints' own fields instead, which apply compress-then-encrypt per batch:
 
-```yaml
+```yaml endpoint
 output:
   file:
     path: "data.enc"
@@ -445,7 +445,7 @@ feature.
 | `algorithm` | `none` \| `gzip` \| `lz4` \| `zstd` | `zstd` |
 | `max_decompressed_bytes` | integer — reject a payload that decompresses larger than this (bomb guard); consumer side only | unset (no limit) |
 
-```yaml
+```yaml middleware
 - compression: { algorithm: zstd }
 ```
 
@@ -466,7 +466,7 @@ endpoints' own `compression`/`encryption` fields instead.
 Emits throughput, latency and error metrics for the endpoint. Input and output. Requires the
 `metrics` feature. Takes no options; its presence enables collection.
 
-```yaml
+```yaml middleware
 - metrics: {}
 ```
 
@@ -482,13 +482,31 @@ Deliberate fault injection for testing recovery paths. Input and output.
 | `trigger_on_message` | integer (1-indexed) | – (every message) |
 | `enabled` | bool | `true` |
 
-```yaml
+```yaml middleware
 - random_panic: { mode: disconnect, trigger_on_message: 500 }
 ```
 
 `disconnect` and `timeout` produce retryable errors; `json_format_error` produces a
 non-retryable one — useful for exercising a `dlq`. Keep `enabled: false` in committed configs
 rather than deleting the block.
+
+The middleware block alone is **not** enough: fault injection is gated per route by
+`allow_fault_injection`, which defaults to `false`. Copying only the snippet above leaves the
+middleware inert (the route logs that it is disabled). A complete, working configuration:
+
+```yaml route
+flaky_test_route:
+  allow_fault_injection: true
+  input:
+    memory: { topic: "in" }
+    middlewares:
+      - random_panic: { mode: disconnect, trigger_on_message: 500 }
+  output:
+    memory: { topic: "out" }
+```
+
+`allow_fault_injection: true` is intended for test configurations only. Do not enable it — or
+the `random_panic` middleware — in production configs.
 
 ### `custom` (middleware)
 
@@ -499,7 +517,7 @@ Delegates to a factory you registered programmatically.
 | `name` | string | yes |
 | `config` | any JSON | yes |
 
-```yaml
+```yaml middleware
 - custom:
     name: "my_enricher"
     config: { lookup_url: "http://enrich.internal" }
@@ -547,7 +565,7 @@ use mq_bridge::route::register_endpoint;
 register_endpoint("common_queue", Endpoint::new_memory("shared_memory_topic", 100));
 ```
 
-```yaml
+```yaml route
 enrich:
   input: { ref: "common_queue" }
   output: { nats: { subject: "enriched", url: "nats://localhost:4222" } }
@@ -566,7 +584,7 @@ nesting depth is bounded.
 
 Publishes each message to every listed endpoint. Output only.
 
-```yaml
+```yaml endpoint
 output:
   fanout:
     - kafka: { topic: "audit", url: "localhost:9092" }
@@ -587,7 +605,7 @@ Content-based routing: picks a destination by the value of a **metadata key**.
 | `cases` | map value → Endpoint | yes |
 | `default` | Endpoint | no |
 
-```yaml
+```yaml endpoint
 output:
   switch:
     metadata_key: "http_status_code"
@@ -613,7 +631,7 @@ turning a request/reply exchange into a one-way flow.
 | `to` | Endpoint (request-capable) | yes |
 | `forward_to` | Endpoint | yes |
 
-```yaml
+```yaml endpoint
 output:
   request:
     to: { http: { url: "https://api.internal/score" } }
@@ -630,7 +648,7 @@ status key such as `http_status_code`.
 Replies to the origin of the current request. Output only, and the recommended way to build
 request/reply routes.
 
-```yaml
+```yaml route
 http_echo:
   input: { http: { url: "0.0.0.0:8080" } }
   output: { response: {} }
@@ -646,7 +664,7 @@ pipeline. See [README.md](README.md#patterns-request-response).
 An output endpoint that **ignores the incoming payload** and instead reads one message from
 the wrapped consumer, returning it as the response. The inbound message is purely a trigger.
 
-```yaml
+```yaml route
 # HTTP GET pulls the next message off a Kafka topic.
 poll_api:
   input: { http: { url: "0.0.0.0:8080", method: "GET" } }
@@ -672,7 +690,7 @@ source).
 
 Accepts either a bare string or the full map form:
 
-```yaml
+```yaml endpoint
 output: { static: "OK" }                       # shorthand, body JSON-encoded
 
 output:
@@ -709,7 +727,7 @@ structure — append `| raw` to a token to splice it verbatim. To emit a literal
 `${…}`, write `$${…}` (a bare `$$` is left as-is); any `${…}` with an unknown namespace is also
 left untouched.
 
-```yaml
+```yaml endpoint
 output:
   static:
     body: '{"error":"not found","id":"${message:id}","at":"${gen:now}"}'
@@ -728,7 +746,7 @@ bodies between routes.
 | `correlation_id` | string | **required on consumers, must be unset on publishers** |
 | `capacity` | integer | default `100`, per partition |
 
-```yaml
+```yaml endpoint
 output:
   stream_buffer: { topic: "responses" }        # publisher: no correlation_id
 
@@ -743,7 +761,7 @@ and ignores it. Primarily wired up via `HttpConfig::stream_response_to`.
 
 Discards every message. Output only. This is the **default output** when a route omits one.
 
-```yaml
+```yaml route
 drain:
   input: { kafka: { topic: "noisy", url: "localhost:9092" } }
   output: null          # a bare YAML null
@@ -764,7 +782,7 @@ Delegates to a factory you registered programmatically.
 | `name` | string | yes |
 | `config` | any JSON | yes |
 
-```yaml
+```yaml endpoint
 output:
   custom:
     name: "my_sink"

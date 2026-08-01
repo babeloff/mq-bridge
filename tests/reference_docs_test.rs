@@ -1,10 +1,61 @@
 //! Parses every config shape documented in REFERENCE.md.
 //!
 //! The reference file is the place people (and LLMs) look up what exists and how to spell
-//! it, so a snippet that does not deserialize is a real bug. Add a case here whenever a
-//! middleware or structural endpoint is added or its config changes.
+//! it, so a snippet that does not deserialize is a real bug.
+//!
+//! The snippets are read out of REFERENCE.md itself rather than copied here, so a doc edit
+//! is tested as written and cannot drift from a stale duplicate. A fenced block opts in by
+//! tagging its info string — ```yaml middleware, ```yaml endpoint or ```yaml route; a plain
+//! ```yaml block is prose and is skipped. Only cases a fence cannot express (the `null`
+//! spelling, behavioural rules) stay hand-written below.
 
 use mq_bridge::models::{Endpoint, Middleware};
+use std::collections::HashMap;
+
+const REFERENCE: &str = include_str!("../REFERENCE.md");
+
+/// A fenced code block lifted out of REFERENCE.md.
+struct Fence {
+    /// 1-based line of the opening fence, for failure messages.
+    line: usize,
+    info: String,
+    body: String,
+}
+
+/// Splits REFERENCE.md into its fenced code blocks.
+fn fenced_blocks() -> Vec<Fence> {
+    let mut blocks = Vec::new();
+    let mut open: Option<(usize, String, Vec<&str>)> = None;
+
+    for (index, line) in REFERENCE.lines().enumerate() {
+        match (line.strip_prefix("```"), open.as_mut()) {
+            (Some(_), Some(_)) => {
+                let (line_no, info, body) = open.take().expect("checked open above");
+                blocks.push(Fence {
+                    line: line_no,
+                    info,
+                    body: body.join("\n"),
+                });
+            }
+            (Some(info), None) => open = Some((index + 1, info.trim().to_string(), Vec::new())),
+            (None, Some((_, _, body))) => body.push(line),
+            (None, None) => {}
+        }
+    }
+
+    if let Some((line_no, info, _)) = open {
+        panic!("REFERENCE.md has an unterminated ```{info} fence opened at line {line_no}");
+    }
+    blocks
+}
+
+/// The blocks tagged with `tag`.
+fn tagged(tag: &str) -> Vec<Fence> {
+    fenced_blocks()
+        .into_iter()
+        .filter(|fence| fence.info == tag)
+        .collect()
+}
 
 /// Indents every non-empty line, so a doc snippet can be embedded under a YAML key.
 fn indent(yaml: &str, spaces: usize) -> String {
@@ -22,20 +73,17 @@ fn indent(yaml: &str, spaces: usize) -> String {
         .join("\n")
 }
 
-/// Parses a `middlewares:` list entry exactly as it appears in the reference — middleware
-/// is only ever deserialized as part of an endpoint, never standalone.
-fn middleware(entry_yaml: &str) -> Middleware {
+/// Parses a `middlewares:` list exactly as it appears in the reference — middleware is only
+/// ever deserialized as part of an endpoint, never standalone.
+fn middlewares(entries_yaml: &str, line: usize) -> Vec<Middleware> {
     let doc = format!(
         "middlewares:\n{}\nmemory: {{ topic: \"reference_probe\" }}\n",
-        indent(entry_yaml, 2)
+        indent(entries_yaml, 2)
     );
-    let endpoint: Endpoint = serde_yaml_ng::from_str(&doc)
-        .unwrap_or_else(|e| panic!("REFERENCE.md middleware snippet does not parse: {e}\n{doc}"));
-    endpoint
-        .middlewares
-        .into_iter()
-        .next()
-        .expect("snippet should yield one middleware")
+    let endpoint: Endpoint = serde_yaml_ng::from_str(&doc).unwrap_or_else(|e| {
+        panic!("REFERENCE.md middleware block at line {line} does not parse: {e}\n{doc}")
+    });
+    endpoint.middlewares
 }
 
 fn endpoint(yaml: &str) -> Endpoint {
@@ -43,147 +91,91 @@ fn endpoint(yaml: &str) -> Endpoint {
         .unwrap_or_else(|e| panic!("REFERENCE.md endpoint snippet does not parse: {e}\n{yaml}"))
 }
 
+/// Endpoint blocks in the reference are shown in place, under the `input:` / `output:` key
+/// they would occupy in a route. A block may hold several such fragments, separated by a
+/// blank line (e.g. the publisher and consumer sides of `stream_buffer`).
+fn endpoints(body: &str, line: usize) -> Vec<Endpoint> {
+    let mut found = Vec::new();
+    for chunk in body.split("\n\n") {
+        if chunk.trim().is_empty() {
+            continue;
+        }
+        let fragment: HashMap<String, Endpoint> =
+            serde_yaml_ng::from_str(chunk).unwrap_or_else(|e| {
+                panic!("REFERENCE.md endpoint block at line {line} does not parse: {e}\n{chunk}")
+            });
+        for (key, value) in fragment {
+            assert!(
+                key == "input" || key == "output",
+                "REFERENCE.md endpoint block at line {line} uses key '{key}'; \
+                 expected the fragment to sit under 'input' or 'output'"
+            );
+            found.push(value);
+        }
+    }
+    assert!(
+        !found.is_empty(),
+        "REFERENCE.md endpoint block at line {line} yielded no endpoints"
+    );
+    found
+}
+
+/// Every middleware documented in the reference, parsed from the doc itself.
 #[test]
 fn documented_middleware_snippets_parse() {
-    let snippets = [
-        r#"- retry: { max_attempts: 5, initial_interval_ms: 200, max_interval_ms: 10000, multiplier: 2.0 }"#,
-        r#"- dlq: { endpoint: { file: { path: "dead-letters.jsonl" } } }"#,
-        r#"
-- transform:
-    mapping:
-      firstName: "$.first_name"
-      id: "$.user_id"
-      "address.city": { path: "$.city", default: "unknown" }
-    schema_file: "schemas/user.json"
-"#,
-        r#"
-- transform:
-    schema:
-      type: object
-      properties:
-        payload:
-          type: string
-          contentMediaType: application/json
-          contentSchema:
-            type: object
-            properties:
-              qty: { type: integer }
-"#,
-        r#"- deduplication: { sled_path: "/var/lib/mq-bridge/dedup", ttl_seconds: 3600 }"#,
-        r#"- deduplication: { store: "sled:///var/lib/mq-bridge/dedup", ttl_seconds: 3600 }"#,
-        r#"- deduplication: { store: "mongodb://localhost:27017/etl", ttl_seconds: 3600 }"#,
-        r#"- deduplication: { store: "postgres://user:pass@localhost/etl", ttl_seconds: 3600 }"#,
-        r#"- weak_join: { group_by: "correlation_id", expected_count: 3, timeout_ms: 5000 }"#,
-        r#"
-- weak_join:
-    group_by: "correlation_id"
-    expected_count: 2
-    timeout_ms: 5000
-    branch_by: "source"
-    required: ["inventory", "pricing"]
-    on_timeout: discard
-"#,
-        r#"- buffer: { max_messages: 500, max_delay_ms: 20 }"#,
-        r#"- limiter: { messages_per_second: 250 }"#,
-        r#"- delay: { delay_ms: 100 }"#,
-        r#"
-- cookie_jar:
-    shared_scope: "login-session"
-    capture_metadata_keys: ["x-csrf-token"]
-    export_metadata_prefix: "session."
-"#,
-        r#"- encryption: { key: "${env:MQB_ENC_KEY}" }"#,
-        r#"
-- encryption:
-    cipher: aes256gcm
-    key_id: "k2"
-    key: "${env:MQB_ENC_KEY}"
-    decrypt_keys: { k1: "${env:MQB_OLD_ENC_KEY}" }
-"#,
-        r#"- compression: { algorithm: zstd }"#,
-        r#"- compression: { algorithm: gzip, max_decompressed_bytes: 1048576 }"#,
-        r#"- metrics: {}"#,
-        r#"- random_panic: { mode: disconnect, trigger_on_message: 500 }"#,
-        r#"
-- custom:
-    name: "my_enricher"
-    config: { lookup_url: "http://enrich.internal" }
-"#,
-    ];
-
-    for snippet in snippets {
-        middleware(snippet);
+    let blocks = tagged("yaml middleware");
+    assert!(
+        blocks.len() >= 15,
+        "expected the reference to tag a `yaml middleware` block per middleware section, found {}",
+        blocks.len()
+    );
+    for fence in blocks {
+        let parsed = middlewares(&fence.body, fence.line);
+        assert!(
+            !parsed.is_empty(),
+            "REFERENCE.md middleware block at line {} yielded no middleware",
+            fence.line
+        );
     }
 }
 
+/// Every structural endpoint documented in the reference, parsed from the doc itself.
 #[test]
 fn documented_structural_endpoint_snippets_parse() {
-    let snippets = [
-        r#"ref: "common_queue""#,
-        r#"
-fanout:
-  - kafka: { topic: "audit", url: "localhost:9092" }
-  - file: { path: "audit.jsonl" }
-  - nats: { subject: "audit", url: "nats://localhost:4222" }
-"#,
-        r#"
-switch:
-  metadata_key: "http_status_code"
-  cases:
-    "200": { nats: { subject: "ok", url: "nats://localhost:4222" } }
-    "404": { file: { path: "not-found.jsonl" } }
-  default: { file: { path: "other.jsonl" } }
-"#,
-        r#"
-request:
-  to: { http: { url: "https://api.internal/score" } }
-  forward_to: { ibmmq: { queue: "RESULTS", url: "mq(1414)", queue_manager: "QM1", channel: "APP.SVRCONN" } }
-"#,
-        r#"response: {}"#,
-        r#"
-reader:
-  kafka: { topic: "queue", url: "localhost:9092" }
-"#,
-        r#"static: "OK""#,
-        r#"
-static:
-  body: '{"status":"ok"}'
-  raw: true
-  metadata: { content-type: "application/json" }
-"#,
-        r#"
-static:
-  body: '{"error":"not found","id":"${message:id}","at":"${gen:now}"}'
-  raw: true
-  metadata: { content-type: "application/json" }
-"#,
-        r#"stream_buffer: { topic: "responses" }"#,
-        r#"stream_buffer: { topic: "responses", correlation_id: "req-123" }"#,
-        r#"
-custom:
-  name: "my_sink"
-  config: { target: "internal://thing" }
-"#,
-    ];
-
-    for snippet in snippets {
-        endpoint(snippet);
+    let blocks = tagged("yaml endpoint");
+    assert!(
+        blocks.len() >= 6,
+        "expected the reference to tag a `yaml endpoint` block per structural endpoint section, found {}",
+        blocks.len()
+    );
+    for fence in blocks {
+        endpoints(&fence.body, fence.line);
     }
 }
 
-/// The at-rest compress-then-encrypt example from the `encryption` section.
+/// The complete named-route examples, parsed from the doc itself.
 #[test]
-fn documented_at_rest_encryption_snippet_parses() {
-    let ep = endpoint(
-        r#"
-file:
-  path: "data.enc"
-  format: raw
-  compression: lz4
-  encryption: { key: "${env:MQB_ENC_KEY}" }
-"#,
+fn documented_route_snippets_parse() {
+    let blocks = tagged("yaml route");
+    assert!(
+        blocks.len() >= 5,
+        "expected the reference to tag its complete route examples, found {}",
+        blocks.len()
     );
-    assert_eq!(ep.endpoint_type.name(), "file");
+    for fence in blocks {
+        let routes: HashMap<String, mq_bridge::models::Route> =
+            serde_yaml_ng::from_str(&fence.body).unwrap_or_else(|e| {
+                panic!(
+                    "REFERENCE.md route block at line {} does not parse: {e}\n{}",
+                    fence.line, fence.body
+                )
+            });
+        assert!(
+            !routes.is_empty(),
+            "REFERENCE.md route block at line {} yielded no routes",
+            fence.line
+        );
+    }
 }
 
 /// `null` is the one endpoint whose YAML spelling is a trap. A bare YAML null is the form
@@ -211,41 +203,6 @@ input:
     )
     .unwrap();
     assert_eq!(route.output.endpoint_type.name(), "null");
-}
-
-/// Full route shapes used as examples in the reference.
-#[test]
-fn documented_route_snippets_parse() {
-    let routes = [
-        r#"
-input:
-  middlewares:
-    - deduplication: { sled_path: "/var/lib/mqb/dedup", ttl_seconds: 3600 }
-  kafka: { topic: "orders", url: "localhost:9092" }
-output:
-  middlewares:
-    - retry: { max_attempts: 5 }
-    - dlq: { endpoint: { file: { path: "failed.jsonl" } } }
-  nats: { subject: "orders.processed", url: "nats://localhost:4222" }
-"#,
-        r#"
-input: { http: { url: "0.0.0.0:8080" } }
-output: { response: {} }
-"#,
-        r#"
-input: { ref: "common_queue" }
-output: { nats: { subject: "enriched", url: "nats://localhost:4222" } }
-"#,
-        r#"
-input: { kafka: { topic: "noisy", url: "localhost:9092" } }
-output: null
-"#,
-    ];
-
-    for yaml in routes {
-        let _: mq_bridge::models::Route = serde_yaml_ng::from_str(yaml)
-            .unwrap_or_else(|e| panic!("REFERENCE.md route snippet does not parse: {e}\n{yaml}"));
-    }
 }
 
 /// The reference distinguishes "wrong side, warns and is skipped" from "wrong side, hard

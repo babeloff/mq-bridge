@@ -192,11 +192,9 @@ impl CompiledSchema {
                 return Err(TransformError::new(
                     render_path(crumbs),
                     ErrorKind::Enum,
-                    format!(
-                        "value {} is not one of {}",
-                        value,
-                        Value::Array(allowed.clone())
-                    ),
+                    // The rejected value is payload data; report only the allowed set,
+                    // matching the type-only reporting in `coerce()`.
+                    format!("value is not one of {}", Value::Array(allowed.clone())),
                 ));
             }
         }

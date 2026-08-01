@@ -728,7 +728,7 @@ impl MessagePublisher for FilePublisher {
                         csv_header_guard.as_mut(),
                     )
                     .await;
-                    return Err(PublisherError::NonRetryable(anyhow::anyhow!(e)));
+                    return Err(PublisherError::Retryable(anyhow::anyhow!(e)));
                 }
             }
             let serialized_msg = match serialized_msg {

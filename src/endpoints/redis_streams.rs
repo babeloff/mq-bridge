@@ -436,7 +436,13 @@ fn spawn_stream_reader(ctx: ReaderCtx) {
                 Ok(None) => {}
                 // Client-side read timeout: same "no data" condition as `Ok(None)`,
                 // it just fired before the server's empty BLOCK reply arrived.
-                Err(e) if e.is_timeout() => {}
+                Err(e) if e.is_timeout() => {
+                    trace!(
+                        stream = %task_stream,
+                        error = %e,
+                        "Redis XREAD client-side read timeout; polling again"
+                    );
+                }
                 Err(e) => {
                     if tx
                         .send(Err(ConsumerError::Connection(anyhow!(

@@ -20,11 +20,22 @@ impl ReaderPublisher {
     }
 }
 
+/// How long a lifecycle hook waits for the consumer lock.
+///
+/// `send` holds the lock across `receive()`, which parks indefinitely on an idle source.
+/// An unbounded wait here would let that park block shutdown, so the hook is skipped
+/// rather than allowed to hang.
+const HOOK_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 #[async_trait]
 impl MessagePublisher for ReaderPublisher {
     fn on_connect_hook(&self) -> Option<BoxFuture<'_, anyhow::Result<()>>> {
         Some(Box::pin(async move {
-            let consumer = self.consumer.lock().await;
+            let Ok(consumer) = tokio::time::timeout(HOOK_LOCK_TIMEOUT, self.consumer.lock()).await
+            else {
+                tracing::warn!("ReaderPublisher: consumer busy, skipping connect hook");
+                return Ok(());
+            };
             if let Some(hook) = consumer.on_connect_hook() {
                 hook.await?;
             }
@@ -34,7 +45,11 @@ impl MessagePublisher for ReaderPublisher {
 
     fn on_disconnect_hook(&self) -> Option<BoxFuture<'_, anyhow::Result<()>>> {
         Some(Box::pin(async move {
-            let consumer = self.consumer.lock().await;
+            let Ok(consumer) = tokio::time::timeout(HOOK_LOCK_TIMEOUT, self.consumer.lock()).await
+            else {
+                tracing::warn!("ReaderPublisher: consumer busy, skipping disconnect hook");
+                return Ok(());
+            };
             if let Some(hook) = consumer.on_disconnect_hook() {
                 hook.await?;
             }

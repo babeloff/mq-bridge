@@ -314,6 +314,7 @@ fn is_known_endpoint_name(name: &str) -> bool {
 /// Represents a connection point for messages, which can be a source (input) or a sink (output).
 #[derive(Serialize, Clone, Default)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[cfg_attr(feature = "schema", schemars(transform = endpoint_schema_transform))]
 #[serde(deny_unknown_fields)]
 pub struct Endpoint {
     /// (Optional) A list of middlewares to apply to the endpoint.
@@ -1577,10 +1578,10 @@ pub struct FileConfig {
     /// The format for writing messages to the file (Publisher) or interpreting them (Consumer). Defaults to `normal`.
     #[serde(default)]
     pub format: FileFormat,
-    /// Per-batch compression (`none`, `gzip`, `lz4`, `zstd`). Requires the `compression` feature; consume mode only.
+    /// Per-batch compression (`none`, `gzip`, `lz4`, `zstd`). Requires the `compression` feature. Publishers: always. Consumers: must match, and only the default `consume` mode reads it.
     #[serde(default)]
     pub compression: Compression,
-    /// At-rest AEAD encryption applied after compression. Requires the `encryption` feature; consume mode only.
+    /// At-rest AEAD encryption applied after compression. Requires the `encryption` feature. Publishers: always. Consumers: must match, and only the default `consume` mode reads it.
     #[serde(default)]
     pub encryption: Option<EncryptionConfig>,
 }
@@ -2025,6 +2026,31 @@ fn memory_config_schema_transform(schema: &mut schemars::Schema) {
             { "required": ["url"] }
         ]),
     );
+}
+
+/// `null` is a unit variant, so schemars emits it as the bare string `"null"` — which can
+/// never validate inside `Endpoint`'s object schema. Flattened, it serialises as
+/// `{ "null": null }`; rewrite the branch to that object form.
+#[cfg(feature = "schema")]
+fn endpoint_schema_transform(schema: &mut schemars::Schema) {
+    let Some(one_of) = schema
+        .as_object_mut()
+        .and_then(|schema_obj| schema_obj.get_mut("oneOf"))
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return;
+    };
+
+    for branch in one_of.iter_mut() {
+        if branch.get("const") == Some(&serde_json::Value::String("null".to_string())) {
+            *branch = serde_json::json!({
+                "type": "object",
+                "format": "structural_endpoint",
+                "properties": { "null": { "type": "null" } },
+                "required": ["null"]
+            });
+        }
+    }
 }
 
 #[cfg(feature = "schema")]

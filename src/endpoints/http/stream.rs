@@ -524,6 +524,7 @@ async fn send_stream_item(
 
     let response_tx = dispatch.response_tx.clone();
     let response_format = dispatch.response_format;
+    let send_timeout = std::time::Duration::from_millis(2000).min(dispatch.request_timeout / 2);
     if let Some(inline_publisher) = dispatch.inline_publisher.as_ref() {
         let disposition =
             match tokio::time::timeout(dispatch.request_timeout, inline_publisher.send(message))
@@ -537,14 +538,13 @@ async fn send_stream_item(
                 Err(_) => return Err(anyhow!("HTTP inline stream publisher timed out")),
             };
 
-        return streamable_commit(disposition, response_tx, response_format).await;
+        return streamable_commit(disposition, response_tx, response_format, send_timeout).await;
     }
 
     let commit = Box::new(move |disposition: MessageDisposition| {
-        streamable_commit(disposition, response_tx, response_format)
+        streamable_commit(disposition, response_tx, response_format, send_timeout)
     });
 
-    let send_timeout = std::time::Duration::from_millis(2000).min(dispatch.request_timeout / 2);
     match tokio::time::timeout(send_timeout, dispatch.tx.send((message, commit))).await {
         Ok(Ok(_)) => Ok(()),
         Ok(Err(error)) => Err(anyhow!("Internal pipeline closed: {}", error)),
@@ -556,6 +556,7 @@ fn streamable_commit(
     disposition: MessageDisposition,
     response_tx: Option<HttpStreamResponseTx>,
     response_format: HttpStreamFormat,
+    send_timeout: std::time::Duration,
 ) -> BoxFuture<'static, anyhow::Result<()>> {
     Box::pin(async move {
         let Some(response_tx) = response_tx else {
@@ -573,8 +574,11 @@ fn streamable_commit(
             )),
         };
 
-        if response_tx.send(Ok(frame)).await.is_err() {
-            debug!("HTTP stream closed before response was sent");
+        // A stalled reader must not pin this commit forever; a timeout is treated as a
+        // closed stream.
+        match tokio::time::timeout(send_timeout, response_tx.send(Ok(frame))).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) | Err(_) => debug!("HTTP stream closed before response was sent"),
         }
         Ok(())
     })

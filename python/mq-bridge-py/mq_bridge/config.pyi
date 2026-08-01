@@ -113,7 +113,36 @@ class EncryptionConfig(TypedDict, total=False):
 
 class Endpoint(TypedDict, total=False):
     """Represents a connection point for messages, which can be a source (input) or a sink (output)."""
+    amqp: AmqpConfig
+    aws: AwsConfig
+    clickhouse: ClickHouseConfig
+    custom: Dict[str, Any]
+    fanout: List[Endpoint]
+    file: FileConfig
+    grpc: GrpcConfig
+    http: HttpConfig
+    ibmmq: IbmMqConfig
+    kafka: KafkaConfig
+    memory: MemoryConfig
     middlewares: List[Middleware]
+    mongodb: MongoDbConfig
+    mqtt: MqttConfig
+    nats: NatsConfig
+    null: Any
+    object_store: ObjectStoreConfig
+    postgres_cdc: PostgresCdcConfig
+    reader: Endpoint
+    redis_streams: RedisStreamsConfig
+    ref: str
+    request: RequestForwardConfig
+    response: ResponseConfig
+    sled: SledConfig
+    sqlx: SqlxConfig
+    static: StaticConfig
+    stream_buffer: StreamBufferConfig
+    switch: SwitchConfig
+    websocket: WebSocketConfig
+    zeromq: ZeroMqConfig
 
 
 class FileConfig(TypedDict, total=False):

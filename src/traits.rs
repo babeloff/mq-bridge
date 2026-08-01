@@ -195,6 +195,12 @@ pub(crate) fn drain_idle_timeout() -> std::time::Duration {
 /// Awaits `fut`, but in drain mode gives up after [`drain_idle_timeout`], returning
 /// `None` so a blocking consumer can surface an empty batch instead of hanging.
 /// Outside drain mode it simply awaits, preserving the event-driven fast path.
+///
+/// `fut` **must be cancel safe**: on expiry the timeout drops it mid-poll. A future that
+/// has already taken a message off the transport at that point loses it silently — and
+/// drain reports completion, so nothing retries it. Channel `recv`/`recv_many`,
+/// `Stream::next`, and the length-delimited IPC `recv_batch` all qualify; a hand-rolled
+/// `read_exact` pair does not.
 pub(crate) async fn drain_gated<F: std::future::Future>(
     exit_on_empty: bool,
     fut: F,
