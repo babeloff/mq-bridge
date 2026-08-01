@@ -139,7 +139,9 @@ pub async fn assert_cursor_reads_unmappable_types(database_url: &str, cursor_id:
         url: database_url.to_string(),
         table: "typed_events".to_string(),
         cursor_column: Some("id".to_string()),
-        cursor_id: Some(cursor_id.to_string()),
+        // Unique per run: a persisted cursor from a previous run would resume past all
+        // 3 rows and return an empty batch.
+        cursor_id: Some(format!("{cursor_id}-{}", fast_uuid_v7::gen_id())),
         ..Default::default()
     };
 

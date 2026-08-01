@@ -48,3 +48,7 @@ tests/**/*.pkcs12
 .pytest_cache/
 python/mq-bridge-py/.venv/
 python/mq-bridge-py/dist/
+
+# Local build setup (shared cargo target dir with mq-bridge-app), not for git
+.cargo/
+.vscode/

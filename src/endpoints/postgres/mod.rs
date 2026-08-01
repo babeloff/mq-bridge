@@ -432,7 +432,7 @@ impl MessageConsumer for PostgresCdcConsumer {
         self.exit_on_empty = exit_on_empty;
     }
 
-    /// Release the slot while the runtime is still healthy — see [`Self::teardown`].
+    /// Release the slot while the runtime is still healthy — see `teardown`.
     fn on_disconnect_hook(&self) -> Option<crate::traits::BoxFuture<'_, anyhow::Result<()>>> {
         Some(Box::pin(async move {
             self.teardown().await;

@@ -226,6 +226,115 @@ pub async fn test_redis_drain_exits_on_empty() {
     .await;
 }
 
+/// A replacement consumer must reclaim a backlog left by dead consumers even when the
+/// `>` side of the stream is already fully delivered (`lag: 0`).
+///
+/// Regression for a permanent wedge: the reclaiming reader issued `XAUTOCLAIM` on the same
+/// multiplexed connection it then parked in `XREAD BLOCK`. With nothing new arriving the
+/// read really blocks, so the claim reply could time out client-side *after* the server had
+/// applied it — the entries moved into the new consumer's own PEL and were never delivered,
+/// and every retry re-claimed them and reset their idle time. The route stayed `healthy`.
+///
+/// The shape matters: two dead consumers holding the backlog, a drained `>` side, several
+/// reader connections, `batch_size` larger than the backlog, and `block_ms` equal to
+/// `redelivery_timeout_ms` so the reclaim fires on every blocked read.
+pub async fn test_redis_reclaims_backlog_with_drained_stream() {
+    use mq_bridge::models::{Endpoint, EndpointType, RedisStreamsConfig};
+    use mq_bridge::traits::{MessageConsumer, MessagePublisher};
+    use mq_bridge::{CanonicalMessage, Route};
+
+    setup_logging();
+    run_test_with_docker(COMPOSE, || async {
+        const N: usize = 200;
+        let stream = format!("reclaim_redis_{}", fast_uuid_v7::gen_id());
+        let group = format!("g_reclaim_{}", fast_uuid_v7::gen_id());
+
+        let base = |consumer_name: Option<String>| RedisStreamsConfig {
+            url: URL.to_string(),
+            stream: Some(stream.clone()),
+            group: Some(group.clone()),
+            read_from_start: true,
+            consumer_name,
+            redelivery_timeout_ms: Some(1000),
+            block_ms: Some(1000),
+            ..Default::default()
+        };
+
+        RedisStreamsPublisher::new(&base(None))
+            .await
+            .unwrap()
+            .send_batch(
+                (0..N)
+                    .map(|i| CanonicalMessage::new(format!("msg-{i}").into_bytes(), None))
+                    .collect(),
+            )
+            .await
+            .unwrap();
+
+        // Two consumers read the whole stream and are dropped without acking: the backlog
+        // ends up pending under two now-dead names and `>` has nothing left to deliver.
+        let mut drained = 0usize;
+        for i in 0..2 {
+            let mut dead = RedisStreamsConsumer::new(&base(Some(format!("dead-{i}"))))
+                .await
+                .unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            while drained < N * (i + 1) / 2 && std::time::Instant::now() < deadline {
+                let batch =
+                    tokio::time::timeout(std::time::Duration::from_secs(5), dead.receive_batch(16))
+                        .await;
+                match batch {
+                    Ok(Ok(b)) => drained += b.messages.len(),
+                    _ => break,
+                }
+            }
+            drop(dead);
+        }
+        assert!(drained > 0, "seeding left no pending entries");
+
+        // The replacement: batch_size well above the backlog, several reader connections.
+        let out_topic = format!("reclaim_out_{}", fast_uuid_v7::gen_id());
+        let output = Endpoint::new_memory(&out_topic, N + 100);
+        let mut in_config = base(None);
+        in_config.reader_connections = Some(4);
+        let route = Route::new(
+            Endpoint::new(EndpointType::RedisStreams(in_config)),
+            output.clone(),
+        )
+        .with_batch_size(512)
+        .with_concurrency(4);
+
+        let mut sink = output.create_consumer("reclaim_sink").await.unwrap();
+        let handle = route.run("redis_reclaim_test").await.unwrap();
+
+        let mut received = 0usize;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while received < drained {
+            let batch =
+                tokio::time::timeout(std::time::Duration::from_secs(20), sink.receive_batch(512))
+                    .await
+                    .unwrap_or_else(|_| {
+                        panic!("reclaim wedged: {received}/{drained} entries redelivered")
+                    })
+                    .unwrap();
+            received += batch.messages.len();
+            (batch.commit)(vec![
+                mq_bridge::traits::MessageDisposition::Ack;
+                batch.messages.len()
+            ])
+            .await
+            .unwrap();
+            assert!(
+                std::time::Instant::now() < deadline,
+                "reclaim wedged: {received}/{drained} entries redelivered"
+            );
+        }
+        handle.stop().await;
+        println!("[Redis] Reclaim-with-drained-stream test successful ({received} entries).");
+    })
+    .await;
+}
+
 /// A partial batch must be delivered immediately, not withheld until `batch_size` entries
 /// have accumulated. `receive_batch` blocks for the *first* entry, then drains whatever else
 /// is already pending — so two entries answer a `receive_batch(1024)` at once.

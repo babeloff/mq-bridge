@@ -84,6 +84,17 @@ mod tests {
     }
 
     #[test]
+    fn test_anyhow_conversion_preserves_existing_classification() {
+        let permanent = ConsumerError::from(anyhow::Error::new(ConsumerError::Permanent(
+            anyhow::anyhow!("decrypt failed"),
+        )));
+        assert!(matches!(permanent, ConsumerError::Permanent(_)));
+
+        let end = ConsumerError::from(anyhow::Error::new(ConsumerError::EndOfStream));
+        assert!(matches!(end, ConsumerError::EndOfStream));
+    }
+
+    #[test]
     fn test_consumer_error_display_messages() {
         assert_eq!(
             ConsumerError::Gap {

@@ -411,7 +411,13 @@ pub(crate) mod object_store_backend {
     pub(crate) fn build_store(url: &str) -> anyhow::Result<(Box<dyn ObjectStore>, ObjPath)> {
         let parsed =
             url::Url::parse(url).with_context(|| format!("Invalid object_store url '{url}'"))?;
-        let env = std::env::vars().map(|(k, v)| (k.to_ascii_lowercase(), v));
+        // `vars_os`, not `vars`: a single non-UTF-8 env var would panic the latter.
+        let env = std::env::vars_os().filter_map(|(k, v)| {
+            Some((
+                k.into_string().ok()?.to_ascii_lowercase(),
+                v.into_string().ok()?,
+            ))
+        });
         object_store::parse_url_opts(&parsed, env)
             .with_context(|| format!("Failed to build object store for '{url}'"))
     }

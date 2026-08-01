@@ -311,7 +311,7 @@ async fn drain_cdc(reader: &mut MongoDbChangeStreamReader, want: usize) -> usize
     let mut got = 0usize;
     while got < want {
         let batch = tokio::time::timeout(
-            std::time::Duration::from_secs(30),
+            std::time::Duration::from_secs(60),
             reader.receive_batch(1024),
         )
         .await

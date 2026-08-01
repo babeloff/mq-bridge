@@ -118,6 +118,8 @@ async fn test_all_subscriber_logic() {
             integration::redis_streams::test_redis_drain_exits_on_empty().await;
             println!("\n\n>>> Starting Redis Streams Partial Batch Test...");
             integration::redis_streams::test_redis_partial_batch_is_delivered().await;
+            println!("\n\n>>> Starting Redis Streams Reclaim (drained stream) Test...");
+            integration::redis_streams::test_redis_reclaims_backlog_with_drained_stream().await;
         }
     }
     #[cfg(feature = "amqp")]

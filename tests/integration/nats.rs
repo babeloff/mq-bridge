@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 use std::sync::Arc;
 
+use super::assert_permanent_consumer_error;
 use mq_bridge::endpoints::nats::{NatsConsumer, NatsPublisher};
 use mq_bridge::test_utils::{
     add_performance_result, run_chaos_pipeline_test, run_direct_perf_test,
@@ -337,31 +338,4 @@ pub async fn test_nats_subject_stream_mismatch_fails_fast() {
         assert_permanent_consumer_error(route, &route_name, "subject/stream mismatch").await;
     })
     .await;
-}
-
-/// Assert that running `route` once fails with a `ConsumerError::Permanent`.
-///
-/// This targets the classification itself, which is what decides the route's fate:
-/// `route.rs` breaks out of the reconnect loop only for `Permanent`, so anything else spins
-/// on the reconnect interval forever. `run_until_err` is used rather than `run` because a
-/// permanent failure *during startup* reaches the caller of `run` as the same generic
-/// "failed to start" error as a timeout — the very ambiguity that hid these diagnoses.
-async fn assert_permanent_consumer_error(route: mq_bridge::Route, route_name: &str, label: &str) {
-    use mq_bridge::traits::ConsumerError;
-
-    let err = tokio::time::timeout(
-        std::time::Duration::from_secs(30),
-        route.run_until_err(route_name, None, None),
-    )
-    .await
-    .unwrap_or_else(|_| panic!("'{label}': route neither completed nor failed"))
-    .expect_err("must fail");
-
-    assert!(
-        matches!(
-            err.downcast_ref::<ConsumerError>(),
-            Some(ConsumerError::Permanent(_))
-        ),
-        "'{label}': must be a permanent error so the route stops; got: {err:#}"
-    );
 }

@@ -4,6 +4,7 @@
 //! `object_store` reads its backend config (creds/endpoint/region) from the process
 //! environment, so each test sets the LocalStack S3 vars before building endpoints.
 
+use super::assert_permanent_consumer_error;
 use mq_bridge::endpoints::object_store::{ObjectStoreConsumer, ObjectStorePublisher};
 use mq_bridge::models::{FileFormat, ObjectStoreConfig};
 use mq_bridge::test_utils::{run_pipeline_test, run_test_with_docker, setup_logging};
@@ -180,10 +181,13 @@ pub async fn test_object_store_checkpoint_round_trip() {
             let backend = mq_bridge::checkpoint::parse_checkpoint_store(&spec)
                 .expect("parse s3 checkpoint_store");
 
-            let store =
-                mq_bridge::checkpoint::build_external_store(backend.clone(), "mysql", &cursor_id)
-                    .await
-                    .expect("build s3 checkpoint store (creds must come from env)");
+            let store = mq_bridge::checkpoint::build_external_store(
+                backend.clone(),
+                "object_store",
+                &cursor_id,
+            )
+            .await
+            .expect("build s3 checkpoint store (creds must come from env)");
             assert_eq!(store.load().await.unwrap(), None, "fresh cursor is empty");
             store.save("42").await.expect("save cursor");
             assert_eq!(store.load().await.unwrap(), Some("42".to_string()));
@@ -191,7 +195,7 @@ pub async fn test_object_store_checkpoint_round_trip() {
 
             // A freshly built store for the same cursor sees the persisted value.
             let reopened =
-                mq_bridge::checkpoint::build_external_store(backend, "mysql", &cursor_id)
+                mq_bridge::checkpoint::build_external_store(backend, "object_store", &cursor_id)
                     .await
                     .expect("rebuild s3 checkpoint store");
             assert_eq!(reopened.load().await.unwrap(), Some("99".to_string()));
@@ -260,31 +264,4 @@ pub async fn test_object_store_permanent_errors_fail_fast() {
         },
     )
     .await;
-}
-
-/// Assert that running `route` once fails with a `ConsumerError::Permanent`.
-///
-/// This targets the classification itself, which is what decides the route's fate:
-/// `route.rs` breaks out of the reconnect loop only for `Permanent`, so anything else spins
-/// on the reconnect interval forever. `run_until_err` is used rather than `run` because a
-/// permanent failure *during startup* reaches the caller of `run` as the same generic
-/// "failed to start" error as a timeout — the very ambiguity that hid these diagnoses.
-async fn assert_permanent_consumer_error(route: mq_bridge::Route, route_name: &str, label: &str) {
-    use mq_bridge::traits::ConsumerError;
-
-    let err = tokio::time::timeout(
-        std::time::Duration::from_secs(30),
-        route.run_until_err(route_name, None, None),
-    )
-    .await
-    .unwrap_or_else(|_| panic!("'{label}': route neither completed nor failed"))
-    .expect_err("must fail");
-
-    assert!(
-        matches!(
-            err.downcast_ref::<ConsumerError>(),
-            Some(ConsumerError::Permanent(_))
-        ),
-        "'{label}': must be a permanent error so the route stops; got: {err:#}"
-    );
 }
