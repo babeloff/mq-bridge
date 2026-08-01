@@ -240,8 +240,10 @@ feature (pulls `sled`).
 
 - `sled:///path` (or a bare path) — a local sled database; per-process, not cluster-wide.
 - `mongodb://host/db[/collection]` — a shared collection, so multiple instances of a route
-  deduplicate against one another. Requires the `mongodb` feature. Entries expire via a
-  MongoDB TTL index; the collection defaults to `mqb_dedup_<route>`. Point it at the same
+  deduplicate against one another. Requires the `mongodb` feature. Expiry is judged on read,
+  so a `ttl_seconds` boundary is honoured exactly; the TTL index only reclaims space
+  afterwards (MongoDB's sweep can lag by up to a minute). The collection defaults to
+  `mqb_dedup_<route>`. Point it at the same
   deployment your sink already uses to avoid running extra infrastructure.
 - `postgres|mysql|mariadb|sqlite://…[/table]` — a shared SQL table (`dedup_key` PK,
   `expire_at`), so multiple instances deduplicate against one another. Requires the `sqlx`
