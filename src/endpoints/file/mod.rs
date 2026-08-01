@@ -1068,7 +1068,11 @@ fn sniff_compression_magic(path: &str) -> Option<&'static str> {
     let mut head = [0u8; 4];
     let mut f = std::fs::File::open(path).ok()?;
     let n = f.read(&mut head).ok()?;
-    let head = &head[..n];
+    compression_magic_name(&head[..n])
+}
+
+/// The `compression` codec name whose magic bytes `head` begins with, if any.
+fn compression_magic_name(head: &[u8]) -> Option<&'static str> {
     if head.starts_with(&[0x1f, 0x8b]) {
         Some("gzip")
     } else if head.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]) {
@@ -1078,6 +1082,32 @@ fn sniff_compression_magic(path: &str) -> Option<&'static str> {
     } else {
         None
     }
+}
+
+/// Whether the file at `path` looks like an at-rest encrypted file: an 8-byte
+/// big-endian frame length that fits the file, followed by a well-formed crypto
+/// envelope header (`[version=1][cipher 0|1][key_id_len>=1]`). Used to reject
+/// reading one with no `encryption` configured, which would otherwise emit
+/// ciphertext as messages under a clean success.
+fn looks_encrypted_at_rest(path: &str) -> bool {
+    use std::io::Read;
+    const MIN_ENVELOPE: u64 = 3 + 1 + 12; // header + 1-byte key_id + shortest nonce
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return false;
+    };
+    let Ok(file_len) = f.metadata().map(|m| m.len()) else {
+        return false;
+    };
+    let mut head = [0u8; 11];
+    if f.read_exact(&mut head).is_err() {
+        return false;
+    }
+    let frame_len = u64::from_be_bytes(head[..8].try_into().expect("8 bytes"));
+    frame_len >= MIN_ENVELOPE
+        && frame_len.saturating_add(8) <= file_len
+        && head[8] == 1
+        && head[9] <= 1
+        && head[10] >= 1
 }
 
 fn read_until_bytes_sync<R: std::io::BufRead>(
@@ -1665,6 +1695,19 @@ impl<R: std::io::Read> EncryptedFramesReader<R> {
         } else {
             member
         };
+        // Decryption succeeds regardless of the inner codec, so an unconfigured
+        // compression would otherwise be emitted as one binary "message".
+        if self.compression == Compression::None {
+            if let Some(codec) = compression_magic_name(&member) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "decrypted data begins with a {codec} magic header but no `compression` \
+                         is configured; set `compression: {codec}`"
+                    ),
+                ));
+            }
+        }
         self.current = std::io::Cursor::new(member);
         Ok(true)
     }
@@ -1774,6 +1817,15 @@ impl FileConsumer {
             return Err(anyhow::anyhow!(
                 "file '{}' begins with a {codec} magic header but no `compression` is configured; \
                  set `compression: {codec}` (and any `encryption`) to match how it was written",
+                config.path
+            ));
+        }
+        // Same guard for encryption: the envelope is behind an 8-byte frame prefix,
+        // so a compressor magic never shows up at offset 0 for an encrypted file.
+        if looks_encrypted_at_rest(&config.path) {
+            return Err(anyhow::anyhow!(
+                "file '{}' looks encrypted but no `encryption` is configured; \
+                 set `encryption` (and any `compression`) to match how it was written",
                 config.path
             ));
         }

@@ -1858,3 +1858,108 @@ async fn live_tail_waits_for_a_missing_file() {
         .expect("receive_batch errored");
     assert_eq!(batch.messages.len(), 1);
 }
+
+#[cfg(all(feature = "encryption", feature = "compression"))]
+mod at_rest_codec_mismatch {
+    use super::*;
+    use crate::models::EncryptionConfig;
+
+    const KEY: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+
+    fn encryption() -> Option<EncryptionConfig> {
+        Some(EncryptionConfig {
+            key: KEY.to_string(),
+            ..Default::default()
+        })
+    }
+
+    async fn write_encrypted(path: &str, compression: Compression) {
+        let publisher = FilePublisher::new(&FileConfig {
+            path: path.to_string(),
+            compression,
+            encryption: encryption(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        publisher
+            .send_batch(vec![msg!(json!({"a": 1})), msg!(json!({"a": 2}))])
+            .await
+            .unwrap();
+    }
+
+    /// An encrypted file read with no `encryption` configured used to emit its
+    /// ciphertext as messages under a clean success.
+    #[tokio::test]
+    async fn encrypted_source_without_encryption_is_rejected() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("enc.jsonl").display().to_string();
+        write_encrypted(&path, Compression::Gzip).await;
+
+        let err = match FileConsumer::new(&FileConfig {
+            path: path.clone(),
+            ..Default::default()
+        })
+        .await
+        {
+            Ok(_) => panic!("an encrypted file must not be read as plaintext"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("looks encrypted"), "got: {err}");
+    }
+
+    /// Decryption succeeds whatever the inner codec is, so a missing
+    /// `compression` used to surface the compressed bytes as one message.
+    #[tokio::test]
+    async fn decrypted_compression_mismatch_is_permanent() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("enc-gzip.jsonl").display().to_string();
+        write_encrypted(&path, Compression::Gzip).await;
+
+        let mut source = FileConsumer::new(&FileConfig {
+            path: path.clone(),
+            encryption: encryption(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        source.set_exit_on_empty(true);
+
+        let mut last = None;
+        for _ in 0..20 {
+            match source.receive_batch(16).await {
+                Err(crate::errors::ConsumerError::Permanent(e)) => {
+                    last = Some(e.to_string());
+                    break;
+                }
+                Ok(batch) => assert!(
+                    batch.messages.is_empty(),
+                    "gzip bytes must not be emitted as messages"
+                ),
+                Err(e) => panic!("unexpected error: {e:?}"),
+            }
+        }
+        let err = last.expect("expected a permanent decode error");
+        assert!(err.contains("Giving up decoding"), "got: {err}");
+    }
+
+    /// The matching configuration still round-trips.
+    #[tokio::test]
+    async fn encrypted_and_compressed_round_trip() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("ok.jsonl").display().to_string();
+        write_encrypted(&path, Compression::Gzip).await;
+
+        let mut source = FileConsumer::new(&FileConfig {
+            path: path.clone(),
+            compression: Compression::Gzip,
+            encryption: encryption(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        source.set_exit_on_empty(true);
+        let batch = source.receive_batch(16).await.unwrap();
+        assert_eq!(batch.messages.len(), 2);
+    }
+}

@@ -861,10 +861,18 @@ impl Route {
             }),
             _ => {
                 handle.abort();
+                // The startup failure itself stays inside the reconnect loop, so
+                // surface the cause it recorded rather than a bare timeout.
+                let cause = recover_read_lock(&status, "route_handle_status")
+                    .error
+                    .clone()
+                    .map(|e| format!(": {e}"))
+                    .unwrap_or_default();
                 Err(anyhow::anyhow!(
-                    "Route '{}' failed to start within {}ms or encountered an error",
+                    "Route '{}' failed to start within {}ms or encountered an error{}",
                     name_str,
-                    startup_timeout.as_millis()
+                    startup_timeout.as_millis(),
+                    cause
                 ))
             }
         }
