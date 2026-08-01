@@ -400,6 +400,16 @@ async fn test_mongodb_cdc_latency() {
     }
 }
 
+/// Regression: an idle change stream must survive the idle resume-token refresh (no abort).
+#[cfg(feature = "mongodb")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires docker compose (mongodb replica set)"]
+async fn test_mongodb_cdc_survives_idle_resume_refresh() {
+    if should_run("mongodb_cdc") || should_run("mongodb") {
+        integration::mongodb::test_mongodb_cdc_survives_idle_resume_refresh().await;
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires docker compose, takes long time to run"]
 async fn test_all_performance_pipeline() {

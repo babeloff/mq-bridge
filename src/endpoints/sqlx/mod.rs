@@ -1901,7 +1901,8 @@ impl MessageConsumer for SqlxCursorReader {
             let cursor = cursor_col
                 .and_then(|(idx, kind)| extract_cursor_at(row, idx, kind))
                 .ok_or_else(|| {
-                    ConsumerError::Connection(anyhow!(
+                    // Schema-level, so re-polling fails identically: permanent, not a reconnect.
+                    ConsumerError::Permanent(anyhow!(
                         "cursor_column '{}' is missing or of a type the SQL `Any` driver cannot decode \
                          (only integer and text cursors are supported). CAST it to BIGINT/TEXT in a view, \
                          or point cursor_column at an integer or text column.",
@@ -1925,8 +1926,8 @@ impl MessageConsumer for SqlxCursorReader {
             if emit_len == 0 {
                 // A single cursor value fills the whole batch and more rows with that value exist
                 // beyond it. Advancing past the value would silently skip the remainder, so fail
-                // loudly instead of losing rows.
-                return Err(ConsumerError::Connection(anyhow!(
+                // loudly instead of losing rows. Permanent: re-polling returns the same page forever.
+                return Err(ConsumerError::Permanent(anyhow!(
                     "cursor_column '{}' has a group of equal values larger than batch_size ({}); \
                      cannot page without skipping rows. Increase batch_size above the size of the \
                      largest equal-value group.",

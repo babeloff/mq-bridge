@@ -158,6 +158,46 @@ async fn test_sqlx_cursor_reader_non_unique_column_no_loss() {
     );
 }
 
+// Regression: an equal-value group larger than batch_size can never be paged, so the error
+// must be Permanent. Classified as Connection it read as transient and the route re-polled
+// the same unpageable page forever, hanging `--drain` instead of exiting.
+#[tokio::test]
+async fn test_sqlx_cursor_oversized_equal_group_is_permanent() {
+    sqlx::any::install_default_drivers();
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("wide.db");
+    let url = sqlite_url(&path);
+    drop(tokio::fs::File::create(&path).await.unwrap());
+    let pool = AnyPool::connect(&url).await.unwrap();
+    sqlx::query("CREATE TABLE events (id INTEGER PRIMARY KEY, ts INTEGER)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    // Four rows share ts=20, so a batch of 2 can never advance past the group.
+    for (id, ts) in [(1, 20), (2, 20), (3, 20), (4, 20), (5, 30)] {
+        sqlx::query("INSERT INTO events (id, ts) VALUES (?, ?)")
+            .bind(id)
+            .bind(ts)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    let config = SqlxConfig {
+        url: url.clone(),
+        table: "events".to_string(),
+        cursor_column: Some("ts".to_string()),
+        ..Default::default()
+    };
+    let mut reader = SqlxCursorReader::new(&config).await.unwrap();
+
+    let err = reader.receive_batch(2).await.expect_err("cannot page");
+    assert!(
+        matches!(err, ConsumerError::Permanent(_)),
+        "expected ConsumerError::Permanent, got {err:?}"
+    );
+}
+
 // Regression: a mid-batch Nack must make the nacked (and following) rows re-read by the
 // same running reader, not skipped until a restart. Rows 1..4 are read; row 3 is nacked,
 // so the next receive_batch on the same reader resumes at row 3.

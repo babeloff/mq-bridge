@@ -306,9 +306,14 @@ server-side (default one-hour window) — `insert_deduplication_token` lets you 
 mq-bridge does not set one, so rely on `ReplacingMergeTree` for logical dedup and treat block-level
 dedup only as retry-safety.
 
-**Postgres CDC — deterministic id + `postgres.key`.** The `postgres_cdc` source already resumes from a
-durable LSN checkpoint (no re-delivery on clean restart). For the crash window (row written, then a
-crash before the checkpoint flush) it is at-least-once, so make the sink idempotent. Each change event
+**Postgres CDC — deterministic id + `postgres.key`.** The `postgres_cdc` source resumes from the slot's
+durable `confirmed_flush_lsn`. In-band standby feedback is asynchronous and is *not* flushed when the
+stream stops, so the last acks are made durable by the consumer's `Drop`, which stops the stream and
+advances the slot synchronously. Re-delivery is therefore avoided only on a restart that actually runs
+that teardown — a host process that exits without dropping the route (or one on a current-thread Tokio
+runtime, where the blocking advance is skipped) replays everything since the last asynchronous feedback
+tick. Set `checkpoint_store` to a `file://` path for a second, per-ack durable position that survives
+teardown regardless. Treat the source as at-least-once and make the sink idempotent. Each change event
 carries the full row (so the primary key is in the payload), `postgres.lsn` (a monotonic version),
 `postgres.operation`/`schema`/`table`, and — when the table has a primary key / replica identity —
 `postgres.key` (the key value). The event's `message_id` is a stable hash of `schema.table + key +

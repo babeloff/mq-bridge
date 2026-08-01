@@ -639,8 +639,8 @@ impl MessageConsumer for ClickHouseCursorReader {
             if emit_len == 0 {
                 // The whole page shares one cursor value and more rows with that value exist beyond
                 // it. Advancing past the value would silently skip the remainder, so fail loudly
-                // instead of losing rows.
-                return Err(ConsumerError::Connection(anyhow!(
+                // instead of losing rows. Permanent: re-polling returns the same page forever.
+                return Err(ConsumerError::Permanent(anyhow!(
                     "cursor_column '{}' has a group of equal values larger than batch_size ({}); \
                      cannot page without skipping rows. Increase batch_size above the size of the \
                      largest equal-value group.",

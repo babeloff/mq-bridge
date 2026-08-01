@@ -450,6 +450,45 @@ pub async fn test_mongodb_cdc_latency() {
     .await;
 }
 
+/// Regression: a change stream that sits idle past the idle resume-token refresh interval
+/// (10s) must keep streaming. The idle branch used to poll with a cancellable `StreamExt::next`
+/// and then read `resume_token()`, which panics unless the driver's stream state is `Idle` —
+/// the cancelled poll left it non-`Idle`, aborting the process on every idle CDC route.
+pub async fn test_mongodb_cdc_survives_idle_resume_refresh() {
+    setup_logging();
+    run_test_with_docker(
+        "tests/integration/docker-compose/mongodb-replica.yml",
+        || async {
+            let collection = format!("cdc_idle_{}", fast_uuid_v7::gen_id());
+            let mut reader = MongoDbChangeStreamReader::new(&cdc_reader_cfg(&collection), false)
+                .await
+                .expect("create CDC reader");
+
+            let client = mongodb::Client::with_uri_str(CDC_URL).await.unwrap();
+            let coll = client
+                .database(CDC_DB)
+                .collection::<mongodb::bson::Document>(&collection);
+
+            // Idle well past IDLE_RESUME_REFRESH so the refresh branch runs at least twice,
+            // then write: the stream must still deliver the change.
+            let writer = tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(25)).await;
+                coll.insert_one(mongodb::bson::doc! { "id": 1i64, "name": "after-idle" })
+                    .await
+                    .expect("insert after idle");
+            });
+
+            let seen = drain_cdc(&mut reader, 1).await;
+            assert!(
+                seen >= 1,
+                "change after a long idle period must be delivered"
+            );
+            writer.await.expect("writer task panicked");
+        },
+    )
+    .await;
+}
+
 async fn run_mongodb_direct_perf_test_impl(
     compose_file: &str,
     url: &str,
