@@ -118,11 +118,18 @@ async fn control_conn(url: &str, tls: &crate::models::TlsConfig) -> anyhow::Resu
 
 /// Ensure the logical replication slot exists, creating it with the `pgoutput`
 /// plugin if missing and `create_if_missing` is true.
+///
+/// The slot is always created as **permanent**, even for an ephemeral run. A
+/// Postgres *temporary* slot lives and dies with the session that created it, and
+/// the streaming connection is a separate session from this control connection —
+/// so a temporary slot would be gone before `START_REPLICATION` could use it.
+/// Ephemeral runs (`temporary_slot: true`) instead get the slot dropped on
+/// teardown; see [`drop_slot`] and `PostgresCdcConsumer`'s `Drop`.
 pub async fn ensure_slot(
     url: &str,
     slot_name: &str,
     create_if_missing: bool,
-    temporary: bool,
+    drop_on_stop: bool,
     tls: &crate::models::TlsConfig,
 ) -> anyhow::Result<()> {
     let mut conn = control_conn(url, tls).await?;
@@ -144,15 +151,17 @@ pub async fn ensure_slot(
         ));
     }
 
-    sqlx::query("SELECT pg_create_logical_replication_slot($1, 'pgoutput', $2)")
+    sqlx::query("SELECT pg_create_logical_replication_slot($1, 'pgoutput', false)")
         .bind(slot_name)
-        .bind(temporary)
         .execute(&mut conn)
         .await
         .map_err(|e| anyhow!("postgres-cdc: create slot failed: {e}"))?;
 
-    if temporary {
-        debug!("postgres-cdc: created temporary replication slot '{slot_name}'");
+    if drop_on_stop {
+        debug!(
+            "postgres-cdc: created replication slot '{slot_name}'; it is dropped again when the \
+             route stops (temporary_slot: true)"
+        );
     } else {
         warn!(
             "postgres-cdc: created PERMANENT replication slot '{slot_name}' — it retains WAL on \
@@ -161,6 +170,63 @@ pub async fn ensure_slot(
         );
     }
     Ok(())
+}
+
+/// Drop the replication slot, waiting for the server to release it first.
+/// `pg_drop_replication_slot` refuses to run while a walsender still holds the
+/// slot, and the server releases it only shortly after the streaming socket
+/// closes — so poll `pg_replication_slots.active` the same way
+/// [`advance_slot_when_inactive`] does. A slot that is already gone is a no-op.
+pub async fn drop_slot(
+    url: &str,
+    slot_name: &str,
+    tls: &crate::models::TlsConfig,
+) -> anyhow::Result<()> {
+    let mut conn = control_conn(url, tls).await?;
+    if !wait_for_slot_release(&mut conn, slot_name).await? {
+        return Ok(());
+    }
+    sqlx::query("SELECT pg_drop_replication_slot($1)")
+        .bind(slot_name)
+        .execute(&mut conn)
+        .await
+        .map_err(|e| anyhow!("postgres-cdc: drop slot failed: {e}"))?;
+    debug!("postgres-cdc: dropped replication slot '{slot_name}'");
+    Ok(())
+}
+
+/// Poll `pg_replication_slots.active` until the walsender lets go of the slot. Both
+/// `pg_replication_slot_advance` and `pg_drop_replication_slot` refuse to run on an active
+/// slot, and the server releases it only shortly after the streaming socket closes.
+///
+/// Returns `false` when the slot no longer exists (nothing left to do), `true` once it is
+/// inactive — or after the budget runs out, letting the caller's statement produce the real
+/// server error rather than a synthetic timeout.
+async fn wait_for_slot_release(conn: &mut PgConnection, slot_name: &str) -> anyhow::Result<bool> {
+    // ~5s: the stream is asked to stop just before this, but CopyDone plus the server's
+    // walsender cleanup is a round trip, and this runs once per route stop.
+    for _ in 0..200 {
+        let active: Option<(Option<bool>,)> =
+            sqlx::query_as("SELECT active FROM pg_replication_slots WHERE slot_name = $1")
+                .bind(slot_name)
+                .fetch_optional(&mut *conn)
+                .await
+                .map_err(|e| anyhow!("postgres-cdc: slot status check failed: {e}"))?;
+        match active {
+            None => return Ok(false),
+            Some((Some(false) | None,)) => return Ok(true),
+            Some((Some(true),)) => tokio::time::sleep(Duration::from_millis(25)).await,
+        }
+    }
+    warn!("postgres-cdc: replication slot '{slot_name}' still active after 5s; proceeding anyway");
+    Ok(true)
+}
+
+/// True when an error reports that the replication slot is gone (SQLSTATE 42704,
+/// `undefined_object`). Reconnecting cannot recreate it, so the route must fail
+/// permanently rather than retry on the reconnect interval forever.
+pub fn is_missing_slot_error(msg: &str) -> bool {
+    msg.contains("42704") || (msg.contains("replication slot") && msg.contains("does not exist"))
 }
 
 /// A publication table reference is a plain identifier or a single `schema.table`,
@@ -346,21 +412,8 @@ pub async fn advance_slot_when_inactive(
         return Ok(());
     }
     let mut conn = control_conn(url, tls).await?;
-    for _ in 0..40 {
-        let active: Option<(Option<bool>,)> =
-            sqlx::query_as("SELECT active FROM pg_replication_slots WHERE slot_name = $1")
-                .bind(slot_name)
-                .fetch_optional(&mut conn)
-                .await
-                .map_err(|e| anyhow!("postgres-cdc: slot status check failed: {e}"))?;
-        match active {
-            // Slot no longer exists — nothing to advance.
-            None => return Ok(()),
-            // Inactive (or NULL) — safe to advance.
-            Some((Some(false) | None,)) => break,
-            // Still held by a walsender — wait for release.
-            Some((Some(true),)) => tokio::time::sleep(Duration::from_millis(25)).await,
-        }
+    if !wait_for_slot_release(&mut conn, slot_name).await? {
+        return Ok(());
     }
     sqlx::query("SELECT pg_replication_slot_advance($1, $2::pg_lsn)")
         .bind(slot_name)
@@ -395,7 +448,14 @@ pub async fn start_replication(
     .with_status_interval(status_interval)
     .with_wakeup_interval(status_interval);
 
-    ReplicationClient::connect(cfg)
-        .await
-        .map_err(|e| anyhow!("postgres-cdc: start_replication failed: {e}"))
+    ReplicationClient::connect(cfg).await.map_err(|e| {
+        let msg = format!("postgres-cdc: start_replication failed: {e}");
+        // A missing slot cannot heal itself; surface it as permanent so the route
+        // stops instead of reconnecting on the interval forever.
+        if is_missing_slot_error(&msg) {
+            anyhow::Error::new(crate::errors::ConsumerError::Permanent(anyhow!(msg)))
+        } else {
+            anyhow!(msg)
+        }
+    })
 }

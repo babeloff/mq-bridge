@@ -521,6 +521,35 @@ async fn build_nats_options(config: &NatsConfig) -> anyhow::Result<ConnectOption
     Ok(options)
 }
 
+/// True for JetStream setup failures a reconnect cannot change: the stream exists but its
+/// configuration is incompatible with the route's `stream`/`subject` (most often the subject
+/// is not covered by the stream's subjects). Retrying rebuilds the identical mismatch.
+fn is_permanent_jetstream_setup_error(msg: &str) -> bool {
+    let m = msg.to_ascii_lowercase();
+    m.contains("filter subject")
+        || m.contains("does not match any subject")
+        || m.contains("subjects overlap")
+        || m.contains("stream name already in use")
+}
+
+/// Classify a JetStream setup failure so a configuration mismatch stops the route instead of
+/// spinning on the reconnect interval forever. Connect/IO failures stay retryable.
+fn classify_jetstream_setup_error(
+    e: impl std::fmt::Display,
+    stream: &str,
+    subject: &str,
+) -> anyhow::Error {
+    let msg = format!("NATS JetStream setup failed (stream '{stream}', subject '{subject}'): {e}");
+    if is_permanent_jetstream_setup_error(&msg) {
+        anyhow::Error::new(ConsumerError::Permanent(anyhow!(
+            "{msg}. This is a configuration mismatch, not a transient failure: reconcile the \
+             route's `stream`/`subject` with the existing stream, or update the stream."
+        )))
+    } else {
+        anyhow!(msg)
+    }
+}
+
 impl NatsCore {
     async fn connect(
         config: &NatsConfig,
@@ -546,7 +575,8 @@ impl NatsCore {
                     max_bytes: config.stream_max_bytes.unwrap_or(1024 * 1024 * 1024), // 1GB
                     ..Default::default()
                 })
-                .await?;
+                .await
+                .map_err(|e| classify_jetstream_setup_error(e, stream_name, subject))?;
 
             let stream = jetstream.get_stream(stream_name).await?;
 
@@ -559,7 +589,8 @@ impl NatsCore {
                     max_ack_pending,
                     ..Default::default()
                 })
-                .await?;
+                .await
+                .map_err(|e| classify_jetstream_setup_error(e, stream_name, subject))?;
 
             let stream = consumer.messages().await?;
             info!(stream = %stream_name, subject = %subject, "NATS JetStream subscribed");

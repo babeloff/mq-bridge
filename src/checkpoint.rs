@@ -393,12 +393,28 @@ pub async fn build_external_store(
 /// Cloud object-store checkpoint backend: one object per cursor key (no read-modify-write,
 /// no cross-process locking needed). URL/creds are resolved by `object_store` from env vars.
 #[cfg(feature = "object-store")]
-mod object_store_backend {
+pub(crate) mod object_store_backend {
     use super::{object_store_checkpoint_key, CheckpointStore};
     use anyhow::Context;
     use async_trait::async_trait;
     use object_store::{path::Path as ObjPath, ObjectStore, ObjectStoreExt};
     use std::sync::Arc;
+
+    /// Builds an `object_store` backend and its base prefix `Path` from a URL. Credentials and
+    /// backend options (`AWS_ACCESS_KEY_ID`, `AWS_ENDPOINT`, `AWS_REGION`, `AWS_ALLOW_HTTP`,
+    /// `GOOGLE_SERVICE_ACCOUNT`, ...) are read from the process environment.
+    ///
+    /// The backend config-key parsers only accept the lowercase form (`aws_access_key_id`), so
+    /// env-var names are lowercased before being folded into the builder — the same
+    /// normalization `AmazonS3Builder::from_env` does. Unrecognized keys are ignored. Bare
+    /// `parse_url` reads no env at all, which would fall through to the EC2/GCE metadata service.
+    pub(crate) fn build_store(url: &str) -> anyhow::Result<(Box<dyn ObjectStore>, ObjPath)> {
+        let parsed =
+            url::Url::parse(url).with_context(|| format!("Invalid object_store url '{url}'"))?;
+        let env = std::env::vars().map(|(k, v)| (k.to_ascii_lowercase(), v));
+        object_store::parse_url_opts(&parsed, env)
+            .with_context(|| format!("Failed to build object store for '{url}'"))
+    }
 
     struct ObjectStoreCheckpointStore {
         store: Arc<dyn ObjectStore>,
@@ -441,10 +457,7 @@ mod object_store_backend {
         source_name: &str,
         cursor_id: &str,
     ) -> anyhow::Result<Arc<dyn CheckpointStore>> {
-        let parsed = url::Url::parse(url)
-            .with_context(|| format!("Invalid object-store checkpoint URL '{url}'"))?;
-        let (store, base) = object_store::parse_url(&parsed)
-            .with_context(|| format!("Failed to build object store for '{url}'"))?;
+        let (store, base) = build_store(url)?;
         let key = object_store_checkpoint_key(source_name, cursor_id);
         let path = base.join(key);
         Ok(Arc::new(ObjectStoreCheckpointStore {

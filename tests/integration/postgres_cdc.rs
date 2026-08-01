@@ -143,6 +143,119 @@ pub async fn test_postgres_cdc_pipeline() {
     .await;
 }
 
+/// `temporary_slot: true` must actually deliver changes, and must leave no slot
+/// behind once the route stops. A Postgres *temporary* slot dies with the session
+/// that created it, so the option is implemented as drop-on-stop instead.
+pub async fn test_postgres_cdc_temporary_slot() {
+    setup_logging();
+    run_test_with_docker(COMPOSE, || async {
+        let slot = "mqb_cdc_temp_slot";
+        reset_schema(slot).await;
+        let mut config = cfg(slot);
+        config.temporary_slot = true;
+
+        let mut consumer = PostgresCdcConsumer::new(&config)
+            .await
+            .expect("create CDC consumer");
+        insert_rows(1..=10).await;
+        let seen = drain_ids(&mut consumer, 10).await;
+        assert_eq!(seen.len(), 10, "temporary_slot route must deliver rows");
+
+        // Graceful stop runs the teardown that drops the slot; the extra `drop` then hits
+        // the fallback in `Drop`, which must be a no-op because teardown is single-shot.
+        consumer.close().await.expect("clean close");
+        drop(consumer);
+        let mut conn = connect_retry().await;
+        let mut remaining = -1i64;
+        for _ in 0..40 {
+            remaining = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_replication_slots WHERE slot_name = $1",
+            )
+            .bind(slot)
+            .fetch_one(&mut conn)
+            .await
+            .expect("count slots");
+            if remaining == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        assert_eq!(
+            remaining, 0,
+            "temporary slot '{slot}' must be dropped on stop"
+        );
+    })
+    .await;
+}
+
+/// Read the slot's durable `confirmed_flush_lsn` as a `pg_lsn` string.
+async fn confirmed_flush_lsn(slot: &str) -> String {
+    let mut conn = connect_retry().await;
+    sqlx::query_scalar::<_, String>(
+        "SELECT confirmed_flush_lsn::text FROM pg_replication_slots WHERE slot_name = $1",
+    )
+    .bind(slot)
+    .fetch_one(&mut conn)
+    .await
+    .expect("read confirmed_flush_lsn")
+}
+
+/// `X/Y` hex LSN -> u64, for comparing positions.
+fn lsn_to_u64(lsn: &str) -> u64 {
+    let (hi, lo) = lsn.split_once('/').expect("pg_lsn has the form X/Y");
+    (u64::from_str_radix(hi, 16).expect("lsn high") << 32)
+        | u64::from_str_radix(lo, 16).expect("lsn low")
+}
+
+/// After a clean stop, the slot's `confirmed_flush_lsn` must cover the last delivered and
+/// acked change. The teardown that flushes it runs in `on_disconnect_hook` (awaited by the
+/// route while the runtime is healthy); doing it from `Drop` instead always failed with
+/// "control-plane connect failed: task was cancelled", so the final flush never landed and
+/// the confirmed position lagged the last transaction.
+pub async fn test_postgres_cdc_confirms_lsn_on_clean_stop() {
+    setup_logging();
+    run_test_with_docker(COMPOSE, || async {
+        let slot = "mqb_cdc_flush_slot";
+        reset_schema(slot).await;
+        let mut consumer = PostgresCdcConsumer::new(&cfg(slot))
+            .await
+            .expect("create CDC consumer");
+
+        insert_rows(1..=20).await;
+        let mut last_lsn = 0u64;
+        let mut seen = 0usize;
+        while seen < 20 {
+            let batch = tokio::time::timeout(Duration::from_secs(20), consumer.receive_batch(1024))
+                .await
+                .expect("timed out waiting for CDC events")
+                .expect("receive_batch failed");
+            let n = batch.messages.len();
+            for msg in &batch.messages {
+                let lsn = msg
+                    .metadata
+                    .get("postgres.lsn")
+                    .expect("each change carries postgres.lsn");
+                last_lsn = last_lsn.max(lsn_to_u64(lsn));
+            }
+            seen += n;
+            (batch.commit)(vec![MessageDisposition::Ack; n])
+                .await
+                .expect("commit (ack) failed");
+        }
+        assert!(last_lsn > 0, "delivered changes must carry an LSN");
+
+        // Graceful stop: `close()` awaits the same disconnect hook the route awaits.
+        consumer.close().await.expect("clean close");
+        let confirmed = confirmed_flush_lsn(slot).await;
+        assert!(
+            lsn_to_u64(&confirmed) >= last_lsn,
+            "confirmed_flush_lsn ({confirmed}) must cover the last acked change ({last_lsn:#x}) \
+             after a clean stop"
+        );
+    })
+    .await;
+}
+
 // --- Isolated CDC read benchmarks ---------------------------------------------------------------
 // Unlike the coupled pipeline test (which times INSERT + WAL + read together and is therefore
 // write-bound), these attach the reader first, seed the table *untimed* — the changes buffer in the

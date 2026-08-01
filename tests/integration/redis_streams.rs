@@ -225,3 +225,81 @@ pub async fn test_redis_drain_exits_on_empty() {
     })
     .await;
 }
+
+/// A partial batch must be delivered immediately, not withheld until `batch_size` entries
+/// have accumulated. `receive_batch` blocks for the *first* entry, then drains whatever else
+/// is already pending — so two entries answer a `receive_batch(1024)` at once.
+///
+/// Reported as a bug against v0.3.8 (a route stalling at the app's default batch_size of
+/// 1024); it did not reproduce at either level, so these pin the behaviour instead.
+pub async fn test_redis_partial_batch_is_delivered() {
+    use mq_bridge::models::{Endpoint, EndpointType, RedisStreamsConfig};
+    use mq_bridge::traits::{MessageConsumer, MessagePublisher};
+    use mq_bridge::{CanonicalMessage, Route};
+
+    setup_logging();
+    run_test_with_docker(COMPOSE, || async {
+        let config = |suffix: &str| RedisStreamsConfig {
+            url: URL.to_string(),
+            stream: Some(format!("partial_{suffix}_{}", fast_uuid_v7::gen_id())),
+            group: Some(format!("g_partial_{suffix}")),
+            read_from_start: true,
+            ..Default::default()
+        };
+        let two = || {
+            vec![
+                CanonicalMessage::new(b"v1".to_vec(), None),
+                CanonicalMessage::new(b"v2".to_vec(), None),
+            ]
+        };
+
+        // Consumer level. Entries are published *before* the group exists, matching the report.
+        let cfg = config("consumer");
+        RedisStreamsPublisher::new(&cfg)
+            .await
+            .unwrap()
+            .send_batch(two())
+            .await
+            .unwrap();
+        let mut consumer = RedisStreamsConsumer::new(&cfg).await.unwrap();
+        let batch = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            consumer.receive_batch(1024),
+        )
+        .await
+        .expect("receive_batch never returned: a partial batch was withheld")
+        .unwrap();
+        assert_eq!(
+            batch.messages.len(),
+            2,
+            "both pending entries must arrive in one under-full batch"
+        );
+
+        // Route level, at the app's default batch_size.
+        let cfg = config("route");
+        RedisStreamsPublisher::new(&cfg)
+            .await
+            .unwrap()
+            .send_batch(two())
+            .await
+            .unwrap();
+        let out_topic = format!("partial_out_{}", fast_uuid_v7::gen_id());
+        let output = Endpoint::new_memory(&out_topic, 100);
+        let route = Route::new(
+            Endpoint::new(EndpointType::RedisStreams(cfg)),
+            output.clone(),
+        )
+        .with_batch_size(1024);
+        let handle = route.run("redis_partial_batch").await.unwrap();
+
+        let mut sink = output.create_consumer("partial_sink").await.unwrap();
+        let batch =
+            tokio::time::timeout(std::time::Duration::from_secs(10), sink.receive_batch(1024))
+                .await
+                .expect("nothing reached the sink: the route withheld a partial batch")
+                .unwrap();
+        assert!(!batch.messages.is_empty());
+        handle.stop().await;
+    })
+    .await;
+}

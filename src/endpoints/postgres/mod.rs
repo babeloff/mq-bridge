@@ -31,7 +31,7 @@ use pgwire_replication::{Lsn, ReplicationClient};
 use replication::ReplicationEvent;
 use std::any::Any;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
@@ -60,6 +60,10 @@ pub struct PostgresCdcConsumer {
     /// TLS config used on teardown to reopen the control-plane connection (see `Drop`).
     tls: crate::models::TlsConfig,
     ended: bool,
+    /// `temporary_slot`: drop the slot on teardown instead of advancing it.
+    drop_slot_on_stop: bool,
+    /// Set once teardown has run, so the `Drop` fallback never repeats the hook's work.
+    teardown_done: AtomicBool,
     /// Drain mode: only then does an idle replication read time out into an empty batch.
     exit_on_empty: bool,
 }
@@ -167,8 +171,43 @@ impl PostgresCdcConsumer {
             slot_name: config.slot_name.clone(),
             tls: config.tls.clone(),
             ended: false,
+            drop_slot_on_stop: config.temporary_slot,
+            teardown_done: AtomicBool::new(false),
             exit_on_empty: false,
         })
+    }
+
+    /// Release the slot: stop the stream, then either drop the slot (ephemeral run) or
+    /// advance its `confirmed_flush_lsn` to the last acked position.
+    ///
+    /// Runs at most once. Both branches need a fresh control-plane connection —
+    /// `pg_replication_slot_advance` and `pg_drop_replication_slot` are ordinary SQL, not
+    /// replication commands — which is why this belongs in `on_disconnect_hook` (awaited by
+    /// the route while the runtime is still healthy) rather than in `Drop`, where opening a
+    /// connection during runtime teardown fails with "task was cancelled".
+    async fn teardown(&self) {
+        if self.teardown_done.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let lsn = self.confirmed.load(Ordering::Acquire);
+        if lsn == 0 && !self.drop_slot_on_stop {
+            return;
+        }
+        // CopyDone; the worker exits and the server releases the slot shortly after. Both
+        // helpers below poll `pg_replication_slots.active` until then.
+        self.client.stop();
+        if self.drop_slot_on_stop {
+            // Ephemeral run: the slot is discarded, so its confirmed_flush_lsn is
+            // irrelevant — dropping it releases the retained WAL outright.
+            if let Err(e) = replication::drop_slot(&self.url, &self.slot_name, &self.tls).await {
+                warn!(error = %e, "postgres_cdc: dropping ephemeral slot on shutdown failed");
+            }
+        } else if let Err(e) =
+            replication::advance_slot_when_inactive(&self.url, &self.slot_name, lsn, &self.tls)
+                .await
+        {
+            warn!(error = %e, "postgres_cdc: durable slot advance on shutdown failed");
+        }
     }
 
     /// Push the current confirmed LSN to the server as the slot's applied position.
@@ -392,6 +431,15 @@ impl MessageConsumer for PostgresCdcConsumer {
     fn set_exit_on_empty(&mut self, exit_on_empty: bool) {
         self.exit_on_empty = exit_on_empty;
     }
+
+    /// Release the slot while the runtime is still healthy — see [`Self::teardown`].
+    fn on_disconnect_hook(&self) -> Option<crate::traits::BoxFuture<'_, anyhow::Result<()>>> {
+        Some(Box::pin(async move {
+            self.teardown().await;
+            Ok(())
+        }))
+    }
+
     async fn receive_batch(&mut self, max_messages: usize) -> Result<ReceivedBatch, ConsumerError> {
         if max_messages == 0 {
             return Ok(ReceivedBatch {
@@ -426,9 +474,13 @@ impl MessageConsumer for PostgresCdcConsumer {
                     self.handle_event(ev).map_err(ConsumerError::Connection)?;
                 }
                 Err(e) => {
-                    return Err(ConsumerError::Connection(anyhow!(
-                        "postgres_cdc: recv failed: {e}"
-                    )));
+                    let msg = format!("postgres_cdc: recv failed: {e}");
+                    // A vanished slot never comes back on its own; don't reconnect-loop.
+                    return Err(if replication::is_missing_slot_error(&msg) {
+                        ConsumerError::Permanent(anyhow!(msg))
+                    } else {
+                        ConsumerError::Connection(anyhow!(msg))
+                    });
                 }
             }
         }
@@ -511,9 +563,20 @@ impl MessageConsumer for PostgresCdcConsumer {
 /// current-thread runtime (or off-runtime) we fall back to the best-effort async
 /// feedback already sent during streaming.
 impl Drop for PostgresCdcConsumer {
+    /// Best-effort fallback for consumers dropped without a graceful stop (direct API use,
+    /// a panicking route). The route path runs `on_disconnect_hook` first, and `teardown`
+    /// is single-shot, so this is normally a no-op.
+    ///
+    /// It stays best-effort on purpose: opening the control-plane connection from here
+    /// fails once the runtime has started cancelling tasks, which is exactly why the real
+    /// teardown moved into the disconnect hook.
     fn drop(&mut self) {
+        if self.teardown_done.load(Ordering::Acquire) {
+            return;
+        }
         let lsn = self.confirmed.load(Ordering::Acquire);
-        if lsn == 0 {
+        // With no acked position and nothing to clean up there is no teardown work.
+        if lsn == 0 && !self.drop_slot_on_stop {
             return;
         }
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
@@ -522,22 +585,7 @@ impl Drop for PostgresCdcConsumer {
         if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::CurrentThread {
             return;
         }
-        let url = self.url.clone();
-        let slot = self.slot_name.clone();
-        let tls = self.tls.clone();
-        let client = &mut self.client;
-        tokio::task::block_in_place(|| {
-            handle.block_on(async move {
-                // Stop the stream so the server releases the slot, then advance
-                // confirmed_flush_lsn to the last durably-acked LSN.
-                let _ = client.shutdown().await;
-                if let Err(e) =
-                    replication::advance_slot_when_inactive(&url, &slot, lsn, &tls).await
-                {
-                    warn!(error = %e, "postgres_cdc: durable slot advance on shutdown failed");
-                }
-            });
-        });
+        tokio::task::block_in_place(|| handle.block_on(self.teardown()));
     }
 }
 

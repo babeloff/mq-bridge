@@ -37,21 +37,10 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 use tracing::{info, trace, warn};
 
-/// Builds an `object_store` backend and its base prefix `Path` from a URL. Credentials and
-/// backend options (`AWS_ACCESS_KEY_ID`, `AWS_ENDPOINT`, `AWS_REGION`, `AWS_ALLOW_HTTP`,
-/// `GOOGLE_SERVICE_ACCOUNT`, ...) are read from the process environment.
-///
-/// The backend config-key parsers only accept the lowercase form (`aws_access_key_id`), so
-/// env-var names are lowercased before being folded into the builder — the same
-/// normalization `AmazonS3Builder::from_env` does. Unrecognized keys are ignored. Bare
-/// `parse_url` reads no env at all, which would fall through to the EC2/GCE metadata service.
-fn build_store(url: &str) -> anyhow::Result<(Box<dyn ObjectStore>, ObjPath)> {
-    let parsed =
-        url::Url::parse(url).with_context(|| format!("Invalid object_store url '{url}'"))?;
-    let env = std::env::vars().map(|(k, v)| (k.to_ascii_lowercase(), v));
-    object_store::parse_url_opts(&parsed, env)
-        .with_context(|| format!("Failed to build object store for '{url}'"))
-}
+/// Builds an `object_store` backend and its base prefix `Path` from a URL, reading
+/// credentials from the environment. Shared with the object-store checkpoint backend so
+/// both resolve creds identically — see [`checkpoint::object_store_backend::build_store`].
+use crate::checkpoint::object_store_backend::build_store;
 
 /// True if two object-store URLs share a scheme+host and one's path segments are a prefix
 /// of the other's — i.e. a recursive `list` of one would surface objects of the other.
@@ -385,19 +374,22 @@ impl ObjectStoreConsumer {
         ) {
             (Some(cid), Some(spec)) => match checkpoint::parse_checkpoint_store(spec)? {
                 CheckpointBackend::Source { .. } => {
-                    return Err(anyhow!(
+                    // Same misconfiguration class as the overlap check below: permanent.
+                    return Err(anyhow::Error::new(ConsumerError::Permanent(anyhow!(
                             "object_store source requires an external checkpoint_store (file://, s3://, postgres://, or mongodb://); a source-datastore checkpoint is not available."
-                        ));
+                        ))));
                 }
                 external => {
                     // Guard against the cursor object landing under the source prefix, where
                     // it would be listed and re-emitted as data.
                     if let CheckpointBackend::ObjectStore { url: ck_url } = &external {
                         if object_urls_overlap(&config.url, ck_url) {
-                            return Err(anyhow!(
+                            // Misconfiguration: rebuilding the consumer reads the same config,
+                            // so this must stop the route rather than reconnect forever.
+                            return Err(anyhow::Error::new(ConsumerError::Permanent(anyhow!(
                                 "object_store checkpoint_store '{ck_url}' overlaps the source prefix '{}'; the cursor object would be listed and re-read as data. Point checkpoint_store at a different bucket or prefix.",
                                 config.url
-                            ));
+                            ))));
                         }
                     }
                     Some(checkpoint::build_external_store(external, &config.url, cid).await?)
@@ -501,12 +493,13 @@ impl ObjectStoreConsumer {
                 continue;
             }
             // Refuse to materialize an over-large object; the listing already carries its size.
+            // The object will not shrink, so retrying re-lists it forever: fail permanently.
             if let Some(limit) = self.max_object_bytes {
                 if meta.size > limit {
-                    return Err(anyhow!(
-                        "object '{key}' is {} bytes, exceeding max_object_bytes ({limit}); refusing to buffer it whole",
+                    return Err(anyhow::Error::new(ConsumerError::Permanent(anyhow!(
+                        "object '{key}' is {} bytes, exceeding max_object_bytes ({limit}); refusing to buffer it whole. Raise max_object_bytes or remove the object.",
                         meta.size
-                    ));
+                    ))));
                 }
             }
             let data = self
@@ -577,10 +570,12 @@ impl MessageConsumer for ObjectStoreConsumer {
             let in_flight = self.progress.lock().await.is_some();
             if buffer_empty && !in_flight {
                 let last = self.last_key.lock().await.clone();
+                // `from` (not `Connection`) so a permanent listing failure — e.g. an object
+                // over `max_object_bytes` — is not retried as a transport blip.
                 match self
                     .next_object(last.as_deref())
                     .await
-                    .map_err(ConsumerError::Connection)?
+                    .map_err(ConsumerError::from)?
                 {
                     None => {
                         tokio::time::sleep(self.idle_delay).await;

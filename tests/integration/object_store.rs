@@ -163,3 +163,128 @@ async fn wait_for_batch(consumer: &mut ObjectStoreConsumer) -> mq_bridge::traits
         );
     }
 }
+
+/// An `s3://` `checkpoint_store` must resolve static credentials and a custom endpoint from
+/// the environment. Bare `object_store::parse_url` reads no env at all and falls through to
+/// the EC2 metadata service, which made cloud checkpoints unusable against LocalStack/R2.
+pub async fn test_object_store_checkpoint_round_trip() {
+    setup_logging();
+    run_test_with_docker(
+        "tests/integration/docker-compose/object_store.yml",
+        || async {
+            set_s3_env();
+            ensure_bucket().await;
+
+            let cursor_id = format!("cp-{}", fast_uuid_v7::gen_id());
+            let spec = format!("s3://{BUCKET}/cursors");
+            let backend = mq_bridge::checkpoint::parse_checkpoint_store(&spec)
+                .expect("parse s3 checkpoint_store");
+
+            let store =
+                mq_bridge::checkpoint::build_external_store(backend.clone(), "mysql", &cursor_id)
+                    .await
+                    .expect("build s3 checkpoint store (creds must come from env)");
+            assert_eq!(store.load().await.unwrap(), None, "fresh cursor is empty");
+            store.save("42").await.expect("save cursor");
+            assert_eq!(store.load().await.unwrap(), Some("42".to_string()));
+            store.save("99").await.expect("overwrite cursor");
+
+            // A freshly built store for the same cursor sees the persisted value.
+            let reopened =
+                mq_bridge::checkpoint::build_external_store(backend, "mysql", &cursor_id)
+                    .await
+                    .expect("rebuild s3 checkpoint store");
+            assert_eq!(reopened.load().await.unwrap(), Some("99".to_string()));
+        },
+    )
+    .await;
+}
+
+/// Both permanent object_store misconfigurations must terminate the route as `Failed`
+/// instead of spinning on the reconnect interval forever:
+///
+/// * an object larger than `max_object_bytes` — it will never shrink, so every retry
+///   re-lists it and emits the same warning (this is what made `--drain` hang at zero rows);
+/// * a `checkpoint_store` overlapping the source prefix — a config error, so rebuilding the
+///   consumer reproduces it exactly.
+pub async fn test_object_store_permanent_errors_fail_fast() {
+    use mq_bridge::models::{Endpoint, EndpointType};
+    use mq_bridge::Route;
+
+    setup_logging();
+    run_test_with_docker(
+        "tests/integration/docker-compose/object_store.yml",
+        || async {
+            set_s3_env();
+            ensure_bucket().await;
+
+            // Seed one object that is comfortably over the limit set below.
+            let prefix = format!("permanent/{}", fast_uuid_v7::gen_id_str());
+            let publisher = ObjectStorePublisher::new(&config(&prefix, None))
+                .await
+                .expect("create publisher");
+            publisher
+                .send_batch((1..=20).map(json_msg).collect::<Vec<_>>())
+                .await
+                .expect("seed objects");
+            drop(publisher);
+
+            let cases: Vec<(&str, ObjectStoreConfig)> = vec![
+                (
+                    "max_object_bytes",
+                    ObjectStoreConfig {
+                        max_object_bytes: Some(4),
+                        ..config(
+                            &prefix,
+                            Some("file:///tmp/mqb-permanent-cursor.json".into()),
+                        )
+                    },
+                ),
+                (
+                    "checkpoint overlaps source prefix",
+                    ObjectStoreConfig {
+                        cursor_id: Some("overlap-test".to_string()),
+                        checkpoint_store: Some(format!("s3://{BUCKET}/{prefix}/cursor")),
+                        ..config(&prefix, None)
+                    },
+                ),
+            ];
+
+            for (label, cfg) in cases {
+                let route_name = format!("permanent_{}", fast_uuid_v7::gen_id_str());
+                let input = Endpoint::new(EndpointType::ObjectStore(cfg));
+                let output = Endpoint::new_memory(&route_name, 1024);
+                let route = Route::new(input, output);
+                assert_permanent_consumer_error(route, &route_name, label).await;
+            }
+        },
+    )
+    .await;
+}
+
+/// Assert that running `route` once fails with a `ConsumerError::Permanent`.
+///
+/// This targets the classification itself, which is what decides the route's fate:
+/// `route.rs` breaks out of the reconnect loop only for `Permanent`, so anything else spins
+/// on the reconnect interval forever. `run_until_err` is used rather than `run` because a
+/// permanent failure *during startup* reaches the caller of `run` as the same generic
+/// "failed to start" error as a timeout — the very ambiguity that hid these diagnoses.
+async fn assert_permanent_consumer_error(route: mq_bridge::Route, route_name: &str, label: &str) {
+    use mq_bridge::traits::ConsumerError;
+
+    let err = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        route.run_until_err(route_name, None, None),
+    )
+    .await
+    .unwrap_or_else(|_| panic!("'{label}': route neither completed nor failed"))
+    .expect_err("must fail");
+
+    assert!(
+        matches!(
+            err.downcast_ref::<ConsumerError>(),
+            Some(ConsumerError::Permanent(_))
+        ),
+        "'{label}': must be a permanent error so the route stops; got: {err:#}"
+    );
+}

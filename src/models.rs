@@ -3206,7 +3206,7 @@ pub struct PostgresCdcConfig {
     /// Missing ones are added to an existing publication (never removed). Empty = `FOR ALL TABLES` (needs superuser).
     #[serde(default)]
     pub publication_tables: Vec<String>,
-    /// Use a temporary slot (dropped on disconnect). Not restart-safe; default is a permanent slot.
+    /// Ephemeral run: drop the slot when the route stops. Not restart-safe; a hard crash leaks it.
     #[serde(default)]
     pub temporary_slot: bool,
     /// Checkpoint key for persisting the confirmed LSN across restarts (optional; the slot is authoritative).

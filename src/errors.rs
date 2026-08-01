@@ -45,8 +45,13 @@ pub enum ConsumerError {
 
 impl From<anyhow::Error> for ConsumerError {
     fn from(err: anyhow::Error) -> Self {
-        // By default, we'll treat any generic error as a connection-level, retryable error.
-        ConsumerError::Connection(err)
+        // Preserve a classification the source already made — downgrading an existing
+        // `Permanent` to `Connection` would make the route retry something that cannot heal.
+        match err.downcast::<ConsumerError>() {
+            Ok(classified) => classified,
+            // Otherwise a generic error is connection-level, and therefore retryable.
+            Err(err) => ConsumerError::Connection(err),
+        }
     }
 }
 
