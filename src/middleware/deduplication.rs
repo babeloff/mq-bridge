@@ -3,9 +3,11 @@
 //  Licensed under MIT License, see License file for more details
 //  git clone https://github.com/marcomq/mq-bridge
 use crate::models::DeduplicationMiddleware;
+use crate::support::interpolation::CompiledTemplate;
 use crate::traits::{
     BoxFuture, ConsumerError, MessageConsumer, MessageDisposition, Received, ReceivedBatch,
 };
+use crate::CanonicalMessage;
 use anyhow::{anyhow, Context};
 use async_trait::async_trait;
 use sled::Db;
@@ -329,6 +331,30 @@ pub(crate) fn hex_key(key: &[u8]) -> String {
 pub struct DeduplicationConsumer {
     inner: Box<dyn MessageConsumer>,
     store: Arc<dyn DedupStore>,
+    /// Compiled `key` template. `None` keys on `message_id`, which most sources
+    /// regenerate per read — so a re-read of the same source dedupes nothing.
+    key_template: Option<CompiledTemplate>,
+}
+
+/// The dedup key for a message: the rendered `key` template, or the raw `message_id`.
+///
+/// An unresolved selector renders empty, and an empty key would be shared by every message
+/// missing that field — silently dropping all but the first. Such a message falls back to
+/// `message_id` instead, so it is passed through rather than swallowed.
+fn dedup_key(template: Option<&CompiledTemplate>, msg: &CanonicalMessage) -> Vec<u8> {
+    match template {
+        Some(t) => match t.render(Some(msg)) {
+            key if key.is_empty() => {
+                warn!(
+                    message_id = %msg.message_id,
+                    "Deduplication `key` template resolved to nothing; keying on message_id for this message"
+                );
+                msg.message_id.to_be_bytes().to_vec()
+            }
+            key => key,
+        },
+        None => msg.message_id.to_be_bytes().to_vec(),
+    }
 }
 
 impl DeduplicationConsumer {
@@ -352,7 +378,17 @@ impl DeduplicationConsumer {
             }
         };
         let store = build_store(backend, config.ttl_seconds, route_name).await?;
-        Ok(Self { inner, store })
+        let key_template = config
+            .key
+            .as_deref()
+            .map(|k| CompiledTemplate::compile(k, None))
+            .transpose()
+            .context("invalid deduplication `key` template")?;
+        Ok(Self {
+            inner,
+            store,
+            key_template,
+        })
     }
 }
 
@@ -402,7 +438,7 @@ impl MessageConsumer for DeduplicationConsumer {
 
             self.store.maybe_cleanup(now);
 
-            let key = received.message.message_id.to_be_bytes();
+            let key = dedup_key(self.key_template.as_ref(), &received.message);
             if self.store.reserve(&key, now).await? {
                 info!(message_id = %format!("{:032x}", received.message.message_id), "Duplicate message detected and skipped");
                 if let Err(e) = (received.commit)(MessageDisposition::Ack).await {
@@ -412,7 +448,6 @@ impl MessageConsumer for DeduplicationConsumer {
             }
 
             let store = self.store.clone();
-            let message_id = received.message.message_id;
             let original_commit = received.commit;
 
             // Wrap commit to promote the reservation to "processed" state.
@@ -428,7 +463,7 @@ impl MessageConsumer for DeduplicationConsumer {
                             .duration_since(UNIX_EPOCH)
                             .unwrap_or_default()
                             .as_secs();
-                        store.mark_processed(&message_id.to_be_bytes(), now).await;
+                        store.mark_processed(&key, now).await;
                     }
                     Ok(())
                 }) as crate::traits::BoxFuture<'static, anyhow::Result<()>>
@@ -455,19 +490,29 @@ impl MessageConsumer for DeduplicationConsumer {
 
             self.store.maybe_cleanup(now);
 
+            // An empty inner batch is how a drained source signals `exit_on_empty`
+            // (see `traits::drain_gated`). Looping on it here would spin forever on
+            // an already-drained source, so pass it through untouched.
+            if messages.is_empty() {
+                return Ok(ReceivedBatch {
+                    messages,
+                    commit: inner_commit,
+                });
+            }
+
             let mut filtered_messages = Vec::with_capacity(messages.len());
             let mut kept_indices = Vec::with_capacity(messages.len());
 
+            let mut kept_keys: Vec<Vec<u8>> = Vec::with_capacity(messages.len());
+
             for (idx, msg) in messages.iter().enumerate() {
-                if self
-                    .store
-                    .reserve(&msg.message_id.to_be_bytes(), now)
-                    .await?
-                {
+                let key = dedup_key(self.key_template.as_ref(), msg);
+                if self.store.reserve(&key, now).await? {
                     info!(message_id = %format!("{:032x}", msg.message_id), "Duplicate message detected and skipped");
                 } else {
                     filtered_messages.push(msg.clone());
                     kept_indices.push(idx);
+                    kept_keys.push(key);
                 }
             }
 
@@ -477,21 +522,20 @@ impl MessageConsumer for DeduplicationConsumer {
             }
 
             let store = self.store.clone();
-            let kept_ids: Vec<u128> = filtered_messages.iter().map(|m| m.message_id).collect();
             let total_len = messages.len();
 
             let commit: crate::traits::BatchCommitFunc = Box::new(move |dispositions| {
                 let store = store.clone();
                 let inner_commit = inner_commit;
                 let kept_indices = kept_indices;
-                let kept_ids = kept_ids;
+                let kept_keys = kept_keys;
 
                 Box::pin(async move {
                     let mut full_dispositions = vec![MessageDisposition::Ack; total_len];
                     let mut acks = Vec::new();
                     for (i, disp) in dispositions.into_iter().enumerate() {
                         if matches!(disp, MessageDisposition::Ack | MessageDisposition::Reply(_)) {
-                            acks.push(kept_ids[i]);
+                            acks.push(kept_keys[i].clone());
                         }
                         full_dispositions[kept_indices[i]] = disp;
                     }
@@ -502,8 +546,8 @@ impl MessageConsumer for DeduplicationConsumer {
                         .duration_since(UNIX_EPOCH)
                         .unwrap_or_default()
                         .as_secs();
-                    for id in acks {
-                        store.mark_processed(&id.to_be_bytes(), now).await;
+                    for key in acks {
+                        store.mark_processed(&key, now).await;
                     }
                     Ok(())
                 }) as crate::traits::BoxFuture<'static, anyhow::Result<()>>
@@ -527,6 +571,7 @@ mod tests {
     use crate::endpoints::memory::MemoryConsumer;
     use crate::models::DeduplicationMiddleware;
     use crate::CanonicalMessage;
+    use std::time::Duration;
     use tempfile::tempdir;
 
     #[tokio::test]
@@ -538,6 +583,7 @@ mod tests {
             store: None,
             sled_path: Some(db_path),
             ttl_seconds: 60,
+            key: None,
         };
 
         let mem_consumer = MemoryConsumer::new_local("dedup_topic", 10);
@@ -566,6 +612,133 @@ mod tests {
         let rec2 = dedup_consumer.receive().await.unwrap();
         assert_eq!(rec2.message.message_id, 101);
         let _ = (rec2.commit)(crate::traits::MessageDisposition::Ack).await;
+    }
+
+    /// Regression: an empty inner batch is how a drained source signals `exit_on_empty`.
+    /// The wrapper used to loop on it, so a route with `deduplication` on the input moved
+    /// everything and then hung `healthy: true` forever instead of completing.
+    #[tokio::test]
+    async fn empty_inner_batch_is_passed_through_for_drain() {
+        let dir = tempdir().unwrap();
+        let config = DeduplicationMiddleware {
+            store: None,
+            sled_path: Some(dir.path().join("dedup_drain").to_str().unwrap().to_string()),
+            ttl_seconds: 60,
+            key: None,
+        };
+
+        let mut mem_consumer = MemoryConsumer::new_local("dedup_drain_topic", 10);
+        mem_consumer.set_exit_on_empty(true);
+
+        let mut dedup_consumer =
+            DeduplicationConsumer::new(Box::new(mem_consumer), &config, "test_route")
+                .await
+                .unwrap();
+
+        let batch = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            dedup_consumer.receive_batch(16),
+        )
+        .await
+        .expect("receive_batch must return on a drained source, not loop forever")
+        .unwrap();
+
+        assert!(batch.messages.is_empty());
+    }
+
+    /// With a `key` template, dedup follows the payload, not `message_id` — which most
+    /// sources regenerate per read, so a re-read of the same data would dedupe nothing.
+    #[tokio::test]
+    async fn key_template_dedupes_on_payload_not_message_id() {
+        let dir = tempdir().unwrap();
+        let config = DeduplicationMiddleware {
+            store: None,
+            sled_path: Some(dir.path().join("dedup_key").to_str().unwrap().to_string()),
+            ttl_seconds: 60,
+            key: Some("${payload:order_id}".to_string()),
+        };
+
+        let mem_consumer = MemoryConsumer::new_local("dedup_key_topic", 10);
+        let channel = mem_consumer.channel();
+
+        // Same order_id, different message_ids: the second must be suppressed.
+        for id in [1u128, 2, 3] {
+            let body = if id == 3 {
+                br#"{"order_id":"B"}"#
+            } else {
+                br#"{"order_id":"A"}"#
+            };
+            channel
+                .send_message(CanonicalMessage::new(body.to_vec(), Some(id)))
+                .await
+                .unwrap();
+        }
+
+        let mut dedup_consumer =
+            DeduplicationConsumer::new(Box::new(mem_consumer), &config, "test_route")
+                .await
+                .unwrap();
+
+        // Timed out rather than awaited bare: a key that fails to resolve makes every
+        // message share one key, so the second `receive` would block forever.
+        macro_rules! recv {
+            () => {
+                tokio::time::timeout(Duration::from_secs(10), dedup_consumer.receive())
+                    .await
+                    .expect("receive timed out — the key template resolved to a constant")
+                    .unwrap()
+            };
+        }
+
+        let first = recv!();
+        assert_eq!(first.message.message_id, 1);
+        let _ = (first.commit)(crate::traits::MessageDisposition::Ack).await;
+
+        // message_id 2 carries order_id "A" again and is skipped internally.
+        let second = recv!();
+        assert_eq!(
+            second.message.message_id, 3,
+            "the second copy of order_id A must be suppressed by the key template"
+        );
+    }
+
+    /// A message missing the keyed field renders an empty key. Keying on that would make
+    /// every such message collide, so all but the first would vanish; they fall back to
+    /// `message_id` and are passed through instead.
+    #[tokio::test]
+    async fn messages_missing_the_keyed_field_are_not_collapsed() {
+        let dir = tempdir().unwrap();
+        let config = DeduplicationMiddleware {
+            store: None,
+            sled_path: Some(dir.path().join("dedup_miss").to_str().unwrap().to_string()),
+            ttl_seconds: 60,
+            key: Some("${payload:order_id}".to_string()),
+        };
+
+        let mem_consumer = MemoryConsumer::new_local("dedup_miss_topic", 10);
+        let channel = mem_consumer.channel();
+        for id in [1u128, 2, 3] {
+            channel
+                .send_message(CanonicalMessage::new(br#"{"other":1}"#.to_vec(), Some(id)))
+                .await
+                .unwrap();
+        }
+
+        let mut dedup_consumer =
+            DeduplicationConsumer::new(Box::new(mem_consumer), &config, "test_route")
+                .await
+                .unwrap();
+        dedup_consumer.set_exit_on_empty(true);
+
+        let batch = tokio::time::timeout(Duration::from_secs(10), dedup_consumer.receive_batch(16))
+            .await
+            .expect("receive_batch timed out")
+            .unwrap();
+        assert_eq!(
+            batch.messages.len(),
+            3,
+            "an unresolvable key must not collapse distinct messages into one"
+        );
     }
 
     #[test]

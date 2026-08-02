@@ -918,6 +918,9 @@ pub struct DeduplicationMiddleware {
     pub sled_path: Option<String>,
     /// Time-to-live for deduplication entries in seconds.
     pub ttl_seconds: u64,
+    /// Dedup key template, e.g. `${payload:order_id}`. Defaults to `message_id`.
+    #[serde(default)]
+    pub key: Option<String>,
 }
 
 /// Metrics middleware configuration.

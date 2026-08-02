@@ -1963,3 +1963,71 @@ mod at_rest_codec_mismatch {
         assert_eq!(batch.messages.len(), 2);
     }
 }
+
+/// A payload that is neither JSON nor UTF-8 — what the `compression` and `encryption`
+/// middlewares produce — must survive a `json`/`text` sink. It used to come back as the
+/// *textual* byte array `[40,181,47,…]`, so the reader's first byte was `[` (91).
+#[test]
+fn binary_payload_round_trips_through_json_and_text_formats() {
+    use crate::endpoints::file::{encode_record, parse_message};
+
+    let payload = vec![0x28u8, 0xb5, 0x2f, 0xfd, 0x00, 0xff, 0xfe];
+    let msg = crate::CanonicalMessage::new(payload.clone(), Some(7));
+
+    for format in [FileFormat::Json, FileFormat::Text] {
+        let line = encode_record(&msg, &format).unwrap();
+        let parsed = parse_message(&line, &format, &mut None).expect("record must parse");
+        assert_eq!(
+            parsed.payload.as_ref(),
+            payload.as_slice(),
+            "{format:?} must preserve a binary payload verbatim"
+        );
+        assert!(
+            !parsed.metadata.contains_key("mq_bridge.payload_bytes"),
+            "the byte marker is a storage detail and must not leak downstream"
+        );
+    }
+}
+
+/// The marker is honoured only at the value this crate writes, and only when the payload
+/// really is a byte array — a producer's own key of that name must not redirect decoding.
+#[test]
+fn byte_payload_marker_is_only_honoured_when_it_is_ours() {
+    use crate::endpoints::file::parse_message;
+
+    // A marked *string* payload is not ours: it stays the JSON text it was.
+    let line =
+        br#"{"message_id":"1","payload":"hello","metadata":{"mq_bridge.payload_bytes":"1"}}"#;
+    let parsed = parse_message(line, &FileFormat::Json, &mut None).unwrap();
+    assert_eq!(parsed.payload.as_ref(), br#""hello""#);
+
+    // A foreign value under the same key is the producer's data and survives untouched.
+    let line =
+        br#"{"message_id":"2","payload":[1,2,3],"metadata":{"mq_bridge.payload_bytes":"theirs"}}"#;
+    let parsed = parse_message(line, &FileFormat::Json, &mut None).unwrap();
+    assert_eq!(parsed.payload.as_ref(), b"[1,2,3]");
+    assert_eq!(
+        parsed
+            .metadata
+            .get("mq_bridge.payload_bytes")
+            .map(String::as_str),
+        Some("theirs")
+    );
+}
+
+/// A binary payload still round-trips when the message already carries the reserved key.
+/// `mq_bridge.*` is the crate's namespace — as with `mq_bridge.dlq.*` and
+/// `mq_bridge.retry.attempt`, a value a producer puts there is ours to overwrite.
+#[test]
+fn pre_existing_marker_does_not_break_a_binary_round_trip() {
+    use crate::endpoints::file::{encode_record, parse_message};
+
+    let payload = vec![0x28u8, 0xb5, 0x2f, 0xfd, 0x00];
+    let mut msg = crate::CanonicalMessage::new(payload.clone(), Some(9));
+    msg.metadata
+        .insert("mq_bridge.payload_bytes".to_string(), "theirs".to_string());
+
+    let line = encode_record(&msg, &FileFormat::Json).unwrap();
+    let parsed = parse_message(&line, &FileFormat::Json, &mut None).unwrap();
+    assert_eq!(parsed.payload.as_ref(), payload.as_slice());
+}

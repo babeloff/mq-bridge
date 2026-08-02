@@ -1909,6 +1909,7 @@ mod tests {
                 store: None,
                 sled_path: Some("".into()),
                 ttl_seconds: 10,
+                key: None,
             })
             .with_consumer_metrics();
 

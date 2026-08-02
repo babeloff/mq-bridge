@@ -12,9 +12,45 @@ use std::any::Any;
 use std::sync::Arc;
 use tracing::{debug, error, info};
 
+/// Metadata key holding why a message was dead-lettered.
+pub const DLQ_ERROR_KEY: &str = "mq_bridge.dlq.error";
+/// Metadata key holding the route that dead-lettered the message.
+pub const DLQ_ROUTE_KEY: &str = "mq_bridge.dlq.route";
+/// Metadata key holding when the message was dead-lettered, as Unix epoch milliseconds.
+pub const DLQ_TIMESTAMP_KEY: &str = "mq_bridge.dlq.timestamp_ms";
+
 pub struct DlqPublisher {
     inner: Box<dyn MessagePublisher>,
     dlq_publisher: Arc<dyn MessagePublisher>,
+    route_name: String,
+}
+
+/// Stamp the cause onto a message on its way to the DLQ. Without it a dead-lettered
+/// record is indistinguishable from a good one and carries no clue why it failed.
+fn tag_dlq_failure(message: &mut CanonicalMessage, error: &str, route_name: &str) {
+    tag_dlq_failure_at(message, error, route_name, &now_ms());
+}
+
+/// One batch is one dead-lettering event, so every message in it must carry the same
+/// timestamp — taking `now()` per message would spread them across the loop.
+fn tag_dlq_failure_at(message: &mut CanonicalMessage, error: &str, route_name: &str, now_ms: &str) {
+    message
+        .metadata
+        .insert(DLQ_ERROR_KEY.to_string(), error.to_string());
+    message
+        .metadata
+        .insert(DLQ_ROUTE_KEY.to_string(), route_name.to_string());
+    message
+        .metadata
+        .insert(DLQ_TIMESTAMP_KEY.to_string(), now_ms.to_string());
+}
+
+fn now_ms() -> String {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .to_string()
 }
 
 impl DlqPublisher {
@@ -31,6 +67,7 @@ impl DlqPublisher {
         Ok(Self {
             inner,
             dlq_publisher,
+            route_name: route_name.to_string(),
         })
     }
 }
@@ -104,6 +141,8 @@ impl MessagePublisher for DlqPublisher {
                     "Message send failed permanently, sending to DLQ: {}",
                     error_msg
                 );
+                let mut message = message;
+                tag_dlq_failure(&mut message, &error_msg, &self.route_name);
                 match self.dlq_publisher.send(message).await {
                     Ok(_) => Ok(Sent::Ack),
                     Err(dlq_error) => {
@@ -157,8 +196,16 @@ impl MessagePublisher for DlqPublisher {
                     non_retryable.len()
                 );
 
-                let messages_to_dlq: Vec<CanonicalMessage> =
-                    non_retryable.iter().map(|(msg, _)| msg.clone()).collect();
+                // Each message keeps its own failure, not a shared summary.
+                let now = now_ms();
+                let messages_to_dlq: Vec<CanonicalMessage> = non_retryable
+                    .iter()
+                    .map(|(msg, err)| {
+                        let mut msg = msg.clone();
+                        tag_dlq_failure_at(&mut msg, &err.to_string(), &self.route_name, &now);
+                        msg
+                    })
+                    .collect();
 
                 let final_failed = still_retryable;
 
@@ -221,6 +268,11 @@ impl MessagePublisher for DlqPublisher {
                 );
 
                 // We attempt to send the original batch to the DLQ.
+                let mut messages = messages;
+                let now = now_ms();
+                for msg in &mut messages {
+                    tag_dlq_failure_at(msg, &error_msg, &self.route_name, &now);
+                }
                 match self.dlq_publisher.send_batch(messages).await {
                     Ok(SentBatch::Ack) => {
                         debug!("Batch successfully sent to DLQ after complete primary failure.");
@@ -373,6 +425,7 @@ mod tests {
         let dlq_middleware = DlqPublisher {
             inner: Box::new(retry_publisher),
             dlq_publisher: Arc::new(dlq_target),
+            route_name: "test-route".to_string(),
         };
 
         let msg = CanonicalMessage::new(b"test".to_vec(), None);
@@ -418,6 +471,7 @@ mod tests {
         let dlq_middleware = DlqPublisher {
             inner: Box::new(retry_publisher),
             dlq_publisher: Arc::new(dlq_publisher),
+            route_name: "test-route".to_string(),
         };
 
         let msg_payload = b"failed_message";
@@ -434,6 +488,23 @@ mod tests {
         let dlq_msgs = dlq_channel.drain_messages();
         assert_eq!(dlq_msgs.len(), 1);
         assert_eq!(dlq_msgs[0].payload, msg_payload.as_slice());
+
+        // A dead-lettered record must say why it was dead-lettered.
+        let meta = &dlq_msgs[0].metadata;
+        assert!(
+            meta.get(DLQ_ERROR_KEY)
+                .is_some_and(|e| e.contains("Always fails")),
+            "DLQ record must carry the failure reason, got {meta:?}"
+        );
+        assert_eq!(
+            meta.get(DLQ_ROUTE_KEY).map(String::as_str),
+            Some("test-route")
+        );
+        assert!(
+            meta.get(DLQ_TIMESTAMP_KEY)
+                .is_some_and(|t| t.parse::<u64>().is_ok_and(|ms| ms > 0)),
+            "DLQ record must carry an epoch-ms timestamp, got {meta:?}"
+        );
     }
 
     #[derive(Clone)]
@@ -500,6 +571,7 @@ mod tests {
         let dlq_middleware = DlqPublisher {
             inner: Box::new(failing_target),
             dlq_publisher: Arc::new(dlq_target),
+            route_name: "test-route".to_string(),
         };
 
         let messages = vec![CanonicalMessage::from("1"), CanonicalMessage::from("2")];
@@ -522,6 +594,71 @@ mod tests {
         );
     }
 
+    /// One batch is one dead-lettering event: every message must carry the same
+    /// `timestamp_ms`, not one clock read per message.
+    #[tokio::test]
+    async fn batch_dlq_records_share_one_timestamp() {
+        struct CapturingPublisher {
+            seen: Arc<Mutex<Vec<CanonicalMessage>>>,
+        }
+
+        #[async_trait]
+        impl MessagePublisher for CapturingPublisher {
+            async fn send(&self, msg: CanonicalMessage) -> Result<Sent, PublisherError> {
+                self.seen.lock().unwrap().push(msg);
+                Ok(Sent::Ack)
+            }
+
+            async fn send_batch(
+                &self,
+                messages: Vec<CanonicalMessage>,
+            ) -> Result<SentBatch, PublisherError> {
+                self.seen.lock().unwrap().extend(messages);
+                Ok(SentBatch::Ack)
+            }
+
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let dlq_middleware = DlqPublisher {
+            inner: Box::new(MockFailingBatchPublisher {
+                calls: Arc::new(Mutex::new(0)),
+                fail_on_call: 1,
+                partial_fail: false,
+            }),
+            dlq_publisher: Arc::new(CapturingPublisher { seen: seen.clone() }),
+            route_name: "test-route".to_string(),
+        };
+
+        dlq_middleware
+            .send_batch(vec![
+                CanonicalMessage::from("1"),
+                CanonicalMessage::from("2"),
+                CanonicalMessage::from("3"),
+            ])
+            .await
+            .unwrap();
+
+        let stamps: Vec<Option<String>> = {
+            let seen = seen.lock().unwrap();
+            seen.iter()
+                .map(|m| m.metadata.get(DLQ_TIMESTAMP_KEY).cloned())
+                .collect()
+        };
+        assert_eq!(stamps.len(), 3, "every message must reach the DLQ");
+        assert!(
+            stamps.iter().all(Option::is_some),
+            "every DLQ record must be stamped, got {stamps:?}"
+        );
+        assert!(
+            stamps.iter().all(|s| *s == stamps[0]),
+            "one batch is one event, but got {stamps:?}"
+        );
+    }
+
     #[tokio::test]
     async fn test_dlq_send_batch_partial_failure() {
         let target_calls = Arc::new(Mutex::new(0));
@@ -539,6 +676,7 @@ mod tests {
         let dlq_middleware = DlqPublisher {
             inner: Box::new(failing_target),
             dlq_publisher: Arc::new(dlq_target),
+            route_name: "test-route".to_string(),
         };
 
         let messages = vec![CanonicalMessage::from("1"), CanonicalMessage::from("2")];
@@ -570,6 +708,7 @@ mod tests {
         let dlq_middleware = DlqPublisher {
             inner: Box::new(failing_target.clone()),
             dlq_publisher: Arc::new(failing_dlq),
+            route_name: "test-route".to_string(),
         };
         let result = dlq_middleware.send("test".into()).await;
         assert!(result.is_err());

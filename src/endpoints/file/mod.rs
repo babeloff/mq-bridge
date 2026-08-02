@@ -2346,7 +2346,7 @@ pub(crate) fn encode_record(
                     metadata: &msg.metadata,
                 })
             } else {
-                serde_json::to_vec(msg)
+                encode_byte_payload(msg)
             }
         }
         FileFormat::Text => {
@@ -2357,11 +2357,31 @@ pub(crate) fn encode_record(
                     metadata: &msg.metadata,
                 })
             } else {
-                serde_json::to_vec(msg)
+                encode_byte_payload(msg)
             }
         }
         FileFormat::Csv => unreachable!("CSV is encoded by the caller, not encode_record"),
     }
+}
+
+/// Marks a record whose payload is neither JSON nor UTF-8 and was therefore written as a
+/// byte array. Without it a `json` reader hands the next hop the *textual* array
+/// `[40,181,47,…]`, which breaks any binary payload (compression, encryption).
+pub(crate) const BYTE_PAYLOAD_KEY: &str = "mq_bridge.payload_bytes";
+/// The only value this crate writes for [`BYTE_PAYLOAD_KEY`]. A reader honours the marker
+/// only at this exact value, so an unrelated key of the same name cannot redirect decoding.
+const BYTE_PAYLOAD_MARK: &str = "1";
+
+/// Write a binary payload under a `json`/`text` sink as the byte-array wrapper, marked so
+/// the reader restores the bytes instead of the array's JSON text.
+fn encode_byte_payload(msg: &CanonicalMessage) -> Result<Vec<u8>, serde_json::Error> {
+    let mut metadata = msg.metadata.clone();
+    metadata.insert(BYTE_PAYLOAD_KEY.to_string(), BYTE_PAYLOAD_MARK.to_string());
+    serde_json::to_vec(&RecordWrapper {
+        message_id: msg.message_id,
+        payload: &msg.payload,
+        metadata: &metadata,
+    })
 }
 
 /// Parses one file line into a message. Returns `None` for CSV header lines,
@@ -2419,6 +2439,25 @@ pub(crate) fn parse_message(
             }
 
             let msg = match serde_json::from_slice::<AnyPayloadMessage>(buffer) {
+                // A marked record holds a byte array the sink could not represent as JSON;
+                // re-read it as bytes so a binary payload survives the round trip. The
+                // payload must really be an array — a marked string or object is not ours.
+                Ok(wrapper)
+                    if wrapper.metadata.get(BYTE_PAYLOAD_KEY).map(String::as_str)
+                        == Some(BYTE_PAYLOAD_MARK)
+                        && wrapper.payload.is_array() =>
+                {
+                    match decode_byte_payload_record(buffer) {
+                        Some(msg) => msg,
+                        None => CanonicalMessage {
+                            message_id: wrapper.message_id,
+                            payload: serde_json::to_vec(&wrapper.payload)
+                                .unwrap_or_default()
+                                .into(),
+                            metadata: wrapper.metadata,
+                        },
+                    }
+                }
                 Ok(wrapper) => CanonicalMessage {
                     message_id: wrapper.message_id,
                     payload: serde_json::to_vec(&wrapper.payload)
@@ -2433,25 +2472,48 @@ pub(crate) fn parse_message(
         // `normal` and `text` want the payload as bytes, so it is decoded in one
         // pass by [`RawPayload`] rather than through a `serde_json::Value`.
         FileFormat::Normal | FileFormat::Text => {
-            #[derive(serde::Deserialize)]
-            struct BytePayloadMessage {
-                #[serde(deserialize_with = "deserialize_u128")]
-                message_id: u128,
-                payload: RawPayload,
-                #[serde(default)]
-                metadata: HashMap<String, String>,
-            }
-
             let msg = match serde_json::from_slice::<BytePayloadMessage>(buffer) {
-                Ok(wrapper) => CanonicalMessage {
-                    message_id: wrapper.message_id,
-                    payload: wrapper.payload.into_bytes().into(),
-                    metadata: wrapper.metadata,
-                },
+                Ok(mut wrapper) => {
+                    strip_byte_marker(&mut wrapper.metadata);
+                    CanonicalMessage {
+                        message_id: wrapper.message_id,
+                        payload: wrapper.payload.into_bytes().into(),
+                        metadata: wrapper.metadata,
+                    }
+                }
                 Err(e) => raw_fallback_message(buffer, e),
             };
             Some(msg)
         }
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct BytePayloadMessage {
+    #[serde(deserialize_with = "deserialize_u128")]
+    message_id: u128,
+    payload: RawPayload,
+    #[serde(default)]
+    metadata: HashMap<String, String>,
+}
+
+/// Decode a record whose `payload` is wanted as bytes, in one pass via [`RawPayload`]
+/// rather than through a `serde_json::Value`. `None` if the line is not that envelope.
+fn decode_byte_payload_record(buffer: &[u8]) -> Option<CanonicalMessage> {
+    let mut wrapper = serde_json::from_slice::<BytePayloadMessage>(buffer).ok()?;
+    strip_byte_marker(&mut wrapper.metadata);
+    Some(CanonicalMessage {
+        message_id: wrapper.message_id,
+        payload: wrapper.payload.into_bytes().into(),
+        metadata: wrapper.metadata,
+    })
+}
+
+/// Drop the marker this crate wrote — it is a storage detail, not the message's own
+/// metadata. Any other value under that key belongs to the producer and is left alone.
+fn strip_byte_marker(metadata: &mut HashMap<String, String>) {
+    if metadata.get(BYTE_PAYLOAD_KEY).map(String::as_str) == Some(BYTE_PAYLOAD_MARK) {
+        metadata.remove(BYTE_PAYLOAD_KEY);
     }
 }
 

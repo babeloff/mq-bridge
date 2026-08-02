@@ -38,6 +38,11 @@ layer and sees the failures of the ones before it.** Put `dlq` last.
 **Input (consumer) middlewares are applied in reverse, so the *first* entry is outermost**
 and runs first on an incoming message.
 
+**Consequence: a route that reads back what another route wrote needs the *reversed* list.**
+Writing with `[compression, encryption]` produces `compress(encrypt(payload))`; a reader
+given that same list would try to decrypt first and fail. The reading route must say
+`[encryption, compression]`. The lists mirror — they are not copied.
+
 > This is asserted by `route::tests::test_dlq_and_retry_batch_integration`,
 > `middleware::transform::tests::test_rejected_message_reaches_the_dlq_through_the_config_wiring`,
 > and `reference_docs_test::publisher_middleware_wraps_last_entry_outermost`, and is
@@ -58,7 +63,7 @@ middlewares:
 | [`retry`](#retry) | – | ✅ | – | Exponential-backoff retry of failed sends |
 | [`dlq`](#dlq) | – | ✅ | – | Route permanently-failed messages to another endpoint |
 | [`transform`](#transform) | ✅ | ✅ | – | Declarative JSON mapping, coercion, validation |
-| [`deduplication`](#deduplication) | ✅ | – | `dedup` | Drop repeated message IDs within a TTL |
+| [`deduplication`](#deduplication) | ✅ | – | `dedup` | Drop repeated keys within a TTL |
 | [`weak_join`](#weak_join) | ✅ | – | – | Correlate and join related messages |
 | [`buffer`](#buffer) | ✅ | ✅ | – | Coalesce single sends into batches |
 | [`limiter`](#limiter) | ✅ | ✅ | – | Cap throughput to a message rate |
@@ -227,7 +232,7 @@ with neither stage configured leaves the payload untouched without parsing it.
 
 ### `deduplication`
 
-Drops messages whose ID was already seen within the TTL. Input only. Requires the `dedup`
+Drops messages whose key was already seen within the TTL. Input only. Requires the `dedup`
 feature (pulls `sled`).
 
 | Field | Type | Required |
@@ -235,6 +240,13 @@ feature (pulls `sled`).
 | `store` | string | one of `store`/`sled_path` |
 | `sled_path` | string | one of `store`/`sled_path` |
 | `ttl_seconds` | integer | yes |
+| `key` | string | no (defaults to `message_id`) |
+
+`key` is an interpolation template (see `${namespace:selector}`), typically
+`"${payload:order_id}"`. Without it the key is the `message_id`, which most sources
+regenerate on every read — so re-reading the same source deduplicates nothing and only
+in-flight redeliveries are suppressed. Set `key` to a business key whenever you need
+dedup to survive a re-read.
 
 `store` selects the backend by URL scheme:
 
@@ -262,6 +274,10 @@ feature (pulls `sled`).
 
 ```yaml middleware
 - deduplication: { store: "postgres://user:pass@localhost/etl", ttl_seconds: 3600 }
+```
+
+```yaml middleware
+- deduplication: { store: "sled:///var/lib/mq-bridge/dedup", ttl_seconds: 3600, key: "${payload:order_id}" }
 ```
 
 When MongoDB is your sink and messages carry a business key, prefer the sink's own unique
