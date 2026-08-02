@@ -2451,13 +2451,17 @@ pub(crate) fn parse_message(
                 {
                     match decode_byte_payload_record(buffer) {
                         Some(msg) => msg,
-                        None => CanonicalMessage {
-                            message_id: wrapper.message_id,
-                            payload: serde_json::to_vec(&wrapper.payload)
-                                .unwrap_or_default()
-                                .into(),
-                            metadata: wrapper.metadata,
-                        },
+                        None => {
+                            let mut metadata = wrapper.metadata;
+                            strip_byte_marker(&mut metadata);
+                            CanonicalMessage {
+                                message_id: wrapper.message_id,
+                                payload: serde_json::to_vec(&wrapper.payload)
+                                    .unwrap_or_default()
+                                    .into(),
+                                metadata,
+                            }
+                        }
                     }
                 }
                 Ok(wrapper) => CanonicalMessage {
