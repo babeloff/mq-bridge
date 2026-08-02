@@ -12,4 +12,5 @@ pub(crate) mod compression;
 pub mod connection_registry;
 #[cfg(feature = "encryption")]
 pub mod crypto;
+pub(crate) mod crypto_envelope;
 pub mod interpolation;

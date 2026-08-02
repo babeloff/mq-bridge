@@ -281,15 +281,27 @@ pub async fn test_redis_reclaims_backlog_with_drained_stream() {
                 .await
                 .unwrap();
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            let mut received = 0usize;
             while drained_ids.len() < N * (i + 1) / 2 && std::time::Instant::now() < deadline {
                 let batch =
                     tokio::time::timeout(std::time::Duration::from_secs(5), dead.receive_batch(16))
                         .await;
                 match batch {
-                    Ok(Ok(b)) => drained_ids.extend(b.messages.iter().map(|m| m.payload.clone())),
-                    _ => break,
+                    Ok(Ok(b)) => {
+                        received += b.messages.len();
+                        drained_ids.extend(b.messages.iter().map(|m| m.payload.clone()));
+                    }
+                    Ok(Err(e)) => {
+                        eprintln!("dead-{i}: receive_batch failed: {e:?}");
+                        break;
+                    }
+                    Err(e) => {
+                        eprintln!("dead-{i}: receive_batch timed out: {e}");
+                        break;
+                    }
                 }
             }
+            assert!(received > 0, "dead-{i} received no messages");
             drop(dead);
         }
         let drained = drained_ids.len();

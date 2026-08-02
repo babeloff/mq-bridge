@@ -1090,8 +1090,10 @@ fn compression_magic_name(head: &[u8]) -> Option<&'static str> {
 /// reading one with no `encryption` configured, which would otherwise emit
 /// ciphertext as messages under a clean success.
 fn looks_encrypted_at_rest(path: &str) -> bool {
+    use crate::support::crypto_envelope::{
+        CIPHER_AES_GCM, CIPHER_XCHACHA, ENVELOPE_VERSION, MIN_ENVELOPE_LEN,
+    };
     use std::io::Read;
-    const MIN_ENVELOPE: u64 = 3 + 1 + 12; // header + 1-byte key_id + shortest nonce
     let Ok(mut f) = std::fs::File::open(path) else {
         return false;
     };
@@ -1103,10 +1105,10 @@ fn looks_encrypted_at_rest(path: &str) -> bool {
         return false;
     }
     let frame_len = u64::from_be_bytes(head[..8].try_into().expect("8 bytes"));
-    frame_len >= MIN_ENVELOPE
+    frame_len >= MIN_ENVELOPE_LEN as u64
         && frame_len.saturating_add(8) <= file_len
-        && head[8] == 1
-        && head[9] <= 1
+        && head[8] == ENVELOPE_VERSION
+        && (head[9] == CIPHER_XCHACHA || head[9] == CIPHER_AES_GCM)
         && head[10] >= 1
 }
 

@@ -1927,7 +1927,11 @@ mod at_rest_codec_mismatch {
 
         let mut last = None;
         for _ in 0..20 {
-            match source.receive_batch(16).await {
+            let received =
+                tokio::time::timeout(std::time::Duration::from_secs(10), source.receive_batch(16))
+                    .await
+                    .expect("receive_batch timed out");
+            match received {
                 Err(crate::errors::ConsumerError::Permanent(e)) => {
                     last = Some(e.to_string());
                     break;
@@ -1959,7 +1963,11 @@ mod at_rest_codec_mismatch {
         .await
         .unwrap();
         source.set_exit_on_empty(true);
-        let batch = source.receive_batch(16).await.unwrap();
+        let batch =
+            tokio::time::timeout(std::time::Duration::from_secs(10), source.receive_batch(16))
+                .await
+                .expect("receive_batch timed out")
+                .unwrap();
         assert_eq!(batch.messages.len(), 2);
     }
 }

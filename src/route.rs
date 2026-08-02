@@ -863,9 +863,11 @@ impl Route {
                 handle.abort();
                 // The startup failure itself stays inside the reconnect loop, so
                 // surface the cause it recorded rather than a bare timeout.
+                // "connecting" is the initial marker, not a recorded failure.
                 let cause = recover_read_lock(&status, "route_handle_status")
                     .error
                     .clone()
+                    .filter(|e| e != "connecting")
                     .map(|e| format!(": {e}"))
                     .unwrap_or_default();
                 Err(anyhow::anyhow!(
