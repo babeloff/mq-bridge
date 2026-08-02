@@ -24,7 +24,7 @@
 //! `/async-db` then returns an empty result so the cleartext profiles still run.
 //!
 //! `json-comp` is handled by mq-bridge's response compression
-//! (`compression: gzip`): bodies above the threshold are gzip-encoded when the
+//! (`compression_enabled: true`): bodies above the threshold are gzip-encoded when the
 //! client advertises `Accept-Encoding: gzip`, and sent identity otherwise — so
 //! the same `/json` handler serves both the `json` and `json-comp` profiles.
 //!

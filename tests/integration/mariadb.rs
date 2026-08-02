@@ -91,6 +91,22 @@ where
     .await;
 }
 
+pub async fn test_mariadb_cursor_unmappable_types() {
+    setup_logging();
+    run_test_with_docker(DOCKER_COMPOSE_FILE, || async {
+        super::mysql::assert_cursor_reads_unmappable_types(DATABASE_URL, "mariadb-types").await;
+    })
+    .await;
+}
+
+pub async fn test_mariadb_checkpoint_table() {
+    setup_logging();
+    run_test_with_docker(DOCKER_COMPOSE_FILE, || async {
+        super::mysql::assert_sql_checkpoint_round_trip(DATABASE_URL, "mariadb").await;
+    })
+    .await;
+}
+
 pub async fn test_mariadb_chaos() {
     setup_logging();
     run_test_with_docker_controller(DOCKER_COMPOSE_FILE, |controller| async move {

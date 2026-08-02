@@ -11,6 +11,28 @@ type HttpClient = hyper_util::client::legacy::Client<
     http_body_util::Full<Bytes>,
 >;
 
+/// Cap on how much of a failed response body is quoted in the error. Bodies may be up to
+/// [`MAX_HTTP_BODY_BYTES`]; an error string carried through retries and logs must not be.
+const MAX_ERROR_BODY_EXCERPT_BYTES: usize = 2048;
+
+/// Renders the leading bytes of a response body for an error message, truncating on a UTF-8
+/// character boundary so a multi-byte character is never split.
+fn error_body_excerpt(body: &[u8]) -> String {
+    if body.len() <= MAX_ERROR_BODY_EXCERPT_BYTES {
+        return String::from_utf8_lossy(body).into_owned();
+    }
+    // Back off any UTF-8 continuation bytes (0b10xxxxxx) so the cut lands between characters.
+    let mut end = MAX_ERROR_BODY_EXCERPT_BYTES;
+    while end > 0 && body[end] & 0b1100_0000 == 0b1000_0000 {
+        end -= 1;
+    }
+    format!(
+        "{}... ({} bytes truncated)",
+        String::from_utf8_lossy(&body[..end]),
+        body.len() - end
+    )
+}
+
 /// Builds a connection-pooling hyper client for the given TLS/connector settings.
 fn build_http_client(config: &HttpConfig) -> anyhow::Result<HttpClient> {
     let tls_client_config = create_rustls_client_config(&config.tls)
@@ -406,7 +428,7 @@ impl HttpPublisher {
             let error = anyhow::anyhow!(
                 "HTTP send request failed with status {}: {:?}",
                 response_status,
-                String::from_utf8_lossy(&response_bytes)
+                error_body_excerpt(&response_bytes)
             );
 
             if response_status.is_client_error() {

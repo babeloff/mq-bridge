@@ -728,7 +728,7 @@ impl MessagePublisher for FilePublisher {
                         csv_header_guard.as_mut(),
                     )
                     .await;
-                    return Err(PublisherError::NonRetryable(anyhow::anyhow!(e)));
+                    return Err(PublisherError::Retryable(anyhow::anyhow!(e)));
                 }
             }
             let serialized_msg = match serialized_msg {
@@ -1068,7 +1068,11 @@ fn sniff_compression_magic(path: &str) -> Option<&'static str> {
     let mut head = [0u8; 4];
     let mut f = std::fs::File::open(path).ok()?;
     let n = f.read(&mut head).ok()?;
-    let head = &head[..n];
+    compression_magic_name(&head[..n])
+}
+
+/// The `compression` codec name whose magic bytes `head` begins with, if any.
+fn compression_magic_name(head: &[u8]) -> Option<&'static str> {
     if head.starts_with(&[0x1f, 0x8b]) {
         Some("gzip")
     } else if head.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]) {
@@ -1078,6 +1082,34 @@ fn sniff_compression_magic(path: &str) -> Option<&'static str> {
     } else {
         None
     }
+}
+
+/// Whether the file at `path` looks like an at-rest encrypted file: an 8-byte
+/// big-endian frame length that fits the file, followed by a well-formed crypto
+/// envelope header (`[version=1][cipher 0|1][key_id_len>=1]`). Used to reject
+/// reading one with no `encryption` configured, which would otherwise emit
+/// ciphertext as messages under a clean success.
+fn looks_encrypted_at_rest(path: &str) -> bool {
+    use crate::support::crypto_envelope::{
+        CIPHER_AES_GCM, CIPHER_XCHACHA, ENVELOPE_VERSION, MIN_ENVELOPE_LEN,
+    };
+    use std::io::Read;
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return false;
+    };
+    let Ok(file_len) = f.metadata().map(|m| m.len()) else {
+        return false;
+    };
+    let mut head = [0u8; 11];
+    if f.read_exact(&mut head).is_err() {
+        return false;
+    }
+    let frame_len = u64::from_be_bytes(head[..8].try_into().expect("8 bytes"));
+    frame_len >= MIN_ENVELOPE_LEN as u64
+        && frame_len.saturating_add(8) <= file_len
+        && head[8] == ENVELOPE_VERSION
+        && (head[9] == CIPHER_XCHACHA || head[9] == CIPHER_AES_GCM)
+        && head[10] >= 1
 }
 
 fn read_until_bytes_sync<R: std::io::BufRead>(
@@ -1665,6 +1697,19 @@ impl<R: std::io::Read> EncryptedFramesReader<R> {
         } else {
             member
         };
+        // Decryption succeeds regardless of the inner codec, so an unconfigured
+        // compression would otherwise be emitted as one binary "message".
+        if self.compression == Compression::None {
+            if let Some(codec) = compression_magic_name(&member) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "decrypted data begins with a {codec} magic header but no `compression` \
+                         is configured; set `compression: {codec}`"
+                    ),
+                ));
+            }
+        }
         self.current = std::io::Cursor::new(member);
         Ok(true)
     }
@@ -1691,13 +1736,52 @@ enum ConsumerBackend {
     Queue(FileQueueConsumer),
 }
 
+/// Probes a file source path. `Err` for a path that can never yield data;
+/// `Ok(Some(reason))` for one that is unopenable now but could still appear
+/// (missing file, missing parent directory, not yet readable).
+fn probe_source_path(path: &str) -> anyhow::Result<Option<String>> {
+    // Checked before opening: Windows refuses to open a directory at all, while
+    // on Unix the open succeeds and only the read fails, which the reader threads
+    // report as an ordinary end-of-file.
+    if std::fs::metadata(path).map(|m| m.is_dir()).unwrap_or(false) {
+        anyhow::bail!("file source '{path}' is a directory, not a file");
+    }
+    match std::fs::File::open(path) {
+        Ok(_) => Ok(None),
+        Err(e) => Ok(Some(format!("cannot open file source '{path}': {e}"))),
+    }
+}
+
 /// A consumer that reads messages from a file and removes them upon commit.
 pub struct FileConsumer {
     backend: ConsumerBackend,
+    path: String,
+    /// Why the source path could not be opened at construction, if it could not.
+    /// A live tail keeps waiting for the file to appear; a drain (`exit_on_empty`)
+    /// cannot, so it fails with this instead of blocking forever.
+    startup_open_error: Option<String>,
+    exit_on_empty: bool,
 }
 
 impl FileConsumer {
+    fn wrap(backend: ConsumerBackend) -> Self {
+        Self {
+            backend,
+            path: String::new(),
+            startup_open_error: None,
+            exit_on_empty: false,
+        }
+    }
+
     pub async fn new(config: &FileConfig) -> anyhow::Result<Self> {
+        let startup_open_error = probe_source_path(&config.path)?;
+        let mut consumer = Self::new_backend(config).await?;
+        consumer.path = config.path.clone();
+        consumer.startup_open_error = startup_open_error;
+        Ok(consumer)
+    }
+
+    async fn new_backend(config: &FileConfig) -> anyhow::Result<Self> {
         let delimiter = parse_delimiter(config.delimiter.as_deref())?;
         let format = config.format.clone();
         if matches!(format, FileFormat::Csv)
@@ -1734,6 +1818,15 @@ impl FileConsumer {
             return Err(anyhow::anyhow!(
                 "file '{}' begins with a {codec} magic header but no `compression` is configured; \
                  set `compression: {codec}` (and any `encryption`) to match how it was written",
+                config.path
+            ));
+        }
+        // Same guard for encryption: the envelope is behind an 8-byte frame prefix,
+        // so a compressor magic never shows up at offset 0 for an encrypted file.
+        if looks_encrypted_at_rest(&config.path) {
+            return Err(anyhow::anyhow!(
+                "file '{}' looks encrypted but no `encryption` is configured; \
+                 set `encryption` (and any `compression`) to match how it was written",
                 config.path
             ));
         }
@@ -1785,18 +1878,16 @@ impl FileConsumer {
                 });
 
                 info!(path = %config.path, mode = "queue (delete, optimized)", "File consumer connected");
-                Ok(Self {
-                    backend: ConsumerBackend::Queue(FileQueueConsumer {
-                        msg_rx,
-                        lines_in_memory,
-                        path: config.path.clone(),
-                        file_lock,
-                        buffer: Arc::new(Mutex::new(Vec::new())),
-                        delimiter,
-                        ready,
-                        pending_eof: false,
-                    }),
-                })
+                Ok(Self::wrap(ConsumerBackend::Queue(FileQueueConsumer {
+                    msg_rx,
+                    lines_in_memory,
+                    path: config.path.clone(),
+                    file_lock,
+                    buffer: Arc::new(Mutex::new(Vec::new())),
+                    delimiter,
+                    ready,
+                    pending_eof: false,
+                })))
             }
             Some(FileConsumerMode::Subscribe { delete: true }) => {
                 let key = format!(
@@ -1827,9 +1918,9 @@ impl FileConsumer {
                 let subscriber_id = format!("file-sub-{}", fast_uuid_v7::gen_id_str());
                 info!(path = %config.path, mode = "subscribe (delete)", subscriber_id = %subscriber_id, "File consumer connected");
 
-                Ok(Self {
-                    backend: ConsumerBackend::EventStore(store.consumer(subscriber_id)),
-                })
+                Ok(Self::wrap(ConsumerBackend::EventStore(
+                    store.consumer(subscriber_id),
+                )))
             }
         }
     }
@@ -1889,19 +1980,17 @@ impl FileConsumer {
             );
         });
         info!(path = %config.path, mode = "member consume (compressed/encrypted)", "File consumer connected");
-        Ok(Self {
-            backend: ConsumerBackend::Tail(FileTailConsumer {
-                msg_rx,
-                buffer: Vec::new(),
-                offset_file: None,
-                ready,
-                pending_eof: false,
-                decode_error: Some(decode_error),
-                // Member (compressed/encrypted) readers decode framed members, not
-                // delimiter-split lines, so the trailing-partial-line rule doesn't apply.
-                drain_on_empty: Arc::new(AtomicBool::new(false)),
-            }),
-        })
+        Ok(Self::wrap(ConsumerBackend::Tail(FileTailConsumer {
+            msg_rx,
+            buffer: Vec::new(),
+            offset_file: None,
+            ready,
+            pending_eof: false,
+            decode_error: Some(decode_error),
+            // Member (compressed/encrypted) readers decode framed members, not
+            // delimiter-split lines, so the trailing-partial-line rule doesn't apply.
+            drain_on_empty: Arc::new(AtomicBool::new(false)),
+        })))
     }
 
     async fn new_tail(
@@ -1962,17 +2051,15 @@ impl FileConsumer {
 
         info!(path = %path, mode = "tail (no-delete, optimized)", "File consumer connected");
 
-        Ok(Self {
-            backend: ConsumerBackend::Tail(FileTailConsumer {
-                msg_rx,
-                buffer: Vec::new(),
-                offset_file,
-                ready,
-                pending_eof: false,
-                decode_error: None,
-                drain_on_empty,
-            }),
-        })
+        Ok(Self::wrap(ConsumerBackend::Tail(FileTailConsumer {
+            msg_rx,
+            buffer: Vec::new(),
+            offset_file,
+            ready,
+            pending_eof: false,
+            decode_error: None,
+            drain_on_empty,
+        })))
     }
 
     /// Returns true if the consumer is ready to receive messages.
@@ -1988,6 +2075,7 @@ impl FileConsumer {
 #[async_trait]
 impl MessageConsumer for FileConsumer {
     fn set_exit_on_empty(&mut self, exit_on_empty: bool) {
+        self.exit_on_empty = exit_on_empty;
         match &mut self.backend {
             // Only the delimiter-splitting tail reader distinguishes a complete final
             // record from a torn mid-write; propagate the drain intent to its thread.
@@ -2002,6 +2090,17 @@ impl MessageConsumer for FileConsumer {
     // a cumulative byte offset (the max acked `file_offset`), so out-of-order
     // commits could advance the offset past un-acked messages and lose them.
     async fn receive_batch(&mut self, max_messages: usize) -> Result<ReceivedBatch, ConsumerError> {
+        // The path was unopenable at startup. A live tail waits for it (rotation,
+        // a writer that hasn't created it yet), but a drain has nothing to wait
+        // for, so re-probe and fail rather than block forever on a typo'd path.
+        if self.exit_on_empty && self.startup_open_error.is_some() {
+            match probe_source_path(&self.path) {
+                Ok(None) => self.startup_open_error = None,
+                Ok(Some(reason)) => return Err(ConsumerError::Permanent(anyhow::anyhow!(reason))),
+                Err(e) => return Err(ConsumerError::Permanent(e)),
+            }
+        }
+
         match &mut self.backend {
             ConsumerBackend::EventStore(c) => c.receive_batch(max_messages).await,
             ConsumerBackend::Tail(c) => {
@@ -2249,7 +2348,7 @@ pub(crate) fn encode_record(
                     metadata: &msg.metadata,
                 })
             } else {
-                serde_json::to_vec(msg)
+                encode_byte_payload(msg)
             }
         }
         FileFormat::Text => {
@@ -2260,11 +2359,31 @@ pub(crate) fn encode_record(
                     metadata: &msg.metadata,
                 })
             } else {
-                serde_json::to_vec(msg)
+                encode_byte_payload(msg)
             }
         }
         FileFormat::Csv => unreachable!("CSV is encoded by the caller, not encode_record"),
     }
+}
+
+/// Marks a record whose payload is neither JSON nor UTF-8 and was therefore written as a
+/// byte array. Without it a `json` reader hands the next hop the *textual* array
+/// `[40,181,47,…]`, which breaks any binary payload (compression, encryption).
+pub(crate) const BYTE_PAYLOAD_KEY: &str = "mq_bridge.payload_bytes";
+/// The only value this crate writes for [`BYTE_PAYLOAD_KEY`]. A reader honours the marker
+/// only at this exact value, so an unrelated key of the same name cannot redirect decoding.
+const BYTE_PAYLOAD_MARK: &str = "1";
+
+/// Write a binary payload under a `json`/`text` sink as the byte-array wrapper, marked so
+/// the reader restores the bytes instead of the array's JSON text.
+fn encode_byte_payload(msg: &CanonicalMessage) -> Result<Vec<u8>, serde_json::Error> {
+    let mut metadata = msg.metadata.clone();
+    metadata.insert(BYTE_PAYLOAD_KEY.to_string(), BYTE_PAYLOAD_MARK.to_string());
+    serde_json::to_vec(&RecordWrapper {
+        message_id: msg.message_id,
+        payload: &msg.payload,
+        metadata: &metadata,
+    })
 }
 
 /// Parses one file line into a message. Returns `None` for CSV header lines,
@@ -2322,6 +2441,29 @@ pub(crate) fn parse_message(
             }
 
             let msg = match serde_json::from_slice::<AnyPayloadMessage>(buffer) {
+                // A marked record holds a byte array the sink could not represent as JSON;
+                // re-read it as bytes so a binary payload survives the round trip. The
+                // payload must really be an array — a marked string or object is not ours.
+                Ok(wrapper)
+                    if wrapper.metadata.get(BYTE_PAYLOAD_KEY).map(String::as_str)
+                        == Some(BYTE_PAYLOAD_MARK)
+                        && wrapper.payload.is_array() =>
+                {
+                    match decode_byte_payload_record(buffer) {
+                        Some(msg) => msg,
+                        None => {
+                            let mut metadata = wrapper.metadata;
+                            strip_byte_marker(&mut metadata);
+                            CanonicalMessage {
+                                message_id: wrapper.message_id,
+                                payload: serde_json::to_vec(&wrapper.payload)
+                                    .unwrap_or_default()
+                                    .into(),
+                                metadata,
+                            }
+                        }
+                    }
+                }
                 Ok(wrapper) => CanonicalMessage {
                     message_id: wrapper.message_id,
                     payload: serde_json::to_vec(&wrapper.payload)
@@ -2336,25 +2478,48 @@ pub(crate) fn parse_message(
         // `normal` and `text` want the payload as bytes, so it is decoded in one
         // pass by [`RawPayload`] rather than through a `serde_json::Value`.
         FileFormat::Normal | FileFormat::Text => {
-            #[derive(serde::Deserialize)]
-            struct BytePayloadMessage {
-                #[serde(deserialize_with = "deserialize_u128")]
-                message_id: u128,
-                payload: RawPayload,
-                #[serde(default)]
-                metadata: HashMap<String, String>,
-            }
-
             let msg = match serde_json::from_slice::<BytePayloadMessage>(buffer) {
-                Ok(wrapper) => CanonicalMessage {
-                    message_id: wrapper.message_id,
-                    payload: wrapper.payload.into_bytes().into(),
-                    metadata: wrapper.metadata,
-                },
+                Ok(mut wrapper) => {
+                    strip_byte_marker(&mut wrapper.metadata);
+                    CanonicalMessage {
+                        message_id: wrapper.message_id,
+                        payload: wrapper.payload.into_bytes().into(),
+                        metadata: wrapper.metadata,
+                    }
+                }
                 Err(e) => raw_fallback_message(buffer, e),
             };
             Some(msg)
         }
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct BytePayloadMessage {
+    #[serde(deserialize_with = "deserialize_u128")]
+    message_id: u128,
+    payload: RawPayload,
+    #[serde(default)]
+    metadata: HashMap<String, String>,
+}
+
+/// Decode a record whose `payload` is wanted as bytes, in one pass via [`RawPayload`]
+/// rather than through a `serde_json::Value`. `None` if the line is not that envelope.
+fn decode_byte_payload_record(buffer: &[u8]) -> Option<CanonicalMessage> {
+    let mut wrapper = serde_json::from_slice::<BytePayloadMessage>(buffer).ok()?;
+    strip_byte_marker(&mut wrapper.metadata);
+    Some(CanonicalMessage {
+        message_id: wrapper.message_id,
+        payload: wrapper.payload.into_bytes().into(),
+        metadata: wrapper.metadata,
+    })
+}
+
+/// Drop the marker this crate wrote — it is a storage detail, not the message's own
+/// metadata. Any other value under that key belongs to the producer and is left alone.
+fn strip_byte_marker(metadata: &mut HashMap<String, String>) {
+    if metadata.get(BYTE_PAYLOAD_KEY).map(String::as_str) == Some(BYTE_PAYLOAD_MARK) {
+        metadata.remove(BYTE_PAYLOAD_KEY);
     }
 }
 

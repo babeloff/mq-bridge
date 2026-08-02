@@ -50,7 +50,7 @@ profiles still run.
   reads its cert/key from `/certs/server.crt` + `/certs/server.key` (overridable
   via `TLS_CERT` / `TLS_KEY`) and is skipped when the certs are absent, so a local
   plaintext-only run still works. Uses the `ring` crypto provider.
-- **json-comp via response compression.** Setting `compression: gzip` (with a
+- **json-comp via response compression.** Setting `compression_enabled: true` (with a
   256-byte threshold) makes the server gzip bodies when the client advertises
   `Accept-Encoding: gzip`, identity otherwise — so the one `/json` handler serves
   both `json` and `json-comp`.

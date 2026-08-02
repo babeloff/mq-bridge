@@ -16,7 +16,7 @@ members = ["bindings-common", "python/mq-bridge-py", "node/mq-bridge-node"]
 resolver = "2"
 
 [workspace.package]
-version = "0.3.8"
+version = "0.3.9"
 
 [workspace.dependencies]
 anyhow = "1.0"
@@ -210,7 +210,7 @@ float-roundtrip = ["serde_json/float_roundtrip"]
 # runtime the client is loaded lazily only when an ibm-mq endpoint is opened
 # (clear error if the client isn't installed). Use `ibm-mq-static` instead for
 # static linking.
-full = ["middleware", "mongodb", "kafka", "amqp", "nats", "mqtt", "http", "aws", "zeromq", "redis-streams", "sled", "grpc", "sqlx", "clickhouse", "websocket", "postgres-cdc", "object-store", "rustls-aws-lc", "ibm-mq"]
+full = ["middleware", "mongodb", "kafka", "amqp", "nats", "mqtt", "http", "aws", "zeromq", "zeromq-omq", "redis-streams", "sled", "grpc", "sqlx", "clickhouse", "websocket", "postgres-cdc", "object-store", "rustls-aws-lc", "ibm-mq"]
 
 # Endpoints that build across most OS targets (glibc/musl/Alpine, macOS,
 # Windows, aarch64/armv7) without a special toolchain — no librdkafka, protoc,

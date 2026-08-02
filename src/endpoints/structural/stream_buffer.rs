@@ -57,7 +57,7 @@
 //!
 //! // Send the request with an explicit correlation id. If you omit this
 //! // metadata, the HTTP publisher uses format!("{:032x}", message.message_id).
-//! let mut request = CanonicalMessage::new(Payload::Text("hello".into()));
+//! let mut request = CanonicalMessage::new(Payload::Text("hello".into()), None);
 //! request.metadata.insert("correlation_id".into(), correlation_id.into());
 //! // create_publisher(&http).await?.send(request).await?;
 //!
@@ -130,6 +130,12 @@ use std::sync::{Arc, Mutex};
 use tracing::{trace, warn};
 
 const DEFAULT_CAPACITY: usize = 100;
+
+/// How long a publish waits on a full partition before giving up.
+///
+/// A partition whose reader never arrives (or went away without closing the channel) stays
+/// full forever, and an unbounded send would pin the publishing route on it.
+const SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 #[derive(Clone)]
 struct StreamPartition {
@@ -235,10 +241,17 @@ impl MessagePublisher for StreamBufferPublisher {
                 "stream_buffer partition is closed"
             )));
         }
-        partition.sender.send(vec![message]).await.map_err(|e| {
-            PublisherError::Retryable(anyhow!("Failed to send to stream_buffer: {}", e))
-        })?;
-        Ok(Sent::Ack)
+        match tokio::time::timeout(SEND_TIMEOUT, partition.sender.send(vec![message])).await {
+            Ok(Ok(())) => Ok(Sent::Ack),
+            Ok(Err(e)) => Err(PublisherError::Retryable(anyhow!(
+                "Failed to send to stream_buffer: {}",
+                e
+            ))),
+            Err(_) => Err(PublisherError::Retryable(anyhow!(
+                "stream_buffer partition '{}' is full and not being read",
+                correlation_id
+            ))),
+        }
     }
 
     async fn send_batch(
@@ -272,14 +285,22 @@ impl MessagePublisher for StreamBufferPublisher {
                 "stream_buffer partition is closed"
             )));
         }
-        partition
-            .sender
-            .send(std::mem::take(&mut messages))
-            .await
-            .map_err(|e| {
-                PublisherError::Retryable(anyhow!("Failed to send to stream_buffer: {}", e))
-            })?;
-        Ok(SentBatch::Ack)
+        match tokio::time::timeout(
+            SEND_TIMEOUT,
+            partition.sender.send(std::mem::take(&mut messages)),
+        )
+        .await
+        {
+            Ok(Ok(())) => Ok(SentBatch::Ack),
+            Ok(Err(e)) => Err(PublisherError::Retryable(anyhow!(
+                "Failed to send to stream_buffer: {}",
+                e
+            ))),
+            Err(_) => Err(PublisherError::Retryable(anyhow!(
+                "stream_buffer partition '{}' is full and not being read",
+                correlation_id
+            ))),
+        }
     }
 
     async fn status(&self) -> EndpointStatus {

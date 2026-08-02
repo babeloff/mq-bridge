@@ -225,3 +225,210 @@ pub async fn test_redis_drain_exits_on_empty() {
     })
     .await;
 }
+
+/// A replacement consumer must reclaim a backlog left by dead consumers even when the
+/// `>` side of the stream is already fully delivered (`lag: 0`).
+///
+/// Regression for a permanent wedge: the reclaiming reader issued `XAUTOCLAIM` on the same
+/// multiplexed connection it then parked in `XREAD BLOCK`. With nothing new arriving the
+/// read really blocks, so the claim reply could time out client-side *after* the server had
+/// applied it — the entries moved into the new consumer's own PEL and were never delivered,
+/// and every retry re-claimed them and reset their idle time. The route stayed `healthy`.
+///
+/// The shape matters: two dead consumers holding the backlog, a drained `>` side, several
+/// reader connections, `batch_size` larger than the backlog, and `block_ms` equal to
+/// `redelivery_timeout_ms` so the reclaim fires on every blocked read.
+pub async fn test_redis_reclaims_backlog_with_drained_stream() {
+    use mq_bridge::models::{Endpoint, EndpointType, RedisStreamsConfig};
+    use mq_bridge::traits::{MessageConsumer, MessagePublisher};
+    use mq_bridge::{CanonicalMessage, Route};
+
+    setup_logging();
+    run_test_with_docker(COMPOSE, || async {
+        const N: usize = 200;
+        let stream = format!("reclaim_redis_{}", fast_uuid_v7::gen_id());
+        let group = format!("g_reclaim_{}", fast_uuid_v7::gen_id());
+
+        let base = |consumer_name: Option<String>| RedisStreamsConfig {
+            url: URL.to_string(),
+            stream: Some(stream.clone()),
+            group: Some(group.clone()),
+            read_from_start: true,
+            consumer_name,
+            redelivery_timeout_ms: Some(1000),
+            block_ms: Some(1000),
+            ..Default::default()
+        };
+
+        RedisStreamsPublisher::new(&base(None))
+            .await
+            .unwrap()
+            .send_batch(
+                (0..N)
+                    .map(|i| CanonicalMessage::new(format!("msg-{i}").into_bytes(), None))
+                    .collect(),
+            )
+            .await
+            .unwrap();
+
+        // Two consumers read the whole stream and are dropped without acking: the backlog
+        // ends up pending under two now-dead names and `>` has nothing left to deliver.
+        // Counted as distinct payloads: the second dead consumer may reclaim entries that
+        // are already pending under `dead-0`, so deliveries overcount the backlog.
+        let mut drained_ids = std::collections::HashSet::new();
+        for i in 0..2 {
+            let mut dead = RedisStreamsConsumer::new(&base(Some(format!("dead-{i}"))))
+                .await
+                .unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            let mut received = 0usize;
+            while drained_ids.len() < N * (i + 1) / 2 && std::time::Instant::now() < deadline {
+                let batch =
+                    tokio::time::timeout(std::time::Duration::from_secs(5), dead.receive_batch(16))
+                        .await;
+                match batch {
+                    Ok(Ok(b)) => {
+                        received += b.messages.len();
+                        drained_ids.extend(b.messages.iter().map(|m| m.payload.clone()));
+                    }
+                    Ok(Err(e)) => {
+                        eprintln!("dead-{i}: receive_batch failed: {e:?}");
+                        break;
+                    }
+                    Err(e) => {
+                        eprintln!("dead-{i}: receive_batch timed out: {e}");
+                        break;
+                    }
+                }
+            }
+            assert!(received > 0, "dead-{i} received no messages");
+            drop(dead);
+        }
+        let drained = drained_ids.len();
+        assert!(drained > 0, "seeding left no pending entries");
+
+        // The replacement: batch_size well above the backlog, several reader connections.
+        let out_topic = format!("reclaim_out_{}", fast_uuid_v7::gen_id());
+        let output = Endpoint::new_memory(&out_topic, N + 100);
+        let mut in_config = base(None);
+        in_config.reader_connections = Some(4);
+        let route = Route::new(
+            Endpoint::new(EndpointType::RedisStreams(in_config)),
+            output.clone(),
+        )
+        .with_batch_size(512)
+        .with_concurrency(4);
+
+        let mut sink = output.create_consumer("reclaim_sink").await.unwrap();
+        let handle = route.run("redis_reclaim_test").await.unwrap();
+
+        let mut received_ids = std::collections::HashSet::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while received_ids.len() < drained {
+            let received = received_ids.len();
+            let batch =
+                tokio::time::timeout(std::time::Duration::from_secs(20), sink.receive_batch(512))
+                    .await
+                    .unwrap_or_else(|_| {
+                        panic!("reclaim wedged: {received}/{drained} entries redelivered")
+                    })
+                    .unwrap();
+            received_ids.extend(batch.messages.iter().map(|m| m.payload.clone()));
+            (batch.commit)(vec![
+                mq_bridge::traits::MessageDisposition::Ack;
+                batch.messages.len()
+            ])
+            .await
+            .unwrap();
+            assert!(
+                std::time::Instant::now() < deadline,
+                "reclaim wedged: {}/{drained} entries redelivered",
+                received_ids.len()
+            );
+        }
+        handle.stop().await;
+        println!(
+            "[Redis] Reclaim-with-drained-stream test successful ({} entries).",
+            received_ids.len()
+        );
+    })
+    .await;
+}
+
+/// A partial batch must be delivered immediately, not withheld until `batch_size` entries
+/// have accumulated. `receive_batch` blocks for the *first* entry, then drains whatever else
+/// is already pending — so two entries answer a `receive_batch(1024)` at once.
+///
+/// Reported as a bug against v0.3.8 (a route stalling at the app's default batch_size of
+/// 1024); it did not reproduce at either level, so these pin the behaviour instead.
+pub async fn test_redis_partial_batch_is_delivered() {
+    use mq_bridge::models::{Endpoint, EndpointType, RedisStreamsConfig};
+    use mq_bridge::traits::{MessageConsumer, MessagePublisher};
+    use mq_bridge::{CanonicalMessage, Route};
+
+    setup_logging();
+    run_test_with_docker(COMPOSE, || async {
+        let config = |suffix: &str| RedisStreamsConfig {
+            url: URL.to_string(),
+            stream: Some(format!("partial_{suffix}_{}", fast_uuid_v7::gen_id())),
+            group: Some(format!("g_partial_{suffix}")),
+            read_from_start: true,
+            ..Default::default()
+        };
+        let two = || {
+            vec![
+                CanonicalMessage::new(b"v1".to_vec(), None),
+                CanonicalMessage::new(b"v2".to_vec(), None),
+            ]
+        };
+
+        // Consumer level. Entries are published *before* the group exists, matching the report.
+        let cfg = config("consumer");
+        RedisStreamsPublisher::new(&cfg)
+            .await
+            .unwrap()
+            .send_batch(two())
+            .await
+            .unwrap();
+        let mut consumer = RedisStreamsConsumer::new(&cfg).await.unwrap();
+        let batch = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            consumer.receive_batch(1024),
+        )
+        .await
+        .expect("receive_batch never returned: a partial batch was withheld")
+        .unwrap();
+        assert_eq!(
+            batch.messages.len(),
+            2,
+            "both pending entries must arrive in one under-full batch"
+        );
+
+        // Route level, at the app's default batch_size.
+        let cfg = config("route");
+        RedisStreamsPublisher::new(&cfg)
+            .await
+            .unwrap()
+            .send_batch(two())
+            .await
+            .unwrap();
+        let out_topic = format!("partial_out_{}", fast_uuid_v7::gen_id());
+        let output = Endpoint::new_memory(&out_topic, 100);
+        let route = Route::new(
+            Endpoint::new(EndpointType::RedisStreams(cfg)),
+            output.clone(),
+        )
+        .with_batch_size(1024);
+        let handle = route.run("redis_partial_batch").await.unwrap();
+
+        let mut sink = output.create_consumer("partial_sink").await.unwrap();
+        let batch =
+            tokio::time::timeout(std::time::Duration::from_secs(10), sink.receive_batch(1024))
+                .await
+                .expect("nothing reached the sink: the route withheld a partial batch")
+                .unwrap();
+        assert!(!batch.messages.is_empty());
+        handle.stop().await;
+    })
+    .await;
+}

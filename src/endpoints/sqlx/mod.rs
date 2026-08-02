@@ -140,6 +140,21 @@ fn positional_placeholder(driver_name: &str, index: usize) -> String {
     }
 }
 
+/// True when `sql` still binds a value: an unrewritten `${…}` token, or a positional
+/// placeholder in any of the driver spellings (`?`, `$N`, `@pN`).
+fn binds_after_values(sql: &str) -> bool {
+    if sql.contains("${") {
+        return true;
+    }
+    let bytes = sql.as_bytes();
+    bytes.iter().enumerate().any(|(i, &b)| match b {
+        b'?' => true,
+        b'$' => bytes.get(i + 1).is_some_and(|c| c.is_ascii_digit()),
+        b'@' => bytes.get(i + 1) == Some(&b'p'),
+        _ => false,
+    })
+}
+
 /// Parse `${metadata:<key>}` / `${payload:<field>}` tokens out of an `insert_query`,
 /// rewriting each into a driver-appropriate positional placeholder assigned a running
 /// 1-based index in encounter order. Returns the rewritten query and the ordered
@@ -803,6 +818,16 @@ impl MessagePublisher for SqlxPublisher {
             None => "",
         };
 
+        // A token after the VALUES tuple (e.g. `ON CONFLICT … DO UPDATE SET v = ${payload:v}`)
+        // was already rewritten to a placeholder by `parse_insert_template`, numbered for the
+        // single-row query. The rebuild below renumbers only the row tuples, so the suffix
+        // would keep a stale index and the bind count would not line up. Single-row `send()`
+        // handles these correctly.
+        if binds_after_values(values_suffix) {
+            warn!("insert_query binds a value after the VALUES tuple. Falling back to iterative inserts.");
+            return self.send_batch_iterative(messages).await;
+        }
+
         // The `(payload)` single-column guard only applies to legacy mode; a
         // token-based query is already known-correct from `parse_insert_template`.
         if self.column_sources.is_empty() && !contains_payload_clause(base_query) {
@@ -906,10 +931,13 @@ impl SqlxPublisher {
             .copy_in_raw(&stmt)
             .await
             .map_err(classify_sql_error)?;
-        copier
-            .send(buf.as_bytes())
-            .await
-            .map_err(classify_sql_error)?;
+        if let Err(e) = copier.send(buf.as_bytes()).await {
+            // Tear the COPY down explicitly. `Drop` only buffers a CopyFail without
+            // awaiting the reply, so the connection could go back to the pool still in
+            // COPY-in state and poison the next query on it.
+            let _ = copier.abort("mq-bridge: COPY send failed").await;
+            return Err(classify_sql_error(e));
+        }
         copier.finish().await.map_err(classify_sql_error)?;
 
         trace!(count = messages.len(), table = %sink.table, "Bulk-copied batch to PostgreSQL");
@@ -1542,30 +1570,109 @@ fn quote_ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
 
+/// Quote a SQL identifier for `driver_name`. MySQL/MariaDB use backticks; everyone else uses
+/// the SQL-standard double quote. Required for the checkpoint meta table: `last_value` is a
+/// reserved word in MySQL 8 (the `LAST_VALUE` window function), so unquoted DDL is a syntax
+/// error there — and a user-supplied table name may need quoting on any driver.
+fn quote_ident_for(driver_name: &str, name: &str) -> String {
+    match driver_name {
+        "MySQL" | "MariaDB" => format!("`{}`", name.replace('`', "``")),
+        _ => quote_ident(name),
+    }
+}
+
+/// MySQL/MariaDB `information_schema.columns.DATA_TYPE` values that the sqlx `Any` driver can
+/// map to an `AnyValue`. Mirrors sqlx-mysql's `MySqlTypeInfo -> AnyTypeInfo` conversion: the
+/// integer/float column types it names explicitly, plus everything `str`/`[u8]` declare
+/// compatible. Everything else — `decimal`, the whole date/time family, `json`, `bit`, `set`,
+/// `tinyint`, `mediumint`, and MariaDB's `uuid`/`inet6` — aborts row decoding, so it is cast.
+/// Unlisted types default to unsafe, which is the harmless direction (a needless cast).
+fn mysql_data_type_is_any_safe(data_type: &str) -> bool {
+    matches!(
+        data_type,
+        "smallint"
+            | "int"
+            | "integer"
+            | "bigint"
+            | "float"
+            | "double"
+            | "char"
+            | "varchar"
+            | "binary"
+            | "varbinary"
+            | "enum"
+            | "tinytext"
+            | "text"
+            | "mediumtext"
+            | "longtext"
+            | "tinyblob"
+            | "blob"
+            | "mediumblob"
+            | "longblob"
+    )
+}
+
+/// `$1::regclass` resolves the (optionally schema-qualified) table name against the current
+/// search_path. `pg_attribute.attname`/`pg_type.typname` are Postgres `name`-typed columns,
+/// which `Any` cannot decode directly (distinct from `text`), so cast them explicitly.
+const PG_COLUMN_TYPES_SQL: &str = "SELECT a.attname::text AS name, t.typname::text AS typname \
+     FROM pg_attribute a JOIN pg_type t ON t.oid = a.atttypid \
+     WHERE a.attrelid = $1::regclass AND a.attnum > 0 AND NOT a.attisdropped \
+     ORDER BY a.attnum";
+
+/// The bind is the schema part of a `db.table` name, empty for an unqualified one — in which
+/// case the connection's current database is used.
+const MYSQL_COLUMN_TYPES_SQL: &str = "SELECT COLUMN_NAME AS name, LOWER(DATA_TYPE) AS typname \
+     FROM information_schema.columns \
+     WHERE table_schema = COALESCE(NULLIF(?, ''), DATABASE()) AND table_name = ? \
+     ORDER BY ORDINAL_POSITION";
+
 /// Build the SELECT projection used in place of `*` for the cursor reader.
 ///
-/// On PostgreSQL the `Any` driver eagerly decodes every column when building a row and aborts
-/// the whole query on the first type it cannot map (e.g. `TIMESTAMPTZ`). We introspect the
-/// table's columns via the catalog and cast every `Any`-incompatible column to `text`, so the
-/// copy succeeds (unmappable values arrive as strings) instead of failing every read forever.
-/// Any introspection failure (or a non-PostgreSQL driver) falls back to `*`, preserving the
-/// previous behaviour.
+/// The `Any` driver eagerly decodes every column when building a row and aborts the whole
+/// query on the first type it cannot map (`TIMESTAMPTZ` on Postgres, `DECIMAL`/`TIMESTAMP` on
+/// MySQL). We introspect the table's columns and cast every `Any`-incompatible column to a
+/// string type, so the copy succeeds (unmappable values arrive as strings) instead of failing
+/// every read forever. Any introspection failure (or an unsupported driver, e.g. SQLite, whose
+/// dynamic typing needs no cast) falls back to `*`, preserving the previous behaviour.
 async fn build_cursor_projection(pool: &AnyPool, driver_name: &str, table: &str) -> String {
-    if driver_name != "PostgreSQL" {
-        return "*".to_string();
+    type SafeFn = fn(&str) -> bool;
+    type CastFn = fn(&str) -> String;
+
+    let (sql, binds, is_safe, cast): (&str, Vec<String>, SafeFn, CastFn) = match driver_name {
+        "PostgreSQL" => (
+            PG_COLUMN_TYPES_SQL,
+            vec![table.to_string()],
+            pg_typname_is_any_safe,
+            |ident| format!("{ident}::text AS {ident}"),
+        ),
+        "MySQL" | "MariaDB" => {
+            let (schema, name) = match table.split_once('.') {
+                Some((s, t)) => (
+                    s.trim_matches('`').to_string(),
+                    t.trim_matches('`').to_string(),
+                ),
+                None => (String::new(), table.trim_matches('`').to_string()),
+            };
+            (
+                MYSQL_COLUMN_TYPES_SQL,
+                vec![schema, name],
+                mysql_data_type_is_any_safe,
+                |ident| format!("CAST({ident} AS CHAR) AS {ident}"),
+            )
+        }
+        _ => return "*".to_string(),
+    };
+
+    let mut query = sqlx::query(sql);
+    for bind in binds {
+        query = query.bind(bind);
     }
-    // `$1::regclass` resolves the (optionally schema-qualified) table name against the current
-    // search_path. pg_attribute.attname/pg_type.typname are Postgres `name`-typed columns,
-    // which `Any` cannot decode directly (distinct from `text`), so cast them explicitly.
-    let sql = "SELECT a.attname::text AS name, t.typname::text AS typname \
-               FROM pg_attribute a JOIN pg_type t ON t.oid = a.atttypid \
-               WHERE a.attrelid = $1::regclass AND a.attnum > 0 AND NOT a.attisdropped \
-               ORDER BY a.attnum";
-    let rows = match sqlx::query(sql).bind(table).fetch_all(pool).await {
+    let rows = match query.fetch_all(pool).await {
         Ok(rows) if !rows.is_empty() => rows,
         Ok(_) => return "*".to_string(),
         Err(e) => {
-            warn!(table = %table, error = %e, "Could not introspect PostgreSQL columns; falling back to SELECT * (timestamptz/uuid/etc. columns may fail to decode)");
+            warn!(table = %table, error = %e, "Could not introspect {driver_name} columns; falling back to SELECT * (timestamp/decimal/uuid/etc. columns may fail to decode)");
             return "*".to_string();
         }
     };
@@ -1576,12 +1683,12 @@ async fn build_cursor_projection(pool: &AnyPool, driver_name: &str, table: &str)
             Err(_) => return "*".to_string(),
         };
         let typname: String = row.try_get("typname").unwrap_or_default();
-        let ident = quote_ident(&name);
-        if pg_typname_is_any_safe(&typname) {
+        let ident = quote_ident_for(driver_name, &name);
+        if is_safe(&typname) {
             parts.push(ident);
         } else {
-            // Cast to text so `Any` can decode it; keep the original column name via alias.
-            parts.push(format!("{ident}::text AS {ident}"));
+            // Cast to a string type so `Any` can decode it; keep the column name via alias.
+            parts.push(cast(&ident));
         }
     }
     parts.join(", ")
@@ -1607,15 +1714,26 @@ struct SqlTableCheckpointStore {
 }
 
 impl SqlTableCheckpointStore {
+    /// The meta table and its columns, quoted for this driver.
+    fn idents(&self) -> (String, String, String) {
+        let q = |n: &str| quote_ident_for(&self.driver_name, n);
+        (q(&self.meta_table), q("cursor_id"), q("last_value"))
+    }
+
     async fn ensure_table(&self) -> anyhow::Result<()> {
+        let (table, cursor_id, last_value) = self.idents();
         let sql = format!(
-            "CREATE TABLE IF NOT EXISTS {} (cursor_id VARCHAR(255) PRIMARY KEY, last_value TEXT)",
-            self.meta_table
+            "CREATE TABLE IF NOT EXISTS {table} ({cursor_id} VARCHAR(255) PRIMARY KEY, {last_value} TEXT)"
         );
         sqlx::query(audited_sql(&sql))
             .execute(&self.pool)
             .await
-            .with_context(|| format!("Failed to create meta table '{}'", self.meta_table))?;
+            // Inline the driver error rather than layering it as an anyhow source:
+            // the route logs only the top-level message, which hid e.g. MySQL's
+            // ERROR 1064 and made this near-undiagnosable.
+            .map_err(|e| {
+                anyhow::anyhow!("Failed to create meta table '{}': {e}", self.meta_table)
+            })?;
         Ok(())
     }
 }
@@ -1623,9 +1741,9 @@ impl SqlTableCheckpointStore {
 #[async_trait]
 impl crate::checkpoint::CheckpointStore for SqlTableCheckpointStore {
     async fn load(&self) -> anyhow::Result<Option<String>> {
+        let (table, cursor_id, last_value) = self.idents();
         let sql = format!(
-            "SELECT last_value FROM {} WHERE cursor_id = {}",
-            self.meta_table,
+            "SELECT {last_value} FROM {table} WHERE {cursor_id} = {}",
             positional_placeholder(&self.driver_name, 1)
         );
         let row = sqlx::query(audited_sql(&sql))
@@ -1636,18 +1754,17 @@ impl crate::checkpoint::CheckpointStore for SqlTableCheckpointStore {
     }
 
     async fn save(&self, value: &str) -> anyhow::Result<()> {
+        let (table, cursor_id, last_value) = self.idents();
         let p1 = positional_placeholder(&self.driver_name, 1);
         let p2 = positional_placeholder(&self.driver_name, 2);
         let sql = match self.driver_name.as_str() {
             "MySQL" | "MariaDB" => format!(
-                "INSERT INTO {0} (cursor_id, last_value) VALUES ({1}, {2}) \
-                 ON DUPLICATE KEY UPDATE last_value = VALUES(last_value)",
-                self.meta_table, p1, p2
+                "INSERT INTO {table} ({cursor_id}, {last_value}) VALUES ({p1}, {p2}) \
+                 ON DUPLICATE KEY UPDATE {last_value} = VALUES({last_value})"
             ),
             _ => format!(
-                "INSERT INTO {0} (cursor_id, last_value) VALUES ({1}, {2}) \
-                 ON CONFLICT (cursor_id) DO UPDATE SET last_value = excluded.last_value",
-                self.meta_table, p1, p2
+                "INSERT INTO {table} ({cursor_id}, {last_value}) VALUES ({p1}, {p2}) \
+                 ON CONFLICT ({cursor_id}) DO UPDATE SET {last_value} = excluded.{last_value}"
             ),
         };
         sqlx::query(audited_sql(&sql))
@@ -1655,7 +1772,9 @@ impl crate::checkpoint::CheckpointStore for SqlTableCheckpointStore {
             .bind(value.to_string())
             .execute(&self.pool)
             .await
-            .with_context(|| format!("Failed to persist cursor to '{}'", self.meta_table))?;
+            .map_err(|e| {
+                anyhow::anyhow!("Failed to persist cursor to '{}': {e}", self.meta_table)
+            })?;
         Ok(())
     }
 }
@@ -1901,7 +2020,8 @@ impl MessageConsumer for SqlxCursorReader {
             let cursor = cursor_col
                 .and_then(|(idx, kind)| extract_cursor_at(row, idx, kind))
                 .ok_or_else(|| {
-                    ConsumerError::Connection(anyhow!(
+                    // Schema-level, so re-polling fails identically: permanent, not a reconnect.
+                    ConsumerError::Permanent(anyhow!(
                         "cursor_column '{}' is missing or of a type the SQL `Any` driver cannot decode \
                          (only integer and text cursors are supported). CAST it to BIGINT/TEXT in a view, \
                          or point cursor_column at an integer or text column.",
@@ -1925,8 +2045,8 @@ impl MessageConsumer for SqlxCursorReader {
             if emit_len == 0 {
                 // A single cursor value fills the whole batch and more rows with that value exist
                 // beyond it. Advancing past the value would silently skip the remainder, so fail
-                // loudly instead of losing rows.
-                return Err(ConsumerError::Connection(anyhow!(
+                // loudly instead of losing rows. Permanent: re-polling returns the same page forever.
+                return Err(ConsumerError::Permanent(anyhow!(
                     "cursor_column '{}' has a group of equal values larger than batch_size ({}); \
                      cannot page without skipping rows. Increase batch_size above the size of the \
                      largest equal-value group.",

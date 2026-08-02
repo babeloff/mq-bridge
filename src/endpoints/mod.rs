@@ -364,7 +364,7 @@ fn check_consumer_recursive(
             }
             Ok(warnings)
         }
-        #[cfg(feature = "zeromq")]
+        #[cfg(any(feature = "zeromq", feature = "zeromq-omq"))]
         EndpointType::ZeroMq(_) => Ok(warnings),
         #[cfg(feature = "redis-streams")]
         EndpointType::RedisStreams(cfg) => {
@@ -1171,7 +1171,7 @@ fn check_publisher_recursive(
             }
             Ok(warnings)
         }
-        #[cfg(feature = "zeromq")]
+        #[cfg(any(feature = "zeromq", feature = "zeromq-omq"))]
         EndpointType::ZeroMq(cfg) => {
             if cfg.topic.is_some() {
                 warnings.push(
@@ -1909,6 +1909,7 @@ mod tests {
                 store: None,
                 sled_path: Some("".into()),
                 ttl_seconds: 10,
+                key: None,
             })
             .with_consumer_metrics();
 

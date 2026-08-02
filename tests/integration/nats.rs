@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 use std::sync::Arc;
 
+use super::assert_permanent_consumer_error;
 use mq_bridge::endpoints::nats::{NatsConsumer, NatsPublisher};
 use mq_bridge::test_utils::{
     add_performance_result, run_chaos_pipeline_test, run_direct_perf_test,
@@ -288,6 +289,53 @@ pub async fn test_nats_drain_exits_on_empty() {
             .expect("collector task panicked");
         assert_eq!(received, N);
         println!("[NATS] Drain exit_on_empty test successful.");
+    })
+    .await;
+}
+
+/// A route whose `stream`/`subject` pair conflicts with an existing stream can never
+/// succeed: every reconnect rebuilds the identical mismatch. It must terminate the route with
+/// a permanent error instead of looping on the reconnect interval forever.
+///
+/// The reproducible form is a second stream claiming a subject the first already owns
+/// (JetStream error 10065). Note that a consumer whose `filter_subject` merely falls outside
+/// its stream's subjects is *accepted* by the server — it just never delivers — so that
+/// variant is silent starvation rather than an error loop.
+pub async fn test_nats_subject_stream_mismatch_fails_fast() {
+    use mq_bridge::models::{Endpoint, EndpointType, NatsConfig};
+    use mq_bridge::Route;
+
+    setup_logging();
+    run_test_with_docker("tests/integration/docker-compose/nats.yml", || async {
+        let stream = format!("mismatch_stream_{}", fast_uuid_v7::gen_id());
+
+        // Bind the stream to exactly `<stream>.data`. A consumer creates the stream with its
+        // own subject verbatim (the publisher would instead register a `<stream>.>` wildcard,
+        // which covers everything and cannot mismatch).
+        let seed = NatsConsumer::new(&NatsConfig {
+            url: "nats://localhost:4222".to_string(),
+            subject: Some(format!("{stream}.data")),
+            stream: Some(stream.clone()),
+            ..Default::default()
+        })
+        .await
+        .expect("create the stream via a matching consumer");
+        drop(seed);
+
+        // Ask for a *different* stream carrying the same subject. NATS refuses to create it
+        // ("subjects overlap with an existing stream"), and no retry can change that.
+        let in_config = NatsConfig {
+            url: "nats://localhost:4222".to_string(),
+            subject: Some(format!("{stream}.data")),
+            stream: Some(format!("{stream}_other")),
+            ..Default::default()
+        };
+        let route_name = format!("nats_mismatch_{}", fast_uuid_v7::gen_id());
+        let input = Endpoint::new(EndpointType::Nats(in_config));
+        let output = Endpoint::new_memory(&route_name, 16);
+        let route = Route::new(input, output);
+
+        assert_permanent_consumer_error(route, &route_name, "subject/stream mismatch").await;
     })
     .await;
 }

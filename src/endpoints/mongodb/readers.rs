@@ -689,9 +689,15 @@ impl MessageConsumer for MongoDbChangeStreamReader {
         // immediately-available events into the batch with a short timeout. While idle, periodically
         // advance the durable checkpoint to the stream's postBatchResumeToken so it can't age out of
         // the oplog (guarded so it never skips an un-acked change).
+        //
+        // Polls with `next_if_any` rather than `StreamExt::next`: a `next()` future cancelled by the
+        // timeout leaves the driver's stream state non-`Idle`, and `resume_token()` panics on any
+        // other state. `next_if_any` borrows the stream instead of replacing that state, so the
+        // token stays readable when the timeout fires mid-poll.
+        let mut last_refresh = Instant::now();
         loop {
-            match tokio::time::timeout(IDLE_RESUME_REFRESH, stream.next()).await {
-                Ok(Some(Ok(event))) => {
+            match tokio::time::timeout(IDLE_RESUME_REFRESH, stream.next_if_any()).await {
+                Ok(Ok(Some(event))) => {
                     let token = event.id.clone();
                     if let Some(msg) = Self::event_to_message(&event) {
                         messages.push(msg);
@@ -702,28 +708,33 @@ impl MessageConsumer for MongoDbChangeStreamReader {
                     }
                     // Event carried no payload (e.g. a drop); keep waiting for a real change.
                 }
-                Ok(Some(Err(e))) => return Err(ConsumerError::Connection(e.into())),
-                Ok(None) => return Err(anyhow!("MongoDB change stream ended unexpectedly").into()),
-                Err(_) => {
-                    // Extract the token synchronously (stream ref isn't `Send`), then persist.
-                    let token = stream.resume_token();
-                    self.refresh_idle_checkpoint(token).await;
+                Ok(Err(e)) => return Err(ConsumerError::Connection(e.into())),
+                // No change ready: the getMore came back empty, or it outran the refresh interval.
+                Ok(Ok(None)) | Err(_) => {
+                    if !stream.is_alive() {
+                        return Err(anyhow!("MongoDB change stream ended unexpectedly").into());
+                    }
+                    if last_refresh.elapsed() >= IDLE_RESUME_REFRESH {
+                        // Extract the token synchronously (stream ref isn't `Send`), then persist.
+                        let token = stream.resume_token();
+                        self.refresh_idle_checkpoint(token).await;
+                        last_refresh = Instant::now();
+                    }
                 }
             }
         }
 
         while messages.len() < max_messages {
-            match tokio::time::timeout(Duration::from_millis(10), stream.next()).await {
-                Ok(Some(Ok(event))) => {
+            match tokio::time::timeout(Duration::from_millis(10), stream.next_if_any()).await {
+                Ok(Ok(Some(event))) => {
                     let token = event.id.clone();
                     if let Some(msg) = Self::event_to_message(&event) {
                         messages.push(msg);
                         tokens.push(token);
                     }
                 }
-                Ok(Some(Err(e))) => return Err(ConsumerError::Connection(e.into())),
-                Ok(None) => return Err(anyhow!("MongoDB change stream ended unexpectedly").into()),
-                Err(_) => break, // no more events ready right now
+                Ok(Err(e)) => return Err(ConsumerError::Connection(e.into())),
+                Ok(Ok(None)) | Err(_) => break, // no more events ready right now
             }
         }
 

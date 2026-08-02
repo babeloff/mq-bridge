@@ -25,9 +25,9 @@ use std::fmt::Debug;
 use std::future::Future;
 use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 
-/// `(tag, identity)` where `identity` is the full structural connection identity
-/// (see [`connection_identity`]). Using the complete identity rather than a hash
-/// means two distinct connections can never collide onto the same cache entry.
+/// `(tag, identity)` where `identity` is the SHA-256 hex digest of the full structural
+/// connection identity (see [`connection_identity`]). Two distinct connections sharing a
+/// cache entry would therefore require a SHA-256 collision.
 type Key = (&'static str, String);
 
 static REGISTRY: OnceLock<RwLock<HashMap<Key, Weak<dyn Any + Send + Sync>>>> = OnceLock::new();

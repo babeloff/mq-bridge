@@ -39,17 +39,30 @@ const LENGTH_PREFIX_BYTES: usize = 4;
 const STALLED_SEND_WARN_AFTER: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// An IO handle wrapped in the length-delimited codec.
-pub(crate) type FramedIo<S> = Framed<S, LengthDelimitedCodec>;
+///
+/// `maybe_partial` shadows the codec's private decode state. `LengthDelimitedCodec`
+/// consumes the length prefix as soon as it has read one, so while it is mid-frame the
+/// read buffer starts at payload bytes rather than at a prefix — which [`buffered_frames`]
+/// cannot tell apart from a frame boundary. The flag is set pessimistically before every
+/// read and cleared only once a frame has been decoded (which leaves the codec back at a
+/// boundary), so a cancelled read stays pessimistic.
+pub(crate) struct FramedIo<S> {
+    inner: Framed<S, LengthDelimitedCodec>,
+    maybe_partial: bool,
+}
 
 /// Wrap an IO handle in the codec used by every IPC transport.
 pub(crate) fn wrap<S>(io: S) -> FramedIo<S>
 where
     S: AsyncRead + AsyncWrite,
 {
-    LengthDelimitedCodec::builder()
-        .length_field_type::<u32>()
-        .max_frame_length(MAX_FRAME_BYTES)
-        .new_framed(io)
+    FramedIo {
+        inner: LengthDelimitedCodec::builder()
+            .length_field_type::<u32>()
+            .max_frame_length(MAX_FRAME_BYTES)
+            .new_framed(io),
+        maybe_partial: false,
+    }
 }
 
 /// Encode and send a batch as a single frame. Returns the encoded byte count.
@@ -74,7 +87,7 @@ where
     }
     let len = data.len();
 
-    let mut send = std::pin::pin!(framed.send(Bytes::from(data)));
+    let mut send = std::pin::pin!(framed.inner.send(Bytes::from(data)));
     tokio::select! {
         result = &mut send => result?,
         _ = tokio::time::sleep(STALLED_SEND_WARN_AFTER) => {
@@ -102,8 +115,13 @@ pub(crate) async fn recv_batch<S>(framed: &mut FramedIo<S>) -> Result<Vec<Canoni
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
-    match framed.next().await {
-        Some(frame) => decode(&frame?),
+    framed.maybe_partial = true;
+    match framed.inner.next().await {
+        Some(frame) => {
+            let frame = frame?;
+            framed.maybe_partial = false;
+            decode(&frame)
+        }
         // Clean EOF. Surfaced as an io error so callers' disconnect detection
         // treats it like any other peer drop.
         None => Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into()),
@@ -118,8 +136,13 @@ pub(crate) fn try_recv_batch<S>(framed: &mut FramedIo<S>) -> Result<Option<Vec<C
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
-    match framed.next().now_or_never() {
-        Some(Some(frame)) => decode(&frame?).map(Some),
+    framed.maybe_partial = true;
+    match framed.inner.next().now_or_never() {
+        Some(Some(frame)) => {
+            let frame = frame?;
+            framed.maybe_partial = false;
+            decode(&frame).map(Some)
+        }
         Some(None) => Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into()),
         None => Ok(None),
     }
@@ -129,8 +152,14 @@ where
 ///
 /// These are decodable without touching the socket. Walks the length prefixes
 /// without decoding payloads.
+///
+/// A lower bound: while the codec may be mid-frame the buffer does not start at a length
+/// prefix, so nothing can be counted and this reports 0.
 pub(crate) fn buffered_frames<S>(framed: &FramedIo<S>) -> usize {
-    let buf: &BytesMut = framed.read_buffer();
+    if framed.maybe_partial {
+        return 0;
+    }
+    let buf: &BytesMut = framed.inner.read_buffer();
     let mut offset = 0usize;
     let mut frames = 0usize;
 
@@ -238,7 +267,7 @@ mod tests {
         // Write the length prefix and a slice of the payload, then stop.
         {
             use tokio::io::AsyncWriteExt;
-            let io = writer.get_mut();
+            let io = writer.inner.get_mut();
             io.write_all(&(encoded.len() as u32).to_be_bytes())
                 .await
                 .unwrap();
@@ -255,7 +284,7 @@ mod tests {
         // Deliver the rest; the buffered prefix must still be intact.
         {
             use tokio::io::AsyncWriteExt;
-            let io = writer.get_mut();
+            let io = writer.inner.get_mut();
             io.write_all(&encoded[4..]).await.unwrap();
             io.flush().await.unwrap();
         }
@@ -282,6 +311,45 @@ mod tests {
         assert_eq!(buffered_frames(&reader), 1);
 
         let _ = recv_batch(&mut reader).await.unwrap();
+        assert_eq!(buffered_frames(&reader), 0);
+    }
+
+    /// A half-arrived frame leaves the codec holding a consumed length prefix, so the
+    /// read buffer starts at payload bytes. Those must never be counted as frames.
+    #[tokio::test]
+    async fn buffered_frames_ignores_a_partial_frame() {
+        let (a, b) = duplex(64 * 1024);
+        let mut writer = wrap(a);
+        let mut reader = wrap(b);
+
+        // A payload whose leading bytes would themselves read as a plausible length
+        // prefix if mistaken for the start of a frame.
+        let messages = vec![CanonicalMessage::from_vec([0u8; 64])];
+        let encoded = rmp_serde::to_vec(&messages).unwrap();
+
+        {
+            use tokio::io::AsyncWriteExt;
+            let io = writer.inner.get_mut();
+            io.write_all(&(encoded.len() as u32).to_be_bytes())
+                .await
+                .unwrap();
+            io.write_all(&encoded[..8]).await.unwrap();
+            io.flush().await.unwrap();
+        }
+
+        // Drive a read so the codec consumes the prefix and parks mid-frame.
+        assert!(try_recv_batch(&mut reader).unwrap().is_none());
+        assert_eq!(buffered_frames(&reader), 0);
+
+        // Once the frame completes, counting resumes.
+        {
+            use tokio::io::AsyncWriteExt;
+            let io = writer.inner.get_mut();
+            io.write_all(&encoded[8..]).await.unwrap();
+            io.flush().await.unwrap();
+        }
+        let received = recv_batch(&mut reader).await.unwrap();
+        assert_eq!(received[0].payload.len(), 64);
         assert_eq!(buffered_frames(&reader), 0);
     }
 }

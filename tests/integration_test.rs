@@ -116,6 +116,10 @@ async fn test_all_subscriber_logic() {
             integration::redis_streams::test_redis_subscriber_logic().await;
             println!("\n\n>>> Starting Redis Streams Drain (exit_on_empty) Test...");
             integration::redis_streams::test_redis_drain_exits_on_empty().await;
+            println!("\n\n>>> Starting Redis Streams Partial Batch Test...");
+            integration::redis_streams::test_redis_partial_batch_is_delivered().await;
+            println!("\n\n>>> Starting Redis Streams Reclaim (drained stream) Test...");
+            integration::redis_streams::test_redis_reclaims_backlog_with_drained_stream().await;
         }
     }
     #[cfg(feature = "amqp")]
@@ -333,12 +337,93 @@ async fn test_postgres_cdc() {
     }
 }
 
+#[cfg(all(feature = "postgres-cdc", feature = "test-utils"))]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires docker compose (postgres with wal_level=logical)"]
+async fn test_postgres_cdc_temporary_slot() {
+    if should_run("postgres_cdc") || should_run("postgres") {
+        integration::postgres_cdc::test_postgres_cdc_temporary_slot().await;
+    }
+}
+
+#[cfg(feature = "sqlx")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires docker compose (mysql)"]
+async fn test_mysql_cursor_unmappable_types() {
+    if should_run("sqlx") || should_run("mysql") {
+        integration::mysql::test_mysql_cursor_unmappable_types().await;
+    }
+}
+
+#[cfg(feature = "sqlx")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires docker compose (mariadb)"]
+async fn test_mariadb_cursor_unmappable_types() {
+    if should_run("sqlx") || should_run("mariadb") {
+        integration::mariadb::test_mariadb_cursor_unmappable_types().await;
+    }
+}
+
+#[cfg(feature = "sqlx")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires docker compose (mysql)"]
+async fn test_mysql_checkpoint_table() {
+    if should_run("sqlx") || should_run("mysql") {
+        integration::mysql::test_mysql_checkpoint_table().await;
+    }
+}
+
+#[cfg(feature = "sqlx")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires docker compose (mariadb)"]
+async fn test_mariadb_checkpoint_table() {
+    if should_run("sqlx") || should_run("mariadb") {
+        integration::mariadb::test_mariadb_checkpoint_table().await;
+    }
+}
+
+#[cfg(feature = "nats")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires docker compose (nats)"]
+async fn test_nats_subject_stream_mismatch_fails_fast() {
+    if should_run("nats") {
+        integration::nats::test_nats_subject_stream_mismatch_fails_fast().await;
+    }
+}
+
+#[cfg(all(feature = "postgres-cdc", feature = "test-utils"))]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires docker compose (postgres with wal_level=logical)"]
+async fn test_postgres_cdc_confirms_lsn_on_clean_stop() {
+    if should_run("postgres_cdc") || should_run("postgres") {
+        integration::postgres_cdc::test_postgres_cdc_confirms_lsn_on_clean_stop().await;
+    }
+}
+
 #[cfg(feature = "object-store")]
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires docker compose (localstack s3)"]
 async fn test_object_store_pipeline() {
     if should_run("object_store") {
         integration::object_store::test_object_store_pipeline().await;
+    }
+}
+
+#[cfg(feature = "object-store")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires docker compose (localstack s3)"]
+async fn test_object_store_checkpoint_round_trip() {
+    if should_run("object_store") {
+        integration::object_store::test_object_store_checkpoint_round_trip().await;
+    }
+}
+
+#[cfg(feature = "object-store")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires docker compose (localstack s3)"]
+async fn test_object_store_permanent_errors_fail_fast() {
+    if should_run("object_store") {
+        integration::object_store::test_object_store_permanent_errors_fail_fast().await;
     }
 }
 
@@ -397,6 +482,16 @@ async fn test_mongodb_cdc_read_throughput() {
 async fn test_mongodb_cdc_latency() {
     if should_run("mongodb_cdc") || should_run("mongodb") {
         integration::mongodb::test_mongodb_cdc_latency().await;
+    }
+}
+
+/// Regression: an idle change stream must survive the idle resume-token refresh (no abort).
+#[cfg(feature = "mongodb")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires docker compose (mongodb replica set)"]
+async fn test_mongodb_cdc_survives_idle_resume_refresh() {
+    if should_run("mongodb_cdc") || should_run("mongodb") {
+        integration::mongodb::test_mongodb_cdc_survives_idle_resume_refresh().await;
     }
 }
 

@@ -88,8 +88,28 @@ impl ZeroMqPublisher {
         let (tx, rx) = bounded::<PublisherJob>(buffer_size);
         let request_timeout =
             std::time::Duration::from_millis(config.request_timeout_ms.unwrap_or(30_000));
+        // Kept so a timed-out REQ socket can be rebuilt (see the timeout arm below).
+        let req_url = config.url.clone();
+        let req_bind = config.bind;
         tokio::spawn(async move {
+            let mut needs_req_reset = false;
             while let Ok(job) = rx.recv().await {
+                if needs_req_reset {
+                    needs_req_reset = false;
+                    let mut s = zeromq::ReqSocket::new();
+                    let connected = if req_bind {
+                        s.bind(&req_url).await.map(|_| ())
+                    } else {
+                        s.connect(&req_url).await
+                    };
+                    match connected {
+                        Ok(()) => socket = SenderSocket::Req(s),
+                        Err(e) => {
+                            tracing::error!(error = %e, "Failed to rebuild ZeroMQ REQ socket after a timeout; retrying on the next request");
+                            needs_req_reset = true;
+                        }
+                    }
+                }
                 match job {
                     PublisherJob::Send(msg, ack_tx) => match &mut socket {
                         SenderSocket::Push(s) => {
@@ -120,6 +140,11 @@ impl ZeroMqPublisher {
                                     let _ = reply_tx.send(Err(zeromq::ZmqError::Other(
                                         "ZeroMQ REQ/REP exchange timed out",
                                     )));
+                                    // REQ is strictly send/recv alternating. The cancelled
+                                    // recv leaves the socket expecting a reply that will
+                                    // never be read, so the next request would desync.
+                                    // Replace the socket instead of reusing it.
+                                    needs_req_reset = true;
                                 }
                             }
                         }

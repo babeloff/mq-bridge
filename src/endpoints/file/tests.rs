@@ -1764,3 +1764,278 @@ async fn test_file_tail_live_withholds_final_line_without_newline() {
         "live tail withholds the final record until its delimiter arrives"
     );
 }
+
+/// A source path that cannot be opened must end a drain with a permanent error,
+/// not block forever (missing file, missing parent directory, unreadable file).
+#[tokio::test]
+async fn drain_fails_on_unopenable_source_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let unreadable = dir.path().join("locked.jsonl");
+    std::fs::write(&unreadable, b"{\"a\":1}\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000)).unwrap();
+    }
+
+    let mut paths = vec![
+        dir.path().join("missing.jsonl").display().to_string(),
+        dir.path()
+            .join("no-such-dir/in.jsonl")
+            .display()
+            .to_string(),
+    ];
+    // A mode-000 file is still readable by root; only assert on it where the
+    // permission actually bites.
+    if std::fs::File::open(&unreadable).is_err() {
+        paths.push(unreadable.display().to_string());
+    }
+
+    for path in paths {
+        let mut source = FileConsumer::new(&FileConfig {
+            path: path.clone(),
+            ..Default::default()
+        })
+        .await
+        .unwrap_or_else(|e| panic!("construction should succeed for {path}: {e}"));
+        source.set_exit_on_empty(true);
+
+        let result =
+            tokio::time::timeout(std::time::Duration::from_secs(2), source.receive_batch(16))
+                .await
+                .unwrap_or_else(|_| panic!("receive_batch hung on {path}"));
+
+        match result {
+            Err(crate::errors::ConsumerError::Permanent(e)) => {
+                assert!(
+                    e.to_string().contains(&path),
+                    "error should name the path: {e}"
+                );
+            }
+            other => panic!("expected a permanent error for {path}, got {other:?}"),
+        }
+    }
+}
+
+/// A directory given as a file source is permanent nonsense: reject it at
+/// construction rather than reporting a clean, empty drain.
+#[tokio::test]
+async fn directory_as_source_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let err = match FileConsumer::new(&FileConfig {
+        path: dir.path().display().to_string(),
+        ..Default::default()
+    })
+    .await
+    {
+        Ok(_) => panic!("a directory is not a readable file source"),
+        Err(e) => e,
+    };
+    assert!(err.to_string().contains("is a directory"), "got: {err}");
+}
+
+/// A live tail (no drain) still waits for a file that does not exist yet.
+#[tokio::test]
+async fn live_tail_waits_for_a_missing_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("later.jsonl");
+    let mut source = FileConsumer::new(&FileConfig {
+        path: path.display().to_string(),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+
+    let writer = path.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        std::fs::write(&writer, b"{\"a\":1}\n").unwrap();
+    });
+
+    let batch = tokio::time::timeout(std::time::Duration::from_secs(5), source.receive_batch(16))
+        .await
+        .expect("live tail should pick the file up once it appears")
+        .expect("receive_batch errored");
+    assert_eq!(batch.messages.len(), 1);
+}
+
+#[cfg(all(feature = "encryption", feature = "compression"))]
+mod at_rest_codec_mismatch {
+    use super::*;
+    use crate::models::EncryptionConfig;
+
+    const KEY: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+
+    fn encryption() -> Option<EncryptionConfig> {
+        Some(EncryptionConfig {
+            key: KEY.to_string(),
+            ..Default::default()
+        })
+    }
+
+    async fn write_encrypted(path: &str, compression: Compression) {
+        let publisher = FilePublisher::new(&FileConfig {
+            path: path.to_string(),
+            compression,
+            encryption: encryption(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        publisher
+            .send_batch(vec![msg!(json!({"a": 1})), msg!(json!({"a": 2}))])
+            .await
+            .unwrap();
+    }
+
+    /// An encrypted file read with no `encryption` configured used to emit its
+    /// ciphertext as messages under a clean success.
+    #[tokio::test]
+    async fn encrypted_source_without_encryption_is_rejected() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("enc.jsonl").display().to_string();
+        write_encrypted(&path, Compression::Gzip).await;
+
+        let err = match FileConsumer::new(&FileConfig {
+            path: path.clone(),
+            ..Default::default()
+        })
+        .await
+        {
+            Ok(_) => panic!("an encrypted file must not be read as plaintext"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("looks encrypted"), "got: {err}");
+    }
+
+    /// Decryption succeeds whatever the inner codec is, so a missing
+    /// `compression` used to surface the compressed bytes as one message.
+    #[tokio::test]
+    async fn decrypted_compression_mismatch_is_permanent() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("enc-gzip.jsonl").display().to_string();
+        write_encrypted(&path, Compression::Gzip).await;
+
+        let mut source = FileConsumer::new(&FileConfig {
+            path: path.clone(),
+            encryption: encryption(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        source.set_exit_on_empty(true);
+
+        let mut last = None;
+        for _ in 0..20 {
+            let received =
+                tokio::time::timeout(std::time::Duration::from_secs(10), source.receive_batch(16))
+                    .await
+                    .expect("receive_batch timed out");
+            match received {
+                Err(crate::errors::ConsumerError::Permanent(e)) => {
+                    last = Some(e.to_string());
+                    break;
+                }
+                Ok(batch) => assert!(
+                    batch.messages.is_empty(),
+                    "gzip bytes must not be emitted as messages"
+                ),
+                Err(e) => panic!("unexpected error: {e:?}"),
+            }
+        }
+        let err = last.expect("expected a permanent decode error");
+        assert!(err.contains("Giving up decoding"), "got: {err}");
+    }
+
+    /// The matching configuration still round-trips.
+    #[tokio::test]
+    async fn encrypted_and_compressed_round_trip() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("ok.jsonl").display().to_string();
+        write_encrypted(&path, Compression::Gzip).await;
+
+        let mut source = FileConsumer::new(&FileConfig {
+            path: path.clone(),
+            compression: Compression::Gzip,
+            encryption: encryption(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        source.set_exit_on_empty(true);
+        let batch =
+            tokio::time::timeout(std::time::Duration::from_secs(10), source.receive_batch(16))
+                .await
+                .expect("receive_batch timed out")
+                .unwrap();
+        assert_eq!(batch.messages.len(), 2);
+    }
+}
+
+/// A payload that is neither JSON nor UTF-8 — what the `compression` and `encryption`
+/// middlewares produce — must survive a `json`/`text` sink. It used to come back as the
+/// *textual* byte array `[40,181,47,…]`, so the reader's first byte was `[` (91).
+#[test]
+fn binary_payload_round_trips_through_json_and_text_formats() {
+    use crate::endpoints::file::{encode_record, parse_message};
+
+    let payload = vec![0x28u8, 0xb5, 0x2f, 0xfd, 0x00, 0xff, 0xfe];
+    let msg = crate::CanonicalMessage::new(payload.clone(), Some(7));
+
+    for format in [FileFormat::Json, FileFormat::Text] {
+        let line = encode_record(&msg, &format).unwrap();
+        let parsed = parse_message(&line, &format, &mut None).expect("record must parse");
+        assert_eq!(
+            parsed.payload.as_ref(),
+            payload.as_slice(),
+            "{format:?} must preserve a binary payload verbatim"
+        );
+        assert!(
+            !parsed.metadata.contains_key("mq_bridge.payload_bytes"),
+            "the byte marker is a storage detail and must not leak downstream"
+        );
+    }
+}
+
+/// The marker is honoured only at the value this crate writes, and only when the payload
+/// really is a byte array — a producer's own key of that name must not redirect decoding.
+#[test]
+fn byte_payload_marker_is_only_honoured_when_it_is_ours() {
+    use crate::endpoints::file::parse_message;
+
+    // A marked *string* payload is not ours: it stays the JSON text it was.
+    let line =
+        br#"{"message_id":"1","payload":"hello","metadata":{"mq_bridge.payload_bytes":"1"}}"#;
+    let parsed = parse_message(line, &FileFormat::Json, &mut None).unwrap();
+    assert_eq!(parsed.payload.as_ref(), br#""hello""#);
+
+    // A foreign value under the same key is the producer's data and survives untouched.
+    let line =
+        br#"{"message_id":"2","payload":[1,2,3],"metadata":{"mq_bridge.payload_bytes":"theirs"}}"#;
+    let parsed = parse_message(line, &FileFormat::Json, &mut None).unwrap();
+    assert_eq!(parsed.payload.as_ref(), b"[1,2,3]");
+    assert_eq!(
+        parsed
+            .metadata
+            .get("mq_bridge.payload_bytes")
+            .map(String::as_str),
+        Some("theirs")
+    );
+}
+
+/// A binary payload still round-trips when the message already carries the reserved key.
+/// `mq_bridge.*` is the crate's namespace — as with `mq_bridge.dlq.*` and
+/// `mq_bridge.retry.attempt`, a value a producer puts there is ours to overwrite.
+#[test]
+fn pre_existing_marker_does_not_break_a_binary_round_trip() {
+    use crate::endpoints::file::{encode_record, parse_message};
+
+    let payload = vec![0x28u8, 0xb5, 0x2f, 0xfd, 0x00];
+    let mut msg = crate::CanonicalMessage::new(payload.clone(), Some(9));
+    msg.metadata
+        .insert("mq_bridge.payload_bytes".to_string(), "theirs".to_string());
+
+    let line = encode_record(&msg, &FileFormat::Json).unwrap();
+    let parsed = parse_message(&line, &FileFormat::Json, &mut None).unwrap();
+    assert_eq!(parsed.payload.as_ref(), payload.as_slice());
+}

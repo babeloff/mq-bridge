@@ -26,11 +26,9 @@ use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::XChaCha20Poly1305;
 use std::collections::HashMap;
 
-const ENVELOPE_VERSION: u8 = 1;
-const CIPHER_XCHACHA: u8 = 0;
-const CIPHER_AES_GCM: u8 = 1;
-const XCHACHA_NONCE_LEN: usize = 24;
-const AES_GCM_NONCE_LEN: usize = 12;
+use super::crypto_envelope::{
+    AES_GCM_NONCE_LEN, CIPHER_AES_GCM, CIPHER_XCHACHA, ENVELOPE_VERSION, XCHACHA_NONCE_LEN,
+};
 
 /// A ready-to-use AEAD engine built from an [`EncryptionConfig`]: the active
 /// seal key plus any extra decrypt-only keys (rotation).

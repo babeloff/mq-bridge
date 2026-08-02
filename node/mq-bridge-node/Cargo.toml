@@ -24,9 +24,19 @@ napi-derive = "3"
 schemars = { version = "1.2", optional = true }
 serde_json.workspace = true
 serde_yaml_ng.workspace = true
-tokio = { workspace = true, features = ["rt-multi-thread", "sync"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "sync", "time"] }
 tracing.workspace = true
 tracing-subscriber = { version = "0.3", default-features = false, features = ["registry", "env-filter"] }
+
+# The addon is dlopen'd by Node, so mimalloc's thread-locals must use the dynamic
+# TLS model — the default initial-exec model draws from the fixed static TLS
+# surplus and fails to load on slim images ("cannot allocate memory in static TLS
+# block", napi-rs#1060). Not applicable on macOS/Windows.
+[target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies]
+mimalloc = { version = "0.1", default-features = false, features = ["local_dynamic_tls"], optional = true }
+
+[target.'cfg(not(any(target_os = "linux", target_os = "freebsd")))'.dependencies]
+mimalloc = { version = "0.1", default-features = false, optional = true }
 
 [build-dependencies]
 napi-build = "2"
@@ -34,7 +44,11 @@ napi-build = "2"
 [features]
 default = ["full"]
 middleware = ["mq-bridge/middleware"]
-full = ["mq-bridge/full", "schema"]
+full = ["mq-bridge/full", "schema", "mimalloc"]
+# mimalloc as Rust-side global allocator. Only redirects allocations made by this
+# cdylib's Rust code; V8's allocator is untouched. Safe because no raw
+# Rust-allocated buffer crosses the addon boundary. Excluded from `basic`.
+mimalloc = ["dep:mimalloc"]
 basic = ["http", "nats", "mqtt", "websocket", "zeromq", "rustls-ring", "schema"]
 dedup = ["mq-bridge/dedup"]
 metrics = ["mq-bridge/metrics"]

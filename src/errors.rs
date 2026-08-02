@@ -45,8 +45,13 @@ pub enum ConsumerError {
 
 impl From<anyhow::Error> for ConsumerError {
     fn from(err: anyhow::Error) -> Self {
-        // By default, we'll treat any generic error as a connection-level, retryable error.
-        ConsumerError::Connection(err)
+        // Preserve a classification the source already made — downgrading an existing
+        // `Permanent` to `Connection` would make the route retry something that cannot heal.
+        match err.downcast::<ConsumerError>() {
+            Ok(classified) => classified,
+            // Otherwise a generic error is connection-level, and therefore retryable.
+            Err(err) => ConsumerError::Connection(err),
+        }
     }
 }
 
@@ -76,6 +81,17 @@ mod tests {
 
         let processing_error = ProcessingError::from(anyhow::anyhow!("processing failure"));
         assert!(matches!(processing_error, ProcessingError::Retryable(_)));
+    }
+
+    #[test]
+    fn test_anyhow_conversion_preserves_existing_classification() {
+        let permanent = ConsumerError::from(anyhow::Error::new(ConsumerError::Permanent(
+            anyhow::anyhow!("decrypt failed"),
+        )));
+        assert!(matches!(permanent, ConsumerError::Permanent(_)));
+
+        let end = ConsumerError::from(anyhow::Error::new(ConsumerError::EndOfStream));
+        assert!(matches!(end, ConsumerError::EndOfStream));
     }
 
     #[test]

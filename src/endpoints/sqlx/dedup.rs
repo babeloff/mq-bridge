@@ -99,13 +99,33 @@ impl crate::middleware::deduplication::DedupStore for SqlDedupStore {
             positional_placeholder(&self.driver_name, 1),
             positional_placeholder(&self.driver_name, 2)
         );
-        if let Err(e) = sqlx::query(audited_sql(&sql))
+        match sqlx::query(audited_sql(&sql))
             .bind(expire_at)
-            .bind(id)
+            .bind(id.clone())
             .execute(&self.pool)
             .await
         {
-            warn!("Failed to mark dedup key processed in SQL: {}", e);
+            // The reserved row was reclaimed by cleanup in the meantime. Insert the marker
+            // instead of dropping it, so the key stays deduplicated (matching the Mongo
+            // store's upsert).
+            Ok(result) if result.rows_affected() == 0 => {
+                let ins = format!(
+                    "INSERT INTO {} (dedup_key, expire_at) VALUES ({}, {})",
+                    self.table,
+                    positional_placeholder(&self.driver_name, 1),
+                    positional_placeholder(&self.driver_name, 2)
+                );
+                if let Err(e) = sqlx::query(audited_sql(&ins))
+                    .bind(id)
+                    .bind(expire_at)
+                    .execute(&self.pool)
+                    .await
+                {
+                    warn!("Failed to insert dedup key marker in SQL: {}", e);
+                }
+            }
+            Ok(_) => {}
+            Err(e) => warn!("Failed to mark dedup key processed in SQL: {}", e),
         }
     }
 

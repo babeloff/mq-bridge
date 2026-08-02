@@ -30,8 +30,16 @@ fn parse_endpoint(url: &str) -> anyhow::Result<Endpoint> {
 
 /// Collect every frame of a received omq `Message` into a plain `Vec<Bytes>` for
 /// the shared codec.
-fn message_frames(msg: &Message) -> Vec<bytes::Bytes> {
-    (0..msg.len()).filter_map(|i| msg.part_bytes(i)).collect()
+///
+/// Fails rather than skipping a missing part: `RawFramed` decoding is positional, so a
+/// silently dropped frame would shift every frame after it.
+fn message_frames(msg: &Message) -> anyhow::Result<Vec<bytes::Bytes>> {
+    (0..msg.len())
+        .map(|i| {
+            msg.part_bytes(i)
+                .ok_or_else(|| anyhow!("ZeroMQ message part {i} of {} is missing", msg.len()))
+        })
+        .collect()
 }
 
 /// Build an omq `Message` from codec frames (always at least one).
@@ -212,7 +220,8 @@ impl ZeroMqOmqConsumer {
             omq_tokio::Error::Closed => ConsumerError::EndOfStream,
             other => ConsumerError::Connection(anyhow!(other)),
         })?;
-        let msgs = codec::decode_frames(message_frames(&msg), self.is_sub, &self.format)
+        let frames = message_frames(&msg).map_err(|e| ConsumerError::Connection(anyhow!(e)))?;
+        let msgs = codec::decode_frames(frames, self.is_sub, &self.format)
             .map_err(|e| ConsumerError::Connection(anyhow!(e)))?;
         self.buffer.extend(msgs);
         Ok(())

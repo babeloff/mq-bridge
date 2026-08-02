@@ -1,3 +1,7 @@
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -27,6 +31,9 @@ use tracing_subscriber::util::SubscriberInitExt;
 
 #[napi(js_name = "version")]
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// How often a blocking `join()` checks whether the route ended on its own.
+const ROUTE_END_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 /// JSON Schema for the route/config mapping, generated on demand from the
 /// compiled Rust models (no checked-in copy, so it cannot drift).
@@ -256,6 +263,10 @@ struct RouteRunState {
     running: bool,
     stop_tx: Option<oneshot::Sender<()>>,
     join_handle: Option<thread::JoinHandle<()>>,
+    /// Set when a route started with `start()` ended on a permanent failure, so
+    /// `join()` can report the cause instead of returning as if it had stopped
+    /// cleanly. Taken by `join()`.
+    failure: Option<String>,
 }
 
 #[napi]
@@ -394,10 +405,17 @@ impl Route {
             .name(format!("mqb-node-route-{name}"))
             .spawn(move || {
                 let stop_name = wait_name.clone();
-                runtime.block_on(async move {
-                    let _ = stop_rx.await;
+                let result = runtime.block_on(async move {
+                    let outcome = wait_for_stop_or_end(&stop_name, stop_rx).await;
+                    let result = outcome_to_result(&stop_name, outcome);
                     core::Route::stop(&stop_name).await;
+                    result
                 });
+                if let Err(err) = result {
+                    if let Ok(mut state) = wait_run_state.lock() {
+                        state.failure = Some(err.to_string());
+                    }
+                }
                 finish_run(&wait_run_state, &wait_name);
             }) {
             Ok(handle) => handle,
@@ -423,6 +441,9 @@ impl Route {
         Ok(())
     }
 
+    /// Block until the route has fully stopped — either by `stop()` or by ending
+    /// on its own (a drained source under `exit_on_empty`, an exhausted stream).
+    /// Throws if the route ended on a permanent error.
     #[napi]
     pub fn join(&self) -> Result<()> {
         let handle = self.lock_run_state()?.join_handle.take();
@@ -430,6 +451,9 @@ impl Route {
             handle
                 .join()
                 .map_err(|_| Error::from_reason("Route background thread panicked"))?;
+        }
+        if let Some(failure) = self.lock_run_state()?.failure.take() {
+            return Err(Error::from_reason(failure));
         }
         Ok(())
     }
@@ -1060,6 +1084,44 @@ fn lock_active_route_names() -> Result<std::sync::MutexGuard<'static, HashSet<St
     active_route_names()
         .lock()
         .map_err(|_| Error::from_reason("Active route registry lock poisoned"))
+}
+
+/// Wait for an explicit `stop()` or for the route to end on its own — a drained
+/// source under `exit_on_empty`, an exhausted stream, or a permanent failure.
+///
+/// Returns the terminal outcome when the route ended by itself, `None` when a
+/// stop was requested. Without this a drain-then-exit route would leave `join()`
+/// waiting forever on a stop signal that never arrives.
+async fn wait_for_stop_or_end(
+    name: &str,
+    stop_rx: oneshot::Receiver<()>,
+) -> Option<core::RouteOutcome> {
+    tokio::pin!(stop_rx);
+    loop {
+        tokio::select! {
+            _ = &mut stop_rx => return None,
+            _ = tokio::time::sleep(ROUTE_END_POLL_INTERVAL) => {
+                if let Some(outcome) = core::route_outcome(name) {
+                    return Some(outcome);
+                }
+            }
+        }
+    }
+}
+
+/// Turn a self-terminated route's outcome into the result `join()` reports. A
+/// clean drain is success; a permanent failure carries the cause from the
+/// route's status.
+fn outcome_to_result(name: &str, outcome: Option<core::RouteOutcome>) -> Result<()> {
+    if outcome == Some(core::RouteOutcome::Failed) {
+        let cause = core::route_status(name)
+            .and_then(|status| status.error)
+            .unwrap_or_else(|| "permanent error".to_string());
+        return Err(Error::from_reason(format!(
+            "Route '{name}' failed: {cause}"
+        )));
+    }
+    Ok(())
 }
 
 fn finish_run(run_state: &Arc<Mutex<RouteRunState>>, name: &str) {

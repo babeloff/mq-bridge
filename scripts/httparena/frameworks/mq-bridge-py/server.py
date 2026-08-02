@@ -23,7 +23,7 @@ static assets from ``/data/static`` (``STATIC_DIR``), Postgres from
 an empty result so the cleartext profiles still run.
 
 ``json-comp`` is handled by mq-bridge's response compression
-(``compression: gzip``): bodies over the threshold are gzip-encoded when the
+(``compression_enabled: true``): bodies over the threshold are gzip-encoded when the
 client advertises ``Accept-Encoding: gzip``, identity otherwise — so the same
 ``/json`` handler serves both ``json`` and ``json-comp``.
 """

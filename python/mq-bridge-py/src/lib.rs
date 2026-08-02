@@ -1,3 +1,7 @@
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
@@ -42,6 +46,8 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
 const MAX_JSON_DEPTH: usize = 64;
+/// How often a blocking `run()`/`join()` checks whether the route ended on its own.
+const ROUTE_END_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 static PYTHON_HANDLER_CONCURRENCY: OnceLock<Option<Arc<Semaphore>>> = OnceLock::new();
 static ACTIVE_ROUTE_NAMES: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
@@ -54,6 +60,10 @@ struct RouteRunState {
     running: bool,
     stop_tx: Option<oneshot::Sender<()>>,
     join_handle: Option<thread::JoinHandle<()>>,
+    /// Set when a route started with `start()` ended on a permanent failure, so
+    /// `join()` can report the cause instead of returning as if it had stopped
+    /// cleanly. Taken by `join()`.
+    failure: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -542,9 +552,11 @@ impl Route {
         Ok(slf)
     }
 
-    /// Deploy the route and block the calling thread until `stop()` is called
-    /// (typically from another thread). Use `start()` instead if you want to
-    /// keep running Python code after the route is up.
+    /// Deploy the route and block the calling thread until it ends: either
+    /// `stop()` is called (typically from another thread) or the route finishes
+    /// on its own — a drained source under `exit_on_empty`, or an exhausted
+    /// stream. Raises if the route ended on a permanent error. Use `start()`
+    /// instead if you want to keep running Python code after the route is up.
     fn run(&self, py: Python<'_>) -> PyResult<()> {
         let route = self.lock_route()?.clone();
         let stop_rx = self.begin_run()?;
@@ -556,9 +568,10 @@ impl Route {
         py.detach(move || {
             let result = runtime.block_on(async move {
                 route.deploy(&deployed_name).await?;
-                let _ = stop_rx.await;
+                let outcome = wait_for_stop_or_end(&deployed_name, stop_rx).await;
+                let result = outcome_to_result(&deployed_name, outcome);
                 core::Route::stop(&deployed_name).await;
-                Ok::<(), anyhow::Error>(())
+                result
             });
             finish_run(&run_state, &name);
             result
@@ -596,10 +609,17 @@ impl Route {
             .name(format!("mqb-route-{name}"))
             .spawn(move || {
                 let stop_name = wait_name.clone();
-                runtime.block_on(async move {
-                    let _ = stop_rx.await;
+                let result = runtime.block_on(async move {
+                    let outcome = wait_for_stop_or_end(&stop_name, stop_rx).await;
+                    let result = outcome_to_result(&stop_name, outcome);
                     core::Route::stop(&stop_name).await;
+                    result
                 });
+                if let Err(err) = result {
+                    if let Ok(mut state) = wait_run_state.lock() {
+                        state.failure = Some(err.to_string());
+                    }
+                }
                 finish_run(&wait_run_state, &wait_name);
             }) {
             Ok(handle) => handle,
@@ -616,13 +636,18 @@ impl Route {
         Ok(())
     }
 
-    /// Block until a route started with `start()` has fully stopped. No-op for
-    /// routes that were never started or that ran via the blocking `run()`.
+    /// Block until a route started with `start()` has fully stopped — either by
+    /// `stop()` or by ending on its own (a drained source under `exit_on_empty`,
+    /// an exhausted stream). Raises if the route ended on a permanent error.
+    /// No-op for routes that were never started or that ran via `run()`.
     fn join(&self, py: Python<'_>) -> PyResult<()> {
         let handle = self.lock_run_state()?.join_handle.take();
         if let Some(handle) = handle {
             py.detach(|| handle.join())
                 .map_err(|_| PyRuntimeError::new_err("Route background thread panicked"))?;
+        }
+        if let Some(failure) = self.lock_run_state()?.failure.take() {
+            return Err(PyRuntimeError::new_err(failure));
         }
         Ok(())
     }
@@ -2014,6 +2039,42 @@ fn lock_active_route_names() -> PyResult<std::sync::MutexGuard<'static, HashSet<
     active_route_names()
         .lock()
         .map_err(|_| PyRuntimeError::new_err("Active route name lock poisoned"))
+}
+
+/// Wait for an explicit `stop()` or for the route to end on its own — a drained
+/// source under `exit_on_empty`, an exhausted stream, or a permanent failure.
+///
+/// Returns the terminal outcome when the route ended by itself, `None` when a
+/// stop was requested. Without this a drain-then-exit route would block its
+/// caller forever on a stop signal that never arrives.
+async fn wait_for_stop_or_end(
+    name: &str,
+    stop_rx: oneshot::Receiver<()>,
+) -> Option<core::RouteOutcome> {
+    tokio::pin!(stop_rx);
+    loop {
+        tokio::select! {
+            _ = &mut stop_rx => return None,
+            _ = tokio::time::sleep(ROUTE_END_POLL_INTERVAL) => {
+                if let Some(outcome) = core::route_outcome(name) {
+                    return Some(outcome);
+                }
+            }
+        }
+    }
+}
+
+/// Turn a self-terminated route's outcome into the result `run()`/`join()`
+/// reports. A clean drain is success; a permanent failure raises with the cause
+/// from the route's status.
+fn outcome_to_result(name: &str, outcome: Option<core::RouteOutcome>) -> anyhow::Result<()> {
+    if outcome == Some(core::RouteOutcome::Failed) {
+        let cause = core::route_status(name)
+            .and_then(|status| status.error)
+            .unwrap_or_else(|| "permanent error".to_string());
+        return Err(anyhow!("Route '{name}' failed: {cause}"));
+    }
+    Ok(())
 }
 
 /// Clear a route's running state and release its reserved name once it has

@@ -100,7 +100,7 @@ pub(crate) fn decompress_all(
             if out.len() as u64 > limit {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
-                    format!("decompressed data exceeds max_object_bytes ({limit})"),
+                    format!("decompressed data exceeds the decode limit of {limit} bytes"),
                 ));
             }
         }

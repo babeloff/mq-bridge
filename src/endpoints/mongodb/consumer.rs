@@ -248,13 +248,13 @@ impl MongoDbConsumer {
             .sort(doc! { "_id": 1 })
             .await?;
 
-        let mut ids_to_claim = Vec::new();
+        // Any `_id` type is claimable — ObjectId, string, integer, UUID binary. Restricting
+        // this to UUIDs would silently skip documents `try_claim_document` picks up fine.
+        let mut ids_to_claim: Vec<Bson> = Vec::new();
         while let Some(result) = cursor.next().await {
             if let Ok(doc) = result {
-                if let Some(Bson::Binary(binary)) = doc.get("_id") {
-                    if let Ok(uuid) = binary.to_uuid() {
-                        ids_to_claim.push(uuid);
-                    }
+                if let Some(id) = doc.get("_id") {
+                    ids_to_claim.push(id.clone());
                 }
             }
         }
@@ -272,7 +272,7 @@ impl MongoDbConsumer {
 
         // If we successfully modified any documents, retrieve their full content.
         if update_result.modified_count > 0 {
-            self.get_documents_by_ids(&ids_to_claim).await
+            self.get_documents_by_ids(&ids_to_claim, locked_until).await
         } else {
             Ok(Vec::new())
         }
@@ -376,12 +376,17 @@ impl MongoDbConsumer {
         }
     }
 
-    /// Retrieves documents by their IDs.
+    /// Retrieves the documents this claim locked.
+    ///
+    /// The candidate ids were gathered before the update, so a concurrent consumer may
+    /// have taken some of them. Matching on the exact `locked_until` we wrote narrows the
+    /// result to the documents this call actually won.
     async fn get_documents_by_ids(
         &self,
-        claimed_ids: &[mongodb::bson::Uuid],
+        claimed_ids: &[Bson],
+        locked_until: i64,
     ) -> anyhow::Result<Vec<Document>> {
-        let filter = doc! { "_id": { "$in": claimed_ids } };
+        let filter = doc! { "_id": { "$in": claimed_ids }, "locked_until": locked_until };
         let mut cursor = self
             .collection
             .find(filter)

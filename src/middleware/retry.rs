@@ -7,9 +7,28 @@ use std::any::Any;
 use std::time::Duration;
 use tracing::warn;
 
+/// Metadata key carrying the 1-based delivery attempt, present only on **re**-deliveries
+/// (attempt ≥ 2). Everything downstream of `retry` — including a handler, which `retry`
+/// re-invokes once per attempt when it wraps one — is otherwise unable to tell a retry
+/// from a first delivery, which makes per-message counting scale with `max_attempts`.
+pub const RETRY_ATTEMPT_KEY: &str = "mq_bridge.retry.attempt";
+
 pub struct RetryPublisher {
     inner: Box<dyn MessagePublisher>,
     config: RetryMiddleware,
+}
+
+/// Stamp the attempt number on a redelivery. Attempt 1 clears the key rather than
+/// leaving it, so "no key" reliably means "first try" even for a message that arrived
+/// already carrying one.
+fn tag_attempt(message: &mut CanonicalMessage, attempt: usize) {
+    if attempt > 1 {
+        message
+            .metadata
+            .insert(RETRY_ATTEMPT_KEY.to_string(), attempt.to_string());
+    } else {
+        message.metadata.remove(RETRY_ATTEMPT_KEY);
+    }
 }
 
 impl RetryPublisher {
@@ -17,9 +36,10 @@ impl RetryPublisher {
         Self { inner, config }
     }
 
+    /// `operation` receives the 1-based attempt number so it can mark redeliveries.
     async fn retry_op<F, Fut, T>(&self, operation: F) -> Result<T, PublisherError>
     where
-        F: Fn() -> Fut,
+        F: Fn(usize) -> Fut,
         Fut: std::future::Future<Output = Result<T, PublisherError>>,
     {
         let mut attempt = 0;
@@ -27,7 +47,7 @@ impl RetryPublisher {
 
         loop {
             attempt += 1;
-            match operation().await {
+            match operation(attempt).await {
                 Ok(val) => return Ok(val),
                 Err(e @ PublisherError::NonRetryable(_)) => return Err(e), // Don't retry non-retryable errors
                 Err(e @ PublisherError::Connection(_)) => return Err(e), // Propagate connection errors
@@ -69,8 +89,9 @@ impl MessagePublisher for RetryPublisher {
     }
 
     async fn send(&self, message: CanonicalMessage) -> Result<Sent, PublisherError> {
-        self.retry_op(|| {
-            let msg = message.clone();
+        self.retry_op(|attempt| {
+            let mut msg = message.clone();
+            tag_attempt(&mut msg, attempt);
             async { self.inner.send(msg).await }
         })
         .await
@@ -90,7 +111,11 @@ impl MessagePublisher for RetryPublisher {
 
         loop {
             attempt += 1;
-            match self.inner.send_batch(current_messages.clone()).await {
+            let mut outgoing = current_messages.clone();
+            for msg in &mut outgoing {
+                tag_attempt(msg, attempt);
+            }
+            match self.inner.send_batch(outgoing).await {
                 Ok(SentBatch::Ack) => {
                     return if all_responses.is_empty() && all_failed.is_empty() {
                         Ok(SentBatch::Ack)
@@ -246,6 +271,66 @@ mod tests {
         let result = retry_publisher.send(msg).await;
         assert!(result.is_ok());
         assert_eq!(*attempts.lock().unwrap(), 3);
+    }
+
+    /// A redelivery must be distinguishable from a first delivery, so anything downstream
+    /// (a handler, or a caller counting messages) does not count one message N times.
+    #[tokio::test]
+    async fn redeliveries_carry_an_attempt_marker() {
+        #[derive(Clone)]
+        struct RecordingPublisher {
+            seen: Arc<Mutex<Vec<Option<String>>>>,
+            succeed_after: usize,
+        }
+
+        #[async_trait]
+        impl MessagePublisher for RecordingPublisher {
+            async fn send(&self, msg: CanonicalMessage) -> Result<Sent, PublisherError> {
+                let mut seen = self.seen.lock().unwrap();
+                seen.push(msg.metadata.get(RETRY_ATTEMPT_KEY).cloned());
+                if seen.len() > self.succeed_after {
+                    Ok(Sent::Ack)
+                } else {
+                    Err(anyhow!("Simulated error").into())
+                }
+            }
+
+            async fn send_batch(
+                &self,
+                _messages: Vec<CanonicalMessage>,
+            ) -> Result<SentBatch, PublisherError> {
+                Ok(SentBatch::Ack)
+            }
+
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mock = RecordingPublisher {
+            seen: seen.clone(),
+            succeed_after: 2,
+        };
+        let config = RetryMiddleware {
+            max_attempts: 5,
+            initial_interval_ms: 1,
+            max_interval_ms: 10,
+            multiplier: 1.0,
+        };
+
+        let retry_publisher = RetryPublisher::new(Box::new(mock), config);
+        retry_publisher
+            .send(CanonicalMessage::new(vec![], None))
+            .await
+            .unwrap();
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(
+            *seen,
+            vec![None, Some("2".to_string()), Some("3".to_string())],
+            "attempt 1 must be unmarked; every redelivery must carry its attempt number"
+        );
     }
 
     #[tokio::test]
