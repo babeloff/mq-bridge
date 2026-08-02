@@ -37,7 +37,10 @@ pub use publisher::Publisher;
 
 pub use endpoints::memory::get_or_create_channel;
 pub use publisher::{get_publisher, list_publishers, register_publisher, unregister_publisher};
-pub use route::{get_route, list_routes, register_endpoint, stop_route};
+pub use route::{
+    get_route, list_routes, register_endpoint, route_outcome, route_status, stop_route,
+    RouteOutcome,
+};
 
 // Re-export the underlying driver crate for each feature-gated endpoint, so
 // downstream code can depend on the exact same version mq-bridge builds against

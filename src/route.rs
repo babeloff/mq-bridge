@@ -1644,6 +1644,28 @@ pub fn list_routes() -> Vec<String> {
     Route::list()
 }
 
+/// Returns why a deployed route terminated, or `None` while it is still running
+/// (or if nothing is deployed under `name`).
+///
+/// [`Route::deploy`] keeps its [`RouteHandle`] private, so this is how a caller
+/// that deployed by name — the language bindings, a supervisor — learns that a
+/// drain-then-exit route finished on its own rather than waiting on a `stop()`
+/// that never comes.
+pub fn route_outcome(name: &str) -> Option<RouteOutcome> {
+    let registry = ROUTE_REGISTRY.get()?;
+    let map = recover_read_lock(registry, "route_registry");
+    map.get(name)?.handle.outcome()
+}
+
+/// Returns the connection health of a deployed route, or `None` if nothing is
+/// deployed under `name`. Pairs with [`route_outcome`]: after a
+/// [`RouteOutcome::Failed`], `error` holds the cause.
+pub fn route_status(name: &str) -> Option<EndpointStatus> {
+    let registry = ROUTE_REGISTRY.get()?;
+    let map = recover_read_lock(registry, "route_registry");
+    Some(map.get(name)?.handle.status())
+}
+
 pub async fn stop_route(name: &str) -> bool {
     Route::stop(name).await
 }

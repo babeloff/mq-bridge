@@ -25,9 +25,19 @@ schemars = "1.2"
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 serde_yaml_ng.workspace = true
-tokio = { workspace = true, features = ["rt-multi-thread", "sync"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "sync", "time"] }
 tracing.workspace = true
 tracing-subscriber = { version = "0.3", default-features = false, features = ["registry", "env-filter"] }
+
+# The extension module is dlopen'd by CPython, so mimalloc's thread-locals must
+# use the dynamic TLS model — the default initial-exec model draws from the fixed
+# static TLS surplus and fails to load on slim images ("cannot allocate memory in
+# static TLS block"). Not applicable on macOS/Windows.
+[target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies]
+mimalloc = { version = "0.1", default-features = false, features = ["local_dynamic_tls"], optional = true }
+
+[target.'cfg(not(any(target_os = "linux", target_os = "freebsd")))'.dependencies]
+mimalloc = { version = "0.1", default-features = false, optional = true }
 
 # `auto-initialize` is only needed to embed the interpreter for the in-crate
 # `cargo test` unit tests (`Python::attach`). It must NOT be enabled for the
@@ -41,7 +51,12 @@ pyo3 = { version = "0.29.0", features = ["abi3-py38", "auto-initialize"] }
 default = ["full"]
 # Testing-only middleware hooks; do not include this feature in production wheels.
 middleware = ["mq-bridge/middleware"]
-full = ["mq-bridge/full", "rustls-aws-lc"]
+full = ["mq-bridge/full", "rustls-aws-lc", "mimalloc"]
+# mimalloc as Rust-side global allocator. Only redirects allocations made by
+# this cdylib's Rust code; CPython's own allocator is untouched. Safe here
+# because no raw Rust-allocated buffer crosses the extension boundary.
+# Excluded from `basic`, which also builds for musl.
+mimalloc = ["dep:mimalloc"]
 # All-platform set for the `mq-bridge-py-basic` wheel: the endpoints from
 # `mq-bridge/portable` that build across native OS targets without a special
 # toolchain, incl. musl/Alpine. amqp + aws pull aws-lc-sys (BoringSSL C), so
