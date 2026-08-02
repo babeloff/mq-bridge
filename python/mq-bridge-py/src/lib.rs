@@ -701,6 +701,9 @@ impl Route {
         let (stop_tx, stop_rx) = oneshot::channel();
         state.running = true;
         state.stop_tx = Some(stop_tx);
+        // Drop any failure left unclaimed by a previous run, so `join()` cannot
+        // report a stale error for this one.
+        state.failure = None;
         Ok(stop_rx)
     }
 
