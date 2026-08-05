@@ -138,7 +138,8 @@ flate2 = { version = "1.1", optional = true }
 lz4_flex = { version = "0.14", optional = true, default-features = false, features = ["frame"] }
 # zstd (bundled libzstd via zstd-sys); Decoder handles concatenated frames like gzip/lz4.
 zstd = { version = "0.13", optional = true }
-base64 = { version = "0.23", optional = true }
+# Non-optional: `CanonicalMessage`'s JSON form encodes binary payloads as base64.
+base64 = { version = "0.23" }
 
 # AEAD ciphers for the `encryption` feature (payload middleware + at-rest file/object).
 chacha20poly1305 = { version = "0.11", optional = true }
@@ -229,7 +230,7 @@ dedup = ["sled"]
 compression = ["dep:flate2", "dep:lz4_flex", "dep:zstd"]
 # AEAD payload encryption: the `encryption` middleware and the at-rest
 # `encryption` field on the file/object_store endpoints.
-encryption = ["dep:chacha20poly1305", "dep:aes-gcm", "dep:base64"]
+encryption = ["dep:chacha20poly1305", "dep:aes-gcm"]
 metrics = ["dep:metrics"]
 test-utils = ["dep:tracing-appender", "dep:tracing-subscriber", "dep:serde_yaml_ng"]
 # Opt-in produce/consume-only isolation benchmarks (throwaway diagnostics, off by default)
@@ -254,9 +255,9 @@ amqp = ["lapin", "rustls", "rustls-pemfile", "url"]
 nats = ["async-nats", "rustls", "rustls-pemfile"]
 mongodb = ["dep:mongodb", "url"]
 mqtt = ["rumqttc", "rustls", "tokio-rustls", "rustls-pemfile", "url"]
-http = ["dep:arc-swap", "hyper", "hyper-util", "hyper-rustls", "http-body-util", "dep:http-body", "rustls", "tokio-rustls", "rustls-pemfile", "webpki-roots", "h2", "dep:flate2", "dep:lz4_flex", "dep:zstd", "dep:base64"]
+http = ["dep:arc-swap", "hyper", "hyper-util", "hyper-rustls", "http-body-util", "dep:http-body", "rustls", "tokio-rustls", "rustls-pemfile", "webpki-roots", "h2", "dep:flate2", "dep:lz4_flex", "dep:zstd"]
 websocket = ["dep:tokio-websockets"]
-aws = ["aws-config", "aws-sdk-sqs", "aws-sdk-sns", "dep:base64"]
+aws = ["aws-config", "aws-sdk-sqs", "aws-sdk-sns"]
 # Runtime-loaded IBM MQ client via dlopen: builds with no SDK present; the IBM
 # redistributable client is only needed at runtime, and only if an ibm-mq
 # endpoint is actually used.
@@ -283,7 +284,7 @@ object-store = ["dep:object_store", "url"]
 # Postgres logical-replication CDC (pgoutput). Reuses the sqlx dependency for the
 # slot-lifecycle control plane; the streaming wire protocol is pgwire-replication.
 # Needs Rust 1.88 (pgwire-replication MSRV), like the amqp feature gate.
-postgres-cdc = ["dep:pgwire-replication", "dep:byteorder", "sqlx", "dep:base64", "url", "dep:percent-encoding"]
+postgres-cdc = ["dep:pgwire-replication", "dep:byteorder", "sqlx", "url", "dep:percent-encoding"]
 
 [dev-dependencies]
 config = { version = "0.15" }

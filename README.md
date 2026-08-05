@@ -21,7 +21,7 @@ It is not only a forwarder. A route can transform, filter, fan out, retry, rate-
 
 ## Move data from A to B — inside your own service
 
-If you need to move data reliably between systems and you write code (Rust, Python, or Node), `mq-bridge` is a strong default. It is a **library you embed**, not a daemon or control plane you operate.
+If you need to move data or events reliably between systems and you write code (Rust, Python, or Node), `mq-bridge` is a strong default. It is a **library you embed**, not a daemon or control plane you operate.
 
 **Prefer not to write code?** [`mq-bridge-app`](https://github.com/marcomq/mq-bridge-app) runs the exact same engine as a **standalone, zero-code ETL service** configured entirely by **YAML or environment variables** — move data from A to B without writing a line. It ships a **Postman-style UI** to build, send, and inspect messages against a route, and can **import Postman collections and AsyncAPI documents** to scaffold routes and endpoints for you.
 
@@ -402,6 +402,20 @@ replay_from_s3:
 > is not decomposed: the whole line becomes the payload and the line's own `metadata` is discarded.
 > The reader logs a warning naming the wrapper when this happens. For plain JSON lines, use
 > `format: raw`.
+>
+> **Payload encoding in the wrapper.** A UTF-8 payload is written as a plain JSON string under
+> `payload`. A binary one (compressed, encrypted, Protobuf, …) is base64-encoded under a separate
+> `payload_base64` field; the two are mutually exclusive, as in the
+> [CloudEvents JSON format](https://github.com/cloudevents/spec/blob/main/cloudevents/formats/json-format.md).
+>
+> ```json
+> {"message_id":"019f9b12-d786-7ebe-a7ec-a1aa71bc47ae","payload":"{\"order_id\":7}"}
+> {"message_id":"019f9b12-d78a-7c01-b0f4-2f0f4d6a1c33","payload_base64":"KLUv/SBOAQAA"}
+> ```
+>
+> Sources still read the older byte-array form (`"payload":[123,34,…]`), so existing files keep
+> working. Only the reverse is a break: a **binary** record written by this version is not readable
+> by an older mq-bridge. Text records are compatible in both directions.
 
 ### Response Endpoint
 The `response` output endpoint sends a reply back to the original requester. This is useful for synchronous request-reply flows, for example HTTP-to-NATS-to-HTTP. Use `response: {}` as the output endpoint configuration.

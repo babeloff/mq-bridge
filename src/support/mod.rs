@@ -7,6 +7,7 @@
 //! cryptographic primitives, payload (de)compression, `${...}` string
 //! interpolation, and the shared connection registry.
 
+pub mod base64_engine;
 #[cfg(feature = "compression")]
 pub(crate) mod compression;
 pub mod connection_registry;

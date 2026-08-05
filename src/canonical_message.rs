@@ -11,13 +11,234 @@ use uuid::Uuid;
 
 use crate::type_handler::KIND_KEY;
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+/// The unified message format.
+///
+/// `Serialize`/`Deserialize` are hand-written (see below) because the derived JSON
+/// form wrote the payload as a per-byte array (`[123,34,…]`) — ~3.9x the payload
+/// size and an `itoa` call per byte. Text payloads now cost ~1.0x, binary 1.33x.
+#[derive(Debug, Clone)]
 pub struct CanonicalMessage {
-    #[serde(serialize_with = "print_uuidv7", deserialize_with = "deserialize_u128")]
     pub message_id: u128,
     pub payload: Bytes,
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub metadata: HashMap<String, String>,
+}
+
+/// JSON field holding a base64-encoded binary payload, mutually exclusive with
+/// `payload`. Mirrors the CloudEvents JSON `data` / `data_base64` split.
+pub const PAYLOAD_BASE64_KEY: &str = "payload_base64";
+
+const FIELDS_COMPACT: &[&str] = &["message_id", "payload", "metadata"];
+const FIELDS_HUMAN: &[&str] = &["message_id", "payload", PAYLOAD_BASE64_KEY, "metadata"];
+
+/// Text-based formats (JSON) get a UTF-8 payload as a plain string under `payload`
+/// and a binary payload as base64 under `payload_base64`. Binary formats (msgpack)
+/// already encode bytes compactly, so they keep the native representation.
+impl Serialize for CanonicalMessage {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+
+        let human_readable = serializer.is_human_readable();
+        let with_metadata = !self.metadata.is_empty();
+        let len = 2 + usize::from(with_metadata);
+        let mut state = serializer.serialize_struct("CanonicalMessage", len)?;
+        state.serialize_field("message_id", &MessageId(self.message_id))?;
+
+        if human_readable {
+            // from_utf8 bails at the first invalid byte, so binary payloads cost O(1) here.
+            match std::str::from_utf8(&self.payload) {
+                Ok(text) => state.serialize_field("payload", text)?,
+                Err(_) => state.serialize_field(
+                    PAYLOAD_BASE64_KEY,
+                    &crate::support::base64_engine::encode(&self.payload),
+                )?,
+            }
+        } else {
+            state.serialize_field("payload", &self.payload)?;
+        }
+
+        if with_metadata {
+            state.serialize_field("metadata", &self.metadata)?;
+        }
+        state.end()
+    }
+}
+
+/// Wrapper so `print_uuidv7` stays the single source of truth for id formatting.
+struct MessageId(u128);
+
+impl Serialize for MessageId {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        print_uuidv7(&self.0, serializer)
+    }
+}
+
+/// Accepts every historical shape: `payload` as a string, as a byte array, or as
+/// native bytes, plus the new `payload_base64`.
+impl<'de> Deserialize<'de> for CanonicalMessage {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let fields = if deserializer.is_human_readable() {
+            FIELDS_HUMAN
+        } else {
+            FIELDS_COMPACT
+        };
+        deserializer.deserialize_struct("CanonicalMessage", fields, CanonicalMessageVisitor)
+    }
+}
+
+struct CanonicalMessageVisitor;
+
+enum Field {
+    MessageId,
+    Payload,
+    PayloadBase64,
+    Metadata,
+    Ignore,
+}
+
+impl<'de> Deserialize<'de> for Field {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct FieldVisitor;
+
+        impl serde::de::Visitor<'_> for FieldVisitor {
+            type Value = Field;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a CanonicalMessage field name")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Field, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(match value {
+                    "message_id" => Field::MessageId,
+                    "payload" => Field::Payload,
+                    PAYLOAD_BASE64_KEY => Field::PayloadBase64,
+                    "metadata" => Field::Metadata,
+                    _ => Field::Ignore,
+                })
+            }
+        }
+
+        deserializer.deserialize_identifier(FieldVisitor)
+    }
+}
+
+/// `u128` id newtype reusing [`deserialize_u128`].
+struct MessageIdRepr(u128);
+
+impl<'de> Deserialize<'de> for MessageIdRepr {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserialize_u128(deserializer).map(MessageIdRepr)
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for CanonicalMessageVisitor {
+    type Value = CanonicalMessage;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("struct CanonicalMessage")
+    }
+
+    // Compact/positional encodings (msgpack writes structs as arrays).
+    fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+    where
+        A: serde::de::SeqAccess<'de>,
+    {
+        use serde::de::Error;
+        let message_id: MessageIdRepr = seq
+            .next_element()?
+            .ok_or_else(|| A::Error::invalid_length(0, &self))?;
+        let payload: Bytes = seq
+            .next_element()?
+            .ok_or_else(|| A::Error::invalid_length(1, &self))?;
+        let metadata = seq.next_element()?.unwrap_or_default();
+        Ok(CanonicalMessage {
+            message_id: message_id.0,
+            payload,
+            metadata,
+        })
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: serde::de::MapAccess<'de>,
+    {
+        use serde::de::Error;
+        let mut message_id: Option<u128> = None;
+        let mut payload: Option<Bytes> = None;
+        let mut payload_base64: Option<String> = None;
+        let mut metadata: Option<HashMap<String, String>> = None;
+
+        while let Some(key) = map.next_key::<Field>()? {
+            match key {
+                Field::MessageId => {
+                    if message_id.is_some() {
+                        return Err(A::Error::duplicate_field("message_id"));
+                    }
+                    message_id = Some(map.next_value::<MessageIdRepr>()?.0);
+                }
+                // `Bytes`' own visitor already accepts a string, a byte array and
+                // native bytes, which covers all legacy JSON forms.
+                Field::Payload => {
+                    if payload.is_some() {
+                        return Err(A::Error::duplicate_field("payload"));
+                    }
+                    payload = Some(map.next_value()?);
+                }
+                Field::PayloadBase64 => {
+                    if payload_base64.is_some() {
+                        return Err(A::Error::duplicate_field(PAYLOAD_BASE64_KEY));
+                    }
+                    payload_base64 = Some(map.next_value()?);
+                }
+                Field::Metadata => {
+                    if metadata.is_some() {
+                        return Err(A::Error::duplicate_field("metadata"));
+                    }
+                    metadata = Some(map.next_value()?);
+                }
+                Field::Ignore => {
+                    map.next_value::<serde::de::IgnoredAny>()?;
+                }
+            }
+        }
+
+        let payload = match (payload, payload_base64) {
+            (Some(_), Some(_)) => {
+                return Err(A::Error::custom(
+                    "payload and payload_base64 are mutually exclusive",
+                ));
+            }
+            (Some(p), None) => p,
+            (None, Some(b64)) => Bytes::from(
+                crate::support::base64_engine::decode(&b64)
+                    .map_err(|err| A::Error::custom(format!("invalid payload_base64: {err}")))?,
+            ),
+            (None, None) => return Err(A::Error::missing_field("payload")),
+        };
+
+        Ok(CanonicalMessage {
+            message_id: message_id.ok_or_else(|| A::Error::missing_field("message_id"))?,
+            payload,
+            metadata: metadata.unwrap_or_default(),
+        })
+    }
 }
 
 /// Reserved prefix for framework-injected **source/provenance** metadata — the
@@ -400,6 +621,99 @@ macro_rules! msg {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// A UTF-8 payload becomes a plain JSON string, not a byte array.
+    #[test]
+    fn json_utf8_payload_is_a_string() {
+        let msg = CanonicalMessage::new(b"{\"a\":1}".to_vec(), Some(42));
+        let json = String::from_utf8(serde_json::to_vec(&msg).unwrap()).unwrap();
+        assert!(json.contains(r#""payload":"{\"a\":1}""#), "{json}");
+        assert!(!json.contains('['), "{json}");
+        assert!(!json.contains(PAYLOAD_BASE64_KEY), "{json}");
+
+        let back: CanonicalMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.payload, msg.payload);
+        assert_eq!(back.message_id, 42);
+    }
+
+    #[test]
+    fn json_binary_payload_is_base64() {
+        let msg = CanonicalMessage::new(vec![0xFF, 0x00, 0xFE], Some(7));
+        let json = String::from_utf8(serde_json::to_vec(&msg).unwrap()).unwrap();
+        assert!(json.contains(r#""payload_base64":"/wD+""#), "{json}");
+        assert!(!json.contains(r#""payload""#), "{json}");
+
+        let back: CanonicalMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.payload.as_ref(), &[0xFF, 0x00, 0xFE]);
+        assert_eq!(back.message_id, 7);
+    }
+
+    /// Metadata still round-trips and is still omitted when empty.
+    #[test]
+    fn json_metadata_round_trip() {
+        let mut msg = CanonicalMessage::new(b"hi".to_vec(), Some(1));
+        assert!(!String::from_utf8(serde_json::to_vec(&msg).unwrap())
+            .unwrap()
+            .contains("metadata"));
+
+        msg.metadata.insert("kind".into(), "Order".into());
+        let back: CanonicalMessage =
+            serde_json::from_slice(&serde_json::to_vec(&msg).unwrap()).unwrap();
+        assert_eq!(back.metadata.get("kind").map(String::as_str), Some("Order"));
+    }
+
+    /// The legacy verbose byte-array form is still read.
+    #[test]
+    fn json_reads_legacy_byte_array() {
+        let msg: CanonicalMessage =
+            serde_json::from_str(r#"{"message_id":"1","payload":[104,105]}"#).unwrap();
+        assert_eq!(msg.payload.as_ref(), b"hi");
+        assert_eq!(msg.message_id, 1);
+    }
+
+    /// A string payload already deserialized to its raw UTF-8 bytes before this
+    /// change; that must not shift to base64 decoding.
+    #[test]
+    fn json_reads_string_payload_verbatim() {
+        let msg: CanonicalMessage =
+            serde_json::from_str(r#"{"message_id":"1","payload":"hi"}"#).unwrap();
+        assert_eq!(msg.payload.as_ref(), b"hi");
+    }
+
+    #[test]
+    fn json_rejects_both_payload_fields() {
+        let err = serde_json::from_str::<CanonicalMessage>(
+            r#"{"message_id":"1","payload":"hi","payload_base64":"aGk="}"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("mutually exclusive"), "{err}");
+    }
+
+    #[test]
+    fn json_rejects_invalid_base64() {
+        let err = serde_json::from_str::<CanonicalMessage>(
+            r#"{"message_id":"1","payload_base64":"!!!!"}"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("invalid payload_base64"), "{err}");
+    }
+
+    /// The msgpack IPC transport must keep native bytes — no base64, no array.
+    #[test]
+    fn msgpack_keeps_native_bytes() {
+        let payload: Vec<u8> = (0..=255u8).collect();
+        let msg = CanonicalMessage::new(payload.clone(), Some(9));
+        let encoded = rmp_serde::to_vec(&msg).unwrap();
+        assert!(
+            encoded.len() < payload.len() + 64,
+            "msgpack payload was not native bytes: {} bytes",
+            encoded.len()
+        );
+
+        let back: CanonicalMessage = rmp_serde::from_slice(&encoded).unwrap();
+        assert_eq!(back.payload.as_ref(), payload.as_slice());
+        assert_eq!(back.message_id, 9);
+    }
 
     #[test]
     fn source_metadata_key_detection() {
