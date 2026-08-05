@@ -17,6 +17,7 @@ use serde_json::{Map, Value};
 pub(super) struct Opts {
     pub(super) coerce: bool,
     pub(super) apply_defaults: bool,
+    pub(super) coerce_empty_as_null: bool,
 }
 
 // --- Compiled configuration ---
@@ -127,6 +128,7 @@ impl Compiled {
         let opts = Opts {
             coerce: config.coerce,
             apply_defaults: config.apply_defaults,
+            coerce_empty_as_null: config.coerce_empty_as_null,
         };
         Ok(Self {
             fast_eligible: fast_eligible(&rules, schema.as_ref(), opts),
@@ -218,10 +220,14 @@ impl Compiled {
                 .ok()
                 .map(|idx| &schema.properties[idx].1);
 
+            // `coerce_empty_as_null` turns this field into a null, which both shortcuts
+            // below would otherwise wave through as an ordinary string.
+            let empty_string = self.opts.coerce_empty_as_null && raw.get() == "\"\"";
+
             match sub {
                 // Embedded JSON with nothing to check afterwards: unescape the string and
                 // emit the document it carried, without ever building it.
-                Some(sub) if sub.is_plain_content_decode(raw.get()) => {
+                Some(sub) if !empty_string && sub.is_plain_content_decode(raw.get()) => {
                     // serde_json does the unescaping, so `😀` and friends are
                     // handled exactly as the normal path handles them.
                     let text: std::borrow::Cow<'_, str> = match serde_json::from_str(raw.get()) {
@@ -249,7 +255,7 @@ impl Compiled {
                 }
                 // The schema has something to say about this field and the raw bytes do
                 // not already satisfy it: parse just this field and transform it.
-                Some(sub) if !sub.is_passthrough(raw.get()) => {
+                Some(sub) if empty_string || !sub.is_passthrough(raw.get()) => {
                     let mut value: Value = match serde_json::from_str(raw.get()) {
                         Ok(value) => value,
                         Err(e) => {

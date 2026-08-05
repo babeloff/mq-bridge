@@ -1306,6 +1306,62 @@ async fn test_file_csv_round_trip() {
     );
 }
 
+/// RFC 4180 lets a quoted field carry the record separator. Splitting the file on `\n`
+/// before parsing turned such a row into two malformed ones — silent corruption for any
+/// export with free-text notes or addresses.
+#[tokio::test]
+async fn test_file_csv_reads_a_newline_inside_a_quoted_field_as_one_record() {
+    let dir = tempdir().unwrap();
+    let file_path = dir.path().join("data.csv");
+    let file_path_str = file_path.to_str().unwrap().to_string();
+
+    tokio::fs::write(
+        &file_path,
+        "id,name,note\n\
+         1,Simple,plain\n\
+         2,\"With, comma\",\"a \"\"quoted\"\" word\"\n\
+         3,\"Line1\nLine2\",\n\
+         4,héllo 世界,🎉\n",
+    )
+    .await
+    .unwrap();
+
+    let config = FileConfig {
+        path: file_path_str,
+        format: FileFormat::Csv,
+        ..Default::default()
+    };
+
+    let mut source = FileConsumer::new(&config).await.unwrap();
+    let mut rows = Vec::new();
+    for _ in 0..4 {
+        let received = source.receive().await.unwrap();
+        rows.push(serde_json::from_slice::<serde_json::Value>(&received.message.payload).unwrap());
+    }
+
+    assert_eq!(
+        rows,
+        vec![
+            json!({"id": "1", "name": "Simple", "note": "plain"}),
+            json!({"id": "2", "name": "With, comma", "note": "a \"quoted\" word"}),
+            json!({"id": "3", "name": "Line1\nLine2", "note": ""}),
+            json!({"id": "4", "name": "héllo 世界", "note": "🎉"}),
+        ]
+    );
+}
+
+#[test]
+fn test_csv_ends_inside_quotes_tracks_field_starts() {
+    use super::csv_ends_inside_quotes;
+    assert!(csv_ends_inside_quotes(b"3,\"Line1\n"));
+    assert!(!csv_ends_inside_quotes(b"3,\"Line1\nLine2\",\n"));
+    // Doubled quotes are an escape, not a close.
+    assert!(csv_ends_inside_quotes(b"1,\"a \"\"b\n"));
+    assert!(!csv_ends_inside_quotes(b"1,\"a \"\"b\"\n"));
+    // A quote that does not start a field is literal data, matching `parse_csv_row`.
+    assert!(!csv_ends_inside_quotes(b"1,in\"ch\n"));
+}
+
 #[tokio::test]
 async fn test_file_csv_value_types_and_escaping() {
     let dir = tempdir().unwrap();

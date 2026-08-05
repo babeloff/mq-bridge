@@ -1492,20 +1492,14 @@ fn create_publisher_with_depth(
             if referenced_opt.is_none() {
                 if let Some(pub_instance) = crate::publisher::get_publisher(name) {
                     let inner = pub_instance.inner();
-                    let mut publisher: Box<dyn MessagePublisher> = Box::new(inner);
-
-                    if let Some(handler) = &endpoint.handler {
-                        publisher = Box::new(crate::command_handler::CommandPublisher::new(
-                            publisher,
-                            handler.clone(),
-                        ));
-                    }
-                    return crate::middleware::apply_middlewares_to_publisher(
+                    let publisher: Box<dyn MessagePublisher> = Box::new(inner);
+                    let publisher = crate::middleware::apply_middlewares_to_publisher(
                         publisher,
                         &endpoint,
                         &route_name,
                     )
-                    .await;
+                    .await?;
+                    return Ok(wrap_handler(publisher, &endpoint));
                 }
             }
 
@@ -1532,16 +1526,34 @@ fn create_publisher_with_depth(
             return create_publisher_with_depth(route_name, merged, depth + 1).await;
         }
 
-        let mut publisher =
-            create_base_publisher(&route_name, &endpoint.endpoint_type, depth).await?;
-        if let Some(handler) = &endpoint.handler {
-            publisher = Box::new(crate::command_handler::CommandPublisher::new(
-                publisher,
-                handler.clone(),
-            ));
-        }
-        crate::middleware::apply_middlewares_to_publisher(publisher, &endpoint, &route_name).await
+        let publisher = create_base_publisher(&route_name, &endpoint.endpoint_type, depth).await?;
+        let publisher =
+            crate::middleware::apply_middlewares_to_publisher(publisher, &endpoint, &route_name)
+                .await?;
+        Ok(wrap_handler(publisher, &endpoint))
     })
+}
+
+/// Puts the handler outside every output middleware, so it runs **once** per message and
+/// the middlewares act on what it produced.
+///
+/// The handler used to sit innermost, which meant `retry` wrapped it: a sink that retried
+/// four times ran the handler four times, so any handler with a side effect (a counter, a
+/// capture, an enrichment call) fired N times for one message. Retrying only the publish
+/// is what comparable pipelines do. The trade, accepted deliberately: a `dlq` on the
+/// output no longer captures handler failures, only send failures — a handler error now
+/// propagates to the route.
+fn wrap_handler(
+    publisher: Arc<dyn MessagePublisher>,
+    endpoint: &Endpoint,
+) -> Arc<dyn MessagePublisher> {
+    match &endpoint.handler {
+        Some(handler) => Arc::new(crate::command_handler::CommandPublisher::new(
+            publisher,
+            handler.clone(),
+        )),
+        None => publisher,
+    }
 }
 
 async fn create_base_publisher(

@@ -165,6 +165,7 @@ pub struct RouteOptions {
     pub allow_fault_injection: bool,
     /// If true, the route exits gracefully once the source yields an empty batch
     /// (drain-then-exit). Off by default — routes normally poll indefinitely.
+    /// A drain that keeps failing to reconnect gives up and fails rather than retrying forever.
     #[serde(default = "default_false", skip_serializing_if = "is_false")]
     #[cfg_attr(feature = "schema", schemars(default = "default_false"))]
     pub exit_on_empty: bool,
@@ -1131,6 +1132,9 @@ pub struct TransformMiddleware {
     /// Insert `default` values from the schema for missing fields. Defaults to true.
     #[serde(default = "default_true")]
     pub apply_defaults: bool,
+    /// Read an empty string as `null`, so a nullable field or its default wins. Defaults to false.
+    #[serde(default)]
+    pub coerce_empty_as_null: bool,
     /// What to do with a message that fails to transform. Defaults to `reject`.
     #[serde(default)]
     pub on_error: TransformErrorPolicy,
@@ -1148,6 +1152,7 @@ impl Default for TransformMiddleware {
             schema_file: None,
             coerce: default_true(),
             apply_defaults: default_true(),
+            coerce_empty_as_null: false,
             on_error: TransformErrorPolicy::default(),
         }
     }

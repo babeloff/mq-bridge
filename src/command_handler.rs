@@ -11,7 +11,7 @@ use std::any::Any;
 use std::future::Future;
 use std::sync::Arc;
 
-use crate::traits::{PublisherError, Sent, SentBatch};
+use crate::traits::{EndpointStatus, PublisherError, Sent, SentBatch};
 #[async_trait]
 impl<F, Fut> Handler for F
 where
@@ -155,6 +155,14 @@ impl MessagePublisher for CommandPublisher {
 
     async fn flush(&self) -> anyhow::Result<()> {
         self.inner.flush().await
+    }
+
+    /// The handler has no transport of its own, so health is whatever it publishes to.
+    /// Without this the default `healthy: true` would mask a dead endpoint — this
+    /// publisher is the outermost one on a handler route, so it is what a route's
+    /// status reads.
+    async fn status(&self) -> EndpointStatus {
+        self.inner.status().await
     }
 
     fn as_any(&self) -> &dyn Any {

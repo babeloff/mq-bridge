@@ -931,6 +931,82 @@ async fn test_consumer_transforms_from_a_real_memory_endpoint() {
     assert_eq!(out, json!({ "firstName": "John", "id": 42 }));
 }
 
+// --- coerce_empty_as_null ---
+
+/// The same schema with and without the flag, so the default stays visible: an empty
+/// string is an ordinary string unless it is opted in.
+fn empty_as_null_cfg(properties: Value, on: bool) -> Compiled {
+    compiled(json!({
+        "schema": {"type": "object", "properties": properties},
+        "coerce_empty_as_null": on,
+    }))
+}
+
+#[test]
+fn test_empty_string_is_a_string_unless_opted_in() {
+    let props = json!({"email": {"type": "string", "nullable": true}});
+    let out = run(&empty_as_null_cfg(props, false), json!({"email": ""})).unwrap();
+    assert_eq!(out, json!({"email": ""}));
+}
+
+#[test]
+fn test_coerce_empty_as_null_nulls_only_empty_strings() {
+    let props = json!({
+        "email": {"type": "string", "nullable": true},
+        "name": {"type": "string"},
+        "qty": {"type": "integer", "nullable": true},
+    });
+    let out = run(
+        &empty_as_null_cfg(props, true),
+        json!({"email": "", "name": " ", "qty": 0}),
+    )
+    .unwrap();
+    // A blank is not empty and `0` is not falsy: only `""` is affected.
+    assert_eq!(out, json!({"email": null, "name": " ", "qty": 0}));
+}
+
+#[test]
+fn test_coerce_empty_as_null_lets_the_default_win() {
+    let props = json!({"tier": {"type": "string", "default": "standard"}});
+    let out = run(&empty_as_null_cfg(props, true), json!({"tier": ""})).unwrap();
+    assert_eq!(out, json!({"tier": "standard"}));
+}
+
+#[test]
+fn test_coerce_empty_as_null_rejects_a_non_nullable_field() {
+    let props = json!({"email": {"type": "string"}});
+    let err = run(&empty_as_null_cfg(props, true), json!({"email": ""})).unwrap_err();
+    assert_eq!(err.kind, ErrorKind::TypeMismatch);
+    assert_eq!(err.path, "$.email");
+    // The message has to name the coercion, or the null looks like it was in the payload.
+    assert!(
+        err.detail.contains("empty string"),
+        "unhelpful detail: {}",
+        err.detail
+    );
+}
+
+#[test]
+fn test_coerce_empty_as_null_reaches_nested_and_array_fields() {
+    let props = json!({
+        "user": {"type": "object", "properties": {"nick": {"type": "string", "nullable": true}}},
+        "tags": {"type": "array", "items": {"type": "string", "nullable": true}},
+    });
+    let out = run(
+        &empty_as_null_cfg(props, true),
+        json!({"user": {"nick": ""}, "tags": ["a", ""]}),
+    )
+    .unwrap();
+    assert_eq!(out, json!({"user": {"nick": null}, "tags": ["a", null]}));
+}
+
+#[test]
+fn test_coerce_empty_as_null_leaves_fields_the_schema_does_not_mention() {
+    let props = json!({"email": {"type": "string", "nullable": true}});
+    let out = run(&empty_as_null_cfg(props, true), json!({"note": ""})).unwrap();
+    assert_eq!(out, json!({"note": ""}));
+}
+
 mod fast_path_equivalence {
     use super::super::compiled::{map_sorts_keys, Compiled};
     use crate::models::TransformMiddleware;
@@ -950,10 +1026,16 @@ mod fast_path_equivalence {
     }
 
     fn both(schema: Value, payload: &str) -> Outcomes {
-        let config = TransformMiddleware {
-            schema: Some(schema),
-            ..Default::default()
-        };
+        both_with(
+            TransformMiddleware {
+                schema: Some(schema),
+                ..Default::default()
+            },
+            payload,
+        )
+    }
+
+    fn both_with(config: TransformMiddleware, payload: &str) -> Outcomes {
         let mut compiled = Compiled::new(&config).unwrap();
         let eligible = compiled.fast_eligible;
         let sort_keys = compiled.sort_keys;
@@ -1274,5 +1356,51 @@ mod fast_path_equivalence {
     fn a_root_schema_without_properties_is_still_consistent() {
         assert_same(json!({"type":"object"}), r#"{"anything":[1,2]}"#);
         assert_same(json!({}), r#"{"anything":[1,2]}"#);
+    }
+
+    /// `coerce_empty_as_null` makes `""` mean something other than itself, which is
+    /// exactly the assumption `is_passthrough` and `is_plain_content_decode` make when
+    /// they wave a string through untouched.
+    #[test]
+    fn empty_strings_agree_under_coerce_empty_as_null() {
+        // No property-level `default` here: that alone rules the fast path out, and this
+        // test is about the shortcut still being taken.
+        let schema = json!({"type":"object","properties":{
+            "plain":{"type":"string"},
+            "loose":{},
+            "nullable":{"type":"string","nullable":true},
+            "doc":{"type":"string","contentMediaType":"application/json"},
+            "listed":{"type":"string","enum":["a","b"]}}});
+        let cases = [
+            r#"{"plain":""}"#,
+            r#"{"loose":""}"#,
+            r#"{"nullable":""}"#,
+            r#"{"doc":""}"#,
+            r#"{"listed":""}"#,
+            r#"{"unmentioned":""}"#,
+            r#"{"nullable":"","plain":"kept"}"#,
+        ];
+        for payload in cases {
+            let config = TransformMiddleware {
+                schema: Some(schema.clone()),
+                coerce_empty_as_null: true,
+                ..Default::default()
+            };
+            let out = both_with(config, payload);
+            assert!(
+                out.eligible,
+                "the fast path should stay available: {payload}"
+            );
+            assert_eq!(
+                as_json(&out.slow),
+                as_json(&out.fast),
+                "paths disagree on payload: {payload}"
+            );
+            assert_eq!(
+                as_json(&out.slow),
+                as_json(&out.fast_other_order),
+                "paths disagree under the opposite key ordering on payload: {payload}"
+            );
+        }
     }
 }

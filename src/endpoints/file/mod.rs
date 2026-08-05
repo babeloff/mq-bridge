@@ -302,6 +302,61 @@ pub(crate) fn parse_delimiter(delimiter: Option<&str>) -> anyhow::Result<Vec<u8>
     Ok(bytes)
 }
 
+/// True when `buf` stops inside an open quote, so the delimiter it ended on was field
+/// data: RFC 4180 lets a quoted field contain the record separator. Mirrors the quote
+/// handling in [`parse_csv_row`], down to only opening a quote at the start of a field,
+/// so the splitter and the parser can never disagree about where a record ends.
+fn csv_ends_inside_quotes(buf: &[u8]) -> bool {
+    let mut in_quotes = false;
+    let mut field_is_empty = true;
+    let mut i = 0;
+    while i < buf.len() {
+        let b = buf[i];
+        if in_quotes {
+            if b == b'"' {
+                if buf.get(i + 1) == Some(&b'"') {
+                    i += 1;
+                } else {
+                    in_quotes = false;
+                }
+            }
+        } else if b == b'"' && field_is_empty {
+            in_quotes = true;
+        } else if b == b',' {
+            field_is_empty = true;
+            i += 1;
+            continue;
+        } else {
+            field_is_empty = false;
+        }
+        i += 1;
+    }
+    in_quotes
+}
+
+/// Reads one *record*, which for CSV may span several delimiters. Every read loop and
+/// every record count goes through this, so a multi-line row stays one record everywhere
+/// — including the `lines_in_memory` bookkeeping that consume mode truncates the file by.
+async fn read_record<R: AsyncBufReadExt + Unpin>(
+    reader: &mut R,
+    delimiter: &[u8],
+    format: &FileFormat,
+    buf: &mut Vec<u8>,
+) -> std::io::Result<usize> {
+    let mut total = read_until_bytes(reader, delimiter, buf).await?;
+    if !matches!(format, FileFormat::Csv) {
+        return Ok(total);
+    }
+    while total > 0 && csv_ends_inside_quotes(buf) {
+        let n = read_until_bytes(reader, delimiter, buf).await?;
+        if n == 0 {
+            break; // Unterminated quote at EOF: emit what there is rather than hang.
+        }
+        total += n;
+    }
+    Ok(total)
+}
+
 async fn read_until_bytes<R: AsyncBufReadExt + Unpin>(
     reader: &mut R,
     delimiter: &[u8],
@@ -834,6 +889,7 @@ async fn create_file_event_store(
     let path_clone = path.clone();
     let file_op_lock_clone = file_op_lock.clone();
     let delimiter_clone = delimiter.clone();
+    let format_gc = format.clone();
 
     let retention = RetentionPolicy {
         gc_interval: std::time::Duration::ZERO,
@@ -853,6 +909,7 @@ async fn create_file_event_store(
             let path = path_clone.clone();
             let file_op_lock = file_op_lock_clone.clone();
             let delimiter = delimiter_clone.clone();
+            let format = format_gc.clone();
 
             tokio::spawn(async move {
                 // Serialize file operations to prevent race conditions between multiple GCs
@@ -863,7 +920,7 @@ async fn create_file_event_store(
                     s.lines_in_memory = s.lines_in_memory.saturating_sub(count);
                 }
 
-                if let Err(e) = remove_lines_from_file(&path, count, &delimiter).await {
+                if let Err(e) = remove_lines_from_file(&path, count, &delimiter, &format).await {
                     tracing::error!("Failed to remove lines from file {}: {}", path, e);
                     // Note: In this simplified model, if deletion fails, lines_in_memory
                     // might become out of sync, leading to reprocessing on restart.
@@ -921,7 +978,7 @@ async fn create_file_event_store(
             let lines_to_skip = state.lines_in_memory;
             while lines_skipped < lines_to_skip {
                 let mut buf = Vec::new();
-                match read_until_bytes(&mut reader, &delimiter, &mut buf).await {
+                match read_record(&mut reader, &delimiter, &format_clone, &mut buf).await {
                     Ok(0) => break, // EOF
                     Ok(_) => lines_skipped += 1,
                     Err(e) => {
@@ -949,7 +1006,7 @@ async fn create_file_event_store(
 
             loop {
                 let mut buffer = Vec::new();
-                match read_until_bytes(&mut reader, &delimiter, &mut buffer).await {
+                match read_record(&mut reader, &delimiter, &format_clone, &mut buffer).await {
                     Ok(0) => break,
                     Ok(_) => {
                         if buffer.ends_with(&delimiter) {
@@ -997,7 +1054,14 @@ async fn create_file_event_store(
     Ok(store)
 }
 
-async fn remove_lines_from_file(path: &str, count: usize, delimiter: &[u8]) -> anyhow::Result<()> {
+/// Drops the first `count` *records* from `path`. `format` matters: a CSV record can span
+/// several delimiters, and consuming the wrong number of them would corrupt the remainder.
+async fn remove_lines_from_file(
+    path: &str,
+    count: usize,
+    delimiter: &[u8],
+    format: &FileFormat,
+) -> anyhow::Result<()> {
     let unique_id = fast_uuid_v7::gen_id_str();
     let temp_path = format!("{}.{}.tmp", path, unique_id);
 
@@ -1009,7 +1073,7 @@ async fn remove_lines_from_file(path: &str, count: usize, delimiter: &[u8]) -> a
     let mut lines_skipped = 0;
     while lines_skipped < count {
         let mut buf = Vec::new();
-        if read_until_bytes(&mut reader, delimiter, &mut buf).await? == 0 {
+        if read_record(&mut reader, delimiter, format, &mut buf).await? == 0 {
             break;
         }
         lines_skipped += 1;
@@ -1112,6 +1176,27 @@ fn looks_encrypted_at_rest(path: &str) -> bool {
         && head[10] >= 1
 }
 
+/// Blocking [`read_record`].
+fn read_record_sync<R: std::io::BufRead>(
+    reader: &mut R,
+    delimiter: &[u8],
+    format: &FileFormat,
+    buf: &mut Vec<u8>,
+) -> std::io::Result<usize> {
+    let mut total = read_until_bytes_sync(reader, delimiter, buf)?;
+    if !matches!(format, FileFormat::Csv) {
+        return Ok(total);
+    }
+    while total > 0 && csv_ends_inside_quotes(buf) {
+        let n = read_until_bytes_sync(reader, delimiter, buf)?;
+        if n == 0 {
+            break;
+        }
+        total += n;
+    }
+    Ok(total)
+}
+
 fn read_until_bytes_sync<R: std::io::BufRead>(
     reader: &mut R,
     delimiter: &[u8],
@@ -1204,7 +1289,7 @@ fn run_file_tail_task_sync(
         if let Some(r) = reader.as_mut() {
             for _ in 0..BATCH_SIZE {
                 buf.clear();
-                match read_until_bytes_sync(r, &delimiter, &mut buf) {
+                match read_record_sync(r, &delimiter, &format, &mut buf) {
                     Ok(0) => break, // EOF
                     Ok(n) => {
                         if !buf.ends_with(&delimiter) {
@@ -1299,6 +1384,9 @@ struct FileQueueConsumer {
     file_lock: Arc<Mutex<()>>,
     buffer: Arc<Mutex<Vec<CanonicalMessage>>>,
     delimiter: Vec<u8>,
+    /// Needed on the commit path too: deleting acked records re-splits the file, and CSV
+    /// records do not map one-to-one onto delimiters.
+    format: FileFormat,
     ready: Arc<AtomicBool>,
     /// See [`FileTailConsumer::pending_eof`].
     pending_eof: bool,
@@ -1348,7 +1436,7 @@ fn run_file_queue_task(
 
             while skipped < skip_count {
                 buf.clear();
-                match read_until_bytes_sync(&mut reader, &delimiter, &mut buf) {
+                match read_record_sync(&mut reader, &delimiter, &format, &mut buf) {
                     Ok(0) => break,
                     Ok(_) => skipped += 1,
                     Err(e) => {
@@ -1362,7 +1450,7 @@ fn run_file_queue_task(
             if !error {
                 for _ in 0..128 {
                     buf.clear();
-                    match read_until_bytes_sync(&mut reader, &delimiter, &mut buf) {
+                    match read_record_sync(&mut reader, &delimiter, &format, &mut buf) {
                         Ok(0) => break,
                         Ok(_) => {
                             if buf.ends_with(&delimiter) {
@@ -1380,9 +1468,9 @@ fn run_file_queue_task(
                                 None => {
                                     // CSV header line: remove it immediately so it never
                                     // occupies a slot in the ack/delete line accounting.
-                                    if let Err(e) = runtime_handle
-                                        .block_on(remove_lines_from_file(&path, 1, &delimiter))
-                                    {
+                                    if let Err(e) = runtime_handle.block_on(remove_lines_from_file(
+                                        &path, 1, &delimiter, &format,
+                                    )) {
                                         tracing::error!(
                                             "Failed to remove CSV header line from {}: {}",
                                             path,
@@ -1513,7 +1601,7 @@ fn run_file_member_consume_task_sync<F>(
         let mut decode_error = false;
         while skipped < records_emitted {
             buf.clear();
-            match read_until_bytes_sync(&mut reader, &delimiter, &mut buf) {
+            match read_record_sync(&mut reader, &delimiter, &format, &mut buf) {
                 Ok(0) => break,
                 Ok(_) => skipped += 1,
                 Err(e) => {
@@ -1550,7 +1638,7 @@ fn run_file_member_consume_task_sync<F>(
         let mut batch = Vec::with_capacity(256);
         loop {
             buf.clear();
-            match read_until_bytes_sync(&mut reader, &delimiter, &mut buf) {
+            match read_record_sync(&mut reader, &delimiter, &format, &mut buf) {
                 Ok(0) => break,
                 Ok(_) => {
                     if !buf.ends_with(&delimiter) {
@@ -1885,6 +1973,7 @@ impl FileConsumer {
                     file_lock,
                     buffer: Arc::new(Mutex::new(Vec::new())),
                     delimiter,
+                    format,
                     ready,
                     pending_eof: false,
                 })))
@@ -2251,6 +2340,7 @@ impl MessageConsumer for FileConsumer {
                 let lines_mem = c.lines_in_memory.clone();
                 let batch_for_commit = batch.clone();
                 let delimiter = c.delimiter.clone();
+                let format = c.format.clone();
 
                 let commit = Box::new(
                     move |dispositions: Vec<crate::traits::MessageDisposition>| {
@@ -2291,7 +2381,8 @@ impl MessageConsumer for FileConsumer {
                             if leading_acks > 0 {
                                 let _guard = lock.lock().await;
                                 if let Err(e) =
-                                    remove_lines_from_file(&path, leading_acks, &delimiter).await
+                                    remove_lines_from_file(&path, leading_acks, &delimiter, &format)
+                                        .await
                                 {
                                     tracing::error!("Failed to remove lines from {}: {}", path, e);
                                 }
@@ -2526,13 +2617,35 @@ fn strip_byte_marker(metadata: &mut HashMap<String, String>) {
 /// A line that is not the JSON envelope the format promised is kept verbatim as a
 /// raw payload rather than dropped, and marked so the next hop can tell.
 fn raw_fallback_message(buffer: &[u8], err: serde_json::Error) -> CanonicalMessage {
-    // A file that is not JSON at all hits this for every line, so only the first
-    // occurrence warns; the rest stay at debug.
-    static WARNED: AtomicBool = AtomicBool::new(false);
-    if !WARNED.swap(true, Ordering::Relaxed) {
-        warn!(error = %err, content_length = buffer.len(), "Failed to parse file line as JSON, treating as raw. Further occurrences are logged at debug level.");
+    // Two very different situations end up here, and they get their own one-shot flag so
+    // one cannot mask the other:
+    //
+    // - not JSON at all (a plain text file): expected, and every line hits it.
+    // - valid JSON that is not the record envelope: almost always a mistake in a
+    //   hand-written file, and the silent fallback discards the `metadata` the line
+    //   carried. Worth naming the envelope so the fix is obvious.
+    static WARNED_SHAPE: AtomicBool = AtomicBool::new(false);
+    static WARNED_SYNTAX: AtomicBool = AtomicBool::new(false);
+    let (warned, message) = if err.classify() == serde_json::error::Category::Data {
+        (
+            &WARNED_SHAPE,
+            "File line is valid JSON but not a record envelope, so the whole line is \
+             taken as the payload and its own `metadata` is discarded. A `json`/`normal`/\
+             `text` source expects the envelope a matching sink writes: \
+             {\"message_id\": ..., \"payload\": ..., \"metadata\": {...}}. Use `format: raw` \
+             for plain JSON lines. Further occurrences are logged at debug level.",
+        )
     } else {
-        tracing::debug!(error = %err, content_length = buffer.len(), "Failed to parse file line as JSON, treating as raw.");
+        (
+            &WARNED_SYNTAX,
+            "Failed to parse file line as JSON, treating as raw. Further occurrences are \
+             logged at debug level.",
+        )
+    };
+    if !warned.swap(true, Ordering::Relaxed) {
+        warn!(error = %err, content_length = buffer.len(), "{message}");
+    } else {
+        tracing::debug!(error = %err, content_length = buffer.len(), "{message}");
     }
     let mut msg = CanonicalMessage::new(buffer.to_vec(), None);
     msg.metadata

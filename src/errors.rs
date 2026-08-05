@@ -1,16 +1,21 @@
 use thiserror::Error;
 
 /// Errors that can occur during message processing (handling or publishing).
+///
+/// Every variant formats its cause with `{:#}`, anyhow's whole-chain form. A plain `{}`
+/// prints only the outermost `.context(...)`, and these errors are routinely flattened
+/// into a string on the way to the route and the logs, which threw away whatever the
+/// client library actually said (a driver reason code, an HTTP status detail).
 #[derive(Error, Debug)]
 pub enum ProcessingError {
     /// A transient error occurred. The operation should be retried.
-    #[error("retryable error: {0}")]
+    #[error("retryable error: {0:#}")]
     Retryable(#[source] anyhow::Error),
     /// A permanent error occurred. The operation should not be retried.
-    #[error("non-retryable error: {0}")]
+    #[error("non-retryable error: {0:#}")]
     NonRetryable(#[source] anyhow::Error),
     /// A connection-level error occurred. Used to signal broker disconnects, etc.
-    #[error("connection error: {0}")]
+    #[error("connection error: {0:#}")]
     Connection(#[source] anyhow::Error),
 }
 impl ProcessingError {
@@ -22,11 +27,12 @@ impl ProcessingError {
 pub type HandlerError = ProcessingError;
 pub type PublisherError = ProcessingError;
 
-/// Errors that can occur when consuming messages.
+/// Errors that can occur when consuming messages. Causes are formatted like
+/// [`ProcessingError`]'s, and for the same reason.
 #[derive(Error, Debug)]
 pub enum ConsumerError {
     /// A transport-level or other error occurred that should trigger a reconnect.
-    #[error("consumer connection error: {0}")]
+    #[error("consumer connection error: {0:#}")]
     Connection(#[source] anyhow::Error),
 
     /// A consumer gap was detected: the requested events were already garbage-collected.
@@ -39,7 +45,7 @@ pub enum ConsumerError {
 
     /// A permanent, non-retryable error: the message cannot be processed and must
     /// not be re-read (e.g. failed AEAD decryption/authentication of a payload).
-    #[error("permanent consumer error: {0}")]
+    #[error("permanent consumer error: {0:#}")]
     Permanent(#[source] anyhow::Error),
 }
 
@@ -92,6 +98,22 @@ mod tests {
 
         let end = ConsumerError::from(anyhow::Error::new(ConsumerError::EndOfStream));
         assert!(matches!(end, ConsumerError::EndOfStream));
+    }
+
+    #[test]
+    fn test_display_keeps_the_whole_cause_chain() {
+        // What an endpoint does: a client-library error, then a `.context()` on top. The
+        // context alone ("MQ connect failed") is useless without the reason code under it.
+        let cause = anyhow::anyhow!("MQRC_NOT_AUTHORIZED (2035)").context("MQ connect failed");
+        let rendered = ProcessingError::Retryable(cause).to_string();
+        assert!(
+            rendered.contains("MQ connect failed") && rendered.contains("MQRC_NOT_AUTHORIZED"),
+            "cause chain was flattened away: {rendered}"
+        );
+
+        let cause = anyhow::anyhow!("broken pipe").context("read failed");
+        let rendered = ConsumerError::Connection(cause).to_string();
+        assert!(rendered.contains("broken pipe"), "{rendered}");
     }
 
     #[test]

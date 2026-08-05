@@ -396,6 +396,12 @@ replay_from_s3:
 > always write the `{message_id, payload, metadata}` wrapper, so the message id survives the round
 > trip. Use `format: raw` to write payloads verbatim (bare documents, no wrapper). Applies to both
 > `file` and `object_store`.
+>
+> A **source** on those formats expects that same wrapper, `message_id` included. A line that is
+> valid JSON but not the wrapper — a hand-written fixture with only `payload` and `metadata`, say —
+> is not decomposed: the whole line becomes the payload and the line's own `metadata` is discarded.
+> The reader logs a warning naming the wrapper when this happens. For plain JSON lines, use
+> `format: raw`.
 
 ### Response Endpoint
 The `response` output endpoint sends a reply back to the original requester. This is useful for synchronous request-reply flows, for example HTTP-to-NATS-to-HTTP. Use `response: {}` as the output endpoint configuration.

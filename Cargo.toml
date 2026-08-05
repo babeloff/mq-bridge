@@ -287,6 +287,8 @@ postgres-cdc = ["dep:pgwire-replication", "dep:byteorder", "sqlx", "dep:base64",
 
 [dev-dependencies]
 config = { version = "0.15" }
+# `start_paused` — lets a test cross a 30s health window without waiting 30s.
+tokio = { workspace = true, features = ["test-util"] }
 serde_yaml_ng = "0.10"
 tempfile = "3.27"
 chrono = "0.4"

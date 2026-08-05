@@ -43,6 +43,12 @@ Writing with `[compression, encryption]` produces `compress(encrypt(payload))`; 
 given that same list would try to decrypt first and fail. The reading route must say
 `[encryption, compression]`. The lists mirror — they are not copied.
 
+**A route handler sits outside every output middleware**, so it runs **once** per message
+and the middlewares act on what it returned. In particular `retry` re-attempts only the
+publish, never the handler — a handler with a side effect fires once however many times the
+sink is retried. The trade: a `dlq` cannot capture a handler failure, only a send failure;
+a handler error propagates to the route and is reported there.
+
 > This is asserted by `route::tests::test_dlq_and_retry_batch_integration`,
 > `middleware::transform::tests::test_rejected_message_reaches_the_dlq_through_the_config_wiring`,
 > and `reference_docs_test::publisher_middleware_wraps_last_entry_outermost`, and is
@@ -131,12 +137,14 @@ Sends permanently-failed messages to a separate endpoint instead of failing the 
 ```
 
 Captures `NonRetryable` failures and `Retryable` ones whose retries are exhausted. Connection
-errors are **not** dead-lettered — they propagate so the route can reconnect. The DLQ endpoint
+errors are **not** dead-lettered — they propagate so the route can reconnect. Nor are handler
+failures: the handler runs outside the middlewares (see [Ordering](#ordering--read-this-before-combining-middleware)),
+so a `dlq` only ever sees what failed on the way to the sink. The DLQ endpoint
 is a full endpoint, so it can itself have middleware. If the DLQ send fails with a connection
 error that error propagates rather than silently dropping the message.
 
 **Without a `dlq` middleware**, a message that fails permanently — a data/type
-error the sink rejects, a poison payload a handler rejects — is logged at `error` level and
+error the sink rejects — is logged at `error` level and
 **dropped**, and the route keeps processing the rest of the batch. `dlq` is the only retention
 mechanism: `retry` alone does not retain a permanently-failed message nor prevent it from being
 dropped — it only re-attempts retryable/connection errors, then hands a still-failing message on
@@ -161,10 +169,16 @@ validation — over a single parse. Input and output.
 | `schema_file` | path to a schema file | – |
 | `coerce` | bool | `true` |
 | `apply_defaults` | bool | `true` |
+| `coerce_empty_as_null` | bool | `false` |
 | `on_error` | `reject` \| `pass_through` | `reject` |
 
 `schema` and `schema_file` are mutually exclusive. A mapping rule is either a bare path
 string or `{ path, default, required }`.
+
+`schema` must be a JSON *object*, not a string containing one. A flat `key=value` middleware
+syntax (such as the `|transform?schema=…` form in a connection URI) can only pass strings, so
+it cannot express `schema` or any mapping rule beyond a bare path — use `schema_file`, or move
+the route into a config file.
 
 ```yaml middleware
 - transform:
@@ -184,6 +198,26 @@ Schema keywords honoured: `type`, `properties`, `required`, `default`, `items`, 
 else is ignored, so an existing fuller schema can be used as-is. Coercions are limited to the
 lossless ones: `string → integer`, `string → number`, `string → boolean` (`true`/`false`/`1`/`0`),
 `number → string`.
+
+#### Empty strings
+
+CSV and many SQL exports spell "no value" as an empty string. `coerce_empty_as_null: true`
+reads every `""` the schema visits as `null`, which is then handled like any other null —
+a `nullable` field keeps it, a `default` replaces it:
+
+```yaml middleware
+- transform:
+    coerce_empty_as_null: true
+    schema:
+      type: object
+      properties:
+        note: { type: string, nullable: true }
+        tier: { type: string, default: standard }
+```
+
+`note: ""` arrives as `null` and `tier: ""` as `"standard"`. A field that is neither
+nullable nor defaulted is rejected, naming the coercion. Only fields the schema declares are
+affected; `" "` is not empty.
 
 #### Embedded JSON
 
@@ -310,6 +344,11 @@ Correlates messages by a metadata key and emits them as one joined message. Inpu
     required: ["inventory", "pricing"]
     on_timeout: discard
 ```
+
+`group_by` reads message **metadata** only — never the payload. A message that lacks the key
+falls into a shared `"default"` group, so a mistyped key or a source that never sets it joins
+unrelated messages instead of failing. If the value lives in the payload, lift it into metadata
+first (a `transform` mapping, or the source's own metadata options).
 
 Setting `branch_by` switches to branch mode, where `required` overrides `expected_count`.
 On timeout an incomplete group is either emitted partially (`fire`) or dropped (`discard`).
