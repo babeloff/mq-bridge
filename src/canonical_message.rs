@@ -373,13 +373,34 @@ pub(crate) fn u128_from_json(val: &serde_json::Value) -> Result<u128, String> {
             return Ok(n);
         }
     }
+    if let Some(s) = val.as_str() {
+        // Any other string id (`"j1"`, an application key, a foreign system's id) is
+        // folded into a stable u128 instead of failing. Rejecting it used to make a
+        // whole JSON line unparseable, and a `file`/`json` source then silently kept
+        // the line as an opaque raw payload, discarding its own `metadata`.
+        return Ok(fnv1a_128(s.as_bytes()));
+    }
     Err("Invalid u128 format".to_string())
+}
+
+/// FNV-1a, 128-bit. Deterministic and stable forever (unlike `DefaultHasher`), so the
+/// same string id maps to the same message id in every process and every release —
+/// which is what deduplication and correlation rely on.
+fn fnv1a_128(bytes: &[u8]) -> u128 {
+    const OFFSET: u128 = 0x6c62272e07bb014262b821756295c58d;
+    const PRIME: u128 = 0x0000000001000000000000000000013b;
+    let mut hash = OFFSET;
+    for b in bytes {
+        hash ^= *b as u128;
+        hash = hash.wrapping_mul(PRIME);
+    }
+    hash
 }
 
 /// Parse a message id from a string, accepting the same formats as the JSON
 /// deserializer: a UUID string, a `0x`-prefixed hex literal, or a decimal
-/// integer. Used by the language bindings so id parsing stays identical across
-/// Rust, Python, and Node.
+/// integer. Any other string is hashed into a stable id. Used by the language
+/// bindings so id parsing stays identical across Rust, Python, and Node.
 pub fn message_id_from_str(id: &str) -> Result<u128, String> {
     u128_from_json(&serde_json::Value::String(id.to_string()))
         .map_err(|err| format!("invalid message id '{id}': {err}"))
@@ -622,6 +643,31 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// An ordinary string id must not make the whole envelope unparseable — a
+    /// `file`/`json` source used to keep such a line as an opaque raw payload and throw
+    /// away its `metadata`.
+    #[test]
+    fn arbitrary_string_message_id_is_hashed_not_rejected() {
+        let line = r#"{"message_id":"j1","payload":"hello","metadata":{"k":"v"}}"#;
+        let msg: CanonicalMessage = serde_json::from_str(line).unwrap();
+        assert_eq!(msg.payload, Bytes::from_static(b"hello"));
+        assert_eq!(msg.metadata.get("k").unwrap(), "v");
+
+        // Stable: the same string always maps to the same id, and different ones differ.
+        let again: CanonicalMessage = serde_json::from_str(line).unwrap();
+        assert_eq!(msg.message_id, again.message_id);
+        assert_ne!(msg.message_id, message_id_from_str("j2").unwrap());
+
+        // The documented forms keep their exact value.
+        assert_eq!(message_id_from_str("42").unwrap(), 42);
+        assert_eq!(
+            message_id_from_str("019fd574-0000-7000-8000-000000000001").unwrap(),
+            Uuid::parse_str("019fd574-0000-7000-8000-000000000001")
+                .unwrap()
+                .as_u128()
+        );
+    }
+
     /// A UTF-8 payload becomes a plain JSON string, not a byte array.
     #[test]
     fn json_utf8_payload_is_a_string() {
@@ -763,7 +809,15 @@ mod tests {
         );
         assert_eq!(message_id_from_str("0xFF").unwrap(), 255);
         assert_eq!(message_id_from_str("100").unwrap(), 100);
-        assert!(message_id_from_str("not-an-id").is_err());
+        // Anything else is hashed rather than rejected, and stably so.
+        assert_eq!(
+            message_id_from_str("not-an-id").unwrap(),
+            message_id_from_str("not-an-id").unwrap()
+        );
+        assert_ne!(
+            message_id_from_str("not-an-id").unwrap(),
+            message_id_from_str("also-not-an-id").unwrap()
+        );
 
         // A UUID id round-trips through format_message_id unchanged.
         let id = message_id_from_str(uuid).unwrap();

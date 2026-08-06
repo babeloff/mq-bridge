@@ -3184,6 +3184,335 @@ mod tests {
         Route::stop("test_dead_fanout_leg").await;
     }
 
+    /// A fanout leg carrying its own `retry` + `dlq` must dead-letter its failures exactly
+    /// like the same endpoint would as a route's sole output.
+    #[tokio::test]
+    async fn test_fanout_leg_middleware_dead_letters_its_own_failures() {
+        let unique_id = fast_uuid_v7::gen_id().to_string();
+        let factory_name = format!("failing_leg_{}", unique_id);
+
+        let mut factory = MockEndpointFactory::new();
+        factory.publisher_behavior = Arc::new(Mutex::new(|| {
+            struct AlwaysFails;
+            #[async_trait::async_trait]
+            impl MessagePublisher for AlwaysFails {
+                async fn send_batch(
+                    &self,
+                    _: Vec<crate::CanonicalMessage>,
+                ) -> Result<SentBatch, PublisherError> {
+                    Err(PublisherError::Retryable(anyhow::anyhow!("leg refused")))
+                }
+                fn as_any(&self) -> &dyn Any {
+                    self
+                }
+            }
+            Ok(Box::new(AlwaysFails) as Box<dyn MessagePublisher>)
+        }));
+        register_endpoint_factory(&factory_name, Arc::new(factory));
+
+        let dir = tempfile::tempdir().unwrap();
+        let in_path = dir.path().join("fan_in.jsonl");
+        std::fs::write(&in_path, "a\n").unwrap();
+        let good_path = dir.path().join("fan_good.jsonl");
+        let dlq_path = dir.path().join("fan_dlq.jsonl");
+
+        let raw_file = |path: &std::path::Path| {
+            Endpoint::new(EndpointType::File(crate::models::FileConfig {
+                path: path.to_str().unwrap().to_string(),
+                format: crate::models::FileFormat::Raw,
+                ..Default::default()
+            }))
+        };
+
+        let mut failing_leg = Endpoint::new(EndpointType::Custom {
+            name: factory_name,
+            config: serde_json::Value::Null,
+        });
+        failing_leg.middlewares = vec![
+            crate::models::Middleware::Retry(crate::models::RetryMiddleware {
+                max_attempts: 2,
+                initial_interval_ms: 1,
+                max_interval_ms: 2,
+                multiplier: 1.0,
+            }),
+            crate::models::Middleware::Dlq(Box::new(crate::models::DeadLetterQueueMiddleware {
+                endpoint: raw_file(&dlq_path),
+            })),
+        ];
+
+        let output = Endpoint::new(EndpointType::Fanout(vec![
+            raw_file(&good_path),
+            failing_leg,
+        ]));
+
+        let handle = Route::new(raw_file(&in_path), output)
+            .with_exit_on_empty(true)
+            .with_batch_size(1)
+            .with_reconnect_interval_ms(10)
+            .run("test_fanout_leg_dlq")
+            .await
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(15), async {
+            while handle.outcome().is_none() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("route never finished");
+        Route::stop("test_fanout_leg_dlq").await;
+
+        let dlq = std::fs::read_to_string(&dlq_path).unwrap_or_default();
+        assert!(
+            dlq.contains('a'),
+            "the fanout leg's own dlq never received the failed message, got {dlq:?}"
+        );
+    }
+
+    /// The reported N20 shape verbatim: a real `http` leg pointed at a closed port. The mock
+    /// above only proves the wiring; this proves the classification an unreachable sink
+    /// actually produces still reaches that leg's dlq.
+    #[cfg(feature = "http")]
+    #[tokio::test]
+    async fn test_fanout_http_leg_dead_letters_a_connection_refusal() {
+        #[cfg(feature = "rustls-aws-lc")]
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        #[cfg(all(feature = "rustls-ring", not(feature = "rustls-aws-lc")))]
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let dir = tempfile::tempdir().unwrap();
+        let in_path = dir.path().join("http_fan_in.jsonl");
+        std::fs::write(&in_path, "a\n").unwrap();
+        let good_path = dir.path().join("http_fan_good.jsonl");
+        let dlq_path = dir.path().join("http_fan_dlq.jsonl");
+
+        let raw_file = |path: &std::path::Path| {
+            Endpoint::new(EndpointType::File(crate::models::FileConfig {
+                path: path.to_str().unwrap().to_string(),
+                format: crate::models::FileFormat::Raw,
+                ..Default::default()
+            }))
+        };
+
+        let mut dead_leg = Endpoint::new(EndpointType::Http(crate::models::HttpConfig {
+            url: "http://127.0.0.1:1/dead".to_string(),
+            request_timeout_ms: Some(500),
+            ..Default::default()
+        }));
+        dead_leg.middlewares = vec![
+            crate::models::Middleware::Retry(crate::models::RetryMiddleware {
+                max_attempts: 2,
+                initial_interval_ms: 1,
+                max_interval_ms: 2,
+                multiplier: 1.0,
+            }),
+            crate::models::Middleware::Dlq(Box::new(crate::models::DeadLetterQueueMiddleware {
+                endpoint: raw_file(&dlq_path),
+            })),
+        ];
+
+        let output = Endpoint::new(EndpointType::Fanout(vec![raw_file(&good_path), dead_leg]));
+
+        let handle = Route::new(raw_file(&in_path), output)
+            .with_exit_on_empty(true)
+            .with_batch_size(1)
+            .with_reconnect_interval_ms(10)
+            .run("test_fanout_http_leg_dlq")
+            .await
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while handle.outcome().is_none() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("route never finished");
+        Route::stop("test_fanout_http_leg_dlq").await;
+
+        let dlq = std::fs::read_to_string(&dlq_path).unwrap_or_default();
+        assert!(
+            dlq.contains('a'),
+            "the http leg's own dlq never received the failed message, got {dlq:?}"
+        );
+    }
+
+    /// A `Connection` failure is deliberately never dead-lettered: `retry` does not retry it
+    /// and `dlq` propagates it so the route reconnects instead of dead-lettering a whole
+    /// backlog while a sink is merely down. That has to hold identically inside and outside a
+    /// fanout — a leg must not be the reason a message stops reaching its dlq.
+    #[tokio::test]
+    async fn test_connection_failures_bypass_the_dlq_identically_in_and_out_of_a_fanout() {
+        async fn dlq_content_for(in_fanout: bool) -> String {
+            let factory_name = format!("conn_fail_{}", fast_uuid_v7::gen_id());
+            let mut factory = MockEndpointFactory::new();
+            factory.publisher_behavior = Arc::new(Mutex::new(|| {
+                struct Disconnected;
+                #[async_trait::async_trait]
+                impl MessagePublisher for Disconnected {
+                    async fn send_batch(
+                        &self,
+                        _: Vec<crate::CanonicalMessage>,
+                    ) -> Result<SentBatch, PublisherError> {
+                        Err(PublisherError::Connection(anyhow::anyhow!(
+                            "Simulated connection loss"
+                        )))
+                    }
+                    fn as_any(&self) -> &dyn Any {
+                        self
+                    }
+                }
+                Ok(Box::new(Disconnected) as Box<dyn MessagePublisher>)
+            }));
+            register_endpoint_factory(&factory_name, Arc::new(factory));
+
+            let dir = tempfile::tempdir().unwrap();
+            let in_path = dir.path().join("in.jsonl");
+            std::fs::write(&in_path, "a\n").unwrap();
+            let dlq_path = dir.path().join("dlq.jsonl");
+            let good_path = dir.path().join("good.jsonl");
+            let raw_file = |path: &std::path::Path| {
+                Endpoint::new(EndpointType::File(crate::models::FileConfig {
+                    path: path.to_str().unwrap().to_string(),
+                    format: crate::models::FileFormat::Raw,
+                    ..Default::default()
+                }))
+            };
+
+            let mut failing = Endpoint::new(EndpointType::Custom {
+                name: factory_name,
+                config: serde_json::Value::Null,
+            });
+            failing.middlewares = vec![
+                crate::models::Middleware::Retry(crate::models::RetryMiddleware {
+                    max_attempts: 2,
+                    initial_interval_ms: 1,
+                    max_interval_ms: 2,
+                    multiplier: 1.0,
+                }),
+                crate::models::Middleware::Dlq(Box::new(
+                    crate::models::DeadLetterQueueMiddleware {
+                        endpoint: raw_file(&dlq_path),
+                    },
+                )),
+            ];
+            let output = if in_fanout {
+                Endpoint::new(EndpointType::Fanout(vec![raw_file(&good_path), failing]))
+            } else {
+                failing
+            };
+
+            let route_name = format!("conn_dlq_{in_fanout}");
+            let handle = Route::new(raw_file(&in_path), output)
+                .with_exit_on_empty(true)
+                .with_batch_size(1)
+                .with_reconnect_interval_ms(10)
+                .run(&route_name)
+                .await
+                .unwrap();
+            let _ = tokio::time::timeout(Duration::from_secs(15), async {
+                while handle.outcome().is_none() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await;
+            Route::stop(&route_name).await;
+            std::fs::read_to_string(&dlq_path).unwrap_or_default()
+        }
+
+        assert_eq!(
+            dlq_content_for(true).await,
+            dlq_content_for(false).await,
+            "a fanout leg must dead-letter a connection failure the same way a sole output does"
+        );
+    }
+
+    /// Same as above but driven by an `http` webhook input, which is the shape the finding
+    /// was reported in — a request/reply consumer, not a file drain.
+    #[cfg(feature = "http")]
+    #[tokio::test]
+    async fn test_fanout_leg_dlq_works_behind_an_http_webhook_input() {
+        #[cfg(feature = "rustls-aws-lc")]
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        #[cfg(all(feature = "rustls-ring", not(feature = "rustls-aws-lc")))]
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let dir = tempfile::tempdir().unwrap();
+        let good_path = dir.path().join("wh_good.jsonl");
+        let dlq_path = dir.path().join("wh_dlq.jsonl");
+        let raw_file = |path: &std::path::Path| {
+            Endpoint::new(EndpointType::File(crate::models::FileConfig {
+                path: path.to_str().unwrap().to_string(),
+                format: crate::models::FileFormat::Raw,
+                ..Default::default()
+            }))
+        };
+
+        let port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        let input = Endpoint::new(EndpointType::Http(crate::models::HttpConfig {
+            url: format!("127.0.0.1:{port}"),
+            fire_and_forget: true,
+            ..Default::default()
+        }));
+
+        let mut dead_leg = Endpoint::new(EndpointType::Http(crate::models::HttpConfig {
+            url: "http://127.0.0.1:1/dead".to_string(),
+            request_timeout_ms: Some(500),
+            ..Default::default()
+        }));
+        dead_leg.middlewares = vec![
+            crate::models::Middleware::Retry(crate::models::RetryMiddleware {
+                max_attempts: 2,
+                initial_interval_ms: 1,
+                max_interval_ms: 2,
+                multiplier: 1.0,
+            }),
+            crate::models::Middleware::Dlq(Box::new(crate::models::DeadLetterQueueMiddleware {
+                endpoint: raw_file(&dlq_path),
+            })),
+        ];
+        let output = Endpoint::new(EndpointType::Fanout(vec![raw_file(&good_path), dead_leg]));
+
+        let _handle = Route::new(input, output)
+            .run("test_fanout_webhook_dlq")
+            .await
+            .unwrap();
+
+        let addr = format!("127.0.0.1:{port}");
+        for _ in 0..200 {
+            if tokio::net::TcpStream::connect(&addr).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let client = reqwest::Client::new();
+        client
+            .post(format!("http://{addr}/"))
+            .body(r#"{"order_id":"o1"}"#)
+            .send()
+            .await
+            .expect("webhook POST failed");
+
+        let mut dlq = String::new();
+        for _ in 0..200 {
+            dlq = std::fs::read_to_string(&dlq_path).unwrap_or_default();
+            if dlq.contains("o1") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        Route::stop("test_fanout_webhook_dlq").await;
+
+        assert!(
+            dlq.contains("o1"),
+            "the fanout leg's dlq never received the failed message, got {dlq:?}"
+        );
+    }
+
     // The flip side of the test above: gating health on "the pass stayed up" must not
     // leave a route that recovered stuck reporting the failure forever.
     #[tokio::test(start_paused = true)]

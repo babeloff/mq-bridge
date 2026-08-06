@@ -1505,7 +1505,7 @@ impl SledConfig {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum FileFormat {
-    /// The full `CanonicalMessage` is serialized to JSON. Payload is a byte array.
+    /// The full `CanonicalMessage` is serialized to JSON. Payload is either base64 or utf8 text.
     #[default]
     Normal,
     /// The full `CanonicalMessage` is serialized to JSON. Payload is rendered as a JSON value if possible.
@@ -3363,6 +3363,8 @@ pub struct SqlxConfig {
     pub idle_timeout_ms: Option<u64>,
     /// Maximum lifetime of a connection in milliseconds. Defaults to 1800000ms (30 minutes).
     pub max_lifetime_ms: Option<u64>,
+    /// Ping each pooled connection before handing it out (default false). Costs a round-trip per acquire.
+    pub test_before_acquire: Option<bool>,
     /// Share one connection pool per connection (default: true); false forces a dedicated pool.
     #[serde(default)]
     #[cfg_attr(feature = "schema", schemars(default = "default_shared_schema"))]

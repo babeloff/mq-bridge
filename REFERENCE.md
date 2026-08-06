@@ -94,9 +94,10 @@ middlewares:
 **Putting a middleware on the wrong side behaves in two different ways**, so check the table
 above rather than assuming:
 
-- `deduplication` on an output, and `dlq` / `retry` on an input, log a warning and are
-  skipped. The route still starts.
-- `weak_join` on an output is a **hard startup error** (`Unsupported publisher middleware`).
+- `dlq` / `retry` on an input log a warning and are skipped. The route still starts.
+- `deduplication` and `weak_join` on an output are **hard startup errors**. Deduplication
+  cannot work on the publish side, and silently starting an un-deduplicated route is worse
+  than refusing to start.
 
 A middleware whose feature is not compiled in (`deduplication` without `dedup`, `metrics`
 without `metrics`) is likewise a startup error, not a silent no-op.
@@ -147,8 +148,10 @@ error that error propagates rather than silently dropping the message.
 error the sink rejects — is logged at `error` level and
 **dropped**, and the route keeps processing the rest of the batch. `dlq` is the only retention
 mechanism: `retry` alone does not retain a permanently-failed message nor prevent it from being
-dropped — it only re-attempts retryable/connection errors, then hands a still-failing message on
-to be dropped (or to a following `dlq`). This tolerate-and-continue
+dropped — it only re-attempts `Retryable` errors (a connection error is passed straight through
+for the route to reconnect on, not retried), then hands a still-failing message on to be dropped
+(or to a following `dlq`). This is why a sink that fails with a *connection* error never reaches
+its `dlq`, whether it is a route's sole output or one leg of a `fanout`. This tolerate-and-continue
 policy keeps one bad message from halting the whole stream, but it means a *systematic* failure
 (e.g. every row hitting a column-type mismatch) drains the input while committing nothing and
 still ends `completed`. Add a `dlq` to capture the failures for inspection/replay, or watch the
@@ -544,6 +547,15 @@ Deliberate fault injection for testing recovery paths. Input and output.
 `disconnect` and `timeout` produce retryable errors; `json_format_error` produces a
 non-retryable one — useful for exercising a `dlq`. Keep `enabled: false` in committed configs
 rather than deleting the block.
+
+On the **input** side, `json_format_error`/`nack` never call the real consumer at all — they
+substitute a synthetic message (or error) on every triggered `receive`. Leaving
+`trigger_on_message` unset means *every* poll is faulted, so the real source is never read and
+`exit_on_empty`/`--drain` never sees the empty batch it waits for — the route runs forever,
+manufacturing synthetic messages. Always set `trigger_on_message` to a specific count when
+testing a drain-mode route with input-side fault injection. And since `dlq`/`retry` on an input
+are no-ops (see above), pair an input-side fault with a real assertion on the *consumer's*
+recovery, not a `dlq`.
 
 The middleware block alone is **not** enough: fault injection is gated per route by
 `allow_fault_injection`, which defaults to `false`. Copying only the snippet above leaves the

@@ -134,11 +134,13 @@ pub async fn apply_middlewares_to_publisher(
             Middleware::Metrics(cfg) => {
                 Box::new(MetricsPublisher::new(publisher, cfg, route_name, "output"))
             }
-            // This middleware is consumer-only
+            // Consumer-only. Accepting it here used to warn and do nothing, which silently
+            // left a route un-deduplicated; `weak_join` already fails fast the same way.
             #[cfg(feature = "dedup")]
             Middleware::Deduplication(_) => {
-                tracing::warn!("Deduplication middleware is ignored on publishers (output endpoints). It should be configured on the input endpoint.");
-                publisher
+                return Err(anyhow::anyhow!(
+                    "[middleware:{route_name}] deduplication is a consumer-only middleware and does nothing on an output endpoint. Move it to the route's input endpoint."
+                ))
             }
             Middleware::Retry(cfg) => Box::new(RetryPublisher::new(publisher, cfg.clone())),
             Middleware::Delay(cfg) => Box::new(DelayPublisher::new(publisher, cfg)),
@@ -169,4 +171,39 @@ pub async fn apply_middlewares_to_publisher(
         };
     }
     Ok(publisher.into())
+}
+
+#[cfg(all(test, feature = "dedup"))]
+mod tests {
+    use super::*;
+    use crate::models::{DeduplicationMiddleware, EndpointType};
+
+    /// Deduplication cannot work on the publish side. It used to warn and no-op, which left a
+    /// route running with no deduplication at all and no way to notice.
+    #[tokio::test]
+    async fn deduplication_on_an_output_endpoint_fails_fast() {
+        let mut endpoint = Endpoint::new(EndpointType::Null);
+        endpoint.middlewares = vec![Middleware::Deduplication(DeduplicationMiddleware {
+            store: None,
+            sled_path: None,
+            ttl_seconds: 60,
+            key: None,
+        })];
+
+        let result = apply_middlewares_to_publisher(
+            Box::new(crate::endpoints::structural::null::NullPublisher),
+            &endpoint,
+            "dedup_output",
+        )
+        .await;
+        let err = match result {
+            Ok(_) => panic!("deduplication on an output must not be silently accepted"),
+            Err(err) => err,
+        };
+
+        assert!(
+            err.to_string().contains("consumer-only"),
+            "error should say why, got {err}"
+        );
+    }
 }
