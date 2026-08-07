@@ -6,6 +6,8 @@
 ![Linux](https://img.shields.io/badge/Linux-supported-green?logo=linux)
 ![Windows](https://img.shields.io/badge/Windows-supported-green?logo=windows)
 ![macOS](https://img.shields.io/badge/macOS-supported-green?logo=apple)
+[![Supply chain](https://img.shields.io/badge/supply%20chain-cargo--deny-blue)](deny.toml)
+[![Security](https://img.shields.io/badge/security-advisory%20analysis-brightgreen)](SECURITY.md)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 
