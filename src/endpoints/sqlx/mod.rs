@@ -155,6 +155,32 @@ fn binds_after_values(sql: &str) -> bool {
     })
 }
 
+/// True when `tuple` (including its outer parens) is nothing but comma-separated
+/// positional placeholders, i.e. the batch rebuild can regenerate it losslessly.
+/// Anything else — `decode($1, 'base64')`, `$1::bytea`, `now()`, a literal — must keep
+/// the user's own SQL.
+fn tuple_is_bare_placeholders(tuple: &str, driver_name: &str) -> bool {
+    let inner = tuple
+        .trim()
+        .strip_prefix('(')
+        .and_then(|s| s.strip_suffix(')'));
+    let Some(inner) = inner else {
+        return false;
+    };
+    inner.split(',').all(|part| {
+        let part = part.trim();
+        match driver_name {
+            "PostgreSQL" => part
+                .strip_prefix('$')
+                .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())),
+            "Microsoft SQL Server" => part
+                .strip_prefix("@p")
+                .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())),
+            _ => part == "?",
+        }
+    })
+}
+
 /// Parse `${metadata:<key>}` / `${payload:<field>}` tokens out of an `insert_query`,
 /// rewriting each into a driver-appropriate positional placeholder assigned a running
 /// 1-based index in encounter order. Returns the rewritten query and the ordered
@@ -257,17 +283,38 @@ fn bind_value(query: AnyQuery<'_>, value: BindValue) -> AnyQuery<'_> {
     }
 }
 
+/// Reject a string carrying an embedded NUL. `text`/`varchar` cannot represent one on
+/// PostgreSQL or MySQL, and the driver dropped the bind instead of failing — the row
+/// landed with a silent SQL `NULL` while the route reported a clean success.
+fn reject_embedded_nul(source: &ColumnSource, value: &BindValue) -> Result<(), PublisherError> {
+    let BindValue::Text(s) = value else {
+        return Ok(());
+    };
+    if !s.contains('\0') {
+        return Ok(());
+    }
+    let (kind, name) = match source {
+        ColumnSource::Metadata(k) => ("metadata", k),
+        ColumnSource::Payload(f) => ("payload", f),
+    };
+    Err(PublisherError::NonRetryable(anyhow!(
+        "${{{kind}:{name}}} contains an embedded NUL byte, which a SQL text column cannot store"
+    )))
+}
+
 /// Parse the payload as JSON once, then resolve+bind every column source for one row.
 fn bind_message_sources<'q>(
     mut query: AnyQuery<'q>,
     msg: &CanonicalMessage,
     sources: &[ColumnSource],
-) -> AnyQuery<'q> {
+) -> Result<AnyQuery<'q>, PublisherError> {
     let payload_json: Option<serde_json::Value> = serde_json::from_slice(&msg.payload).ok();
     for source in sources {
-        query = bind_value(query, resolve_source(msg, source, &payload_json));
+        let value = resolve_source(msg, source, &payload_json);
+        reject_embedded_nul(source, &value)?;
+        query = bind_value(query, value);
     }
-    query
+    Ok(query)
 }
 
 fn build_sqlx_url_with_tls(config: &SqlxConfig) -> anyhow::Result<String> {
@@ -365,6 +412,10 @@ async fn create_sqlx_pool(config: &SqlxConfig) -> anyhow::Result<AnyPool> {
     if let Some(lifetime) = config.max_lifetime_ms {
         pool_options = pool_options.max_lifetime(Duration::from_millis(lifetime));
     }
+    // sqlx defaults this to true, which pings the server on every acquire — a second round-trip
+    // per batch. Dead connections instead surface as a query error, which the route already
+    // reconnects on.
+    pool_options = pool_options.test_before_acquire(config.test_before_acquire.unwrap_or(false));
 
     Ok(pool_options.connect(&url).await?)
 }
@@ -725,6 +776,8 @@ impl SqlxPublisher {
             let url = build_sqlx_url_with_tls(config)?;
             let pg_pool = PgPoolOptions::new()
                 .max_connections(config.max_connections.unwrap_or(5))
+                // Match `create_sqlx_pool`: no liveness ping per acquire.
+                .test_before_acquire(config.test_before_acquire.unwrap_or(false))
                 .connect(&url)
                 .await
                 .context("bulk_copy: failed to open native PostgreSQL pool")?;
@@ -758,7 +811,7 @@ impl MessagePublisher for SqlxPublisher {
         let query = if self.column_sources.is_empty() {
             query.bind(message.payload.to_vec())
         } else {
-            bind_message_sources(query, &message, &self.column_sources)
+            bind_message_sources(query, &message, &self.column_sources)?
         };
         query
             .execute(&self.pool)
@@ -795,7 +848,7 @@ impl MessagePublisher for SqlxPublisher {
         // KEY UPDATE, RETURNING). Single-row send() keeps it verbatim; without this the batch
         // rebuild would silently drop it, making batched inserts non-idempotent.
         let after_values = values_pos + "VALUES".len();
-        let values_suffix = match self.insert_query[after_values..].find('(') {
+        let (values_tuple, values_suffix) = match self.insert_query[after_values..].find('(') {
             Some(rel_open) => {
                 let open = after_values + rel_open;
                 let mut depth = 0usize;
@@ -813,10 +866,22 @@ impl MessagePublisher for SqlxPublisher {
                         _ => {}
                     }
                 }
-                end.map(|e| &self.insert_query[e..]).unwrap_or("")
+                match end {
+                    Some(e) => (&self.insert_query[open..e], &self.insert_query[e..]),
+                    None => ("", ""),
+                }
             }
-            None => "",
+            None => ("", ""),
         };
+
+        // The rebuild below emits a tuple of bare placeholders, so anything else the user
+        // wrote inside the tuple — a cast, `decode(…, 'base64')` for a bytea column, a
+        // function call, a literal — would be dropped and the value bound raw against the
+        // target column's type. Single-row `send()` keeps the tuple verbatim.
+        if !tuple_is_bare_placeholders(values_tuple, &self.driver_name) {
+            warn!("insert_query's VALUES tuple contains an expression, not just tokens. Falling back to iterative inserts.");
+            return self.send_batch_iterative(messages).await;
+        }
 
         // A token after the VALUES tuple (e.g. `ON CONFLICT … DO UPDATE SET v = ${payload:v}`)
         // was already rewritten to a placeholder by `parse_insert_template`, numbered for the
@@ -862,7 +927,7 @@ impl MessagePublisher for SqlxPublisher {
             if self.column_sources.is_empty() {
                 query = query.bind(msg.payload.to_vec());
             } else {
-                query = bind_message_sources(query, msg, &self.column_sources);
+                query = bind_message_sources(query, msg, &self.column_sources)?;
             }
         }
 
@@ -915,7 +980,9 @@ impl SqlxPublisher {
                 if i > 0 {
                     buf.push('\t');
                 }
-                match resolve_source(msg, source, &payload_json) {
+                let value = resolve_source(msg, source, &payload_json);
+                reject_embedded_nul(source, &value)?;
+                match value {
                     BindValue::Null => buf.push_str("\\N"),
                     BindValue::Int(n) => buf.push_str(&n.to_string()),
                     BindValue::Float(f) => buf.push_str(&f.to_string()),
@@ -960,7 +1027,7 @@ impl SqlxPublisher {
             let query = if self.column_sources.is_empty() {
                 query.bind(msg.payload.to_vec())
             } else {
-                bind_message_sources(query, msg, &self.column_sources)
+                bind_message_sources(query, msg, &self.column_sources)?
             };
             query.execute(&mut *tx).await.map_err(classify_sql_error)?;
         }
@@ -1443,93 +1510,137 @@ impl SqlCursor {
 
 /// Serialize a full row into a JSON object payload (`{column: value, ...}`), trying the
 /// value types the `Any` driver supports. Unknown/unsupported types bind to JSON null.
-fn row_to_json(row: &sqlx::any::AnyRow) -> serde_json::Value {
-    let mut map = serde_json::Map::with_capacity(row.columns().len());
-    for col in row.columns() {
-        map.insert(col.name().to_string(), extract_json_value(row, col));
+/// One column's pre-rendered JSON key. Every row of a batch shares the query's column
+/// list, so resolving this per row only re-allocated the same key strings. The value
+/// *kind* is deliberately not cached — see [`JsonRowSchema::encode_row`].
+struct JsonColumn {
+    /// `"name":` — quoted, escaped and colon-terminated, ready to memcpy into a payload.
+    key: Vec<u8>,
+    ordinal: usize,
+}
+
+/// The column layout of a batch, resolved once from its first row.
+struct JsonRowSchema {
+    columns: Vec<JsonColumn>,
+}
+
+impl JsonRowSchema {
+    fn from_row(row: &sqlx::any::AnyRow) -> Self {
+        let columns = row
+            .columns()
+            .iter()
+            .map(|col| {
+                let mut key = Vec::new();
+                // Serialize the name so column names containing `"` or `\` stay valid JSON.
+                let _ = serde_json::to_writer(&mut key, col.name());
+                key.push(b':');
+                JsonColumn {
+                    key,
+                    ordinal: col.ordinal(),
+                }
+            })
+            .collect();
+        Self { columns }
     }
-    serde_json::Value::Object(map)
+
+    /// Write one row as a JSON object straight into `buf`. Going through
+    /// `serde_json::Map`/`Value` first allocated a `String` per key per row and copied every
+    /// text value an extra time before the final serialization pass.
+    ///
+    /// The value kind is read from the row being encoded, not cached with the column:
+    /// SQLite types a *value*, not a column, so `Any` can report a different kind per row.
+    /// Caching row 1's kind decoded later rows as the wrong type — and a NULL first row
+    /// pinned the whole column to `null`.
+    fn encode_row(&self, row: &sqlx::any::AnyRow, buf: &mut Vec<u8>) {
+        buf.push(b'{');
+        for (i, col) in self.columns.iter().enumerate() {
+            if i > 0 {
+                buf.push(b',');
+            }
+            buf.extend_from_slice(&col.key);
+            let kind = value_kind(row, col.ordinal).unwrap_or(sqlx::any::AnyTypeInfoKind::Null);
+            write_json_value(row, col.ordinal, kind, buf);
+        }
+        buf.push(b'}');
+    }
+}
+
+/// The type of the *value* at `idx`, not of the column. `AnyRow` builds its columns from the
+/// statement's column metadata (one fixed kind for the whole result set), but stores each
+/// decoded value's own kind — which is what SQLite actually types. Reading the kind off the
+/// column pinned every row to the declared/inferred type, so a text or blob value in an
+/// `INTEGER`-typed column (or any value in a column SQLite typed from a NULL) decoded wrong.
+fn value_kind(row: &sqlx::any::AnyRow, idx: usize) -> Option<sqlx::any::AnyTypeInfoKind> {
+    use sqlx::ValueRef;
+    Some(row.try_get_raw(idx).ok()?.type_info().kind())
+}
+
+/// Append a JSON-encoded scalar, or `null` when the value is absent or fails to decode.
+/// Only non-finite floats can fail mid-write, and serde_json emits `null` for those before
+/// writing anything, so a partial value can never land in `buf`.
+fn write_opt<T: serde::Serialize>(buf: &mut Vec<u8>, value: Result<Option<T>, sqlx::Error>) {
+    match value {
+        Ok(Some(v)) if serde_json::to_writer(&mut *buf, &v).is_ok() => {}
+        _ => buf.extend_from_slice(b"null"),
+    }
 }
 
 /// Decode one column's value straight to its known `AnyTypeInfoKind`, instead of guessing
 /// via a cascade of `try_get::<T>` calls (each of which round-trips through `Any`'s dynamic
 /// dispatch and fails before the right type is found). This is the hot path for the cursor
 /// reader, so avoiding N wasted decode attempts per column matters at scale.
-fn extract_json_value(
-    row: &sqlx::any::AnyRow,
-    col: &<sqlx::Any as sqlx::Database>::Column,
-) -> serde_json::Value {
-    use serde_json::Value;
-    use sqlx::any::AnyTypeInfoKind;
-    let idx = col.ordinal();
-    match col.type_info().kind() {
-        AnyTypeInfoKind::Null => Value::Null,
-        AnyTypeInfoKind::Bool => row
-            .try_get::<Option<bool>, _>(idx)
-            .ok()
-            .flatten()
-            .map(Value::from)
-            .unwrap_or(Value::Null),
-        AnyTypeInfoKind::SmallInt | AnyTypeInfoKind::Integer | AnyTypeInfoKind::BigInt => row
-            .try_get::<Option<i64>, _>(idx)
-            .ok()
-            .flatten()
-            .map(Value::from)
-            .unwrap_or(Value::Null),
-        AnyTypeInfoKind::Real => row
-            .try_get::<Option<f32>, _>(idx)
-            .ok()
-            .flatten()
-            .map(|v| Value::from(v as f64))
-            .unwrap_or(Value::Null),
-        AnyTypeInfoKind::Double => row
-            .try_get::<Option<f64>, _>(idx)
-            .ok()
-            .flatten()
-            .map(Value::from)
-            .unwrap_or(Value::Null),
-        AnyTypeInfoKind::Text => row
-            .try_get::<Option<String>, _>(idx)
-            .ok()
-            .flatten()
-            .map(Value::from)
-            .unwrap_or(Value::Null),
-        AnyTypeInfoKind::Blob => row
-            .try_get::<Option<Vec<u8>>, _>(idx)
-            .ok()
-            .flatten()
-            // Bytes have no JSON scalar; expose as a base16 string so the copy is lossless-ish.
-            // Hand-rolled nibble encoding: `format!` per byte allocates a String per byte.
-            .map(|b| {
-                const HEX: &[u8; 16] = b"0123456789abcdef";
-                let mut s = String::with_capacity(b.len() * 2);
-                for x in &b {
-                    s.push(HEX[(x >> 4) as usize] as char);
-                    s.push(HEX[(x & 0x0f) as usize] as char);
-                }
-                Value::from(s)
-            })
-            .unwrap_or(Value::Null),
-    }
-}
-
-/// Resolve the cursor column's ordinal and kind once per batch (same query, same column
-/// order for every row) instead of re-resolving the name -> ordinal lookup on every row.
-fn resolve_cursor_column(
-    row: &sqlx::any::AnyRow,
-    column: &str,
-) -> Option<(usize, sqlx::any::AnyTypeInfoKind)> {
-    let col = row.try_column(column).ok()?;
-    Some((col.ordinal(), col.type_info().kind()))
-}
-
-fn extract_cursor_at(
+///
+/// Text and blobs are borrowed (`&str`/`&[u8]`), not owned: `Any` already materialized them
+/// into an `Arc<String>`/`Arc<Vec<u8>>` when it built the row, and decoding to `String`/
+/// `Vec<u8>` copies that a second time for no reason.
+fn write_json_value(
     row: &sqlx::any::AnyRow,
     idx: usize,
     kind: sqlx::any::AnyTypeInfoKind,
-) -> Option<SqlCursor> {
+    buf: &mut Vec<u8>,
+) {
     use sqlx::any::AnyTypeInfoKind;
     match kind {
+        AnyTypeInfoKind::Null => buf.extend_from_slice(b"null"),
+        AnyTypeInfoKind::Bool => write_opt(buf, row.try_get::<Option<bool>, _>(idx)),
+        AnyTypeInfoKind::SmallInt | AnyTypeInfoKind::Integer | AnyTypeInfoKind::BigInt => {
+            write_opt(buf, row.try_get::<Option<i64>, _>(idx))
+        }
+        // Widened to f64 so the rendered decimal matches the old `Value::from(v as f64)`.
+        AnyTypeInfoKind::Real => write_opt(
+            buf,
+            row.try_get::<Option<f32>, _>(idx).map(|v| v.map(f64::from)),
+        ),
+        AnyTypeInfoKind::Double => write_opt(buf, row.try_get::<Option<f64>, _>(idx)),
+        AnyTypeInfoKind::Text => write_opt(buf, row.try_get::<Option<&str>, _>(idx)),
+        // Bytes have no JSON scalar; expose as a base16 string so the copy is lossless-ish.
+        // Hex is ASCII-only, so it needs no escaping and can be written nibble by nibble.
+        AnyTypeInfoKind::Blob => match row.try_get::<Option<&[u8]>, _>(idx) {
+            Ok(Some(b)) => {
+                const HEX: &[u8; 16] = b"0123456789abcdef";
+                buf.reserve(b.len() * 2 + 2);
+                buf.push(b'"');
+                for x in b {
+                    buf.push(HEX[(x >> 4) as usize]);
+                    buf.push(HEX[(x & 0x0f) as usize]);
+                }
+                buf.push(b'"');
+            }
+            _ => buf.extend_from_slice(b"null"),
+        },
+    }
+}
+
+/// Resolve the cursor column's ordinal once per batch (same query, same column order for
+/// every row) instead of re-resolving the name -> ordinal lookup on every row. The kind is
+/// not resolved here — it is per value on SQLite, so [`extract_cursor_at`] reads it per row.
+fn resolve_cursor_column(row: &sqlx::any::AnyRow, column: &str) -> Option<usize> {
+    Some(row.try_column(column).ok()?.ordinal())
+}
+
+fn extract_cursor_at(row: &sqlx::any::AnyRow, idx: usize) -> Option<SqlCursor> {
+    use sqlx::any::AnyTypeInfoKind;
+    match value_kind(row, idx)? {
         AnyTypeInfoKind::SmallInt | AnyTypeInfoKind::Integer | AnyTypeInfoKind::BigInt => row
             .try_get::<Option<i64>, _>(idx)
             .ok()
@@ -1833,13 +1944,29 @@ pub struct SqlxCursorReader {
     table: String,
     cursor_column: String,
     driver_name: String,
-    /// SELECT projection used in place of `*`. On PostgreSQL, columns whose type the
-    /// sqlx `Any` driver cannot map (timestamptz, uuid, numeric, json, arrays, ...) are
-    /// cast to `text` so `fetch_all` does not abort the whole query; other drivers use `*`.
-    projection: String,
     backoff: PollBackoff,
     checkpoint: Option<Arc<dyn crate::checkpoint::CheckpointStore>>,
     last_value: Arc<Mutex<Option<SqlCursor>>>,
+    /// Page queries, built once: only the bound cursor and limit vary between polls.
+    sql_first: String,
+    sql_next: String,
+}
+
+/// Run one keyset page. `from` is the exclusive lower bound (`None` = start of table).
+async fn fetch_page(
+    pool: &AnyPool,
+    sql: &str,
+    from: Option<&SqlCursor>,
+    limit: i64,
+) -> Result<Vec<sqlx::any::AnyRow>, sqlx::Error> {
+    let mut query = sqlx::query(audited_sql(sql));
+    if let Some(c) = from {
+        query = match c {
+            SqlCursor::Int(n) => query.bind(*n),
+            SqlCursor::Text(s) => query.bind(s.clone()),
+        };
+    }
+    query.bind(limit).fetch_all(pool).await
 }
 
 impl SqlxCursorReader {
@@ -1922,12 +2049,29 @@ impl SqlxCursorReader {
 
         let projection = build_cursor_projection(&pool, &driver_name, &config.table).await;
 
+        let sql_first = format!(
+            "SELECT {0} FROM {1} ORDER BY {2} ASC LIMIT {3}",
+            projection,
+            config.table,
+            cursor_column,
+            positional_placeholder(&driver_name, 1),
+        );
+        let sql_next = format!(
+            "SELECT {0} FROM {1} WHERE {2} > {3} ORDER BY {2} ASC LIMIT {4}",
+            projection,
+            config.table,
+            cursor_column,
+            positional_placeholder(&driver_name, 1),
+            positional_placeholder(&driver_name, 2),
+        );
+
         Ok(Self {
             pool,
             table: config.table.clone(),
             cursor_column,
             driver_name,
-            projection,
+            sql_first,
+            sql_next,
             backoff: PollBackoff::new(
                 Duration::from_millis(config.polling_interval_ms.unwrap_or(100)),
                 config.max_polling_interval_ms.map(Duration::from_millis),
@@ -1935,6 +2079,16 @@ impl SqlxCursorReader {
             checkpoint,
             last_value: Arc::new(Mutex::new(last_value)),
         })
+    }
+}
+
+impl SqlxCursorReader {
+    fn page_sql(&self, has_cursor: bool) -> &str {
+        if has_cursor {
+            &self.sql_next
+        } else {
+            &self.sql_first
+        }
     }
 }
 
@@ -1949,38 +2103,13 @@ impl MessageConsumer for SqlxCursorReader {
         }
 
         let last = self.last_value.lock().unwrap().clone();
-        let sql = match &last {
-            Some(_) => format!(
-                "SELECT {0} FROM {1} WHERE {2} > {3} ORDER BY {2} ASC LIMIT {4}",
-                self.projection,
-                self.table,
-                self.cursor_column,
-                positional_placeholder(&self.driver_name, 1),
-                positional_placeholder(&self.driver_name, 2),
-            ),
-            None => format!(
-                "SELECT {0} FROM {1} ORDER BY {2} ASC LIMIT {3}",
-                self.projection,
-                self.table,
-                self.cursor_column,
-                positional_placeholder(&self.driver_name, 1),
-            ),
-        };
-
-        let mut query = sqlx::query(audited_sql(&sql));
-        if let Some(c) = &last {
-            query = match c {
-                SqlCursor::Int(n) => query.bind(*n),
-                SqlCursor::Text(s) => query.bind(s.clone()),
-            };
-        }
         // Peek one extra row beyond the batch so we can detect a run of equal cursor
         // values split across the LIMIT boundary; `col > last` would otherwise skip the
         // remainder of that run (silent row loss for a non-unique cursor_column).
         let fetch_limit = (max_messages as i64).saturating_add(1);
-        query = query.bind(fetch_limit);
 
-        let rows = match query.fetch_all(&self.pool).await {
+        let sql = self.page_sql(last.is_some());
+        let rows = match fetch_page(&self.pool, sql, last.as_ref(), fetch_limit).await {
             Ok(rows) => rows,
             // A decode/type-mapping failure is permanent: the same query will fail identically
             // every poll. Surface it as a non-retryable error so the route stops instead of
@@ -2010,15 +2139,20 @@ impl MessageConsumer for SqlxCursorReader {
         // Rows arrived: return to the base polling interval.
         self.backoff.reset();
 
-        // Resolve the cursor column's position once; every row in this batch shares the
-        // same query/column order, so there's no need to re-resolve it per row.
+        // Resolve column positions and JSON keys once; every row in this batch shares the
+        // same query/column order. Value *kinds* are still read per row (SQLite types
+        // values, not columns).
         let cursor_col = resolve_cursor_column(&rows[0], &self.cursor_column);
+        let schema = JsonRowSchema::from_row(&rows[0]);
 
         // Extract (cursor, message) for every fetched row.
         let mut fetched: Vec<(SqlCursor, CanonicalMessage)> = Vec::with_capacity(rows.len());
+        // Rows of one table are near-uniform in size, so the previous row's length is a good
+        // capacity guess and spares the payload buffer its doubling reallocations.
+        let mut size_hint = 256usize;
         for row in &rows {
             let cursor = cursor_col
-                .and_then(|(idx, kind)| extract_cursor_at(row, idx, kind))
+                .and_then(|idx| extract_cursor_at(row, idx))
                 .ok_or_else(|| {
                     // Schema-level, so re-polling fails identically: permanent, not a reconnect.
                     ConsumerError::Permanent(anyhow!(
@@ -2028,7 +2162,9 @@ impl MessageConsumer for SqlxCursorReader {
                         self.cursor_column
                     ))
                 })?;
-            let payload = serde_json::to_vec(&row_to_json(row)).unwrap_or_default();
+            let mut payload = Vec::with_capacity(size_hint);
+            schema.encode_row(row, &mut payload);
+            size_hint = payload.len() + payload.len() / 8;
             fetched.push((cursor, CanonicalMessage::new(payload, None)));
         }
 

@@ -3,7 +3,10 @@
 //  Licensed under MIT License, see License file for more details
 //  git clone https://github.com/marcomq/mq-bridge
 
-use crate::endpoints::{create_consumer_from_route, create_publisher_from_route};
+use crate::endpoints::{
+    create_consumer_from_route, create_consumer_from_route_with_source_metadata,
+    create_publisher_from_route, output_requires_source_metadata,
+};
 use crate::errors::ProcessingError;
 pub use crate::models::Route;
 use crate::models::{Endpoint, EndpointType, Middleware, RouteOptions};
@@ -314,6 +317,19 @@ fn check_fault_middleware_allowed(
 /// affects `batch_size` smaller than this (larger batches already exceed it in a
 /// single iteration and yield once per batch regardless).
 const YIELD_EVERY_MSGS: usize = 128;
+
+/// How many reconnects in a row a route with `exit_on_empty` may make before it is
+/// declared failed. A drain job that keeps failing on the same pass — an output leg at a
+/// dead address, say — never reaches the empty batch it exits on, so retrying forever
+/// leaves it running with nothing to show. A continuous route has no such bound: coming
+/// back after an outage is the whole point.
+const DRAIN_MAX_RECONNECT_ATTEMPTS: usize = 10;
+
+/// How long a connection has to stay up before the route counts as recovered: the flap
+/// counter resets and the health cell goes back to healthy. Until then a reconnect keeps
+/// the last error visible, so a route that only ever connects and immediately fails is
+/// never reported healthy on the strength of the connect alone.
+const STABLE_RUN: std::time::Duration = std::time::Duration::from_secs(30);
 
 async fn pause_after_empty_batch(delay_ms: u64) {
     if delay_ms > 0 {
@@ -733,10 +749,16 @@ impl Route {
             resolved: None,
         };
 
+        let exit_on_empty = self.options.exit_on_empty;
         let handle = tokio::spawn(async move {
             // The startup `ready` channel is consumed once by `run()`; only the first
             // (re)connect needs to notify it.
             let mut startup_notified = false;
+            // Reconnects since the route last ran stably. Drives both the drain-mode
+            // bound below and the health cell: a route that reconnects on a loop is
+            // flapping, and reporting it `healthy` the moment it connects again hides
+            // exactly the failure an operator is looking for.
+            let mut consecutive_failures = 0usize;
             'reconnect: loop {
                 let route_arc = Arc::clone(&route);
                 let name_arc = Arc::clone(&name);
@@ -767,12 +789,26 @@ impl Route {
                             outcome_guard.set(RouteOutcome::Stopped);
                             break 'reconnect;
                         }
+                        // A pass that stays up this long has recovered: clear the flap
+                        // state and the stale error. Disabled while healthy, so a route
+                        // that never fails never arms the timer.
+                        _ = tokio::time::sleep(STABLE_RUN), if consecutive_failures > 0 => {
+                            consecutive_failures = 0;
+                            let mut s = recover_write_lock(&status_loop, "route_handle_status");
+                            s.healthy = true;
+                            s.error = None;
+                        }
                         Ok(_) = iter_ready_rx.recv() => {
                             // The route (re)connected and is ready to process messages.
+                            // Connected is not the same as healthy while it is still
+                            // failing on every pass: keep the last error visible until the
+                            // pass above proves it stayed up.
                             {
                                 let mut s = recover_write_lock(&status_loop, "route_handle_status");
-                                s.healthy = true;
-                                s.error = None;
+                                if consecutive_failures == 0 {
+                                    s.healthy = true;
+                                    s.error = None;
+                                }
                             }
                             // Forward to the startup `ready` channel so `run()` can return.
                             if !startup_notified {
@@ -803,6 +839,23 @@ impl Route {
                                         let mut s = recover_write_lock(&status_loop, "route_handle_status");
                                         s.healthy = false;
                                         s.error = Some(e.to_string());
+                                        consecutive_failures += 1;
+                                    }
+
+                                    // A drain job is finite: if it cannot get past the same
+                                    // failure it will never reach the empty batch it is
+                                    // waiting for, so bound it instead of retrying forever.
+                                    // A continuous route is meant to reconnect indefinitely.
+                                    if !is_permanent
+                                        && exit_on_empty
+                                        && consecutive_failures >= DRAIN_MAX_RECONNECT_ATTEMPTS
+                                    {
+                                        outcome_guard.set(RouteOutcome::Failed);
+                                        error!(
+                                            "Route '{}' failed {} times in a row while draining; giving up. Last error: {}",
+                                            name, consecutive_failures, e
+                                        );
+                                        break 'reconnect;
                                     }
 
                                     if is_permanent {
@@ -832,6 +885,19 @@ impl Route {
                                         let mut s = recover_write_lock(&status_loop, "route_handle_status");
                                         s.healthy = false;
                                         s.error = Some(format!("route task panicked: {}", e));
+                                        consecutive_failures += 1;
+                                    }
+                                    // Same bound as the error arm: a drain whose task keeps
+                                    // panicking will never reach its empty batch.
+                                    if exit_on_empty
+                                        && consecutive_failures >= DRAIN_MAX_RECONNECT_ATTEMPTS
+                                    {
+                                        outcome_guard.set(RouteOutcome::Failed);
+                                        error!(
+                                            "Route '{}' panicked {} times in a row while draining; giving up. Last error: {}",
+                                            name, consecutive_failures, e
+                                        );
+                                        break 'reconnect;
                                     }
                                     error!(
                                         "Route '{}' task panicked: {}. Reconnecting in {}ms...",
@@ -913,8 +979,14 @@ impl Route {
         shutdown_rx: async_channel::Receiver<()>,
         ready_tx: Option<Sender<()>>,
     ) -> anyhow::Result<bool> {
+        let source_metadata_required = output_requires_source_metadata(name, &self.output)?;
         let publisher = create_publisher_from_route(name, &self.output).await?;
-        let mut consumer = create_consumer_from_route(name, &self.input).await?;
+        let mut consumer = create_consumer_from_route_with_source_metadata(
+            name,
+            &self.input,
+            source_metadata_required,
+        )
+        .await?;
         consumer.set_exit_on_empty(self.options.exit_on_empty);
         if let Err(err) = run_publisher_connect_hook(name, &publisher).await {
             run_publisher_disconnect_hook(name, &publisher).await;
@@ -1046,8 +1118,14 @@ impl Route {
         shutdown_rx: async_channel::Receiver<()>,
         ready_tx: Option<Sender<()>>,
     ) -> anyhow::Result<bool> {
+        let source_metadata_required = output_requires_source_metadata(name, &self.output)?;
         let publisher = create_publisher_from_route(name, &self.output).await?;
-        let mut consumer = create_consumer_from_route(name, &self.input).await?;
+        let mut consumer = create_consumer_from_route_with_source_metadata(
+            name,
+            &self.input,
+            source_metadata_required,
+        )
+        .await?;
         consumer.set_exit_on_empty(self.options.exit_on_empty);
         if let Err(err) = run_publisher_connect_hook(name, &publisher).await {
             run_publisher_disconnect_hook(name, &publisher).await;
@@ -2880,6 +2958,652 @@ mod tests {
 
         handle.stop().await;
         let _ = handle.join().await;
+    }
+
+    // N3 (regression): `retry` used to wrap the handler, so a sink that retried N times
+    // ran the handler N times for the same message — every side effect in it repeated.
+    // The handler now sits outside the middlewares and runs once; only the publish is
+    // retried.
+    #[tokio::test]
+    async fn test_retry_does_not_re_invoke_the_handler() {
+        let unique_id = fast_uuid_v7::gen_id().to_string();
+        let factory_name = format!("retry_handler_{}", unique_id);
+
+        let sends = Arc::new(AtomicUsize::new(0));
+        let sends_pub = sends.clone();
+        let mut factory = MockEndpointFactory::new();
+        factory.publisher_behavior = Arc::new(Mutex::new(move || {
+            struct CountingFailPublisher(Arc<AtomicUsize>);
+            #[async_trait::async_trait]
+            impl MessagePublisher for CountingFailPublisher {
+                async fn send_batch(
+                    &self,
+                    _: Vec<crate::CanonicalMessage>,
+                ) -> Result<SentBatch, PublisherError> {
+                    self.0.fetch_add(1, Ordering::SeqCst);
+                    Err(PublisherError::Retryable(anyhow::anyhow!("sink down")))
+                }
+                fn as_any(&self) -> &dyn Any {
+                    self
+                }
+            }
+            Ok(Box::new(CountingFailPublisher(sends_pub.clone())) as Box<dyn MessagePublisher>)
+        }));
+        register_endpoint_factory(&factory_name, Arc::new(factory));
+
+        let handler_calls = Arc::new(AtomicUsize::new(0));
+        let handler_calls_inner = handler_calls.clone();
+        let handler = move |msg: crate::CanonicalMessage| {
+            let calls = handler_calls_inner.clone();
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(crate::Handled::Publish(msg))
+            }
+        };
+
+        let in_topic = format!("retry_handler_in_{}", unique_id);
+        let input = Endpoint::new_memory(&in_topic, 10);
+        let input_ch = input.channel().unwrap();
+
+        const ATTEMPTS: usize = 4;
+        let mut output = Endpoint {
+            endpoint_type: EndpointType::Custom {
+                name: factory_name,
+                config: serde_json::Value::Null,
+            },
+            middlewares: vec![],
+            handler: None,
+        };
+        output
+            .middlewares
+            .push(Middleware::Retry(crate::models::RetryMiddleware {
+                max_attempts: ATTEMPTS,
+                initial_interval_ms: 1,
+                max_interval_ms: 2,
+                multiplier: 1.0,
+            }));
+
+        let route = Route::new(input, output).with_handler(handler);
+        route.deploy("test_retry_handler_once").await.unwrap();
+        input_ch.send_message("one".into()).await.unwrap();
+
+        // Wait for the sink to have exhausted its attempts.
+        for _ in 0..200 {
+            if sends.load(Ordering::SeqCst) >= ATTEMPTS {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            sends.load(Ordering::SeqCst) >= ATTEMPTS,
+            "expected the publish itself to be retried"
+        );
+        assert_eq!(
+            handler_calls.load(Ordering::SeqCst),
+            1,
+            "the handler must run once per message, not once per retry attempt"
+        );
+
+        Route::stop("test_retry_handler_once").await;
+    }
+
+    // N5 (regression): a drain route whose output leg is at a dead address used to
+    // reconnect forever — `finished: false`, no outcome, and `healthy: true` on every
+    // poll, because reconnecting flipped health back the moment the consumer was ready.
+    // It must now report unhealthy while it flaps and end as `Failed`.
+    #[tokio::test]
+    async fn test_drain_route_with_a_dead_output_fails_instead_of_reconnecting_forever() {
+        let unique_id = fast_uuid_v7::gen_id().to_string();
+        let factory_name = format!("dead_output_{}", unique_id);
+
+        // Constructs fine (so the route reports ready), then fails every send with a
+        // connection error — an HTTP sink pointed at a closed port behaves this way.
+        let mut factory = MockEndpointFactory::new();
+        factory.publisher_behavior = Arc::new(Mutex::new(|| {
+            struct DeadPublisher;
+            #[async_trait::async_trait]
+            impl MessagePublisher for DeadPublisher {
+                async fn send_batch(
+                    &self,
+                    _: Vec<crate::CanonicalMessage>,
+                ) -> Result<SentBatch, PublisherError> {
+                    Err(PublisherError::Connection(anyhow::anyhow!(
+                        "connection refused"
+                    )))
+                }
+                fn as_any(&self) -> &dyn Any {
+                    self
+                }
+            }
+            Ok(Box::new(DeadPublisher) as Box<dyn MessagePublisher>)
+        }));
+        register_endpoint_factory(&factory_name, Arc::new(factory));
+
+        // A file source, like the reported repro: it re-reads the same records after a
+        // reconnect, so the failing batch comes back around every pass. That is what
+        // turned "retry the connection" into "never finish".
+        let dir = tempfile::tempdir().unwrap();
+        let in_path = dir.path().join("in.jsonl");
+        std::fs::write(&in_path, "a\nb\nc\n").unwrap();
+        let input = Endpoint::new(EndpointType::File(crate::models::FileConfig {
+            path: in_path.to_str().unwrap().to_string(),
+            format: crate::models::FileFormat::Raw,
+            ..Default::default()
+        }));
+
+        let output = Endpoint {
+            endpoint_type: EndpointType::Custom {
+                name: factory_name,
+                config: serde_json::Value::Null,
+            },
+            middlewares: vec![],
+            handler: None,
+        };
+        let route = Route::new(input, output)
+            .with_exit_on_empty(true)
+            .with_reconnect_interval_ms(10);
+
+        let handle = route.run("test_dead_output_drain").await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while handle.outcome().is_none() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("drain route reconnected forever instead of giving up");
+
+        assert_eq!(handle.outcome(), Some(RouteOutcome::Failed));
+        let status = handle.status();
+        assert!(!status.healthy, "a wedged route must not report healthy");
+        assert!(
+            status
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("connection refused"),
+            "status should carry the leg's error, got {:?}",
+            status.error
+        );
+
+        Route::stop("test_dead_output_drain").await;
+    }
+
+    // N5 as originally reported: the dead leg sits inside a `fanout` next to a working
+    // one. `FanoutPublisher::send_batch` propagates a hard error from any leg, so this
+    // must reach the same bound rather than wedging at `healthy: true` forever.
+    #[tokio::test]
+    async fn test_drain_fanout_with_one_dead_leg_fails_instead_of_wedging() {
+        let unique_id = fast_uuid_v7::gen_id().to_string();
+        let factory_name = format!("dead_leg_{}", unique_id);
+
+        let mut factory = MockEndpointFactory::new();
+        factory.publisher_behavior = Arc::new(Mutex::new(|| {
+            struct DeadLeg;
+            #[async_trait::async_trait]
+            impl MessagePublisher for DeadLeg {
+                async fn send_batch(
+                    &self,
+                    _: Vec<crate::CanonicalMessage>,
+                ) -> Result<SentBatch, PublisherError> {
+                    Err(PublisherError::Connection(anyhow::anyhow!(
+                        "dead leg refused"
+                    )))
+                }
+                fn as_any(&self) -> &dyn Any {
+                    self
+                }
+            }
+            Ok(Box::new(DeadLeg) as Box<dyn MessagePublisher>)
+        }));
+        register_endpoint_factory(&factory_name, Arc::new(factory));
+
+        let dir = tempfile::tempdir().unwrap();
+        let in_path = dir.path().join("in5.jsonl");
+        std::fs::write(&in_path, "a\nb\nc\nd\ne\n").unwrap();
+        let good_path = dir.path().join("fan_ok.jsonl");
+
+        let input = Endpoint::new(EndpointType::File(crate::models::FileConfig {
+            path: in_path.to_str().unwrap().to_string(),
+            format: crate::models::FileFormat::Raw,
+            ..Default::default()
+        }));
+        let output = Endpoint::new(EndpointType::Fanout(vec![
+            Endpoint::new(EndpointType::File(crate::models::FileConfig {
+                path: good_path.to_str().unwrap().to_string(),
+                format: crate::models::FileFormat::Raw,
+                ..Default::default()
+            })),
+            Endpoint::new(EndpointType::Custom {
+                name: factory_name,
+                config: serde_json::Value::Null,
+            }),
+        ]));
+
+        let handle = Route::new(input, output)
+            .with_exit_on_empty(true)
+            .with_batch_size(1)
+            .with_reconnect_interval_ms(10)
+            .run("test_dead_fanout_leg")
+            .await
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(15), async {
+            while handle.outcome().is_none() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("fanout with a dead leg wedged instead of giving up");
+
+        assert_eq!(handle.outcome(), Some(RouteOutcome::Failed));
+        let status = handle.status();
+        assert!(!status.healthy, "a wedged fanout must not report healthy");
+        assert!(
+            status
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("dead leg refused"),
+            "status should carry the failing leg's error, got {:?}",
+            status.error
+        );
+
+        Route::stop("test_dead_fanout_leg").await;
+    }
+
+    /// A fanout leg carrying its own `retry` + `dlq` must dead-letter its failures exactly
+    /// like the same endpoint would as a route's sole output.
+    #[tokio::test]
+    async fn test_fanout_leg_middleware_dead_letters_its_own_failures() {
+        let unique_id = fast_uuid_v7::gen_id().to_string();
+        let factory_name = format!("failing_leg_{}", unique_id);
+
+        let mut factory = MockEndpointFactory::new();
+        factory.publisher_behavior = Arc::new(Mutex::new(|| {
+            struct AlwaysFails;
+            #[async_trait::async_trait]
+            impl MessagePublisher for AlwaysFails {
+                async fn send_batch(
+                    &self,
+                    _: Vec<crate::CanonicalMessage>,
+                ) -> Result<SentBatch, PublisherError> {
+                    Err(PublisherError::Retryable(anyhow::anyhow!("leg refused")))
+                }
+                fn as_any(&self) -> &dyn Any {
+                    self
+                }
+            }
+            Ok(Box::new(AlwaysFails) as Box<dyn MessagePublisher>)
+        }));
+        register_endpoint_factory(&factory_name, Arc::new(factory));
+
+        let dir = tempfile::tempdir().unwrap();
+        let in_path = dir.path().join("fan_in.jsonl");
+        std::fs::write(&in_path, "a\n").unwrap();
+        let good_path = dir.path().join("fan_good.jsonl");
+        let dlq_path = dir.path().join("fan_dlq.jsonl");
+
+        let raw_file = |path: &std::path::Path| {
+            Endpoint::new(EndpointType::File(crate::models::FileConfig {
+                path: path.to_str().unwrap().to_string(),
+                format: crate::models::FileFormat::Raw,
+                ..Default::default()
+            }))
+        };
+
+        let mut failing_leg = Endpoint::new(EndpointType::Custom {
+            name: factory_name,
+            config: serde_json::Value::Null,
+        });
+        failing_leg.middlewares = vec![
+            crate::models::Middleware::Retry(crate::models::RetryMiddleware {
+                max_attempts: 2,
+                initial_interval_ms: 1,
+                max_interval_ms: 2,
+                multiplier: 1.0,
+            }),
+            crate::models::Middleware::Dlq(Box::new(crate::models::DeadLetterQueueMiddleware {
+                endpoint: raw_file(&dlq_path),
+            })),
+        ];
+
+        let output = Endpoint::new(EndpointType::Fanout(vec![
+            raw_file(&good_path),
+            failing_leg,
+        ]));
+
+        let handle = Route::new(raw_file(&in_path), output)
+            .with_exit_on_empty(true)
+            .with_batch_size(1)
+            .with_reconnect_interval_ms(10)
+            .run("test_fanout_leg_dlq")
+            .await
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(15), async {
+            while handle.outcome().is_none() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("route never finished");
+        Route::stop("test_fanout_leg_dlq").await;
+
+        let dlq = std::fs::read_to_string(&dlq_path).unwrap_or_default();
+        assert!(
+            dlq.contains('a'),
+            "the fanout leg's own dlq never received the failed message, got {dlq:?}"
+        );
+    }
+
+    /// The reported N20 shape verbatim: a real `http` leg pointed at a closed port. The mock
+    /// above only proves the wiring; this proves the classification an unreachable sink
+    /// actually produces still reaches that leg's dlq.
+    #[cfg(feature = "http")]
+    #[tokio::test]
+    async fn test_fanout_http_leg_dead_letters_a_connection_refusal() {
+        #[cfg(feature = "rustls-aws-lc")]
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        #[cfg(all(feature = "rustls-ring", not(feature = "rustls-aws-lc")))]
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let dir = tempfile::tempdir().unwrap();
+        let in_path = dir.path().join("http_fan_in.jsonl");
+        std::fs::write(&in_path, "a\n").unwrap();
+        let good_path = dir.path().join("http_fan_good.jsonl");
+        let dlq_path = dir.path().join("http_fan_dlq.jsonl");
+
+        let raw_file = |path: &std::path::Path| {
+            Endpoint::new(EndpointType::File(crate::models::FileConfig {
+                path: path.to_str().unwrap().to_string(),
+                format: crate::models::FileFormat::Raw,
+                ..Default::default()
+            }))
+        };
+
+        let mut dead_leg = Endpoint::new(EndpointType::Http(crate::models::HttpConfig {
+            url: "http://127.0.0.1:1/dead".to_string(),
+            request_timeout_ms: Some(500),
+            ..Default::default()
+        }));
+        dead_leg.middlewares = vec![
+            crate::models::Middleware::Retry(crate::models::RetryMiddleware {
+                max_attempts: 2,
+                initial_interval_ms: 1,
+                max_interval_ms: 2,
+                multiplier: 1.0,
+            }),
+            crate::models::Middleware::Dlq(Box::new(crate::models::DeadLetterQueueMiddleware {
+                endpoint: raw_file(&dlq_path),
+            })),
+        ];
+
+        let output = Endpoint::new(EndpointType::Fanout(vec![raw_file(&good_path), dead_leg]));
+
+        let handle = Route::new(raw_file(&in_path), output)
+            .with_exit_on_empty(true)
+            .with_batch_size(1)
+            .with_reconnect_interval_ms(10)
+            .run("test_fanout_http_leg_dlq")
+            .await
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while handle.outcome().is_none() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("route never finished");
+        Route::stop("test_fanout_http_leg_dlq").await;
+
+        let dlq = std::fs::read_to_string(&dlq_path).unwrap_or_default();
+        assert!(
+            dlq.contains('a'),
+            "the http leg's own dlq never received the failed message, got {dlq:?}"
+        );
+    }
+
+    /// A `Connection` failure is deliberately never dead-lettered: `retry` does not retry it
+    /// and `dlq` propagates it so the route reconnects instead of dead-lettering a whole
+    /// backlog while a sink is merely down. That has to hold identically inside and outside a
+    /// fanout — a leg must not be the reason a message stops reaching its dlq.
+    #[tokio::test]
+    async fn test_connection_failures_bypass_the_dlq_identically_in_and_out_of_a_fanout() {
+        async fn dlq_content_for(in_fanout: bool) -> String {
+            let factory_name = format!("conn_fail_{}", fast_uuid_v7::gen_id());
+            let mut factory = MockEndpointFactory::new();
+            factory.publisher_behavior = Arc::new(Mutex::new(|| {
+                struct Disconnected;
+                #[async_trait::async_trait]
+                impl MessagePublisher for Disconnected {
+                    async fn send_batch(
+                        &self,
+                        _: Vec<crate::CanonicalMessage>,
+                    ) -> Result<SentBatch, PublisherError> {
+                        Err(PublisherError::Connection(anyhow::anyhow!(
+                            "Simulated connection loss"
+                        )))
+                    }
+                    fn as_any(&self) -> &dyn Any {
+                        self
+                    }
+                }
+                Ok(Box::new(Disconnected) as Box<dyn MessagePublisher>)
+            }));
+            register_endpoint_factory(&factory_name, Arc::new(factory));
+
+            let dir = tempfile::tempdir().unwrap();
+            let in_path = dir.path().join("in.jsonl");
+            std::fs::write(&in_path, "a\n").unwrap();
+            let dlq_path = dir.path().join("dlq.jsonl");
+            let good_path = dir.path().join("good.jsonl");
+            let raw_file = |path: &std::path::Path| {
+                Endpoint::new(EndpointType::File(crate::models::FileConfig {
+                    path: path.to_str().unwrap().to_string(),
+                    format: crate::models::FileFormat::Raw,
+                    ..Default::default()
+                }))
+            };
+
+            let mut failing = Endpoint::new(EndpointType::Custom {
+                name: factory_name,
+                config: serde_json::Value::Null,
+            });
+            failing.middlewares = vec![
+                crate::models::Middleware::Retry(crate::models::RetryMiddleware {
+                    max_attempts: 2,
+                    initial_interval_ms: 1,
+                    max_interval_ms: 2,
+                    multiplier: 1.0,
+                }),
+                crate::models::Middleware::Dlq(Box::new(
+                    crate::models::DeadLetterQueueMiddleware {
+                        endpoint: raw_file(&dlq_path),
+                    },
+                )),
+            ];
+            let output = if in_fanout {
+                Endpoint::new(EndpointType::Fanout(vec![raw_file(&good_path), failing]))
+            } else {
+                failing
+            };
+
+            let route_name = format!("conn_dlq_{in_fanout}");
+            let handle = Route::new(raw_file(&in_path), output)
+                .with_exit_on_empty(true)
+                .with_batch_size(1)
+                .with_reconnect_interval_ms(10)
+                .run(&route_name)
+                .await
+                .unwrap();
+            let _ = tokio::time::timeout(Duration::from_secs(15), async {
+                while handle.outcome().is_none() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await;
+            Route::stop(&route_name).await;
+            std::fs::read_to_string(&dlq_path).unwrap_or_default()
+        }
+
+        assert_eq!(
+            dlq_content_for(true).await,
+            dlq_content_for(false).await,
+            "a fanout leg must dead-letter a connection failure the same way a sole output does"
+        );
+    }
+
+    /// Same as above but driven by an `http` webhook input, which is the shape the finding
+    /// was reported in — a request/reply consumer, not a file drain.
+    #[cfg(feature = "http")]
+    #[tokio::test]
+    async fn test_fanout_leg_dlq_works_behind_an_http_webhook_input() {
+        #[cfg(feature = "rustls-aws-lc")]
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        #[cfg(all(feature = "rustls-ring", not(feature = "rustls-aws-lc")))]
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let dir = tempfile::tempdir().unwrap();
+        let good_path = dir.path().join("wh_good.jsonl");
+        let dlq_path = dir.path().join("wh_dlq.jsonl");
+        let raw_file = |path: &std::path::Path| {
+            Endpoint::new(EndpointType::File(crate::models::FileConfig {
+                path: path.to_str().unwrap().to_string(),
+                format: crate::models::FileFormat::Raw,
+                ..Default::default()
+            }))
+        };
+
+        let port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        let input = Endpoint::new(EndpointType::Http(crate::models::HttpConfig {
+            url: format!("127.0.0.1:{port}"),
+            fire_and_forget: true,
+            ..Default::default()
+        }));
+
+        let mut dead_leg = Endpoint::new(EndpointType::Http(crate::models::HttpConfig {
+            url: "http://127.0.0.1:1/dead".to_string(),
+            request_timeout_ms: Some(500),
+            ..Default::default()
+        }));
+        dead_leg.middlewares = vec![
+            crate::models::Middleware::Retry(crate::models::RetryMiddleware {
+                max_attempts: 2,
+                initial_interval_ms: 1,
+                max_interval_ms: 2,
+                multiplier: 1.0,
+            }),
+            crate::models::Middleware::Dlq(Box::new(crate::models::DeadLetterQueueMiddleware {
+                endpoint: raw_file(&dlq_path),
+            })),
+        ];
+        let output = Endpoint::new(EndpointType::Fanout(vec![raw_file(&good_path), dead_leg]));
+
+        let _handle = Route::new(input, output)
+            .run("test_fanout_webhook_dlq")
+            .await
+            .unwrap();
+
+        let addr = format!("127.0.0.1:{port}");
+        for _ in 0..200 {
+            if tokio::net::TcpStream::connect(&addr).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let client = reqwest::Client::new();
+        client
+            .post(format!("http://{addr}/"))
+            .body(r#"{"order_id":"o1"}"#)
+            .send()
+            .await
+            .expect("webhook POST failed");
+
+        let mut dlq = String::new();
+        for _ in 0..200 {
+            dlq = std::fs::read_to_string(&dlq_path).unwrap_or_default();
+            if dlq.contains("o1") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        Route::stop("test_fanout_webhook_dlq").await;
+
+        assert!(
+            dlq.contains("o1"),
+            "the fanout leg's dlq never received the failed message, got {dlq:?}"
+        );
+    }
+
+    // The flip side of the test above: gating health on "the pass stayed up" must not
+    // leave a route that recovered stuck reporting the failure forever.
+    #[tokio::test(start_paused = true)]
+    async fn test_route_reports_healthy_again_after_it_recovers() {
+        let unique_id = fast_uuid_v7::gen_id().to_string();
+        let factory_name = format!("recovering_{}", unique_id);
+
+        // Fails the first connection, then serves a working publisher.
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let mut factory = MockEndpointFactory::new();
+        factory.publisher_behavior = Arc::new(Mutex::new(move || {
+            struct OneShotFail;
+            #[async_trait::async_trait]
+            impl MessagePublisher for OneShotFail {
+                async fn send_batch(
+                    &self,
+                    _: Vec<crate::CanonicalMessage>,
+                ) -> Result<SentBatch, PublisherError> {
+                    Err(PublisherError::Connection(anyhow::anyhow!("first flap")))
+                }
+                fn as_any(&self) -> &dyn Any {
+                    self
+                }
+            }
+            if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                Ok(Box::new(OneShotFail) as Box<dyn MessagePublisher>)
+            } else {
+                Ok(Box::new(NoOpPublisher) as Box<dyn MessagePublisher>)
+            }
+        }));
+        register_endpoint_factory(&factory_name, Arc::new(factory));
+
+        let in_topic = format!("recovering_in_{}", unique_id);
+        let input = Endpoint::new_memory(&in_topic, 10);
+        let input_ch = input.channel().unwrap();
+        let output = Endpoint {
+            endpoint_type: EndpointType::Custom {
+                name: factory_name,
+                config: serde_json::Value::Null,
+            },
+            middlewares: vec![],
+            handler: None,
+        };
+
+        let handle = Route::new(input, output)
+            .with_reconnect_interval_ms(10)
+            .run("test_route_recovers")
+            .await
+            .unwrap();
+        input_ch.send_message("one".into()).await.unwrap();
+
+        // Provoke the failure, then let the replacement connection run past STABLE_RUN.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        tokio::time::sleep(STABLE_RUN + Duration::from_secs(1)).await;
+
+        let status = handle.status();
+        assert!(
+            status.healthy,
+            "a route that recovered must not stay unhealthy: {:?}",
+            status.error
+        );
+        assert!(status.error.is_none(), "stale error: {:?}", status.error);
+
+        Route::stop("test_route_recovers").await;
     }
 
     #[tokio::test]

@@ -66,10 +66,22 @@ pub struct PostgresCdcConsumer {
     teardown_done: AtomicBool,
     /// Drain mode: only then does an idle replication read time out into an empty batch.
     exit_on_empty: bool,
+    /// Resolved once at construction from endpoint config and the legacy fallback.
+    source_metadata: bool,
 }
 
 impl PostgresCdcConsumer {
     pub async fn new(config: &PostgresCdcConfig) -> anyhow::Result<Self> {
+        Self::new_with_source_metadata(config, false).await
+    }
+
+    pub async fn new_with_source_metadata(
+        config: &PostgresCdcConfig,
+        source_metadata: bool,
+    ) -> anyhow::Result<Self> {
+        let source_metadata = crate::canonical_message::source_metadata_enabled_for_endpoint(
+            source_metadata || config.source_metadata,
+        );
         if config.url.trim().is_empty() {
             return Err(anyhow!("postgres_cdc: `url` is required"));
         }
@@ -174,6 +186,7 @@ impl PostgresCdcConsumer {
             drop_slot_on_stop: config.temporary_slot,
             teardown_done: AtomicBool::new(false),
             exit_on_empty: false,
+            source_metadata,
         })
     }
 
@@ -249,6 +262,9 @@ impl PostgresCdcConsumer {
                     }
                     msg.metadata
                         .insert("postgres.lsn".to_string(), lsn_str.clone());
+                    if self.source_metadata {
+                        add_source_metadata(&mut msg, &self.slot_name, lsn, ordinal);
+                    }
                     self.ready.push_back((msg, lsn));
                 }
             }
@@ -395,6 +411,18 @@ fn cdc_dedup_id(
         }
     }
     h
+}
+
+fn add_source_metadata(message: &mut CanonicalMessage, slot: &str, lsn: u64, ordinal: usize) {
+    message
+        .metadata
+        .insert("mqb.src.postgres_slot".into(), slot.into());
+    message
+        .metadata
+        .insert("mqb.src.postgres_lsn".into(), lsn.to_string());
+    message
+        .metadata
+        .insert("mqb.src.postgres_ordinal".into(), ordinal.to_string());
 }
 
 /// A safe Postgres identifier for a publication / replication slot: non-empty
@@ -658,5 +686,33 @@ mod cdc_id_tests {
         assert_ne!(a, cdc_dedup_id("public", "orders", "42", 100, "update", 0));
         // Different in-transaction ordinal → different id (same key twice in one commit).
         assert_ne!(a, cdc_dedup_id("public", "orders", "42", 100, "insert", 1));
+    }
+
+    #[test]
+    fn source_metadata_identifies_each_change_in_a_commit() {
+        let mut message = CanonicalMessage::new(b"payload".to_vec(), None);
+        add_source_metadata(&mut message, "bridge_slot", 9_876_543_210, 1);
+
+        assert_eq!(
+            message
+                .metadata
+                .get("mqb.src.postgres_slot")
+                .map(String::as_str),
+            Some("bridge_slot")
+        );
+        assert_eq!(
+            message
+                .metadata
+                .get("mqb.src.postgres_lsn")
+                .map(String::as_str),
+            Some("9876543210")
+        );
+        assert_eq!(
+            message
+                .metadata
+                .get("mqb.src.postgres_ordinal")
+                .map(String::as_str),
+            Some("1")
+        );
     }
 }

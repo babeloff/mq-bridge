@@ -884,17 +884,19 @@ async fn test_retryable_error_without_middleware_crashes_route() {
     assert!(res.is_err());
 }
 
+/// The handler sits outside every output middleware, so `retry` covers only the publish.
+/// A `Retryable` handler error therefore propagates to the route instead of re-running
+/// the handler.
 #[tokio::test(flavor = "multi_thread")]
-async fn test_retryable_error_with_middleware_succeeds() {
+async fn test_retryable_handler_error_is_not_retried_by_output_middleware() {
     let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let attempts_clone = attempts.clone();
 
-    let in_topic = get_unique_topic("in_retry_success");
-    let out_topic = get_unique_topic("out_retry_success");
+    let in_topic = get_unique_topic("in_retry_handler_once");
+    let out_topic = get_unique_topic("out_retry_handler_once");
     let input = Endpoint::new_memory(&in_topic, 10);
     let mut output = Endpoint::new_memory(&out_topic, 10);
 
-    // Add RetryMiddleware
     output.middlewares.push(Middleware::Retry(RetryMiddleware {
         max_attempts: 3,
         initial_interval_ms: 10,
@@ -902,18 +904,14 @@ async fn test_retryable_error_with_middleware_succeeds() {
         multiplier: 1.0,
     }));
 
-    let route = Route::new(input, output).add_handler("my_message", move |msg: MyTypedMessage| {
+    let route = Route::new(input, output).add_handler("my_message", move |_msg: MyTypedMessage| {
         let attempts = attempts_clone.clone();
         async move {
-            let count = attempts.fetch_add(1, Ordering::SeqCst) + 1;
-            if count < 3 {
-                Err(mq_bridge::HandlerError::Retryable(anyhow::anyhow!(
-                    "Temporary failure attempt {}",
-                    count
-                )))
-            } else {
-                Ok(Handled::Publish(CanonicalMessage::from_type(&msg).unwrap()))
-            }
+            attempts.fetch_add(1, Ordering::SeqCst);
+            let res: Result<Handled, mq_bridge::HandlerError> = Err(
+                mq_bridge::HandlerError::Retryable(anyhow::anyhow!("Temporary failure")),
+            );
+            res
         }
     });
 
@@ -926,24 +924,28 @@ async fn test_retryable_error_with_middleware_succeeds() {
     };
     let canonical_message = msg!(&message, "my_message");
 
-    route
-        .deploy("test_retryable_error_with_middleware_succeeds")
-        .await
-        .unwrap();
+    let route_name = "test_retryable_handler_error_is_not_retried_by_output_middleware";
+    route.deploy(route_name).await.unwrap();
 
     in_channel.send_message(canonical_message).await.unwrap();
     let start = std::time::Instant::now();
-    while out_channel.is_empty() {
+    while attempts.load(Ordering::SeqCst) == 0 {
         if start.elapsed() > std::time::Duration::from_secs(5) {
-            panic!("Timeout waiting for retry success");
+            panic!("Timeout waiting for the handler to run");
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
+    // Comfortably longer than all three retry attempts (10ms apart) would take.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
-    Route::stop("test_retryable_error_with_middleware_succeeds").await;
+    Route::stop(route_name).await;
 
-    assert_eq!(attempts.load(Ordering::SeqCst), 3);
-    assert_eq!(out_channel.len(), 1);
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        1,
+        "retry middleware must not re-run the handler"
+    );
+    assert_eq!(out_channel.len(), 0);
 }
 
 #[tokio::test]

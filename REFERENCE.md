@@ -43,7 +43,15 @@ Writing with `[compression, encryption]` produces `compress(encrypt(payload))`; 
 given that same list would try to decrypt first and fail. The reading route must say
 `[encryption, compression]`. The lists mirror — they are not copied.
 
-> This is asserted by `route::tests::test_dlq_and_retry_batch_integration`,
+**A route handler sits outside every output middleware**, so it runs **once** per message
+and the middlewares act on what it returned. In particular `retry` re-attempts only the
+publish, never the handler — a handler with a side effect fires once however many times the
+sink is retried. The trade: a `dlq` cannot capture a handler failure, only a send failure;
+a handler error propagates to the route and is reported there.
+
+> This is asserted by `route::tests::test_retryable_handler_error_is_not_retried_by_output_middleware`
+> (the handler runs once and `retry` does not re-run it),
+> `route::tests::test_dlq_and_retry_batch_integration`,
 > `middleware::transform::tests::test_rejected_message_reaches_the_dlq_through_the_config_wiring`,
 > and `reference_docs_test::publisher_middleware_wraps_last_entry_outermost`, and is
 > documented on `apply_middlewares_to_publisher` in `src/middleware/mod.rs`.
@@ -88,9 +96,10 @@ middlewares:
 **Putting a middleware on the wrong side behaves in two different ways**, so check the table
 above rather than assuming:
 
-- `deduplication` on an output, and `dlq` / `retry` on an input, log a warning and are
-  skipped. The route still starts.
-- `weak_join` on an output is a **hard startup error** (`Unsupported publisher middleware`).
+- `dlq` / `retry` on an input log a warning and are skipped. The route still starts.
+- `deduplication` and `weak_join` on an output are **hard startup errors**. Deduplication
+  cannot work on the publish side, and silently starting an un-deduplicated route is worse
+  than refusing to start.
 
 A middleware whose feature is not compiled in (`deduplication` without `dedup`, `metrics`
 without `metrics`) is likewise a startup error, not a silent no-op.
@@ -131,16 +140,20 @@ Sends permanently-failed messages to a separate endpoint instead of failing the 
 ```
 
 Captures `NonRetryable` failures and `Retryable` ones whose retries are exhausted. Connection
-errors are **not** dead-lettered — they propagate so the route can reconnect. The DLQ endpoint
+errors are **not** dead-lettered — they propagate so the route can reconnect. Nor are handler
+failures: the handler runs outside the middlewares (see [Ordering](#ordering--read-this-before-combining-middleware)),
+so a `dlq` only ever sees what failed on the way to the sink. The DLQ endpoint
 is a full endpoint, so it can itself have middleware. If the DLQ send fails with a connection
 error that error propagates rather than silently dropping the message.
 
 **Without a `dlq` middleware**, a message that fails permanently — a data/type
-error the sink rejects, a poison payload a handler rejects — is logged at `error` level and
+error the sink rejects — is logged at `error` level and
 **dropped**, and the route keeps processing the rest of the batch. `dlq` is the only retention
 mechanism: `retry` alone does not retain a permanently-failed message nor prevent it from being
-dropped — it only re-attempts retryable/connection errors, then hands a still-failing message on
-to be dropped (or to a following `dlq`). This tolerate-and-continue
+dropped — it only re-attempts `Retryable` errors (a connection error is passed straight through
+for the route to reconnect on, not retried), then hands a still-failing message on to be dropped
+(or to a following `dlq`). This is why a sink that fails with a *connection* error never reaches
+its `dlq`, whether it is a route's sole output or one leg of a `fanout`. This tolerate-and-continue
 policy keeps one bad message from halting the whole stream, but it means a *systematic* failure
 (e.g. every row hitting a column-type mismatch) drains the input while committing nothing and
 still ends `completed`. Add a `dlq` to capture the failures for inspection/replay, or watch the
@@ -161,10 +174,16 @@ validation — over a single parse. Input and output.
 | `schema_file` | path to a schema file | – |
 | `coerce` | bool | `true` |
 | `apply_defaults` | bool | `true` |
+| `coerce_empty_as_null` | bool | `false` |
 | `on_error` | `reject` \| `pass_through` | `reject` |
 
 `schema` and `schema_file` are mutually exclusive. A mapping rule is either a bare path
 string or `{ path, default, required }`.
+
+`schema` must be a JSON *object*, not a string containing one. A flat `key=value` middleware
+syntax (such as the `|transform?schema=…` form in a connection URI) can only pass strings, so
+it cannot express `schema` or any mapping rule beyond a bare path — use `schema_file`, or move
+the route into a config file.
 
 ```yaml middleware
 - transform:
@@ -184,6 +203,26 @@ Schema keywords honoured: `type`, `properties`, `required`, `default`, `items`, 
 else is ignored, so an existing fuller schema can be used as-is. Coercions are limited to the
 lossless ones: `string → integer`, `string → number`, `string → boolean` (`true`/`false`/`1`/`0`),
 `number → string`.
+
+#### Empty strings
+
+CSV and many SQL exports spell "no value" as an empty string. `coerce_empty_as_null: true`
+reads every `""` the schema visits as `null`, which is then handled like any other null —
+a `nullable` field keeps it, a `default` replaces it:
+
+```yaml middleware
+- transform:
+    coerce_empty_as_null: true
+    schema:
+      type: object
+      properties:
+        note: { type: string, nullable: true }
+        tier: { type: string, default: standard }
+```
+
+`note: ""` arrives as `null` and `tier: ""` as `"standard"`. A field that is neither
+nullable nor defaulted is rejected, naming the coercion. Only fields the schema declares are
+affected; `" "` is not empty.
 
 #### Embedded JSON
 
@@ -310,6 +349,11 @@ Correlates messages by a metadata key and emits them as one joined message. Inpu
     required: ["inventory", "pricing"]
     on_timeout: discard
 ```
+
+`group_by` reads message **metadata** only — never the payload. A message that lacks the key
+falls into a shared `"default"` group, so a mistyped key or a source that never sets it joins
+unrelated messages instead of failing. If the value lives in the payload, lift it into metadata
+first (a `transform` mapping, or the source's own metadata options).
 
 Setting `branch_by` switches to branch mode, where `required` overrides `expected_count`.
 On timeout an incomplete group is either emitted partially (`fire`) or dropped (`discard`).
@@ -505,6 +549,15 @@ Deliberate fault injection for testing recovery paths. Input and output.
 `disconnect` and `timeout` produce retryable errors; `json_format_error` produces a
 non-retryable one — useful for exercising a `dlq`. Keep `enabled: false` in committed configs
 rather than deleting the block.
+
+On the **input** side, `json_format_error`/`nack` never call the real consumer at all — they
+substitute a synthetic message (or error) on every triggered `receive`. Leaving
+`trigger_on_message` unset means *every* poll is faulted, so the real source is never read and
+`exit_on_empty`/`--drain` never sees the empty batch it waits for — the route runs forever,
+manufacturing synthetic messages. Always set `trigger_on_message` to a specific count when
+testing a drain-mode route with input-side fault injection. And since `dlq`/`retry` on an input
+are no-ops (see above), pair an input-side fault with a real assertion on the *consumer's*
+recovery, not a `dlq`.
 
 The middleware block alone is **not** enough: fault injection is gated per route by
 `allow_fault_injection`, which defaults to `false`. Copying only the snippet above leaves the

@@ -16,6 +16,7 @@ class AmqpConfig(TypedDict, total=False):
     password: Optional[str]
     prefetch_count: Optional[int]
     queue: Optional[str]
+    source_metadata: bool
     subscribe_mode: bool
     tls: TlsConfig
     url: Required[str]
@@ -151,6 +152,7 @@ class FileConfig(TypedDict, total=False):
     delimiter: Optional[str]
     encryption: Optional[EncryptionConfig]
     format: FileFormat
+    idempotency: bool
     path: Required[str]
 
 
@@ -233,6 +235,7 @@ class KafkaConfig(TypedDict, total=False):
     password: Optional[str]
     producer_options: Optional[List[List[Any]]]
     shared: Optional[bool]
+    source_metadata: bool
     tls: TlsConfig
     topic: Optional[str]
     url: Required[str]
@@ -297,6 +300,7 @@ class MongoDbConfig(TypedDict, total=False):
     request_reply: bool
     request_timeout_ms: Optional[int]
     shared: Optional[bool]
+    source_metadata: bool
     tls: TlsConfig
     ttl_seconds: Optional[int]
     url: Required[str]
@@ -332,6 +336,7 @@ class NatsConfig(TypedDict, total=False):
     request_reply: bool
     request_timeout_ms: Optional[int]
     shared: Optional[bool]
+    source_metadata: bool
     stream: Optional[str]
     stream_max_bytes: Optional[int]
     stream_max_messages: Optional[int]
@@ -353,6 +358,7 @@ class ObjectStoreConfig(TypedDict, total=False):
     encryption: Optional[EncryptionConfig]
     extension: Optional[str]
     format: FileFormat
+    idempotency: bool
     max_object_bytes: Optional[int]
     polling_interval_ms: Optional[int]
     url: Required[str]
@@ -367,6 +373,7 @@ class PostgresCdcConfig(TypedDict, total=False):
     publication: Required[str]
     publication_tables: List[str]
     slot_name: str
+    source_metadata: bool
     status_interval_ms: int
     temporary_slot: bool
     tls: TlsConfig
@@ -462,6 +469,7 @@ class SqlxConfig(TypedDict, total=False):
     shared: Optional[bool]
     slot_name: Optional[str]
     table: Required[str]
+    test_before_acquire: Optional[bool]
     tls: TlsConfig
     url: Required[str]
     username: Optional[str]
@@ -494,6 +502,7 @@ class TransformMiddleware(TypedDict, total=False):
     """JSON transform middleware configuration."""
     apply_defaults: bool
     coerce: bool
+    coerce_empty_as_null: bool
     mapping: Dict[str, MappingRule]
     on_error: TransformErrorPolicy
     schema: Any

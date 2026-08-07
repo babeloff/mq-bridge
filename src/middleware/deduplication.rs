@@ -12,8 +12,9 @@ use anyhow::{anyhow, Context};
 use async_trait::async_trait;
 use sled::Db;
 use std::any::Any;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{error, info, instrument, trace, warn};
 
@@ -32,10 +33,28 @@ pub(crate) trait DedupStore: Send + Sync {
     /// `Ok(false)` = freshly reserved (caller should process the message).
     async fn reserve(&self, key: &[u8], now: u64) -> Result<bool, ConsumerError>;
 
+    /// Reserve a whole batch at once, returning one flag per key in order. Backends that can
+    /// amortise per-call work — a lock, a network round trip — override this; the default
+    /// reserves one key at a time.
+    async fn reserve_many(&self, keys: &[Vec<u8>], now: u64) -> Result<Vec<bool>, ConsumerError> {
+        let mut claimed = Vec::with_capacity(keys.len());
+        for key in keys {
+            claimed.push(self.reserve(key, now).await?);
+        }
+        Ok(claimed)
+    }
+
     /// Promote a reserved key to the processed state with the full TTL. Best-effort: a failure
     /// here only risks a later redelivery being reprocessed (at-least-once), so it logs rather
     /// than propagating.
     async fn mark_processed(&self, key: &[u8], now: u64);
+
+    /// Promote a whole batch of reserved keys. See [`DedupStore::reserve_many`].
+    async fn mark_processed_many(&self, keys: &[Vec<u8>], now: u64) {
+        for key in keys {
+            self.mark_processed(key, now).await;
+        }
+    }
 
     /// Best-effort periodic GC of expired keys. Default no-op for backends with native TTL.
     fn maybe_cleanup(&self, _now: u64) {}
@@ -161,22 +180,141 @@ async fn build_store(
     }
 }
 
-/// Local, single-instance deduplication store backed by a Sled database. Reserve/processed states
-/// are a 9-byte value `[state, be_u64_timestamp]`; expiry is enforced on read (a stale entry is
-/// reclaimable) and swept lazily by `maybe_cleanup`.
+/// Keys claimed by a batch that has not committed yet, and when they were claimed.
+type Claims = HashMap<Vec<u8>, u64>;
+
+const STATE_PENDING: u8 = 0;
+const STATE_PROCESSED: u8 = 1;
+
+/// The stored form of a committed key.
+fn processed_value(now: u64) -> [u8; 9] {
+    let mut value = [0u8; 9];
+    value[0] = STATE_PROCESSED;
+    value[1..9].copy_from_slice(&now.to_be_bytes());
+    value
+}
+
+/// A poisoned lock is recovered rather than propagated: the map is still consistent, and
+/// failing every later message would be far worse than the panic that poisoned it.
+fn lock_claims(claims: &Mutex<Claims>) -> std::sync::MutexGuard<'_, Claims> {
+    claims.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Whether a stored value is still within its TTL. Values written by older versions are 8 bytes
+/// (a bare timestamp) or carry the pending state, and are read on their own terms.
+fn is_live(value: &[u8], now: u64, ttl_seconds: u64) -> bool {
+    let (timestamp, ttl) = match value.len() {
+        9 => {
+            let ttl = if value[0] == STATE_PENDING {
+                PENDING_TTL_SECS
+            } else {
+                ttl_seconds
+            };
+            match value[1..9].try_into() {
+                Ok(bytes) => (u64::from_be_bytes(bytes), ttl),
+                Err(_) => return false,
+            }
+        }
+        8 => match value.try_into() {
+            Ok(bytes) => (u64::from_be_bytes(bytes), ttl_seconds),
+            Err(_) => return false,
+        },
+        _ => return false,
+    };
+    now.saturating_sub(timestamp) < ttl
+}
+
+/// Claim `key` against an already-held claim map. `Ok(true)` = a live entry already exists.
+fn claim_key(
+    db: &Db,
+    claims: &mut Claims,
+    key: &[u8],
+    now: u64,
+    ttl_seconds: u64,
+) -> Result<bool, ConsumerError> {
+    if claims
+        .get(key)
+        .is_some_and(|at| now.saturating_sub(*at) < PENDING_TTL_SECS)
+    {
+        return Ok(true);
+    }
+    let stored = db
+        .get(key)
+        .map_err(|e| ConsumerError::Connection(anyhow!("Deduplication DB error: {e}")))?;
+    if stored
+        .as_deref()
+        .is_some_and(|v| is_live(v, now, ttl_seconds))
+    {
+        return Ok(true);
+    }
+    claims.insert(key.to_vec(), now);
+    Ok(false)
+}
+
+/// Claim every key under one acquisition of the claim map.
+fn claim_all(
+    db: &Db,
+    claims: &Mutex<Claims>,
+    keys: &[Vec<u8>],
+    now: u64,
+    ttl_seconds: u64,
+) -> Result<Vec<bool>, ConsumerError> {
+    let mut held = lock_claims(claims);
+    keys.iter()
+        .map(|key| claim_key(db, &mut held, key, now, ttl_seconds))
+        .collect()
+}
+
+fn commit_key(db: &Db, key: &[u8], now: u64) {
+    if let Err(e) = db.insert(key, &processed_value(now)[..]) {
+        error!(
+            "Failed to update key {} as processed in deduplication DB: {}",
+            hex_key(key),
+            e
+        );
+    } else {
+        trace!("Updated message as processed in deduplication DB");
+    }
+}
+
+/// Persist every key, then release its claim. The claim outlives the write on purpose, so a
+/// concurrent `reserve` never sees a key that is in neither the map nor the store.
+fn commit_all(db: &Db, claims: &Mutex<Claims>, keys: &[Vec<u8>], now: u64) {
+    for key in keys {
+        commit_key(db, key, now);
+    }
+    let mut held = lock_claims(claims);
+    for key in keys {
+        held.remove(key.as_slice());
+    }
+}
+
+/// Local, single-instance deduplication store backed by a Sled database.
+///
+/// Committed keys are stored as `[state, be_u64_timestamp]`, expire on read, and are swept
+/// lazily by `maybe_cleanup`. Reservations — keys claimed by a batch that has not committed
+/// yet — are held in memory rather than written to disk: sled takes an exclusive file lock, so
+/// a reservation only ever has to be visible to this process, and a sled write costs about six
+/// times a read. A crash drops every reservation, which is exactly what one is for — the
+/// uncommitted messages are redelivered and reprocessed.
+///
+/// Sled's calls are synchronous and made inline: handing a batch to a blocking thread measured
+/// slower than paying them where they are. They are not this middleware's main cost — rendering
+/// the dedup key is, because a `${payload:...}` key parses the whole payload.
 struct SledDedupStore {
     db: Arc<Db>,
     ttl_seconds: u64,
-    last_cleanup: Arc<AtomicU64>,
+    in_flight: Arc<Mutex<Claims>>,
+    last_cleanup: AtomicU64,
 }
 
 impl SledDedupStore {
     fn new(path: &str, ttl_seconds: u64) -> anyhow::Result<Self> {
-        let db = sled::open(path)?;
         Ok(Self {
-            db: Arc::new(db),
+            db: Arc::new(sled::open(path)?),
             ttl_seconds,
-            last_cleanup: Arc::new(AtomicU64::new(0)),
+            in_flight: Arc::new(Mutex::new(Claims::new())),
+            last_cleanup: AtomicU64::new(0),
         })
     }
 }
@@ -184,132 +322,62 @@ impl SledDedupStore {
 #[async_trait]
 impl DedupStore for SledDedupStore {
     async fn reserve(&self, key: &[u8], now: u64) -> Result<bool, ConsumerError> {
-        let now_bytes = now.to_be_bytes();
+        let mut held = lock_claims(&self.in_flight);
+        claim_key(&self.db, &mut held, key, now, self.ttl_seconds)
+    }
 
-        const STATE_PENDING: u8 = 0;
-
-        let mut pending_val = [0u8; 9];
-        pending_val[0] = STATE_PENDING;
-        pending_val[1..9].copy_from_slice(&now_bytes);
-
-        let mut yield_counter = 0;
-        let mut total_attempts = 0;
-        const MAX_TOTAL_ATTEMPTS: usize = 1000;
-
-        loop {
-            if total_attempts >= MAX_TOTAL_ATTEMPTS {
-                return Err(ConsumerError::Connection(anyhow::anyhow!(
-                    "Deduplication CAS exceeded max attempts for key {}",
-                    hex_key(key)
-                )));
-            }
-            if yield_counter > 10 {
-                tokio::task::yield_now().await;
-                yield_counter = 0;
-            }
-            yield_counter += 1;
-            total_attempts += 1;
-
-            match self
-                .db
-                .compare_and_swap(key, None::<&[u8]>, Some(&pending_val[..]))
-            {
-                Ok(Ok(())) => return Ok(false),
-                Ok(Err(cas_error)) => {
-                    if let Some(current_bytes) = cas_error.current.as_deref() {
-                        let (ts, ttl) = if current_bytes.len() == 9 {
-                            let state = current_bytes[0];
-                            let ts_bytes: [u8; 8] = current_bytes[1..9].try_into().unwrap();
-                            (
-                                u64::from_be_bytes(ts_bytes),
-                                if state == STATE_PENDING {
-                                    PENDING_TTL_SECS
-                                } else {
-                                    self.ttl_seconds
-                                },
-                            )
-                        } else if current_bytes.len() == 8 {
-                            let ts_bytes: [u8; 8] = current_bytes.try_into().unwrap();
-                            (u64::from_be_bytes(ts_bytes), self.ttl_seconds)
-                        } else {
-                            (0, 0)
-                        };
-
-                        if now.saturating_sub(ts) < ttl {
-                            return Ok(true);
-                        }
-                        match self.db.compare_and_swap(
-                            key,
-                            Some(current_bytes),
-                            Some(&pending_val[..]),
-                        ) {
-                            Ok(Ok(())) => return Ok(false),
-                            Ok(Err(_)) => continue,
-                            Err(e) => {
-                                return Err(ConsumerError::Connection(anyhow::anyhow!(
-                                    "Deduplication DB error: {}",
-                                    e
-                                )))
-                            }
-                        }
-                    } else {
-                        continue;
-                    }
-                }
-                Err(e) => {
-                    return Err(ConsumerError::Connection(anyhow::anyhow!(
-                        "Deduplication DB error: {}",
-                        e
-                    )))
-                }
-            }
-        }
+    async fn reserve_many(&self, keys: &[Vec<u8>], now: u64) -> Result<Vec<bool>, ConsumerError> {
+        claim_all(&self.db, &self.in_flight, keys, now, self.ttl_seconds)
     }
 
     async fn mark_processed(&self, key: &[u8], now: u64) {
-        let mut processed_val = [0u8; 9];
-        processed_val[0] = 1; // STATE_PROCESSED
-        processed_val[1..9].copy_from_slice(&now.to_be_bytes());
-        if let Err(e) = self.db.insert(key, &processed_val[..]) {
-            error!(
-                "Failed to update key {} as processed in deduplication DB: {}",
-                hex_key(key),
-                e
-            );
-        } else {
-            trace!("Updated message as processed in deduplication DB");
-        }
+        commit_key(&self.db, key, now);
+        lock_claims(&self.in_flight).remove(key);
+    }
+
+    async fn mark_processed_many(&self, keys: &[Vec<u8>], now: u64) {
+        commit_all(&self.db, &self.in_flight, keys, now);
     }
 
     fn maybe_cleanup(&self, now: u64) {
+        const CLEANUP_INTERVAL_SECS: u64 = 30;
         let last = self.last_cleanup.load(Ordering::Acquire);
-        if now.saturating_sub(last) > 30
-            && self
+        // The first call only starts the clock. Sweeping straight away would scan the whole
+        // store before a single message had been handled.
+        if last == 0 {
+            let _ = self
+                .last_cleanup
+                .compare_exchange(0, now, Ordering::SeqCst, Ordering::Acquire);
+            return;
+        }
+        if now.saturating_sub(last) <= CLEANUP_INTERVAL_SECS
+            || self
                 .last_cleanup
                 .compare_exchange(last, now, Ordering::SeqCst, Ordering::Acquire)
-                .is_ok()
+                .is_err()
         {
-            let db = self.db.clone();
-            let ttl = self.ttl_seconds;
-            tokio::spawn(async move {
-                let cutoff = now.saturating_sub(ttl);
-                for (key, val) in db.iter().flatten() {
-                    let len = val.len();
-                    let ts_offset = if len == 9 {
-                        1
-                    } else if len == 8 {
-                        0
-                    } else {
-                        continue;
-                    };
-                    if let Ok(ts_bytes) = val[ts_offset..ts_offset + 8].try_into() {
-                        if u64::from_be_bytes(ts_bytes) < cutoff {
-                            let _ = db.compare_and_swap(&key, Some(val), None::<&[u8]>);
-                        }
+            return;
+        }
+
+        lock_claims(&self.in_flight).retain(|_, at| now.saturating_sub(*at) < PENDING_TTL_SECS);
+
+        let db = self.db.clone();
+        let ttl = self.ttl_seconds;
+        tokio::task::spawn_blocking(move || {
+            let cutoff = now.saturating_sub(ttl);
+            for (key, value) in db.iter().flatten() {
+                let offset = match value.len() {
+                    9 => 1,
+                    8 => 0,
+                    _ => continue,
+                };
+                if let Ok(bytes) = value[offset..offset + 8].try_into() {
+                    if u64::from_be_bytes(bytes) < cutoff {
+                        let _ = db.compare_and_swap(&key, Some(value), None::<&[u8]>);
                     }
                 }
-            });
-        }
+            }
+        });
     }
 
     async fn flush(&self) -> anyhow::Result<()> {
@@ -388,6 +456,24 @@ impl DeduplicationConsumer {
             inner,
             store,
             key_template,
+        })
+    }
+
+    /// Test seam: wrap `inner` around a store the caller already holds, so a test can inspect
+    /// the store's state directly. Reopening the same sled path instead would deadlock on its
+    /// file lock.
+    #[cfg(test)]
+    pub(crate) fn with_store(
+        inner: Box<dyn MessageConsumer>,
+        store: Arc<dyn DedupStore>,
+        key: Option<&str>,
+    ) -> anyhow::Result<Self> {
+        Ok(Self {
+            inner,
+            store,
+            key_template: key
+                .map(|k| CompiledTemplate::compile(k, None))
+                .transpose()?,
         })
     }
 }
@@ -500,44 +586,54 @@ impl MessageConsumer for DeduplicationConsumer {
                 });
             }
 
-            let mut filtered_messages = Vec::with_capacity(messages.len());
-            let mut kept_indices = Vec::with_capacity(messages.len());
+            let total_len = messages.len();
+            let keys: Vec<Vec<u8>> = messages
+                .iter()
+                .map(|msg| dedup_key(self.key_template.as_ref(), msg))
+                .collect();
+            let duplicates = self.store.reserve_many(&keys, now).await?;
 
-            let mut kept_keys: Vec<Vec<u8>> = Vec::with_capacity(messages.len());
+            let mut filtered_messages = Vec::with_capacity(total_len);
+            let mut kept_indices = Vec::with_capacity(total_len);
+            let mut kept_keys: Vec<Vec<u8>> = Vec::with_capacity(total_len);
 
-            for (idx, msg) in messages.iter().enumerate() {
-                let key = dedup_key(self.key_template.as_ref(), msg);
-                if self.store.reserve(&key, now).await? {
+            for ((idx, msg), (key, duplicate)) in messages
+                .into_iter()
+                .enumerate()
+                .zip(keys.into_iter().zip(duplicates))
+            {
+                if duplicate {
                     info!(message_id = %format!("{:032x}", msg.message_id), "Duplicate message detected and skipped");
                 } else {
-                    filtered_messages.push(msg.clone());
+                    filtered_messages.push(msg);
                     kept_indices.push(idx);
                     kept_keys.push(key);
                 }
             }
 
             if filtered_messages.is_empty() {
-                let _ = inner_commit(vec![MessageDisposition::Ack; messages.len()]).await;
+                if let Err(e) = inner_commit(vec![MessageDisposition::Ack; total_len]).await {
+                    warn!("Failed to commit skipped all-duplicate batch: {}", e);
+                }
                 continue;
             }
 
             let store = self.store.clone();
-            let total_len = messages.len();
 
             let commit: crate::traits::BatchCommitFunc = Box::new(move |dispositions| {
-                let store = store.clone();
-                let inner_commit = inner_commit;
-                let kept_indices = kept_indices;
-                let kept_keys = kept_keys;
-
                 Box::pin(async move {
                     let mut full_dispositions = vec![MessageDisposition::Ack; total_len];
-                    let mut acks = Vec::new();
-                    for (i, disp) in dispositions.into_iter().enumerate() {
-                        if matches!(disp, MessageDisposition::Ack | MessageDisposition::Reply(_)) {
-                            acks.push(kept_keys[i].clone());
+                    let mut acked = Vec::with_capacity(kept_keys.len());
+                    for ((key, disposition), slot) in
+                        kept_keys.into_iter().zip(dispositions).zip(kept_indices)
+                    {
+                        if matches!(
+                            disposition,
+                            MessageDisposition::Ack | MessageDisposition::Reply(_)
+                        ) {
+                            acked.push(key);
                         }
-                        full_dispositions[kept_indices[i]] = disp;
+                        full_dispositions[slot] = disposition;
                     }
 
                     inner_commit(full_dispositions).await?;
@@ -546,9 +642,7 @@ impl MessageConsumer for DeduplicationConsumer {
                         .duration_since(UNIX_EPOCH)
                         .unwrap_or_default()
                         .as_secs();
-                    for key in acks {
-                        store.mark_processed(&key, now).await;
-                    }
+                    store.mark_processed_many(&acked, now).await;
                     Ok(())
                 }) as crate::traits::BoxFuture<'static, anyhow::Result<()>>
             });
@@ -738,6 +832,285 @@ mod tests {
             batch.messages.len(),
             3,
             "an unresolvable key must not collapse distinct messages into one"
+        );
+    }
+
+    // --- Store-level semantics ---
+    //
+    // `reserve` takes `now` explicitly, so expiry is tested by moving the clock rather than
+    // sleeping. These pin the reserve/promote/expire contract the consumer relies on.
+
+    fn sled_store(dir: &tempfile::TempDir, name: &str, ttl_seconds: u64) -> SledDedupStore {
+        SledDedupStore::new(dir.path().join(name).to_str().unwrap(), ttl_seconds).unwrap()
+    }
+
+    #[tokio::test]
+    async fn reserve_claims_a_key_once() {
+        let dir = tempdir().unwrap();
+        let store = sled_store(&dir, "once", 60);
+        assert!(!store.reserve(b"k", 1000).await.unwrap(), "first is fresh");
+        assert!(store.reserve(b"k", 1000).await.unwrap(), "second is a dup");
+    }
+
+    #[tokio::test]
+    async fn distinct_keys_do_not_collide() {
+        let dir = tempdir().unwrap();
+        let store = sled_store(&dir, "distinct", 60);
+        assert!(!store.reserve(b"a", 1000).await.unwrap());
+        assert!(!store.reserve(b"b", 1000).await.unwrap());
+        assert!(!store.reserve(b"", 1000).await.unwrap());
+    }
+
+    /// A reservation that is never committed frees itself, so a crash between reserve and
+    /// commit leaves the message redeliverable instead of permanently swallowed.
+    #[tokio::test]
+    async fn an_uncommitted_reservation_expires_quickly() {
+        let dir = tempdir().unwrap();
+        let store = sled_store(&dir, "pending", 3600);
+        assert!(!store.reserve(b"k", 1000).await.unwrap());
+        assert!(
+            store
+                .reserve(b"k", 1000 + PENDING_TTL_SECS - 1)
+                .await
+                .unwrap(),
+            "still held while the reservation is live"
+        );
+        assert!(
+            !store
+                .reserve(b"k", 1000 + PENDING_TTL_SECS + 1)
+                .await
+                .unwrap(),
+            "a reservation outlived by its short TTL must be reclaimable"
+        );
+    }
+
+    /// Committing promotes the key to the configured TTL, which is what makes it a duplicate
+    /// long after the short reservation window has passed.
+    #[tokio::test]
+    async fn mark_processed_promotes_to_the_full_ttl() {
+        let dir = tempdir().unwrap();
+        let store = sled_store(&dir, "promote", 3600);
+        assert!(!store.reserve(b"k", 1000).await.unwrap());
+        store.mark_processed(b"k", 1000).await;
+        assert!(
+            store
+                .reserve(b"k", 1000 + PENDING_TTL_SECS + 1)
+                .await
+                .unwrap(),
+            "a committed key must outlive the reservation TTL"
+        );
+        assert!(store.reserve(b"k", 1000 + 3599).await.unwrap());
+        assert!(
+            !store.reserve(b"k", 1000 + 3601).await.unwrap(),
+            "past its TTL the key is reclaimable again"
+        );
+    }
+
+    // --- Batch path ---
+
+    fn label(disposition: &MessageDisposition) -> &'static str {
+        match disposition {
+            MessageDisposition::Ack => "ack",
+            MessageDisposition::Nack => "nack",
+            MessageDisposition::Reply(_) => "reply",
+        }
+    }
+
+    type Committed = Arc<std::sync::Mutex<Vec<Vec<&'static str>>>>;
+
+    /// Hands out prepared batches and records what its commit was called with, so the
+    /// dispositions the wrapper passes *inward* can be asserted on.
+    struct RecordingConsumer {
+        batches: std::collections::VecDeque<Vec<CanonicalMessage>>,
+        committed: Committed,
+    }
+
+    #[async_trait]
+    impl MessageConsumer for RecordingConsumer {
+        async fn receive_batch(
+            &mut self,
+            _max_messages: usize,
+        ) -> Result<ReceivedBatch, ConsumerError> {
+            let messages = self.batches.pop_front().unwrap_or_default();
+            let committed = self.committed.clone();
+            let commit: crate::traits::BatchCommitFunc = Box::new(move |dispositions| {
+                committed
+                    .lock()
+                    .unwrap()
+                    .push(dispositions.iter().map(label).collect());
+                Box::pin(async { Ok(()) }) as crate::traits::BoxFuture<'static, anyhow::Result<()>>
+            });
+            Ok(ReceivedBatch { messages, commit })
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    /// A message whose `id` field drives the `${payload:id}` key template.
+    fn keyed(id: &str, message_id: u128) -> CanonicalMessage {
+        CanonicalMessage::new(
+            format!(r#"{{"id":"{id}","n":{message_id}}}"#).into_bytes(),
+            Some(message_id),
+        )
+    }
+
+    async fn dedup_over(
+        dir: &tempfile::TempDir,
+        name: &str,
+        batches: Vec<Vec<CanonicalMessage>>,
+    ) -> (DeduplicationConsumer, Committed) {
+        let config = DeduplicationMiddleware {
+            store: None,
+            sled_path: Some(dir.path().join(name).to_str().unwrap().to_string()),
+            ttl_seconds: 3600,
+            key: Some("${payload:id}".to_string()),
+        };
+        let committed: Committed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let inner = RecordingConsumer {
+            batches: batches.into(),
+            committed: committed.clone(),
+        };
+        let consumer = DeduplicationConsumer::new(Box::new(inner), &config, "test_route")
+            .await
+            .unwrap();
+        (consumer, committed)
+    }
+
+    #[tokio::test]
+    async fn duplicates_within_one_batch_are_suppressed() {
+        let dir = tempdir().unwrap();
+        let (mut consumer, _) = dedup_over(
+            &dir,
+            "in_batch",
+            vec![vec![
+                keyed("A", 1),
+                keyed("A", 2),
+                keyed("B", 3),
+                keyed("A", 4),
+            ]],
+        )
+        .await;
+
+        let batch = consumer.receive_batch(16).await.unwrap();
+        let ids: Vec<u128> = batch.messages.iter().map(|m| m.message_id).collect();
+        assert_eq!(
+            ids,
+            vec![1, 3],
+            "only the first of each key survives, in order"
+        );
+        assert_eq!(
+            batch.messages[0].payload.as_ref(),
+            keyed("A", 1).payload.as_ref(),
+            "the surviving message keeps its own payload"
+        );
+    }
+
+    /// The wrapper hands the inner consumer a full-width disposition vector: the caller's
+    /// choices at the slots they came from, and `Ack` for the duplicates it dropped — which
+    /// is what stops a suppressed duplicate from being redelivered forever.
+    #[tokio::test]
+    async fn dispositions_are_remapped_to_the_inner_batch_slots() {
+        let dir = tempdir().unwrap();
+        let (mut consumer, committed) = dedup_over(
+            &dir,
+            "remap",
+            vec![vec![keyed("A", 1), keyed("A", 2), keyed("B", 3)]],
+        )
+        .await;
+
+        let batch = consumer.receive_batch(16).await.unwrap();
+        assert_eq!(batch.messages.len(), 2);
+        (batch.commit)(vec![MessageDisposition::Nack, MessageDisposition::Ack])
+            .await
+            .unwrap();
+
+        assert_eq!(
+            committed.lock().unwrap().as_slice(),
+            [vec!["nack", "ack", "ack"]],
+            "kept slots carry the caller's disposition; the dropped duplicate is acked"
+        );
+    }
+
+    /// A batch of nothing but duplicates must not surface as an empty batch — that is the
+    /// drain signal — so the wrapper acks them and fetches again.
+    #[tokio::test]
+    async fn an_all_duplicate_batch_is_acked_and_retried() {
+        let dir = tempdir().unwrap();
+        let (mut consumer, committed) = dedup_over(
+            &dir,
+            "all_dup",
+            vec![
+                vec![keyed("A", 1)],
+                vec![keyed("A", 2), keyed("A", 3)],
+                vec![keyed("B", 4)],
+            ],
+        )
+        .await;
+
+        let first = consumer.receive_batch(16).await.unwrap();
+        assert_eq!(first.messages.len(), 1);
+        (first.commit)(vec![MessageDisposition::Ack]).await.unwrap();
+
+        let second = tokio::time::timeout(Duration::from_secs(10), consumer.receive_batch(16))
+            .await
+            .expect("an all-duplicate batch must not stall the consumer")
+            .unwrap();
+        assert_eq!(
+            second
+                .messages
+                .iter()
+                .map(|m| m.message_id)
+                .collect::<Vec<_>>(),
+            vec![4],
+            "the all-duplicate batch is skipped and the next one delivered"
+        );
+        assert_eq!(
+            committed.lock().unwrap()[1],
+            vec!["ack", "ack"],
+            "every message of the skipped batch is acked"
+        );
+    }
+
+    /// Only an ack promotes the reservation. A nacked message leaves its key on the short
+    /// reservation TTL, so a redelivery is reprocessed rather than silently dropped.
+    #[tokio::test]
+    async fn a_nacked_message_is_not_marked_processed() {
+        let dir = tempdir().unwrap();
+        let store: Arc<dyn DedupStore> = Arc::new(sled_store(&dir, "nack_state", 3600));
+        let committed: Committed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let inner = RecordingConsumer {
+            batches: vec![vec![keyed("A", 1), keyed("B", 2)]].into(),
+            committed,
+        };
+        let mut consumer = DeduplicationConsumer::with_store(
+            Box::new(inner),
+            store.clone(),
+            Some("${payload:id}"),
+        )
+        .unwrap();
+
+        let batch = consumer.receive_batch(16).await.unwrap();
+        (batch.commit)(vec![MessageDisposition::Nack, MessageDisposition::Ack])
+            .await
+            .unwrap();
+
+        // Look past the reservation window: the acked key was promoted and still blocks, the
+        // nacked one has released.
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + PENDING_TTL_SECS
+            + 1;
+        assert!(
+            !store.reserve(b"A", now).await.unwrap(),
+            "a nacked key must be reclaimable"
+        );
+        assert!(
+            store.reserve(b"B", now).await.unwrap(),
+            "an acked key stays claimed for the configured TTL"
         );
     }
 

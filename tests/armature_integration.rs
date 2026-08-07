@@ -56,6 +56,22 @@ fn armature_messaging_test() {
         .expect("Failed to checkout");
     assert!(status.success(), "Failed to checkout armature repo");
 
+    // Every workspace member is a submodule upstream, so a plain checkout leaves empty
+    // gitlink directories and cargo cannot read the members listed in the root manifest.
+    let status = Command::new("git")
+        .args([
+            "submodule",
+            "update",
+            "--init",
+            "--depth",
+            "1",
+            "--filter=blob:none",
+        ])
+        .current_dir(&test_dir)
+        .status()
+        .expect("Failed to execute git submodule update");
+    assert!(status.success(), "Failed to init armature submodules");
+
     let project_dir = test_dir.join(subdirectory);
     assert!(
         project_dir.exists(),

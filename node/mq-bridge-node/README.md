@@ -153,8 +153,8 @@ that ack each batch individually (NATS JetStream, AMQP, MQTT) accept any order.
 > source position (Kafka `partition:offset`, NATS `stream_sequence`, AMQP delivery
 > tag) and makes a natural primary key; source cursor fields are also available in
 > `message.metadata` (`mqb.src.kafka_topic`/`mqb.src.kafka_offset`, `mqb.src.nats_subject`/`mqb.src.nats_stream_sequence`,
-> `mqb.src.amqp_routing_key`/`mqb.src.amqp_delivery_tag`) when you opt in via the
-> `MQB_SOURCE_METADATA=1` environment variable (off by default). Keep `batchSize × per-record cost` under
+> `mqb.src.amqp_routing_key`/`mqb.src.amqp_delivery_tag`) when its Kafka, NATS, or
+> AMQP source config sets `source_metadata: true` (off by default). Keep `batchSize × per-record cost` under
 > the smallest broker ack deadline (JetStream `AckWait`, AMQP prefetch/timeout, MQTT
 > inflight) or raise it in config. **Kafka has no per-message nack:** `nack` there
 > leaves the offset unadvanced, so redelivery happens on the next run/rebalance.

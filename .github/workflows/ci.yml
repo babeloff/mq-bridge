@@ -305,3 +305,30 @@ jobs:
       
       - name: Build documentation (deny warnings)
         run: RUSTDOCFLAGS="-D warnings" cargo doc --all-features --no-deps
+
+  # Supply chain: licenses, banned crates, source registries, RustSec advisories
+  supply-chain:
+    name: Supply Chain
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      # Hard gate: an unapproved license, a banned crate or a non-crates.io
+      # source is always a real, actionable problem in this repo.
+      - name: Licenses / bans / sources
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check bans licenses sources
+
+      # Informational: every current advisory is in a transitive dependency we
+      # cannot upgrade ourselves, and RustSec updates daily. SECURITY.md records
+      # the per-feature reachability analysis; deny.toml carries the reasoning.
+      - name: Advisories (informational)
+        continue-on-error: true
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories

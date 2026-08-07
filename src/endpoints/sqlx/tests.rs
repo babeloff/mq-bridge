@@ -292,6 +292,145 @@ async fn test_sqlx_cursor_reader_resumes_and_is_nondestructive() {
     assert!(again.messages.is_empty());
 }
 
+/// The cursor reader writes row JSON straight into the payload buffer rather than building a
+/// `serde_json::Value`, so escaping, blob hex and nulls are hand-written and worth pinning.
+#[tokio::test]
+async fn test_sqlx_cursor_reader_json_escapes_blobs_and_nulls() {
+    sqlx::any::install_default_drivers();
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("enc.db");
+    let url = sqlite_url(&path);
+    drop(tokio::fs::File::create(&path).await.unwrap());
+    let pool = AnyPool::connect(&url).await.unwrap();
+    sqlx::query(
+        r#"CREATE TABLE t (id INTEGER PRIMARY KEY, "he""llo" TEXT, ratio REAL, raw BLOB, maybe TEXT)"#,
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(r#"INSERT INTO t (id, "he""llo", ratio, raw, maybe) VALUES (?, ?, ?, ?, NULL)"#)
+        .bind(1i64)
+        .bind("quote\" back\\slash \n tab\t ünïcode")
+        .bind(0.5f64)
+        .bind(vec![0x00u8, 0x0f, 0xff])
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let config = SqlxConfig {
+        url,
+        table: "t".to_string(),
+        cursor_column: Some("id".to_string()),
+        ..Default::default()
+    };
+    let mut reader = SqlxCursorReader::new(&config).await.unwrap();
+    let b = reader.receive_batch(10).await.unwrap();
+    assert_eq!(b.messages.len(), 1);
+
+    // Parsing at all proves the quoted column name and control chars were escaped correctly.
+    let v: serde_json::Value = serde_json::from_slice(&b.messages[0].payload).unwrap();
+    assert_eq!(v["he\"llo"], "quote\" back\\slash \n tab\t ünïcode");
+    assert_eq!(v["ratio"], 0.5);
+    assert_eq!(v["raw"], "000fff");
+    assert!(v["maybe"].is_null());
+}
+
+/// SQLite types values, not columns, so an untyped column holds a different storage class per
+/// row. Reading the kind off `AnyRow`'s column (fixed for the whole result set) pinned every
+/// row to the first one's type — a NULL first row silenced the column entirely and made the
+/// cursor undecodable.
+#[tokio::test]
+async fn test_sqlx_cursor_reader_mixed_value_types_per_row() {
+    sqlx::any::install_default_drivers();
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("mixed.db");
+    let url = sqlite_url(&path);
+    drop(tokio::fs::File::create(&path).await.unwrap());
+    let pool = AnyPool::connect(&url).await.unwrap();
+    // Untyped columns: SQLite stores each value's own class rather than a column affinity.
+    sqlx::query("CREATE TABLE mixed (k, val)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO mixed (k, val) VALUES (1, NULL)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO mixed (k, val) VALUES (2, 42)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO mixed (k, val) VALUES (3, 'text')")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO mixed (k, val) VALUES (4, x'00ff')")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let config = SqlxConfig {
+        url,
+        table: "mixed".to_string(),
+        cursor_column: Some("k".to_string()),
+        cursor_id: Some("mixed-1".to_string()),
+        ..Default::default()
+    };
+    let mut reader = SqlxCursorReader::new(&config).await.unwrap();
+    // The cursor itself decodes from an untyped column whose first row is not NULL-pinned.
+    let b = reader.receive_batch(10).await.unwrap();
+    assert_eq!(b.messages.len(), 4);
+
+    let vals: Vec<serde_json::Value> = b
+        .messages
+        .iter()
+        .map(|m| serde_json::from_slice::<serde_json::Value>(&m.payload).unwrap()["val"].clone())
+        .collect();
+    assert!(vals[0].is_null());
+    assert_eq!(vals[1], 42);
+    assert_eq!(vals[2], "text");
+    assert_eq!(vals[3], "00ff");
+
+    // The checkpoint advanced, so a restart sees nothing left.
+    (b.commit)(vec![MessageDisposition::Ack; 4]).await.unwrap();
+    let mut reader2 = SqlxCursorReader::new(&config).await.unwrap();
+    assert!(reader2.receive_batch(10).await.unwrap().messages.is_empty());
+}
+
+/// A text cursor in an untyped column must decode as text, not be pinned to the first row.
+#[tokio::test]
+async fn test_sqlx_cursor_reader_untyped_text_cursor() {
+    sqlx::any::install_default_drivers();
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("untyped_text.db");
+    let url = sqlite_url(&path);
+    drop(tokio::fs::File::create(&path).await.unwrap());
+    let pool = AnyPool::connect(&url).await.unwrap();
+    sqlx::query("CREATE TABLE t (k, payload)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO t (k, payload) VALUES ('a', 1), ('b', 2)")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let config = SqlxConfig {
+        url,
+        table: "t".to_string(),
+        cursor_column: Some("k".to_string()),
+        cursor_id: Some("untyped-text-1".to_string()),
+        ..Default::default()
+    };
+    let mut reader = SqlxCursorReader::new(&config).await.unwrap();
+    let b = reader.receive_batch(10).await.unwrap();
+    assert_eq!(b.messages.len(), 2);
+    (b.commit)(vec![MessageDisposition::Ack; 2]).await.unwrap();
+
+    let mut reader2 = SqlxCursorReader::new(&config).await.unwrap();
+    assert!(reader2.receive_batch(10).await.unwrap().messages.is_empty());
+}
+
 #[tokio::test]
 async fn test_sqlx_cursor_reader_partial_ack_resumes_at_boundary() {
     let (_dir, url, _pool) = setup_arbitrary_table(5).await;
@@ -942,6 +1081,35 @@ async fn test_classify_sql_error_constraint_is_nonretryable_others_retryable() {
     ));
 }
 
+/// A stale pooled connection (the failure mode `test_before_acquire: false` trades away)
+/// surfaces as a transport error, not a SQL one. Both classifiers must treat it as
+/// transient so the route reconnects instead of dead-lettering a message that never ran.
+#[test]
+fn test_connection_level_failures_stay_retryable() {
+    let transport = || {
+        [
+            sqlx::Error::Io(std::io::Error::from(std::io::ErrorKind::ConnectionReset)),
+            sqlx::Error::Io(std::io::Error::from(std::io::ErrorKind::BrokenPipe)),
+            sqlx::Error::PoolClosed,
+            sqlx::Error::PoolTimedOut,
+        ]
+    };
+    for e in transport() {
+        let label = e.to_string();
+        assert!(
+            matches!(classify_sql_error(e), PublisherError::Retryable(_)),
+            "sink must retry '{label}'"
+        );
+    }
+    for e in transport() {
+        let label = e.to_string();
+        assert!(
+            matches!(classify_sql_consumer_error(e), ConsumerError::Connection(_)),
+            "source must reconnect on '{label}'"
+        );
+    }
+}
+
 #[tokio::test]
 async fn test_sqlx_status() {
     let (_dir, url) = setup_db_file().await;
@@ -988,4 +1156,98 @@ async fn sql_dedup_store_reserve_mark_and_expire() {
 
     // Once the processed TTL has elapsed, the key is reclaimable.
     assert!(!store.reserve(&key, now + 61).await.unwrap());
+}
+
+#[test]
+fn tuple_is_bare_placeholders_only_accepts_plain_tokens() {
+    assert!(tuple_is_bare_placeholders("($1, $2)", "PostgreSQL"));
+    assert!(tuple_is_bare_placeholders("(?, ?)", "SQLite"));
+    assert!(tuple_is_bare_placeholders(
+        "(@p1, @p2)",
+        "Microsoft SQL Server"
+    ));
+    // Casts and function calls must keep the user's SQL, so the batch rebuild is skipped.
+    assert!(!tuple_is_bare_placeholders(
+        "($1, decode($2, 'base64'))",
+        "PostgreSQL"
+    ));
+    assert!(!tuple_is_bare_placeholders("($1, $2::bytea)", "PostgreSQL"));
+    assert!(!tuple_is_bare_placeholders("($1, now())", "PostgreSQL"));
+    assert!(!tuple_is_bare_placeholders("", "PostgreSQL"));
+}
+
+/// The batch path used to regenerate the VALUES tuple as bare placeholders, which
+/// dropped the `decode(…)`/cast a binary column needs and bound the raw text instead.
+#[tokio::test]
+async fn batch_insert_keeps_an_expression_in_the_values_tuple() {
+    let (_dir, url) = setup_db_file().await;
+    let pool = AnyPool::connect(&url).await.unwrap();
+    sqlx::query("CREATE TABLE t (label TEXT, blob BLOB)")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let config = SqlxConfig {
+        url: url.clone(),
+        table: "t".to_string(),
+        insert_query: Some(
+            "INSERT INTO t (label, blob) VALUES (${payload:label}, unhex(${payload:hex}))"
+                .to_string(),
+        ),
+        ..Default::default()
+    };
+    let publisher = SqlxPublisher::new(&config).await.unwrap();
+
+    publisher
+        .send_batch(vec![
+            CanonicalMessage::new(br#"{"label":"a","hex":"414243"}"#.to_vec(), None),
+            CanonicalMessage::new(br#"{"label":"b","hex":"444546"}"#.to_vec(), None),
+        ])
+        .await
+        .unwrap();
+
+    let rows = sqlx::query("SELECT label, CAST(blob AS TEXT) AS blob FROM t ORDER BY label")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    let first: String = rows[0].get("blob");
+    let second: String = rows[1].get("blob");
+    assert_eq!(first, "ABC", "the unhex() call was dropped from the tuple");
+    assert_eq!(second, "DEF");
+}
+
+/// An embedded NUL used to reach the driver, which dropped the bind and stored SQL
+/// NULL while the route reported success.
+#[tokio::test]
+async fn embedded_nul_in_a_bound_value_is_rejected() {
+    let (_dir, url) = setup_db_file().await;
+    let pool = AnyPool::connect(&url).await.unwrap();
+    sqlx::query("CREATE TABLE t (val TEXT)")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let config = SqlxConfig {
+        url: url.clone(),
+        table: "t".to_string(),
+        insert_query: Some("INSERT INTO t (val) VALUES (${payload:val})".to_string()),
+        ..Default::default()
+    };
+    let publisher = SqlxPublisher::new(&config).await.unwrap();
+
+    // The JSON escape below decodes to a real NUL inside the string value.
+    let msg = CanonicalMessage::new(br#"{"val":"before\u0000after"}"#.to_vec(), None);
+    let err = publisher.send(msg).await.unwrap_err();
+    assert!(
+        matches!(err, PublisherError::NonRetryable(_)),
+        "expected a non-retryable rejection, got {err}"
+    );
+    assert!(err.to_string().contains("NUL"), "{err}");
+
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM t")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 0, "the row must not land at all");
 }

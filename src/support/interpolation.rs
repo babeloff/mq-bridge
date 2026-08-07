@@ -40,7 +40,10 @@
 //! always inserted verbatim.
 
 use anyhow::{anyhow, bail, Context};
+use serde::de::{self, DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor};
+use serde::Deserialize;
 use serde_json::Value;
+use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::canonical_message::{format_message_id, CanonicalMessage};
@@ -106,6 +109,9 @@ pub struct CompiledTemplate {
     escape: EscapeMode,
     /// True if any token reads the payload, so it is parsed once per render.
     needs_payload: bool,
+    /// The path of the only `${payload:…}` token, when there is exactly one. Rendering then
+    /// extracts that one field instead of materializing the whole document.
+    single_payload_path: Option<String>,
     /// Backs `${gen:counter}`; shared across clones via the enclosing `Arc`.
     counter: AtomicU64,
     /// Sum of literal byte lengths, used to pre-size the render buffer.
@@ -173,10 +179,23 @@ impl CompiledTemplate {
             })
             .sum();
 
+        let mut payload_paths = segments.iter().filter_map(|s| match s {
+            Segment::Token(Token {
+                source: Source::Payload(path),
+                ..
+            }) => Some(path.clone()),
+            _ => None,
+        });
+        let single_payload_path = match (payload_paths.next(), payload_paths.next()) {
+            (Some(path), None) => Some(path),
+            _ => None,
+        };
+
         Ok(Self {
             segments,
             escape,
             needs_payload,
+            single_payload_path,
             counter: AtomicU64::new(0),
             literal_len,
         })
@@ -191,18 +210,14 @@ impl CompiledTemplate {
     /// Render the template against an optional message. On the source side (no
     /// input message) `payload`/`metadata`/`message` tokens resolve to empty.
     pub fn render(&self, msg: Option<&CanonicalMessage>) -> Vec<u8> {
-        let payload_json: Option<Value> = if self.needs_payload {
-            msg.and_then(|m| serde_json::from_slice(&m.payload).ok())
-        } else {
-            None
-        };
+        let payload = self.parse_payload(msg);
 
         let mut out = Vec::with_capacity(self.literal_len + 16);
         for seg in &self.segments {
             match seg {
                 Segment::Literal(b) => out.extend_from_slice(b),
                 Segment::Token(tok) => {
-                    let value = self.resolve(tok, msg, &payload_json);
+                    let value = self.resolve(tok, msg, &payload);
                     if tok.raw || self.escape == EscapeMode::None {
                         out.extend_from_slice(value.as_bytes());
                     } else {
@@ -214,18 +229,30 @@ impl CompiledTemplate {
         out
     }
 
-    fn resolve(
-        &self,
-        tok: &Token,
-        msg: Option<&CanonicalMessage>,
-        payload: &Option<Value>,
-    ) -> String {
+    /// Parse as little of the payload as the template actually asks for.
+    fn parse_payload(&self, msg: Option<&CanonicalMessage>) -> Payload {
+        if !self.needs_payload {
+            return Payload::None;
+        }
+        let Some(msg) = msg else {
+            return Payload::None;
+        };
+        match &self.single_payload_path {
+            Some(path) => Payload::Field(pick_path(&msg.payload, path)),
+            None => match serde_json::from_slice(&msg.payload) {
+                Ok(doc) => Payload::Doc(doc),
+                Err(_) => Payload::None,
+            },
+        }
+    }
+
+    fn resolve(&self, tok: &Token, msg: Option<&CanonicalMessage>, payload: &Payload) -> String {
         match &tok.source {
-            Source::Payload(path) => payload
-                .as_ref()
-                .and_then(|v| walk(v, path))
-                .map(value_to_string)
-                .unwrap_or_default(),
+            Source::Payload(path) => match payload {
+                Payload::Field(value) => value.as_ref().map(value_to_string).unwrap_or_default(),
+                Payload::Doc(doc) => walk(doc, path).map(value_to_string).unwrap_or_default(),
+                Payload::None => String::new(),
+            },
             Source::Metadata(key) => msg
                 .and_then(|m| m.metadata.get(key))
                 .cloned()
@@ -378,6 +405,114 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 }
 
 /// Walk a dotted path into a JSON value. Empty path returns the whole value.
+/// What a single render needs from the payload.
+enum Payload {
+    /// No payload token, no message, or the payload did not parse.
+    None,
+    /// The whole document, walked per token (two or more payload tokens).
+    Doc(Value),
+    /// The one field the template asked for, already extracted.
+    Field(Option<Value>),
+}
+
+/// Deserialize only the value at `path`, skipping every other field.
+///
+/// Equivalent to `walk(&serde_json::from_slice(bytes)?, path)` — the picked subtree is built
+/// as a normal `Value`, so rendering is byte-identical — but the rest of the document is
+/// discarded as it is scanned instead of being allocated.
+fn pick_path(bytes: &[u8], path: &str) -> Option<Value> {
+    let segs: Vec<&str> = path.split('.').filter(|s| !s.is_empty()).collect();
+    let mut de = serde_json::Deserializer::from_slice(bytes);
+    let picked = Pick(&segs).deserialize(&mut de).ok().flatten();
+    // Keep `from_slice`'s strictness: trailing garbage is still a parse failure.
+    de.end().ok()?;
+    picked
+}
+
+#[derive(Clone, Copy)]
+struct Pick<'a>(&'a [&'a str]);
+
+impl<'de, 'a> DeserializeSeed<'de> for Pick<'a> {
+    type Value = Option<Value>;
+
+    fn deserialize<D: de::Deserializer<'de>>(self, de: D) -> Result<Self::Value, D::Error> {
+        match self.0.split_first() {
+            None => Value::deserialize(de).map(Some),
+            Some((head, rest)) => de.deserialize_any(PickVisitor { head, rest }),
+        }
+    }
+}
+
+struct PickVisitor<'a> {
+    head: &'a str,
+    rest: &'a [&'a str],
+}
+
+// Scalars are left to the default `Visitor` methods, which error. `pick_path` maps that to
+// `None`, which is what `walk` returns when a path runs into a scalar.
+impl<'de, 'a> Visitor<'de> for PickVisitor<'a> {
+    type Value = Option<Value>;
+
+    fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str("a JSON object or array")
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+        let mut found = None;
+        while let Some(matched) = map.next_key_seed(KeyEq(self.head))? {
+            if matched {
+                // Last occurrence wins, matching how `Value` folds duplicate keys.
+                found = map.next_value_seed(Pick(self.rest))?;
+            } else {
+                map.next_value::<IgnoredAny>()?;
+            }
+        }
+        Ok(found)
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+        let want: Option<usize> = self.head.parse().ok();
+        let mut found = None;
+        let mut idx = 0usize;
+        loop {
+            if Some(idx) == want {
+                match seq.next_element_seed(Pick(self.rest))? {
+                    Some(value) => found = value,
+                    None => break,
+                }
+            } else if seq.next_element::<IgnoredAny>()?.is_none() {
+                break;
+            }
+            idx += 1;
+        }
+        Ok(found)
+    }
+}
+
+/// Compares an object key against a wanted name without allocating it.
+#[derive(Clone, Copy)]
+struct KeyEq<'a>(&'a str);
+
+impl<'de, 'a> DeserializeSeed<'de> for KeyEq<'a> {
+    type Value = bool;
+
+    fn deserialize<D: de::Deserializer<'de>>(self, de: D) -> Result<bool, D::Error> {
+        de.deserialize_str(self)
+    }
+}
+
+impl<'de, 'a> Visitor<'de> for KeyEq<'a> {
+    type Value = bool;
+
+    fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str("an object key")
+    }
+
+    fn visit_str<E: de::Error>(self, v: &str) -> Result<bool, E> {
+        Ok(v == self.0)
+    }
+}
+
 fn walk<'a>(value: &'a Value, path: &str) -> Option<&'a Value> {
     let mut cur = value;
     for part in path.split('.') {
@@ -430,6 +565,114 @@ mod tests {
             m.metadata.insert(k.to_string(), v.to_string());
         }
         m
+    }
+
+    /// The whole safety argument for `pick_path`: it must agree with parsing the document and
+    /// walking it. A disagreement would silently change rendered dedup keys, and an existing
+    /// on-disk dedup store would stop matching after an upgrade.
+    #[test]
+    fn pick_path_matches_a_full_parse_and_walk() {
+        let payloads: [&[u8]; 22] = [
+            br#"{"id":42,"name":"bob","amount":1.50,"created_at":"2026-01-01T00:00:00Z"}"#,
+            br#"{"a":{"b":{"c":"deep"}},"z":1}"#,
+            br#"{"a":{"b":["x","y","z"]}}"#,
+            br#"{"dup":1,"dup":2}"#,
+            "{\"esc\\\"key\":\"v\",\"s\":\"line\\nbreak é\"}".as_bytes(),
+            br#"{"n":null,"t":true,"obj":{"k":[1,2]},"arr":[{"q":9}]}"#,
+            br#"{"big":123456789012345678,"neg":-0.0,"exp":1e3}"#,
+            "{\"unicode\":\"héllo ☃\"}".as_bytes(),
+            // A key spelled with \u escapes: must still match the plain path "id".
+            br#"{"\u0069\u0064":7}"#,
+            // Keys where one is a prefix of another.
+            br#"{"id":1,"identity":2,"i":3}"#,
+            // Surrogate pair, escaped solidus, tab and a control char, all as \u escapes.
+            br#"{"emoji":"\ud83d\ude00","sl":"a\/b","tab":"a\tb","ctl":"a\u0001b"}"#,
+            br#"{"empty":{},"earr":[],"nested":{"a":{"a":{"a":1}}}}"#,
+            br#"[10,20,30]"#,
+            br#"42"#,
+            br#""bare""#,
+            br#"{"a":1} trailing"#,
+            br#"{not json"#,
+            b"",
+            // Invalid UTF-8: JSON must be UTF-8, so both paths must reject these identically.
+            &[b'{', b'"', b'a', b'"', b':', b'"', 0xff, 0xfe, b'"', b'}'],
+            &[0xff, 0xfe, 0xfd],
+            // Lone surrogate and a truncated escape.
+            br#"{"a":"\ud83d"}"#,
+            br#"{"a":"\u00"}"#,
+        ];
+        let paths = [
+            "id",
+            "name",
+            "amount",
+            "a",
+            "a.b",
+            "a.b.c",
+            "a.b.1",
+            "dup",
+            "esc\"key",
+            "s",
+            "n",
+            "t",
+            "obj",
+            "arr.0.q",
+            "big",
+            "neg",
+            "exp",
+            "unicode",
+            "identity",
+            "i",
+            "emoji",
+            "sl",
+            "tab",
+            "ctl",
+            "empty",
+            "earr",
+            "empty.x",
+            "earr.0",
+            "nested.a.a.a",
+            "0",
+            "2",
+            "9",
+            "missing",
+            "a.missing.x",
+            "",
+        ];
+
+        for payload in payloads {
+            for path in paths {
+                let expected = serde_json::from_slice::<Value>(payload)
+                    .ok()
+                    .and_then(|doc| walk(&doc, path).cloned());
+                let actual = pick_path(payload, path);
+                assert_eq!(
+                    actual,
+                    expected,
+                    "pick_path disagreed for payload {} and path {path:?}",
+                    String::from_utf8_lossy(payload)
+                );
+            }
+        }
+    }
+
+    /// A second payload token disables the single-field path; both spellings must render alike.
+    #[test]
+    fn one_and_two_payload_tokens_render_the_same_field() {
+        let msg = msg_with(r#"{"id":42,"amount":1.50,"s":"a\"b"}"#, &[]);
+        assert_eq!(render_str("${payload:id}", None, Some(&msg)), "42");
+        assert_eq!(
+            render_str("${payload:id}-${payload:amount}", None, Some(&msg)),
+            "42-1.5"
+        );
+        // Escaping still applies to the extracted field in a JSON context.
+        assert_eq!(
+            render_str(
+                r#"{"v":"${payload:s}"}"#,
+                Some("application/json"),
+                Some(&msg)
+            ),
+            r#"{"v":"a\"b"}"#
+        );
     }
 
     #[test]

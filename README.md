@@ -6,6 +6,8 @@
 ![Linux](https://img.shields.io/badge/Linux-supported-green?logo=linux)
 ![Windows](https://img.shields.io/badge/Windows-supported-green?logo=windows)
 ![macOS](https://img.shields.io/badge/macOS-supported-green?logo=apple)
+[![Supply chain](https://img.shields.io/badge/supply%20chain-cargo--deny-blue)](deny.toml)
+[![Security](https://img.shields.io/badge/security-advisory%20analysis-brightgreen)](SECURITY.md)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 
@@ -21,7 +23,7 @@ It is not only a forwarder. A route can transform, filter, fan out, retry, rate-
 
 ## Move data from A to B — inside your own service
 
-If you need to move data reliably between systems and you write code (Rust, Python, or Node), `mq-bridge` is a strong default. It is a **library you embed**, not a daemon or control plane you operate.
+If you need to move data or events reliably between systems and you write code (Rust, Python, or Node), `mq-bridge` is a strong default. It is a **library you embed**, not a daemon or control plane you operate.
 
 **Prefer not to write code?** [`mq-bridge-app`](https://github.com/marcomq/mq-bridge-app) runs the exact same engine as a **standalone, zero-code ETL service** configured entirely by **YAML or environment variables** — move data from A to B without writing a line. It ships a **Postman-style UI** to build, send, and inspect messages against a route, and can **import Postman collections and AsyncAPI documents** to scaffold routes and endpoints for you.
 
@@ -34,6 +36,8 @@ If you need to move data reliably between systems and you write code (Rust, Pyth
 *   **Self-hosted, no daemon**: generate config in the optional UI, paste it into your code, run it in-process. No hosted control plane, no separate scheduler.
 
 > **Throughput & footprint.** In our own benchmarks, the same engine — driven the zero-code way through [`mq-bridge-app`](https://github.com/marcomq/mq-bridge-app) — on a CSV→JSONL file conversion (1,000,000 mixed-type rows, ~116 MiB) sustained **1,133,786 rows/s** at ~22 MiB, about **~58x faster** and **~20x leaner in memory** than Meltano (`tap-csv` → `target-jsonl`, ~19,500 rows/s / ~444 MiB). Full setup, methodology, and the exact parameters are in [`benches/ETL_BENCHMARKS.md`](benches/ETL_BENCHMARKS.md).
+
+> **Kafka → file.** In a 1,000,000-row relay with the default file format and no transform, the engine was up to **80% faster than Sea Streamer**. The [`mq-bridge-app` benchmark](https://github.com/marcomq/mq-bridge-app/tree/dev/benches/etl) contains the reproducible helper and native file-format caveats.
 
 
 ## Language Bindings
@@ -364,11 +368,56 @@ orders_upsert_branch:
 duplicate to detect. Left unwrapped by `request`, the tagged message is returned as the route's
 response as usual.
 
+**Files & object storage — `idempotency`.** A filesystem has no unique constraint, so the `file` and
+`object_store` sinks get replay safety a different way: **deterministic names plus covered-range
+recovery**. Set `idempotency: true` and the sink stops writing UUID-named objects. Instead it groups
+each batch into runs of consecutive source positions and writes one immutable part per run, named
+for the range it covers:
+
+```yaml
+kafka_to_s3:
+  input:
+    kafka: { topic: "orders", url: "localhost:9092", source_metadata: true }
+  output:
+    object_store:
+      url: "s3://my-bucket/orders"
+      idempotency: true          # → s3://my-bucket/orders/part-orders-0-0-1023.jsonl
+```
+
+On startup the sink lists what is already there, parses the ranges out of the part names, and drops
+any incoming record whose position falls inside one. Filtering is **per record, not per batch**, so
+batch boundaries are free to differ across restarts — that is what makes it work without a
+checkpoint protocol. Local files stage to a temp name, `fsync`, then `rename` (atomic within a
+filesystem); object stores have no atomic rename, so a single PUT under the final name *is* the
+commit.
+
+This needs a replayable source position, which today means **Kafka** (topic/partition/offset) or
+**`postgres_cdc`** (commit LSN plus in-transaction ordinal). A route with an idempotent output turns
+`source_metadata` on for its input automatically; set it explicitly only when you want the
+`mqb.src.*` keys for something else. Any other input is rejected when the route starts. NATS, AMQP
+and MongoDB CDC also accept `source_metadata` and emit provenance keys, but a subject or routing key
+is not a replayable offset, so they cannot drive an idempotent sink.
+
+For the `file` sink, `idempotency: true` changes what `path` means: it is the directory that receives
+the part files, not the file that is appended to. The sink creates it on startup, so pointing it at an
+existing regular file fails there with "Failed to create idempotent file sink directory".
+
+`compression` and `encryption` work as usual.
+
+Current limits, all of which the sink rejects or logs rather than silently mishandling:
+
+*   No `csv` (each part would need its own header row).
+*   `date_partition` is ignored — parts are written flat under the prefix, since the name already
+    carries the range. Logged at startup.
+*   **One part file per contiguous run per batch.** There is no size-based rolling yet, so a large
+    backfill produces many small files (~1000 per 1M rows at `batch_size: 1024`). For `postgres_cdc`
+    this is per-transaction, so a high-commit-rate stream produces one small file per commit. Rolling
+    would require buffering across batches the route has already acked, which is not safe today.
 
 ### Cloud Object Storage (S3 / GCS / Azure)
 The `object_store` endpoint (alias `s3`) reads and writes cloud object stores — Amazon S3, Google Cloud Storage, Azure Blob, Cloudflare R2, and anything else the [`object_store`](https://crates.io/crates/object_store) crate speaks — behind the same `receive_batch` / `send_batch` API. Enable it with the `object-store` feature. Credentials and backend options are read from the process environment (`AWS_ACCESS_KEY_ID`, `AWS_ENDPOINT`, `AWS_REGION`, `GOOGLE_SERVICE_ACCOUNT`, `AZURE_STORAGE_ACCOUNT`, ...); the URL scheme picks the backend (`s3://`, `gs://`, `az://`).
 
-*   **As a sink**, each flushed batch is encoded with the same file endpoint formats (`normal` JSONL, `json`, `text`, `raw`) and written as **one immutable object** at `<prefix>/[YYYY/MM/DD/]<uuidv7>.<ext>`. Objects are write-once — nothing is appended or mutated. The uuidv7 name already sorts by write time; the optional `date_partition` prefix (on by default, derived from that same id's timestamp) is a readability / lifecycle-rule convenience.
+*   **As a sink**, each flushed batch is encoded with the same file endpoint formats (`normal` JSONL, `json`, `text`, `raw`) and written as **one immutable object** at `<prefix>/[YYYY/MM/DD/]<uuidv7>.<ext>`. Objects are write-once — nothing is appended or mutated. The uuidv7 name already sorts by write time; the optional `date_partition` prefix (on by default, derived from that same id's timestamp) is a readability / lifecycle-rule convenience. This naming applies only while `idempotency` is off — with `idempotency: true` the parts are instead named for the source range they cover and written flat under the prefix, and `date_partition` is ignored (see "Files & object storage — `idempotency`" above).
 *   **As a source**, objects under the prefix are listed in key order, fetched whole, split on the delimiter, and emitted. Progress is a durable cursor holding the last fully-acked object key: set `cursor_id` and an external `checkpoint_store` (`file://`, `s3://`, `postgres://`, `mongodb://`) so a restart resumes without re-emitting. Objects are **never deleted or rewritten** — resume is non-destructive and at-least-once at object granularity (a nacked batch is redelivered; the cursor only advances once an object is fully acked). `csv` is supported on the source only.
 
 ```yaml
@@ -396,6 +445,26 @@ replay_from_s3:
 > always write the `{message_id, payload, metadata}` wrapper, so the message id survives the round
 > trip. Use `format: raw` to write payloads verbatim (bare documents, no wrapper). Applies to both
 > `file` and `object_store`.
+>
+> A **source** on those formats expects that same wrapper, `message_id` included. A line that is
+> valid JSON but not the wrapper — a hand-written fixture with only `payload` and `metadata`, say —
+> is not decomposed: the whole line becomes the payload and the line's own `metadata` is discarded.
+> The reader logs a warning naming the wrapper when this happens. For plain JSON lines, use
+> `format: raw`.
+>
+> **Payload encoding in the wrapper.** A UTF-8 payload is written as a plain JSON string under
+> `payload`. A binary one (compressed, encrypted, Protobuf, …) is base64-encoded under a separate
+> `payload_base64` field; the two are mutually exclusive, as in the
+> [CloudEvents JSON format](https://github.com/cloudevents/spec/blob/main/cloudevents/formats/json-format.md).
+>
+> ```json
+> {"message_id":"019f9b12-d786-7ebe-a7ec-a1aa71bc47ae","payload":"{\"order_id\":7}"}
+> {"message_id":"019f9b12-d78a-7c01-b0f4-2f0f4d6a1c33","payload_base64":"KLUv/SBOAQAA"}
+> ```
+>
+> Sources still read the older byte-array form (`"payload":[123,34,…]`), so existing files keep
+> working. Only the reverse is a break: a **binary** record written by this version is not readable
+> by an older mq-bridge. Text records are compatible in both directions.
 
 ### Response Endpoint
 The `response` output endpoint sends a reply back to the original requester. This is useful for synchronous request-reply flows, for example HTTP-to-NATS-to-HTTP. Use `response: {}` as the output endpoint configuration.

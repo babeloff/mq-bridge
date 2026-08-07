@@ -482,12 +482,24 @@ pub struct AmqpConsumer {
     is_poisoned: Arc<AtomicBool>,
     reply_confirms_selected: Arc<tokio::sync::OnceCell<()>>,
     prefetch: u16,
+    /// Resolved once at construction from endpoint config and the legacy fallback.
+    source_metadata: bool,
     /// Drain mode: only then does an idle wait surface an empty batch.
     exit_on_empty: bool,
 }
 
 impl AmqpConsumer {
     pub async fn new(config: &AmqpConfig) -> anyhow::Result<Self> {
+        Self::new_with_source_metadata(config, false).await
+    }
+
+    pub async fn new_with_source_metadata(
+        config: &AmqpConfig,
+        source_metadata: bool,
+    ) -> anyhow::Result<Self> {
+        let source_metadata = crate::canonical_message::source_metadata_enabled_for_endpoint(
+            source_metadata || config.source_metadata,
+        );
         let queue_or_exchange = config
             .queue
             .as_deref()
@@ -597,6 +609,7 @@ impl AmqpConsumer {
             is_poisoned: Arc::new(AtomicBool::new(false)),
             reply_confirms_selected: Arc::new(tokio::sync::OnceCell::new()),
             prefetch: prefetch_count,
+            source_metadata,
             exit_on_empty: false,
         })
     }
@@ -673,7 +686,10 @@ async fn build_tls_config(config: &AmqpConfig) -> anyhow::Result<OwnedTLSConfig>
     })
 }
 
-fn delivery_to_canonical_message(delivery: &lapin::message::Delivery) -> CanonicalMessage {
+fn delivery_to_canonical_message(
+    delivery: &lapin::message::Delivery,
+    source_metadata: bool,
+) -> CanonicalMessage {
     let mut message_id = Some(delivery.delivery_tag as u128);
     if let Some(amqp_id) = delivery.properties.message_id().as_ref() {
         if let Ok(uuid) = Uuid::parse_str(amqp_id.as_str()) {
@@ -702,8 +718,7 @@ fn delivery_to_canonical_message(delivery: &lapin::message::Delivery) -> Canonic
     }
 
     // Source-position cursor keys (useful for dlt-style pull consumers).
-    // Opt-in via the MQB_SOURCE_METADATA env var; off by default.
-    if crate::canonical_message::source_metadata_enabled() {
+    if source_metadata {
         canonical_message.metadata.insert(
             "mqb.src.amqp_routing_key".to_string(),
             delivery.routing_key.to_string(),
@@ -806,7 +821,7 @@ impl MessageConsumer for AmqpConsumer {
         let mut ackers = Vec::with_capacity(max_messages);
         let mut reply_infos = Vec::with_capacity(max_messages);
 
-        let msg = delivery_to_canonical_message(&first_delivery);
+        let msg = delivery_to_canonical_message(&first_delivery, self.source_metadata);
         reply_infos.push((
             msg.metadata.get("reply_to").cloned(),
             msg.metadata.get("correlation_id").cloned(),
@@ -818,7 +833,7 @@ impl MessageConsumer for AmqpConsumer {
         while messages.len() < max_messages {
             match self.consumer.try_next().now_or_never() {
                 Some(Ok(Some(delivery))) => {
-                    let msg = delivery_to_canonical_message(&delivery);
+                    let msg = delivery_to_canonical_message(&delivery, self.source_metadata);
                     reply_infos.push((
                         msg.metadata.get("reply_to").cloned(),
                         msg.metadata.get("correlation_id").cloned(),

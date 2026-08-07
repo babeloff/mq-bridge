@@ -931,9 +931,85 @@ async fn test_consumer_transforms_from_a_real_memory_endpoint() {
     assert_eq!(out, json!({ "firstName": "John", "id": 42 }));
 }
 
+// --- coerce_empty_as_null ---
+
+/// The same schema with and without the flag, so the default stays visible: an empty
+/// string is an ordinary string unless it is opted in.
+fn empty_as_null_cfg(properties: Value, on: bool) -> Compiled {
+    compiled(json!({
+        "schema": {"type": "object", "properties": properties},
+        "coerce_empty_as_null": on,
+    }))
+}
+
+#[test]
+fn test_empty_string_is_a_string_unless_opted_in() {
+    let props = json!({"email": {"type": "string", "nullable": true}});
+    let out = run(&empty_as_null_cfg(props, false), json!({"email": ""})).unwrap();
+    assert_eq!(out, json!({"email": ""}));
+}
+
+#[test]
+fn test_coerce_empty_as_null_nulls_only_empty_strings() {
+    let props = json!({
+        "email": {"type": "string", "nullable": true},
+        "name": {"type": "string"},
+        "qty": {"type": "integer", "nullable": true},
+    });
+    let out = run(
+        &empty_as_null_cfg(props, true),
+        json!({"email": "", "name": " ", "qty": 0}),
+    )
+    .unwrap();
+    // A blank is not empty and `0` is not falsy: only `""` is affected.
+    assert_eq!(out, json!({"email": null, "name": " ", "qty": 0}));
+}
+
+#[test]
+fn test_coerce_empty_as_null_lets_the_default_win() {
+    let props = json!({"tier": {"type": "string", "default": "standard"}});
+    let out = run(&empty_as_null_cfg(props, true), json!({"tier": ""})).unwrap();
+    assert_eq!(out, json!({"tier": "standard"}));
+}
+
+#[test]
+fn test_coerce_empty_as_null_rejects_a_non_nullable_field() {
+    let props = json!({"email": {"type": "string"}});
+    let err = run(&empty_as_null_cfg(props, true), json!({"email": ""})).unwrap_err();
+    assert_eq!(err.kind, ErrorKind::TypeMismatch);
+    assert_eq!(err.path, "$.email");
+    // The message has to name the coercion, or the null looks like it was in the payload.
+    assert!(
+        err.detail.contains("empty string"),
+        "unhelpful detail: {}",
+        err.detail
+    );
+}
+
+#[test]
+fn test_coerce_empty_as_null_reaches_nested_and_array_fields() {
+    let props = json!({
+        "user": {"type": "object", "properties": {"nick": {"type": "string", "nullable": true}}},
+        "tags": {"type": "array", "items": {"type": "string", "nullable": true}},
+    });
+    let out = run(
+        &empty_as_null_cfg(props, true),
+        json!({"user": {"nick": ""}, "tags": ["a", ""]}),
+    )
+    .unwrap();
+    assert_eq!(out, json!({"user": {"nick": null}, "tags": ["a", null]}));
+}
+
+#[test]
+fn test_coerce_empty_as_null_leaves_fields_the_schema_does_not_mention() {
+    let props = json!({"email": {"type": "string", "nullable": true}});
+    let out = run(&empty_as_null_cfg(props, true), json!({"note": ""})).unwrap();
+    assert_eq!(out, json!({"note": ""}));
+}
+
 mod fast_path_equivalence {
     use super::super::compiled::{map_sorts_keys, Compiled};
-    use crate::models::TransformMiddleware;
+    use crate::models::{DetailedMappingRule, MappingRule, TransformMiddleware};
     use crate::CanonicalMessage;
     use serde_json::{json, Map, Value};
 
@@ -950,10 +1026,16 @@ mod fast_path_equivalence {
     }
 
     fn both(schema: Value, payload: &str) -> Outcomes {
-        let config = TransformMiddleware {
-            schema: Some(schema),
-            ..Default::default()
-        };
+        both_with(
+            TransformMiddleware {
+                schema: Some(schema),
+                ..Default::default()
+            },
+            payload,
+        )
+    }
+
+    fn both_with(config: TransformMiddleware, payload: &str) -> Outcomes {
         let mut compiled = Compiled::new(&config).unwrap();
         let eligible = compiled.fast_eligible;
         let sort_keys = compiled.sort_keys;
@@ -993,8 +1075,8 @@ mod fast_path_equivalence {
     /// Compares outcomes as parsed JSON: object key order and escape spelling are
     /// serialization choices, not data. Both key orderings must agree with the normal path.
     #[track_caller]
-    fn assert_same(schema: Value, payload: &str) {
-        let out = both(schema, payload);
+    fn assert_same_with(config: TransformMiddleware, payload: &str) {
+        let out = both_with(config, payload);
         assert_eq!(
             as_json(&out.slow),
             as_json(&out.fast),
@@ -1004,6 +1086,17 @@ mod fast_path_equivalence {
             as_json(&out.slow),
             as_json(&out.fast_other_order),
             "paths disagree under the opposite key ordering on payload: {payload}"
+        );
+    }
+
+    #[track_caller]
+    fn assert_same(schema: Value, payload: &str) {
+        assert_same_with(
+            TransformMiddleware {
+                schema: Some(schema),
+                ..Default::default()
+            },
+            payload,
         );
     }
 
@@ -1020,6 +1113,20 @@ mod fast_path_equivalence {
     }
 
     /// Stronger than `assert_same`: byte for byte, for the key ordering this build uses.
+    #[track_caller]
+    fn assert_byte_identical_with(config: TransformMiddleware, payload: &str) {
+        let out = both_with(config, payload);
+        assert!(out.eligible, "expected the fast path to be eligible");
+        assert_eq!(
+            out.slow, out.fast,
+            "byte output differs for payload: {payload}"
+        );
+        assert_eq!(
+            out.slow, out.fast_other_order,
+            "byte output differs under the opposite key ordering: {payload}"
+        );
+    }
+
     #[track_caller]
     fn assert_byte_identical(schema: Value, payload: &str) {
         let out = both(schema.clone(), payload);
@@ -1274,5 +1381,224 @@ mod fast_path_equivalence {
     fn a_root_schema_without_properties_is_still_consistent() {
         assert_same(json!({"type":"object"}), r#"{"anything":[1,2]}"#);
         assert_same(json!({}), r#"{"anything":[1,2]}"#);
+    }
+
+    /// `coerce_empty_as_null` makes `""` mean something other than itself, which is
+    /// exactly the assumption `is_passthrough` and `is_plain_content_decode` make when
+    /// they wave a string through untouched.
+    #[test]
+    fn empty_strings_agree_under_coerce_empty_as_null() {
+        // No property-level `default` here: that alone rules the fast path out, and this
+        // test is about the shortcut still being taken.
+        let schema = json!({"type":"object","properties":{
+            "plain":{"type":"string"},
+            "loose":{},
+            "nullable":{"type":"string","nullable":true},
+            "doc":{"type":"string","contentMediaType":"application/json"},
+            "listed":{"type":"string","enum":["a","b"]}}});
+        let cases = [
+            r#"{"plain":""}"#,
+            r#"{"loose":""}"#,
+            r#"{"nullable":""}"#,
+            r#"{"doc":""}"#,
+            r#"{"listed":""}"#,
+            r#"{"unmentioned":""}"#,
+            r#"{"nullable":"","plain":"kept"}"#,
+        ];
+        for payload in cases {
+            let config = TransformMiddleware {
+                schema: Some(schema.clone()),
+                coerce_empty_as_null: true,
+                ..Default::default()
+            };
+            let out = both_with(config, payload);
+            assert!(
+                out.eligible,
+                "the fast path should stay available: {payload}"
+            );
+            assert_eq!(
+                as_json(&out.slow),
+                as_json(&out.fast),
+                "paths disagree on payload: {payload}"
+            );
+            assert_eq!(
+                as_json(&out.slow),
+                as_json(&out.fast_other_order),
+                "paths disagree under the opposite key ordering on payload: {payload}"
+            );
+        }
+    }
+
+    // --- Mapping-only projections ---
+
+    fn projection(rules: &[(&str, &str)]) -> TransformMiddleware {
+        TransformMiddleware {
+            mapping: rules
+                .iter()
+                .map(|(out, path)| (out.to_string(), MappingRule::Path(path.to_string())))
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    /// The benchmark's row: seven fields, four kept, and the one dropped field is the
+    /// biggest — which the fast path must never parse.
+    fn row() -> &'static str {
+        concat!(
+            r#"{"id":41,"first_name":"Ada","country":"UK","amount":12.5,"#,
+            r#""created_at":"2026-08-06T10:00:00Z","active":true,"#,
+            r#""attributes":"{\"tier\":\"gold\",\"tags\":[\"a\",\"b\"]}"}"#
+        )
+    }
+
+    fn four_of_seven() -> TransformMiddleware {
+        projection(&[
+            ("id", "$.id"),
+            ("first_name", "$.first_name"),
+            ("country", "$.country"),
+            ("amount", "$.amount"),
+        ])
+    }
+
+    #[test]
+    fn a_projection_takes_the_fast_path() {
+        assert_byte_identical_with(four_of_seven(), row());
+    }
+
+    #[test]
+    fn renamed_and_reordered_outputs_agree() {
+        let config = projection(&[
+            ("z_name", "$.first_name"),
+            ("a_id", "$.id"),
+            ("m_when", "$.created_at"),
+        ]);
+        assert_byte_identical_with(config, row());
+    }
+
+    #[test]
+    fn a_projection_carries_whole_subtrees_through() {
+        let payload = r#"{"keep":{"deep":[1,{"k":"v"}],"é":"😀"},"drop":[1,2,3]}"#;
+        assert_byte_identical_with(projection(&[("keep", "$.keep")]), payload);
+    }
+
+    #[test]
+    fn an_absent_optional_field_is_left_out() {
+        assert_byte_identical_with(four_of_seven(), r#"{"id":1,"country":"UK"}"#);
+        // Nothing matched at all: an empty object, not a failure.
+        assert_byte_identical_with(four_of_seven(), r#"{"other":1}"#);
+    }
+
+    #[test]
+    fn a_missing_required_field_fails_identically() {
+        let config = TransformMiddleware {
+            mapping: [
+                (
+                    "id".to_string(),
+                    MappingRule::Detailed(DetailedMappingRule {
+                        path: "$.id".to_string(),
+                        default: None,
+                        required: true,
+                    }),
+                ),
+                ("country".to_string(), MappingRule::Path("$.country".into())),
+            ]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        };
+        assert_byte_identical_with(config.clone(), r#"{"id":1,"country":"UK"}"#);
+        assert_same_with(config, r#"{"country":"UK"}"#);
+    }
+
+    #[test]
+    fn a_duplicated_source_key_resolves_to_its_last_value() {
+        // A `Value` parse collapses duplicates last-wins; picking spans has to match.
+        assert_byte_identical_with(
+            projection(&[("id", "$.id")]),
+            r#"{"id":1,"other":9,"id":2}"#,
+        );
+    }
+
+    #[test]
+    fn projections_that_must_fall_back_still_agree() {
+        // A nested output key, a source path below the top level, and a default: each
+        // alone keeps the general path.
+        assert_same_with(projection(&[("a.b", "$.id")]), row());
+        assert_same_with(
+            projection(&[("tier", "$.nested.tier")]),
+            r#"{"nested":{"tier":"gold"}}"#,
+        );
+        assert_same_with(projection(&[("first", "$.list[0]")]), r#"{"list":[7,8]}"#);
+        assert_same_with(
+            TransformMiddleware {
+                mapping: [(
+                    "id".to_string(),
+                    MappingRule::Detailed(DetailedMappingRule {
+                        path: "$.id".to_string(),
+                        default: Some(json!(0)),
+                        required: false,
+                    }),
+                )]
+                .into_iter()
+                .collect(),
+                ..Default::default()
+            },
+            r#"{"country":"UK"}"#,
+        );
+
+        // A schema alongside the mapping: the coercion stage still has to run.
+        let mut with_schema = four_of_seven();
+        with_schema.schema = Some(json!({"type":"object","properties":{"id":{"type":"string"}}}));
+        assert_same_with(with_schema, row());
+
+        // Shapes the span walk cannot read.
+        assert_same_with(four_of_seven(), r#"[1,2,3]"#);
+        assert_same_with(four_of_seven(), r#""bare string""#);
+        assert_same_with(four_of_seven(), r#"{"id":}"#);
+        assert_same_with(four_of_seven(), r#"not json at all"#);
+        // An escaped key cannot be borrowed, so the fast path declines the payload.
+        assert_same_with(four_of_seven(), r#"{"a\"b":1,"id":2}"#);
+        assert_same_with(four_of_seven(), r#"{"id":1,"country":"UK"}"#);
+    }
+
+    #[test]
+    fn an_output_key_needing_escapes_is_written_correctly() {
+        assert_byte_identical_with(projection(&[(r#"quote"and\slash"#, "$.id")]), r#"{"id":1}"#);
+    }
+
+    /// A documented, deliberate difference, and the same one `transform_fast` already
+    /// carries: a number too large for f64 is copied through as bytes, because a
+    /// projection never parses the fields it moves — where a whole-payload parse rejects
+    /// the message. Asserted so it cannot change unnoticed.
+    #[test]
+    fn known_difference_unrepresentable_number_in_a_projected_payload() {
+        for payload in [r#"{"id":1e400}"#, r#"{"id":1,"dropped":1e400}"#] {
+            let out = both_with(four_of_seven(), payload);
+            assert!(out.slow.is_err(), "normal path used to reject {payload}");
+            assert!(out.fast.is_ok(), "fast path rejected {payload}");
+        }
+    }
+
+    /// The general path moves picked values out of the input instead of cloning them, but
+    /// only when no rule reads through another's path. These overlap, so it must clone.
+    #[test]
+    fn overlapping_source_paths_still_see_the_whole_input() {
+        let payload = r#"{"a":{"b":1,"c":2}}"#;
+        let out = both_with(projection(&[("whole", "$.a"), ("part", "$.a.b")]), payload);
+        assert_eq!(
+            as_json(&out.slow),
+            Ok(json!({"whole":{"b":1,"c":2},"part":1}))
+        );
+    }
+
+    /// Disjoint deep paths do get moved rather than cloned; the result must not change.
+    #[test]
+    fn disjoint_deep_paths_agree_when_moved() {
+        let payload = r#"{"a":{"b":[1,2],"c":{"d":"x"}},"e":9}"#;
+        let out = both_with(
+            projection(&[("b", "$.a.b"), ("d", "$.a.c.d"), ("e", "$.e")]),
+            payload,
+        );
+        assert_eq!(as_json(&out.slow), Ok(json!({"b":[1,2],"d":"x","e":9})));
     }
 }

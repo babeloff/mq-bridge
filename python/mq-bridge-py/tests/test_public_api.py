@@ -95,13 +95,16 @@ def test_message_repr_includes_shape_without_payload() -> None:
     assert "secret" not in text
 
 
-def test_message_rejects_invalid_id() -> None:
-    try:
-        Message(b"hello", id="not-a-uuid")
-    except ValueError as exc:
-        assert "invalid message id" in str(exc)
-    else:  # pragma: no cover - defensive assertion
-        raise AssertionError("invalid message id was accepted")
+def test_message_hashes_non_uuid_id_stably() -> None:
+    # A non-UUID id is folded into a stable id rather than rejected.
+    first = Message(b"hello", id="not-a-uuid")
+    second = Message(b"world", id="not-a-uuid")
+
+    assert first.id == second.id
+    assert first.id != Message(b"hello", id="another-id").id
+    # Pinned FNV-1a/128 vector: the fold must stay identical across processes,
+    # releases and the Rust/Node bindings, so a seeded hash would fail here.
+    assert first.id == "32f0a7f7-0c3a-5303-92fb-c6935a4bdc48"
 
 
 def test_message_json_reports_decode_errors() -> None:

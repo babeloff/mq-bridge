@@ -165,6 +165,7 @@ pub struct RouteOptions {
     pub allow_fault_injection: bool,
     /// If true, the route exits gracefully once the source yields an empty batch
     /// (drain-then-exit). Off by default — routes normally poll indefinitely.
+    /// A drain that keeps failing to reconnect gives up and fails rather than retrying forever.
     #[serde(default = "default_false", skip_serializing_if = "is_false")]
     #[cfg_attr(feature = "schema", schemars(default = "default_false"))]
     pub exit_on_empty: bool,
@@ -1131,6 +1132,9 @@ pub struct TransformMiddleware {
     /// Insert `default` values from the schema for missing fields. Defaults to true.
     #[serde(default = "default_true")]
     pub apply_defaults: bool,
+    /// Read an empty string as `null`, so a nullable field or its default wins. Defaults to false.
+    #[serde(default)]
+    pub coerce_empty_as_null: bool,
     /// What to do with a message that fails to transform. Defaults to `reject`.
     #[serde(default)]
     pub on_error: TransformErrorPolicy,
@@ -1148,6 +1152,7 @@ impl Default for TransformMiddleware {
             schema_file: None,
             coerce: default_true(),
             apply_defaults: default_true(),
+            coerce_empty_as_null: false,
             on_error: TransformErrorPolicy::default(),
         }
     }
@@ -1377,6 +1382,9 @@ pub struct KafkaConfig {
     /// (Consumer only) Consumer group ID.
     /// If not provided, the consumer acts in **Subscriber mode**: it generates a unique, ephemeral group ID and starts consuming from the latest offset.
     pub group_id: Option<String>,
+    /// (Consumer only) Include authoritative `mqb.src.kafka_*` source positions. Defaults to false.
+    #[serde(default)]
+    pub source_metadata: bool,
     /// (Publisher only) If true, do not wait for an acknowledgement when sending to broker. Defaults to false.
     #[serde(default)]
     pub delayed_ack: bool,
@@ -1500,7 +1508,7 @@ impl SledConfig {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum FileFormat {
-    /// The full `CanonicalMessage` is serialized to JSON. Payload is a byte array.
+    /// The full `CanonicalMessage` is serialized to JSON. Payload is either base64 or utf8 text.
     #[default]
     Normal,
     /// The full `CanonicalMessage` is serialized to JSON. Payload is rendered as a JSON value if possible.
@@ -1568,8 +1576,12 @@ impl Default for CompressionMiddleware {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct FileConfig {
-    /// Path to the file.
+    /// Path to the file, or to the directory holding the part files when `idempotency` is true.
     pub path: String,
+    /// Write replay-safe source ranges as immutable part files under this directory.
+    /// Requires Kafka source metadata or postgres_cdc commit LSN plus transaction ordinal metadata.
+    #[serde(default)]
+    pub idempotency: bool,
     /// Optional delimiter for messages. Defaults to newline ("\n").
     /// Can be a string or a hex sequence (e.g. "0x00").
     /// Currently only single-byte delimiters are supported.
@@ -1636,6 +1648,7 @@ impl FileConfig {
     pub fn new(path: impl Into<String>) -> Self {
         Self {
             path: path.into(),
+            idempotency: false,
             mode: Some(FileConsumerMode::default()),
             delimiter: None,
             format: FileFormat::default(),
@@ -1672,6 +1685,10 @@ pub struct ObjectStoreConfig {
     /// the `object_store` crate (same mechanism as the checkpoint backend); R2 uses
     /// `s3://` plus a custom `AWS_ENDPOINT_URL`.
     pub url: String,
+    /// Write replay-safe source ranges as immutable objects instead of UUID-named objects.
+    /// Requires Kafka source metadata or postgres_cdc commit LSN plus transaction ordinal metadata.
+    #[serde(default)]
+    pub idempotency: bool,
     /// Record encoding within an object, shared with the file endpoint. Defaults to
     /// `normal` (one JSON `CanonicalMessage` per line). CSV is supported for sources only.
     #[serde(default)]
@@ -1713,6 +1730,7 @@ impl Default for ObjectStoreConfig {
     fn default() -> Self {
         Self {
             url: String::new(),
+            idempotency: false,
             format: FileFormat::default(),
             delimiter: None,
             checkpoint_store: None,
@@ -1774,6 +1792,9 @@ pub struct NatsConfig {
     /// (Consumer only) If true, use ephemeral **Subscriber mode**. Defaults to false (durable consumer).
     #[serde(default)]
     pub subscriber_mode: bool,
+    /// (Consumer only) Include authoritative `mqb.src.nats_*` source positions. Defaults to false.
+    #[serde(default)]
+    pub source_metadata: bool,
     /// (Publisher only) Maximum number of messages in the stream (if created by the bridge). Defaults to 1,000,000.
     pub stream_max_messages: Option<i64>,
     /// (Consumer only) The delivery policy for the consumer. Defaults to "all".
@@ -2178,6 +2199,9 @@ pub struct AmqpConfig {
     /// (Consumer only) If true, act as a **Subscriber** (fan-out). Defaults to false.
     #[serde(default)]
     pub subscribe_mode: bool,
+    /// (Consumer only) Include authoritative `mqb.src.amqp_*` source positions. Defaults to false.
+    #[serde(default)]
+    pub source_metadata: bool,
     /// Optional username for authentication.
     pub username: Option<String>,
     /// Optional password for authentication.
@@ -2306,6 +2330,10 @@ pub struct MongoDbConfig {
     pub consume: Option<MongoConsume>,
     /// (Consumer only) Optional custom MongoDB query to filter messages. Provided as a JSON string (e.g., '{"type": "notification"}').
     pub receive_query: Option<String>,
+    /// (Consumer only, `capture_new`/`capture_all`) Include authoritative `mqb.src.mongodb_*`
+    /// source positions. Defaults to false.
+    #[serde(default)]
+    pub source_metadata: bool,
     /// (Consumer only) **Deprecated** — use `consume: subscriber`. Kept for compatibility.
     #[serde(default)]
     pub change_stream: bool,
@@ -3221,6 +3249,9 @@ pub struct PostgresCdcConfig {
     pub url: String,
     /// Publication name (must already exist; defines which tables are captured).
     pub publication: String,
+    /// Include authoritative `mqb.src.postgres_*` source positions. Defaults to false.
+    #[serde(default)]
+    pub source_metadata: bool,
     /// Replication slot name; created if missing when `create_slot` is true.
     #[serde(default = "default_pg_cdc_slot")]
     pub slot_name: String,
@@ -3358,6 +3389,8 @@ pub struct SqlxConfig {
     pub idle_timeout_ms: Option<u64>,
     /// Maximum lifetime of a connection in milliseconds. Defaults to 1800000ms (30 minutes).
     pub max_lifetime_ms: Option<u64>,
+    /// Ping each pooled connection before handing it out (default false). Costs a round-trip per acquire.
+    pub test_before_acquire: Option<bool>,
     /// Share one connection pool per connection (default: true); false forces a dedicated pool.
     #[serde(default)]
     #[cfg_attr(feature = "schema", schemars(default = "default_shared_schema"))]
@@ -4092,6 +4125,17 @@ mod null_endpoint_tests {
         let yaml = serde_yaml_ng::to_string(&Endpoint::null()).expect("serialize");
         let back: Endpoint = serde_yaml_ng::from_str(&yaml).expect("deserialize");
         assert!(matches!(back.endpoint_type, EndpointType::Null));
+    }
+
+    #[test]
+    fn source_metadata_is_a_source_configuration_option() {
+        let endpoint: Endpoint =
+            serde_yaml_ng::from_str("kafka:\n  url: localhost:9092\n  source_metadata: true\n")
+                .expect("deserialize Kafka source metadata option");
+        let EndpointType::Kafka(config) = endpoint.endpoint_type else {
+            panic!("expected Kafka endpoint");
+        };
+        assert!(config.source_metadata);
     }
 }
 

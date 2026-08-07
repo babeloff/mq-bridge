@@ -21,6 +21,10 @@ impl RateState {
         }
     }
 
+    /// Returns how long to wait before releasing `count` messages. The wait covers the whole
+    /// window those messages occupy, not just the queue ahead of them: releasing a batch the
+    /// moment its slot opens let a single `send_batch` of N pass instantly, however large N
+    /// was, and only charged the next batch for it.
     fn reserve(&mut self, count: usize, per_message: Duration) -> Duration {
         const MAX_DELAY: Duration = Duration::from_secs(3600);
 
@@ -34,7 +38,7 @@ impl RateState {
         self.next_allowed_at = start_at
             .checked_add(additional)
             .unwrap_or_else(|| start_at + MAX_DELAY);
-        start_at.saturating_duration_since(now)
+        self.next_allowed_at.saturating_duration_since(now)
     }
 }
 
@@ -270,5 +274,31 @@ mod tests {
 
         assert_eq!(sent.lock().unwrap().len(), 2);
         assert!(elapsed >= Duration::from_millis(45));
+    }
+
+    /// A single `send_batch` must be paced by its own message count. It used to pass straight
+    /// through and only charge the *next* call, so a route that read everything in one poll
+    /// ignored the limit entirely.
+    #[tokio::test]
+    async fn test_limiter_publisher_paces_a_single_large_batch() {
+        let config = LimiterMiddleware {
+            messages_per_second: 20.0,
+        };
+        let sent = Arc::new(StdMutex::new(Vec::new()));
+        let publisher =
+            LimiterPublisher::new(Box::new(MockPublisher { sent: sent.clone() }), &config).unwrap();
+
+        let messages: Vec<CanonicalMessage> = (0..10)
+            .map(|i| CanonicalMessage::from(&*i.to_string()))
+            .collect();
+        let start = Instant::now();
+        publisher.send_batch(messages).await.unwrap();
+        let elapsed = start.elapsed();
+
+        assert_eq!(sent.lock().unwrap().len(), 10);
+        assert!(
+            elapsed >= Duration::from_millis(450),
+            "10 messages at 20/s should take ~500ms, took {elapsed:?}"
+        );
     }
 }

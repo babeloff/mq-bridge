@@ -7,6 +7,7 @@ use crate::event_store::{EventStore, EventStoreConsumer, RetentionPolicy};
 use crate::models::{Compression, FileConfig, FileConsumerMode, FileFormat};
 #[cfg(feature = "encryption")]
 use crate::support::crypto::Crypto;
+use crate::support::source_ranges::{finalized_name, CoveredRanges};
 use crate::traits::{
     ConsumerError, MessageConsumer, MessagePublisher, PublisherError, ReceivedBatch, SentBatch,
 };
@@ -20,6 +21,7 @@ use std::io::Seek;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, Weak};
+use std::time::{Duration, SystemTime};
 use tokio::fs::{self, File, OpenOptions};
 use tokio::io::{self, AsyncBufReadExt, AsyncSeekExt, BufReader};
 use tokio::io::{AsyncWriteExt, BufWriter};
@@ -302,6 +304,61 @@ pub(crate) fn parse_delimiter(delimiter: Option<&str>) -> anyhow::Result<Vec<u8>
     Ok(bytes)
 }
 
+/// True when `buf` stops inside an open quote, so the delimiter it ended on was field
+/// data: RFC 4180 lets a quoted field contain the record separator. Mirrors the quote
+/// handling in [`parse_csv_row`], down to only opening a quote at the start of a field,
+/// so the splitter and the parser can never disagree about where a record ends.
+fn csv_ends_inside_quotes(buf: &[u8]) -> bool {
+    let mut in_quotes = false;
+    let mut field_is_empty = true;
+    let mut i = 0;
+    while i < buf.len() {
+        let b = buf[i];
+        if in_quotes {
+            if b == b'"' {
+                if buf.get(i + 1) == Some(&b'"') {
+                    i += 1;
+                } else {
+                    in_quotes = false;
+                }
+            }
+        } else if b == b'"' && field_is_empty {
+            in_quotes = true;
+        } else if b == b',' {
+            field_is_empty = true;
+            i += 1;
+            continue;
+        } else {
+            field_is_empty = false;
+        }
+        i += 1;
+    }
+    in_quotes
+}
+
+/// Reads one *record*, which for CSV may span several delimiters. Every read loop and
+/// every record count goes through this, so a multi-line row stays one record everywhere
+/// — including the `lines_in_memory` bookkeeping that consume mode truncates the file by.
+async fn read_record<R: AsyncBufReadExt + Unpin>(
+    reader: &mut R,
+    delimiter: &[u8],
+    format: &FileFormat,
+    buf: &mut Vec<u8>,
+) -> std::io::Result<usize> {
+    let mut total = read_until_bytes(reader, delimiter, buf).await?;
+    if !matches!(format, FileFormat::Csv) {
+        return Ok(total);
+    }
+    while total > 0 && csv_ends_inside_quotes(buf) {
+        let n = read_until_bytes(reader, delimiter, buf).await?;
+        if n == 0 {
+            break; // Unterminated quote at EOF: emit what there is rather than hang.
+        }
+        total += n;
+    }
+    Ok(total)
+}
+
 async fn read_until_bytes<R: AsyncBufReadExt + Unpin>(
     reader: &mut R,
     delimiter: &[u8],
@@ -330,6 +387,9 @@ pub struct FilePublisher {
     file_lock: Arc<Mutex<()>>,
     delimiter: Vec<u8>,
     format: FileFormat,
+    idempotency: bool,
+    idempotent_extension: String,
+    covered_ranges: Arc<Mutex<CoveredRanges>>,
     #[cfg(any(feature = "compression", feature = "encryption"))]
     compression: Compression,
     #[cfg(feature = "encryption")]
@@ -359,34 +419,140 @@ fn validate_member_settings(config: &FileConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Staging files younger than this may belong to a concurrent writer — another worker or an
+/// overlapping restart sharing the directory — so only older ones are treated as crash debris.
+const STAGING_REAP_AGE: Duration = Duration::from_secs(60);
+
+async fn recover_idempotent_file_ranges(
+    directory: &Path,
+    extension: &str,
+) -> anyhow::Result<CoveredRanges> {
+    let now = SystemTime::now();
+    let mut entries = fs::read_dir(directory).await?;
+    let mut names = Vec::new();
+    while let Some(entry) = entries.next_entry().await? {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with(".stage-") {
+            let Ok(metadata) = entry.metadata().await else {
+                continue;
+            };
+            let Ok(modified) = metadata.modified() else {
+                continue;
+            };
+            let Ok(age) = now.duration_since(modified) else {
+                continue;
+            };
+            if age >= STAGING_REAP_AGE {
+                match fs::remove_file(entry.path()).await {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+        } else {
+            names.push(name);
+        }
+    }
+    Ok(CoveredRanges::from_finalized_names(
+        names.iter().map(String::as_str),
+        extension,
+    ))
+}
+
+async fn write_finalized_file(path: &Path, body: &[u8]) -> Result<(), PublisherError> {
+    let directory = path
+        .parent()
+        .ok_or_else(|| PublisherError::NonRetryable(anyhow::anyhow!("missing output directory")))?;
+    let staging = directory.join(format!(".stage-{}", fast_uuid_v7::gen_id_str()));
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&staging)
+        .await
+        .context("Failed to create idempotent file staging output")?;
+    file.write_all(body)
+        .await
+        .context("Failed to write idempotent file staging output")?;
+    file.sync_all()
+        .await
+        .context("Failed to sync idempotent file staging output")?;
+    drop(file);
+    fs::rename(&staging, path)
+        .await
+        .context("Failed to finalize idempotent file output")?;
+    // Best effort: Windows cannot open a directory handle this way.
+    if let Ok(directory) = File::open(directory).await {
+        let _ = directory.sync_all().await;
+    }
+    Ok(())
+}
+
 impl FilePublisher {
     pub async fn new(config: &FileConfig) -> anyhow::Result<Self> {
         validate_member_settings(config)?;
         let path_str = &config.path;
         let path = Path::new(path_str);
+        if config.idempotency {
+            if matches!(config.format, FileFormat::Csv) {
+                return Err(anyhow::anyhow!(
+                    "file idempotency does not support CSV (per-part headers are unimplemented)"
+                ));
+            }
+            tokio::fs::create_dir_all(path).await.with_context(|| {
+                format!("Failed to create idempotent file sink directory: {path_str}")
+            })?;
+        }
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent).await.with_context(|| {
                 format!("Failed to create parent directory for file: {:?}", parent)
             })?;
         }
 
-        let _ = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .await
-            .with_context(|| format!("Failed to open or create file for writing: {}", path_str))?;
+        if !config.idempotency {
+            let _ = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .await
+                .with_context(|| {
+                    format!("Failed to open or create file for writing: {}", path_str)
+                })?;
+        }
 
         let file_lock = get_file_lock(path_str);
         let delimiter = parse_delimiter(config.delimiter.as_deref())?;
         let format = config.format.clone();
-
+        // Part names must advertise what the bytes actually are: a compressed or sealed part
+        // holds one member, so it earns the same suffixes the appending sink's file would.
+        let mut idempotent_extension = match format {
+            FileFormat::Csv => "csv",
+            FileFormat::Raw => "bin",
+            FileFormat::Normal | FileFormat::Json | FileFormat::Text => "jsonl",
+        }
+        .to_string();
+        match config.compression {
+            Compression::None => {}
+            Compression::Gzip => idempotent_extension.push_str(".gz"),
+            Compression::Lz4 => idempotent_extension.push_str(".lz4"),
+            Compression::Zstd => idempotent_extension.push_str(".zst"),
+        }
+        if config.encryption.is_some() {
+            idempotent_extension.push_str(".enc");
+        }
+        let covered_ranges = if config.idempotency {
+            recover_idempotent_file_ranges(path, &idempotent_extension).await?
+        } else {
+            CoveredRanges::default()
+        };
         info!(path = %path_str, format = ?format, "File sink opened for appending");
         Ok(Self {
             path: path_str.to_string(),
             file_lock,
             delimiter,
             format,
+            idempotency: config.idempotency,
+            idempotent_extension,
+            covered_ranges: Arc::new(Mutex::new(covered_ranges)),
             #[cfg(any(feature = "compression", feature = "encryption"))]
             compression: config.compression,
             #[cfg(feature = "encryption")]
@@ -398,6 +564,79 @@ impl FilePublisher {
                 .map(Arc::new),
             csv_header: Arc::new(Mutex::new(None)),
         })
+    }
+
+    async fn send_batch_idempotent(
+        &self,
+        messages: Vec<CanonicalMessage>,
+    ) -> Result<SentBatch, PublisherError> {
+        let _file_guard = self.file_lock.lock().await;
+        let mut covered = self.covered_ranges.lock().await;
+        let runs = covered
+            .uncovered_runs(messages)
+            .map_err(PublisherError::NonRetryable)?;
+
+        for run in runs {
+            let name = finalized_name(&run.source, run.start, run.end, &self.idempotent_extension)
+                .map_err(PublisherError::NonRetryable)?;
+            let final_path = Path::new(&self.path).join(&name);
+            if !fs::try_exists(&final_path)
+                .await
+                .context("Failed to check idempotent file sink output")?
+            {
+                let mut body = Vec::new();
+                for mut message in run.messages {
+                    message.strip_source_metadata();
+                    let bytes = encode_record(&message, &self.format)
+                        .map_err(|error| PublisherError::NonRetryable(anyhow::anyhow!(error)))?;
+                    body.extend_from_slice(&bytes);
+                    body.extend_from_slice(&self.delimiter);
+                }
+                let body = self.encode_member(body)?;
+                write_finalized_file(&final_path, &body).await?;
+            }
+            covered
+                .insert(run.source, run.start, run.end)
+                .map_err(PublisherError::NonRetryable)?;
+        }
+        Ok(SentBatch::Ack)
+    }
+
+    /// Turns a fully built batch body into one self-contained member: compress, then seal into
+    /// a `[u64 be length][sealed bytes]` frame. Compressed members self-delimit; a sealed one
+    /// does not, hence the frame. Returns the body untouched when neither is configured.
+    ///
+    /// The appending path concatenates these into one file and the idempotent path writes each
+    /// as its own part file, but the encoding is identical either way, so the same reader
+    /// handles both and neither adds a format of its own.
+    #[allow(unused_mut)]
+    fn encode_member(&self, mut body: Vec<u8>) -> Result<Vec<u8>, PublisherError> {
+        #[cfg(feature = "compression")]
+        if self.compression != Compression::None {
+            body = crate::support::compression::compress_member(self.compression, &body)
+                .map_err(|e| PublisherError::NonRetryable(anyhow::anyhow!(e)))?;
+        }
+        #[cfg(feature = "encryption")]
+        if let Some(crypto) = &self.crypto {
+            let sealed = crypto
+                .seal(&body, b"")
+                .map_err(PublisherError::NonRetryable)?;
+            // The consumer rejects any frame whose length prefix exceeds this cap, so a batch
+            // sealing larger than it would be written but never read back. Fail fast and tell
+            // the operator to shrink batch_size rather than emit a member that corrupts the
+            // stream on read.
+            if sealed.len() as u64 > MAX_ENCRYPTED_FRAME_BYTES {
+                return Err(PublisherError::NonRetryable(anyhow::anyhow!(
+                    "encrypted batch frame is {} bytes, exceeding the {} byte cap the consumer can read; reduce batch_size",
+                    sealed.len(),
+                    MAX_ENCRYPTED_FRAME_BYTES
+                )));
+            }
+            body = Vec::with_capacity(8 + sealed.len());
+            body.extend_from_slice(&(sealed.len() as u64).to_be_bytes());
+            body.extend_from_slice(&sealed);
+        }
+        Ok(body)
     }
 
     /// True when batches are written as self-contained members (compressed
@@ -507,89 +746,60 @@ impl FilePublisher {
             // CSV header established for this batch is cleared afterwards — otherwise the
             // retry would think the header was already written and emit a headerless file.
             let outcome: Result<(), PublisherError> = async {
-            #[cfg(feature = "compression")]
-            let raw = if self.compression != Compression::None {
-                crate::support::compression::compress_member(self.compression, &raw)
-                    .map_err(|e| PublisherError::NonRetryable(anyhow::anyhow!(e)))?
-            } else {
-                raw
-            };
-            #[allow(unused_mut)]
-            let mut member = raw;
-            #[cfg(feature = "encryption")]
-            if let Some(crypto) = &self.crypto {
-                let sealed = crypto
-                    .seal(&member, b"")
-                    .map_err(PublisherError::NonRetryable)?;
-                // The consumer rejects any frame whose length prefix exceeds this cap, so a
-                // batch sealing larger than it would be written but never read back. Fail
-                // fast and tell the operator to shrink batch_size rather than emit a member
-                // that corrupts the stream on read.
-                if sealed.len() as u64 > MAX_ENCRYPTED_FRAME_BYTES {
-                    return Err(PublisherError::NonRetryable(anyhow::anyhow!(
-                        "encrypted batch frame is {} bytes, exceeding the {} byte cap the consumer can read; reduce batch_size",
-                        sealed.len(),
-                        MAX_ENCRYPTED_FRAME_BYTES
-                    )));
-                }
-                let mut framed = Vec::with_capacity(8 + sealed.len());
-                framed.extend_from_slice(&(sealed.len() as u64).to_be_bytes());
-                framed.extend_from_slice(&sealed);
-                member = framed;
-            }
+                let member = self.encode_member(raw)?;
 
-            // The member is fully built by now, so unless the batch already holds the
-            // lock (CSV), it is taken here and covers only the append.
-            if file_guard.is_none() {
-                file_guard = Some(self.file_lock.lock().await);
-            }
-            // Length before the append: a failed write_all can leave a partial
-            // member behind, which would corrupt the concatenated stream and get
-            // compounded by the Retryable re-append. Truncate back to this
-            // known-good member boundary on failure so a retry appends cleanly.
-            let pre_len = file
-                .metadata()
-                .await
-                .context("Failed to stat file before member write")?
-                .len();
-            // Append the whole member in one write so a concurrent reader never
-            // observes a torn member (the consumer also guards against it).
-            if let Err(e) = file.write_all(&member).await {
-                if let Err(te) = file.set_len(pre_len).await {
-                    tracing::error!(
-                        "Failed to truncate file back to {} after member write error: {}",
-                        pre_len,
-                        te
-                    );
-                    // Rollback failed, so a partial member is still on disk. A Retryable
-                    // re-append would concatenate onto that torn member and corrupt the
-                    // whole stream, so fail permanently instead of letting a retry compound it.
-                    return Err(PublisherError::NonRetryable(anyhow::Error::new(e).context(
+                // The member is fully built by now, so unless the batch already holds the
+                // lock (CSV), it is taken here and covers only the append.
+                if file_guard.is_none() {
+                    file_guard = Some(self.file_lock.lock().await);
+                }
+                // Length before the append: a failed write_all can leave a partial
+                // member behind, which would corrupt the concatenated stream and get
+                // compounded by the Retryable re-append. Truncate back to this
+                // known-good member boundary on failure so a retry appends cleanly.
+                let pre_len = file
+                    .metadata()
+                    .await
+                    .context("Failed to stat file before member write")?
+                    .len();
+                // Append the whole member in one write so a concurrent reader never
+                // observes a torn member (the consumer also guards against it).
+                if let Err(e) = file.write_all(&member).await {
+                    if let Err(te) = file.set_len(pre_len).await {
+                        tracing::error!(
+                            "Failed to truncate file back to {} after member write error: {}",
+                            pre_len,
+                            te
+                        );
+                        // Rollback failed, so a partial member is still on disk. A Retryable
+                        // re-append would concatenate onto that torn member and corrupt the
+                        // whole stream, so fail permanently instead of letting a retry compound it.
+                        return Err(PublisherError::NonRetryable(anyhow::Error::new(e).context(
                         "Failed to write member to file and could not truncate the partial write",
                     )));
+                    }
+                    return Err(PublisherError::Retryable(
+                        anyhow::Error::new(e).context("Failed to write member to file"),
+                    ));
                 }
-                return Err(PublisherError::Retryable(
-                    anyhow::Error::new(e).context("Failed to write member to file"),
-                ));
-            }
-            // Same rollback as the write above: a failed flush can leave a partial
-            // member on disk, which a Retryable re-append would concatenate onto.
-            if let Err(e) = file.flush().await {
-                if let Err(te) = file.set_len(pre_len).await {
-                    tracing::error!(
-                        "Failed to truncate file back to {} after member flush error: {}",
-                        pre_len,
-                        te
-                    );
-                    return Err(PublisherError::NonRetryable(anyhow::Error::new(e).context(
+                // Same rollback as the write above: a failed flush can leave a partial
+                // member on disk, which a Retryable re-append would concatenate onto.
+                if let Err(e) = file.flush().await {
+                    if let Err(te) = file.set_len(pre_len).await {
+                        tracing::error!(
+                            "Failed to truncate file back to {} after member flush error: {}",
+                            pre_len,
+                            te
+                        );
+                        return Err(PublisherError::NonRetryable(anyhow::Error::new(e).context(
                         "Failed to flush member to file and could not truncate the partial write",
                     )));
+                    }
+                    return Err(PublisherError::Retryable(
+                        anyhow::Error::new(e).context("Failed to flush file"),
+                    ));
                 }
-                return Err(PublisherError::Retryable(
-                    anyhow::Error::new(e).context("Failed to flush file"),
-                ));
-            }
-            Ok(())
+                Ok(())
             }
             .await;
             if let Err(e) = outcome {
@@ -649,6 +859,10 @@ impl MessagePublisher for FilePublisher {
     ) -> Result<SentBatch, PublisherError> {
         if messages.is_empty() {
             return Ok(SentBatch::Ack);
+        }
+
+        if self.idempotency {
+            return self.send_batch_idempotent(messages).await;
         }
 
         #[cfg(any(feature = "compression", feature = "encryption"))]
@@ -834,6 +1048,7 @@ async fn create_file_event_store(
     let path_clone = path.clone();
     let file_op_lock_clone = file_op_lock.clone();
     let delimiter_clone = delimiter.clone();
+    let format_gc = format.clone();
 
     let retention = RetentionPolicy {
         gc_interval: std::time::Duration::ZERO,
@@ -853,6 +1068,7 @@ async fn create_file_event_store(
             let path = path_clone.clone();
             let file_op_lock = file_op_lock_clone.clone();
             let delimiter = delimiter_clone.clone();
+            let format = format_gc.clone();
 
             tokio::spawn(async move {
                 // Serialize file operations to prevent race conditions between multiple GCs
@@ -863,7 +1079,7 @@ async fn create_file_event_store(
                     s.lines_in_memory = s.lines_in_memory.saturating_sub(count);
                 }
 
-                if let Err(e) = remove_lines_from_file(&path, count, &delimiter).await {
+                if let Err(e) = remove_lines_from_file(&path, count, &delimiter, &format).await {
                     tracing::error!("Failed to remove lines from file {}: {}", path, e);
                     // Note: In this simplified model, if deletion fails, lines_in_memory
                     // might become out of sync, leading to reprocessing on restart.
@@ -921,7 +1137,7 @@ async fn create_file_event_store(
             let lines_to_skip = state.lines_in_memory;
             while lines_skipped < lines_to_skip {
                 let mut buf = Vec::new();
-                match read_until_bytes(&mut reader, &delimiter, &mut buf).await {
+                match read_record(&mut reader, &delimiter, &format_clone, &mut buf).await {
                     Ok(0) => break, // EOF
                     Ok(_) => lines_skipped += 1,
                     Err(e) => {
@@ -949,7 +1165,7 @@ async fn create_file_event_store(
 
             loop {
                 let mut buffer = Vec::new();
-                match read_until_bytes(&mut reader, &delimiter, &mut buffer).await {
+                match read_record(&mut reader, &delimiter, &format_clone, &mut buffer).await {
                     Ok(0) => break,
                     Ok(_) => {
                         if buffer.ends_with(&delimiter) {
@@ -997,7 +1213,14 @@ async fn create_file_event_store(
     Ok(store)
 }
 
-async fn remove_lines_from_file(path: &str, count: usize, delimiter: &[u8]) -> anyhow::Result<()> {
+/// Drops the first `count` *records* from `path`. `format` matters: a CSV record can span
+/// several delimiters, and consuming the wrong number of them would corrupt the remainder.
+async fn remove_lines_from_file(
+    path: &str,
+    count: usize,
+    delimiter: &[u8],
+    format: &FileFormat,
+) -> anyhow::Result<()> {
     let unique_id = fast_uuid_v7::gen_id_str();
     let temp_path = format!("{}.{}.tmp", path, unique_id);
 
@@ -1009,7 +1232,7 @@ async fn remove_lines_from_file(path: &str, count: usize, delimiter: &[u8]) -> a
     let mut lines_skipped = 0;
     while lines_skipped < count {
         let mut buf = Vec::new();
-        if read_until_bytes(&mut reader, delimiter, &mut buf).await? == 0 {
+        if read_record(&mut reader, delimiter, format, &mut buf).await? == 0 {
             break;
         }
         lines_skipped += 1;
@@ -1112,6 +1335,27 @@ fn looks_encrypted_at_rest(path: &str) -> bool {
         && head[10] >= 1
 }
 
+/// Blocking [`read_record`].
+fn read_record_sync<R: std::io::BufRead>(
+    reader: &mut R,
+    delimiter: &[u8],
+    format: &FileFormat,
+    buf: &mut Vec<u8>,
+) -> std::io::Result<usize> {
+    let mut total = read_until_bytes_sync(reader, delimiter, buf)?;
+    if !matches!(format, FileFormat::Csv) {
+        return Ok(total);
+    }
+    while total > 0 && csv_ends_inside_quotes(buf) {
+        let n = read_until_bytes_sync(reader, delimiter, buf)?;
+        if n == 0 {
+            break;
+        }
+        total += n;
+    }
+    Ok(total)
+}
+
 fn read_until_bytes_sync<R: std::io::BufRead>(
     reader: &mut R,
     delimiter: &[u8],
@@ -1204,7 +1448,7 @@ fn run_file_tail_task_sync(
         if let Some(r) = reader.as_mut() {
             for _ in 0..BATCH_SIZE {
                 buf.clear();
-                match read_until_bytes_sync(r, &delimiter, &mut buf) {
+                match read_record_sync(r, &delimiter, &format, &mut buf) {
                     Ok(0) => break, // EOF
                     Ok(n) => {
                         if !buf.ends_with(&delimiter) {
@@ -1299,6 +1543,9 @@ struct FileQueueConsumer {
     file_lock: Arc<Mutex<()>>,
     buffer: Arc<Mutex<Vec<CanonicalMessage>>>,
     delimiter: Vec<u8>,
+    /// Needed on the commit path too: deleting acked records re-splits the file, and CSV
+    /// records do not map one-to-one onto delimiters.
+    format: FileFormat,
     ready: Arc<AtomicBool>,
     /// See [`FileTailConsumer::pending_eof`].
     pending_eof: bool,
@@ -1348,7 +1595,7 @@ fn run_file_queue_task(
 
             while skipped < skip_count {
                 buf.clear();
-                match read_until_bytes_sync(&mut reader, &delimiter, &mut buf) {
+                match read_record_sync(&mut reader, &delimiter, &format, &mut buf) {
                     Ok(0) => break,
                     Ok(_) => skipped += 1,
                     Err(e) => {
@@ -1362,7 +1609,7 @@ fn run_file_queue_task(
             if !error {
                 for _ in 0..128 {
                     buf.clear();
-                    match read_until_bytes_sync(&mut reader, &delimiter, &mut buf) {
+                    match read_record_sync(&mut reader, &delimiter, &format, &mut buf) {
                         Ok(0) => break,
                         Ok(_) => {
                             if buf.ends_with(&delimiter) {
@@ -1380,9 +1627,9 @@ fn run_file_queue_task(
                                 None => {
                                     // CSV header line: remove it immediately so it never
                                     // occupies a slot in the ack/delete line accounting.
-                                    if let Err(e) = runtime_handle
-                                        .block_on(remove_lines_from_file(&path, 1, &delimiter))
-                                    {
+                                    if let Err(e) = runtime_handle.block_on(remove_lines_from_file(
+                                        &path, 1, &delimiter, &format,
+                                    )) {
                                         tracing::error!(
                                             "Failed to remove CSV header line from {}: {}",
                                             path,
@@ -1513,7 +1760,7 @@ fn run_file_member_consume_task_sync<F>(
         let mut decode_error = false;
         while skipped < records_emitted {
             buf.clear();
-            match read_until_bytes_sync(&mut reader, &delimiter, &mut buf) {
+            match read_record_sync(&mut reader, &delimiter, &format, &mut buf) {
                 Ok(0) => break,
                 Ok(_) => skipped += 1,
                 Err(e) => {
@@ -1550,7 +1797,7 @@ fn run_file_member_consume_task_sync<F>(
         let mut batch = Vec::with_capacity(256);
         loop {
             buf.clear();
-            match read_until_bytes_sync(&mut reader, &delimiter, &mut buf) {
+            match read_record_sync(&mut reader, &delimiter, &format, &mut buf) {
                 Ok(0) => break,
                 Ok(_) => {
                     if !buf.ends_with(&delimiter) {
@@ -1885,6 +2132,7 @@ impl FileConsumer {
                     file_lock,
                     buffer: Arc::new(Mutex::new(Vec::new())),
                     delimiter,
+                    format,
                     ready,
                     pending_eof: false,
                 })))
@@ -2251,6 +2499,7 @@ impl MessageConsumer for FileConsumer {
                 let lines_mem = c.lines_in_memory.clone();
                 let batch_for_commit = batch.clone();
                 let delimiter = c.delimiter.clone();
+                let format = c.format.clone();
 
                 let commit = Box::new(
                     move |dispositions: Vec<crate::traits::MessageDisposition>| {
@@ -2291,7 +2540,8 @@ impl MessageConsumer for FileConsumer {
                             if leading_acks > 0 {
                                 let _guard = lock.lock().await;
                                 if let Err(e) =
-                                    remove_lines_from_file(&path, leading_acks, &delimiter).await
+                                    remove_lines_from_file(&path, leading_acks, &delimiter, &format)
+                                        .await
                                 {
                                     tracing::error!("Failed to remove lines from {}: {}", path, e);
                                 }
@@ -2435,42 +2685,63 @@ pub(crate) fn parse_message(
             struct AnyPayloadMessage {
                 #[serde(deserialize_with = "deserialize_u128")]
                 message_id: u128,
-                payload: serde_json::Value,
+                #[serde(default)]
+                payload: MaybePayload<serde_json::Value>,
+                #[serde(default)]
+                payload_base64: Option<String>,
                 #[serde(default)]
                 metadata: HashMap<String, String>,
             }
 
             let msg = match serde_json::from_slice::<AnyPayloadMessage>(buffer) {
-                // A marked record holds a byte array the sink could not represent as JSON;
-                // re-read it as bytes so a binary payload survives the round trip. The
-                // payload must really be an array — a marked string or object is not ours.
-                Ok(wrapper)
-                    if wrapper.metadata.get(BYTE_PAYLOAD_KEY).map(String::as_str)
-                        == Some(BYTE_PAYLOAD_MARK)
-                        && wrapper.payload.is_array() =>
-                {
-                    match decode_byte_payload_record(buffer) {
-                        Some(msg) => msg,
-                        None => {
-                            let mut metadata = wrapper.metadata;
-                            strip_byte_marker(&mut metadata);
-                            CanonicalMessage {
-                                message_id: wrapper.message_id,
-                                payload: serde_json::to_vec(&wrapper.payload)
-                                    .unwrap_or_default()
-                                    .into(),
+                Ok(wrapper) => {
+                    let AnyPayloadMessage {
+                        message_id,
+                        payload,
+                        payload_base64,
+                        mut metadata,
+                    } = wrapper;
+                    match (payload.into_option(), payload_base64) {
+                        // A `normal`-written binary record read back through a `json` source.
+                        (None, Some(b64)) => match decode_base64_payload(&b64) {
+                            Some(payload) => CanonicalMessage {
+                                message_id,
+                                payload,
                                 metadata,
-                            }
+                            },
+                            None => raw_fallback_message(buffer, bad_payload_error()),
+                        },
+                        // A marked record holds a byte array the sink could not represent as
+                        // JSON; re-read it as bytes so a binary payload survives the round
+                        // trip. The payload must really be an array — a marked string or
+                        // object is not ours.
+                        (Some(payload), None)
+                            if metadata.get(BYTE_PAYLOAD_KEY).map(String::as_str)
+                                == Some(BYTE_PAYLOAD_MARK)
+                                && payload.is_array() =>
+                        {
+                            decode_byte_payload_record(buffer).unwrap_or_else(|| {
+                                strip_byte_marker(&mut metadata);
+                                CanonicalMessage {
+                                    message_id,
+                                    payload: serde_json::to_vec(&payload)
+                                        .unwrap_or_default()
+                                        .into(),
+                                    metadata,
+                                }
+                            })
+                        }
+                        (Some(payload), None) => CanonicalMessage {
+                            message_id,
+                            payload: serde_json::to_vec(&payload).unwrap_or_default().into(),
+                            metadata,
+                        },
+                        // Mutually exclusive, like CloudEvents `data`/`data_base64`.
+                        (Some(_), Some(_)) | (None, None) => {
+                            raw_fallback_message(buffer, bad_payload_error())
                         }
                     }
                 }
-                Ok(wrapper) => CanonicalMessage {
-                    message_id: wrapper.message_id,
-                    payload: serde_json::to_vec(&wrapper.payload)
-                        .unwrap_or_default()
-                        .into(),
-                    metadata: wrapper.metadata,
-                },
                 Err(e) => raw_fallback_message(buffer, e),
             };
             Some(msg)
@@ -2479,14 +2750,10 @@ pub(crate) fn parse_message(
         // pass by [`RawPayload`] rather than through a `serde_json::Value`.
         FileFormat::Normal | FileFormat::Text => {
             let msg = match serde_json::from_slice::<BytePayloadMessage>(buffer) {
-                Ok(mut wrapper) => {
-                    strip_byte_marker(&mut wrapper.metadata);
-                    CanonicalMessage {
-                        message_id: wrapper.message_id,
-                        payload: wrapper.payload.into_bytes().into(),
-                        metadata: wrapper.metadata,
-                    }
-                }
+                Ok(wrapper) => match wrapper.into_message() {
+                    Some(msg) => msg,
+                    None => raw_fallback_message(buffer, bad_payload_error()),
+                },
                 Err(e) => raw_fallback_message(buffer, e),
             };
             Some(msg)
@@ -2498,21 +2765,79 @@ pub(crate) fn parse_message(
 struct BytePayloadMessage {
     #[serde(deserialize_with = "deserialize_u128")]
     message_id: u128,
-    payload: RawPayload,
+    #[serde(default)]
+    payload: MaybePayload<RawPayload>,
+    #[serde(default)]
+    payload_base64: Option<String>,
     #[serde(default)]
     metadata: HashMap<String, String>,
+}
+
+impl BytePayloadMessage {
+    /// `None` when the line carries no usable payload field — i.e. it is not the
+    /// envelope after all, and the caller falls back to keeping the line verbatim.
+    fn into_message(mut self) -> Option<CanonicalMessage> {
+        strip_byte_marker(&mut self.metadata);
+        let payload = match (self.payload.into_option(), self.payload_base64) {
+            (None, Some(b64)) => decode_base64_payload(&b64)?,
+            (Some(payload), None) => payload.into_bytes().into(),
+            // Mutually exclusive, like CloudEvents `data`/`data_base64`.
+            (Some(_), Some(_)) | (None, None) => return None,
+        };
+        Some(CanonicalMessage {
+            message_id: self.message_id,
+            payload,
+            metadata: self.metadata,
+        })
+    }
+}
+
+/// Tells "field absent" apart from an explicit `null` payload — `Option` alone
+/// cannot, because serde maps JSON `null` to `None`, and a `null` payload has
+/// always decoded to the text `null`.
+#[derive(Default)]
+enum MaybePayload<T> {
+    #[default]
+    Missing,
+    Present(T),
+}
+
+impl<T> MaybePayload<T> {
+    fn into_option(self) -> Option<T> {
+        match self {
+            MaybePayload::Missing => None,
+            MaybePayload::Present(v) => Some(v),
+        }
+    }
+}
+
+impl<'de, T: serde::Deserialize<'de>> serde::Deserialize<'de> for MaybePayload<T> {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        T::deserialize(d).map(MaybePayload::Present)
+    }
+}
+
+/// Decode the `payload_base64` field written for binary payloads.
+fn decode_base64_payload(encoded: &str) -> Option<bytes::Bytes> {
+    crate::support::base64_engine::decode(encoded)
+        .ok()
+        .map(bytes::Bytes::from)
+}
+
+/// A `Data`-category error so a record that parsed but carries no usable payload
+/// gets the same "not a record envelope" warning as a shape mismatch.
+fn bad_payload_error() -> serde_json::Error {
+    <serde_json::Error as serde::de::Error>::custom(
+        "record has neither a `payload` nor a `payload_base64` field",
+    )
 }
 
 /// Decode a record whose `payload` is wanted as bytes, in one pass via [`RawPayload`]
 /// rather than through a `serde_json::Value`. `None` if the line is not that envelope.
 fn decode_byte_payload_record(buffer: &[u8]) -> Option<CanonicalMessage> {
-    let mut wrapper = serde_json::from_slice::<BytePayloadMessage>(buffer).ok()?;
-    strip_byte_marker(&mut wrapper.metadata);
-    Some(CanonicalMessage {
-        message_id: wrapper.message_id,
-        payload: wrapper.payload.into_bytes().into(),
-        metadata: wrapper.metadata,
-    })
+    serde_json::from_slice::<BytePayloadMessage>(buffer)
+        .ok()?
+        .into_message()
 }
 
 /// Drop the marker this crate wrote — it is a storage detail, not the message's own
@@ -2526,13 +2851,35 @@ fn strip_byte_marker(metadata: &mut HashMap<String, String>) {
 /// A line that is not the JSON envelope the format promised is kept verbatim as a
 /// raw payload rather than dropped, and marked so the next hop can tell.
 fn raw_fallback_message(buffer: &[u8], err: serde_json::Error) -> CanonicalMessage {
-    // A file that is not JSON at all hits this for every line, so only the first
-    // occurrence warns; the rest stay at debug.
-    static WARNED: AtomicBool = AtomicBool::new(false);
-    if !WARNED.swap(true, Ordering::Relaxed) {
-        warn!(error = %err, content_length = buffer.len(), "Failed to parse file line as JSON, treating as raw. Further occurrences are logged at debug level.");
+    // Two very different situations end up here, and they get their own one-shot flag so
+    // one cannot mask the other:
+    //
+    // - not JSON at all (a plain text file): expected, and every line hits it.
+    // - valid JSON that is not the record envelope: almost always a mistake in a
+    //   hand-written file, and the silent fallback discards the `metadata` the line
+    //   carried. Worth naming the envelope so the fix is obvious.
+    static WARNED_SHAPE: AtomicBool = AtomicBool::new(false);
+    static WARNED_SYNTAX: AtomicBool = AtomicBool::new(false);
+    let (warned, message) = if err.classify() == serde_json::error::Category::Data {
+        (
+            &WARNED_SHAPE,
+            "File line is valid JSON but not a record envelope, so the whole line is \
+             taken as the payload and its own `metadata` is discarded. A `json`/`normal`/\
+             `text` source expects the envelope a matching sink writes: \
+             {\"message_id\": ..., \"payload\": ..., \"metadata\": {...}}. Use `format: raw` \
+             for plain JSON lines. Further occurrences are logged at debug level.",
+        )
     } else {
-        tracing::debug!(error = %err, content_length = buffer.len(), "Failed to parse file line as JSON, treating as raw.");
+        (
+            &WARNED_SYNTAX,
+            "Failed to parse file line as JSON, treating as raw. Further occurrences are \
+             logged at debug level.",
+        )
+    };
+    if !warned.swap(true, Ordering::Relaxed) {
+        warn!(error = %err, content_length = buffer.len(), "{message}");
+    } else {
+        tracing::debug!(error = %err, content_length = buffer.len(), "{message}");
     }
     let mut msg = CanonicalMessage::new(buffer.to_vec(), None);
     msg.metadata

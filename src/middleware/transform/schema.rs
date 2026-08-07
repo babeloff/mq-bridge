@@ -153,6 +153,13 @@ impl CompiledSchema {
         crumbs: &mut Vec<Crumb<'s>>,
         opts: Opts,
     ) -> Result<(), TransformError> {
+        // An empty string stands in for "no value" in CSV and many SQL exports, so it is
+        // read as a null and then handled by `nullable` / `default` like any other null.
+        let was_empty = opts.coerce_empty_as_null && value.as_str() == Some("");
+        if was_empty {
+            *value = Value::Null;
+        }
+
         if value.is_null() {
             // A nullable null is explicitly allowed and needs no type/enum check.
             if self.nullable {
@@ -164,10 +171,17 @@ impl CompiledSchema {
                 // render the far less helpful "cannot coerce null to integer".
                 _ => {
                     if self.ty.is_some_and(|ty| ty != Ty::Null) {
+                        // Naming the coercion, or the null would look like it came from the
+                        // payload when the payload actually held `""`.
+                        let cause = if was_empty {
+                            "field is an empty string, read as null by coerce_empty_as_null, but is not nullable and has no default"
+                        } else {
+                            "field is null but is not nullable and has no default"
+                        };
                         return Err(TransformError::new(
                             render_path(crumbs),
                             ErrorKind::TypeMismatch,
-                            "field is null but is not nullable and has no default",
+                            cause,
                         ));
                     }
                 }

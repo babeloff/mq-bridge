@@ -207,6 +207,9 @@ impl DockerController {
         assert!(status.success(), "docker compose stop failed");
     }
 
+    /// Starts the service and waits until it is running/healthy again. Plain
+    /// `docker compose start` returns before the broker accepts connections,
+    /// which made reconnect tests race the container startup.
     pub fn start_service(&self, service: &str) {
         println!(
             "Starting docker-compose service {} from {}...",
@@ -216,14 +219,40 @@ impl DockerController {
             .arg("compose")
             .arg("-f")
             .arg(&self.compose_file)
-            .arg("start")
+            .arg("up")
+            .arg("-d")
+            .arg("--wait")
+            .arg("--wait-timeout")
+            .arg("120")
             .arg(service)
             .stdout(std::process::Stdio::inherit())
             .stderr(std::process::Stdio::inherit())
             .status()
             .expect("Failed to start docker compose service");
 
+        if !status.success() {
+            self.dump_diagnostics(service);
+        }
+
         assert!(status.success(), "docker compose start failed");
+    }
+
+    /// Prints `ps` and the service logs; used when a restart fails or a test
+    /// times out waiting for the service.
+    pub fn dump_diagnostics(&self, service: &str) {
+        for args in [
+            vec!["ps", "-a"],
+            vec!["logs", "--no-color", "--tail", "100", service],
+        ] {
+            let _ = Command::new("docker")
+                .arg("compose")
+                .arg("-f")
+                .arg(&self.compose_file)
+                .args(&args)
+                .stdout(std::process::Stdio::inherit())
+                .stderr(std::process::Stdio::inherit())
+                .status();
+        }
     }
 }
 

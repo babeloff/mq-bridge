@@ -173,7 +173,7 @@ impl MessagePublisher for NatsPublisher {
             .map_err(|_| PublisherError::Retryable(anyhow!("NATS request timed out")))?
             .map_err(|e| PublisherError::Retryable(anyhow!("NATS request failed: {}", e)))?;
 
-            let response_msg = create_nats_canonical_message(&response, None, false);
+            let response_msg = create_nats_canonical_message(&response, None, false, false);
             return Ok(Sent::Response(response_msg));
         }
 
@@ -284,6 +284,7 @@ pub struct NatsConsumer {
     core: NatsCore,
     client: async_nats::Client,
     subject: String,
+    source_metadata: bool,
     /// Set by the route when `exit_on_empty`/`--drain` is active. Only then does an
     /// idle read time out into an empty batch; otherwise it blocks indefinitely
     /// (event-driven, no added latency) as a streaming source should.
@@ -293,6 +294,16 @@ use std::any::Any;
 
 impl NatsConsumer {
     pub async fn new(config: &NatsConfig) -> anyhow::Result<Self> {
+        Self::new_with_source_metadata(config, false).await
+    }
+
+    pub async fn new_with_source_metadata(
+        config: &NatsConfig,
+        source_metadata: bool,
+    ) -> anyhow::Result<Self> {
+        let source_metadata = crate::canonical_message::source_metadata_enabled_for_endpoint(
+            source_metadata || config.source_metadata,
+        );
         let subject = config
             .subject
             .as_deref()
@@ -336,6 +347,7 @@ impl NatsConsumer {
             core,
             client,
             subject: subject.to_string(),
+            source_metadata,
             exit_on_empty: false,
         })
     }
@@ -360,6 +372,7 @@ impl MessageConsumer for NatsConsumer {
                 &self.subject,
                 &self.client,
                 self.exit_on_empty,
+                self.source_metadata,
             )
             .await
     }
@@ -621,6 +634,7 @@ impl NatsCore {
         subject: &str,
         client: &async_nats::Client,
         exit_on_empty: bool,
+        source_metadata: bool,
     ) -> Result<ReceivedBatch, ConsumerError> {
         if max_messages == 0 {
             return Ok(ReceivedBatch {
@@ -654,6 +668,7 @@ impl NatsCore {
                             &first_message,
                             sequence,
                             false,
+                            source_metadata,
                         ));
                         jetstream_messages.push(first_message);
                     }
@@ -670,8 +685,12 @@ impl NatsCore {
                     match stream.try_next().now_or_never() {
                         Some(Ok(Some(message))) => {
                             let sequence = message.info().ok().map(|meta| meta.stream_sequence);
-                            canonical_messages
-                                .push(create_nats_canonical_message(&message, sequence, false));
+                            canonical_messages.push(create_nats_canonical_message(
+                                &message,
+                                sequence,
+                                false,
+                                source_metadata,
+                            ));
                             jetstream_messages.push(message);
                         }
                         _ => break, // No more messages in the buffer or stream ended/errored
@@ -719,13 +738,23 @@ impl NatsCore {
                     // may reflect header-provided values (read by route.rs). The batch commit closure always
                     // publishes to the original Message.reply to preserve native NATS reply semantics.
                     reply_subjects.push(message.reply.clone());
-                    messages.push(create_nats_canonical_message(&message, None, true));
+                    messages.push(create_nats_canonical_message(
+                        &message,
+                        None,
+                        true,
+                        source_metadata,
+                    ));
 
                     while messages.len() < max_messages {
                         match sub.next().now_or_never() {
                             Some(Some(message)) => {
                                 reply_subjects.push(message.reply.clone());
-                                messages.push(create_nats_canonical_message(&message, None, true))
+                                messages.push(create_nats_canonical_message(
+                                    &message,
+                                    None,
+                                    true,
+                                    source_metadata,
+                                ))
                             }
                             _ => break,
                         }
@@ -801,6 +830,7 @@ fn create_nats_canonical_message(
     message: &async_nats::Message,
     sequence: Option<u64>,
     include_native_reply_to: bool,
+    source_metadata: bool,
 ) -> CanonicalMessage {
     // The most reliable ID is the JetStream sequence number.
     let mut message_id: Option<u128> = None;
@@ -869,8 +899,7 @@ fn create_nats_canonical_message(
     // Source-position cursor keys (useful for dlt-style pull consumers; the
     // per-message subject is the only way to recover it under a wildcard
     // subscription). `nats_stream_sequence` is absent for core NATS.
-    // Opt-in via the MQB_SOURCE_METADATA env var; off by default.
-    if crate::canonical_message::source_metadata_enabled() {
+    if source_metadata {
         canonical_message.metadata.insert(
             "mqb.src.nats_subject".to_string(),
             message.subject.to_string(),
@@ -985,7 +1014,7 @@ mod tests {
     fn core_native_reply_is_mapped_to_reply_to_metadata() {
         let message = nats_message(Some("_INBOX.reply"), None);
 
-        let canonical = create_nats_canonical_message(&message, None, true);
+        let canonical = create_nats_canonical_message(&message, None, true, false);
 
         assert_eq!(
             canonical.metadata.get("reply_to").map(String::as_str),
@@ -997,17 +1026,16 @@ mod tests {
     fn jetstream_ack_reply_is_not_mapped_to_reply_to_metadata() {
         let message = nats_message(Some("$JS.ACK.test-stream.consumer.1.1"), None);
 
-        let canonical = create_nats_canonical_message(&message, Some(1), false);
+        let canonical = create_nats_canonical_message(&message, Some(1), false, false);
 
         assert!(!canonical.metadata.contains_key("reply_to"));
     }
 
     #[test]
     fn jetstream_exposes_source_cursor_metadata() {
-        let _source_metadata = crate::canonical_message::force_source_metadata_for_test(Some(true));
         let message = nats_message(None, None);
 
-        let canonical = create_nats_canonical_message(&message, Some(42), false);
+        let canonical = create_nats_canonical_message(&message, Some(42), false, true);
 
         assert_eq!(
             canonical
@@ -1024,7 +1052,7 @@ mod tests {
             Some("42")
         );
         // Core NATS (no sequence) omits the sequence key.
-        let core = create_nats_canonical_message(&message, None, false);
+        let core = create_nats_canonical_message(&message, None, false, true);
         assert!(!core.metadata.contains_key("mqb.src.nats_stream_sequence"));
         assert!(crate::canonical_message::is_source_metadata_key(
             "mqb.src.nats_subject"
@@ -1035,14 +1063,13 @@ mod tests {
     fn inbound_source_metadata_header_cannot_spoof_cursor() {
         // An upstream producer sets a reserved `mqb.src.*` header. It must be
         // dropped, and the authoritative subject cursor must win.
-        let _source_metadata = crate::canonical_message::force_source_metadata_for_test(Some(true));
         let mut headers = HeaderMap::new();
         headers.insert("mqb.src.kafka_offset", "999");
         headers.insert("mqb.src.nats_subject", "evil.subject");
         headers.insert("user_key", "kept");
         let message = nats_message(None, Some(headers));
 
-        let canonical = create_nats_canonical_message(&message, Some(7), false);
+        let canonical = create_nats_canonical_message(&message, Some(7), false, true);
 
         assert!(!canonical.metadata.contains_key("mqb.src.kafka_offset"));
         assert_eq!(
@@ -1065,7 +1092,7 @@ mod tests {
         headers.insert("reply_to", "app.reply.subject");
         let message = nats_message(Some("$JS.ACK.test-stream.consumer.1.1"), Some(headers));
 
-        let canonical = create_nats_canonical_message(&message, Some(1), false);
+        let canonical = create_nats_canonical_message(&message, Some(1), false, false);
 
         assert_eq!(
             canonical.metadata.get("reply_to").map(String::as_str),
@@ -1079,7 +1106,7 @@ mod tests {
         headers.insert("reply_to", "app.reply.subject");
         let message = nats_message(Some("_INBOX.native"), Some(headers));
 
-        let canonical = create_nats_canonical_message(&message, None, true);
+        let canonical = create_nats_canonical_message(&message, None, true, false);
 
         assert_eq!(
             canonical.metadata.get("reply_to").map(String::as_str),
@@ -1090,7 +1117,7 @@ mod tests {
     #[test]
     fn core_native_reply_true_with_no_reply_is_absent() {
         let message = nats_message(None, None);
-        let canonical = create_nats_canonical_message(&message, None, true);
+        let canonical = create_nats_canonical_message(&message, None, true, false);
         assert!(!canonical.metadata.contains_key("reply_to"));
     }
 }

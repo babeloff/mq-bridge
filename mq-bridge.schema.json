@@ -57,6 +57,11 @@
             "null"
           ]
         },
+        "source_metadata": {
+          "description": "(Consumer only) Include authoritative `mqb.src.amqp_*` source positions. Defaults to false.",
+          "type": "boolean",
+          "default": false
+        },
         "subscribe_mode": {
           "description": "(Consumer only) If true, act as a **Subscriber** (fan-out). Defaults to false.",
           "type": "boolean",
@@ -1006,8 +1011,13 @@
           "$ref": "#/$defs/FileFormat",
           "default": "normal"
         },
+        "idempotency": {
+          "description": "Write replay-safe source ranges as immutable part files under this directory.\nRequires Kafka source metadata or postgres_cdc commit LSN plus transaction ordinal metadata.",
+          "type": "boolean",
+          "default": false
+        },
         "path": {
-          "description": "Path to the file.",
+          "description": "Path to the file, or to the directory holding the part files when `idempotency` is true.",
           "type": "string"
         }
       },
@@ -1085,7 +1095,7 @@
       "description": "Format for messages written to or read from a file.",
       "oneOf": [
         {
-          "description": "The full `CanonicalMessage` is serialized to JSON. Payload is a byte array.",
+          "description": "The full `CanonicalMessage` is serialized to JSON. Payload is either base64 or utf8 text.",
           "type": "string",
           "const": "normal"
         },
@@ -1685,6 +1695,11 @@
           ],
           "default": true
         },
+        "source_metadata": {
+          "description": "(Consumer only) Include authoritative `mqb.src.kafka_*` source positions. Defaults to false.",
+          "type": "boolean",
+          "default": false
+        },
         "tls": {
           "description": "TLS configuration.",
           "$ref": "#/$defs/TlsConfig",
@@ -2157,6 +2172,11 @@
           ],
           "default": true
         },
+        "source_metadata": {
+          "description": "(Consumer only, `capture_new`/`capture_all`) Include authoritative `mqb.src.mongodb_*`\nsource positions. Defaults to false.",
+          "type": "boolean",
+          "default": false
+        },
         "tls": {
           "description": "TLS configuration.",
           "$ref": "#/$defs/TlsConfig",
@@ -2402,6 +2422,11 @@
           ],
           "default": true
         },
+        "source_metadata": {
+          "description": "(Consumer only) Include authoritative `mqb.src.nats_*` source positions. Defaults to false.",
+          "type": "boolean",
+          "default": false
+        },
         "stream": {
           "description": "The JetStream stream name. Required for Consumers, even with\n`no_jetstream: true` (unused there, but still validated).",
           "type": [
@@ -2543,6 +2568,11 @@
           "$ref": "#/$defs/FileFormat",
           "default": "normal"
         },
+        "idempotency": {
+          "description": "Write replay-safe source ranges as immutable objects instead of UUID-named objects.\nRequires Kafka source metadata or postgres_cdc commit LSN plus transaction ordinal metadata.",
+          "type": "boolean",
+          "default": false
+        },
         "max_object_bytes": {
           "description": "(Source only) Maximum size in bytes of a single object to fetch into memory. An object\nlarger than this fails the read (surfaced as a consumer error) instead of being\nbuffered whole. Unset means no limit (the whole object is materialized).",
           "type": [
@@ -2615,6 +2645,11 @@
           "description": "Replication slot name; created if missing when `create_slot` is true.",
           "type": "string",
           "default": "mq_bridge_slot"
+        },
+        "source_metadata": {
+          "description": "Include authoritative `mqb.src.postgres_*` source positions. Defaults to false.",
+          "type": "boolean",
+          "default": false
         },
         "status_interval_ms": {
           "description": "Standby-status-update interval in ms; must be shorter than the server's `wal_sender_timeout`.",
@@ -2891,7 +2926,7 @@
           "minimum": 0
         },
         "exit_on_empty": {
-          "description": "If true, the route exits gracefully once the source yields an empty batch\n(drain-then-exit). Off by default — routes normally poll indefinitely.",
+          "description": "If true, the route exits gracefully once the source yields an empty batch\n(drain-then-exit). Off by default — routes normally poll indefinitely.\nA drain that keeps failing to reconnect gives up and fails rather than retrying forever.",
           "type": "boolean"
         },
         "input": {
@@ -3122,6 +3157,13 @@
           "description": "The table to interact with.",
           "type": "string"
         },
+        "test_before_acquire": {
+          "description": "Ping each pooled connection before handing it out (default false). Costs a round-trip per acquire.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
         "tls": {
           "description": "TLS configuration for the database connection.",
           "$ref": "#/$defs/TlsConfig",
@@ -3324,6 +3366,11 @@
           "description": "Coerce safely convertible types (e.g. `\"42\"` -> `42`) instead of rejecting. Defaults to true.",
           "type": "boolean",
           "default": true
+        },
+        "coerce_empty_as_null": {
+          "description": "Read an empty string as `null`, so a nullable field or its default wins. Defaults to false.",
+          "type": "boolean",
+          "default": false
         },
         "mapping": {
           "description": "Output field name -> source path (e.g. `firstName: \"$.first_name\"`). Dots nest the output.",

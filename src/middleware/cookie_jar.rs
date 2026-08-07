@@ -141,6 +141,7 @@ fn inject_session_metadata(
     store: &SessionStore,
     cookie_metadata_key: &str,
     inject_metadata: &HashMap<String, String>,
+    export_metadata_prefix: Option<&str>,
 ) {
     let snapshot = recover_read_lock(store, "cookie_jar_session").clone();
 
@@ -154,11 +155,21 @@ fn inject_session_metadata(
         if metadata.contains_key(metadata_key) {
             continue;
         }
-        if let Some(value) = snapshot
-            .values
-            .get(session_key)
-            .or_else(|| snapshot.cookies.get(session_key))
-        {
+        // `export_metadata_prefix` reports names as `<prefix>cookie.<name>` /
+        // `<prefix>value.<name>`, so accept that spelling here too — looking a name up
+        // under the form it was just read back in used to silently inject nothing.
+        let unprefixed = export_metadata_prefix
+            .and_then(|prefix| session_key.strip_prefix(prefix))
+            .unwrap_or(session_key);
+        let value = match unprefixed.split_once('.') {
+            Some(("cookie", name)) => snapshot.cookies.get(name),
+            Some(("value", name)) => snapshot.values.get(name),
+            _ => None,
+        }
+        .or_else(|| snapshot.values.get(session_key))
+        .or_else(|| snapshot.cookies.get(session_key));
+
+        if let Some(value) = value {
             metadata.insert(metadata_key.clone(), value.clone());
         }
     }
@@ -259,6 +270,7 @@ impl CookieJarPublisher {
             &self.store,
             &self.config.cookie_metadata_key,
             &self.config.inject_metadata,
+            self.config.export_metadata_prefix.as_deref(),
         );
         export_session_metadata(
             &mut message.metadata,
@@ -493,5 +505,61 @@ mod tests {
             sent[0].metadata.get("x-forwarded-csrf").map(|s| s.as_str()),
             Some("csrf123")
         );
+    }
+
+    /// `inject_metadata` must also resolve a name held in the cookie store, not only one
+    /// captured through `capture_metadata_keys`, and it must accept the same `cookie.<name>`
+    /// spelling `export_metadata_prefix` reports back.
+    #[tokio::test]
+    async fn test_inject_metadata_resolves_a_captured_cookie_by_either_spelling() {
+        let scope = format!("inject-scope-{}", fast_uuid_v7::gen_id_string());
+        let mut inbound = CanonicalMessage::from("input");
+        inbound.metadata.insert(
+            "set-cookie".to_string(),
+            "session=xyz789; Path=/".to_string(),
+        );
+
+        let mut consumer = CookieJarConsumer::new(
+            Box::new(MockConsumer {
+                messages: Some(vec![inbound]),
+            }),
+            &CookieJarMiddleware {
+                shared_scope: Some(scope.clone()),
+                ..Default::default()
+            },
+        );
+        consumer.receive_batch(10).await.unwrap();
+
+        for (session_key, export_prefix) in [
+            ("session", None),
+            ("cookie.session", None),
+            ("session.cookie.session", Some("session.".to_string())),
+        ] {
+            let sent = Arc::new(Mutex::new(Vec::new()));
+            let publisher = CookieJarPublisher::new(
+                Box::new(RecordingPublisher {
+                    sent: sent.clone(),
+                    response_metadata: HashMap::new(),
+                }),
+                &CookieJarMiddleware {
+                    shared_scope: Some(scope.clone()),
+                    inject_metadata: HashMap::from([(
+                        "authorization".to_string(),
+                        session_key.to_string(),
+                    )]),
+                    export_metadata_prefix: export_prefix,
+                    ..Default::default()
+                },
+            );
+            publisher.send(CanonicalMessage::from("out")).await.unwrap();
+
+            let sent = sent.lock().unwrap();
+            assert_eq!(
+                sent[0].metadata.get("authorization").map(|s| s.as_str()),
+                Some("xyz789"),
+                "inject_metadata did not resolve {session_key:?}, got {:?}",
+                sent[0].metadata
+            );
+        }
     }
 }

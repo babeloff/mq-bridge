@@ -5,7 +5,7 @@
 
 use super::coerce::{Crumb, Ty};
 use super::error::{ErrorKind, TransformError};
-use super::path::{insert_at, CompiledPath, CompiledRule};
+use super::path::{insert_at, paths_are_disjoint, CompiledPath, CompiledRule, Seg};
 use super::schema::{CompiledSchema, RawPairs};
 use super::TRANSFORM_ERROR_KEY;
 use crate::models::{MappingRule, TransformErrorPolicy, TransformMiddleware};
@@ -17,6 +17,7 @@ use serde_json::{Map, Value};
 pub(super) struct Opts {
     pub(super) coerce: bool,
     pub(super) apply_defaults: bool,
+    pub(super) coerce_empty_as_null: bool,
 }
 
 // --- Compiled configuration ---
@@ -29,10 +30,24 @@ pub(super) struct Compiled {
     pub(super) schema: Option<CompiledSchema>,
     pub(super) opts: Opts,
     pub(super) on_error: TransformErrorPolicy,
-    /// Decided once: whether `transform_fast` may be tried at all.
+    /// Decided once: whether a fast path may be tried at all.
     pub(super) fast_eligible: bool,
+    /// `Some` when the mapping is a plain projection `project_fast` can serve; parallel
+    /// to `rules`, which stays the source of truth for everything else about a rule.
+    pub(super) fast_map: Option<Vec<FastMapRule>>,
+    /// Decided once: whether picked values can be moved out of the input, see
+    /// [`paths_are_disjoint`].
+    pub(super) take_inputs: bool,
     /// Decided once: see `map_sorts_keys`.
     pub(super) sort_keys: bool,
+}
+
+/// A mapping rule reduced to what `project_fast` needs: the single top-level input key to
+/// pick, and the output key already quoted and escaped, ready to write.
+#[derive(Debug)]
+pub(super) struct FastMapRule {
+    from: String,
+    out: Vec<u8>,
 }
 
 /// Whether `serde_json::Map` iterates its keys in sorted order.
@@ -72,6 +87,34 @@ pub(super) fn fast_eligible(
         && schema.default.is_none()
         && schema.required.is_empty()
         && !(opts.apply_defaults && schema.properties.iter().any(|(_, s)| s.default.is_some()))
+}
+
+/// The mapping-only subset `project_fast` can serve: no schema, and every rule lifts one
+/// top-level field to one output key with no default. The output is then a subset of the
+/// input's top-level fields, which a span walk can assemble without building a `Value` at
+/// all. Deeper source paths, nested output keys and defaults keep the general path.
+pub(super) fn compile_projection(
+    rules: &[CompiledRule],
+    schema: Option<&CompiledSchema>,
+) -> Option<Vec<FastMapRule>> {
+    if rules.is_empty() || schema.is_some() {
+        return None;
+    }
+    rules
+        .iter()
+        .map(|rule| {
+            let [Seg::Key(from)] = rule.from.segs.as_slice() else {
+                return None;
+            };
+            if rule.out.len() != 1 || rule.default.is_some() {
+                return None;
+            }
+            Some(FastMapRule {
+                from: from.clone(),
+                out: serde_json::to_vec(&rule.out[0]).ok()?,
+            })
+        })
+        .collect()
 }
 
 impl Compiled {
@@ -127,9 +170,13 @@ impl Compiled {
         let opts = Opts {
             coerce: config.coerce,
             apply_defaults: config.apply_defaults,
+            coerce_empty_as_null: config.coerce_empty_as_null,
         };
+        let fast_map = compile_projection(&rules, schema.as_ref());
         Ok(Self {
-            fast_eligible: fast_eligible(&rules, schema.as_ref(), opts),
+            fast_eligible: fast_eligible(&rules, schema.as_ref(), opts) || fast_map.is_some(),
+            take_inputs: paths_are_disjoint(&rules),
+            fast_map,
             sort_keys: map_sorts_keys(),
             rules,
             schema,
@@ -143,11 +190,18 @@ impl Compiled {
         self.rules.is_empty() && self.schema.is_none()
     }
 
-    fn apply_mapping(&self, input: &Value) -> Result<Value, TransformError> {
+    fn apply_mapping(&self, input: &mut Value) -> Result<Value, TransformError> {
         let mut out = Value::Object(Map::new());
         for rule in &self.rules {
-            let picked = match rule.from.get(input) {
-                Some(found) => found.clone(),
+            // `input` is dropped as soon as this returns, so a value no other rule reads
+            // through can be moved out rather than deep-cloned.
+            let found = if self.take_inputs {
+                rule.from.take(input)
+            } else {
+                rule.from.get(input).cloned()
+            };
+            let picked = match found {
+                Some(found) => found,
                 None => match &rule.default {
                     Some(default) => default.clone(),
                     None if rule.required => {
@@ -218,10 +272,14 @@ impl Compiled {
                 .ok()
                 .map(|idx| &schema.properties[idx].1);
 
+            // `coerce_empty_as_null` turns this field into a null, which both shortcuts
+            // below would otherwise wave through as an ordinary string.
+            let empty_string = self.opts.coerce_empty_as_null && raw.get() == "\"\"";
+
             match sub {
                 // Embedded JSON with nothing to check afterwards: unescape the string and
                 // emit the document it carried, without ever building it.
-                Some(sub) if sub.is_plain_content_decode(raw.get()) => {
+                Some(sub) if !empty_string && sub.is_plain_content_decode(raw.get()) => {
                     // serde_json does the unescaping, so `😀` and friends are
                     // handled exactly as the normal path handles them.
                     let text: std::borrow::Cow<'_, str> = match serde_json::from_str(raw.get()) {
@@ -249,7 +307,7 @@ impl Compiled {
                 }
                 // The schema has something to say about this field and the raw bytes do
                 // not already satisfy it: parse just this field and transform it.
-                Some(sub) if !sub.is_passthrough(raw.get()) => {
+                Some(sub) if empty_string || !sub.is_passthrough(raw.get()) => {
                     let mut value: Value = match serde_json::from_str(raw.get()) {
                         Ok(value) => value,
                         Err(e) => {
@@ -280,18 +338,78 @@ impl Compiled {
         Some(Ok(out))
     }
 
+    /// Assembles a projection from the input's top-level spans: each picked field's
+    /// verbatim JSON bytes are copied straight through. Fields the projection drops are
+    /// never parsed — which for a dropped blob is the bulk of the message's cost — and
+    /// nothing is cloned or turned into a `Value`.
+    ///
+    /// Keys come out sorted by output key, because `rules` is sorted that way and every
+    /// output key is a single segment. That is what a `serde_json::Map` produces either
+    /// way here — sorted (`BTreeMap`) or in insertion order (`IndexMap`, fed in that same
+    /// order) — so unlike `transform_fast` this path needs no `sort_keys`.
+    ///
+    /// `None` means the payload's shape rules the shortcut out and the caller should fall
+    /// back; `Some(Err(_))` is a real transform failure and must not be retried slowly.
+    pub(super) fn project_fast(
+        &self,
+        fast_map: &[FastMapRule],
+        payload: &[u8],
+    ) -> Option<Result<Vec<u8>, TransformError>> {
+        // Not an object, or a key we cannot borrow because it carried escapes.
+        let RawPairs(pairs) = serde_json::from_slice::<RawPairs>(payload).ok()?;
+
+        let mut out = Vec::with_capacity(payload.len());
+        out.push(b'{');
+        let mut first = true;
+        for (rule, fast) in self.rules.iter().zip(fast_map) {
+            // Searching from the back makes a duplicated key resolve to its last value,
+            // the way collapsing the payload into a `Value` would.
+            let picked = pairs
+                .iter()
+                .rev()
+                .find(|(key, _)| *key == fast.from)
+                .map(|(_, raw)| raw.get());
+            let Some(raw) = picked else {
+                if rule.required {
+                    return Some(Err(TransformError::new(
+                        rule.from.spec.clone(),
+                        ErrorKind::MissingRequired,
+                        format!(
+                            "required source field is missing (mapped to '{}')",
+                            rule.out.join(".")
+                        ),
+                    )));
+                }
+                // Optional and absent: leave the output key out entirely.
+                continue;
+            };
+            if !first {
+                out.push(b',');
+            }
+            first = false;
+            out.extend_from_slice(&fast.out);
+            out.push(b':');
+            out.extend_from_slice(raw.as_bytes());
+        }
+        out.push(b'}');
+        Some(Ok(out))
+    }
+
     /// Parses once, reshapes, serialises once.
     pub(super) fn transform(&self, message: &mut CanonicalMessage) -> Result<(), TransformError> {
         if self.fast_eligible {
-            if let Some(schema) = &self.schema {
-                if let Some(result) = self.transform_fast(schema, &message.payload) {
-                    message.payload = Bytes::from(result?);
-                    return Ok(());
-                }
+            let fast = match (&self.schema, &self.fast_map) {
+                (Some(schema), _) => self.transform_fast(schema, &message.payload),
+                (None, Some(fast_map)) => self.project_fast(fast_map, &message.payload),
+                (None, None) => None,
+            };
+            if let Some(result) = fast {
+                message.payload = Bytes::from(result?);
+                return Ok(());
             }
         }
 
-        let input: Value = serde_json::from_slice(&message.payload).map_err(|e| {
+        let mut input: Value = serde_json::from_slice(&message.payload).map_err(|e| {
             TransformError::new(
                 "$".to_string(),
                 ErrorKind::Parse,
@@ -302,7 +420,7 @@ impl Compiled {
         let mut value = if self.rules.is_empty() {
             input
         } else {
-            self.apply_mapping(&input)?
+            self.apply_mapping(&mut input)?
         };
 
         if let Some(schema) = &self.schema {
