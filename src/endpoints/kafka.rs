@@ -332,9 +332,33 @@ impl MessagePublisher for KafkaPublisher {
         self
     }
 }
+
+/// Owns a `StreamConsumer` so its close never runs on a caller's thread.
+///
+/// rdkafka closes the consumer in `Drop` with `while !closed() { poll(100ms) }`, which
+/// never returns if the broker disappears mid-close. The last handle can be dropped from
+/// anywhere — a tokio worker, runtime shutdown — so the close is handed to its own thread.
+struct ClosingStreamConsumer(Option<StreamConsumer>);
+
+impl std::ops::Deref for ClosingStreamConsumer {
+    type Target = StreamConsumer;
+
+    fn deref(&self) -> &StreamConsumer {
+        self.0.as_ref().expect("consumer is taken only in Drop")
+    }
+}
+
+impl Drop for ClosingStreamConsumer {
+    fn drop(&mut self) {
+        if let Some(consumer) = self.0.take() {
+            std::thread::spawn(move || drop(consumer));
+        }
+    }
+}
+
 pub struct KafkaConsumer {
     // The consumer needs to be stored to keep the connection alive.
-    consumer: Arc<StreamConsumer>,
+    consumer: Arc<ClosingStreamConsumer>,
     producer: Option<FutureProducer>,
     topic: String,
     /// Drain mode: only then does an idle fetch time out into an empty batch.
@@ -414,7 +438,7 @@ impl KafkaConsumer {
         }
 
         // Wrap the consumer in an Arc to allow it to be shared.
-        let consumer = Arc::new(consumer);
+        let consumer = Arc::new(ClosingStreamConsumer(Some(consumer)));
 
         // Create a producer for sending replies, but only for consumers, not subscribers.
         let producer = if !is_subscriber {
@@ -803,7 +827,7 @@ fn prefetch_byte_budget() -> usize {
 }
 
 fn spawn_prefetcher(
-    consumer: Arc<StreamConsumer>,
+    consumer: Arc<ClosingStreamConsumer>,
     capacity: usize,
     source_metadata: bool,
 ) -> Prefetcher {
@@ -815,7 +839,7 @@ fn spawn_prefetcher(
 }
 
 fn spawn_prefetcher_without_source_metadata(
-    consumer: Arc<StreamConsumer>,
+    consumer: Arc<ClosingStreamConsumer>,
     capacity: usize,
 ) -> Prefetcher {
     let (tx, rx) = async_channel::bounded(capacity);
@@ -874,7 +898,7 @@ async fn prefetched_record<M: Message>(
 }
 
 fn spawn_prefetcher_with_source_metadata(
-    consumer: Arc<StreamConsumer>,
+    consumer: Arc<ClosingStreamConsumer>,
     capacity: usize,
 ) -> Prefetcher {
     let (tx, rx) = async_channel::bounded(capacity);
@@ -1326,7 +1350,7 @@ fn assemble_batch(
 
 async fn receive_batch_internal(
     prefetcher: &Prefetcher,
-    consumer: &Arc<StreamConsumer>,
+    consumer: &Arc<ClosingStreamConsumer>,
     producer: impl Into<Option<&FutureProducer>>,
     max_messages: usize,
     topic: &str,
