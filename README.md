@@ -396,6 +396,10 @@ This needs a replayable source position, which today means **Kafka** (topic/part
 and MongoDB CDC also accept `source_metadata` and emit provenance keys, but a subject or routing key
 is not a replayable offset, so they cannot drive an idempotent sink.
 
+For the `file` sink, `idempotency: true` changes what `path` means: it is the directory that receives
+the part files, not the file that is appended to. The sink creates it on startup, so pointing it at an
+existing regular file fails there with "Failed to create idempotent file sink directory".
+
 `compression` and `encryption` work as usual.
 
 Current limits, all of which the sink rejects or logs rather than silently mishandling:
@@ -411,7 +415,7 @@ Current limits, all of which the sink rejects or logs rather than silently misha
 ### Cloud Object Storage (S3 / GCS / Azure)
 The `object_store` endpoint (alias `s3`) reads and writes cloud object stores — Amazon S3, Google Cloud Storage, Azure Blob, Cloudflare R2, and anything else the [`object_store`](https://crates.io/crates/object_store) crate speaks — behind the same `receive_batch` / `send_batch` API. Enable it with the `object-store` feature. Credentials and backend options are read from the process environment (`AWS_ACCESS_KEY_ID`, `AWS_ENDPOINT`, `AWS_REGION`, `GOOGLE_SERVICE_ACCOUNT`, `AZURE_STORAGE_ACCOUNT`, ...); the URL scheme picks the backend (`s3://`, `gs://`, `az://`).
 
-*   **As a sink**, each flushed batch is encoded with the same file endpoint formats (`normal` JSONL, `json`, `text`, `raw`) and written as **one immutable object** at `<prefix>/[YYYY/MM/DD/]<uuidv7>.<ext>`. Objects are write-once — nothing is appended or mutated. The uuidv7 name already sorts by write time; the optional `date_partition` prefix (on by default, derived from that same id's timestamp) is a readability / lifecycle-rule convenience.
+*   **As a sink**, each flushed batch is encoded with the same file endpoint formats (`normal` JSONL, `json`, `text`, `raw`) and written as **one immutable object** at `<prefix>/[YYYY/MM/DD/]<uuidv7>.<ext>`. Objects are write-once — nothing is appended or mutated. The uuidv7 name already sorts by write time; the optional `date_partition` prefix (on by default, derived from that same id's timestamp) is a readability / lifecycle-rule convenience. This naming applies only while `idempotency` is off — with `idempotency: true` the parts are instead named for the source range they cover and written flat under the prefix, and `date_partition` is ignored (see "Files & object storage — `idempotency`" above).
 *   **As a source**, objects under the prefix are listed in key order, fetched whole, split on the delimiter, and emitted. Progress is a durable cursor holding the last fully-acked object key: set `cursor_id` and an external `checkpoint_store` (`file://`, `s3://`, `postgres://`, `mongodb://`) so a restart resumes without re-emitting. Objects are **never deleted or rewritten** — resume is non-destructive and at-least-once at object granularity (a nacked batch is redelivered; the cursor only advances once an object is fully acked). `csv` is supported on the source only.
 
 ```yaml

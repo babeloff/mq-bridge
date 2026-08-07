@@ -184,6 +184,12 @@ impl MessagePublisher for KafkaPublisher {
         let key = record_key(self.partition_key.as_deref(), &message);
         record = record.key(&key);
 
+        // A tombstone must go out with a null value, not a zero-length one, or the broker
+        // stores an empty record and the key is never compacted away.
+        if is_tombstone(&message) {
+            record.payload = None;
+        }
+
         if !self.delayed_ack {
             // Await the delivery report from Kafka, providing at-least-once guarantees per message.
             self.producer
@@ -233,6 +239,10 @@ impl MessagePublisher for KafkaPublisher {
             record = record.key(&key_bytes);
 
             record = record.headers(message_headers(&message));
+            // See `send`: a tombstone needs a null value, not an empty one.
+            if is_tombstone(&message) {
+                record.payload = None;
+            }
 
             match self.producer.send_result(record) {
                 Ok(fut) => delivery_futures.push((message, fut)),
@@ -471,8 +481,7 @@ impl MessageConsumer for KafkaConsumer {
             .context("Failed to receive Kafka message")?;
         let item = match item {
             Ok(item) => item,
-            Err(PrefetchError::EndOfStream) => return Err(ConsumerError::EndOfStream),
-            Err(PrefetchError::Connection(e)) => return Err(ConsumerError::Connection(anyhow!(e))),
+            Err(terminal) => return Err(terminal_to_consumer_error(terminal)),
         };
         let mut last_offsets = BatchOffsets::new();
         record_offset(&mut last_offsets, &item.topic, item.partition, item.offset);
@@ -647,7 +656,9 @@ fn message_headers(message: &CanonicalMessage) -> OwnedHeaders {
         value: Some(format!("{:032x}", message.message_id).as_bytes()),
     });
     for (key, value) in &message.metadata {
-        if crate::canonical_message::is_source_metadata_key(key) {
+        // The tombstone flag is our own marker for a null value; it is re-expressed by
+        // omitting the payload, not by shipping a header the next consumer would keep.
+        if key == KAFKA_TOMBSTONE_KEY || crate::canonical_message::is_source_metadata_key(key) {
             continue;
         }
         headers = headers.insert(rdkafka::message::Header {
@@ -667,6 +678,15 @@ fn record_key(partition_key: Option<&str>, message: &CanonicalMessage) -> Vec<u8
         .unwrap_or_else(|| message.message_id.to_be_bytes().to_vec())
 }
 
+/// True when the consumer flagged this message as a compacted-topic tombstone. Publishing it
+/// with an empty payload would write a zero-length value, which does not delete the key.
+fn is_tombstone(message: &CanonicalMessage) -> bool {
+    message
+        .metadata
+        .get(KAFKA_TOMBSTONE_KEY)
+        .is_some_and(|v| v == "true")
+}
+
 /// Helper function to process a Kafka message and add it to the batch.
 /// One record pulled ahead of the pipeline, with the position needed to commit it.
 struct Prefetched {
@@ -674,12 +694,65 @@ struct Prefetched {
     topic: String,
     partition: i32,
     offset: i64,
+    /// Released when this record leaves the channel — see [`PrefetchBudget`].
+    _slot: BudgetSlot,
+}
+
+/// Byte bound on the prefetch channel, on top of its slot count.
+///
+/// Slots alone do not bound memory: the channel holds owned payloads, so the 8192-slot floor
+/// is ~8 GB at Kafka's default 1 MB `message.max.bytes`. A paused sink used to be able to
+/// grow the buffer that far before any backpressure applied.
+struct PrefetchBudget {
+    limit: usize,
+    used: std::sync::atomic::AtomicUsize,
+    released: tokio::sync::Notify,
+}
+
+impl PrefetchBudget {
+    /// Holds the reader back while the queued payloads exceed the budget. One record is
+    /// always admitted, so a payload larger than the whole budget cannot wedge the stream.
+    async fn acquire(&self, bytes: usize) {
+        use std::sync::atomic::Ordering;
+        loop {
+            // Register before the check: a release between the two would otherwise be missed.
+            let released = self.released.notified();
+            if self.used.load(Ordering::Acquire) < self.limit {
+                break;
+            }
+            released.await;
+        }
+        self.used.fetch_add(bytes, Ordering::AcqRel);
+    }
+}
+
+/// One record's share of the prefetch budget, returned when the record is taken off the
+/// channel (or when a dropped channel discards it).
+struct BudgetSlot {
+    budget: Arc<PrefetchBudget>,
+    bytes: usize,
+}
+
+impl Drop for BudgetSlot {
+    fn drop(&mut self) {
+        self.budget
+            .used
+            .fetch_sub(self.bytes, std::sync::atomic::Ordering::AcqRel);
+        self.budget.released.notify_waiters();
+    }
 }
 
 /// Why the prefetch task stopped producing records.
 enum PrefetchError {
     EndOfStream,
     Connection(String),
+}
+
+fn terminal_to_consumer_error(terminal: PrefetchError) -> ConsumerError {
+    match terminal {
+        PrefetchError::EndOfStream => ConsumerError::EndOfStream,
+        PrefetchError::Connection(e) => ConsumerError::Connection(anyhow!(e)),
+    }
 }
 
 /// Reads librdkafka continuously into a bounded channel, for the consumer's whole life.
@@ -715,6 +788,20 @@ fn prefetch_capacity(max_messages: usize) -> usize {
     configured.unwrap_or_else(|| (max_messages * 4).clamp(8192, 262_144))
 }
 
+/// Payload bytes the prefetch channel may hold, whatever the slot count allows. Override via
+/// `MQ_BRIDGE_KAFKA_PREFETCH_BYTES`. The default covers several full fetches per partition
+/// while keeping a paused sink's buffer in the tens of megabytes rather than the gigabytes.
+fn prefetch_byte_budget() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("MQ_BRIDGE_KAFKA_PREFETCH_BYTES")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(64 * 1024 * 1024)
+    })
+}
+
 fn spawn_prefetcher(
     consumer: Arc<StreamConsumer>,
     capacity: usize,
@@ -732,6 +819,7 @@ fn spawn_prefetcher_without_source_metadata(
     capacity: usize,
 ) -> Prefetcher {
     let (tx, rx) = async_channel::bounded(capacity);
+    let budget = new_budget();
     let task = tokio::spawn(async move {
         // One stream for the task's whole life. Rebuilding it per batch is what starved the
         // fetch pipeline; `ready_chunks` still batches whatever is already waiting.
@@ -740,12 +828,7 @@ fn spawn_prefetcher_without_source_metadata(
             for result in chunk {
                 let item = match result {
                     Ok(message) => match to_canonical(&message) {
-                        Ok(canonical) => Ok(Prefetched {
-                            message: canonical,
-                            topic: message.topic().to_string(),
-                            partition: message.partition(),
-                            offset: message.offset() + 1,
-                        }),
+                        Ok(canonical) => Ok(prefetched_record(&budget, canonical, &message).await),
                         Err(e) => Err(PrefetchError::Connection(e.to_string())),
                     },
                     Err(e) => Err(PrefetchError::Connection(e.to_string())),
@@ -761,23 +844,48 @@ fn spawn_prefetcher_without_source_metadata(
     Prefetcher { rx, task }
 }
 
+fn new_budget() -> Arc<PrefetchBudget> {
+    Arc::new(PrefetchBudget {
+        limit: prefetch_byte_budget(),
+        used: std::sync::atomic::AtomicUsize::new(0),
+        released: tokio::sync::Notify::new(),
+    })
+}
+
+/// Charges the payload against the byte budget — waiting if the channel is already full of
+/// bytes — and packages the record for the channel.
+async fn prefetched_record<M: Message>(
+    budget: &Arc<PrefetchBudget>,
+    message: CanonicalMessage,
+    raw: &M,
+) -> Prefetched {
+    let bytes = message.payload.len();
+    budget.acquire(bytes).await;
+    Prefetched {
+        message,
+        topic: raw.topic().to_string(),
+        partition: raw.partition(),
+        offset: raw.offset() + 1,
+        _slot: BudgetSlot {
+            budget: budget.clone(),
+            bytes,
+        },
+    }
+}
+
 fn spawn_prefetcher_with_source_metadata(
     consumer: Arc<StreamConsumer>,
     capacity: usize,
 ) -> Prefetcher {
     let (tx, rx) = async_channel::bounded(capacity);
+    let budget = new_budget();
     let task = tokio::spawn(async move {
         let mut chunks = consumer.stream().ready_chunks(1024);
         while let Some(chunk) = chunks.next().await {
             for result in chunk {
                 let item = match result {
                     Ok(message) => match to_canonical_with_source_metadata(&message) {
-                        Ok(canonical) => Ok(Prefetched {
-                            message: canonical,
-                            topic: message.topic().to_string(),
-                            partition: message.partition(),
-                            offset: message.offset() + 1,
-                        }),
+                        Ok(canonical) => Ok(prefetched_record(&budget, canonical, &message).await),
                         Err(e) => Err(PrefetchError::Connection(e.to_string())),
                     },
                     Err(e) => Err(PrefetchError::Connection(e.to_string())),
@@ -1044,22 +1152,55 @@ struct DrainState {
     /// lags by a few cycles at the end of a drain — and each cycle costs a whole idle
     /// timeout. What was handed downstream is already known here, exactly and immediately.
     delivered: PartitionOffsets,
+    /// The prefetch stream's terminal, held back because the batch it arrived with still
+    /// had records in it. Returned by the next `receive_batch`, so a stopped or panicking
+    /// reader ends the route instead of looking like a drain.
+    pending_terminal: Option<PrefetchError>,
+    /// When the next watermark lookup may block again — see [`drain_target`].
+    watermark_retry_at: Option<std::time::Instant>,
 }
 
+/// How long a failed watermark lookup suppresses further broker calls. `fetch_watermarks`
+/// is synchronous librdkafka and blocks the runtime worker for its full timeout, and
+/// readiness is evaluated twice per idle wait for up to `drain_join_timeout`. Without this,
+/// an unreachable broker meant a blocked worker thread for essentially that whole window.
+const WATERMARK_RETRY_BACKOFF: Duration = Duration::from_secs(5);
+
 /// Resolves the offset a partition must reach, reading it from the broker at most once.
+///
+/// A failure is remembered: the next lookups return `None` (reported as "not drained yet",
+/// the safe answer) without paying the blocking round-trip again until the backoff expires.
 fn drain_target(
     consumer: &StreamConsumer,
-    targets: &mut PartitionOffsets,
+    state: &mut DrainState,
     key: &(String, i32),
 ) -> Option<i64> {
-    if let Some(high) = targets.get(key) {
+    if let Some(high) = state.targets.get(key) {
         return Some(*high);
     }
-    let (_low, high) = consumer
-        .fetch_watermarks(&key.0, key.1, Duration::from_secs(1))
-        .ok()?;
-    targets.insert(key.clone(), high);
-    Some(high)
+    if state
+        .watermark_retry_at
+        .is_some_and(|at| std::time::Instant::now() < at)
+    {
+        return None;
+    }
+    match consumer.fetch_watermarks(&key.0, key.1, Duration::from_secs(1)) {
+        Ok((_low, high)) => {
+            state.watermark_retry_at = None;
+            state.targets.insert(key.clone(), high);
+            Some(high)
+        }
+        Err(e) => {
+            debug!(
+                topic = %key.0,
+                partition = key.1,
+                error = %e,
+                "Kafka watermark lookup failed; backing off before blocking on it again"
+            );
+            state.watermark_retry_at = Some(std::time::Instant::now() + WATERMARK_RETRY_BACKOFF);
+            None
+        }
+    }
 }
 
 /// Decides what an idle drain-mode wait means.
@@ -1078,7 +1219,7 @@ fn drain_readiness(consumer: &StreamConsumer, state: &mut DrainState) -> DrainRe
     };
     for elem in positions.elements() {
         let key = (elem.topic().to_string(), elem.partition());
-        let Some(high) = drain_target(consumer, &mut state.targets, &key) else {
+        let Some(high) = drain_target(consumer, state, &key) else {
             return DrainReadiness::Starting;
         };
         if state.delivered.get(&key).is_some_and(|d| *d >= high) {
@@ -1115,7 +1256,9 @@ async fn await_first(
             return None;
         }
         if let Some(item) = crate::traits::drain_gated(exit_on_empty, rx.recv()).await {
-            return item.ok();
+            // A closed channel means the prefetch task is gone (it normally sends a
+            // terminal first). Report that, rather than letting it read as a drain.
+            return Some(item.unwrap_or(Err(PrefetchError::EndOfStream)));
         }
         match readiness() {
             DrainReadiness::Drained => return None,
@@ -1190,6 +1333,11 @@ async fn receive_batch_internal(
     exit_on_empty: bool,
     drain_state: &mut DrainState,
 ) -> Result<ReceivedBatch, ConsumerError> {
+    // A terminal held back by the previous batch ends the stream now.
+    if let Some(terminal) = drain_state.pending_terminal.take() {
+        return Err(terminal_to_consumer_error(terminal));
+    }
+
     // Block for the first record, then take whatever else the prefetcher already has.
     let first = await_first(&prefetcher.rx, exit_on_empty, topic, || {
         drain_readiness(consumer, drain_state)
@@ -1207,12 +1355,12 @@ async fn receive_batch_internal(
     } = parts;
 
     // A failure is only surfaced once the records already read have been delivered.
-    if messages.is_empty() {
-        return match terminal {
-            Some(PrefetchError::EndOfStream) => Err(ConsumerError::EndOfStream),
-            Some(PrefetchError::Connection(e)) => Err(ConsumerError::Connection(anyhow!(e))),
-            None => Ok(ReceivedBatch::empty()),
-        };
+    match terminal {
+        Some(terminal) if messages.is_empty() => return Err(terminal_to_consumer_error(terminal)),
+        // Held for the next call rather than dropped, so the stream still ends.
+        Some(terminal) => drain_state.pending_terminal = Some(terminal),
+        None if messages.is_empty() => return Ok(ReceivedBatch::empty()),
+        None => {}
     }
 
     // Only a drain asks how far each partition has got, so only a drain pays for tracking it.
@@ -1444,12 +1592,62 @@ mod tests {
     }
 
     fn prefetched(topic: &str, partition: i32, offset: i64) -> Prefetched {
+        let message = CanonicalMessage::new(b"payload".to_vec(), None);
+        let budget = new_budget();
+        let bytes = message.payload.len();
+        budget
+            .used
+            .fetch_add(bytes, std::sync::atomic::Ordering::AcqRel);
         Prefetched {
-            message: CanonicalMessage::new(b"payload".to_vec(), None),
+            message,
             topic: topic.to_string(),
             partition,
             offset,
+            _slot: BudgetSlot { budget, bytes },
         }
+    }
+
+    /// The slot count alone does not bound memory (8192 slots x 1 MB records is ~8 GB), so a
+    /// paused sink must hit the byte budget and stall the reader well before the slots run out.
+    #[tokio::test]
+    async fn test_prefetch_budget_blocks_once_the_byte_limit_is_reached() {
+        use std::sync::atomic::Ordering;
+
+        let budget = Arc::new(PrefetchBudget {
+            limit: 1024,
+            used: std::sync::atomic::AtomicUsize::new(0),
+            released: tokio::sync::Notify::new(),
+        });
+
+        budget.acquire(1024).await;
+        assert_eq!(budget.used.load(Ordering::Acquire), 1024);
+
+        // At the limit the next record must wait, however many slots are free.
+        let waiter = tokio::spawn({
+            let budget = budget.clone();
+            async move { budget.acquire(16).await }
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), async {
+                while !waiter.is_finished() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .is_err(),
+            "acquire must block while the budget is exhausted"
+        );
+
+        // Taking the record off the channel releases its bytes and lets the reader continue.
+        drop(BudgetSlot {
+            budget: budget.clone(),
+            bytes: 1024,
+        });
+        tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("releasing the slot must wake the reader")
+            .unwrap();
+        assert_eq!(budget.used.load(Ordering::Acquire), 16);
     }
 
     type PrefetchChannel = (
@@ -1507,6 +1705,29 @@ mod tests {
             Some("delete")
         );
         assert!(canonical.metadata.contains_key(KAFKA_TOMBSTONE_KEY));
+    }
+
+    /// Round trip: what the consumer flagged, the publisher turns back into a null value.
+    /// Publishing the empty payload instead wrote a zero-length record, which does not
+    /// delete the key on a compacted topic.
+    #[test]
+    fn test_republished_tombstone_drops_its_payload_and_flag() {
+        let msg = create_mock_message(None, Some(b"orders-42"), None, 7, 1);
+        let canonical = to_canonical(&msg).unwrap();
+
+        assert!(is_tombstone(&canonical));
+        let headers = message_headers(&canonical);
+        assert!(
+            (0..headers.count()).all(|i| headers.get(i).key != KAFKA_TOMBSTONE_KEY),
+            "the tombstone flag must not be shipped as a Kafka header"
+        );
+    }
+
+    #[test]
+    fn test_ordinary_message_is_not_republished_as_a_tombstone() {
+        let msg = create_mock_message(Some(b"{\"a\":1}"), None, None, 7, 1);
+
+        assert!(!is_tombstone(&to_canonical(&msg).unwrap()));
     }
 
     #[test]

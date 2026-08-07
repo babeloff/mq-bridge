@@ -20,7 +20,7 @@ fn chain(err: &anyhow::Error) -> String {
 
 /// Errors that can occur during message processing (handling or publishing).
 ///
-/// Every variant formats its whole cause chain (see [`chain`]). A plain `{}` prints
+/// Every variant formats its whole cause chain. A plain `{}` prints
 /// only the outermost `.context(...)`, and these errors are routinely flattened into a
 /// string on the way to the route and the logs, which threw away whatever the client
 /// library actually said (a driver reason code, an HTTP status detail).

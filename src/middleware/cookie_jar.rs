@@ -141,6 +141,7 @@ fn inject_session_metadata(
     store: &SessionStore,
     cookie_metadata_key: &str,
     inject_metadata: &HashMap<String, String>,
+    export_metadata_prefix: Option<&str>,
 ) {
     let snapshot = recover_read_lock(store, "cookie_jar_session").clone();
 
@@ -154,10 +155,13 @@ fn inject_session_metadata(
         if metadata.contains_key(metadata_key) {
             continue;
         }
-        // `export_metadata_prefix` reports names as `cookie.<name>` / `value.<name>`, so accept
-        // that spelling here too — looking a name up under the form it was just read back in
-        // used to silently inject nothing.
-        let value = match session_key.split_once('.') {
+        // `export_metadata_prefix` reports names as `<prefix>cookie.<name>` /
+        // `<prefix>value.<name>`, so accept that spelling here too — looking a name up
+        // under the form it was just read back in used to silently inject nothing.
+        let unprefixed = export_metadata_prefix
+            .and_then(|prefix| session_key.strip_prefix(prefix))
+            .unwrap_or(session_key);
+        let value = match unprefixed.split_once('.') {
             Some(("cookie", name)) => snapshot.cookies.get(name),
             Some(("value", name)) => snapshot.values.get(name),
             _ => None,
@@ -266,6 +270,7 @@ impl CookieJarPublisher {
             &self.store,
             &self.config.cookie_metadata_key,
             &self.config.inject_metadata,
+            self.config.export_metadata_prefix.as_deref(),
         );
         export_session_metadata(
             &mut message.metadata,
@@ -525,7 +530,11 @@ mod tests {
         );
         consumer.receive_batch(10).await.unwrap();
 
-        for session_key in ["session", "cookie.session"] {
+        for (session_key, export_prefix) in [
+            ("session", None),
+            ("cookie.session", None),
+            ("session.cookie.session", Some("session.".to_string())),
+        ] {
             let sent = Arc::new(Mutex::new(Vec::new()));
             let publisher = CookieJarPublisher::new(
                 Box::new(RecordingPublisher {
@@ -538,6 +547,7 @@ mod tests {
                         "authorization".to_string(),
                         session_key.to_string(),
                     )]),
+                    export_metadata_prefix: export_prefix,
                     ..Default::default()
                 },
             );

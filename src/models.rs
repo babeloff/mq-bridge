@@ -1576,7 +1576,7 @@ impl Default for CompressionMiddleware {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct FileConfig {
-    /// Path to the file.
+    /// Path to the file, or to the directory holding the part files when `idempotency` is true.
     pub path: String,
     /// Write replay-safe source ranges as immutable part files under this directory.
     /// Requires Kafka source metadata or postgres_cdc commit LSN plus transaction ordinal metadata.

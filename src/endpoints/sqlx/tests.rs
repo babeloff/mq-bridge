@@ -985,6 +985,35 @@ async fn test_classify_sql_error_constraint_is_nonretryable_others_retryable() {
     ));
 }
 
+/// A stale pooled connection (the failure mode `test_before_acquire: false` trades away)
+/// surfaces as a transport error, not a SQL one. Both classifiers must treat it as
+/// transient so the route reconnects instead of dead-lettering a message that never ran.
+#[test]
+fn test_connection_level_failures_stay_retryable() {
+    let transport = || {
+        [
+            sqlx::Error::Io(std::io::Error::from(std::io::ErrorKind::ConnectionReset)),
+            sqlx::Error::Io(std::io::Error::from(std::io::ErrorKind::BrokenPipe)),
+            sqlx::Error::PoolClosed,
+            sqlx::Error::PoolTimedOut,
+        ]
+    };
+    for e in transport() {
+        let label = e.to_string();
+        assert!(
+            matches!(classify_sql_error(e), PublisherError::Retryable(_)),
+            "sink must retry '{label}'"
+        );
+    }
+    for e in transport() {
+        let label = e.to_string();
+        assert!(
+            matches!(classify_sql_consumer_error(e), ConsumerError::Connection(_)),
+            "source must reconnect on '{label}'"
+        );
+    }
+}
+
 #[tokio::test]
 async fn test_sqlx_status() {
     let (_dir, url) = setup_db_file().await;

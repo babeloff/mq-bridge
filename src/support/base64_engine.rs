@@ -74,4 +74,28 @@ mod tests {
         assert_eq!(super::decode("Zm9vYmFy").unwrap(), b"foobar");
         assert!(super::decode("!!!!").is_err());
     }
+
+    /// Only one `imp` is compiled per target, so the reference vectors above never compare
+    /// the two engines. Pin the active one against the scalar `STANDARD` engine so a
+    /// padding or decode-mode difference in `Simd::standard` cannot ship unnoticed.
+    #[test]
+    fn agrees_with_the_scalar_engine() {
+        use base64::engine::general_purpose::STANDARD;
+        use base64::Engine as _;
+
+        // Lengths 0..=3 cover every padding case; 1024 exercises the SIMD block path.
+        for len in [0usize, 1, 2, 3, 1024] {
+            let data: Vec<u8> = (0..=255u8).cycle().take(len).collect();
+            let encoded = super::encode(&data);
+            assert_eq!(
+                encoded,
+                STANDARD.encode(&data),
+                "encode differs at len {len}"
+            );
+            assert_eq!(super::decode(&encoded).unwrap(), data);
+        }
+        // Padding must be required, not merely tolerated, in both engines.
+        assert!(super::decode("Zg").is_err());
+        assert!(STANDARD.decode("Zg").is_err());
+    }
 }

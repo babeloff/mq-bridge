@@ -49,7 +49,9 @@ publish, never the handler — a handler with a side effect fires once however m
 sink is retried. The trade: a `dlq` cannot capture a handler failure, only a send failure;
 a handler error propagates to the route and is reported there.
 
-> This is asserted by `route::tests::test_dlq_and_retry_batch_integration`,
+> This is asserted by `route::tests::test_retryable_handler_error_is_not_retried_by_output_middleware`
+> (the handler runs once and `retry` does not re-run it),
+> `route::tests::test_dlq_and_retry_batch_integration`,
 > `middleware::transform::tests::test_rejected_message_reaches_the_dlq_through_the_config_wiring`,
 > and `reference_docs_test::publisher_middleware_wraps_last_entry_outermost`, and is
 > documented on `apply_middlewares_to_publisher` in `src/middleware/mod.rs`.

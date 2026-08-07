@@ -29,6 +29,14 @@ class NonRetryableError(Exception): ...
 
 
 class Message:
+    """A message payload with optional metadata and id.
+
+    ``id`` accepts a UUID string, a ``0x``-prefixed hex literal, or a decimal
+    integer. Any other string is hashed to a stable id rather than rejected, so
+    an arbitrary string no longer raises ``ValueError``; equal strings always
+    yield the same id.
+    """
+
     def __init__(
         self,
         payload: bytes,

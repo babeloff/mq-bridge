@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 
 use anyhow::{anyhow, bail, Result};
+use tracing::warn;
 
 use crate::CanonicalMessage;
 
@@ -182,11 +183,22 @@ impl CoveredRanges {
         for message in messages {
             let position = SourcePosition::from_message(&message)?;
             if !self.contains(&position) {
-                grouped
-                    .entry(position.source)
+                let offset = position.offset;
+                // One source position maps to one part-file record, so a second message at
+                // the same position (a middleware that fans one record out) is dropped.
+                if grouped
+                    .entry(position.source.clone())
                     .or_default()
-                    .entry(position.offset)
-                    .or_insert(message);
+                    .insert(offset, message)
+                    .is_some()
+                {
+                    warn!(
+                        source = ?position.source,
+                        offset,
+                        "idempotent sink dropped a second message at the same source position; \
+                         middleware that fans one source record out is not replay-safe"
+                    );
+                }
             }
         }
 

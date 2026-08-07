@@ -8,7 +8,10 @@ All notable changes to `mq-bridge`. Newest first.
 ### Changed
 
 - DLQ and output middleware now run around the publish step, not inside the handler, so a
-  handler failure is no longer retried by the output chain.
+  handler failure is no longer retried by the output chain. The tradeoff: a handler failure
+  now skips the output middleware entirely, so `dlq` on the output endpoint cannot capture
+  it — only publish failures reach the DLQ. Put a `dlq` on the input endpoint to catch
+  handler failures.
 - Errors carry their full cause chain instead of only the outermost context.
 - `deduplication` on an **output** endpoint is now a startup error instead of a warning and a
   silent no-op. Move it to the route's input endpoint.

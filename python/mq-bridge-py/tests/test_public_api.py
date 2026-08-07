@@ -95,13 +95,13 @@ def test_message_repr_includes_shape_without_payload() -> None:
     assert "secret" not in text
 
 
-def test_message_rejects_invalid_id() -> None:
-    try:
-        Message(b"hello", id="not-a-uuid")
-    except ValueError as exc:
-        assert "invalid message id" in str(exc)
-    else:  # pragma: no cover - defensive assertion
-        raise AssertionError("invalid message id was accepted")
+def test_message_hashes_non_uuid_id_stably() -> None:
+    # A non-UUID id is folded into a stable id rather than rejected.
+    first = Message(b"hello", id="not-a-uuid")
+    second = Message(b"world", id="not-a-uuid")
+
+    assert first.id == second.id
+    assert first.id != Message(b"hello", id="another-id").id
 
 
 def test_message_json_reports_decode_errors() -> None:

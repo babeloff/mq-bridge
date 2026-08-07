@@ -36,7 +36,7 @@ use std::any::Any;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
-use tracing::{info, trace, warn};
+use tracing::{debug, info, trace, warn};
 
 /// Builds an `object_store` backend and its base prefix `Path` from a URL, reading
 /// credentials from the environment. Shared with the object-store checkpoint backend so
@@ -219,7 +219,9 @@ impl ObjectStorePublisher {
         });
         let covered_ranges = if config.idempotency {
             if config.date_partition {
-                warn!("object_store 'idempotency' ignores 'date_partition'; part names carry the source range and are written flat under the prefix");
+                // `date_partition` defaults to true, so this cannot tell an explicit
+                // setting from the default — keep it out of the operator's warning log.
+                debug!("object_store 'idempotency' ignores 'date_partition'; part names carry the source range and are written flat under the prefix");
             }
             recover_idempotent_object_ranges(store.as_ref(), &base, &extension).await?
         } else {

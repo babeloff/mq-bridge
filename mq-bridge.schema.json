@@ -1017,7 +1017,7 @@
           "default": false
         },
         "path": {
-          "description": "Path to the file.",
+          "description": "Path to the file, or to the directory holding the part files when `idempotency` is true.",
           "type": "string"
         }
       },

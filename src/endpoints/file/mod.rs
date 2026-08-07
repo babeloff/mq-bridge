@@ -480,12 +480,10 @@ async fn write_finalized_file(path: &Path, body: &[u8]) -> Result<(), PublisherE
     fs::rename(&staging, path)
         .await
         .context("Failed to finalize idempotent file output")?;
-    File::open(directory)
-        .await
-        .context("Failed to open idempotent file output directory")?
-        .sync_all()
-        .await
-        .context("Failed to sync idempotent file output directory")?;
+    // Best effort: Windows cannot open a directory handle this way.
+    if let Ok(directory) = File::open(directory).await {
+        let _ = directory.sync_all().await;
+    }
     Ok(())
 }
 

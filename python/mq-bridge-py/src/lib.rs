@@ -1457,6 +1457,9 @@ fn validate_message_id(id: Option<&str>) -> PyResult<()> {
     Ok(())
 }
 
+/// Resolve a user-supplied id string. A UUID, `0x` hex literal or decimal integer parses
+/// directly; anything else is hashed to a stable id, so this no longer raises `ValueError`
+/// for arbitrary strings. The `PyResult` is kept for the API's shape.
 fn parse_message_id(id: &str) -> PyResult<u128> {
     core::canonical_message::message_id_from_str(id).map_err(PyValueError::new_err)
 }

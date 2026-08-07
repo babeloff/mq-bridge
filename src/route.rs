@@ -887,6 +887,18 @@ impl Route {
                                         s.error = Some(format!("route task panicked: {}", e));
                                         consecutive_failures += 1;
                                     }
+                                    // Same bound as the error arm: a drain whose task keeps
+                                    // panicking will never reach its empty batch.
+                                    if exit_on_empty
+                                        && consecutive_failures >= DRAIN_MAX_RECONNECT_ATTEMPTS
+                                    {
+                                        outcome_guard.set(RouteOutcome::Failed);
+                                        error!(
+                                            "Route '{}' panicked {} times in a row while draining; giving up. Last error: {}",
+                                            name, consecutive_failures, e
+                                        );
+                                        break 'reconnect;
+                                    }
                                     error!(
                                         "Route '{}' task panicked: {}. Reconnecting in {}ms...",
                                         name,

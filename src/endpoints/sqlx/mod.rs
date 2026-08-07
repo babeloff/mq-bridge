@@ -1510,13 +1510,13 @@ impl SqlCursor {
 
 /// Serialize a full row into a JSON object payload (`{column: value, ...}`), trying the
 /// value types the `Any` driver supports. Unknown/unsupported types bind to JSON null.
-/// One column's pre-rendered JSON key and decode plan. Every row of a batch shares the
-/// query's column list, so resolving this per row only re-allocated the same key strings.
+/// One column's pre-rendered JSON key. Every row of a batch shares the query's column
+/// list, so resolving this per row only re-allocated the same key strings. The value
+/// *kind* is deliberately not cached — see [`JsonRowSchema::encode_row`].
 struct JsonColumn {
     /// `"name":` — quoted, escaped and colon-terminated, ready to memcpy into a payload.
     key: Vec<u8>,
     ordinal: usize,
-    kind: sqlx::any::AnyTypeInfoKind,
 }
 
 /// The column layout of a batch, resolved once from its first row.
@@ -1537,7 +1537,6 @@ impl JsonRowSchema {
                 JsonColumn {
                     key,
                     ordinal: col.ordinal(),
-                    kind: col.type_info().kind(),
                 }
             })
             .collect();
@@ -1547,6 +1546,11 @@ impl JsonRowSchema {
     /// Write one row as a JSON object straight into `buf`. Going through
     /// `serde_json::Map`/`Value` first allocated a `String` per key per row and copied every
     /// text value an extra time before the final serialization pass.
+    ///
+    /// The value kind is read from the row being encoded, not cached with the column:
+    /// SQLite types a *value*, not a column, so `Any` can report a different kind per row.
+    /// Caching row 1's kind decoded later rows as the wrong type — and a NULL first row
+    /// pinned the whole column to `null`.
     fn encode_row(&self, row: &sqlx::any::AnyRow, buf: &mut Vec<u8>) {
         buf.push(b'{');
         for (i, col) in self.columns.iter().enumerate() {
@@ -1554,7 +1558,8 @@ impl JsonRowSchema {
                 buf.push(b',');
             }
             buf.extend_from_slice(&col.key);
-            write_json_value(row, col.ordinal, col.kind, buf);
+            let kind = row.column(col.ordinal).type_info().kind();
+            write_json_value(row, col.ordinal, kind, buf);
         }
         buf.push(b'}');
     }
@@ -1616,23 +1621,16 @@ fn write_json_value(
     }
 }
 
-/// Resolve the cursor column's ordinal and kind once per batch (same query, same column
-/// order for every row) instead of re-resolving the name -> ordinal lookup on every row.
-fn resolve_cursor_column(
-    row: &sqlx::any::AnyRow,
-    column: &str,
-) -> Option<(usize, sqlx::any::AnyTypeInfoKind)> {
-    let col = row.try_column(column).ok()?;
-    Some((col.ordinal(), col.type_info().kind()))
+/// Resolve the cursor column's ordinal once per batch (same query, same column order for
+/// every row) instead of re-resolving the name -> ordinal lookup on every row. The kind is
+/// not resolved here — it is per value on SQLite, so [`extract_cursor_at`] reads it per row.
+fn resolve_cursor_column(row: &sqlx::any::AnyRow, column: &str) -> Option<usize> {
+    Some(row.try_column(column).ok()?.ordinal())
 }
 
-fn extract_cursor_at(
-    row: &sqlx::any::AnyRow,
-    idx: usize,
-    kind: sqlx::any::AnyTypeInfoKind,
-) -> Option<SqlCursor> {
+fn extract_cursor_at(row: &sqlx::any::AnyRow, idx: usize) -> Option<SqlCursor> {
     use sqlx::any::AnyTypeInfoKind;
-    match kind {
+    match row.column(idx).type_info().kind() {
         AnyTypeInfoKind::SmallInt | AnyTypeInfoKind::Integer | AnyTypeInfoKind::BigInt => row
             .try_get::<Option<i64>, _>(idx)
             .ok()
@@ -2131,10 +2129,10 @@ impl MessageConsumer for SqlxCursorReader {
         // Rows arrived: return to the base polling interval.
         self.backoff.reset();
 
-        // Resolve the cursor column's position once; every row in this batch shares the
-        // same query/column order, so there's no need to re-resolve it per row.
+        // Resolve column positions and JSON keys once; every row in this batch shares the
+        // same query/column order. Value *kinds* are still read per row (SQLite types
+        // values, not columns).
         let cursor_col = resolve_cursor_column(&rows[0], &self.cursor_column);
-        // Same reasoning for the JSON column layout: identical for every row of the batch.
         let schema = JsonRowSchema::from_row(&rows[0]);
 
         // Extract (cursor, message) for every fetched row.
@@ -2144,7 +2142,7 @@ impl MessageConsumer for SqlxCursorReader {
         let mut size_hint = 256usize;
         for row in &rows {
             let cursor = cursor_col
-                .and_then(|(idx, kind)| extract_cursor_at(row, idx, kind))
+                .and_then(|idx| extract_cursor_at(row, idx))
                 .ok_or_else(|| {
                     // Schema-level, so re-polling fails identically: permanent, not a reconnect.
                     ConsumerError::Permanent(anyhow!(
