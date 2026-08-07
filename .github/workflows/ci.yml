@@ -314,6 +314,8 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       # Hard gate: an unapproved license, a banned crate or a non-crates.io
       # source is always a real, actionable problem in this repo.

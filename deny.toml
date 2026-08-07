@@ -7,6 +7,10 @@
 # not imply the affected code is compiled into any given build. SECURITY.md
 # records the per-feature reachability analysis; keep the two in sync.
 
+[graph]
+# Scan the full-feature dependency graph, so optional transports are covered.
+all-features = true
+
 [advisories]
 version = 2
 # Security advisories from the RustSec database. Yanked crates are denied by

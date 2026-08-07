@@ -45,8 +45,9 @@ the tool output and the real exposure:
 | [RUSTSEC-2024-0384](https://rustsec.org/advisories/RUSTSEC-2024-0384) | `instant` via `sled 0.34` → `parking_lot 0.11` | `sled`, `dedup` | Unmaintained only, no vulnerability |
 | [RUSTSEC-2025-0134](https://rustsec.org/advisories/RUSTSEC-2025-0134) | `rustls-pemfile` (direct + `rumqttc`) | `amqp`, `nats`, `mqtt`, `http` | Unmaintained only, no vulnerability |
 
-If you build without `mqtt`, `aws`, `sled`, and `dedup`, none of the above is
-compiled into your binary.
+Each row applies only to the features listed for it: a build that enables none of
+a row's features does not compile that finding's code. `rustls-pemfile` is the
+broadest — it is pulled in by `amqp`, `nats`, `mqtt`, and `http` alike.
 
 ### Detail: the `rustls-webpki` advisories
 
