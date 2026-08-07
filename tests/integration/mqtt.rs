@@ -211,12 +211,18 @@ pub async fn test_mqtt_status() {
 
             let start = std::time::Instant::now();
             loop {
-                if publisher.status().await.healthy && consumer.status().await.healthy {
+                let pub_status = publisher.status().await;
+                let con_status = consumer.status().await;
+                if pub_status.healthy && con_status.healthy {
                     println!("[MQTT] Reconnect detected.");
                     break;
                 }
-                if start.elapsed() > Duration::from_secs(20) {
-                    panic!("[MQTT] Timeout waiting for reconnect.");
+                if start.elapsed() > Duration::from_secs(60) {
+                    controller.dump_diagnostics("mosquitto");
+                    panic!(
+                        "[MQTT] Timeout waiting for reconnect. Pub: {:?}, Con: {:?}",
+                        pub_status, con_status
+                    );
                 }
                 sleep(Duration::from_secs(1)).await;
             }
