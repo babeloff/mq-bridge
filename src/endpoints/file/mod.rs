@@ -433,14 +433,21 @@ async fn recover_idempotent_file_ranges(
     while let Some(entry) = entries.next_entry().await? {
         let name = entry.file_name().to_string_lossy().into_owned();
         if name.starts_with(".stage-") {
-            let age = entry
-                .metadata()
-                .await
-                .and_then(|meta| meta.modified())
-                .map(|modified| now.duration_since(modified).unwrap_or_default())
-                .unwrap_or(STAGING_REAP_AGE);
+            let Ok(metadata) = entry.metadata().await else {
+                continue;
+            };
+            let Ok(modified) = metadata.modified() else {
+                continue;
+            };
+            let Ok(age) = now.duration_since(modified) else {
+                continue;
+            };
             if age >= STAGING_REAP_AGE {
-                fs::remove_file(entry.path()).await?;
+                match fs::remove_file(entry.path()).await {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                }
             }
         } else {
             names.push(name);

@@ -49,6 +49,31 @@ fn change_event_source_metadata_is_opt_in_and_orders_by_cluster_time() {
 }
 
 #[test]
+fn snapshot_source_metadata_uses_namespace_and_document_id() {
+    let mut message = CanonicalMessage::new(Vec::new(), None);
+    super::readers::add_snapshot_source_metadata(
+        &mut message,
+        "shop.orders",
+        &mongodb::bson::Bson::String("order-42".into()),
+    );
+
+    assert_eq!(
+        message
+            .metadata
+            .get("mqb.src.mongodb_namespace")
+            .map(String::as_str),
+        Some("shop.orders")
+    );
+    assert_eq!(
+        message
+            .metadata
+            .get("mqb.src.mongodb_document_id")
+            .map(String::as_str),
+        Some("\"order-42\"")
+    );
+}
+
+#[test]
 fn parse_document_takes_wrapped_fields_and_falls_back_otherwise() {
     let id = mongodb::bson::Uuid::new();
     // Wrapped: payload is unwrapped and metadata decoded.

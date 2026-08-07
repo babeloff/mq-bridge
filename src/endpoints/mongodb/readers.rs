@@ -509,6 +509,9 @@ impl MongoDbChangeStreamReader {
                     if let Some(enc) = encode_id(&id) {
                         msg.metadata.insert("mongodb.document_id".to_string(), enc);
                     }
+                    if self.source_metadata {
+                        add_snapshot_source_metadata(&mut msg, &self.namespace, &id);
+                    }
                     messages.push(msg);
                     ids.push(id.clone());
                 }
@@ -694,6 +697,23 @@ fn add_source_metadata(
             "mqb.src.mongodb_cluster_time".to_string(),
             packed.to_string(),
         );
+    }
+}
+
+/// Tags a snapshot document with the stable identity used when it is redelivered.
+pub(super) fn add_snapshot_source_metadata(
+    message: &mut CanonicalMessage,
+    namespace: &str,
+    id: &Bson,
+) {
+    message.metadata.insert(
+        "mqb.src.mongodb_namespace".to_string(),
+        namespace.to_string(),
+    );
+    if let Ok(document_id) = serde_json::to_string(id) {
+        message
+            .metadata
+            .insert("mqb.src.mongodb_document_id".to_string(), document_id);
     }
 }
 
