@@ -630,6 +630,7 @@ fn sqlx_cfg_to_cdc(
     Ok(crate::models::PostgresCdcConfig {
         url: cfg.url.clone(),
         publication: cfg.publication.clone().unwrap_or_default(),
+        source_metadata: false,
         slot_name: cfg
             .slot_name
             .clone()
@@ -654,10 +655,115 @@ pub async fn create_consumer_from_route(
     route_name: &str,
     endpoint: &Endpoint,
 ) -> Result<Box<dyn MessageConsumer>> {
+    create_consumer_from_route_with_source_metadata(route_name, endpoint, false).await
+}
+
+/// Create a route consumer with source positions required by an idempotent output.
+pub async fn create_consumer_from_route_with_source_metadata(
+    route_name: &str,
+    endpoint: &Endpoint,
+    source_metadata_required: bool,
+) -> Result<Box<dyn MessageConsumer>> {
     let resolved_endpoint = resolve_endpoint(endpoint, route_name)?;
     check_consumer(route_name, &resolved_endpoint, None)?;
-    let consumer = create_base_consumer(route_name, &resolved_endpoint).await?;
+    if source_metadata_required && !supports_source_metadata(&resolved_endpoint.endpoint_type) {
+        return Err(anyhow!(
+            "[route:{route_name}] idempotent file/object_store output requires a Kafka or Postgres CDC input"
+        ));
+    }
+    let source_metadata =
+        source_metadata_required || source_metadata_requested(&resolved_endpoint.endpoint_type);
+    let consumer = create_base_consumer(route_name, &resolved_endpoint, source_metadata).await?;
     apply_middlewares_to_consumer(consumer, &resolved_endpoint, route_name).await
+}
+
+/// Sources whose `mqb.src.*` keys [`SourcePosition`](crate::support::source_ranges::SourcePosition)
+/// can turn into a replay position. NATS and AMQP also emit provenance under `source_metadata`,
+/// but a routing key is not a replayable offset, so they do not belong here — admitting them
+/// would start the route and then fail on the first message.
+fn supports_source_metadata(endpoint_type: &EndpointType) -> bool {
+    matches!(
+        endpoint_type,
+        EndpointType::Kafka(_) | EndpointType::PostgresCdc(_)
+    ) || matches!(endpoint_type, EndpointType::Sqlx(config) if config.publication.is_some())
+}
+
+fn source_metadata_requested(endpoint_type: &EndpointType) -> bool {
+    match endpoint_type {
+        EndpointType::Kafka(config) => config.source_metadata,
+        EndpointType::Nats(config) => config.source_metadata,
+        EndpointType::Amqp(config) => config.source_metadata,
+        EndpointType::PostgresCdc(config) => config.source_metadata,
+        _ => false,
+    }
+}
+
+/// Whether a route's resolved output contains an idempotent file or object-store sink.
+pub fn output_requires_source_metadata(route_name: &str, endpoint: &Endpoint) -> Result<bool> {
+    fn visit(
+        route_name: &str,
+        endpoint: &Endpoint,
+        depth: usize,
+        visited_refs: &mut std::collections::HashSet<String>,
+    ) -> Result<bool> {
+        const MAX_DEPTH: usize = 16;
+        if depth > MAX_DEPTH {
+            return Err(anyhow!(
+                "[route:{route_name}] output recursion depth exceeded limit of {MAX_DEPTH}"
+            ));
+        }
+        match &endpoint.endpoint_type {
+            EndpointType::File(config) => Ok(config.idempotency),
+            EndpointType::ObjectStore(config) => Ok(config.idempotency),
+            EndpointType::Fanout(outputs) => outputs
+                .iter()
+                .map(|output| visit(route_name, output, depth + 1, visited_refs))
+                .collect::<Result<Vec<_>>>()
+                .map(|requirements| requirements.into_iter().any(|required| required)),
+            EndpointType::Switch(config) => {
+                let cases_required = config
+                    .cases
+                    .values()
+                    .map(|output| visit(route_name, output, depth + 1, visited_refs))
+                    .collect::<Result<Vec<_>>>()?
+                    .into_iter()
+                    .any(|required| required);
+                if cases_required {
+                    Ok(true)
+                } else {
+                    config.default.as_deref().map_or(Ok(false), |output| {
+                        visit(route_name, output, depth + 1, visited_refs)
+                    })
+                }
+            }
+            EndpointType::Reader(output) => visit(route_name, output, depth + 1, visited_refs),
+            EndpointType::Request(config) => {
+                Ok(visit(route_name, &config.to, depth + 1, visited_refs)?
+                    || visit(route_name, &config.forward_to, depth + 1, visited_refs)?)
+            }
+            EndpointType::Ref(name) => {
+                if !visited_refs.insert(name.clone()) {
+                    return Err(anyhow!(
+                        "[route:{route_name}] circular output reference detected for endpoint '{name}'"
+                    ));
+                }
+                let referenced = crate::route::get_endpoint(name).ok_or_else(|| {
+                    anyhow!("[route:{route_name}] referenced output endpoint '{name}' not found")
+                })?;
+                let required = visit(route_name, &referenced, depth + 1, visited_refs);
+                visited_refs.remove(name);
+                required
+            }
+            _ => Ok(false),
+        }
+    }
+
+    visit(
+        route_name,
+        endpoint,
+        0,
+        &mut std::collections::HashSet::new(),
+    )
 }
 
 pub(crate) async fn try_run_fast_path_route(
@@ -842,6 +948,7 @@ async fn run_http_inline_response_fast_path(
 async fn create_base_consumer(
     route_name: &str,
     endpoint: &Endpoint,
+    _source_metadata: bool,
 ) -> Result<Box<dyn MessageConsumer>> {
     // Helper to coerce concrete consumers to the trait object, fixing type inference issues in the match block.
     fn boxed<T: MessageConsumer + 'static>(c: T) -> Box<dyn MessageConsumer> {
@@ -857,7 +964,9 @@ async fn create_base_consumer(
             if config.topic.is_none() {
                 config.topic = Some(route_name.to_string());
             }
-            Ok(boxed(kafka::KafkaConsumer::new(&config).await?))
+            Ok(boxed(
+                kafka::KafkaConsumer::new_with_source_metadata(&config, _source_metadata).await?,
+            ))
         }
         #[cfg(feature = "nats")]
         EndpointType::Nats(cfg) => {
@@ -865,7 +974,9 @@ async fn create_base_consumer(
             if config.subject.is_none() {
                 config.subject = Some(route_name.to_string());
             }
-            Ok(boxed(nats::NatsConsumer::new(&config).await?))
+            Ok(boxed(
+                nats::NatsConsumer::new_with_source_metadata(&config, _source_metadata).await?,
+            ))
         }
         #[cfg(feature = "amqp")]
         EndpointType::Amqp(cfg) => {
@@ -873,7 +984,9 @@ async fn create_base_consumer(
             if config.queue.is_none() {
                 config.queue = Some(route_name.to_string());
             }
-            Ok(boxed(amqp::AmqpConsumer::new(&config).await?))
+            Ok(boxed(
+                amqp::AmqpConsumer::new_with_source_metadata(&config, _source_metadata).await?,
+            ))
         }
         #[cfg(feature = "mqtt")]
         EndpointType::Mqtt(cfg) => {
@@ -928,7 +1041,11 @@ async fn create_base_consumer(
                 #[cfg(feature = "postgres-cdc")]
                 {
                     Ok(boxed(
-                        postgres::PostgresCdcConsumer::new(&sqlx_cfg_to_cdc(cfg)?).await?,
+                        postgres::PostgresCdcConsumer::new_with_source_metadata(
+                            &sqlx_cfg_to_cdc(cfg)?,
+                            _source_metadata,
+                        )
+                        .await?,
                     ))
                 }
                 #[cfg(not(feature = "postgres-cdc"))]
@@ -957,7 +1074,9 @@ async fn create_base_consumer(
             }
         }
         #[cfg(feature = "postgres-cdc")]
-        EndpointType::PostgresCdc(cfg) => Ok(boxed(postgres::PostgresCdcConsumer::new(cfg).await?)),
+        EndpointType::PostgresCdc(cfg) => Ok(boxed(
+            postgres::PostgresCdcConsumer::new_with_source_metadata(cfg, _source_metadata).await?,
+        )),
         #[cfg(feature = "http")]
         EndpointType::Http(cfg) => Ok(boxed(http::HttpConsumer::new(cfg).await?)),
         #[cfg(feature = "websocket")]
@@ -991,14 +1110,25 @@ async fn create_base_consumer(
                     // Watch an existing collection for changes from now on (needs a replica set;
                     // otherwise the change-stream open returns a clear error).
                     Ok(boxed(
-                        mongodb::MongoDbChangeStreamReader::new(&config, false).await?,
+                        mongodb::MongoDbChangeStreamReader::new_with_source_metadata(
+                            &config,
+                            false,
+                            _source_metadata,
+                        )
+                        .await?,
                     ))
                 }
                 MongoConsume::CaptureAll => {
                     // Read existing documents first, then capture changes. Prefer a change stream
                     // (captures updates/deletes); on a standalone server change streams are
                     // unavailable, so fall back to a non-destructive `_id` read (inserts only).
-                    match mongodb::MongoDbChangeStreamReader::new(&config, true).await {
+                    match mongodb::MongoDbChangeStreamReader::new_with_source_metadata(
+                        &config,
+                        true,
+                        _source_metadata,
+                    )
+                    .await
+                    {
                         Ok(reader) => Ok(boxed(reader)),
                         // Only fall back for the "change streams need a replica set" error (40573);
                         // auth/network/config and other startup errors propagate untouched.
@@ -1793,6 +1923,66 @@ mod tests {
     use super::*;
     use crate::models::{Endpoint, EndpointType};
     use crate::CanonicalMessage;
+
+    #[test]
+    fn idempotent_output_requires_source_metadata_through_fanout_and_switch() {
+        let ordinary = Endpoint::new_memory("ordinary", 1);
+        let mut idempotent_file = crate::models::FileConfig::new("/tmp/idempotent.jsonl");
+        idempotent_file.idempotency = true;
+        let file = Endpoint::new(EndpointType::File(idempotent_file));
+
+        let fanout = Endpoint::new(EndpointType::Fanout(vec![ordinary.clone(), file.clone()]));
+        assert!(output_requires_source_metadata("test", &fanout).unwrap());
+
+        let mut cases = std::collections::HashMap::new();
+        cases.insert("archive".to_string(), file);
+        let switch = Endpoint::new(EndpointType::Switch(crate::models::SwitchConfig {
+            metadata_key: "kind".to_string(),
+            cases,
+            default: Some(Box::new(ordinary)),
+        }));
+        assert!(output_requires_source_metadata("test", &switch).unwrap());
+    }
+
+    #[tokio::test]
+    async fn idempotent_output_rejects_a_source_without_replay_position() {
+        let result = create_consumer_from_route_with_source_metadata(
+            "idempotent-route",
+            &Endpoint::new_memory("input", 1),
+            true,
+        )
+        .await;
+        let error = match result {
+            Ok(_) => panic!("memory has no durable source position"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("requires a Kafka or Postgres CDC input"));
+    }
+
+    /// NATS emits `mqb.src.*` provenance but no replayable offset. The guard must reject it up
+    /// front rather than let the route start and die on the first message. The rejection happens
+    /// before any connection attempt, so this needs no broker.
+    #[cfg(feature = "nats")]
+    #[tokio::test]
+    async fn idempotent_output_rejects_a_source_with_provenance_but_no_offset() {
+        let nats = Endpoint::new(EndpointType::Nats(crate::models::NatsConfig {
+            subject: Some("orders".to_string()),
+            stream: Some("ORDERS".to_string()),
+            source_metadata: true,
+            ..Default::default()
+        }));
+        let result =
+            create_consumer_from_route_with_source_metadata("idempotent-route", &nats, true).await;
+        let error = match result {
+            Ok(_) => panic!("a NATS subject is not a replay position"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("requires a Kafka or Postgres CDC input"));
+    }
 
     #[tokio::test]
     async fn test_fanout_publisher_integration() {

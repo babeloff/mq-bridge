@@ -22,6 +22,7 @@ use crate::endpoints::file::{encode_record, parse_delimiter, parse_message};
 use crate::models::{Compression, FileFormat, ObjectStoreConfig};
 #[cfg(feature = "encryption")]
 use crate::support::crypto::Crypto;
+use crate::support::source_ranges::{finalized_name, CoveredRanges};
 use crate::traits::{
     BoxFuture, ConsumerError, MessageConsumer, MessageDisposition, MessagePublisher,
     PublisherError, ReceivedBatch, SentBatch,
@@ -102,6 +103,31 @@ fn validate_object_settings(_config: &ObjectStoreConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Rebuilds the covered source ranges from the object names already present under `base`.
+///
+/// Unlike the file sink this never deletes anything: a single PUT under the final name *is*
+/// the commit here (object stores have no atomic rename), so this path never creates staging
+/// objects and has no leftovers of its own to reap. Anything that is not a parseable part
+/// name — including a `.stage-` object — belongs to someone else and is left untouched.
+async fn recover_idempotent_object_ranges(
+    store: &dyn ObjectStore,
+    base: &ObjPath,
+    extension: &str,
+) -> anyhow::Result<CoveredRanges> {
+    let mut names = Vec::new();
+    let mut stream = store.list(Some(base));
+    while let Some(meta) = stream.next().await {
+        let key = meta?.location.to_string();
+        if let Some(name) = key.rsplit('/').next() {
+            names.push(name.to_string());
+        }
+    }
+    Ok(CoveredRanges::from_finalized_names(
+        names.iter().map(String::as_str),
+        extension,
+    ))
+}
+
 /// Splits a fetched object into record slices on `delimiter`, dropping a trailing empty
 /// remainder and a stray `\r` before a `\n` delimiter (mirrors the file reader).
 fn split_records<'a>(data: &'a [u8], delimiter: &[u8]) -> Vec<&'a [u8]> {
@@ -167,6 +193,8 @@ pub struct ObjectStorePublisher {
     crypto: Option<Arc<Crypto>>,
     date_partition: bool,
     extension: String,
+    idempotency: bool,
+    covered_ranges: Arc<Mutex<CoveredRanges>>,
 }
 
 impl ObjectStorePublisher {
@@ -180,6 +208,7 @@ impl ObjectStorePublisher {
         }
         validate_object_settings(config)?;
         let (store, base) = build_store(&config.url)?;
+        let store: Arc<dyn ObjectStore> = Arc::from(store);
         let delimiter = parse_delimiter(config.delimiter.as_deref())?;
         let extension = config.extension.clone().unwrap_or_else(|| {
             extension_for(
@@ -188,9 +217,17 @@ impl ObjectStorePublisher {
                 config.encryption.is_some(),
             )
         });
-        info!(url = %config.url, format = ?config.format, "Object-store sink opened");
+        let covered_ranges = if config.idempotency {
+            if config.date_partition {
+                warn!("object_store 'idempotency' ignores 'date_partition'; part names carry the source range and are written flat under the prefix");
+            }
+            recover_idempotent_object_ranges(store.as_ref(), &base, &extension).await?
+        } else {
+            CoveredRanges::default()
+        };
+        info!(url = %config.url, format = ?config.format, idempotency = config.idempotency, "Object-store sink opened");
         Ok(Self {
-            store: Arc::from(store),
+            store,
             base,
             delimiter,
             format: config.format.clone(),
@@ -203,8 +240,12 @@ impl ObjectStorePublisher {
                 .map(Crypto::new)
                 .transpose()?
                 .map(Arc::new),
-            date_partition: config.date_partition,
+            // The idempotent path names objects by source range and writes them flat under the
+            // base prefix; a date layout would just be ignored, so make the override visible.
+            date_partition: config.date_partition && !config.idempotency,
             extension,
+            idempotency: config.idempotency,
+            covered_ranges: Arc::new(Mutex::new(covered_ranges)),
         })
     }
 
@@ -228,6 +269,64 @@ impl ObjectStorePublisher {
         } else {
             self.base.clone().join(name.as_str())
         }
+    }
+
+    /// Compress-then-encrypt a fully built object body. The whole object is one member, so a
+    /// compressed object stays a standard `.gz`/`.lz4` file and a sealed one is a single
+    /// envelope — no framing, because objects are written and read whole. Both write paths go
+    /// through here, so an idempotent part object is shaped exactly like an ordinary one and
+    /// [`ObjectStoreConsumer::decode_object`] reads either without knowing which wrote it.
+    #[allow(unused_mut)]
+    fn encode_object_body(&self, mut body: Vec<u8>) -> Result<Vec<u8>, PublisherError> {
+        #[cfg(feature = "compression")]
+        if self.compression != Compression::None {
+            body = crate::support::compression::compress_member(self.compression, &body)
+                .map_err(|error| PublisherError::NonRetryable(anyhow!(error)))?;
+        }
+        #[cfg(feature = "encryption")]
+        if let Some(crypto) = &self.crypto {
+            body = crypto
+                .seal(&body, b"")
+                .map_err(PublisherError::NonRetryable)?;
+        }
+        Ok(body)
+    }
+
+    async fn send_batch_idempotent(
+        &self,
+        messages: Vec<CanonicalMessage>,
+    ) -> Result<SentBatch, PublisherError> {
+        let mut covered = self.covered_ranges.lock().await;
+        let runs = covered
+            .uncovered_runs(messages)
+            .map_err(PublisherError::NonRetryable)?;
+
+        for run in runs {
+            let name = finalized_name(&run.source, run.start, run.end, &self.extension)
+                .map_err(PublisherError::NonRetryable)?;
+            let mut body = Vec::new();
+            for mut message in run.messages {
+                message.strip_source_metadata();
+                let bytes = encode_record(&message, &self.format)
+                    .map_err(|error| PublisherError::NonRetryable(anyhow!(error)))?;
+                body.extend_from_slice(&bytes);
+                body.extend_from_slice(&self.delimiter);
+            }
+            let body = self.encode_object_body(body)?;
+            let key = self.base.clone().join(name.as_str());
+            self.store
+                .put(&key, PutPayload::from(body))
+                .await
+                .map_err(|error| {
+                    PublisherError::Retryable(
+                        anyhow!(error).context(format!("object-store put idempotent '{key}'")),
+                    )
+                })?;
+            covered
+                .insert(run.source, run.start, run.end)
+                .map_err(PublisherError::NonRetryable)?;
+        }
+        Ok(SentBatch::Ack)
     }
 }
 
@@ -256,6 +355,9 @@ impl MessagePublisher for ObjectStorePublisher {
         if messages.is_empty() {
             return Ok(SentBatch::Ack);
         }
+        if self.idempotency {
+            return self.send_batch_idempotent(messages).await;
+        }
         let mut body = Vec::new();
         let mut failed = Vec::new();
         for mut msg in messages {
@@ -277,24 +379,7 @@ impl MessagePublisher for ObjectStorePublisher {
                 failed,
             });
         }
-        // Compress-then-encrypt: the whole object is one member, so a compressed
-        // object stays a standard `.gz`/`.lz4` file; a sealed one is a single
-        // envelope (no framing needed — objects are written and read whole).
-        #[cfg(feature = "compression")]
-        let body = if self.compression != Compression::None {
-            crate::support::compression::compress_member(self.compression, &body)
-                .map_err(|e| PublisherError::NonRetryable(anyhow!(e)))?
-        } else {
-            body
-        };
-        #[allow(unused_mut)]
-        let mut body = body;
-        #[cfg(feature = "encryption")]
-        if let Some(crypto) = &self.crypto {
-            body = crypto
-                .seal(&body, b"")
-                .map_err(PublisherError::NonRetryable)?;
-        }
+        let body = self.encode_object_body(body)?;
         let key = self.next_key();
         self.store
             .put(&key, PutPayload::from(body))
@@ -754,7 +839,7 @@ impl MessageConsumer for ObjectStoreConsumer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::traits::MessageConsumer;
+    use crate::traits::{MessageConsumer, MessagePublisher};
     use object_store::memory::InMemory;
 
     #[test]
@@ -835,7 +920,130 @@ mod tests {
             crypto: None,
             date_partition: false,
             extension: "jsonl".to_string(),
+            idempotency: false,
+            covered_ranges: Arc::new(Mutex::new(CoveredRanges::default())),
         }
+    }
+
+    fn kafka_message(offset: i64) -> CanonicalMessage {
+        let mut message = json_msg(serde_json::json!({ "offset": offset }));
+        message
+            .metadata
+            .insert("mqb.src.kafka_topic".into(), "orders".into());
+        message
+            .metadata
+            .insert("mqb.src.kafka_partition".into(), "0".into());
+        message
+            .metadata
+            .insert("mqb.src.kafka_offset".into(), offset.to_string());
+        message
+    }
+
+    #[tokio::test]
+    async fn idempotent_sink_recovers_finalized_objects_and_leaves_foreign_keys_alone() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let mut publisher = test_publisher(store.clone());
+        publisher.idempotency = true;
+        publisher
+            .send_batch(vec![kafka_message(0), kafka_message(1)])
+            .await
+            .unwrap();
+        publisher
+            .send_batch(vec![kafka_message(0), kafka_message(1)])
+            .await
+            .unwrap();
+
+        store
+            .put(
+                &ObjPath::from("data/.stage-crash"),
+                PutPayload::from(Vec::new()),
+            )
+            .await
+            .unwrap();
+        let mut restarted = test_publisher(store.clone());
+        restarted.idempotency = true;
+        restarted.covered_ranges = Arc::new(Mutex::new(
+            recover_idempotent_object_ranges(store.as_ref(), &restarted.base, "jsonl")
+                .await
+                .unwrap(),
+        ));
+        restarted
+            .send_batch(vec![kafka_message(0), kafka_message(1), kafka_message(2)])
+            .await
+            .unwrap();
+
+        let mut stream = store.list(Some(&ObjPath::from("data")));
+        let mut names = Vec::new();
+        while let Some(item) = stream.next().await {
+            names.push(item.unwrap().location.to_string());
+        }
+        names.sort();
+        assert_eq!(
+            names,
+            vec![
+                // Not a parseable part name, and not ours to delete.
+                "data/.stage-crash".to_string(),
+                "data/part-orders-0-0-1.jsonl".to_string(),
+                "data/part-orders-0-2-2.jsonl".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn idempotency_overrides_date_partition_rather_than_rejecting_it() {
+        // `date_partition` defaults to true, so erroring would reject every default config.
+        let publisher = ObjectStorePublisher::new(&ObjectStoreConfig {
+            url: "memory:///data".to_string(),
+            idempotency: true,
+            date_partition: true,
+            ..Default::default()
+        })
+        .await
+        .expect("date_partition is overridden, not rejected");
+        assert!(!publisher.date_partition);
+    }
+
+    #[cfg(feature = "compression")]
+    #[tokio::test]
+    async fn idempotent_parts_are_compressed_and_named_for_it() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let mut publisher = test_publisher(store.clone());
+        publisher.idempotency = true;
+        publisher.compression = Compression::Gzip;
+        publisher.extension = extension_for(&FileFormat::Json, Compression::Gzip, false);
+        publisher
+            .send_batch(vec![kafka_message(0), kafka_message(1)])
+            .await
+            .unwrap();
+
+        // The part name advertises the codec, and the bytes really are gzip.
+        let key = ObjPath::from("data/part-orders-0-0-1.jsonl.gz");
+        let stored = store.get(&key).await.unwrap().bytes().await.unwrap();
+        let plain =
+            crate::support::compression::decompress_all(Compression::Gzip, &stored, None).unwrap();
+        assert_eq!(split_records(&plain, b"\n").len(), 2);
+
+        // A restart parses the longer extension back out, so covered offsets are not rewritten.
+        let recovered =
+            recover_idempotent_object_ranges(store.as_ref(), &publisher.base, "jsonl.gz")
+                .await
+                .unwrap();
+        let mut restarted = test_publisher(store.clone());
+        restarted.idempotency = true;
+        restarted.compression = Compression::Gzip;
+        restarted.extension = publisher.extension.clone();
+        restarted.covered_ranges = Arc::new(Mutex::new(recovered));
+        restarted
+            .send_batch(vec![kafka_message(0), kafka_message(1)])
+            .await
+            .unwrap();
+
+        let mut stream = store.list(Some(&ObjPath::from("data")));
+        let mut names = Vec::new();
+        while let Some(item) = stream.next().await {
+            names.push(item.unwrap().location.to_string());
+        }
+        assert_eq!(names, vec!["data/part-orders-0-0-1.jsonl.gz".to_string()]);
     }
 
     #[cfg(feature = "compression")]

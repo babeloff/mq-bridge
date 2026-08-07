@@ -7,6 +7,48 @@ use super::*;
 use crate::CanonicalMessage;
 
 #[test]
+fn change_event_source_metadata_is_opt_in_and_orders_by_cluster_time() {
+    use mongodb::bson::{doc, Timestamp};
+    use mongodb::change_stream::event::ChangeStreamEvent;
+
+    let event: ChangeStreamEvent<mongodb::bson::Document> = mongodb::bson::from_document(doc! {
+        "_id": { "_data": "826553F1A0000000012B02" },
+        "operationType": "insert",
+        "ns": { "db": "shop", "coll": "orders" },
+        "documentKey": { "_id": 7 },
+        "fullDocument": { "_id": 7, "total": 42 },
+        "clusterTime": Timestamp { time: 1_700_000_000, increment: 3 },
+    })
+    .expect("change event deserializes");
+
+    let off =
+        super::readers::MongoDbChangeStreamReader::event_to_message(&event, false, "shop.orders")
+            .expect("event carries a payload");
+    assert!(!off
+        .metadata
+        .keys()
+        .any(|key| crate::canonical_message::is_source_metadata_key(key)));
+
+    let on =
+        super::readers::MongoDbChangeStreamReader::event_to_message(&event, true, "shop.orders")
+            .expect("event carries a payload");
+    assert_eq!(
+        on.metadata
+            .get("mqb.src.mongodb_namespace")
+            .map(String::as_str),
+        Some("shop.orders")
+    );
+    // (seconds << 32) | increment — the server's own oplog ordering.
+    assert_eq!(
+        on.metadata
+            .get("mqb.src.mongodb_cluster_time")
+            .map(String::as_str),
+        Some(((1_700_000_000u64 << 32) | 3).to_string()).as_deref()
+    );
+    assert!(on.metadata.contains_key("mqb.src.mongodb_resume_token"));
+}
+
+#[test]
 fn parse_document_takes_wrapped_fields_and_falls_back_otherwise() {
     let id = mongodb::bson::Uuid::new();
     // Wrapped: payload is unwrapped and metadata decoded.

@@ -1,7 +1,6 @@
 use crate::endpoints::file::{FileConsumer, FilePublisher};
-#[cfg(any(feature = "compression", feature = "encryption"))]
-use crate::models::Compression;
-use crate::models::{FileConfig, FileConsumerMode, FileFormat};
+#[allow(unused_imports)]
+use crate::models::{Compression, FileConfig, FileConsumerMode, FileFormat};
 use crate::msg;
 use crate::traits::MessageConsumer;
 use crate::traits::MessagePublisher;
@@ -386,6 +385,216 @@ async fn test_file_sink_creates_directory() {
     assert!(sink_result.is_ok());
     assert!(nested_dir_path.exists());
     assert!(file_path.exists());
+}
+
+#[tokio::test]
+async fn idempotent_file_sink_replays_only_uncovered_kafka_offsets_after_restart() {
+    fn kafka_message(offset: i64) -> crate::CanonicalMessage {
+        let mut message = msg!(json!({ "offset": offset }));
+        message
+            .metadata
+            .insert("mqb.src.kafka_topic".into(), "orders".into());
+        message
+            .metadata
+            .insert("mqb.src.kafka_partition".into(), "0".into());
+        message
+            .metadata
+            .insert("mqb.src.kafka_offset".into(), offset.to_string());
+        message
+    }
+
+    let dir = tempdir().unwrap();
+    let output = dir.path().join("parts");
+    let config = FileConfig {
+        path: output.to_string_lossy().into_owned(),
+        idempotency: true,
+        ..Default::default()
+    };
+    let publisher = FilePublisher::new(&config).await.unwrap();
+    publisher
+        .send_batch(vec![kafka_message(0), kafka_message(1)])
+        .await
+        .unwrap();
+    publisher
+        .send_batch(vec![kafka_message(0), kafka_message(1)])
+        .await
+        .unwrap();
+    drop(publisher);
+
+    // Debris from the crashed run is reaped; a staging file young enough to belong to a
+    // concurrent writer is left alone.
+    let stale = output.join(".stage-crash");
+    tokio::fs::write(&stale, b"incomplete").await.unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&stale)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(3600))
+        .unwrap();
+    tokio::fs::write(output.join(".stage-inflight"), b"other worker")
+        .await
+        .unwrap();
+
+    let restarted = FilePublisher::new(&config).await.unwrap();
+    restarted
+        .send_batch(vec![kafka_message(0), kafka_message(1), kafka_message(2)])
+        .await
+        .unwrap();
+
+    let mut names = std::fs::read_dir(&output)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect::<Vec<_>>();
+    names.sort();
+    assert_eq!(
+        names,
+        vec![
+            ".stage-inflight".to_string(),
+            "part-orders-0-0-1.jsonl".to_string(),
+            "part-orders-0-2-2.jsonl".to_string(),
+        ]
+    );
+}
+
+#[cfg(feature = "compression")]
+#[tokio::test]
+async fn idempotent_file_parts_are_compressed_and_named_for_it() {
+    fn kafka_message(offset: i64) -> crate::CanonicalMessage {
+        let mut message = msg!(json!({ "offset": offset }));
+        message
+            .metadata
+            .insert("mqb.src.kafka_topic".into(), "orders".into());
+        message
+            .metadata
+            .insert("mqb.src.kafka_partition".into(), "0".into());
+        message
+            .metadata
+            .insert("mqb.src.kafka_offset".into(), offset.to_string());
+        message
+    }
+
+    let dir = tempdir().unwrap();
+    let output = dir.path().join("parts");
+    let config = FileConfig {
+        path: output.to_string_lossy().into_owned(),
+        idempotency: true,
+        compression: crate::models::Compression::Gzip,
+        ..Default::default()
+    };
+    let publisher = FilePublisher::new(&config).await.unwrap();
+    publisher
+        .send_batch(vec![kafka_message(0), kafka_message(1)])
+        .await
+        .unwrap();
+    drop(publisher);
+
+    // One part file, named for the codec, holding one gzip member with both records.
+    let part = output.join("part-orders-0-0-1.jsonl.gz");
+    let raw = std::fs::read(&part).unwrap();
+    let plain =
+        crate::support::compression::decompress_all(crate::models::Compression::Gzip, &raw, None)
+            .unwrap();
+    assert_eq!(
+        plain
+            .split(|b| *b == b'\n')
+            .filter(|l| !l.is_empty())
+            .count(),
+        2
+    );
+
+    // The restart parses the longer extension, so the covered offsets are not rewritten.
+    let restarted = FilePublisher::new(&config).await.unwrap();
+    restarted
+        .send_batch(vec![kafka_message(0), kafka_message(1)])
+        .await
+        .unwrap();
+    let names = std::fs::read_dir(&output)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(names, vec!["part-orders-0-0-1.jsonl.gz".to_string()]);
+}
+
+#[tokio::test]
+async fn idempotent_file_sink_rejects_records_without_source_metadata() {
+    let dir = tempdir().unwrap();
+    let output = dir.path().join("parts");
+    let config = FileConfig {
+        path: output.to_string_lossy().into_owned(),
+        idempotency: true,
+        ..Default::default()
+    };
+    let publisher = FilePublisher::new(&config).await.unwrap();
+
+    assert!(publisher
+        .send_batch(vec![msg!(json!({ "id": 1 }))])
+        .await
+        .is_err());
+    assert!(std::fs::read_dir(output).unwrap().next().is_none());
+}
+
+#[tokio::test]
+async fn idempotent_file_sink_replays_postgres_cdc_changes_in_one_commit() {
+    fn postgres_message(ordinal: u64) -> crate::CanonicalMessage {
+        let mut message = msg!(json!({ "ordinal": ordinal }));
+        message
+            .metadata
+            .insert("mqb.src.postgres_slot".into(), "bridge_slot".into());
+        message
+            .metadata
+            .insert("mqb.src.postgres_lsn".into(), "9876543210".into());
+        message
+            .metadata
+            .insert("mqb.src.postgres_ordinal".into(), ordinal.to_string());
+        message
+    }
+
+    let dir = tempdir().unwrap();
+    let output = dir.path().join("parts");
+    let config = FileConfig {
+        path: output.to_string_lossy().into_owned(),
+        idempotency: true,
+        ..Default::default()
+    };
+    let publisher = FilePublisher::new(&config).await.unwrap();
+    publisher
+        .send_batch(vec![postgres_message(0), postgres_message(1)])
+        .await
+        .unwrap();
+    publisher
+        .send_batch(vec![
+            postgres_message(0),
+            postgres_message(1),
+            postgres_message(2),
+        ])
+        .await
+        .unwrap();
+
+    let mut names = std::fs::read_dir(&output)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect::<Vec<_>>();
+    names.sort();
+    assert_eq!(
+        names,
+        vec![
+            "part-postgres_cdc-bridge_slot-9876543210-0-0-1.jsonl".to_string(),
+            "part-postgres_cdc-bridge_slot-9876543210-0-2-2.jsonl".to_string(),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn idempotent_file_sink_rejects_unsupported_output_formats() {
+    // CSV still needs a header row per part file, which is unimplemented.
+    let dir = tempdir().unwrap();
+    let csv = FileConfig {
+        path: dir.path().join("csv").to_string_lossy().into_owned(),
+        idempotency: true,
+        format: FileFormat::Csv,
+        ..Default::default()
+    };
+    assert!(FilePublisher::new(&csv).await.is_err());
 }
 
 #[tokio::test]

@@ -260,14 +260,15 @@ pub fn is_source_metadata_key(key: &str) -> bool {
     key.starts_with(SOURCE_METADATA_PREFIX)
 }
 
-/// Whether consumers should inject source/provenance metadata (`mqb.src.*`).
+/// Whether the deprecated `MQB_SOURCE_METADATA` compatibility fallback is enabled.
 ///
 /// Off by default — the per-message origin (topic/subject/queue, offset, …) is only
 /// needed when consuming a wildcard/pattern subscription and you must recover where
-/// each message actually came from (e.g. dead-letter routing). Opt in by setting the
-/// `MQB_SOURCE_METADATA` env var to a truthy value (`1`, `true`, `yes`, `on`). The
-/// value is read once and cached. Stripping/anti-spoofing of `mqb.src.*` stays active
-/// regardless, so these keys never propagate downstream. See [`SOURCE_METADATA_PREFIX`].
+/// each message actually came from (e.g. dead-letter routing). New configurations should use
+/// `source_metadata: true` on the relevant source configuration. The environment variable remains
+/// for one compatibility release; its value is read once and cached. Stripping/anti-spoofing of
+/// `mqb.src.*` stays active regardless, so these keys never propagate downstream.
+/// See [`SOURCE_METADATA_PREFIX`].
 pub fn source_metadata_enabled() -> bool {
     #[cfg(test)]
     {
@@ -287,6 +288,13 @@ pub fn source_metadata_enabled() -> bool {
             })
             .unwrap_or(false)
     })
+}
+
+/// Resolve endpoint-local provenance with the legacy environment fallback once at consumer
+/// construction time, never in a message-processing loop.
+#[inline]
+pub fn source_metadata_enabled_for_endpoint(explicit: bool) -> bool {
+    explicit || source_metadata_enabled()
 }
 
 #[cfg(test)]
@@ -770,6 +778,13 @@ mod tests {
         assert!(!is_source_metadata_key("correlation_id"));
         // The reserved prefix itself is the boundary.
         assert_eq!(SOURCE_METADATA_PREFIX, "mqb.src.");
+    }
+
+    #[test]
+    fn explicit_source_metadata_does_not_depend_on_the_legacy_environment() {
+        let _legacy_disabled = force_source_metadata_for_test(Some(false));
+        assert!(source_metadata_enabled_for_endpoint(true));
+        assert!(!source_metadata_enabled_for_endpoint(false));
     }
 
     #[test]

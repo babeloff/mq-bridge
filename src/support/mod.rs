@@ -15,3 +15,4 @@ pub mod connection_registry;
 pub mod crypto;
 pub(crate) mod crypto_envelope;
 pub mod interpolation;
+pub mod source_ranges;

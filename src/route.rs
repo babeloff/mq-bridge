@@ -3,7 +3,10 @@
 //  Licensed under MIT License, see License file for more details
 //  git clone https://github.com/marcomq/mq-bridge
 
-use crate::endpoints::{create_consumer_from_route, create_publisher_from_route};
+use crate::endpoints::{
+    create_consumer_from_route, create_consumer_from_route_with_source_metadata,
+    create_publisher_from_route, output_requires_source_metadata,
+};
 use crate::errors::ProcessingError;
 pub use crate::models::Route;
 use crate::models::{Endpoint, EndpointType, Middleware, RouteOptions};
@@ -964,8 +967,14 @@ impl Route {
         shutdown_rx: async_channel::Receiver<()>,
         ready_tx: Option<Sender<()>>,
     ) -> anyhow::Result<bool> {
+        let source_metadata_required = output_requires_source_metadata(name, &self.output)?;
         let publisher = create_publisher_from_route(name, &self.output).await?;
-        let mut consumer = create_consumer_from_route(name, &self.input).await?;
+        let mut consumer = create_consumer_from_route_with_source_metadata(
+            name,
+            &self.input,
+            source_metadata_required,
+        )
+        .await?;
         consumer.set_exit_on_empty(self.options.exit_on_empty);
         if let Err(err) = run_publisher_connect_hook(name, &publisher).await {
             run_publisher_disconnect_hook(name, &publisher).await;
@@ -1097,8 +1106,14 @@ impl Route {
         shutdown_rx: async_channel::Receiver<()>,
         ready_tx: Option<Sender<()>>,
     ) -> anyhow::Result<bool> {
+        let source_metadata_required = output_requires_source_metadata(name, &self.output)?;
         let publisher = create_publisher_from_route(name, &self.output).await?;
-        let mut consumer = create_consumer_from_route(name, &self.input).await?;
+        let mut consumer = create_consumer_from_route_with_source_metadata(
+            name,
+            &self.input,
+            source_metadata_required,
+        )
+        .await?;
         consumer.set_exit_on_empty(self.options.exit_on_empty);
         if let Err(err) = run_publisher_connect_hook(name, &publisher).await {
             run_publisher_disconnect_hook(name, &publisher).await;

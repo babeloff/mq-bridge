@@ -22,10 +22,6 @@ Requires `dlt` (an example-only dependency, not needed to use mq-bridge):
 
 from __future__ import annotations
 
-import os
-
-os.environ.setdefault("MQB_SOURCE_METADATA", "1")
-
 import dlt
 
 from mq_bridge import Consumer, Publisher
@@ -43,10 +39,10 @@ def record_from_message(message) -> dict:
     `message.id` is globally unique per source position (Kafka partition/offset,
     NATS stream sequence, AMQP delivery tag), which makes it a natural merge key
     for at-least-once + idempotent-merge. Source cursor fields are also exposed in
-    `metadata` (e.g. mqb.src.kafka_topic/mqb.src.kafka_offset, mqb.src.nats_subject/mqb.src.nats_stream_sequence)
-    in this example because it opts in by setting the `MQB_SOURCE_METADATA=1`
-    environment variable before importing the binding. The flag is off by default
-    unless you enable it.
+    `metadata` (e.g. mqb.src.kafka_topic/mqb.src.kafka_offset,
+    mqb.src.nats_subject/mqb.src.nats_stream_sequence) when a broker source config
+    sets `source_metadata: true` (for example,
+    `{"kafka": {"url": "localhost:9092", "source_metadata": True}}`).
     """
     record = dict(message.json())
     record["_mqb_id"] = message.id

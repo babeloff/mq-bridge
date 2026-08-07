@@ -328,12 +328,27 @@ pub struct MongoDbChangeStreamReader {
     inflight: Arc<AtomicUsize>,
     refresh_clean: Arc<AtomicBool>,
     last_saved_token: Arc<Mutex<Option<String>>>,
+    /// Resolved once at construction from endpoint config and the legacy fallback.
+    source_metadata: bool,
+    /// `<database>.<collection>`, precomputed for the `mqb.src.mongodb_namespace` key.
+    namespace: String,
 }
 
 impl MongoDbChangeStreamReader {
     /// `snapshot` = read the existing documents before streaming changes (`capture_all`); when false
     /// only new changes are streamed (`capture_new`).
     pub async fn new(config: &MongoDbConfig, snapshot: bool) -> anyhow::Result<Self> {
+        Self::new_with_source_metadata(config, snapshot, false).await
+    }
+
+    pub async fn new_with_source_metadata(
+        config: &MongoDbConfig,
+        snapshot: bool,
+        source_metadata: bool,
+    ) -> anyhow::Result<Self> {
+        let source_metadata = crate::canonical_message::source_metadata_enabled_for_endpoint(
+            source_metadata || config.source_metadata,
+        );
         let collection_name = config
             .collection
             .as_deref()
@@ -444,6 +459,8 @@ impl MongoDbChangeStreamReader {
                     .as_ref()
                     .and_then(|t| encode_resume_token(t).ok()),
             )),
+            source_metadata,
+            namespace: format!("{}.{}", config.database, collection_name),
         })
     }
 
@@ -544,7 +561,11 @@ impl MongoDbChangeStreamReader {
     /// Maps a change event into a canonical message, tagging the operation and document `_id`.
     /// Returns `None` for events carrying no usable payload (e.g. an update whose post-image was
     /// already deleted by the time of the lookup).
-    fn event_to_message(event: &ChangeStreamEvent<Document>) -> Option<CanonicalMessage> {
+    pub(super) fn event_to_message(
+        event: &ChangeStreamEvent<Document>,
+        source_metadata: bool,
+        namespace: &str,
+    ) -> Option<CanonicalMessage> {
         let (op, payload) = match event.operation_type {
             OperationType::Insert | OperationType::Update | OperationType::Replace => {
                 let doc = event.full_document.as_ref()?;
@@ -569,6 +590,9 @@ impl MongoDbChangeStreamReader {
             if let Some(enc) = encode_id(id) {
                 msg.metadata.insert("mongodb.document_id".to_string(), enc);
             }
+        }
+        if source_metadata {
+            add_source_metadata(&mut msg, event, namespace);
         }
         Some(msg)
     }
@@ -643,6 +667,36 @@ fn rewrite_operator_value(value: &Bson) -> Bson {
     }
 }
 
+/// Tags a change event with its position in the oplog.
+///
+/// The resume token is the authoritative one — it is what the reader checkpoints and what a
+/// restart resumes after. `cluster_time` is packed into the same `(seconds << 32) | increment`
+/// u64 the server orders the oplog by, so it sorts correctly and is comparable across events;
+/// note that every change in one transaction shares a cluster time, so it identifies a group
+/// rather than a single change.
+fn add_source_metadata(
+    message: &mut CanonicalMessage,
+    event: &ChangeStreamEvent<Document>,
+    namespace: &str,
+) {
+    message.metadata.insert(
+        "mqb.src.mongodb_namespace".to_string(),
+        namespace.to_string(),
+    );
+    if let Ok(token) = encode_resume_token(&event.id) {
+        message
+            .metadata
+            .insert("mqb.src.mongodb_resume_token".to_string(), token);
+    }
+    if let Some(ts) = event.cluster_time {
+        let packed = (u64::from(ts.time) << 32) | u64::from(ts.increment);
+        message.metadata.insert(
+            "mqb.src.mongodb_cluster_time".to_string(),
+            packed.to_string(),
+        );
+    }
+}
+
 /// The change-event operation name stored in message metadata.
 fn op_str(op: &OperationType) -> &'static str {
     match op {
@@ -699,7 +753,9 @@ impl MessageConsumer for MongoDbChangeStreamReader {
             match tokio::time::timeout(IDLE_RESUME_REFRESH, stream.next_if_any()).await {
                 Ok(Ok(Some(event))) => {
                     let token = event.id.clone();
-                    if let Some(msg) = Self::event_to_message(&event) {
+                    if let Some(msg) =
+                        Self::event_to_message(&event, self.source_metadata, &self.namespace)
+                    {
                         messages.push(msg);
                         tokens.push(token);
                     }
@@ -728,7 +784,9 @@ impl MessageConsumer for MongoDbChangeStreamReader {
             match tokio::time::timeout(Duration::from_millis(10), stream.next_if_any()).await {
                 Ok(Ok(Some(event))) => {
                     let token = event.id.clone();
-                    if let Some(msg) = Self::event_to_message(&event) {
+                    if let Some(msg) =
+                        Self::event_to_message(&event, self.source_metadata, &self.namespace)
+                    {
                         messages.push(msg);
                         tokens.push(token);
                     }

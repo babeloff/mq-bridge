@@ -366,6 +366,47 @@ orders_upsert_branch:
 duplicate to detect. Left unwrapped by `request`, the tagged message is returned as the route's
 response as usual.
 
+**Files & object storage — `idempotency`.** A filesystem has no unique constraint, so the `file` and
+`object_store` sinks get replay safety a different way: **deterministic names plus covered-range
+recovery**. Set `idempotency: true` and the sink stops writing UUID-named objects. Instead it groups
+each batch into runs of consecutive source positions and writes one immutable part per run, named
+for the range it covers:
+
+```yaml
+kafka_to_s3:
+  input:
+    kafka: { topic: "orders", url: "localhost:9092", source_metadata: true }
+  output:
+    object_store:
+      url: "s3://my-bucket/orders"
+      idempotency: true          # → s3://my-bucket/orders/part-orders-0-0-1023.jsonl
+```
+
+On startup the sink lists what is already there, parses the ranges out of the part names, and drops
+any incoming record whose position falls inside one. Filtering is **per record, not per batch**, so
+batch boundaries are free to differ across restarts — that is what makes it work without a
+checkpoint protocol. Local files stage to a temp name, `fsync`, then `rename` (atomic within a
+filesystem); object stores have no atomic rename, so a single PUT under the final name *is* the
+commit.
+
+This needs a replayable source position, which today means **Kafka** (topic/partition/offset) or
+**`postgres_cdc`** (commit LSN plus in-transaction ordinal). A route with an idempotent output turns
+`source_metadata` on for its input automatically; set it explicitly only when you want the
+`mqb.src.*` keys for something else. Any other input is rejected when the route starts. NATS, AMQP
+and MongoDB CDC also accept `source_metadata` and emit provenance keys, but a subject or routing key
+is not a replayable offset, so they cannot drive an idempotent sink.
+
+`compression` and `encryption` work as usual.
+
+Current limits, all of which the sink rejects or logs rather than silently mishandling:
+
+*   No `csv` (each part would need its own header row).
+*   `date_partition` is ignored — parts are written flat under the prefix, since the name already
+    carries the range. Logged at startup.
+*   **One part file per contiguous run per batch.** There is no size-based rolling yet, so a large
+    backfill produces many small files (~1000 per 1M rows at `batch_size: 1024`). For `postgres_cdc`
+    this is per-transaction, so a high-commit-rate stream produces one small file per commit. Rolling
+    would require buffering across batches the route has already acked, which is not safe today.
 
 ### Cloud Object Storage (S3 / GCS / Azure)
 The `object_store` endpoint (alias `s3`) reads and writes cloud object stores — Amazon S3, Google Cloud Storage, Azure Blob, Cloudflare R2, and anything else the [`object_store`](https://crates.io/crates/object_store) crate speaks — behind the same `receive_batch` / `send_batch` API. Enable it with the `object-store` feature. Credentials and backend options are read from the process environment (`AWS_ACCESS_KEY_ID`, `AWS_ENDPOINT`, `AWS_REGION`, `GOOGLE_SERVICE_ACCOUNT`, `AZURE_STORAGE_ACCOUNT`, ...); the URL scheme picks the backend (`s3://`, `gs://`, `az://`).

@@ -7,6 +7,7 @@ use crate::event_store::{EventStore, EventStoreConsumer, RetentionPolicy};
 use crate::models::{Compression, FileConfig, FileConsumerMode, FileFormat};
 #[cfg(feature = "encryption")]
 use crate::support::crypto::Crypto;
+use crate::support::source_ranges::{finalized_name, CoveredRanges};
 use crate::traits::{
     ConsumerError, MessageConsumer, MessagePublisher, PublisherError, ReceivedBatch, SentBatch,
 };
@@ -20,6 +21,7 @@ use std::io::Seek;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, Weak};
+use std::time::{Duration, SystemTime};
 use tokio::fs::{self, File, OpenOptions};
 use tokio::io::{self, AsyncBufReadExt, AsyncSeekExt, BufReader};
 use tokio::io::{AsyncWriteExt, BufWriter};
@@ -385,6 +387,9 @@ pub struct FilePublisher {
     file_lock: Arc<Mutex<()>>,
     delimiter: Vec<u8>,
     format: FileFormat,
+    idempotency: bool,
+    idempotent_extension: String,
+    covered_ranges: Arc<Mutex<CoveredRanges>>,
     #[cfg(any(feature = "compression", feature = "encryption"))]
     compression: Compression,
     #[cfg(feature = "encryption")]
@@ -414,34 +419,135 @@ fn validate_member_settings(config: &FileConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Staging files younger than this may belong to a concurrent writer — another worker or an
+/// overlapping restart sharing the directory — so only older ones are treated as crash debris.
+const STAGING_REAP_AGE: Duration = Duration::from_secs(60);
+
+async fn recover_idempotent_file_ranges(
+    directory: &Path,
+    extension: &str,
+) -> anyhow::Result<CoveredRanges> {
+    let now = SystemTime::now();
+    let mut entries = fs::read_dir(directory).await?;
+    let mut names = Vec::new();
+    while let Some(entry) = entries.next_entry().await? {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with(".stage-") {
+            let age = entry
+                .metadata()
+                .await
+                .and_then(|meta| meta.modified())
+                .map(|modified| now.duration_since(modified).unwrap_or_default())
+                .unwrap_or(STAGING_REAP_AGE);
+            if age >= STAGING_REAP_AGE {
+                fs::remove_file(entry.path()).await?;
+            }
+        } else {
+            names.push(name);
+        }
+    }
+    Ok(CoveredRanges::from_finalized_names(
+        names.iter().map(String::as_str),
+        extension,
+    ))
+}
+
+async fn write_finalized_file(path: &Path, body: &[u8]) -> Result<(), PublisherError> {
+    let directory = path
+        .parent()
+        .ok_or_else(|| PublisherError::NonRetryable(anyhow::anyhow!("missing output directory")))?;
+    let staging = directory.join(format!(".stage-{}", fast_uuid_v7::gen_id_str()));
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&staging)
+        .await
+        .context("Failed to create idempotent file staging output")?;
+    file.write_all(body)
+        .await
+        .context("Failed to write idempotent file staging output")?;
+    file.sync_all()
+        .await
+        .context("Failed to sync idempotent file staging output")?;
+    drop(file);
+    fs::rename(&staging, path)
+        .await
+        .context("Failed to finalize idempotent file output")?;
+    File::open(directory)
+        .await
+        .context("Failed to open idempotent file output directory")?
+        .sync_all()
+        .await
+        .context("Failed to sync idempotent file output directory")?;
+    Ok(())
+}
+
 impl FilePublisher {
     pub async fn new(config: &FileConfig) -> anyhow::Result<Self> {
         validate_member_settings(config)?;
         let path_str = &config.path;
         let path = Path::new(path_str);
+        if config.idempotency {
+            if matches!(config.format, FileFormat::Csv) {
+                return Err(anyhow::anyhow!(
+                    "file idempotency does not support CSV (per-part headers are unimplemented)"
+                ));
+            }
+            tokio::fs::create_dir_all(path).await.with_context(|| {
+                format!("Failed to create idempotent file sink directory: {path_str}")
+            })?;
+        }
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent).await.with_context(|| {
                 format!("Failed to create parent directory for file: {:?}", parent)
             })?;
         }
 
-        let _ = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .await
-            .with_context(|| format!("Failed to open or create file for writing: {}", path_str))?;
+        if !config.idempotency {
+            let _ = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .await
+                .with_context(|| {
+                    format!("Failed to open or create file for writing: {}", path_str)
+                })?;
+        }
 
         let file_lock = get_file_lock(path_str);
         let delimiter = parse_delimiter(config.delimiter.as_deref())?;
         let format = config.format.clone();
-
+        // Part names must advertise what the bytes actually are: a compressed or sealed part
+        // holds one member, so it earns the same suffixes the appending sink's file would.
+        let mut idempotent_extension = match format {
+            FileFormat::Csv => "csv",
+            FileFormat::Raw => "bin",
+            FileFormat::Normal | FileFormat::Json | FileFormat::Text => "jsonl",
+        }
+        .to_string();
+        match config.compression {
+            Compression::None => {}
+            Compression::Gzip => idempotent_extension.push_str(".gz"),
+            Compression::Lz4 => idempotent_extension.push_str(".lz4"),
+            Compression::Zstd => idempotent_extension.push_str(".zst"),
+        }
+        if config.encryption.is_some() {
+            idempotent_extension.push_str(".enc");
+        }
+        let covered_ranges = if config.idempotency {
+            recover_idempotent_file_ranges(path, &idempotent_extension).await?
+        } else {
+            CoveredRanges::default()
+        };
         info!(path = %path_str, format = ?format, "File sink opened for appending");
         Ok(Self {
             path: path_str.to_string(),
             file_lock,
             delimiter,
             format,
+            idempotency: config.idempotency,
+            idempotent_extension,
+            covered_ranges: Arc::new(Mutex::new(covered_ranges)),
             #[cfg(any(feature = "compression", feature = "encryption"))]
             compression: config.compression,
             #[cfg(feature = "encryption")]
@@ -453,6 +559,79 @@ impl FilePublisher {
                 .map(Arc::new),
             csv_header: Arc::new(Mutex::new(None)),
         })
+    }
+
+    async fn send_batch_idempotent(
+        &self,
+        messages: Vec<CanonicalMessage>,
+    ) -> Result<SentBatch, PublisherError> {
+        let _file_guard = self.file_lock.lock().await;
+        let mut covered = self.covered_ranges.lock().await;
+        let runs = covered
+            .uncovered_runs(messages)
+            .map_err(PublisherError::NonRetryable)?;
+
+        for run in runs {
+            let name = finalized_name(&run.source, run.start, run.end, &self.idempotent_extension)
+                .map_err(PublisherError::NonRetryable)?;
+            let final_path = Path::new(&self.path).join(&name);
+            if !fs::try_exists(&final_path)
+                .await
+                .context("Failed to check idempotent file sink output")?
+            {
+                let mut body = Vec::new();
+                for mut message in run.messages {
+                    message.strip_source_metadata();
+                    let bytes = encode_record(&message, &self.format)
+                        .map_err(|error| PublisherError::NonRetryable(anyhow::anyhow!(error)))?;
+                    body.extend_from_slice(&bytes);
+                    body.extend_from_slice(&self.delimiter);
+                }
+                let body = self.encode_member(body)?;
+                write_finalized_file(&final_path, &body).await?;
+            }
+            covered
+                .insert(run.source, run.start, run.end)
+                .map_err(PublisherError::NonRetryable)?;
+        }
+        Ok(SentBatch::Ack)
+    }
+
+    /// Turns a fully built batch body into one self-contained member: compress, then seal into
+    /// a `[u64 be length][sealed bytes]` frame. Compressed members self-delimit; a sealed one
+    /// does not, hence the frame. Returns the body untouched when neither is configured.
+    ///
+    /// The appending path concatenates these into one file and the idempotent path writes each
+    /// as its own part file, but the encoding is identical either way, so the same reader
+    /// handles both and neither adds a format of its own.
+    #[allow(unused_mut)]
+    fn encode_member(&self, mut body: Vec<u8>) -> Result<Vec<u8>, PublisherError> {
+        #[cfg(feature = "compression")]
+        if self.compression != Compression::None {
+            body = crate::support::compression::compress_member(self.compression, &body)
+                .map_err(|e| PublisherError::NonRetryable(anyhow::anyhow!(e)))?;
+        }
+        #[cfg(feature = "encryption")]
+        if let Some(crypto) = &self.crypto {
+            let sealed = crypto
+                .seal(&body, b"")
+                .map_err(PublisherError::NonRetryable)?;
+            // The consumer rejects any frame whose length prefix exceeds this cap, so a batch
+            // sealing larger than it would be written but never read back. Fail fast and tell
+            // the operator to shrink batch_size rather than emit a member that corrupts the
+            // stream on read.
+            if sealed.len() as u64 > MAX_ENCRYPTED_FRAME_BYTES {
+                return Err(PublisherError::NonRetryable(anyhow::anyhow!(
+                    "encrypted batch frame is {} bytes, exceeding the {} byte cap the consumer can read; reduce batch_size",
+                    sealed.len(),
+                    MAX_ENCRYPTED_FRAME_BYTES
+                )));
+            }
+            body = Vec::with_capacity(8 + sealed.len());
+            body.extend_from_slice(&(sealed.len() as u64).to_be_bytes());
+            body.extend_from_slice(&sealed);
+        }
+        Ok(body)
     }
 
     /// True when batches are written as self-contained members (compressed
@@ -562,89 +741,60 @@ impl FilePublisher {
             // CSV header established for this batch is cleared afterwards — otherwise the
             // retry would think the header was already written and emit a headerless file.
             let outcome: Result<(), PublisherError> = async {
-            #[cfg(feature = "compression")]
-            let raw = if self.compression != Compression::None {
-                crate::support::compression::compress_member(self.compression, &raw)
-                    .map_err(|e| PublisherError::NonRetryable(anyhow::anyhow!(e)))?
-            } else {
-                raw
-            };
-            #[allow(unused_mut)]
-            let mut member = raw;
-            #[cfg(feature = "encryption")]
-            if let Some(crypto) = &self.crypto {
-                let sealed = crypto
-                    .seal(&member, b"")
-                    .map_err(PublisherError::NonRetryable)?;
-                // The consumer rejects any frame whose length prefix exceeds this cap, so a
-                // batch sealing larger than it would be written but never read back. Fail
-                // fast and tell the operator to shrink batch_size rather than emit a member
-                // that corrupts the stream on read.
-                if sealed.len() as u64 > MAX_ENCRYPTED_FRAME_BYTES {
-                    return Err(PublisherError::NonRetryable(anyhow::anyhow!(
-                        "encrypted batch frame is {} bytes, exceeding the {} byte cap the consumer can read; reduce batch_size",
-                        sealed.len(),
-                        MAX_ENCRYPTED_FRAME_BYTES
-                    )));
-                }
-                let mut framed = Vec::with_capacity(8 + sealed.len());
-                framed.extend_from_slice(&(sealed.len() as u64).to_be_bytes());
-                framed.extend_from_slice(&sealed);
-                member = framed;
-            }
+                let member = self.encode_member(raw)?;
 
-            // The member is fully built by now, so unless the batch already holds the
-            // lock (CSV), it is taken here and covers only the append.
-            if file_guard.is_none() {
-                file_guard = Some(self.file_lock.lock().await);
-            }
-            // Length before the append: a failed write_all can leave a partial
-            // member behind, which would corrupt the concatenated stream and get
-            // compounded by the Retryable re-append. Truncate back to this
-            // known-good member boundary on failure so a retry appends cleanly.
-            let pre_len = file
-                .metadata()
-                .await
-                .context("Failed to stat file before member write")?
-                .len();
-            // Append the whole member in one write so a concurrent reader never
-            // observes a torn member (the consumer also guards against it).
-            if let Err(e) = file.write_all(&member).await {
-                if let Err(te) = file.set_len(pre_len).await {
-                    tracing::error!(
-                        "Failed to truncate file back to {} after member write error: {}",
-                        pre_len,
-                        te
-                    );
-                    // Rollback failed, so a partial member is still on disk. A Retryable
-                    // re-append would concatenate onto that torn member and corrupt the
-                    // whole stream, so fail permanently instead of letting a retry compound it.
-                    return Err(PublisherError::NonRetryable(anyhow::Error::new(e).context(
+                // The member is fully built by now, so unless the batch already holds the
+                // lock (CSV), it is taken here and covers only the append.
+                if file_guard.is_none() {
+                    file_guard = Some(self.file_lock.lock().await);
+                }
+                // Length before the append: a failed write_all can leave a partial
+                // member behind, which would corrupt the concatenated stream and get
+                // compounded by the Retryable re-append. Truncate back to this
+                // known-good member boundary on failure so a retry appends cleanly.
+                let pre_len = file
+                    .metadata()
+                    .await
+                    .context("Failed to stat file before member write")?
+                    .len();
+                // Append the whole member in one write so a concurrent reader never
+                // observes a torn member (the consumer also guards against it).
+                if let Err(e) = file.write_all(&member).await {
+                    if let Err(te) = file.set_len(pre_len).await {
+                        tracing::error!(
+                            "Failed to truncate file back to {} after member write error: {}",
+                            pre_len,
+                            te
+                        );
+                        // Rollback failed, so a partial member is still on disk. A Retryable
+                        // re-append would concatenate onto that torn member and corrupt the
+                        // whole stream, so fail permanently instead of letting a retry compound it.
+                        return Err(PublisherError::NonRetryable(anyhow::Error::new(e).context(
                         "Failed to write member to file and could not truncate the partial write",
                     )));
+                    }
+                    return Err(PublisherError::Retryable(
+                        anyhow::Error::new(e).context("Failed to write member to file"),
+                    ));
                 }
-                return Err(PublisherError::Retryable(
-                    anyhow::Error::new(e).context("Failed to write member to file"),
-                ));
-            }
-            // Same rollback as the write above: a failed flush can leave a partial
-            // member on disk, which a Retryable re-append would concatenate onto.
-            if let Err(e) = file.flush().await {
-                if let Err(te) = file.set_len(pre_len).await {
-                    tracing::error!(
-                        "Failed to truncate file back to {} after member flush error: {}",
-                        pre_len,
-                        te
-                    );
-                    return Err(PublisherError::NonRetryable(anyhow::Error::new(e).context(
+                // Same rollback as the write above: a failed flush can leave a partial
+                // member on disk, which a Retryable re-append would concatenate onto.
+                if let Err(e) = file.flush().await {
+                    if let Err(te) = file.set_len(pre_len).await {
+                        tracing::error!(
+                            "Failed to truncate file back to {} after member flush error: {}",
+                            pre_len,
+                            te
+                        );
+                        return Err(PublisherError::NonRetryable(anyhow::Error::new(e).context(
                         "Failed to flush member to file and could not truncate the partial write",
                     )));
+                    }
+                    return Err(PublisherError::Retryable(
+                        anyhow::Error::new(e).context("Failed to flush file"),
+                    ));
                 }
-                return Err(PublisherError::Retryable(
-                    anyhow::Error::new(e).context("Failed to flush file"),
-                ));
-            }
-            Ok(())
+                Ok(())
             }
             .await;
             if let Err(e) = outcome {
@@ -704,6 +854,10 @@ impl MessagePublisher for FilePublisher {
     ) -> Result<SentBatch, PublisherError> {
         if messages.is_empty() {
             return Ok(SentBatch::Ack);
+        }
+
+        if self.idempotency {
+            return self.send_batch_idempotent(messages).await;
         }
 
         #[cfg(any(feature = "compression", feature = "encryption"))]

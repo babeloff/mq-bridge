@@ -331,6 +331,8 @@ pub struct KafkaConsumer {
     exit_on_empty: bool,
     /// Started on first read, once the batch size is known — see [`Prefetcher`].
     prefetcher: Option<Prefetcher>,
+    /// Resolved once at construction from endpoint config and the legacy fallback.
+    source_metadata: bool,
     /// What the drain knows about its partitions — see [`DrainState`].
     drain_state: DrainState,
 }
@@ -338,7 +340,11 @@ pub struct KafkaConsumer {
 impl KafkaConsumer {
     fn prefetcher(&mut self, max_messages: usize) -> &Prefetcher {
         self.prefetcher.get_or_insert_with(|| {
-            spawn_prefetcher(self.consumer.clone(), prefetch_capacity(max_messages))
+            spawn_prefetcher(
+                self.consumer.clone(),
+                prefetch_capacity(max_messages),
+                self.source_metadata,
+            )
         })
     }
 }
@@ -346,6 +352,16 @@ use std::any::Any;
 
 impl KafkaConsumer {
     pub async fn new(config: &KafkaConfig) -> anyhow::Result<Self> {
+        Self::new_with_source_metadata(config, false).await
+    }
+
+    pub async fn new_with_source_metadata(
+        config: &KafkaConfig,
+        source_metadata: bool,
+    ) -> anyhow::Result<Self> {
+        let source_metadata = crate::canonical_message::source_metadata_enabled_for_endpoint(
+            source_metadata || config.source_metadata,
+        );
         let topic = config.topic.as_deref().unwrap_or("");
         let mut client_config = create_common_config(config);
 
@@ -428,6 +444,7 @@ impl KafkaConsumer {
             topic: topic.to_string(),
             exit_on_empty: false,
             prefetcher: None,
+            source_metadata,
             drain_state: DrainState::default(),
         })
     }
@@ -698,7 +715,22 @@ fn prefetch_capacity(max_messages: usize) -> usize {
     configured.unwrap_or_else(|| (max_messages * 4).clamp(8192, 262_144))
 }
 
-fn spawn_prefetcher(consumer: Arc<StreamConsumer>, capacity: usize) -> Prefetcher {
+fn spawn_prefetcher(
+    consumer: Arc<StreamConsumer>,
+    capacity: usize,
+    source_metadata: bool,
+) -> Prefetcher {
+    if source_metadata {
+        spawn_prefetcher_with_source_metadata(consumer, capacity)
+    } else {
+        spawn_prefetcher_without_source_metadata(consumer, capacity)
+    }
+}
+
+fn spawn_prefetcher_without_source_metadata(
+    consumer: Arc<StreamConsumer>,
+    capacity: usize,
+) -> Prefetcher {
     let (tx, rx) = async_channel::bounded(capacity);
     let task = tokio::spawn(async move {
         // One stream for the task's whole life. Rebuilding it per batch is what starved the
@@ -719,6 +751,37 @@ fn spawn_prefetcher(consumer: Arc<StreamConsumer>, capacity: usize) -> Prefetche
                     Err(e) => Err(PrefetchError::Connection(e.to_string())),
                 };
                 // Receiver gone: the consumer was dropped, so stop reading.
+                if tx.send(item).await.is_err() {
+                    return;
+                }
+            }
+        }
+        let _ = tx.send(Err(PrefetchError::EndOfStream)).await;
+    });
+    Prefetcher { rx, task }
+}
+
+fn spawn_prefetcher_with_source_metadata(
+    consumer: Arc<StreamConsumer>,
+    capacity: usize,
+) -> Prefetcher {
+    let (tx, rx) = async_channel::bounded(capacity);
+    let task = tokio::spawn(async move {
+        let mut chunks = consumer.stream().ready_chunks(1024);
+        while let Some(chunk) = chunks.next().await {
+            for result in chunk {
+                let item = match result {
+                    Ok(message) => match to_canonical_with_source_metadata(&message) {
+                        Ok(canonical) => Ok(Prefetched {
+                            message: canonical,
+                            topic: message.topic().to_string(),
+                            partition: message.partition(),
+                            offset: message.offset() + 1,
+                        }),
+                        Err(e) => Err(PrefetchError::Connection(e.to_string())),
+                    },
+                    Err(e) => Err(PrefetchError::Connection(e.to_string())),
+                };
                 if tx.send(item).await.is_err() {
                     return;
                 }
@@ -875,24 +938,23 @@ fn to_canonical<M: Message>(message: &M) -> anyhow::Result<CanonicalMessage> {
             .insert(KAFKA_TOMBSTONE_KEY.to_string(), "true".to_string());
     }
 
-    // Source-position cursor keys (useful for dlt-style pull consumers; the
-    // per-message topic is the only way to recover it under a topic pattern).
-    // Opt-in via the MQB_SOURCE_METADATA env var; off by default.
-    if crate::canonical_message::source_metadata_enabled() {
-        canonical_message.metadata.insert(
-            "mqb.src.kafka_topic".to_string(),
-            message.topic().to_string(),
-        );
-        canonical_message.metadata.insert(
-            "mqb.src.kafka_partition".to_string(),
-            message.partition().to_string(),
-        );
-        canonical_message.metadata.insert(
-            "mqb.src.kafka_offset".to_string(),
-            message.offset().to_string(),
-        );
-    }
+    Ok(canonical_message)
+}
 
+fn to_canonical_with_source_metadata<M: Message>(message: &M) -> anyhow::Result<CanonicalMessage> {
+    let mut canonical_message = to_canonical(message)?;
+    canonical_message.metadata.insert(
+        "mqb.src.kafka_topic".to_string(),
+        message.topic().to_string(),
+    );
+    canonical_message.metadata.insert(
+        "mqb.src.kafka_partition".to_string(),
+        message.partition().to_string(),
+    );
+    canonical_message.metadata.insert(
+        "mqb.src.kafka_offset".to_string(),
+        message.offset().to_string(),
+    );
     Ok(canonical_message)
 }
 
