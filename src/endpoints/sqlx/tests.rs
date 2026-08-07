@@ -335,6 +335,102 @@ async fn test_sqlx_cursor_reader_json_escapes_blobs_and_nulls() {
     assert!(v["maybe"].is_null());
 }
 
+/// SQLite types values, not columns, so an untyped column holds a different storage class per
+/// row. Reading the kind off `AnyRow`'s column (fixed for the whole result set) pinned every
+/// row to the first one's type — a NULL first row silenced the column entirely and made the
+/// cursor undecodable.
+#[tokio::test]
+async fn test_sqlx_cursor_reader_mixed_value_types_per_row() {
+    sqlx::any::install_default_drivers();
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("mixed.db");
+    let url = sqlite_url(&path);
+    drop(tokio::fs::File::create(&path).await.unwrap());
+    let pool = AnyPool::connect(&url).await.unwrap();
+    // Untyped columns: SQLite stores each value's own class rather than a column affinity.
+    sqlx::query("CREATE TABLE mixed (k, val)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO mixed (k, val) VALUES (1, NULL)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO mixed (k, val) VALUES (2, 42)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO mixed (k, val) VALUES (3, 'text')")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO mixed (k, val) VALUES (4, x'00ff')")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let config = SqlxConfig {
+        url,
+        table: "mixed".to_string(),
+        cursor_column: Some("k".to_string()),
+        cursor_id: Some("mixed-1".to_string()),
+        ..Default::default()
+    };
+    let mut reader = SqlxCursorReader::new(&config).await.unwrap();
+    // The cursor itself decodes from an untyped column whose first row is not NULL-pinned.
+    let b = reader.receive_batch(10).await.unwrap();
+    assert_eq!(b.messages.len(), 4);
+
+    let vals: Vec<serde_json::Value> = b
+        .messages
+        .iter()
+        .map(|m| serde_json::from_slice::<serde_json::Value>(&m.payload).unwrap()["val"].clone())
+        .collect();
+    assert!(vals[0].is_null());
+    assert_eq!(vals[1], 42);
+    assert_eq!(vals[2], "text");
+    assert_eq!(vals[3], "00ff");
+
+    // The checkpoint advanced, so a restart sees nothing left.
+    (b.commit)(vec![MessageDisposition::Ack; 4]).await.unwrap();
+    let mut reader2 = SqlxCursorReader::new(&config).await.unwrap();
+    assert!(reader2.receive_batch(10).await.unwrap().messages.is_empty());
+}
+
+/// A text cursor in an untyped column must decode as text, not be pinned to the first row.
+#[tokio::test]
+async fn test_sqlx_cursor_reader_untyped_text_cursor() {
+    sqlx::any::install_default_drivers();
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("untyped_text.db");
+    let url = sqlite_url(&path);
+    drop(tokio::fs::File::create(&path).await.unwrap());
+    let pool = AnyPool::connect(&url).await.unwrap();
+    sqlx::query("CREATE TABLE t (k, payload)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO t (k, payload) VALUES ('a', 1), ('b', 2)")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let config = SqlxConfig {
+        url,
+        table: "t".to_string(),
+        cursor_column: Some("k".to_string()),
+        cursor_id: Some("untyped-text-1".to_string()),
+        ..Default::default()
+    };
+    let mut reader = SqlxCursorReader::new(&config).await.unwrap();
+    let b = reader.receive_batch(10).await.unwrap();
+    assert_eq!(b.messages.len(), 2);
+    (b.commit)(vec![MessageDisposition::Ack; 2]).await.unwrap();
+
+    let mut reader2 = SqlxCursorReader::new(&config).await.unwrap();
+    assert!(reader2.receive_batch(10).await.unwrap().messages.is_empty());
+}
+
 #[tokio::test]
 async fn test_sqlx_cursor_reader_partial_ack_resumes_at_boundary() {
     let (_dir, url, _pool) = setup_arbitrary_table(5).await;

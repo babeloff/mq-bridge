@@ -1558,11 +1558,21 @@ impl JsonRowSchema {
                 buf.push(b',');
             }
             buf.extend_from_slice(&col.key);
-            let kind = row.column(col.ordinal).type_info().kind();
+            let kind = value_kind(row, col.ordinal).unwrap_or(sqlx::any::AnyTypeInfoKind::Null);
             write_json_value(row, col.ordinal, kind, buf);
         }
         buf.push(b'}');
     }
+}
+
+/// The type of the *value* at `idx`, not of the column. `AnyRow` builds its columns from the
+/// statement's column metadata (one fixed kind for the whole result set), but stores each
+/// decoded value's own kind — which is what SQLite actually types. Reading the kind off the
+/// column pinned every row to the declared/inferred type, so a text or blob value in an
+/// `INTEGER`-typed column (or any value in a column SQLite typed from a NULL) decoded wrong.
+fn value_kind(row: &sqlx::any::AnyRow, idx: usize) -> Option<sqlx::any::AnyTypeInfoKind> {
+    use sqlx::ValueRef;
+    Some(row.try_get_raw(idx).ok()?.type_info().kind())
 }
 
 /// Append a JSON-encoded scalar, or `null` when the value is absent or fails to decode.
@@ -1630,7 +1640,7 @@ fn resolve_cursor_column(row: &sqlx::any::AnyRow, column: &str) -> Option<usize>
 
 fn extract_cursor_at(row: &sqlx::any::AnyRow, idx: usize) -> Option<SqlCursor> {
     use sqlx::any::AnyTypeInfoKind;
-    match row.column(idx).type_info().kind() {
+    match value_kind(row, idx)? {
         AnyTypeInfoKind::SmallInt | AnyTypeInfoKind::Integer | AnyTypeInfoKind::BigInt => row
             .try_get::<Option<i64>, _>(idx)
             .ok()

@@ -102,6 +102,9 @@ def test_message_hashes_non_uuid_id_stably() -> None:
 
     assert first.id == second.id
     assert first.id != Message(b"hello", id="another-id").id
+    # Pinned FNV-1a/128 vector: the fold must stay identical across processes,
+    # releases and the Rust/Node bindings, so a seeded hash would fail here.
+    assert first.id == "32f0a7f7-0c3a-5303-92fb-c6935a4bdc48"
 
 
 def test_message_json_reports_decode_errors() -> None:
