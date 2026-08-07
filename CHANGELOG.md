@@ -19,10 +19,23 @@ All notable changes to `mq-bridge`. Newest first.
 
 ### Performance
 
+- **Kafka consumer**: a long-lived prefetch task reads librdkafka continuously into a bounded
+  channel, instead of rebuilding the stream inside every `receive_batch`. librdkafka only keeps
+  requesting records while its queue is drained, so every pause the pipeline took — a transform,
+  a slow sink — was also a pause in fetching, and the fetch rate collapsed to well under what the
+  broker could serve. Batch offsets are also recorded once per partition rather than once per
+  message, which was O(n²) in the batch and allocated two `CString`s per record.
+  Kafka → transform → file: **192,854 → 824,983 rows/s** on the 1M-row, four-partition
+  benchmark, from 0.35x to 1.51x Arroyo on identical output. A 16,384-message passthrough
+  batch went from 11.5s to 2.2s, and from 10.4s to 0.9s of CPU.
 - **Postgres / sqlx**: `test_before_acquire(false)` on the pool, zero-copy row encoding via
   a prebuilt `JsonRowSchema`, and prebuilt first/next page queries on the cursor path.
 - **Command handler**: `send_batch` no longer loops per-message `send()` (≈8x on batched routes).
 - **File**: single-pass byte-array decode, faster CSV writes, compression sniffing.
+- **Deduplication**: the two-phase reserve/commit no longer writes to the store twice per
+  message. Reservations are held in memory — sled takes an exclusive file lock on its directory,
+  so a claim only ever has to be visible to this process — leaving one write per message, on
+  commit.
 
 ### Fixed
 
@@ -41,5 +54,20 @@ All notable changes to `mq-bridge`. Newest first.
   took chaos-test message loss to zero.
 - Postgres CDC advances its replication slot durably on shutdown instead of leaving the
   feedback unflushed.
+- `deduplication` could silently drop a message after a crash. The reservation was written to
+  the store *before* the message was processed, so a redelivery arriving within the 5s pending
+  TTL was classified as a duplicate and acked — without ever having been written to the sink.
+  Reservations are now in-memory and die with the process, so the redelivery is reprocessed.
+- A Kafka record with no value — a tombstone, which is ordinary traffic on a compacted topic —
+  failed the whole batch. Its offset was never committed, so the route reconnected onto the same
+  record forever: one tombstone wedged the consumer permanently, and a compacted topic could not
+  be consumed at all. Tombstones now arrive as an empty payload flagged `mqb.kafka.tombstone`.
+- `--drain` on a Kafka source could report success having copied only part of a topic, or none
+  of it. An idle wait was taken to mean "source exhausted", but an idle channel means nothing on
+  its own: before the first fetch lands, or in an ordinary gap between fetches, it looks exactly
+  the same as the end of the data. The shorter the idle timeout the more went missing — at 1ms a
+  1,000,000-row topic landed 0 rows, and the copy still exited successfully. A drain now
+  completes only once every assigned partition has reached the offset it held when the drain
+  began, and lands all 1,000,000 rows at every idle timeout including 0.
 - Drain no longer hangs on an empty source, and reconnect attempts are bounded.
 - CSV reader handles quoted newlines; file endpoints fail fast on an unopenable path.

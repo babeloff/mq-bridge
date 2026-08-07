@@ -35,6 +35,8 @@ If you need to move data or events reliably between systems and you write code (
 
 > **Throughput & footprint.** In our own benchmarks, the same engine — driven the zero-code way through [`mq-bridge-app`](https://github.com/marcomq/mq-bridge-app) — on a CSV→JSONL file conversion (1,000,000 mixed-type rows, ~116 MiB) sustained **1,133,786 rows/s** at ~22 MiB, about **~58x faster** and **~20x leaner in memory** than Meltano (`tap-csv` → `target-jsonl`, ~19,500 rows/s / ~444 MiB). Full setup, methodology, and the exact parameters are in [`benches/ETL_BENCHMARKS.md`](benches/ETL_BENCHMARKS.md).
 
+> **Kafka → file.** In a 1,000,000-row relay with the default file format and no transform, the engine was up to **80% faster than Sea Streamer**. The [`mq-bridge-app` benchmark](https://github.com/marcomq/mq-bridge-app/tree/dev/benches/etl) contains the reproducible helper and native file-format caveats.
+
 
 ## Language Bindings
 

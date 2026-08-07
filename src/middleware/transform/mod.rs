@@ -18,6 +18,13 @@
 //! transformed, so the two routes cannot drift apart in behaviour; `fast_path_equivalence`
 //! holds them to that, including the two differences it documents.
 //!
+//! A projection — a mapping that lifts top-level fields to top-level output keys, with no
+//! schema — gets the same treatment from `project_fast`: its output is a subset of the
+//! input's fields, so the wanted spans are copied straight through and the dropped ones,
+//! which are often the largest, are never parsed. Mappings outside that subset still parse
+//! once into a `Value`, but pick values by moving them out rather than deep-cloning,
+//! whenever no rule reads through another's path.
+//!
 //! Only the JSON Schema subset that matters for message integration is honoured:
 //! `type`, `properties`, `required`, `default`, `items`, `nullable`, `enum`, plus
 //! `contentMediaType`/`contentSchema` for embedded JSON. Other keywords are ignored

@@ -70,6 +70,19 @@ impl CompiledPath {
         }
         Some(cur)
     }
+
+    /// Moves the value out, leaving a `Null` in its place. Only sound when no other rule
+    /// reads through this path — see [`paths_are_disjoint`].
+    pub(super) fn take(&self, root: &mut Value) -> Option<Value> {
+        let mut cur = root;
+        for seg in &self.segs {
+            cur = match seg {
+                Seg::Key(k) => cur.get_mut(k.as_str())?,
+                Seg::Index(i) => cur.get_mut(*i)?,
+            };
+        }
+        Some(cur.take())
+    }
 }
 
 // --- Mapping stage ---
@@ -81,6 +94,19 @@ pub(super) struct CompiledRule {
     pub(super) from: CompiledPath,
     pub(super) default: Option<Value>,
     pub(super) required: bool,
+}
+
+/// True when no rule's source path is a prefix of — or equal to — another's. That is what
+/// lets the mapping stage move picked values out of the input instead of deep-cloning
+/// them: taking one value cannot then empty out what another rule still has to read.
+/// Quadratic, but this runs once per middleware over a handful of rules.
+pub(super) fn paths_are_disjoint(rules: &[CompiledRule]) -> bool {
+    !rules.iter().enumerate().any(|(i, a)| {
+        rules[..i].iter().any(|b| {
+            let shared = a.from.segs.len().min(b.from.segs.len());
+            a.from.segs[..shared] == b.from.segs[..shared]
+        })
+    })
 }
 
 /// Writes `value` at `path`, creating intermediate objects as needed.

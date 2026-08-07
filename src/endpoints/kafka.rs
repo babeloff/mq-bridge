@@ -176,24 +176,7 @@ impl MessagePublisher for KafkaPublisher {
         );
         let mut record = FutureRecord::to(&self.topic).payload(&message.payload[..]);
 
-        let mut headers = OwnedHeaders::new();
-        headers = headers.insert(rdkafka::message::Header {
-            key: "mq_bridge.message_id",
-            value: Some(format!("{:032x}", message.message_id).as_bytes()),
-        });
-
-        if !message.metadata.is_empty() {
-            for (key, value) in &message.metadata {
-                if crate::canonical_message::is_source_metadata_key(key) {
-                    continue; // source/provenance keys are not forwarded
-                }
-                headers = headers.insert(rdkafka::message::Header {
-                    key,
-                    value: Some(value.as_bytes()),
-                });
-            }
-        }
-        record = record.headers(headers);
+        record = record.headers(message_headers(&message));
 
         // Key on the configured metadata field when set (and present on this message);
         // otherwise fall back to message_id, which the consumer also recovers from the
@@ -249,24 +232,7 @@ impl MessagePublisher for KafkaPublisher {
             let key_bytes = record_key(self.partition_key.as_deref(), &message);
             record = record.key(&key_bytes);
 
-            let mut headers = OwnedHeaders::new();
-            headers = headers.insert(rdkafka::message::Header {
-                key: "mq_bridge.message_id",
-                value: Some(format!("{:032x}", message.message_id).as_bytes()),
-            });
-
-            if !message.metadata.is_empty() {
-                for (key, value) in &message.metadata {
-                    if crate::canonical_message::is_source_metadata_key(key) {
-                        continue; // source/provenance keys are not forwarded
-                    }
-                    headers = headers.insert(rdkafka::message::Header {
-                        key,
-                        value: Some(value.as_bytes()),
-                    });
-                }
-            }
-            record = record.headers(headers);
+            record = record.headers(message_headers(&message));
 
             match self.producer.send_result(record) {
                 Ok(fut) => delivery_futures.push((message, fut)),
@@ -363,6 +329,18 @@ pub struct KafkaConsumer {
     topic: String,
     /// Drain mode: only then does an idle fetch time out into an empty batch.
     exit_on_empty: bool,
+    /// Started on first read, once the batch size is known — see [`Prefetcher`].
+    prefetcher: Option<Prefetcher>,
+    /// What the drain knows about its partitions — see [`DrainState`].
+    drain_state: DrainState,
+}
+
+impl KafkaConsumer {
+    fn prefetcher(&mut self, max_messages: usize) -> &Prefetcher {
+        self.prefetcher.get_or_insert_with(|| {
+            spawn_prefetcher(self.consumer.clone(), prefetch_capacity(max_messages))
+        })
+    }
 }
 use std::any::Any;
 
@@ -449,6 +427,8 @@ impl KafkaConsumer {
             producer,
             topic: topic.to_string(),
             exit_on_empty: false,
+            prefetcher: None,
+            drain_state: DrainState::default(),
         })
     }
 }
@@ -464,15 +444,23 @@ impl Drop for KafkaConsumer {
 #[async_trait]
 impl MessageConsumer for KafkaConsumer {
     async fn receive(&mut self) -> Result<Received, ConsumerError> {
-        let message = self
-            .consumer
+        // Through the prefetcher, not the consumer directly: two readers would race for
+        // the same records and each would see only some of them.
+        let item = self
+            .prefetcher(1)
+            .rx
             .recv()
             .await
             .context("Failed to receive Kafka message")?;
-        let mut tpl = TopicPartitionList::new();
-        let mut messages = Vec::new();
-        process_message(&message, &mut messages, &mut tpl)?;
-        let canonical_message = messages.pop().unwrap();
+        let item = match item {
+            Ok(item) => item,
+            Err(PrefetchError::EndOfStream) => return Err(ConsumerError::EndOfStream),
+            Err(PrefetchError::Connection(e)) => return Err(ConsumerError::Connection(anyhow!(e))),
+        };
+        let mut last_offsets = BatchOffsets::new();
+        record_offset(&mut last_offsets, &item.topic, item.partition, item.offset);
+        let tpl = offsets_to_tpl(&last_offsets)?;
+        let canonical_message = item.message;
 
         let reply_topic = canonical_message.metadata.get("reply_to").cloned();
         let correlation_id = canonical_message.metadata.get("correlation_id").cloned();
@@ -529,14 +517,26 @@ impl MessageConsumer for KafkaConsumer {
     }
 
     async fn receive_batch(&mut self, max_messages: usize) -> Result<ReceivedBatch, ConsumerError> {
-        receive_batch_internal(
-            &self.consumer,
-            self.producer.as_ref(),
-            max_messages,
-            &self.topic,
+        let (consumer, producer, topic, exit_on_empty) = (
+            self.consumer.clone(),
+            self.producer.clone(),
+            self.topic.clone(),
             self.exit_on_empty,
+        );
+        // Taken out and put back because `prefetcher()` borrows self mutably too.
+        let mut drain_state = std::mem::take(&mut self.drain_state);
+        let result = receive_batch_internal(
+            self.prefetcher(max_messages),
+            &consumer,
+            producer.as_ref(),
+            max_messages,
+            &topic,
+            exit_on_empty,
+            &mut drain_state,
         )
-        .await
+        .await;
+        self.drain_state = drain_state;
+        result
     }
 
     async fn status(&self) -> EndpointStatus {
@@ -619,6 +619,28 @@ impl MessageConsumer for KafkaConsumer {
     }
 }
 
+/// The headers to publish with a message: its id, then its metadata.
+///
+/// The id header is what lets `to_canonical` recover the same `message_id` on the way back
+/// in, so the two must agree on the format. `mqb.src.*` keys describe where a message was
+/// read from and are never forwarded.
+fn message_headers(message: &CanonicalMessage) -> OwnedHeaders {
+    let mut headers = OwnedHeaders::new().insert(rdkafka::message::Header {
+        key: "mq_bridge.message_id",
+        value: Some(format!("{:032x}", message.message_id).as_bytes()),
+    });
+    for (key, value) in &message.metadata {
+        if crate::canonical_message::is_source_metadata_key(key) {
+            continue;
+        }
+        headers = headers.insert(rdkafka::message::Header {
+            key,
+            value: Some(value.as_bytes()),
+        });
+    }
+    headers
+}
+
 /// Choose the Kafka record key for a message: the value of the configured metadata field
 /// when set and present, otherwise the message_id as big-endian bytes.
 fn record_key(partition_key: Option<&str>, message: &CanonicalMessage) -> Vec<u8> {
@@ -629,14 +651,144 @@ fn record_key(partition_key: Option<&str>, message: &CanonicalMessage) -> Vec<u8
 }
 
 /// Helper function to process a Kafka message and add it to the batch.
+/// One record pulled ahead of the pipeline, with the position needed to commit it.
+struct Prefetched {
+    message: CanonicalMessage,
+    topic: String,
+    partition: i32,
+    offset: i64,
+}
+
+/// Why the prefetch task stopped producing records.
+enum PrefetchError {
+    EndOfStream,
+    Connection(String),
+}
+
+/// Reads librdkafka continuously into a bounded channel, for the consumer's whole life.
+///
+/// librdkafka only keeps requesting records while its queue is being drained; let the queue
+/// sit and it stops fetching and has to re-prime, which costs far more than the pause that
+/// caused it. Reading inside `receive_batch` meant every pause the pipeline took — a
+/// transform, a slow sink — was a pause in fetching too, and the fetch rate collapsed to
+/// well under what the broker could serve. This task owns one stream and never stops
+/// reading; the channel, not librdkafka's queue, is what absorbs a downstream pause.
+struct Prefetcher {
+    rx: async_channel::Receiver<Result<Prefetched, PrefetchError>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for Prefetcher {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// How many records may sit between librdkafka and the pipeline. Only has to cover what
+/// arrives while one batch is being processed, so a few batches' worth is plenty; the cost
+/// is memory, one payload copy per slot. Override via `MQ_BRIDGE_KAFKA_PREFETCH`.
+fn prefetch_capacity(max_messages: usize) -> usize {
+    static V: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    let configured = *V.get_or_init(|| {
+        std::env::var("MQ_BRIDGE_KAFKA_PREFETCH")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|n| *n > 0)
+    });
+    configured.unwrap_or_else(|| (max_messages * 4).clamp(8192, 262_144))
+}
+
+fn spawn_prefetcher(consumer: Arc<StreamConsumer>, capacity: usize) -> Prefetcher {
+    let (tx, rx) = async_channel::bounded(capacity);
+    let task = tokio::spawn(async move {
+        // One stream for the task's whole life. Rebuilding it per batch is what starved the
+        // fetch pipeline; `ready_chunks` still batches whatever is already waiting.
+        let mut chunks = consumer.stream().ready_chunks(1024);
+        while let Some(chunk) = chunks.next().await {
+            for result in chunk {
+                let item = match result {
+                    Ok(message) => match to_canonical(&message) {
+                        Ok(canonical) => Ok(Prefetched {
+                            message: canonical,
+                            topic: message.topic().to_string(),
+                            partition: message.partition(),
+                            offset: message.offset() + 1,
+                        }),
+                        Err(e) => Err(PrefetchError::Connection(e.to_string())),
+                    },
+                    Err(e) => Err(PrefetchError::Connection(e.to_string())),
+                };
+                // Receiver gone: the consumer was dropped, so stop reading.
+                if tx.send(item).await.is_err() {
+                    return;
+                }
+            }
+        }
+        let _ = tx.send(Err(PrefetchError::EndOfStream)).await;
+    });
+    Prefetcher { rx, task }
+}
+
+/// The offset to commit for each `(topic, partition)` a batch touched.
+///
+/// Not a `TopicPartitionList`: that one *appends* on `add_partition_offset` and then scans
+/// the list it just grew, so recording every message made a batch cost O(n²) and allocated
+/// two `CString`s per message. A batch spans a handful of partitions, so a linear scan over
+/// this stays cheap — and it stays that small.
+type BatchOffsets = Vec<(String, i32, i64)>;
+
+/// Records the offset to commit for one message, keeping only the latest per partition.
+fn record_offset(offsets: &mut BatchOffsets, topic: &str, partition: i32, offset: i64) {
+    match offsets
+        .iter_mut()
+        .find(|(t, p, _)| *p == partition && t == topic)
+    {
+        Some(entry) => entry.2 = offset,
+        None => offsets.push((topic.to_string(), partition, offset)),
+    }
+}
+
+/// Builds the list to hand to `commit`, one entry per partition.
+fn offsets_to_tpl(offsets: &BatchOffsets) -> anyhow::Result<TopicPartitionList> {
+    let mut tpl = TopicPartitionList::new();
+    for (topic, partition, offset) in offsets {
+        tpl.add_partition_offset(topic, *partition, Offset::Offset(*offset))
+            .map_err(|e| anyhow!(e))?;
+    }
+    Ok(tpl)
+}
+
+/// The two steps the prefetch task now does inline, kept together for the tests that cover
+/// id recovery and offset recording as one contract.
+#[cfg(test)]
 fn process_message<M: Message>(
     message: &M,
     messages: &mut Vec<CanonicalMessage>,
-    last_offset_tpl: &mut TopicPartitionList,
+    last_offsets: &mut BatchOffsets,
 ) -> anyhow::Result<()> {
-    let payload = message
-        .payload()
-        .ok_or_else(|| anyhow!("Kafka message has no payload"))?;
+    messages.push(to_canonical(message)?);
+    // Keep only the latest offset per partition; the list is built once per batch.
+    record_offset(
+        last_offsets,
+        message.topic(),
+        message.partition(),
+        message.offset() + 1,
+    );
+    Ok(())
+}
+
+/// Metadata flag marking a compacted-topic tombstone (a record with no value).
+pub const KAFKA_TOMBSTONE_KEY: &str = "mqb.kafka.tombstone";
+
+/// Converts one Kafka record into a `CanonicalMessage`, recovering its id and headers.
+///
+/// A record with no value is a tombstone, which is ordinary traffic on a compacted topic —
+/// it carries the delete. Rejecting it used to fail the whole batch, and since the offset
+/// was never committed the route reconnected onto the same record forever, so a single
+/// tombstone wedged the consumer. It becomes an empty payload flagged in metadata instead.
+fn to_canonical<M: Message>(message: &M) -> anyhow::Result<CanonicalMessage> {
+    let tombstone = message.payload().is_none();
+    let payload = message.payload().unwrap_or(&[]);
 
     // Recover message_id, preferring the mq_bridge.message_id header (always written by this
     // publisher). Checking the header before the key means an explicit partition key that
@@ -717,6 +869,12 @@ fn process_message<M: Message>(
         }
     }
 
+    if tombstone {
+        canonical_message
+            .metadata
+            .insert(KAFKA_TOMBSTONE_KEY.to_string(), "true".to_string());
+    }
+
     // Source-position cursor keys (useful for dlt-style pull consumers; the
     // per-message topic is the only way to recover it under a topic pattern).
     // Opt-in via the MQB_SOURCE_METADATA env var; off by default.
@@ -735,16 +893,7 @@ fn process_message<M: Message>(
         );
     }
 
-    messages.push(canonical_message);
-
-    // Update the topic partition list with the latest offset
-    last_offset_tpl
-        .add_partition_offset(
-            message.topic(),
-            message.partition(),
-            Offset::Offset(message.offset() + 1),
-        )
-        .map_err(|e| anyhow!(e))
+    Ok(canonical_message)
 }
 
 fn create_common_config(config: &KafkaConfig) -> ClientConfig {
@@ -777,50 +926,246 @@ fn create_common_config(config: &KafkaConfig) -> ClientConfig {
     client_config
 }
 
+/// Whether the group has told this consumer which partitions it owns. Empty until the
+/// join/rebalance completes, which is the state a drain must not mistake for "no data".
+fn has_assignment(consumer: &StreamConsumer) -> bool {
+    consumer.assignment().is_ok_and(|tpl| tpl.count() > 0)
+}
+
+/// How long a draining consumer waits to be told what it owns before accepting that it
+/// owns nothing. The counterpart to `traits::drain_idle_timeout`, which answers a
+/// different question: that one is "is the source idle", this one is "has it started".
+///
+/// A fresh consumer group needs a join/rebalance before any record can arrive, and that
+/// routinely outlasts the idle timeout. Defaults to 30s — only ever paid by a consumer
+/// that never gets an assignment. Override via `MQ_BRIDGE_DRAIN_JOIN_TIMEOUT_MS`.
+fn drain_join_timeout() -> Duration {
+    static V: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("MQ_BRIDGE_DRAIN_JOIN_TIMEOUT_MS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .map(Duration::from_millis)
+            .unwrap_or(Duration::from_secs(30))
+    })
+}
+
+/// What an idle wait means in drain mode. An idle timeout on its own says nothing: the
+/// three states below look identical from the channel, and only one of them is a drain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DrainReadiness {
+    /// No assignment yet — the group join has not finished, so nothing *could* have
+    /// arrived. Not a drain.
+    NotStarted,
+    /// Assigned, but some partition has not reached the offset the drain is aiming for:
+    /// a fetch is still in flight. Not a drain.
+    Starting,
+    /// Assigned and there is nothing left to read.
+    Drained,
+}
+
+/// The offset each assigned partition must reach before the drain is complete.
+///
+/// Resolved once per partition and then reused, which fixes what the drain is aiming at:
+/// everything the topic held when the drain began. Re-reading it would chase a live
+/// producer's tip, and would put a blocking broker round-trip on every idle wait.
+type PartitionOffsets = std::collections::HashMap<(String, i32), i64>;
+
+/// What a drain knows about the partitions it was given.
+#[derive(Default)]
+struct DrainState {
+    /// Where each partition has to get to. See [`PartitionOffsets`].
+    targets: PartitionOffsets,
+    /// How far the pipeline has actually taken each partition.
+    ///
+    /// `position()` answers the same question but only after librdkafka polls again, so it
+    /// lags by a few cycles at the end of a drain — and each cycle costs a whole idle
+    /// timeout. What was handed downstream is already known here, exactly and immediately.
+    delivered: PartitionOffsets,
+}
+
+/// Resolves the offset a partition must reach, reading it from the broker at most once.
+fn drain_target(
+    consumer: &StreamConsumer,
+    targets: &mut PartitionOffsets,
+    key: &(String, i32),
+) -> Option<i64> {
+    if let Some(high) = targets.get(key) {
+        return Some(*high);
+    }
+    let (_low, high) = consumer
+        .fetch_watermarks(&key.0, key.1, Duration::from_secs(1))
+        .ok()?;
+    targets.insert(key.clone(), high);
+    Some(high)
+}
+
+/// Decides what an idle drain-mode wait means.
+///
+/// The only trustworthy answer is where each partition stands against its target — an
+/// idle channel says nothing on its own. Treating "idle after some records arrived" as a
+/// drain is what silently truncated a topic: an ordinary gap between fetches is
+/// indistinguishable from the end of the data, so the shorter the idle timeout the more
+/// of the topic went missing, and the copy still reported success.
+fn drain_readiness(consumer: &StreamConsumer, state: &mut DrainState) -> DrainReadiness {
+    if !has_assignment(consumer) {
+        return DrainReadiness::NotStarted;
+    }
+    let Ok(positions) = consumer.position() else {
+        return DrainReadiness::Starting;
+    };
+    for elem in positions.elements() {
+        let key = (elem.topic().to_string(), elem.partition());
+        let Some(high) = drain_target(consumer, &mut state.targets, &key) else {
+            return DrainReadiness::Starting;
+        };
+        if state.delivered.get(&key).is_some_and(|d| *d >= high) {
+            continue;
+        }
+        let at_end = match elem.offset() {
+            Offset::Offset(position) => position >= high,
+            Offset::End => true,
+            // No position established yet: only an empty log is genuinely drained.
+            _ => high == 0,
+        };
+        if !at_end {
+            return DrainReadiness::Starting;
+        }
+    }
+    DrainReadiness::Drained
+}
+
+/// Waits for the first record of a batch. `Ok(None)` means the source is drained.
+///
+/// Split from the Kafka specifics so the waiting rule can be tested without a broker:
+/// `readiness` is the only thing that knows what a consumer is doing.
+async fn await_first(
+    rx: &async_channel::Receiver<Result<Prefetched, PrefetchError>>,
+    exit_on_empty: bool,
+    topic: &str,
+    mut readiness: impl FnMut() -> DrainReadiness,
+) -> Option<Result<Prefetched, PrefetchError>> {
+    let start_deadline = std::time::Instant::now() + drain_join_timeout();
+    loop {
+        // A drain that is already complete shouldn't spend a whole idle timeout finding
+        // that out. Nothing can still be in flight: every partition is at its target.
+        if exit_on_empty && rx.is_empty() && readiness() == DrainReadiness::Drained {
+            return None;
+        }
+        if let Some(item) = crate::traits::drain_gated(exit_on_empty, rx.recv()).await {
+            return item.ok();
+        }
+        match readiness() {
+            DrainReadiness::Drained => return None,
+            DrainReadiness::NotStarted | DrainReadiness::Starting => {}
+        }
+        if std::time::Instant::now() >= start_deadline {
+            tracing::warn!(
+                topic = %topic,
+                timeout = ?drain_join_timeout(),
+                "Draining Kafka consumer never became ready; treating the source as empty. \
+                 If the topic has data, the group join or first fetch did not complete in \
+                 time — raise MQ_BRIDGE_DRAIN_JOIN_TIMEOUT_MS."
+            );
+            return None;
+        }
+    }
+}
+
+/// A batch taken off the prefetch channel, before it is turned into a `ReceivedBatch`.
+struct BatchParts {
+    messages: Vec<CanonicalMessage>,
+    offsets: BatchOffsets,
+    reply_infos: Vec<(Option<String>, Option<String>)>,
+    /// The stream ended or failed. Surfaced only once the records already in hand have
+    /// been delivered, so a failure never discards a batch that was read successfully.
+    terminal: Option<PrefetchError>,
+}
+
+/// Takes `first` plus whatever else is already waiting, up to `max_messages`.
+///
+/// Never blocks past the first record: a batch is what has arrived, not what might.
+fn assemble_batch(
+    first: Result<Prefetched, PrefetchError>,
+    rx: &async_channel::Receiver<Result<Prefetched, PrefetchError>>,
+    max_messages: usize,
+) -> BatchParts {
+    let mut parts = BatchParts {
+        messages: Vec::with_capacity(max_messages),
+        offsets: BatchOffsets::new(),
+        reply_infos: Vec::with_capacity(max_messages),
+        terminal: None,
+    };
+    let mut next = Some(first);
+    while let Some(item) = next.take() {
+        match item {
+            Ok(item) => {
+                parts.reply_infos.push((
+                    item.message.metadata.get("reply_to").cloned(),
+                    item.message.metadata.get("correlation_id").cloned(),
+                ));
+                parts.messages.push(item.message);
+                record_offset(&mut parts.offsets, &item.topic, item.partition, item.offset);
+            }
+            Err(e) => {
+                parts.terminal = Some(e);
+                break;
+            }
+        }
+        if parts.messages.len() < max_messages {
+            next = rx.try_recv().ok();
+        }
+    }
+    parts
+}
+
 async fn receive_batch_internal(
+    prefetcher: &Prefetcher,
     consumer: &Arc<StreamConsumer>,
     producer: impl Into<Option<&FutureProducer>>,
     max_messages: usize,
     topic: &str,
     exit_on_empty: bool,
+    drain_state: &mut DrainState,
 ) -> Result<ReceivedBatch, ConsumerError> {
-    let mut messages = Vec::with_capacity(max_messages);
-    let mut last_offset_tpl = TopicPartitionList::new();
-    let mut reply_infos = Vec::with_capacity(max_messages);
+    // Block for the first record, then take whatever else the prefetcher already has.
+    let first = await_first(&prefetcher.rx, exit_on_empty, topic, || {
+        drain_readiness(consumer, drain_state)
+    })
+    .await;
+    let Some(first) = first else {
+        return Ok(ReceivedBatch::empty());
+    };
+    let parts = assemble_batch(first, &prefetcher.rx, max_messages);
+    let BatchParts {
+        messages,
+        offsets: last_offsets,
+        reply_infos,
+        terminal,
+    } = parts;
 
-    {
-        let stream = consumer.stream();
-        // Use ready_chunks to efficiently fetch a batch of available messages.
-        // This waits for at least one message, then consumes all currently available messages up to max_messages.
-        let mut chunk_stream = stream.ready_chunks(max_messages);
-
-        // Drain mode: brief timeout → empty batch so --drain fires; else block (cancel-safe).
-        let Some(next_chunk) = crate::traits::drain_gated(exit_on_empty, chunk_stream.next()).await
-        else {
-            return Ok(ReceivedBatch::empty());
+    // A failure is only surfaced once the records already read have been delivered.
+    if messages.is_empty() {
+        return match terminal {
+            Some(PrefetchError::EndOfStream) => Err(ConsumerError::EndOfStream),
+            Some(PrefetchError::Connection(e)) => Err(ConsumerError::Connection(anyhow!(e))),
+            None => Ok(ReceivedBatch::empty()),
         };
+    }
 
-        if let Some(chunk) = next_chunk {
-            for message_result in chunk {
-                match message_result {
-                    Ok(message) => {
-                        process_message(&message, &mut messages, &mut last_offset_tpl)?;
-                        // process_message pushes to messages, so we can peek the last one
-                        if let Some(last_msg) = messages.last() {
-                            reply_infos.push((
-                                last_msg.metadata.get("reply_to").cloned(),
-                                last_msg.metadata.get("correlation_id").cloned(),
-                            ));
-                        }
-                    }
-                    Err(e) => return Err(anyhow!(e).into()),
-                }
-            }
-        } else {
-            return Err(ConsumerError::EndOfStream);
+    // Only a drain asks how far each partition has got, so only a drain pays for tracking it.
+    if exit_on_empty {
+        for (topic, partition, offset) in &last_offsets {
+            let entry = drain_state
+                .delivered
+                .entry((topic.clone(), *partition))
+                .or_insert(*offset);
+            *entry = (*entry).max(*offset);
         }
     }
+
     let messages_len = messages.len();
+    let last_offset_tpl = offsets_to_tpl(&last_offsets)?;
     trace!(count = messages_len, topic = %topic, message_ids = ?LazyMessageIds(&messages), "Received batch of Kafka messages");
 
     let consumer = consumer.clone();
@@ -921,7 +1266,7 @@ mod tests {
         let msg = create_mock_message(Some(b"payload"), Some(&key), None, 0, 0);
 
         let mut messages = Vec::new();
-        let mut tpl = TopicPartitionList::new();
+        let mut tpl = BatchOffsets::new();
         process_message(&msg, &mut messages, &mut tpl).unwrap();
 
         assert_eq!(messages.len(), 1);
@@ -938,7 +1283,7 @@ mod tests {
         let msg = create_mock_message(Some(b"payload"), None, Some(headers), 0, 0);
 
         let mut messages = Vec::new();
-        let mut tpl = TopicPartitionList::new();
+        let mut tpl = BatchOffsets::new();
         process_message(&msg, &mut messages, &mut tpl).unwrap();
 
         assert_eq!(messages.len(), 1);
@@ -953,15 +1298,304 @@ mod tests {
         let offset = msg.offset();
 
         let mut messages = Vec::new();
-        let mut tpl = TopicPartitionList::new();
+        let mut tpl = BatchOffsets::new();
         process_message(&msg, &mut messages, &mut tpl).unwrap();
 
         let expected_id = ((partition as u32 as u128) << 64) | (offset as u64 as u128);
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].message_id, expected_id);
-        // Check that the TPL was updated correctly
-        let committed_offset = tpl.find_partition("test_topic", 4).unwrap().offset();
+        // Check that the offset to commit was recorded correctly
+        let committed_offset = offsets_to_tpl(&tpl)
+            .unwrap()
+            .find_partition("test_topic", 4)
+            .unwrap()
+            .offset();
         assert_eq!(committed_offset, Offset::Offset(124));
+    }
+
+    /// Many messages from one partition must collapse to a single entry carrying the last
+    /// offset — recording one per message is what made a batch cost O(n²).
+    #[test]
+    fn test_batch_offsets_keep_one_entry_per_partition() {
+        let mut messages = Vec::new();
+        let mut offsets = BatchOffsets::new();
+        for offset in 0..100 {
+            let msg = create_mock_message(Some(b"payload"), None, None, offset, 4);
+            process_message(&msg, &mut messages, &mut offsets).unwrap();
+        }
+        let msg = create_mock_message(Some(b"payload"), None, None, 7, 5);
+        process_message(&msg, &mut messages, &mut offsets).unwrap();
+
+        assert_eq!(offsets.len(), 2, "one entry per partition, not per message");
+        let tpl = offsets_to_tpl(&offsets).unwrap();
+        assert_eq!(
+            tpl.find_partition("test_topic", 4).unwrap().offset(),
+            Offset::Offset(100)
+        );
+        assert_eq!(
+            tpl.find_partition("test_topic", 5).unwrap().offset(),
+            Offset::Offset(8)
+        );
+    }
+
+    fn header_value(headers: &OwnedHeaders, key: &str) -> Option<String> {
+        headers
+            .iter()
+            .find(|h| h.key == key)
+            .map(|h| String::from_utf8_lossy(h.value.unwrap_or_default()).to_string())
+    }
+
+    /// The publisher writes the id header that the consumer reads back, so a message that
+    /// goes through Kafka must come out with the id it went in with.
+    #[test]
+    fn test_message_id_survives_the_round_trip() {
+        let message = CanonicalMessage::new(b"payload".to_vec(), None);
+        let sent_id = message.message_id;
+
+        let msg = create_mock_message(
+            Some(b"payload"),
+            None,
+            Some(message_headers(&message)),
+            0,
+            0,
+        );
+
+        assert_eq!(to_canonical(&msg).unwrap().message_id, sent_id);
+    }
+
+    /// `mqb.src.*` records where a message was read from. Forwarding it would let a hop
+    /// through Kafka overwrite the next reader's view of the source.
+    #[test]
+    fn test_publisher_drops_source_metadata_headers() {
+        let mut message = CanonicalMessage::new(b"payload".to_vec(), None);
+        message
+            .metadata
+            .insert("tenant".to_string(), "acme".to_string());
+        message
+            .metadata
+            .insert("mqb.src.kafka_offset".to_string(), "42".to_string());
+
+        let headers = message_headers(&message);
+
+        assert_eq!(header_value(&headers, "tenant"), Some("acme".to_string()));
+        assert_eq!(header_value(&headers, "mqb.src.kafka_offset"), None);
+    }
+
+    fn prefetched(topic: &str, partition: i32, offset: i64) -> Prefetched {
+        Prefetched {
+            message: CanonicalMessage::new(b"payload".to_vec(), None),
+            topic: topic.to_string(),
+            partition,
+            offset,
+        }
+    }
+
+    type PrefetchChannel = (
+        async_channel::Sender<Result<Prefetched, PrefetchError>>,
+        async_channel::Receiver<Result<Prefetched, PrefetchError>>,
+    );
+
+    fn prefetch_channel(capacity: usize) -> PrefetchChannel {
+        async_channel::bounded(capacity)
+    }
+
+    /// A record with no value is a delete on a compacted topic, not a broken message.
+    /// Failing it left the offset uncommitted, so the route reconnected onto the same
+    /// record forever and one tombstone wedged the consumer.
+    #[test]
+    fn test_tombstone_becomes_empty_payload_not_error() {
+        let msg = create_mock_message(None, Some(b"orders-42"), None, 7, 1);
+
+        let canonical = to_canonical(&msg).expect("a tombstone must not fail the batch");
+
+        assert!(canonical.payload.is_empty());
+        assert_eq!(
+            canonical
+                .metadata
+                .get(KAFKA_TOMBSTONE_KEY)
+                .map(String::as_str),
+            Some("true")
+        );
+    }
+
+    #[test]
+    fn test_ordinary_record_carries_no_tombstone_flag() {
+        let msg = create_mock_message(Some(b"{\"a\":1}"), None, None, 7, 1);
+
+        let canonical = to_canonical(&msg).unwrap();
+
+        assert_eq!(canonical.payload.as_ref(), b"{\"a\":1}");
+        assert!(!canonical.metadata.contains_key(KAFKA_TOMBSTONE_KEY));
+    }
+
+    /// A tombstone keeps its headers: the flag is added to the metadata the headers
+    /// produced, not instead of it.
+    #[test]
+    fn test_tombstone_keeps_headers() {
+        let headers = OwnedHeaders::new().insert(Header {
+            key: "op",
+            value: Some(b"delete"),
+        });
+        let msg = create_mock_message(None, None, Some(headers), 7, 1);
+
+        let canonical = to_canonical(&msg).unwrap();
+
+        assert_eq!(
+            canonical.metadata.get("op").map(String::as_str),
+            Some("delete")
+        );
+        assert!(canonical.metadata.contains_key(KAFKA_TOMBSTONE_KEY));
+    }
+
+    #[test]
+    fn test_assemble_batch_takes_what_is_ready() {
+        let (tx, rx) = prefetch_channel(8);
+        for offset in 1..4 {
+            tx.try_send(Ok(prefetched("t", 0, offset))).unwrap();
+        }
+
+        let parts = assemble_batch(Ok(prefetched("t", 0, 0)), &rx, 16);
+
+        assert_eq!(parts.messages.len(), 4);
+        assert_eq!(parts.offsets, vec![("t".to_string(), 0, 3)]);
+        assert!(parts.terminal.is_none());
+    }
+
+    /// The cap is a cap, and what does not fit stays queued for the next call rather than
+    /// being dropped.
+    #[test]
+    fn test_assemble_batch_stops_at_max_messages() {
+        let (tx, rx) = prefetch_channel(8);
+        for offset in 1..5 {
+            tx.try_send(Ok(prefetched("t", 0, offset))).unwrap();
+        }
+
+        let parts = assemble_batch(Ok(prefetched("t", 0, 0)), &rx, 3);
+
+        assert_eq!(parts.messages.len(), 3);
+        assert_eq!(rx.len(), 2, "the remainder must survive for the next batch");
+    }
+
+    /// A batch is what has arrived, not what might: an empty channel ends the batch at the
+    /// first record instead of waiting for the rest.
+    #[test]
+    fn test_assemble_batch_does_not_wait_for_more() {
+        let (_tx, rx) = prefetch_channel(8);
+
+        let parts = assemble_batch(Ok(prefetched("t", 0, 0)), &rx, 1024);
+
+        assert_eq!(parts.messages.len(), 1);
+    }
+
+    #[test]
+    fn test_assemble_batch_collapses_offsets_per_partition() {
+        let (tx, rx) = prefetch_channel(8);
+        tx.try_send(Ok(prefetched("t", 0, 6))).unwrap();
+        tx.try_send(Ok(prefetched("t", 1, 9))).unwrap();
+
+        let parts = assemble_batch(Ok(prefetched("t", 0, 5)), &rx, 16);
+
+        assert_eq!(
+            parts.offsets,
+            vec![("t".to_string(), 0, 6), ("t".to_string(), 1, 9)]
+        );
+    }
+
+    #[test]
+    fn test_assemble_batch_extracts_reply_info() {
+        let (tx, rx) = prefetch_channel(8);
+        let mut with_reply = prefetched("t", 0, 1);
+        with_reply
+            .message
+            .metadata
+            .insert("reply_to".to_string(), "inbox.1".to_string());
+        with_reply
+            .message
+            .metadata
+            .insert("correlation_id".to_string(), "abc".to_string());
+        tx.try_send(Ok(with_reply)).unwrap();
+
+        let parts = assemble_batch(Ok(prefetched("t", 0, 0)), &rx, 16);
+
+        assert_eq!(parts.reply_infos[0], (None, None));
+        assert_eq!(
+            parts.reply_infos[1],
+            (Some("inbox.1".to_string()), Some("abc".to_string()))
+        );
+    }
+
+    /// Records read before the failure are still delivered; the error rides along and is
+    /// only surfaced once they are gone.
+    #[test]
+    fn test_assemble_batch_delivers_records_before_terminal_error() {
+        let (tx, rx) = prefetch_channel(8);
+        tx.try_send(Ok(prefetched("t", 0, 1))).unwrap();
+        tx.try_send(Err(PrefetchError::EndOfStream)).unwrap();
+
+        let parts = assemble_batch(Ok(prefetched("t", 0, 0)), &rx, 16);
+
+        assert_eq!(parts.messages.len(), 2);
+        assert!(matches!(parts.terminal, Some(PrefetchError::EndOfStream)));
+    }
+
+    #[tokio::test]
+    async fn test_await_first_ignores_readiness_when_a_record_is_waiting() {
+        let (tx, rx) = prefetch_channel(1);
+        tx.try_send(Ok(prefetched("t", 0, 5))).unwrap();
+
+        let first = await_first(&rx, true, "t", || {
+            panic!("readiness must not be consulted while a record is waiting")
+        })
+        .await;
+
+        assert!(matches!(first, Some(Ok(p)) if p.offset == 5));
+    }
+
+    #[tokio::test]
+    async fn test_await_first_ends_the_drain_only_when_drained() {
+        let (_tx, rx) = prefetch_channel(1);
+
+        let first = await_first(&rx, true, "t", || DrainReadiness::Drained).await;
+
+        assert!(first.is_none());
+    }
+
+    /// The regression that made `--drain` land zero rows: an idle wait before the first
+    /// fetch arrives is not a drain, so it must keep waiting rather than report empty.
+    #[tokio::test]
+    async fn test_await_first_keeps_waiting_while_starting() {
+        let (tx, rx) = prefetch_channel(1);
+        let mut polls = 0;
+
+        let first = await_first(&rx, true, "t", || {
+            polls += 1;
+            if polls == 1 {
+                tx.try_send(Ok(prefetched("t", 0, 5))).unwrap();
+            }
+            DrainReadiness::Starting
+        })
+        .await;
+
+        assert!(matches!(first, Some(Ok(p)) if p.offset == 5));
+        assert_eq!(polls, 1, "the record must be picked up on the next attempt");
+    }
+
+    /// Outside drain mode readiness carries no authority: a streaming route must block for
+    /// the next record however long it takes, never end because the topic went quiet.
+    #[tokio::test]
+    async fn test_await_first_never_ends_a_streaming_route() {
+        let (_tx, rx) = prefetch_channel(1);
+
+        let outcome = tokio::time::timeout(
+            Duration::from_millis(200),
+            await_first(&rx, false, "t", || DrainReadiness::Drained),
+        )
+        .await;
+
+        assert!(
+            outcome.is_err(),
+            "a streaming route must not stop on drained"
+        );
     }
 
     #[test]
