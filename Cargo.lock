@@ -3759,9 +3759,9 @@ dependencies = [
 
 [[package]]
 name = "omq-tokio"
-version = "0.20.3"
+version = "0.21.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "98aaa33702e7d723de268dd9fe725f93d469afef3f1bedb14cfa7f579f61a7b7"
+checksum = "5595cb3cb1e3ee36ec48c373eb949e21cb11b26d25423bd86d908de36de73b3a"
 dependencies = [
  "arc-swap",
  "bytes",
@@ -7211,9 +7211,9 @@ dependencies = [
 
 [[package]]
 name = "yring"
-version = "0.3.11"
+version = "0.3.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f8545becda6379f37e13fbdf5d9de464849bdd1565a995368648f11fe9d96d13"
+checksum = "299bddd8a337c49d82ca6d7a505d6f4fa59786af2f1b241992463bdbe0575623"
 dependencies = [
  "loom",
 ]
