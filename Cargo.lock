@@ -666,7 +666,7 @@ dependencies = [
  "hyper-util",
  "pin-project-lite",
  "rustls 0.21.12",
- "rustls 0.23.42",
+ "rustls 0.23.43",
  "rustls-native-certs",
  "rustls-pki-types",
  "tokio",
@@ -2108,7 +2108,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a8f2f12607f92c69b12ed746fabf9ca4f5c482cba46679c1a75b874ed7c26adb"
 dependencies = [
  "futures-io",
- "rustls 0.23.42",
+ "rustls 0.23.43",
  "rustls-pki-types",
 ]
 
@@ -2583,7 +2583,7 @@ dependencies = [
  "hyper 1.11.0",
  "hyper-util",
  "log",
- "rustls 0.23.42",
+ "rustls 0.23.43",
  "rustls-native-certs",
  "tokio",
  "tokio-rustls 0.26.4",
@@ -3315,7 +3315,7 @@ dependencies = [
  "pkcs8 0.11.0",
  "rand 0.9.5",
  "rustc_version_runtime",
- "rustls 0.23.42",
+ "rustls 0.23.43",
  "serde",
  "serde_bytes",
  "serde_with",
@@ -3398,7 +3398,7 @@ dependencies = [
  "reqwest",
  "rmp-serde",
  "rumqttc",
- "rustls 0.23.42",
+ "rustls 0.23.43",
  "rustls-pemfile",
  "schemars",
  "serde",
@@ -3475,7 +3475,7 @@ dependencies = [
  "mq-bridge",
  "mq-bridge-bindings-common",
  "pyo3",
- "rustls 0.23.42",
+ "rustls 0.23.43",
  "schemars",
  "serde",
  "serde_json",
@@ -4035,7 +4035,7 @@ dependencies = [
  "hmac 0.12.1",
  "md5",
  "rand 0.9.5",
- "rustls 0.23.42",
+ "rustls 0.23.43",
  "sha2 0.10.9",
  "thiserror 1.0.69",
  "tokio",
@@ -4522,7 +4522,7 @@ dependencies = [
  "quinn-proto",
  "quinn-udp",
  "rustc-hash",
- "rustls 0.23.42",
+ "rustls 0.23.43",
  "socket2 0.6.5",
  "thiserror 2.0.19",
  "tokio",
@@ -4544,7 +4544,7 @@ dependencies = [
  "rand_pcg",
  "ring",
  "rustc-hash",
- "rustls 0.23.42",
+ "rustls 0.23.43",
  "rustls-pki-types",
  "slab",
  "thiserror 2.0.19",
@@ -4808,7 +4808,7 @@ dependencies = [
  "itoa",
  "percent-encoding",
  "pin-project-lite",
- "rustls 0.23.42",
+ "rustls 0.23.43",
  "rustls-native-certs",
  "ryu",
  "socket2 0.6.5",
@@ -4917,7 +4917,7 @@ dependencies = [
  "percent-encoding",
  "pin-project-lite",
  "quinn",
- "rustls 0.23.42",
+ "rustls 0.23.43",
  "rustls-pki-types",
  "rustls-platform-verifier",
  "serde",
@@ -5081,9 +5081,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.42"
+version = "0.23.43"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3c54fcab019b409d04215d3a17cb438fd7fbf192ee61461f20f4fe18704bc138"
+checksum = "0283386ce02abc0151e1761d08802dfe86c173b0b494af5cbc086574e453da06"
 dependencies = [
  "aws-lc-rs",
  "log",
@@ -5104,7 +5104,7 @@ dependencies = [
  "futures-io",
  "futures-rustls",
  "log",
- "rustls 0.23.42",
+ "rustls 0.23.43",
  "rustls-native-certs",
  "rustls-pki-types",
  "rustls-platform-verifier",
@@ -5153,7 +5153,7 @@ dependencies = [
  "jni",
  "log",
  "once_cell",
- "rustls 0.23.42",
+ "rustls 0.23.43",
  "rustls-native-certs",
  "rustls-platform-verifier-android",
  "rustls-webpki 0.103.13",
@@ -5781,7 +5781,7 @@ dependencies = [
  "log",
  "memchr",
  "percent-encoding",
- "rustls 0.23.42",
+ "rustls 0.23.43",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -6233,7 +6233,7 @@ version = "0.26.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1729aa945f29d91ba541258c8df89027d5792d85a8841fb65e8bf0f4ede4ef61"
 dependencies = [
- "rustls 0.23.42",
+ "rustls 0.23.43",
  "tokio",
 ]
 
