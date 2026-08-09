@@ -118,7 +118,7 @@ pub async fn apply_middlewares_to_consumer(
 /// ```
 ///
 /// Reversing those two would put `retry` outside `dlq`, so the DLQ would never see an
-/// exhausted-retry failure. See `REFERENCE.md` for the full ordering rules.
+/// exhausted-retry failure. See `docs/REFERENCE.md` for the full ordering rules.
 ///
 /// A route handler is wrapped *around* the result of this function (see `wrap_handler` in
 /// `endpoints/mod.rs`), so it runs once per message and nothing here re-invokes it.

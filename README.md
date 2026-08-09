@@ -64,7 +64,7 @@ The Python binding also holds up well under load on the third-party [http-arena.
 
 ## Architecture
 
-See [ARCHITECTURE.md](ARCHITECTURE.md) for a detailed overview of the internal design, extensibility, and usage patterns.
+See [ARCHITECTURE.md](docs/ARCHITECTURE.md) for a detailed overview of the internal design, extensibility, and usage patterns.
 
 **Usage Types:**
 
@@ -72,7 +72,7 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for a detailed overview of the internal d
 2. **Compute Handler:** Generally receive and process messages with a custom handler
 3. **Direct Endpoint Usage:** Use `publish` / `publish_batch` and `receive` / `receive_batch` directly on endpoints. This mode requires manual commit, batch sequencing, and concurrency handling.
 
-For implementation details and quick start examples for each usage type, see the [Architecture Guide](ARCHITECTURE.md).
+For implementation details and quick start examples for each usage type, see the [Architecture Guide](docs/ARCHITECTURE.md).
 
 ## Features
 
@@ -160,7 +160,7 @@ Known rough edges (be deliberate here):
 *   **Middleware**: Components that intercept and process messages (e.g., for error handling).
 *   **Handler**: A programmatic component for business logic, such as transforming/consuming messages (`CommandHandler`) or subscribe them (`EventHandler`).
 
-> **[REFERENCE.md](REFERENCE.md)** lists every middleware and every structural endpoint
+> **[REFERENCE.md](docs/REFERENCE.md)** lists every middleware and every structural endpoint
 > (`ref`, `fanout`, `switch`, `request`, `response`, `reader`, `static`, `stream_buffer`,
 > `null`, `custom`) with fields, defaults and working examples.
 
@@ -708,7 +708,7 @@ let projection_handler = TypeHandler::new()
 
 ## Configuration
 
-All routes and endpoints can be defined via a configuration file (for example `mq-bridge.yaml`), JSON, or environment variables. For a complete reference of options, middleware, and examples, see the [Configuration Guide](CONFIGURATION.md).
+All routes and endpoints can be defined via a configuration file (for example `mq-bridge.yaml`), JSON, or environment variables. For a complete reference of options, middleware, and examples, see the [Configuration Guide](docs/CONFIGURATION.md).
 
 Important route-level knobs:
 
@@ -755,7 +755,7 @@ On an **output** endpoint the message is failed so a following `dlq` captures it
 **input** endpoint it is dropped from the batch and acknowledged, which keeps invalid data
 out of the route.
 
-See **[REFERENCE.md](REFERENCE.md#transform)** for the full option list, the supported schema
+See **[REFERENCE.md](docs/REFERENCE.md#transform)** for the full option list, the supported schema
 subset, and the exact set of allowed type coercions.
 
 ## Running Tests

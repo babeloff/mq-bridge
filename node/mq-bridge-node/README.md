@@ -200,7 +200,7 @@ route.join();
 A registered endpoint also keeps the process alive; call `process.exit()` when
 your script is done.
 
-**Full guide, including the Rust path:** [EXTENDING.md](../../EXTENDING.md).
+**Full guide, including the Rust path:** [EXTENDING.md](../../docs/EXTENDING.md).
 
 ## Logging
 

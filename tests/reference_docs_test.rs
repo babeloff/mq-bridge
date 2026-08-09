@@ -1,9 +1,9 @@
-//! Parses every config shape documented in REFERENCE.md.
+//! Parses every config shape documented in docs/REFERENCE.md.
 //!
 //! The reference file is the place people (and LLMs) look up what exists and how to spell
 //! it, so a snippet that does not deserialize is a real bug.
 //!
-//! The snippets are read out of REFERENCE.md itself rather than copied here, so a doc edit
+//! The snippets are read out of docs/REFERENCE.md itself rather than copied here, so a doc edit
 //! is tested as written and cannot drift from a stale duplicate. A fenced block opts in by
 //! tagging its info string — ```yaml middleware, ```yaml endpoint or ```yaml route; a plain
 //! ```yaml block is prose and is skipped. Only cases a fence cannot express (the `null`
@@ -12,9 +12,9 @@
 use mq_bridge::models::{Endpoint, Middleware};
 use std::collections::HashMap;
 
-const REFERENCE: &str = include_str!("../REFERENCE.md");
+const REFERENCE: &str = include_str!("../docs/REFERENCE.md");
 
-/// A fenced code block lifted out of REFERENCE.md.
+/// A fenced code block lifted out of docs/REFERENCE.md.
 struct Fence {
     /// 1-based line of the opening fence, for failure messages.
     line: usize,
@@ -22,7 +22,7 @@ struct Fence {
     body: String,
 }
 
-/// Splits REFERENCE.md into its fenced code blocks.
+/// Splits docs/REFERENCE.md into its fenced code blocks.
 fn fenced_blocks() -> Vec<Fence> {
     let mut blocks = Vec::new();
     let mut open: Option<(usize, String, Vec<&str>)> = None;
@@ -44,7 +44,7 @@ fn fenced_blocks() -> Vec<Fence> {
     }
 
     if let Some((line_no, info, _)) = open {
-        panic!("REFERENCE.md has an unterminated ```{info} fence opened at line {line_no}");
+        panic!("docs/REFERENCE.md has an unterminated ```{info} fence opened at line {line_no}");
     }
     blocks
 }
@@ -81,14 +81,14 @@ fn middlewares(entries_yaml: &str, line: usize) -> Vec<Middleware> {
         indent(entries_yaml, 2)
     );
     let endpoint: Endpoint = serde_yaml_ng::from_str(&doc).unwrap_or_else(|e| {
-        panic!("REFERENCE.md middleware block at line {line} does not parse: {e}\n{doc}")
+        panic!("docs/REFERENCE.md middleware block at line {line} does not parse: {e}\n{doc}")
     });
     endpoint.middlewares
 }
 
 fn endpoint(yaml: &str) -> Endpoint {
     serde_yaml_ng::from_str(yaml)
-        .unwrap_or_else(|e| panic!("REFERENCE.md endpoint snippet does not parse: {e}\n{yaml}"))
+        .unwrap_or_else(|e| panic!("docs/REFERENCE.md endpoint snippet does not parse: {e}\n{yaml}"))
 }
 
 /// Endpoint blocks in the reference are shown in place, under the `input:` / `output:` key
@@ -102,12 +102,12 @@ fn endpoints(body: &str, line: usize) -> Vec<Endpoint> {
         }
         let fragment: HashMap<String, Endpoint> =
             serde_yaml_ng::from_str(chunk).unwrap_or_else(|e| {
-                panic!("REFERENCE.md endpoint block at line {line} does not parse: {e}\n{chunk}")
+                panic!("docs/REFERENCE.md endpoint block at line {line} does not parse: {e}\n{chunk}")
             });
         for (key, value) in fragment {
             assert!(
                 key == "input" || key == "output",
-                "REFERENCE.md endpoint block at line {line} uses key '{key}'; \
+                "docs/REFERENCE.md endpoint block at line {line} uses key '{key}'; \
                  expected the fragment to sit under 'input' or 'output'"
             );
             found.push(value);
@@ -115,7 +115,7 @@ fn endpoints(body: &str, line: usize) -> Vec<Endpoint> {
     }
     assert!(
         !found.is_empty(),
-        "REFERENCE.md endpoint block at line {line} yielded no endpoints"
+        "docs/REFERENCE.md endpoint block at line {line} yielded no endpoints"
     );
     found
 }
@@ -133,7 +133,7 @@ fn documented_middleware_snippets_parse() {
         let parsed = middlewares(&fence.body, fence.line);
         assert!(
             !parsed.is_empty(),
-            "REFERENCE.md middleware block at line {} yielded no middleware",
+            "docs/REFERENCE.md middleware block at line {} yielded no middleware",
             fence.line
         );
     }
@@ -166,13 +166,13 @@ fn documented_route_snippets_parse() {
         let routes: HashMap<String, mq_bridge::models::Route> =
             serde_yaml_ng::from_str(&fence.body).unwrap_or_else(|e| {
                 panic!(
-                    "REFERENCE.md route block at line {} does not parse: {e}\n{}",
+                    "docs/REFERENCE.md route block at line {} does not parse: {e}\n{}",
                     fence.line, fence.body
                 )
             });
         assert!(
             !routes.is_empty(),
-            "REFERENCE.md route block at line {} yielded no routes",
+            "docs/REFERENCE.md route block at line {} yielded no routes",
             fence.line
         );
     }

@@ -1,7 +1,7 @@
 # mq-bridge Project Context
 
 > **Looking for what middleware or structural endpoints exist, and how to configure them?**
-> [REFERENCE.md](REFERENCE.md) is the complete, authoritative list — every middleware
+> [REFERENCE.md](docs/REFERENCE.md) is the complete, authoritative list — every middleware
 > (`retry`, `dlq`, `transform`, `deduplication`, `weak_join`, `buffer`, `limiter`, `delay`,
 > `cookie_jar`, `encryption`, `compression`, `metrics`, `random_panic`, `custom`) and every structural endpoint (`ref`,
 > `fanout`, `switch`, `request`, `response`, `reader`, `static`, `stream_buffer`, `null`,

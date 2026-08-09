@@ -297,7 +297,7 @@ middleware works the same way via `register_middleware`, with `on_receive` /
 Each endpoint instance runs on its own thread and never sees concurrent calls, so
 it need not be thread-safe. Register before starting a route that names it.
 
-**Full guide, including the Rust path:** [EXTENDING.md](../../EXTENDING.md).
+**Full guide, including the Rust path:** [EXTENDING.md](../../docs/EXTENDING.md).
 
 ## Logging
 
