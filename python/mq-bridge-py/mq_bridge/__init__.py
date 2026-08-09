@@ -9,6 +9,8 @@ from ._mq_bridge import (
     __version__,
     config_schema,
     init_logging,
+    register_endpoint,
+    register_middleware,
 )
 
 __all__ = [
@@ -22,4 +24,6 @@ __all__ = [
     "__version__",
     "config_schema",
     "init_logging",
+    "register_endpoint",
+    "register_middleware",
 ]

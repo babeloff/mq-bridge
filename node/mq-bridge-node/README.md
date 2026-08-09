@@ -159,6 +159,49 @@ that ack each batch individually (NATS JetStream, AMQP, MQTT) accept any order.
 > inflight) or raise it in config. **Kafka has no per-message nack:** `nack` there
 > leaves the offset unadvanced, so redelivery happens on the next run/rebalance.
 
+## Custom endpoints and middleware
+
+Register a JS object as an endpoint, and use its name in any route config —
+useful when a system has a good Node SDK but no Rust one.
+
+```js
+const mqb = require("mq-bridge");
+
+mqb.registerEndpoint("pulsar", (routeName, config) => ({
+  async receiveBatch(maxMessages) {
+    // [] = nothing right now; throw mqb.EndOfStream when the source is done
+    return await pullFrom(config.url, config.topic, maxMessages);
+  },
+  async commit(dispositions) {},   // optional: one "ack"/"nack" per message
+  async close() {},
+}));
+
+const route = mqb.Route.fromConfig({
+  input: { pulsar: { url: "pulsar://localhost:6650", topic: "orders" } },
+  output: { file: { path: "orders.jsonl" } },
+}, "ingest");
+route.start();
+```
+
+Implement `sendBatch(messages)` instead of `receiveBatch` for an output. A
+middleware works the same way via `registerMiddleware`, with `onReceive` /
+`onSend` hooks that return one slot per input message (`null` drops it).
+
+Because the endpoint runs in JavaScript, **keep the event loop free** while the
+route is running — `route.join()` straight after `stop()` blocks the very
+dispatch the endpoint needs. Yield first:
+
+```js
+route.stop();
+await new Promise((r) => setTimeout(r, 50));
+route.join();
+```
+
+A registered endpoint also keeps the process alive; call `process.exit()` when
+your script is done.
+
+**Full guide, including the Rust path:** [EXTENDING.md](../../EXTENDING.md).
+
 ## Logging
 
 By default the Rust core's internal `tracing` events go nowhere. Call

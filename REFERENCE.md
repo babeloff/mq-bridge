@@ -593,8 +593,10 @@ Delegates to a factory you registered programmatically.
 ```
 
 Implement `CustomMiddlewareFactory` (`apply_consumer` and/or `apply_publisher`, each
-defaulting to pass-through) and register it before starting routes. See
-[ARCHITECTURE.md](ARCHITECTURE.md#extending-mq-bridge).
+defaulting to pass-through) and register it before starting routes. It can also be written
+in Python (`register_middleware`, hooks `on_receive` / `on_send`) or JavaScript
+(`registerMiddleware`, hooks `onReceive` / `onSend`). See **[EXTENDING.md](EXTENDING.md)**
+for the full guide.
 
 ---
 
@@ -858,8 +860,12 @@ output:
     config: { target: "internal://thing" }
 ```
 
-Implement `CustomEndpointFactory` and register it before starting routes. See
-[ARCHITECTURE.md](ARCHITECTURE.md#extending-mq-bridge).
+Implement `CustomEndpointFactory` and register it before starting routes. Once registered,
+the name also works as a bare endpoint key — `input: { my_sink: {...} }` — since any
+unrecognised key is looked up in the custom-endpoint registry. Use the explicit `custom:`
+form above if you validate configs against `mq-bridge.schema.json`, which cannot know your
+key. Endpoints can also be written in Python (`register_endpoint`) or JavaScript
+(`registerEndpoint`). See **[EXTENDING.md](EXTENDING.md)** for the full guide.
 
 ---
 
@@ -868,3 +874,4 @@ Implement `CustomEndpointFactory` and register it before starting routes. See
 - [README.md](README.md) — overview, data endpoints, request/response and CQRS patterns
 - [CONFIGURATION.md](CONFIGURATION.md) — full YAML examples, env vars, TLS, IDE schema validation
 - [ARCHITECTURE.md](ARCHITECTURE.md) — internals, batching/concurrency, extension traits
+- [EXTENDING.md](EXTENDING.md) — writing your own endpoint or middleware, in Rust, Python or Node

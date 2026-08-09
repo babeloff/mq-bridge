@@ -37,7 +37,6 @@ use pyo3::types::{PyAny, PyByteArray, PyBytes, PyDict, PyList, PyModule, PyTuple
 use serde::de::{DeserializeSeed, Error as DeError, MapAccess, SeqAccess, Visitor};
 use serde::ser::{Error as SerError, SerializeMap, SerializeSeq};
 use serde::{Serialize, Serializer};
-#[cfg(test)]
 use serde_json::Value as JsonValue;
 use tokio::runtime::Runtime;
 use tokio::sync::{oneshot, OwnedSemaphorePermit, Semaphore};
@@ -286,6 +285,684 @@ impl Handler for PythonHandler {
 
     async fn handle_many(&self, msgs: Vec<CanonicalMessage>) -> Vec<Result<Handled, HandlerError>> {
         self.invoke_batch(msgs).await
+    }
+}
+
+// --- Custom endpoints implemented in Python ---------------------------------
+
+/// Which methods the host object implements, probed once when it is built so a
+/// misconfigured route fails at startup instead of at first message.
+#[derive(Clone, Copy)]
+struct PyEndpointCapabilities {
+    consumer: bool,
+    publisher: bool,
+    on_receive: bool,
+    on_send: bool,
+}
+
+enum PyEndpointCall {
+    Receive(usize),
+    Commit(Vec<&'static str>),
+    Send(Vec<CanonicalMessage>),
+    /// Middleware hook on the way in from a consumer.
+    OnReceive(Vec<CanonicalMessage>),
+    /// Middleware hook on the way out to a publisher.
+    OnSend(Vec<CanonicalMessage>),
+    Close,
+}
+
+enum PyEndpointOutcome {
+    Messages(Vec<CanonicalMessage>),
+    /// One slot per input message: `None` means the middleware dropped it.
+    Filtered(Vec<Option<CanonicalMessage>>),
+    EndOfStream,
+    Done,
+}
+
+/// How a Python exception classifies. `RetryableError`/`NonRetryableError` are the
+/// same markers the handler path honours; anything else is unclassified and each
+/// side picks its own default.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum PyEndpointErrorKind {
+    Retryable,
+    NonRetryable,
+    Unclassified,
+}
+
+struct PyEndpointFailure {
+    message: String,
+    kind: PyEndpointErrorKind,
+}
+
+impl PyEndpointFailure {
+    fn gone(label: &str, detail: impl fmt::Display) -> Self {
+        Self {
+            message: format!("Python endpoint worker for '{label}' is unavailable: {detail}"),
+            kind: PyEndpointErrorKind::Unclassified,
+        }
+    }
+
+    /// A failed read is a transport problem by default, so the route reconnects.
+    /// `NonRetryableError` opts out: the route shuts down instead of re-reading a
+    /// message that cannot heal.
+    fn into_consumer_error(self) -> core::errors::ConsumerError {
+        match self.kind {
+            PyEndpointErrorKind::NonRetryable => {
+                core::errors::ConsumerError::Permanent(anyhow!(self.message))
+            }
+            _ => core::errors::ConsumerError::Connection(anyhow!(self.message)),
+        }
+    }
+
+    /// A failed write is non-retryable by default, matching Python handlers, so
+    /// `dlq` catches it and `retry` does not spin on it.
+    fn into_publisher_error(self) -> core::errors::PublisherError {
+        match self.kind {
+            PyEndpointErrorKind::Retryable => {
+                core::errors::PublisherError::Retryable(anyhow!(self.message))
+            }
+            _ => core::errors::PublisherError::NonRetryable(anyhow!(self.message)),
+        }
+    }
+}
+
+struct PyEndpointRequest {
+    call: PyEndpointCall,
+    reply_tx: oneshot::Sender<Result<PyEndpointOutcome, PyEndpointFailure>>,
+}
+
+/// Owns one Python endpoint object on a dedicated thread. Every call into the
+/// object — construction included — runs there, so the route's tokio workers
+/// never block acquiring the GIL, and the host object never sees concurrent calls
+/// even when the route runs with `concurrency > 1`.
+struct PyEndpointWorker {
+    label: String,
+    tx: std::sync::mpsc::Sender<PyEndpointRequest>,
+    /// Guards `close()` so the host object sees it at most once, whether it comes
+    /// from an explicit close or from the worker being dropped.
+    closed: std::sync::atomic::AtomicBool,
+}
+
+impl PyEndpointWorker {
+    fn spawn(
+        label: String,
+        factory: Py<PyAny>,
+        route_name: String,
+        config: serde_json::Value,
+    ) -> anyhow::Result<(Self, PyEndpointCapabilities)> {
+        let (tx, rx) = std::sync::mpsc::channel::<PyEndpointRequest>();
+        let (init_tx, init_rx) =
+            std::sync::mpsc::channel::<Result<PyEndpointCapabilities, String>>();
+        let thread_label = label.clone();
+        thread::Builder::new()
+            .name(format!("mqb-py-endpoint-{label}"))
+            .spawn(move || {
+                let built = Python::attach(|py| -> PyResult<(Py<PyAny>, PyEndpointCapabilities)> {
+                    let config = json_to_python(py, &config)?;
+                    let endpoint = factory.bind(py).call1((route_name.as_str(), config))?;
+                    let capabilities = PyEndpointCapabilities {
+                        consumer: endpoint.hasattr("receive_batch")?,
+                        publisher: endpoint.hasattr("send_batch")?,
+                        on_receive: endpoint.hasattr("on_receive")?,
+                        on_send: endpoint.hasattr("on_send")?,
+                    };
+                    Ok((endpoint.unbind(), capabilities))
+                });
+                let endpoint = match built {
+                    Ok((endpoint, capabilities)) => {
+                        let _ = init_tx.send(Ok(capabilities));
+                        endpoint
+                    }
+                    Err(err) => {
+                        let _ = init_tx.send(Err(err.to_string()));
+                        return;
+                    }
+                };
+                while let Ok(request) = rx.recv() {
+                    let result = Python::attach(|py| {
+                        run_py_endpoint_call(py, &endpoint, &thread_label, request.call)
+                    });
+                    let _ = request.reply_tx.send(result);
+                }
+            })
+            .with_context(|| format!("failed to spawn Python endpoint thread for '{label}'"))?;
+
+        let capabilities = init_rx
+            .recv()
+            .map_err(|_| anyhow!("Python endpoint factory for '{label}' died during construction"))?
+            .map_err(|err| anyhow!("Python endpoint factory for '{label}' failed: {err}"))?;
+        Ok((
+            Self {
+                label,
+                tx,
+                closed: std::sync::atomic::AtomicBool::new(false),
+            },
+            capabilities,
+        ))
+    }
+
+    /// Claims the right to close, so only the first caller reaches the host.
+    fn claim_close(&self) -> bool {
+        !self.closed.swap(true, Ordering::SeqCst)
+    }
+
+    async fn call(&self, call: PyEndpointCall) -> Result<PyEndpointOutcome, PyEndpointFailure> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        if let Err(err) = self.tx.send(PyEndpointRequest { call, reply_tx }) {
+            return Err(PyEndpointFailure::gone(&self.label, err));
+        }
+        match reply_rx.await {
+            Ok(result) => result,
+            Err(err) => Err(PyEndpointFailure::gone(&self.label, err)),
+        }
+    }
+}
+
+impl Drop for PyEndpointWorker {
+    /// A route can tear down without anyone calling `close()` — a host object
+    /// holding a broker connection still needs to hear about it. The reply is
+    /// dropped, but the worker thread runs the call before it sees that.
+    fn drop(&mut self) {
+        if !self.claim_close() {
+            return;
+        }
+        let (reply_tx, _reply_rx) = oneshot::channel();
+        let _ = self.tx.send(PyEndpointRequest {
+            call: PyEndpointCall::Close,
+            reply_tx,
+        });
+    }
+}
+
+fn run_py_endpoint_call(
+    py: Python<'_>,
+    endpoint: &Py<PyAny>,
+    label: &str,
+    call: PyEndpointCall,
+) -> Result<PyEndpointOutcome, PyEndpointFailure> {
+    let endpoint = endpoint.bind(py);
+    // Only a read may end the stream. A `StopIteration` escaping a send or a
+    // middleware hook is an ordinary bug, and treating it as end-of-stream
+    // would silently ack a batch that was never delivered.
+    let ends_stream = matches!(call, PyEndpointCall::Receive(_));
+    let result = match call {
+        PyEndpointCall::Receive(max_messages) => endpoint
+            .call_method1("receive_batch", (max_messages,))
+            .and_then(|batch| py_endpoint_batch_to_outcome(&batch)),
+        // `commit` and `close` are optional; without them the endpoint is
+        // fire-and-forget, which is all a simple source or sink needs.
+        PyEndpointCall::Commit(dispositions) => {
+            py_endpoint_optional_call(endpoint, "commit", |method| method.call1((dispositions,)))
+        }
+        PyEndpointCall::Send(messages) => py_endpoint_send(py, endpoint, messages),
+        PyEndpointCall::OnReceive(messages) => {
+            py_middleware_filter(py, endpoint, "on_receive", messages)
+        }
+        PyEndpointCall::OnSend(messages) => py_middleware_filter(py, endpoint, "on_send", messages),
+        PyEndpointCall::Close => {
+            py_endpoint_optional_call(endpoint, "close", |method| method.call0())
+        }
+    };
+    match result {
+        Ok(outcome) => Ok(outcome),
+        // The host signals "this source is finished" by raising StopIteration.
+        Err(err) if ends_stream && err.is_instance_of::<pyo3::exceptions::PyStopIteration>(py) => {
+            Ok(PyEndpointOutcome::EndOfStream)
+        }
+        Err(err) => Err(py_endpoint_failure(py, label, err)),
+    }
+}
+
+fn py_endpoint_optional_call<'py>(
+    endpoint: &Bound<'py, PyAny>,
+    name: &str,
+    call: impl FnOnce(Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>>,
+) -> PyResult<PyEndpointOutcome> {
+    match endpoint.getattr(name) {
+        Ok(method) => call(method).map(|_| PyEndpointOutcome::Done),
+        Err(_) => Ok(PyEndpointOutcome::Done),
+    }
+}
+
+fn py_endpoint_send(
+    py: Python<'_>,
+    endpoint: &Bound<'_, PyAny>,
+    messages: Vec<CanonicalMessage>,
+) -> PyResult<PyEndpointOutcome> {
+    let batch = PyList::empty(py);
+    for message in &messages {
+        batch.append(Py::new(py, Message::from_canonical(message))?)?;
+    }
+    endpoint.call_method1("send_batch", (batch,))?;
+    Ok(PyEndpointOutcome::Done)
+}
+
+/// Run a middleware hook over a batch. The host returns one slot per input
+/// message: a message (kept, possibly rewritten) or `None` (dropped). Keeping
+/// the length fixed is what lets the commit stay aligned with the source batch.
+fn py_middleware_filter(
+    py: Python<'_>,
+    endpoint: &Bound<'_, PyAny>,
+    method: &str,
+    messages: Vec<CanonicalMessage>,
+) -> PyResult<PyEndpointOutcome> {
+    let expected = messages.len();
+    let batch = PyList::empty(py);
+    for message in &messages {
+        batch.append(Py::new(py, Message::from_canonical(message))?)?;
+    }
+    let result = endpoint.call_method1(method, (batch,))?;
+    let mut kept = Vec::with_capacity(expected);
+    for item in result.try_iter()? {
+        let item = item?;
+        if item.is_none() {
+            kept.push(None);
+        } else {
+            kept.push(Some(py_endpoint_item_to_canonical(&item)?));
+        }
+    }
+    if kept.len() != expected {
+        return Err(PyValueError::new_err(format!(
+            "{method} returned {} items for a batch of {expected}; return one item per message (None to drop it)",
+            kept.len()
+        )));
+    }
+    Ok(PyEndpointOutcome::Filtered(kept))
+}
+
+/// Interpret what `receive_batch` returned. `None` or an empty sequence means
+/// "nothing right now" — the route backs off and retries, and under
+/// `exit_on_empty` treats it as the drain signal. End of stream is a separate
+/// thing the host signals by raising `StopIteration`.
+fn py_endpoint_batch_to_outcome(batch: &Bound<'_, PyAny>) -> PyResult<PyEndpointOutcome> {
+    if batch.is_none() {
+        return Ok(PyEndpointOutcome::Messages(Vec::new()));
+    }
+    let mut messages = Vec::new();
+    for item in batch.try_iter()? {
+        messages.push(py_endpoint_item_to_canonical(&item?)?);
+    }
+    Ok(PyEndpointOutcome::Messages(messages))
+}
+
+/// Accepts anything a Python endpoint may reasonably yield: a `Message`, a
+/// bytes-like payload, a `str`, or any JSON-encodable value.
+fn py_endpoint_item_to_canonical(item: &Bound<'_, PyAny>) -> PyResult<CanonicalMessage> {
+    if let Ok(message) = message_input_to_canonical(item, None) {
+        return Ok(message);
+    }
+    if let Ok(text) = item.extract::<String>() {
+        return Ok(CanonicalMessage::from(text));
+    }
+    Ok(CanonicalMessage::from_vec(python_to_json_bytes(item)?))
+}
+
+fn py_endpoint_failure(py: Python<'_>, label: &str, err: PyErr) -> PyEndpointFailure {
+    error!(endpoint = %label, "Python endpoint raised an exception: {err}");
+    let kind = if err.is_instance_of::<RetryableError>(py) {
+        PyEndpointErrorKind::Retryable
+    } else if err.is_instance_of::<NonRetryableError>(py) {
+        PyEndpointErrorKind::NonRetryable
+    } else {
+        PyEndpointErrorKind::Unclassified
+    };
+    PyEndpointFailure {
+        message: format!("Python endpoint '{label}' failed: {err}"),
+        kind,
+    }
+}
+
+struct PyEndpointFactory {
+    name: String,
+    factory: Py<PyAny>,
+}
+
+impl fmt::Debug for PyEndpointFactory {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PyEndpointFactory")
+            .field("name", &self.name)
+            .finish()
+    }
+}
+
+impl PyEndpointFactory {
+    /// Builds one host object. Runs on a blocking thread because the Python
+    /// factory may open a real connection, and the first thing it does is take
+    /// the GIL.
+    async fn build(
+        &self,
+        route_name: &str,
+        config: &serde_json::Value,
+    ) -> anyhow::Result<(Arc<PyEndpointWorker>, PyEndpointCapabilities)> {
+        let label = format!("{}:{}", self.name, route_name);
+        let factory = Python::attach(|py| self.factory.clone_ref(py));
+        let route_name = route_name.to_string();
+        let config = config.clone();
+        let (worker, capabilities) = tokio::task::spawn_blocking(move || {
+            PyEndpointWorker::spawn(label, factory, route_name, config)
+        })
+        .await??;
+        Ok((Arc::new(worker), capabilities))
+    }
+}
+
+#[async_trait]
+impl core::traits::CustomEndpointFactory for PyEndpointFactory {
+    async fn create_consumer(
+        &self,
+        route_name: &str,
+        config: &serde_json::Value,
+    ) -> anyhow::Result<Box<dyn MessageConsumer>> {
+        let (worker, capabilities) = self.build(route_name, config).await?;
+        if !capabilities.consumer {
+            // A missing method is a config error, not a transport blip. The
+            // route only stops retrying if it can downcast to `Permanent`.
+            return Err(anyhow::Error::new(core::errors::ConsumerError::Permanent(
+                anyhow!(
+                    "Python endpoint '{}' has no receive_batch(max_messages) method, so it cannot be used as an input",
+                    self.name
+                ),
+            )));
+        }
+        Ok(Box::new(PyEndpointConsumer { worker }))
+    }
+
+    async fn create_publisher(
+        &self,
+        route_name: &str,
+        config: &serde_json::Value,
+    ) -> anyhow::Result<Box<dyn core::traits::MessagePublisher>> {
+        let (worker, capabilities) = self.build(route_name, config).await?;
+        if !capabilities.publisher {
+            return Err(anyhow::Error::new(
+                core::errors::ProcessingError::NonRetryable(anyhow!(
+                    "Python endpoint '{}' has no send_batch(messages) method, so it cannot be used as an output",
+                    self.name
+                )),
+            ));
+        }
+        Ok(Box::new(PyEndpointPublisher { worker }))
+    }
+}
+
+struct PyEndpointConsumer {
+    worker: Arc<PyEndpointWorker>,
+}
+
+#[async_trait]
+impl MessageConsumer for PyEndpointConsumer {
+    async fn receive_batch(
+        &mut self,
+        max_messages: usize,
+    ) -> Result<core::ReceivedBatch, core::errors::ConsumerError> {
+        match self
+            .worker
+            .call(PyEndpointCall::Receive(max_messages))
+            .await
+        {
+            Ok(PyEndpointOutcome::Messages(messages)) => {
+                if messages.is_empty() {
+                    return Ok(core::ReceivedBatch::empty());
+                }
+                let worker = Arc::clone(&self.worker);
+                let commit: core::traits::BatchCommitFunc = Box::new(move |dispositions| {
+                    let names = dispositions.iter().map(disposition_name).collect();
+                    Box::pin(async move {
+                        match worker.call(PyEndpointCall::Commit(names)).await {
+                            Ok(_) => Ok(()),
+                            Err(failure) => Err(anyhow!(failure.message)),
+                        }
+                    })
+                });
+                Ok(core::ReceivedBatch { messages, commit })
+            }
+            Ok(PyEndpointOutcome::EndOfStream) => Err(core::errors::ConsumerError::EndOfStream),
+            Ok(PyEndpointOutcome::Done) | Ok(PyEndpointOutcome::Filtered(_)) => {
+                Ok(core::ReceivedBatch::empty())
+            }
+            Err(failure) => Err(failure.into_consumer_error()),
+        }
+    }
+
+    async fn close(&mut self) -> anyhow::Result<()> {
+        if !self.worker.claim_close() {
+            return Ok(());
+        }
+        match self.worker.call(PyEndpointCall::Close).await {
+            Ok(_) => Ok(()),
+            Err(failure) => Err(anyhow!(failure.message)),
+        }
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+struct PyEndpointPublisher {
+    worker: Arc<PyEndpointWorker>,
+}
+
+#[async_trait]
+impl core::traits::MessagePublisher for PyEndpointPublisher {
+    async fn send_batch(
+        &self,
+        messages: Vec<CanonicalMessage>,
+    ) -> Result<SentBatch, core::errors::PublisherError> {
+        match self.worker.call(PyEndpointCall::Send(messages)).await {
+            Ok(_) => Ok(SentBatch::Ack),
+            Err(failure) => Err(failure.into_publisher_error()),
+        }
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+struct PyMiddlewareFactory {
+    name: String,
+    factory: Py<PyAny>,
+}
+
+impl fmt::Debug for PyMiddlewareFactory {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PyMiddlewareFactory")
+            .field("name", &self.name)
+            .finish()
+    }
+}
+
+impl PyMiddlewareFactory {
+    async fn build(
+        &self,
+        route_name: &str,
+        config: &serde_json::Value,
+    ) -> anyhow::Result<(Arc<PyEndpointWorker>, PyEndpointCapabilities)> {
+        let label = format!("{}:{}", self.name, route_name);
+        let factory = Python::attach(|py| self.factory.clone_ref(py));
+        let route_name = route_name.to_string();
+        let config = config.clone();
+        let (worker, capabilities) = tokio::task::spawn_blocking(move || {
+            PyEndpointWorker::spawn(label, factory, route_name, config)
+        })
+        .await??;
+        Ok((Arc::new(worker), capabilities))
+    }
+}
+
+#[async_trait]
+impl core::traits::CustomMiddlewareFactory for PyMiddlewareFactory {
+    async fn apply_consumer(
+        &self,
+        consumer: Box<dyn MessageConsumer>,
+        route_name: &str,
+        config: &serde_json::Value,
+    ) -> anyhow::Result<Box<dyn MessageConsumer>> {
+        let (worker, capabilities) = self.build(route_name, config).await?;
+        // Matching the trait's own default: a middleware that does not implement
+        // this side simply passes through.
+        if !capabilities.on_receive {
+            return Ok(consumer);
+        }
+        Ok(Box::new(PyMiddlewareConsumer {
+            inner: consumer,
+            worker,
+        }))
+    }
+
+    async fn apply_publisher(
+        &self,
+        publisher: Box<dyn core::traits::MessagePublisher>,
+        route_name: &str,
+        config: &serde_json::Value,
+    ) -> anyhow::Result<Box<dyn core::traits::MessagePublisher>> {
+        let (worker, capabilities) = self.build(route_name, config).await?;
+        if !capabilities.on_send {
+            return Ok(publisher);
+        }
+        Ok(Box::new(PyMiddlewarePublisher {
+            inner: publisher,
+            worker,
+        }))
+    }
+}
+
+struct PyMiddlewareConsumer {
+    inner: Box<dyn MessageConsumer>,
+    worker: Arc<PyEndpointWorker>,
+}
+
+#[async_trait]
+impl MessageConsumer for PyMiddlewareConsumer {
+    async fn receive_batch(
+        &mut self,
+        max_messages: usize,
+    ) -> Result<core::ReceivedBatch, core::errors::ConsumerError> {
+        // Keep pulling until something survives the filter. Returning an empty
+        // batch here would be read as "the source is drained" and would end an
+        // `exit_on_empty` route early; only the inner consumer may say that.
+        loop {
+            let batch = self.inner.receive_batch(max_messages).await?;
+            if batch.messages.is_empty() {
+                return Ok(batch);
+            }
+            let outcome = self
+                .worker
+                .call(PyEndpointCall::OnReceive(batch.messages))
+                .await
+                .map_err(PyEndpointFailure::into_consumer_error)?;
+            // `on_receive` always yields one slot per message; anything else is
+            // a bug here, and swallowing it would drop the batch silently.
+            let PyEndpointOutcome::Filtered(results) = outcome else {
+                return Err(core::errors::ConsumerError::Permanent(anyhow!(
+                    "Python middleware '{}' on_receive returned an unexpected result",
+                    self.worker.label
+                )));
+            };
+
+            let mut kept = Vec::with_capacity(results.len());
+            let mut keep_flags = Vec::with_capacity(results.len());
+            for result in results {
+                keep_flags.push(result.is_some());
+                if let Some(message) = result {
+                    kept.push(message);
+                }
+            }
+
+            let inner_commit = batch.commit;
+            if kept.is_empty() {
+                // The route will never commit a batch it never sees, so ack the
+                // dropped messages here or the source redelivers them forever.
+                let dispositions = vec![MessageDisposition::Ack; keep_flags.len()];
+                inner_commit(dispositions)
+                    .await
+                    .map_err(core::errors::ConsumerError::Connection)?;
+                continue;
+            }
+
+            // The route only sees the kept messages, so expand its dispositions
+            // back to one per source message, acking the ones we dropped.
+            let commit: core::traits::BatchCommitFunc = Box::new(move |dispositions| {
+                let mut kept_dispositions = dispositions.into_iter();
+                let expanded: Vec<MessageDisposition> = keep_flags
+                    .iter()
+                    .map(|keep| {
+                        if *keep {
+                            kept_dispositions.next().unwrap_or(MessageDisposition::Ack)
+                        } else {
+                            MessageDisposition::Ack
+                        }
+                    })
+                    .collect();
+                inner_commit(expanded)
+            });
+            return Ok(core::ReceivedBatch {
+                messages: kept,
+                commit,
+            });
+        }
+    }
+
+    fn commit_requires_order(&self) -> bool {
+        self.inner.commit_requires_order()
+    }
+
+    async fn close(&mut self) -> anyhow::Result<()> {
+        self.inner.close().await
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+struct PyMiddlewarePublisher {
+    inner: Box<dyn core::traits::MessagePublisher>,
+    worker: Arc<PyEndpointWorker>,
+}
+
+#[async_trait]
+impl core::traits::MessagePublisher for PyMiddlewarePublisher {
+    async fn send_batch(
+        &self,
+        messages: Vec<CanonicalMessage>,
+    ) -> Result<SentBatch, core::errors::PublisherError> {
+        let outcome = self
+            .worker
+            .call(PyEndpointCall::OnSend(messages))
+            .await
+            .map_err(PyEndpointFailure::into_publisher_error)?;
+        // Acking here without sending would lose the batch, so treat anything
+        // other than a filter result as a failure.
+        let PyEndpointOutcome::Filtered(results) = outcome else {
+            return Err(core::errors::PublisherError::NonRetryable(anyhow!(
+                "Python middleware '{}' on_send returned an unexpected result",
+                self.worker.label
+            )));
+        };
+        let kept: Vec<CanonicalMessage> = results.into_iter().flatten().collect();
+        if kept.is_empty() {
+            return Ok(SentBatch::Ack);
+        }
+        self.inner.send_batch(kept).await
+    }
+
+    async fn flush(&self) -> anyhow::Result<()> {
+        self.inner.flush().await
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+/// The string a `MessageDisposition` is reported as to a Python `commit`.
+/// A `Reply` payload is not delivered to host endpoints yet; it acks.
+fn disposition_name(disposition: &MessageDisposition) -> &'static str {
+    match disposition {
+        MessageDisposition::Ack | MessageDisposition::Reply(_) => "ack",
+        MessageDisposition::Nack => "nack",
     }
 }
 
@@ -1975,7 +2652,6 @@ fn python_to_json_bytes(obj: &Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
     Ok(payload)
 }
 
-#[cfg(test)]
 fn json_to_python(py: Python<'_>, value: &JsonValue) -> PyResult<Py<PyAny>> {
     let payload = serde_json::to_vec(value)
         .map_err(|err| PyValueError::new_err(format!("failed to serialize JSON payload: {err}")))?;
@@ -2095,6 +2771,67 @@ fn finish_run(run_state: &Arc<Mutex<RouteRunState>>, name: &str) {
     }
 }
 
+/// Register a Python endpoint factory under `name`, making `name` usable as an
+/// endpoint type in route configs (`{"input": {"pulsar": {...}}}`, or the
+/// explicit `{"custom": {"name": "pulsar", "config": {...}}}` form).
+///
+/// `factory` is called as `factory(route_name, config)` once per route leg and
+/// must return an object implementing `receive_batch(max_messages)` (input side)
+/// and/or `send_batch(messages)` (output side), optionally `commit(dispositions)`
+/// and `close()`. Register before starting any route that names it; registering
+/// the same name twice keeps the last factory.
+#[pyfunction]
+fn register_endpoint(py: Python<'_>, name: &str, factory: Py<PyAny>) -> PyResult<()> {
+    if name.trim().is_empty() {
+        return Err(PyValueError::new_err("endpoint name must not be empty"));
+    }
+    if !factory.bind(py).is_callable() {
+        return Err(PyTypeError::new_err(
+            "factory must be callable as factory(route_name, config)",
+        ));
+    }
+    core::extensions::register_endpoint_factory(
+        name,
+        Arc::new(PyEndpointFactory {
+            name: name.to_string(),
+            factory,
+        }),
+    );
+    Ok(())
+}
+
+/// Register a Python middleware factory under `name`, making it usable in any
+/// endpoint's `middlewares` list as `{"custom": {"name": name, "config": {...}}}`.
+///
+/// `factory` is called as `factory(route_name, config)` once per endpoint the
+/// middleware is attached to. It must return an object implementing
+/// `on_receive(messages)` (applies on an input endpoint) and/or
+/// `on_send(messages)` (applies on an output endpoint). A side the object does
+/// not implement passes through untouched.
+///
+/// Both hooks take the batch and must return one item per input message: a
+/// `Message` (kept, possibly rewritten) or `None` to drop it. Keeping the length
+/// fixed is what lets acknowledgements stay aligned with the source batch.
+#[pyfunction]
+fn register_middleware(py: Python<'_>, name: &str, factory: Py<PyAny>) -> PyResult<()> {
+    if name.trim().is_empty() {
+        return Err(PyValueError::new_err("middleware name must not be empty"));
+    }
+    if !factory.bind(py).is_callable() {
+        return Err(PyTypeError::new_err(
+            "factory must be callable as factory(route_name, config)",
+        ));
+    }
+    core::extensions::register_middleware_factory(
+        name,
+        Arc::new(PyMiddlewareFactory {
+            name: name.to_string(),
+            factory,
+        }),
+    );
+    Ok(())
+}
+
 /// Return the JSON Schema for the route/config mapping, generated on demand
 /// from the compiled Rust models (no checked-in copy, so it cannot drift).
 #[pyfunction]
@@ -2174,6 +2911,8 @@ fn _mq_bridge(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add("__version__", env!("CARGO_PKG_VERSION"))?;
     module.add_function(wrap_pyfunction!(config_schema, module)?)?;
     module.add_function(wrap_pyfunction!(init_logging, module)?)?;
+    module.add_function(wrap_pyfunction!(register_endpoint, module)?)?;
+    module.add_function(wrap_pyfunction!(register_middleware, module)?)?;
     module.add("RetryableError", module.py().get_type::<RetryableError>())?;
     module.add(
         "NonRetryableError",

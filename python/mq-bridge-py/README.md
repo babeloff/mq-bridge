@@ -263,6 +263,42 @@ def orders():
         consumer.commit()
 ```
 
+## Custom endpoints and middleware
+
+Register a Python object as an endpoint, and use its name in any route config —
+useful when a system has a good Python SDK but no Rust one.
+
+```python
+import mq_bridge
+
+class PulsarSource:
+    def __init__(self, config):
+        self.consumer = make_client(config["url"]).subscribe(config["topic"])
+
+    def receive_batch(self, max_messages):
+        # [] / None = nothing right now; raise StopIteration for end of stream
+        return [m.data() for m in self.consumer.batch(max_messages)]
+
+    def commit(self, dispositions):   # optional: one "ack"/"nack" per message
+        ...
+
+mq_bridge.register_endpoint("pulsar", lambda route_name, config: PulsarSource(config))
+
+route = mq_bridge.Route.from_config({
+    "input": {"pulsar": {"url": "pulsar://localhost:6650", "topic": "orders"}},
+    "output": {"file": {"path": "orders.jsonl"}},
+}, "ingest")
+```
+
+Implement `send_batch(messages)` instead of `receive_batch` for an output. A
+middleware works the same way via `register_middleware`, with `on_receive` /
+`on_send` hooks that return one slot per input message (`None` drops it).
+
+Each endpoint instance runs on its own thread and never sees concurrent calls, so
+it need not be thread-safe. Register before starting a route that names it.
+
+**Full guide, including the Rust path:** [EXTENDING.md](../../EXTENDING.md).
+
 ## Logging
 
 By default the Rust core's internal `tracing` events go nowhere. Call

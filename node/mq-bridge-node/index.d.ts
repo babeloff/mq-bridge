@@ -151,4 +151,72 @@ export function initLogging(
   level?: string | null,
 ): void;
 
+/** Throw from {@link CustomEndpoint.receiveBatch} to end the route cleanly. */
+export class EndOfStream extends Error {
+  constructor(message?: string);
+}
+
+/** One message disposition reported to {@link CustomEndpoint.commit}. */
+export type Disposition = "ack" | "nack";
+
+/** What a {@link registerEndpoint} factory returns. */
+export interface CustomEndpoint {
+  /**
+   * Read up to `maxMessages`. Return `null` or `[]` when nothing is available
+   * right now (the route backs off and retries; under `exit_on_empty` this is
+   * the drain signal), or throw {@link EndOfStream} when the source is done.
+   */
+  receiveBatch?(maxMessages: number): Promise<Iterable<Message | Buffer | string> | null>;
+  /** Called once per received batch, with one disposition per message. */
+  commit?(dispositions: Disposition[]): Promise<void> | void;
+  /** Publish a batch. Throw to fail it; set `err.retryable` to have it retried. */
+  sendBatch?(messages: Message[]): Promise<void> | void;
+  /** Called when the route releases the endpoint. */
+  close?(): Promise<void> | void;
+}
+
+/**
+ * Register a custom endpoint implemented in JavaScript under `name`, making it
+ * usable as an endpoint type in route configs — either as `{ pulsar: {...} }`
+ * or explicitly as `{ custom: { name: "pulsar", config: {...} } }`.
+ *
+ * `factory` is called once per route leg. The returned object must implement
+ * `receiveBatch` to be usable as an input and/or `sendBatch` to be usable as an
+ * output. Register before starting a route that names it; registering the same
+ * name twice keeps the last factory.
+ */
+export function registerEndpoint(
+  name: string,
+  factory: (
+    routeName: string,
+    config: Record<string, JsonValue>,
+  ) => CustomEndpoint | Promise<CustomEndpoint>,
+): void;
+
+/** What a {@link registerMiddleware} factory returns. */
+export interface CustomMiddleware {
+  /** Applies on an input endpoint, after the source produced the batch. */
+  onReceive?(messages: Message[]): Promise<(Message | null)[]> | (Message | null)[];
+  /** Applies on an output endpoint, before the sink receives the batch. */
+  onSend?(messages: Message[]): Promise<(Message | null)[]> | (Message | null)[];
+}
+
+/**
+ * Register a custom middleware implemented in JavaScript under `name`, usable in
+ * any endpoint's `middlewares` list as `{ custom: { name, config: {...} } }`.
+ *
+ * `factory` is called once per endpoint the middleware is attached to. A side
+ * the returned object does not implement passes through untouched. Both hooks
+ * must return one item per input message — a `Message` to keep it (possibly
+ * rewritten) or `null` to drop it — which is what keeps acknowledgements aligned
+ * with the source batch.
+ */
+export function registerMiddleware(
+  name: string,
+  factory: (
+    routeName: string,
+    config: Record<string, JsonValue>,
+  ) => CustomMiddleware | Promise<CustomMiddleware>,
+): void;
+
 export const version: string;
