@@ -1050,7 +1050,7 @@ async fn test_commit_concurrency_limit() {
             delay: Duration::from_millis(50),
         });
         let middleware_name = format!("slow_commit_{}_{}", limit, test_id);
-        mq_bridge::route::register_middleware_factory(&middleware_name, factory);
+        mq_bridge::route::register_middleware_factory(&middleware_name, factory).unwrap();
 
         let input = Endpoint::new_memory(&format!("in_limit_{}_{}", limit, test_id), 100)
             .add_middleware(Middleware::Custom {
@@ -1204,7 +1204,7 @@ async fn test_custom_endpoint_factory_programmatic() {
         }
     }
 
-    mq_bridge::route::register_endpoint_factory("my_factory", Arc::new(MyFactory));
+    mq_bridge::route::register_endpoint_factory("my_factory", Arc::new(MyFactory)).unwrap();
 
     let input = Endpoint::new(EndpointType::Custom {
         name: "my_factory".to_string(),
@@ -1295,13 +1295,14 @@ async fn test_custom_components_yaml_configuration() {
     }
 
     let mw_flag = Arc::new(AtomicBool::new(false));
-    register_endpoint_factory("my_yaml_endpoint", Arc::new(YamlEndpointFactory));
+    register_endpoint_factory("my_yaml_endpoint", Arc::new(YamlEndpointFactory)).unwrap();
     register_middleware_factory(
         "my_yaml_middleware",
         Arc::new(YamlMiddlewareFactory {
             flag: mw_flag.clone(),
         }),
-    );
+    )
+    .unwrap();
 
     let yaml = r#"
     yaml_test_route:

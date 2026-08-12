@@ -193,6 +193,32 @@ export function registerEndpoint(
   ) => CustomEndpoint | Promise<CustomEndpoint>,
 ): void;
 
+/**
+ * Load a native endpoint plugin and register the endpoint it provides.
+ *
+ * `path` is the compiled plugin library shipped by an endpoint package (for
+ * example `mq-bridge-pulsar`), which normally exposes its own `register()`
+ * helper that resolves the bundled file and calls this. Returns the registered
+ * endpoint name, usable as a route's endpoint type.
+ *
+ * Call once, before starting routes; loading the same file again is a no-op. A
+ * plugin is native code with the same privileges as the Node process.
+ */
+export function loadEndpointPlugin(path: string): string;
+
+/** Resolves the native library in an mq-bridge plugin package directory. */
+export function pluginLibraryPath(packageDirectory: string): string;
+
+/** Resolves and loads the native library in an mq-bridge plugin package. */
+export function loadPluginPackage(packageDirectory: string): string;
+
+/** Standard exports for a thin JavaScript plugin package entry point. */
+export function definePluginPackage(packageDirectory: string): {
+  ENDPOINT_NAME: string;
+  libraryPath(): string;
+  register(): string;
+};
+
 /** What a {@link registerMiddleware} factory returns. */
 export interface CustomMiddleware {
   /** Applies on an input endpoint, after the source produced the batch. */

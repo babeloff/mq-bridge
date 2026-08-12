@@ -124,14 +124,16 @@ async fn test_ref_middleware_ordering() {
             tag: "inner".into(),
             log: log.clone(),
         }),
-    );
+    )
+    .unwrap();
     mq_bridge::route::register_middleware_factory(
         "log_outer",
         Arc::new(LogMiddleware {
             tag: "outer".into(),
             log: log.clone(),
         }),
-    );
+    )
+    .unwrap();
 
     // Define Inner Endpoint with "inner" middleware
     let inner_ep = Endpoint::new_memory("order_test", 10).add_middleware(Middleware::Custom {

@@ -2,6 +2,24 @@
 
 All notable changes to `mq-bridge`. Newest first.
 
+## Unreleased
+
+### Added
+
+- Native endpoint plugins. An endpoint can live in its own crate and package and be loaded
+  into any mq-bridge process at runtime — `mq_bridge::plugin::load_endpoint_plugin(path)` in
+  Rust, `mq_bridge.load_endpoint_plugin(path)` in Python, `loadEndpointPlugin(path)` in
+  Node.js — so a broker's dependencies stay out of curated mq-bridge builds while every
+  language runs the same implementation and delivery semantics. The `plugin` feature (part of
+  `full` and `portable`) provides the loader; `plugin-sdk` provides the authoring side:
+  `export_endpoint_plugin!`, which exports an ordinary `CustomEndpointFactory` through the
+  stable C ABI with no handwritten `unsafe`, and a conformance suite to run against the
+  endpoint both linked directly and loaded as a plugin. A plugin can provide a
+  middleware too (`export_middleware_plugin!`, or `middleware:` alongside an
+  endpoint): it returns one entry per message — `None` drops it — while the
+  wrapper around the endpoint stays on the host side, so nothing calls back
+  across the boundary. See [PLUGINS.md](docs/PLUGINS.md).
+
 ## 0.3.10
 
 

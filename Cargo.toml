@@ -12,11 +12,17 @@ keywords = ["messaging", "kafka", "nats", "amqp", "cqrs"]
 categories = ["asynchronous", "network-programming"]
 
 [workspace]
-members = ["bindings-common", "python/mq-bridge-py", "node/mq-bridge-node"]
+members = [
+    "bindings-common",
+    "python/mq-bridge-py",
+    "node/mq-bridge-node",
+    "tests/fixtures/plugin-fixture",
+    "tests/fixtures/plugin-fixture-bad-abi",
+]
 resolver = "2"
 
 [workspace.package]
-version = "0.3.10"
+version = "0.3.11"
 
 [workspace.dependencies]
 anyhow = "1.0"
@@ -54,6 +60,7 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "ti
 # - "amqp" (lapin 4.10) requires Rust 1.88+; "http" (hyper-rustls 0.27) requires Rust 1.85+.
 # - "websocket" (tokio-websockets 0.13) requires Rust 1.89+.
 # - "mongodb" (mongodb 3.8) requires Rust 1.88+; "nats" (async-nats 0.50) requires Rust 1.88+.
+# - "plugin" (libloading 0.9) requires Rust 1.88+.
 # - "aws" (aws-sdk-*) may require a newer stable toolchain than the base MSRV.
 # Use `rustup override set stable` or a `rust-toolchain.toml` file when enabling these features.
 async-trait.workspace = true
@@ -67,6 +74,10 @@ async-channel = { version = "2.5" }
 # Unix sockets and Windows named pipes). Already in the tree transitively.
 tokio-util = { version = "0.7", features = ["codec"] }
 once_cell = { version = "1.21" }
+# Dynamic loading for native endpoint plugins (`plugin` feature). Pure Rust,
+# no C toolchain; the ABI itself lives in src/support/plugin_abi.rs.
+# 0.9 needs Rust 1.88+, like the amqp/mongodb/nats features.
+libloading = { version = "0.9", optional = true }
 # SHA-256 for hashing connection-registry identities so secret-bearing fields
 # (URL/TLS passwords) are never retained verbatim in cache keys.
 sha2 = "0.11"
@@ -217,7 +228,7 @@ float-roundtrip = ["serde_json/float_roundtrip"]
 # runtime the client is loaded lazily only when an ibm-mq endpoint is opened
 # (clear error if the client isn't installed). Use `ibm-mq-static` instead for
 # static linking.
-full = ["middleware", "mongodb", "kafka", "amqp", "nats", "mqtt", "http", "aws", "zeromq", "zeromq-omq", "redis-streams", "sled", "grpc", "sqlx", "clickhouse", "websocket", "postgres-cdc", "object-store", "rustls-aws-lc", "ibm-mq"]
+full = ["middleware", "plugin", "mongodb", "kafka", "amqp", "nats", "mqtt", "http", "aws", "zeromq", "zeromq-omq", "redis-streams", "sled", "grpc", "sqlx", "clickhouse", "websocket", "postgres-cdc", "object-store", "rustls-aws-lc", "ibm-mq"]
 
 # Endpoints that build across most OS targets (glibc/musl/Alpine, macOS,
 # Windows, aarch64/armv7) without a special toolchain — no librdkafka, protoc,
@@ -227,7 +238,7 @@ full = ["middleware", "mongodb", "kafka", "amqp", "nats", "mqtt", "http", "aws",
 # kafka (librdkafka), sqlx (libsqlite3-sys), grpc (protoc), ibm-mq/ibm-mq-static
 # (IBM C client). postgres-cdc is excluded too: its wire protocol is pure Rust
 # but it pulls in sqlx (C).
-portable = ["metrics", "dedup", "mongodb", "amqp", "nats", "mqtt", "http", "aws", "zeromq", "redis-streams", "clickhouse", "websocket", "object-store", "rustls-aws-lc"]
+portable = ["metrics", "dedup", "plugin", "mongodb", "amqp", "nats", "mqtt", "http", "aws", "zeromq", "redis-streams", "clickhouse", "websocket", "object-store", "rustls-aws-lc"]
 
 # Functionality features
 dedup = ["sled"]
@@ -238,7 +249,14 @@ compression = ["dep:flate2", "dep:lz4_flex", "dep:zstd"]
 # `encryption` field on the file/object_store endpoints.
 encryption = ["dep:chacha20poly1305", "dep:aes-gcm"]
 metrics = ["dep:metrics"]
-test-utils = ["dep:tracing-appender", "dep:tracing-subscriber", "dep:serde_yaml_ng"]
+# Load endpoints from native plugin libraries at runtime (`mq_bridge::plugin`).
+# The endpoint itself lives in its own crate and package; see docs/PLUGINS.md.
+plugin = ["dep:libloading"]
+# Author an endpoint plugin: the export macro, the FFI adapters and the
+# conformance suite (`mq_bridge::plugin::sdk` / `::conformance`). Endpoint
+# crates enable this; hosts only need `plugin`.
+plugin-sdk = ["plugin"]
+test-utils =["dep:tracing-appender", "dep:tracing-subscriber", "dep:serde_yaml_ng"]
 # Opt-in produce/consume-only isolation benchmarks (throwaway diagnostics, off by default)
 perf-diagnostics = ["test-utils"]
 

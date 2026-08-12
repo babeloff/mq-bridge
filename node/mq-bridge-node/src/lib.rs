@@ -885,8 +885,35 @@ pub fn register_middleware_dispatch(
             name: name.clone(),
             dispatch: Arc::new(dispatch),
         }),
-    );
+    )
+    .map_err(|err| Error::from_reason(format!("{err:#}")))?;
     Ok(())
+}
+
+/// Load a native endpoint plugin and register the endpoint it provides.
+///
+/// `path` is the compiled plugin library shipped by an endpoint package (for
+/// example `mq-bridge-pulsar`); those packages expose a `register()` helper that
+/// resolves the bundled file and calls this. Returns the registered endpoint
+/// name, usable as a route's endpoint type.
+///
+/// Call once, before starting routes. Loading the same file again is a no-op.
+/// A plugin is native code with the same privileges as the Node process.
+#[napi(js_name = "loadEndpointPlugin")]
+pub fn load_endpoint_plugin(path: String) -> Result<String> {
+    #[cfg(feature = "plugin")]
+    {
+        core::plugin::load_endpoint_plugin(&path)
+            .map(|info| info.name)
+            .map_err(|err| Error::from_reason(format!("{err:#}")))
+    }
+    #[cfg(not(feature = "plugin"))]
+    {
+        let _ = path;
+        Err(Error::from_reason(
+            "this mq-bridge build was compiled without native plugin support",
+        ))
+    }
 }
 
 /// Register a JS endpoint dispatcher under `name`. Called by the `registerEndpoint`
@@ -912,7 +939,8 @@ pub fn register_endpoint_dispatch(
             name: name.clone(),
             dispatch: Arc::new(dispatch),
         }),
-    );
+    )
+    .map_err(|err| Error::from_reason(format!("{err:#}")))?;
     Ok(())
 }
 

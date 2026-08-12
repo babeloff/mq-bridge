@@ -3348,7 +3348,7 @@ dependencies = [
 
 [[package]]
 name = "mq-bridge"
-version = "0.3.10"
+version = "0.3.11"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -3377,6 +3377,7 @@ dependencies = [
  "hyper-rustls 0.27.9",
  "hyper-util",
  "lapin",
+ "libloading",
  "libmqm-sys",
  "lz4_flex",
  "metrics",
@@ -3429,7 +3430,7 @@ dependencies = [
 
 [[package]]
 name = "mq-bridge-bindings-common"
-version = "0.3.10"
+version = "0.3.11"
 dependencies = [
  "anyhow",
  "fast-uuid-v7",
@@ -3443,7 +3444,7 @@ dependencies = [
 
 [[package]]
 name = "mq-bridge-node"
-version = "0.3.10"
+version = "0.3.11"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3464,8 +3465,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "mq-bridge-plugin-fixture"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "mq-bridge",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "mq-bridge-plugin-fixture-bad-abi"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "mq-bridge",
+]
+
+[[package]]
 name = "mq-bridge-py"
-version = "0.3.10"
+version = "0.3.11"
 dependencies = [
  "anyhow",
  "async-trait",

@@ -14,7 +14,9 @@ Registration is process-global and keyed by name. **Register before starting any
 route that names it**; registering the same name twice keeps the last one.
 
 > Looking for the built-in endpoints and middleware instead? See
-> [REFERENCE.md](REFERENCE.md).
+> [REFERENCE.md](REFERENCE.md). To ship a Rust endpoint as a loadable library
+> that Rust, Python and Node.js hosts can all load — an endpoint, a middleware
+> or both — see [PLUGINS.md](PLUGINS.md).
 
 ---
 
@@ -407,14 +409,14 @@ like an open server). Call `process.exit()` when your script is done.
 Reach for a host-language endpoint when the vendor ships a good Python/Node SDK
 and no Rust one, or when the endpoint is glue specific to your deployment. Write
 it in Rust when it is a real transport other people will want, when it must keep
-up with a high-throughput route, or when you want to publish it as a crate — as
-[the Pulsar example](https://github.com/marcomq/mq-bridge/issues/45) is meant to
-be.
+up with a high-throughput route, or when you want to publish it — as a crate, or
+as a native plugin every language can load ([PLUGINS.md](PLUGINS.md)).
 
 ---
 
 ## See also
 
+- [PLUGINS.md](PLUGINS.md) — ship a Rust endpoint or middleware as a loadable native plugin
 - [REFERENCE.md](REFERENCE.md) — every built-in endpoint and middleware
 - [ARCHITECTURE.md](ARCHITECTURE.md) — how routes, batching and commits fit together
 - [CONFIGURATION.md](CONFIGURATION.md) — config loading, env vars, schema validation

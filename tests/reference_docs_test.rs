@@ -87,8 +87,9 @@ fn middlewares(entries_yaml: &str, line: usize) -> Vec<Middleware> {
 }
 
 fn endpoint(yaml: &str) -> Endpoint {
-    serde_yaml_ng::from_str(yaml)
-        .unwrap_or_else(|e| panic!("docs/REFERENCE.md endpoint snippet does not parse: {e}\n{yaml}"))
+    serde_yaml_ng::from_str(yaml).unwrap_or_else(|e| {
+        panic!("docs/REFERENCE.md endpoint snippet does not parse: {e}\n{yaml}")
+    })
 }
 
 /// Endpoint blocks in the reference are shown in place, under the `input:` / `output:` key
@@ -102,7 +103,9 @@ fn endpoints(body: &str, line: usize) -> Vec<Endpoint> {
         }
         let fragment: HashMap<String, Endpoint> =
             serde_yaml_ng::from_str(chunk).unwrap_or_else(|e| {
-                panic!("docs/REFERENCE.md endpoint block at line {line} does not parse: {e}\n{chunk}")
+                panic!(
+                    "docs/REFERENCE.md endpoint block at line {line} does not parse: {e}\n{chunk}"
+                )
             });
         for (key, value) in fragment {
             assert!(

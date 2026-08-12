@@ -1941,11 +1941,13 @@ mod tests {
                 observation: Arc::clone(&observation),
                 requires_order: true,
             }),
-        );
+        )
+        .unwrap();
         register_middleware_factory(
             &reorder_name,
             Arc::new(ReorderingPublisherMiddlewareFactory),
-        );
+        )
+        .unwrap();
 
         let input = Endpoint::new_memory(&in_topic, 32).add_middleware(Middleware::Custom {
             name: tracking_name,
@@ -2016,7 +2018,8 @@ mod tests {
                 observation: Arc::clone(&observation),
                 requires_order: false,
             }),
-        );
+        )
+        .unwrap();
 
         let input = Endpoint::new_memory(&in_topic, 64).add_middleware(Middleware::Custom {
             name: tracking_name,
@@ -2336,7 +2339,8 @@ mod tests {
             Arc::new(FailingMiddlewareFactory {
                 fail_flag: fail_flag.clone(),
             }),
-        );
+        )
+        .unwrap();
 
         let input = Endpoint::new_memory(&in_topic, 100);
         let output = Endpoint::new_memory(&out_topic, 100).add_middleware(Middleware::Custom {
@@ -2675,7 +2679,7 @@ mod tests {
             }) as Box<dyn MessagePublisher>)
         }));
 
-        register_endpoint_factory(&factory_name, Arc::new(factory));
+        register_endpoint_factory(&factory_name, Arc::new(factory)).unwrap();
 
         let input = Endpoint {
             endpoint_type: EndpointType::Custom {
@@ -2775,7 +2779,7 @@ mod tests {
             create_consumer_fail: true,
             ..MockEndpointFactory::new()
         });
-        register_endpoint_factory(&factory_name, factory);
+        register_endpoint_factory(&factory_name, factory).unwrap();
 
         let input = Endpoint {
             endpoint_type: EndpointType::Custom {
@@ -2848,7 +2852,7 @@ mod tests {
 
         let mut factory = MockEndpointFactory::new();
         factory.consumer_behavior = Arc::new(Mutex::new(consumer_logic));
-        register_endpoint_factory(&factory_name, Arc::new(factory));
+        register_endpoint_factory(&factory_name, Arc::new(factory)).unwrap();
 
         let input = Endpoint {
             endpoint_type: EndpointType::Custom {
@@ -2916,7 +2920,7 @@ mod tests {
 
         let mut factory = MockEndpointFactory::new();
         factory.consumer_behavior = Arc::new(Mutex::new(consumer_logic));
-        register_endpoint_factory(&factory_name, Arc::new(factory));
+        register_endpoint_factory(&factory_name, Arc::new(factory)).unwrap();
 
         let input = Endpoint {
             endpoint_type: EndpointType::Custom {
@@ -2989,7 +2993,7 @@ mod tests {
             }
             Ok(Box::new(CountingFailPublisher(sends_pub.clone())) as Box<dyn MessagePublisher>)
         }));
-        register_endpoint_factory(&factory_name, Arc::new(factory));
+        register_endpoint_factory(&factory_name, Arc::new(factory)).unwrap();
 
         let handler_calls = Arc::new(AtomicUsize::new(0));
         let handler_calls_inner = handler_calls.clone();
@@ -3077,7 +3081,7 @@ mod tests {
             }
             Ok(Box::new(DeadPublisher) as Box<dyn MessagePublisher>)
         }));
-        register_endpoint_factory(&factory_name, Arc::new(factory));
+        register_endpoint_factory(&factory_name, Arc::new(factory)).unwrap();
 
         // A file source, like the reported repro: it re-reads the same records after a
         // reconnect, so the failing batch comes back around every pass. That is what
@@ -3155,7 +3159,7 @@ mod tests {
             }
             Ok(Box::new(DeadLeg) as Box<dyn MessagePublisher>)
         }));
-        register_endpoint_factory(&factory_name, Arc::new(factory));
+        register_endpoint_factory(&factory_name, Arc::new(factory)).unwrap();
 
         let dir = tempfile::tempdir().unwrap();
         let in_path = dir.path().join("in5.jsonl");
@@ -3235,7 +3239,7 @@ mod tests {
             }
             Ok(Box::new(AlwaysFails) as Box<dyn MessagePublisher>)
         }));
-        register_endpoint_factory(&factory_name, Arc::new(factory));
+        register_endpoint_factory(&factory_name, Arc::new(factory)).unwrap();
 
         let dir = tempfile::tempdir().unwrap();
         let in_path = dir.path().join("fan_in.jsonl");
@@ -3391,7 +3395,7 @@ mod tests {
                 }
                 Ok(Box::new(Disconnected) as Box<dyn MessagePublisher>)
             }));
-            register_endpoint_factory(&factory_name, Arc::new(factory));
+            register_endpoint_factory(&factory_name, Arc::new(factory)).unwrap();
 
             let dir = tempfile::tempdir().unwrap();
             let in_path = dir.path().join("in.jsonl");
@@ -3570,7 +3574,7 @@ mod tests {
                 Ok(Box::new(NoOpPublisher) as Box<dyn MessagePublisher>)
             }
         }));
-        register_endpoint_factory(&factory_name, Arc::new(factory));
+        register_endpoint_factory(&factory_name, Arc::new(factory)).unwrap();
 
         let in_topic = format!("recovering_in_{}", unique_id);
         let input = Endpoint::new_memory(&in_topic, 10);

@@ -1,5 +1,7 @@
 "use strict";
 
+const fs = require("node:fs");
+const path = require("node:path");
 const native = require("./native.js");
 
 class Message {
@@ -398,6 +400,60 @@ function initLogging(callback, level = null) {
   return native.initLogging(callback, level);
 }
 
+function loadEndpointPlugin(path) {
+  return native.loadEndpointPlugin(path);
+}
+
+function pluginPlatformTag(platform = process.platform, arch = process.arch) {
+  const normalizedArch = arch === "x86_64" ? "x64" : arch === "aarch64" ? "arm64" : arch;
+  const suffix = platform === "linux" ? "-gnu" : platform === "win32" ? "-msvc" : "";
+  return `${platform}-${normalizedArch}${suffix}`;
+}
+
+function pluginLibraryPath(packageDirectory) {
+  const root = path.resolve(packageDirectory);
+  const manifestPath = path.join(root, "mq-bridge-plugin.json");
+  if (!fs.existsSync(manifestPath)) {
+    throw new Error(`mq-bridge plugin manifest not found: ${manifestPath}`);
+  }
+  const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
+  if (typeof manifest.name !== "string" || typeof manifest.library !== "string") {
+    throw new Error(`${manifestPath} must contain string fields 'name' and 'library'`);
+  }
+  const fileName = process.platform === "win32"
+    ? `${manifest.library}.dll`
+    : process.platform === "darwin"
+      ? `lib${manifest.library}.dylib`
+      : `lib${manifest.library}.so`;
+  const candidates = [
+    path.join(root, "prebuilds", pluginPlatformTag(), fileName),
+    path.join(root, fileName),
+  ];
+  const library = candidates.find((candidate) => fs.existsSync(candidate));
+  if (library) {
+    return library;
+  }
+  throw new Error(
+    `no native library for ${pluginPlatformTag()} in mq-bridge plugin package ${root}; ` +
+      `looked in ${candidates.join(", ")}`,
+  );
+}
+
+function loadPluginPackage(packageDirectory) {
+  return loadEndpointPlugin(pluginLibraryPath(packageDirectory));
+}
+
+function definePluginPackage(packageDirectory) {
+  const manifest = JSON.parse(
+    fs.readFileSync(path.join(path.resolve(packageDirectory), "mq-bridge-plugin.json"), "utf8"),
+  );
+  return {
+    ENDPOINT_NAME: manifest.name,
+    libraryPath: () => pluginLibraryPath(packageDirectory),
+    register: () => loadPluginPackage(packageDirectory),
+  };
+}
+
 module.exports = {
   Message,
   Publisher,
@@ -406,6 +462,10 @@ module.exports = {
   EndOfStream,
   configSchema,
   initLogging,
+  definePluginPackage,
+  loadEndpointPlugin,
+  loadPluginPackage,
+  pluginLibraryPath,
   registerEndpoint,
   registerMiddleware,
   version: native.VERSION,

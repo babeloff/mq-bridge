@@ -10,11 +10,15 @@
   },
   "main": "index.js",
   "types": "index.d.ts",
+  "bin": {
+    "mq-bridge-package-plugin": "plugin-packaging.mjs"
+  },
   "files": [
     "index.js",
     "index.d.ts",
     "native.js",
-    "native.d.ts"
+    "native.d.ts",
+    "plugin-packaging.mjs"
   ],
   "napi": {
     "binaryName": "mq_bridge_node",

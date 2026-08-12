@@ -7,6 +7,8 @@ from mq_bridge import (
     Route,
     config_schema,
     init_logging,
+    load_plugin_package,
+    plugin_library_path,
 )
 
 
@@ -22,6 +24,8 @@ def test_public_exports_are_available() -> None:
     assert RetryableError is not None
     assert config_schema is not None
     assert init_logging is not None
+    assert load_plugin_package is not None
+    assert plugin_library_path is not None
 
 
 def test_config_schema_is_public_api() -> None:

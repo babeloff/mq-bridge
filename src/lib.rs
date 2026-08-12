@@ -19,6 +19,8 @@ pub mod extensions;
 pub mod middleware;
 pub mod models;
 pub mod outcomes;
+#[cfg(feature = "plugin")]
+pub mod plugin;
 pub mod publisher;
 pub mod response;
 pub mod route;

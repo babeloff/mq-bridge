@@ -2796,7 +2796,8 @@ fn register_endpoint(py: Python<'_>, name: &str, factory: Py<PyAny>) -> PyResult
             name: name.to_string(),
             factory,
         }),
-    );
+    )
+    .map_err(|err| PyValueError::new_err(format!("{err:#}")))?;
     Ok(())
 }
 
@@ -2828,8 +2829,35 @@ fn register_middleware(py: Python<'_>, name: &str, factory: Py<PyAny>) -> PyResu
             name: name.to_string(),
             factory,
         }),
-    );
+    )
+    .map_err(|err| PyValueError::new_err(format!("{err:#}")))?;
     Ok(())
+}
+
+/// Load a native endpoint plugin and register the endpoint it provides.
+///
+/// `path` is the compiled plugin library shipped by an endpoint package (for
+/// example `mq_bridge_pulsar`); those packages expose a `register()` helper that
+/// resolves the bundled file and calls this. Returns the registered endpoint
+/// name, which routes then use as `type`/`custom name`.
+///
+/// Call once, before starting routes. Loading the same file again is a no-op.
+/// A plugin is native code with the same privileges as the interpreter.
+#[pyfunction]
+fn load_endpoint_plugin(path: String) -> PyResult<String> {
+    #[cfg(feature = "plugin")]
+    {
+        core::plugin::load_endpoint_plugin(&path)
+            .map(|info| info.name)
+            .map_err(|err| PyRuntimeError::new_err(format!("{err:#}")))
+    }
+    #[cfg(not(feature = "plugin"))]
+    {
+        let _ = path;
+        Err(PyRuntimeError::new_err(
+            "this mq_bridge build was compiled without native plugin support",
+        ))
+    }
 }
 
 /// Return the JSON Schema for the route/config mapping, generated on demand
@@ -2911,6 +2939,7 @@ fn _mq_bridge(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add("__version__", env!("CARGO_PKG_VERSION"))?;
     module.add_function(wrap_pyfunction!(config_schema, module)?)?;
     module.add_function(wrap_pyfunction!(init_logging, module)?)?;
+    module.add_function(wrap_pyfunction!(load_endpoint_plugin, module)?)?;
     module.add_function(wrap_pyfunction!(register_endpoint, module)?)?;
     module.add_function(wrap_pyfunction!(register_middleware, module)?)?;
     module.add("RetryableError", module.py().get_type::<RetryableError>())?;

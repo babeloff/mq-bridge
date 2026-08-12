@@ -51,7 +51,7 @@ pyo3 = { version = "0.29.0", features = ["abi3-py38", "auto-initialize"] }
 default = ["full"]
 # Testing-only middleware hooks; do not include this feature in production wheels.
 middleware = ["mq-bridge/middleware"]
-full = ["mq-bridge/full", "rustls-aws-lc", "mimalloc"]
+full = ["mq-bridge/full", "plugin", "rustls-aws-lc", "mimalloc"]
 # mimalloc as Rust-side global allocator. Only redirects allocations made by
 # this cdylib's Rust code; CPython's own allocator is untouched. Safe here
 # because no raw Rust-allocated buffer crosses the extension boundary.
@@ -72,9 +72,11 @@ mimalloc = ["dep:mimalloc"]
 #   - ibm-mq-static -> IBM MQ proprietary C client linked at build (SDK needed)
 # `middleware` is intentionally excluded (metrics + sled dedup are not needed in
 # production wheels; retry/DLQ are not feature-gated and remain available).
-basic = ["mq-bridge/portable", "rustls-aws-lc"]
+basic = ["mq-bridge/portable", "plugin", "rustls-aws-lc"]
 dedup = ["mq-bridge/dedup"]
 metrics = ["mq-bridge/metrics"]
+# Load endpoints from native plugin libraries via `mq_bridge.load_endpoint_plugin`.
+plugin = ["mq-bridge/plugin"]
 # Compatibility alias: config_schema is part of the public Python API and is
 # always compiled.
 schema = []

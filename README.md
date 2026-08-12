@@ -163,6 +163,11 @@ Known rough edges (be deliberate here):
 > **[REFERENCE.md](docs/REFERENCE.md)** lists every middleware and every structural endpoint
 > (`ref`, `fanout`, `switch`, `request`, `response`, `reader`, `static`, `stream_buffer`,
 > `null`, `custom`) with fields, defaults and working examples.
+>
+> To add an endpoint of your own, see **[EXTENDING.md](docs/EXTENDING.md)** — or
+> **[PLUGINS.md](docs/PLUGINS.md)** to ship a Rust endpoint or middleware as a native
+> library that Rust, Python and Node.js hosts all load at runtime, without compiling it
+> into mq-bridge.
 
 ## Backend Features & Configuration
 
