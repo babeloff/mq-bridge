@@ -41,3 +41,29 @@ test("definePluginPackage creates the standard thin-package exports", (t) => {
   assert.equal(plugin.libraryPath(), library);
   assert.equal(typeof plugin.register, "function");
 });
+
+test("pluginLibraryPath reports a missing manifest", (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "mq-bridge-plugin-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  assert.throws(() => pluginLibraryPath(root), /plugin manifest not found/);
+});
+
+test("pluginLibraryPath rejects invalid manifest fields", (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "mq-bridge-plugin-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  fs.writeFileSync(
+    path.join(root, "mq-bridge-plugin.json"),
+    JSON.stringify({ name: 42, library: null }),
+  );
+  assert.throws(() => pluginLibraryPath(root), /must contain string fields/);
+});
+
+test("pluginLibraryPath reports a missing platform library", (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "mq-bridge-plugin-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  fs.writeFileSync(
+    path.join(root, "mq-bridge-plugin.json"),
+    JSON.stringify({ name: "reference", library: "reference" }),
+  );
+  assert.throws(() => pluginLibraryPath(root), /no native library for/);
+});

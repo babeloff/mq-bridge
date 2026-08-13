@@ -291,7 +291,8 @@ pub struct EndpointReply {
     /// `onReceive`/`onSend` only: one slot per input message, `null` for dropped.
     pub filtered: Option<Vec<Option<NativeMessage>>>,
     pub error: Option<String>,
-    /// Whether `error` should be retried; defaults to false.
+    /// Whether `error` should be retried. When absent, consumer errors are retried
+    /// as connection failures while publisher errors are non-retryable.
     pub retryable: Option<bool>,
 }
 
@@ -413,7 +414,7 @@ impl JsEndpointInstance {
         self.instance
             .get_or_try_init(|| async {
                 let id = NEXT_ENDPOINT_INSTANCE.fetch_add(1, Ordering::SeqCst);
-                let reply = call_js_endpoint(
+                let reply = match call_js_endpoint(
                     &self.dispatch,
                     &self.name,
                     EndpointCall {
@@ -426,7 +427,14 @@ impl JsEndpointInstance {
                         dispositions: None,
                     },
                 )
-                .await?;
+                .await
+                {
+                    Ok(reply) => reply,
+                    Err(err) => {
+                        self.close_instance(id);
+                        return Err(err);
+                    }
+                };
                 // JS has already put the instance in its table, so every path
                 // that does not keep the id has to close it or the host object
                 // (and whatever connection it opened) leaks for the process.

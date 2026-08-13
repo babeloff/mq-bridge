@@ -112,12 +112,11 @@ async fn round_trip(
     let sent = payloads("round-trip", options.messages);
     publish(&*publisher, &sent).await?;
 
-    let mut actual: Vec<String> =
-        receive(&mut *consumer, sent.len(), options, MessageDisposition::Ack)
-            .await?
-            .iter()
-            .map(|message| message.get_payload_str().to_string())
-            .collect();
+    let mut actual: Vec<String> = receive(&mut *consumer, &sent, options, MessageDisposition::Ack)
+        .await?
+        .iter()
+        .map(|message| message.get_payload_str().to_string())
+        .collect();
     let mut expected = sent;
     expected.sort();
     actual.sort();
@@ -141,7 +140,8 @@ async fn metadata_preserved(
         .insert("conformance".to_string(), "value".to_string());
     send(&*publisher, vec![message]).await?;
 
-    let received = receive(&mut *consumer, 1, options, MessageDisposition::Ack).await?;
+    let expected = vec!["metadata-check".to_string()];
+    let received = receive(&mut *consumer, &expected, options, MessageDisposition::Ack).await?;
     let value = received[0].metadata.get("conformance");
     if value.map(String::as_str) != Some("value") {
         // Not every transport carries metadata; say so precisely rather than
@@ -165,7 +165,7 @@ async fn nack_redelivers(
     let payload = payloads("nack", 1);
     publish(&*publisher, &payload).await?;
 
-    let first = receive(&mut *consumer, 1, options, MessageDisposition::Nack).await?;
+    let first = receive(&mut *consumer, &payload, options, MessageDisposition::Nack).await?;
     if first[0].get_payload_str() != payload[0] {
         bail!(
             "expected `{}`, got `{}`",
@@ -173,7 +173,7 @@ async fn nack_redelivers(
             first[0].get_payload_str()
         );
     }
-    let second = receive(&mut *consumer, 1, options, MessageDisposition::Ack).await?;
+    let second = receive(&mut *consumer, &payload, options, MessageDisposition::Ack).await?;
     if second[0].get_payload_str() != payload[0] {
         bail!(
             "a nacked message was not redelivered; got `{}`",
@@ -196,17 +196,25 @@ async fn uncommitted_batch_redelivers(
     let deadline = Instant::now() + options.receive_timeout;
     loop {
         let batch = consumer.receive_batch(1).await?;
-        if !batch.messages.is_empty() {
+        if batch.messages.iter().any(|message| {
+            payload
+                .iter()
+                .any(|value| value == message.get_payload_str())
+        }) {
             drop(batch); // deliberately without calling `batch.commit`
             break;
         }
+        let dispositions = vec![MessageDisposition::Ack; batch.messages.len()];
+        (batch.commit)(dispositions)
+            .await
+            .context("acknowledging messages left by an earlier check")?;
         if Instant::now() > deadline {
             bail!("nothing was delivered within {:?}", options.receive_timeout);
         }
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
 
-    let redelivered = receive(&mut *consumer, 1, options, MessageDisposition::Ack).await?;
+    let redelivered = receive(&mut *consumer, &payload, options, MessageDisposition::Ack).await?;
     if redelivered[0].get_payload_str() != payload[0] {
         bail!(
             "a batch dropped without commit was not redelivered; got `{}`",
@@ -275,10 +283,11 @@ async fn send(
 /// `disposition`.
 async fn receive(
     consumer: &mut dyn MessageConsumer,
-    count: usize,
+    expected: &[String],
     options: &ConformanceOptions,
     disposition: MessageDisposition,
 ) -> anyhow::Result<Vec<CanonicalMessage>> {
+    let count = expected.len();
     let deadline = Instant::now() + options.receive_timeout;
     let mut collected = Vec::with_capacity(count);
     while collected.len() < count {
@@ -294,8 +303,18 @@ async fn receive(
             tokio::time::sleep(Duration::from_millis(5)).await;
             continue;
         }
-        let dispositions = vec![disposition.clone(); batch.messages.len()];
-        collected.extend(batch.messages);
+        let mut dispositions = Vec::with_capacity(batch.messages.len());
+        for message in batch.messages {
+            if expected
+                .iter()
+                .any(|value| value == message.get_payload_str())
+            {
+                collected.push(message);
+                dispositions.push(disposition.clone());
+            } else {
+                dispositions.push(MessageDisposition::Ack);
+            }
+        }
         (batch.commit)(dispositions)
             .await
             .context("committing a received batch")?;

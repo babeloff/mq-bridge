@@ -27,9 +27,7 @@ pub fn register_endpoint_factory(
 
 pub fn get_endpoint_factory(name: &str) -> Option<Arc<dyn CustomEndpointFactory>> {
     let registry = CUSTOM_ENDPOINT_REGISTRY.get_or_init(|| RwLock::new(HashMap::new()));
-    let map = registry
-        .read()
-        .expect("Custom endpoint registry lock poisoned");
+    let map = registry.read().ok()?;
     map.get(name).cloned()
 }
 
@@ -61,7 +59,7 @@ pub fn register_middleware_factory(
 
 pub fn get_middleware_factory(name: &str) -> Option<Arc<dyn CustomMiddlewareFactory>> {
     let registry = CUSTOM_MIDDLEWARE_REGISTRY.get_or_init(|| RwLock::new(HashMap::new()));
-    let map = registry.read().expect("Middleware registry lock poisoned");
+    let map = registry.read().ok()?;
     map.get(name).cloned()
 }
 

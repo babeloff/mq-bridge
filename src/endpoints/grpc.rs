@@ -545,7 +545,7 @@ fn grpc_client_commit(
                     let response = client
                         .clone()
                         .acknowledge(Request::new(proto::Ack {
-                            id,
+                            id: id.clone(),
                             status: status as i32,
                             reason: String::new(),
                             metadata,
@@ -555,7 +555,7 @@ fn grpc_client_commit(
                     if !response.success {
                         warn!(ack_id = %id, error = %response.error, "gRPC acknowledge rejected");
                     }
-                    Ok(())
+                    Ok::<(), tonic::Status>(())
                 })
                 .buffer_unordered(GRPC_ACK_CONCURRENCY)
                 .try_collect::<Vec<()>>()
@@ -2068,18 +2068,15 @@ mod tests {
     async fn publish_batch_does_not_serialize_on_commits() {
         const COUNT: usize = 200;
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
-        drop(listener);
-
         let mut consumer = GrpcConsumer::new(&GrpcConfig {
-            url: url.clone(),
+            url: "http://127.0.0.1:0".into(),
             topic: Some("batching".into()),
             server_mode: true,
             ..Default::default()
         })
         .await
         .unwrap();
+        let url = format!("http://{}", consumer.bound_addr.unwrap());
 
         let drain = tokio::spawn(async move {
             let (mut total, mut batches) = (0usize, 0usize);
@@ -2097,9 +2094,6 @@ mod tests {
             }
             (total, batches)
         });
-
-        // Let the embedded server bind before the publisher connects.
-        tokio::time::sleep(Duration::from_millis(300)).await;
 
         let publisher = GrpcPublisher::new(&GrpcConfig {
             url,

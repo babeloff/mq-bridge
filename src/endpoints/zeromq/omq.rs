@@ -94,7 +94,11 @@ impl ReqSocket {
             tokio::time::timeout(timeout, exchange).await
         };
         match result {
-            Ok(res) => res.map_err(|e| anyhow!(e)),
+            Ok(Ok(message)) => Ok(message),
+            Ok(Err(error)) => {
+                self.socket = None;
+                Err(anyhow!(error))
+            }
             Err(_) => {
                 self.socket = None;
                 Err(anyhow!("ZeroMQ REQ/REP exchange timed out"))

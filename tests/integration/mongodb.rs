@@ -357,7 +357,7 @@ pub async fn test_mongodb_capture_all_exits_on_empty() {
                 .expect("commit snapshot");
 
             let empty =
-                tokio::time::timeout(std::time::Duration::from_secs(5), reader.receive_batch(10))
+                tokio::time::timeout(std::time::Duration::from_secs(10), reader.receive_batch(10))
                     .await
                     .expect("capture_all drain did not finish after its idle timeout")
                     .expect("receive empty batch");

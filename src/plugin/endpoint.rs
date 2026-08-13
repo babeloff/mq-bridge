@@ -253,7 +253,11 @@ unsafe impl Sync for ConsumerHandle {}
 
 impl Drop for ConsumerHandle {
     fn drop(&mut self) {
-        unsafe { (self.plugin.table().consumer_free)(self.handle) };
+        let plugin = Arc::clone(&self.plugin);
+        let handle = self.handle.0 as usize;
+        blocking_cleanup(move || unsafe {
+            (plugin.table().consumer_free)(MqbConsumerHandle(handle as *mut _))
+        });
     }
 }
 

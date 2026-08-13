@@ -34,7 +34,12 @@ fn extract_sensitive_string_map_entries(
     for key in secret_keys {
         if let Some(value) = values.remove(&key) {
             secrets.insert(
-                sanitize_secret_key(&format!("{}__{}__{}", prefix, field_name, key)),
+                sanitize_secret_key(&format!(
+                    "{}__{}__{}",
+                    prefix,
+                    field_name,
+                    encode_secret_map_key(&key)
+                )),
                 value,
             );
         }
@@ -63,6 +68,16 @@ fn sanitize_secret_key(key: &str) -> String {
             }
         })
         .collect()
+}
+
+fn encode_secret_map_key(key: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut encoded = String::with_capacity(key.len() * 2);
+    for byte in key.bytes() {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    encoded
 }
 
 fn extract_sensitive_url(
@@ -234,7 +249,12 @@ impl SecretExtractor for EncryptionConfig {
         }
         for (id, k) in std::mem::take(&mut self.decrypt_keys) {
             secrets.insert(
-                sanitize_secret_key(&format!("{}__{}__{}", prefix, "DECRYPT_KEYS", id)),
+                sanitize_secret_key(&format!(
+                    "{}__{}__{}",
+                    prefix,
+                    "DECRYPT_KEYS",
+                    encode_secret_map_key(&id)
+                )),
                 k,
             );
         }

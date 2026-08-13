@@ -400,8 +400,8 @@ function initLogging(callback, level = null) {
   return native.initLogging(callback, level);
 }
 
-function loadEndpointPlugin(path) {
-  return native.loadEndpointPlugin(path);
+function loadEndpointPlugin(pluginPath) {
+  return native.loadEndpointPlugin(pluginPath);
 }
 
 function pluginPlatformTag(platform = process.platform, arch = process.arch) {
@@ -410,7 +410,7 @@ function pluginPlatformTag(platform = process.platform, arch = process.arch) {
   return `${platform}-${normalizedArch}${suffix}`;
 }
 
-function pluginLibraryPath(packageDirectory) {
+function readPluginManifest(packageDirectory) {
   const root = path.resolve(packageDirectory);
   const manifestPath = path.join(root, "mq-bridge-plugin.json");
   if (!fs.existsSync(manifestPath)) {
@@ -420,6 +420,11 @@ function pluginLibraryPath(packageDirectory) {
   if (typeof manifest.name !== "string" || typeof manifest.library !== "string") {
     throw new Error(`${manifestPath} must contain string fields 'name' and 'library'`);
   }
+  return { root, manifest };
+}
+
+function pluginLibraryPath(packageDirectory) {
+  const { root, manifest } = readPluginManifest(packageDirectory);
   const fileName = process.platform === "win32"
     ? `${manifest.library}.dll`
     : process.platform === "darwin"
@@ -444,9 +449,7 @@ function loadPluginPackage(packageDirectory) {
 }
 
 function definePluginPackage(packageDirectory) {
-  const manifest = JSON.parse(
-    fs.readFileSync(path.join(path.resolve(packageDirectory), "mq-bridge-plugin.json"), "utf8"),
-  );
+  const { manifest } = readPluginManifest(packageDirectory);
   return {
     ENDPOINT_NAME: manifest.name,
     libraryPath: () => pluginLibraryPath(packageDirectory),

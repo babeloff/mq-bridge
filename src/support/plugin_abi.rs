@@ -426,6 +426,8 @@ pub struct MqbPluginVTable {
 /// 1.1 field would otherwise grow the minimum and reject every 1.0 plugin, which
 /// is exactly what the additive-minor promise rules out. A newer field must be
 /// gated on the caller's [`MqbPluginVTable::struct_size`], not on this constant.
+/// This word-count formula assumes a 64-bit target; a 32-bit port needs its own
+/// frozen constant because `u64` alignment changes the table layout.
 ///
 /// `the_1_0_table_size_is_frozen` checks it against the declared struct, so a
 /// target whose padding differs fails the build's tests rather than silently

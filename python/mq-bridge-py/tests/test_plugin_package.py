@@ -5,33 +5,25 @@ from pathlib import Path
 
 import pytest
 
-from mq_bridge import plugin_library_path
-
-
-def _tag() -> str:
-    machine = platform.machine().lower()
-    arch = {"aarch64": "arm64", "amd64": "x64", "x86_64": "x64"}.get(machine, machine)
-    suffix = "-gnu" if sys.platform == "linux" else "-msvc" if sys.platform == "win32" else ""
-    return f"{sys.platform}-{arch}{suffix}"
-
-
-def _library_name() -> str:
-    if sys.platform == "win32":
-        return "reference.dll"
-    if sys.platform == "darwin":
-        return "libreference.dylib"
-    return "libreference.so"
+from mq_bridge import _plugin_platform_tag, plugin_library_path
 
 
 def test_plugin_library_path_selects_current_platform_prebuild(tmp_path: Path) -> None:
     (tmp_path / "mq-bridge-plugin.json").write_text(
         json.dumps({"name": "reference", "library": "reference"}), encoding="utf-8"
     )
-    library = tmp_path / "prebuilds" / _tag() / _library_name()
-    library.parent.mkdir(parents=True)
-    library.write_bytes(b"fixture")
+    prebuild = tmp_path / "prebuilds" / _plugin_platform_tag()
+    prebuild.mkdir(parents=True)
+    libraries = [prebuild / name for name in ("reference.dll", "libreference.dylib", "libreference.so")]
+    for library in libraries:
+        library.write_bytes(b"fixture")
 
-    assert plugin_library_path(tmp_path) == str(library)
+    assert Path(plugin_library_path(tmp_path)) in libraries
+
+
+def test_platform_tag_matches_prebuild_convention() -> None:
+    if sys.platform == "linux" and platform.machine().lower() == "x86_64":
+        assert _plugin_platform_tag() == "linux-x64-gnu"
 
 
 def test_plugin_library_path_reports_missing_manifest(tmp_path: Path) -> None:

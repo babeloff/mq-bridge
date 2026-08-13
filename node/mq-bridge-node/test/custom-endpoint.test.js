@@ -209,8 +209,12 @@ test("a throwing JS sink dead-letters the message", async () => {
 
 test("an endpoint without receiveBatch cannot be an input", async () => {
   const outTopic = unique("node.custom.bad");
+  let closed = false;
   const name = register("jssinkonly", () => ({
     async sendBatch() {},
+    close() {
+      closed = true;
+    },
   }));
 
   const route = Route.fromConfig(
@@ -230,11 +234,45 @@ test("an endpoint without receiveBatch cannot be an input", async () => {
   );
 
   route.start();
-  // Give the route thread time to build the endpoint and fail. The event loop
-  // must stay free while it does: `join()` would block the very dispatch the
-  // endpoint needs, so only call it once the route has already ended.
-  await new Promise((resolve) => setTimeout(resolve, 500));
+  // Keep the event loop free until capability rejection has cleaned up the
+  // instance. This bounds the wait without assuming how quickly CI starts it.
+  for (let attempt = 0; attempt < 50 && !closed; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  assert.equal(closed, true, "endpoint was not closed within 5 seconds");
   assert.throws(() => route.join(), /receiveBatch/);
+});
+
+test("a capability getter failure cleans up the endpoint instance", async () => {
+  let closed = false;
+  const name = register("jsthrowinggetter", () => ({
+    get receiveBatch() {
+      const error = new Error("capability inspection failed");
+      error.retryable = false;
+      throw error;
+    },
+    close() {
+      closed = true;
+    },
+  }));
+  const route = Route.fromConfig(
+    {
+      routes: {
+        getter_route: {
+          input: { [name]: {} },
+          output: { memory: { topic: unique("node.custom.getter"), capacity: 64 } },
+        },
+      },
+    },
+    "getter_route",
+  );
+
+  route.start();
+  for (let attempt = 0; attempt < 50 && !closed; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  assert.equal(closed, true, "endpoint was not closed within 5 seconds");
+  assert.throws(() => route.join(), /capability inspection failed/);
 });
 
 test("registerEndpoint rejects a non-callable factory", () => {

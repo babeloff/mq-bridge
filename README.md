@@ -363,7 +363,6 @@ orders_upsert_branch:
           format: json
           id_field: "order_id"     # deterministic _id → insert-if-absent
           report_outcome: true     # → mongodb.outcome = inserted | existed
-          request_reply: true
       forward_to:
         switch:
           metadata_key: "mongodb.outcome"
@@ -373,8 +372,8 @@ orders_upsert_branch:
 ```
 
 `report_outcome` is sink-only and pairs with `id_field`; without a deterministic `_id` there is no
-duplicate to detect. Left unwrapped by `request`, the tagged message is returned as the route's
-response as usual.
+duplicate to detect. Left
+unwrapped by `request`, the tagged message is returned as the route's response as usual.
 
 **Files & object storage — `idempotency`.** A filesystem has no unique constraint, so the `file` and
 `object_store` sinks get replay safety a different way: **deterministic names plus covered-range

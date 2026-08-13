@@ -134,6 +134,9 @@ impl ZeroMqPublisher {
                             };
                             match tokio::time::timeout(request_timeout, exchange).await {
                                 Ok(res) => {
+                                    if res.is_err() {
+                                        needs_req_reset = true;
+                                    }
                                     let _ = reply_tx.send(res);
                                 }
                                 Err(_) => {

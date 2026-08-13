@@ -359,6 +359,10 @@ kafka_to_nats:
             .custom_headers
             .insert("X-API-Key".to_string(), "http-api-key".to_string());
         http_config.custom_headers.insert(
+            "X_API_KEY".to_string(),
+            "http-underscore-api-key".to_string(),
+        );
+        http_config.custom_headers.insert(
             "X-Access-Token".to_string(),
             "http-access-token".to_string(),
         );
@@ -429,25 +433,31 @@ kafka_to_nats:
         );
         assert_eq!(
             secrets
-                .get("MQB__TEST_ROUTE__OUTPUT__HTTP__CUSTOM_HEADERS__X_API_KEY")
+                .get("MQB__TEST_ROUTE__OUTPUT__HTTP__CUSTOM_HEADERS__582D4150492D4B6579")
                 .map(|s| s.as_str()),
             Some("http-api-key")
         );
         assert_eq!(
             secrets
-                .get("MQB__TEST_ROUTE__OUTPUT__HTTP__CUSTOM_HEADERS__X_ACCESS_TOKEN")
+                .get("MQB__TEST_ROUTE__OUTPUT__HTTP__CUSTOM_HEADERS__585F4150495F4B4559")
+                .map(|s| s.as_str()),
+            Some("http-underscore-api-key")
+        );
+        assert_eq!(
+            secrets
+                .get("MQB__TEST_ROUTE__OUTPUT__HTTP__CUSTOM_HEADERS__582D4163636573732D546F6B656E")
                 .map(|s| s.as_str()),
             Some("http-access-token")
         );
         assert_eq!(
             secrets
-                .get("MQB__TEST_ROUTE__OUTPUT__HTTP__CUSTOM_HEADERS__X_AUTHENTICATION")
+                .get("MQB__TEST_ROUTE__OUTPUT__HTTP__CUSTOM_HEADERS__582D41757468656E7469636174696F6E")
                 .map(|s| s.as_str()),
             Some("http-authentication")
         );
         assert_eq!(
             secrets
-                .get("MQB__TEST_ROUTE__OUTPUT__HTTP__CUSTOM_HEADERS__AUTHORIZATION")
+                .get("MQB__TEST_ROUTE__OUTPUT__HTTP__CUSTOM_HEADERS__417574686F72697A6174696F6E")
                 .map(|s| s.as_str()),
             Some("Bearer secret-token")
         );
@@ -467,12 +477,36 @@ kafka_to_nats:
         assert!(h.url.is_empty());
         assert!(h.basic_auth.is_none());
         assert!(!h.custom_headers.contains_key("X-API-Key"));
+        assert!(!h.custom_headers.contains_key("X_API_KEY"));
         assert!(!h.custom_headers.contains_key("X-Access-Token"));
         assert!(!h.custom_headers.contains_key("X-Authentication"));
         assert!(!h.custom_headers.contains_key("Authorization"));
         assert_eq!(
             h.custom_headers.get("X-Trace-Id").map(|s| s.as_str()),
             Some("trace-value")
+        );
+    }
+
+    #[test]
+    fn extracted_dynamic_secret_keys_do_not_collide() {
+        let mut encryption = EncryptionConfig::default();
+        encryption
+            .decrypt_keys
+            .insert("old-key".to_string(), "hyphen-key".to_string());
+        encryption
+            .decrypt_keys
+            .insert("old_key".to_string(), "underscore-key".to_string());
+
+        let mut secrets = HashMap::new();
+        encryption.extract_secrets("MQB__ENCRYPTION", &mut secrets);
+
+        assert_eq!(
+            secrets.get("MQB__ENCRYPTION__DECRYPT_KEYS__6F6C642D6B6579"),
+            Some(&"hyphen-key".to_string())
+        );
+        assert_eq!(
+            secrets.get("MQB__ENCRYPTION__DECRYPT_KEYS__6F6C645F6B6579"),
+            Some(&"underscore-key".to_string())
         );
     }
 

@@ -836,7 +836,7 @@ impl TlsConfig {
 
     /// Checks if TLS server certificate authentication is configured.
     pub fn is_tls_server_configured(&self) -> bool {
-        self.required && self.cert_file.is_some() && self.key_file.is_some()
+        self.is_mtls_client_configured()
     }
 
     /// Checks if the TLS configuration is sufficient to make a TLS client connection.

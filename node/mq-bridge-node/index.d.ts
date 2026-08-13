@@ -166,7 +166,12 @@ export interface CustomEndpoint {
    * right now (the route backs off and retries; under `exit_on_empty` this is
    * the drain signal), or throw {@link EndOfStream} when the source is done.
    */
-  receiveBatch?(maxMessages: number): Promise<Iterable<Message | Buffer | string> | null>;
+  receiveBatch?(
+    maxMessages: number,
+  ):
+    | Promise<Iterable<Message | Buffer | Uint8Array | string | JsonValue> | null>
+    | Iterable<Message | Buffer | Uint8Array | string | JsonValue>
+    | null;
   /** Called once per received batch, with one disposition per message. */
   commit?(dispositions: Disposition[]): Promise<void> | void;
   /** Publish a batch. Throw to fail it; set `err.retryable` to have it retried. */

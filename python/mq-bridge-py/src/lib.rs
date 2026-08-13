@@ -31,7 +31,7 @@ use core::{
 use mq_bridge_bindings_common as common;
 use pyo3::conversion::IntoPyObjectExt;
 use pyo3::create_exception;
-use pyo3::exceptions::{PyException, PyRuntimeError, PyTypeError, PyValueError};
+use pyo3::exceptions::{PyAttributeError, PyException, PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyByteArray, PyBytes, PyDict, PyList, PyModule, PyTuple, PyType};
 use serde::de::{DeserializeSeed, Error as DeError, MapAccess, SeqAccess, Visitor};
@@ -520,7 +520,10 @@ fn py_endpoint_optional_call<'py>(
 ) -> PyResult<PyEndpointOutcome> {
     match endpoint.getattr(name) {
         Ok(method) => call(method).map(|_| PyEndpointOutcome::Done),
-        Err(_) => Ok(PyEndpointOutcome::Done),
+        Err(err) if err.is_instance_of::<PyAttributeError>(endpoint.py()) => {
+            Ok(PyEndpointOutcome::Done)
+        }
+        Err(err) => Err(err),
     }
 }
 
@@ -2844,16 +2847,16 @@ fn register_middleware(py: Python<'_>, name: &str, factory: Py<PyAny>) -> PyResu
 /// Call once, before starting routes. Loading the same file again is a no-op.
 /// A plugin is native code with the same privileges as the interpreter.
 #[pyfunction]
-fn load_endpoint_plugin(path: String) -> PyResult<String> {
+fn load_endpoint_plugin(py: Python<'_>, path: String) -> PyResult<String> {
     #[cfg(feature = "plugin")]
     {
-        core::plugin::load_endpoint_plugin(&path)
+        py.detach(|| core::plugin::load_endpoint_plugin(&path))
             .map(|info| info.name)
             .map_err(|err| PyRuntimeError::new_err(format!("{err:#}")))
     }
     #[cfg(not(feature = "plugin"))]
     {
-        let _ = path;
+        let _ = (py, path);
         Err(PyRuntimeError::new_err(
             "this mq_bridge build was compiled without native plugin support",
         ))
