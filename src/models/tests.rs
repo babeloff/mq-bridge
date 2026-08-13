@@ -563,6 +563,33 @@ path: "/tmp/test"
             _ => panic!("Expected Consume"),
         }
     }
+
+    #[test]
+    fn endpoint_config_builders_initialize_required_fields_and_defaults() {
+        let object_store = ObjectStoreConfig::new("s3://bucket/prefix")
+            .with_checkpoint("file:///tmp/object-store.json", "orders");
+        assert_eq!(object_store.url, "s3://bucket/prefix");
+        assert!(object_store.date_partition);
+        assert_eq!(object_store.cursor_id.as_deref(), Some("orders"));
+
+        let postgres_cdc = PostgresCdcConfig::new("postgres://localhost/db", "events")
+            .with_slot("events_slot")
+            .with_checkpoint_store("file:///tmp/postgres-cdc.json");
+        assert_eq!(postgres_cdc.slot_name, "events_slot");
+        assert!(postgres_cdc.create_slot);
+        assert!(postgres_cdc.status_interval_ms > 0);
+
+        let sqlx = SqlxConfig::new("postgres://localhost/db", "messages")
+            .with_credentials("user", "secret");
+        assert_eq!(sqlx.table, "messages");
+        assert_eq!(sqlx.username.as_deref(), Some("user"));
+
+        let clickhouse = ClickHouseConfig::new("http://localhost:8123", "messages")
+            .with_credentials("default", "secret");
+        assert_eq!(clickhouse.table, "messages");
+        assert_eq!(clickhouse.compression, Compression::Gzip);
+        assert_eq!(clickhouse.username.as_deref(), Some("default"));
+    }
 }
 
 #[cfg(feature = "schema")]
