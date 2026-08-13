@@ -6,7 +6,7 @@
 //! Author an endpoint plugin with normal Rust traits instead of raw FFI.
 //!
 //! An endpoint author implements the usual mq-bridge contracts —
-//! [`CustomEndpointFactory`], [`MessageConsumer`](crate::traits::MessageConsumer)
+//! [`CustomEndpointFactory`], [`MessageConsumer`]
 //! and [`MessagePublisher`] — and exports them through the stable C ABI with one
 //! macro:
 //!

@@ -8,11 +8,14 @@
 //!
 //! Deliberately tiny and self-contained: no logic beyond version checking, only
 //! `#[repr(C)]` types, status codes, and the shape of the exported function
-//! table. Hosts use [`MqbPluginVTable`] through [`crate::plugin`]; plugin
+//! table. Hosts use [`MqbPluginVTable`](crate::support::plugin_abi::MqbPluginVTable)
+//! through [`crate::plugin`]; plugin
 //! authors should use `mq-bridge-plugin-sdk` instead of implementing these
 //! functions by hand.
 //!
-//! It is versioned by [`MQB_PLUGIN_ABI_MAJOR`] / [`MQB_PLUGIN_ABI_MINOR`],
+//! It is versioned by
+//! [`MQB_PLUGIN_ABI_MAJOR`](crate::support::plugin_abi::MQB_PLUGIN_ABI_MAJOR) /
+//! [`MQB_PLUGIN_ABI_MINOR`](crate::support::plugin_abi::MQB_PLUGIN_ABI_MINOR),
 //! independently of the mq-bridge release it ships in — those constants, not
 //! the crate version, are what a host checks before calling a plugin.
 //!
@@ -21,20 +24,24 @@
 //! Only C-compatible data: integers, raw pointers, `#[repr(C)]` structs and
 //! `extern "C"` function pointers. No Rust trait object, future, `String`,
 //! `Vec`, closure, or error type is ever passed across it, and a plugin must
-//! never let a panic unwind out of an ABI function (return [`MQB_ERR_PANIC`]
-//! instead).
+//! never let a panic unwind out of an ABI function (return
+//! [`MQB_ERR_PANIC`](crate::support::plugin_abi::MQB_ERR_PANIC) instead).
 //!
 //! # Ownership rules
 //!
-//! * **Host → plugin data** ([`MqbSlice`], [`MqbMessage`] arrays passed as
+//! * **Host → plugin data**
+//!   ([`MqbSlice`](crate::support::plugin_abi::MqbSlice),
+//!   [`MqbMessage`](crate::support::plugin_abi::MqbMessage) arrays passed as
 //!   arguments) is owned by the host and is only valid for the duration of the
 //!   call. A plugin that needs it later must copy it.
-//! * **Plugin → host data** ([`MqbMessage`] arrays returned from
-//!   [`MqbPluginVTable::consumer_receive_batch`]) is owned by the plugin and
+//! * **Plugin → host data**
+//!   ([`MqbMessage`](crate::support::plugin_abi::MqbMessage) arrays returned from
+//!   [`MqbPluginVTable::consumer_receive_batch`](crate::support::plugin_abi::MqbPluginVTable::consumer_receive_batch)) is owned by the plugin and
 //!   stays valid until the batch handle is committed or freed.
-//! * **Error text** is returned as an [`MqbBuffer`] allocated by the plugin.
+//! * **Error text** is returned as an
+//!   [`MqbBuffer`](crate::support::plugin_abi::MqbBuffer) allocated by the plugin.
 //!   The host must hand every non-empty buffer back to
-//!   [`MqbPluginVTable::buffer_free`].
+//!   [`MqbPluginVTable::buffer_free`](crate::support::plugin_abi::MqbPluginVTable::buffer_free).
 //! * **Handles** are opaque plugin-owned pointers. Each has exactly one
 //!   `*_free` function, and freeing is the host's responsibility. A handle must
 //!   be safe to use and free from any thread (`Send`), and consumer/publisher
@@ -42,10 +49,14 @@
 //!
 //! # Versioning
 //!
-//! [`MQB_PLUGIN_ABI_MAJOR`] changes for any incompatible change; a host rejects
+//! [`MQB_PLUGIN_ABI_MAJOR`](crate::support::plugin_abi::MQB_PLUGIN_ABI_MAJOR)
+//! changes for any incompatible change; a host rejects
 //! a plugin whose major differs. Within a major version, fields may only be
-//! *appended* to [`MqbPluginVTable`], and both sides use
-//! [`MqbPluginVTable::struct_size`] to discover which fields exist.
+//! *appended* to
+//! [`MqbPluginVTable`](crate::support::plugin_abi::MqbPluginVTable), and both
+//! sides use
+//! [`MqbPluginVTable::struct_size`](crate::support::plugin_abi::MqbPluginVTable::struct_size)
+//! to discover which fields exist.
 
 #![allow(clippy::missing_safety_doc)]
 
