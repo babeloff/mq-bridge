@@ -27,6 +27,9 @@ classifiers = [
   "Programming Language :: Rust",
 ]
 
+[project.optional-dependencies]
+plugin-packaging = ["build>=1", "wheel>=0.45"]
+
 [project.urls]
 Homepage = "https://github.com/marcomq/mq-bridge"
 Repository = "https://github.com/marcomq/mq-bridge"
