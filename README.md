@@ -83,7 +83,7 @@ For implementation details and quick start examples for each usage type, see the
     > **TLS**: IBM MQ has its own TLS config shape (`IbmTlsConfig`), since the native client doesn't consume PEM files. The field names mirror the generic `TlsConfig` for config parity, but carry MQ-native semantics: `tls.cert_file` (alias `key_repository`) is a CMS key repository path (e.g. `/path/to/tls` for `tls.kdb`), not a PEM file. The repository can either be passwordless (backed by a `.sth` stash file next to the `.kdb`) or password-protected via `tls.cert_password` (alias `key_repository_password`; requires an IBM MQ client/server at 9.3.0.0 or later, which is the capability level `ibm-mq`/`ibm-mq-static` build against; 9.2 is EOL).
 *   **Configuration**: Routes can be defined via YAML, JSON or environment variables.
 *   **Programmable Logic**: Inject custom Rust handlers to transform or filter messages in-flight.
-*   **Batching**: Every endpoint uses the same `send_batch` / `receive_batch` shape. Routes default to single-message batches, but can switch to larger batches with `batch_size`.
+*   **Batching**: Every endpoint uses the same `send_batch` / `receive_batch` shape. Routes default to batches of up to 512 messages, configurable with `batch_size`.
 *   **Middleware**:
     *   **Retries**: Exponential backoff for transient failures.
     *   **Dead-Letter Queues (DLQ)**: Redirect failed messages.
@@ -98,7 +98,7 @@ The project has one main bias: move data reliably without forcing the rest of th
 
 That means `mq-bridge` tries to keep the boring parts boring. Kafka offsets, RabbitMQ nacks, HTTP responses, MongoDB polling, WebSocket frames, and file rows are all different in real life, but route code should still be able to receive a batch, process it, publish it, and commit it.
 
-Batching is a big part of that design. Every endpoint is optimized around batch-shaped APIs, even when the backend itself only has a single-message primitive. Batching is disabled by default (`batch_size: 1`) because it is the safest behavior and easiest to reason about. When throughput matters, increasing `batch_size` is usually the first knob to try. For example via `batch_size: 128` in yaml or `.with_batch_size(128)` for routes.
+Batching is a big part of that design. Every endpoint is optimized around batch-shaped APIs, even when the backend itself only has a single-message primitive. Routes default to opportunistic batches of up to 512 messages: the consumer waits for the first message, then takes whatever else is already available without adding idle latency. Lower `batch_size` when tighter failure isolation or a smaller per-batch memory footprint matters.
 
 The error handling follows the same idea. Batch publishing can report partial success, retryable failures, and non-retryable failures. Route commits are sequenced for cumulative-ack brokers so later batches cannot acknowledge earlier unresolved messages; transports with independent acknowledgements can commit batches concurrently. In other words: batching is not just a performance trick bolted onto the side; ack/nack behavior and retry/DLQ handling were built to work with it.
 
@@ -180,7 +180,7 @@ The table below summarizes the capabilities and configuration for each backend:
 | **AMQP** | Set `subscribe_mode: true` | Emulated (Property) | **Yes** (Basic.nack) |
 | **AWS** | N/A (Use SNS) | No | **Yes** (Visibility Timeout) |
 | **File** | Set `mode: subscribe` | No | Simulated (In-Memory) |
-| **gRPC** | N/A | No | No |
+| **gRPC** | N/A | No | **Yes** for the built-in Bridge protocol; dynamic services depend on their API |
 | **HTTP** | N/A | **Native** (Implicit) | **Yes** (HTTP 500) |
 | **IBM MQ** | Set `topic` | No | **Yes** (Tx Rollback) |
 | **Kafka** | Omit `group_id` | Emulated (Header) | Eventual (Skip Offset) |
@@ -214,21 +214,23 @@ Databases have no native pub/sub, so `mq-bridge` reads them as a source in one o
 
 #### Choosing a MongoDB consume mode
 
-These are not interchangeable. The default `consumer` is a **competing-consumers work queue**: its
-lock-and-delete protocol lets several readers drain the same collection with each document going to
-exactly one of them — the right thing for dispatching jobs or commands. The `capture_*` modes are
-**readers**: they fan out, so every reader sees every document, and nothing is claimed or removed.
+These are not interchangeable. The default `capture_all` is a **reader**, like the other `capture_*`
+modes: they fan out, so every reader sees every document, and nothing is claimed or removed. Opting
+into `consumer` instead gives a **competing-consumers work queue**: its lock-and-delete protocol lets
+several readers drain the same collection with each document going to exactly one of them — the right
+thing for dispatching jobs or commands, and destructive by design.
 
 Pick by semantics first. Where both would do — a one-shot bulk read or ETL pass with a single
-reader — **use `capture_all`**: `consumer`'s four round trips per batch (find ids → claim →
-re-fetch → delete on ack) buy exclusivity you aren't using, and cost ~5x.
+reader — **use `capture_all`**, the default: `consumer`'s four round trips per batch (find ids →
+claim → re-fetch → delete on ack) buy exclusivity you aren't using, and cost ~5x. Set
+`consume: consumer` explicitly when you want the destructive work-queue semantics.
 
 | `consume` | mechanism | modifies source | ends on drain | use for |
 | :--- | :--- | :--- | :--- | :--- |
-| `consumer` (default) | claim → lock → re-fetch → delete | **yes** | yes | work queues, competing readers |
+| `capture_all` (default) | `_id` snapshot, then change stream | no | standalone only | bulk read / ETL |
+| `consumer` | claim → lock → re-fetch → delete | **yes** | yes | work queues, competing readers |
 | `subscriber` | polls `seq > last_seq`, advancing a cursor | no | yes | ephemeral fan-out |
 | `capture_new` | change stream, new changes only | no | **no** | ongoing CDC |
-| `capture_all` | `_id` snapshot, then change stream | no | standalone only | bulk read / ETL |
 
 500k documents, `batch_size: 1024`, release build, standalone MongoDB: `consumer` → `null`
 **23,667 rows/s**, `capture_all` → jsonl **120,308 rows/s** (`postgres` → `null` reference: 115,924).
@@ -238,8 +240,9 @@ re-fetch → delete on ack) buy exclusivity you aren't using, and cost ~5x.
 *   `consumer` and `subscriber` only read collections written by the mq-bridge MongoDB publisher
     (UUID `_id` / wrapped `seq` field); other documents are skipped or rejected at startup.
 *   `capture_*` need a replica set. `capture_new` errors without one; `capture_all` degrades to an
-    insert-only `_id` read that terminates on drain. On a replica set it streams indefinitely after
-    the snapshot — plan an external stop, not `exit_on_empty`.
+    insert-only `_id` read on a standalone server. With `exit_on_empty` / `--drain`, a replica-set
+    reader finishes after the snapshot and any immediately following changes, once the drain idle
+    timeout expires.
 *   Wart: `capture_all`'s snapshot also emits the internal `<collection>:sequencer` document.
 
 
@@ -717,7 +720,7 @@ All routes and endpoints can be defined via a configuration file (for example `m
 
 Important route-level knobs:
 
-*   `batch_size`: maximum messages per route iteration. Defaults to `1`; increase it when throughput matters.
+*   `batch_size`: maximum messages per route iteration. Defaults to `512`; lower it for tighter failure isolation or large payloads.
 *   `concurrency`: number of route workers. Defaults to `1`; useful for high-latency handlers or endpoints.
 *   `commit_concurrency_limit`: maximum in-flight commit operations, whether they are queued through ordered commit sequencing or run concurrently for independent-ack transports. Defaults to `4096`.
 

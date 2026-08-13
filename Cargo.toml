@@ -22,7 +22,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.3.11"
+version = "0.4.0"
 
 [workspace.dependencies]
 anyhow = "1.0"
@@ -194,6 +194,7 @@ redis = { version = "1.4", default-features = false, features = ["tokio-comp", "
 tonic = { version = "0.14", optional = true, default-features = false, features = ["codegen", "transport", "tls-webpki-roots"] }
 tonic-prost = { version = "0.14", optional = true }
 prost = { version = "0.14", optional = true, default-features = false, features = ["std", "derive"] }
+prost-reflect = { version = "0.16", optional = true, features = ["serde"] }
 tokio-stream = { version = "0.1", optional = true, features = ["net"] }
 
 url = { version = "2.5", optional = true }
@@ -256,7 +257,7 @@ plugin = ["dep:libloading"]
 # conformance suite (`mq_bridge::plugin::sdk` / `::conformance`). Endpoint
 # crates enable this; hosts only need `plugin`.
 plugin-sdk = ["plugin"]
-test-utils =["dep:tracing-appender", "dep:tracing-subscriber", "dep:serde_yaml_ng"]
+test-utils = ["dep:tracing-appender", "dep:tracing-subscriber", "dep:serde_yaml_ng"]
 # Opt-in produce/consume-only isolation benchmarks (throwaway diagnostics, off by default)
 perf-diagnostics = ["test-utils"]
 
@@ -295,12 +296,13 @@ ibm-mq = ["dep:mqi", "mqi/dlopen2", "mqi/mqai", "mqi/mqc_9_3_0_0", "dep:libmqm-s
 # at build.
 ibm-mq-static = ["dep:mqi", "mqi/link", "mqi/mqc_9_3_0_0"]
 zeromq = ["dep:zeromq"]
-# PoC alternative ZeroMQ backend (omq.rs). Opt-in only; NOT in `full`/`portable`
-# because omq-tokio needs MSRV 1.93 / edition 2024. Covers PUSH/PULL + PUB/SUB.
+# Alternative ZeroMQ backend (omq.rs), covering PUSH/PULL, PUB/SUB and REQ/REP.
+# In `full` but not `portable`, because omq-tokio needs MSRV 1.93 / edition 2024.
+# The default `backend: try_omq` uses it when present and falls back to zmq.
 zeromq-omq = ["dep:omq-tokio"]
 redis-streams = ["dep:redis"]
 # Note: The grpc feature requires protobuf-src which can significantly increase build times.
-grpc = ["tonic", "prost", "tokio-stream", "tonic-prost", "tonic-prost-build", "protoc-bin-vendored", "rustls"]
+grpc = ["tonic", "prost", "prost-reflect", "tokio-stream", "tonic-prost", "tonic-prost-build", "protoc-bin-vendored", "rustls"]
 sqlx = ["dep:sqlx", "url"]
 clickhouse = ["dep:reqwest", "dep:flate2", "dep:lz4_flex", "dep:zstd", "url"]
 # Cloud object-store checkpoint backend (S3/GCS/Azure/R2). Talks cloud REST via reqwest.

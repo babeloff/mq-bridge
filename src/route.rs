@@ -500,7 +500,7 @@ async fn send_batch_and_commit(
 }
 
 impl Route {
-    /// Creates a new route with default concurrency (1) and batch size (1).
+    /// Creates a new route with default concurrency (1) and batch size (512).
     ///
     /// # Arguments
     /// * `input` - The input/source endpoint for the route

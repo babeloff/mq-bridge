@@ -220,8 +220,10 @@ impl ZeroMqPublisher {
                         continue;
                     }
                 };
-                // REQ/REP replies are never SUB traffic, so no topic cursor applies.
-                match ZeroMqConsumer::decode_batch(response_zmq, false, &self.format) {
+                // The REP side always answers with a JSON array of canonical messages
+                // (see the commit path), whatever `format` the request used. Replies are
+                // never SUB traffic either, so no topic cursor applies.
+                match ZeroMqConsumer::decode_batch(response_zmq, false, &ZeroMqFormat::Json) {
                     Ok(decoded) => responses.extend(decoded),
                     Err(e) => failed.push((message, PublisherError::NonRetryable(anyhow!(e)))),
                 }

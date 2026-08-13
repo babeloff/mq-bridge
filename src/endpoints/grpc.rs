@@ -4,12 +4,18 @@
 //  git clone https://github.com/marcomq/mq-bridge
 
 use crate::models::GrpcConfig;
-use crate::traits::{ConsumerError, MessageConsumer, MessagePublisher, PublisherError, SentBatch};
+use crate::traits::{
+    ConsumerError, MessageConsumer, MessageDisposition, MessagePublisher, PublisherError, SentBatch,
+};
 use crate::CanonicalMessage;
 use anyhow::Result;
 use async_trait::async_trait;
+use bytes::{Buf, BufMut};
+use futures::{StreamExt, TryStreamExt};
+use prost::Message;
+use prost_reflect::{DescriptorPool, DynamicMessage, MessageDescriptor};
 use std::any::Any;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::Duration;
@@ -26,13 +32,21 @@ use proto::bridge_client::BridgeClient;
 use proto::{BridgeMessage, SubscribeRequest};
 use tonic::Request;
 
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
 use tonic::transport::Server as TonicServer;
 use tonic::transport::{Certificate, ClientTlsConfig, Identity, ServerTlsConfig};
 use tonic::{Response, Status};
 
 const GRPC_BATCH_POLL_MS: u64 = 15; // Increased for better batching in performance tests, and to reduce "poll timed out" warnings
+/// Acks for one committed batch that may be in flight at once.
+const GRPC_ACK_CONCURRENCY: usize = 64;
+/// `publish_batch` messages that may be dispatched but not yet answered. Bounds how far
+/// the dispatch task can run ahead of the commits it is waiting on.
+const PUBLISH_BATCH_INFLIGHT: usize = 1024;
+/// Unacknowledged messages retained per subscriber, and subscribers retained per route.
+const MAX_PENDING_PER_CONSUMER: usize = 1024;
+const MAX_PENDING_CONSUMERS: usize = 64;
 
 // ── Consumer ──────────────────────────────────────────────────────────────────
 
@@ -44,6 +58,7 @@ pub struct GrpcConsumer {
 
 enum GrpcConsumerInner {
     Client(Box<ClientModeConsumer>),
+    Dynamic(Box<DynamicConsumer>),
     Server(ServerModeConsumer),
 }
 
@@ -54,6 +69,11 @@ impl GrpcConsumer {
             let s = ServerModeConsumer::new(config, &url).await?;
             let addr = s.bound_addr();
             (GrpcConsumerInner::Server(s), Some(addr))
+        } else if config.descriptor_set_path.is_some() {
+            (
+                GrpcConsumerInner::Dynamic(Box::new(DynamicConsumer::new(config, &url).await?)),
+                None,
+            )
         } else {
             (
                 GrpcConsumerInner::Client(Box::new(ClientModeConsumer::new(config, &url).await?)),
@@ -86,6 +106,7 @@ impl MessageConsumer for GrpcConsumer {
     fn set_exit_on_empty(&mut self, exit_on_empty: bool) {
         match &mut self.inner {
             GrpcConsumerInner::Client(c) => c.set_exit_on_empty(exit_on_empty),
+            GrpcConsumerInner::Dynamic(c) => c.set_exit_on_empty(exit_on_empty),
             GrpcConsumerInner::Server(s) => s.set_exit_on_empty(exit_on_empty),
         }
     }
@@ -96,6 +117,7 @@ impl MessageConsumer for GrpcConsumer {
     ) -> Result<crate::outcomes::ReceivedBatch, ConsumerError> {
         match &mut self.inner {
             GrpcConsumerInner::Client(c) => c.receive_batch(max_messages).await,
+            GrpcConsumerInner::Dynamic(c) => c.receive_batch(max_messages).await,
             GrpcConsumerInner::Server(s) => s.receive_batch(max_messages).await,
         }
     }
@@ -110,6 +132,7 @@ impl MessageConsumer for GrpcConsumer {
                 serde_json::json!({ "mode": "server", "bound_addr": self.bound_addr }),
             ),
             GrpcConsumerInner::Client(_) => (true, serde_json::json!({ "mode": "client" })),
+            GrpcConsumerInner::Dynamic(_) => (true, serde_json::json!({ "mode": "dynamic" })),
         };
         crate::traits::EndpointStatus {
             healthy,
@@ -129,9 +152,247 @@ impl MessageConsumer for GrpcConsumer {
     }
 }
 
+#[derive(Clone, Default)]
+struct RawProtobufCodec;
+
+#[derive(Clone, Default)]
+struct RawProtobufEncoder;
+
+#[derive(Clone, Default)]
+struct RawProtobufDecoder;
+
+impl tonic::codec::Codec for RawProtobufCodec {
+    type Encode = Vec<u8>;
+    type Decode = Vec<u8>;
+    type Encoder = RawProtobufEncoder;
+    type Decoder = RawProtobufDecoder;
+
+    fn encoder(&mut self) -> Self::Encoder {
+        RawProtobufEncoder
+    }
+
+    fn decoder(&mut self) -> Self::Decoder {
+        RawProtobufDecoder
+    }
+}
+
+impl tonic::codec::Encoder for RawProtobufEncoder {
+    type Item = Vec<u8>;
+    type Error = Status;
+
+    fn encode(
+        &mut self,
+        item: Self::Item,
+        dst: &mut tonic::codec::EncodeBuf<'_>,
+    ) -> std::result::Result<(), Self::Error> {
+        dst.put_slice(&item);
+        Ok(())
+    }
+}
+
+impl tonic::codec::Decoder for RawProtobufDecoder {
+    type Item = Vec<u8>;
+    type Error = Status;
+
+    fn decode(
+        &mut self,
+        src: &mut tonic::codec::DecodeBuf<'_>,
+    ) -> std::result::Result<Option<Self::Item>, Self::Error> {
+        Ok(Some(src.copy_to_bytes(src.remaining()).to_vec()))
+    }
+}
+
+/// Await `call`, failing with a clear error if `deadline` passes first. No deadline
+/// configured means no bound, matching the rest of the endpoint.
+async fn with_deadline<T>(
+    call: impl std::future::Future<Output = Result<T, Status>>,
+    deadline: Option<Duration>,
+) -> Result<T> {
+    match deadline {
+        Some(deadline) => tokio::time::timeout(deadline, call)
+            .await
+            .map_err(|_| anyhow::anyhow!("dynamic gRPC call timed out after {deadline:?}"))?
+            .map_err(Into::into),
+        None => call.await.map_err(Into::into),
+    }
+}
+
+enum DynamicResponse {
+    Unary(Option<Vec<u8>>),
+    // Boxed: an inline `Streaming` is an order of magnitude larger than the unary arm.
+    Streaming(Box<tonic::Streaming<Vec<u8>>>),
+}
+
+struct DynamicConsumer {
+    response: DynamicResponse,
+    output: MessageDescriptor,
+    exit_on_empty: bool,
+}
+
+impl DynamicConsumer {
+    async fn new(config: &GrpcConfig, url: &str) -> Result<Self> {
+        let descriptor_path = config
+            .descriptor_set_path
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("dynamic gRPC requires descriptor_set_path"))?;
+        let service_name = config
+            .service_name
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("dynamic gRPC requires service_name"))?;
+        let method_name = config
+            .method_name
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("dynamic gRPC requires method_name"))?;
+        let descriptor_bytes = tokio::fs::read(descriptor_path).await?;
+        let pool = DescriptorPool::decode(descriptor_bytes.as_slice())?;
+        let service = pool.get_service_by_name(service_name).ok_or_else(|| {
+            anyhow::anyhow!(
+                "gRPC service '{}' not found in descriptor set",
+                service_name
+            )
+        })?;
+        let method = service
+            .methods()
+            .find(|method| method.name() == method_name)
+            .ok_or_else(|| {
+                anyhow::anyhow!("gRPC method '{}.{}' not found", service_name, method_name)
+            })?;
+        if method.is_client_streaming() {
+            anyhow::bail!("dynamic gRPC client-streaming methods are not supported");
+        }
+        if config.server_streaming != method.is_server_streaming() {
+            anyhow::bail!(
+                "dynamic gRPC server_streaming={} does not match descriptor for '{}.{}'",
+                config.server_streaming,
+                service_name,
+                method_name
+            );
+        }
+
+        let request_json = config
+            .request
+            .clone()
+            .unwrap_or_else(|| serde_json::json!({}));
+        let request_text = serde_json::to_string(&request_json)?;
+        let mut deserializer = serde_json::Deserializer::from_str(&request_text);
+        let request = DynamicMessage::deserialize(method.input(), &mut deserializer)?;
+        let mut request_bytes = Vec::with_capacity(request.encoded_len());
+        request.encode(&mut request_bytes)?;
+
+        let channel = make_endpoint(config, url).await?.connect().await?;
+        let mut client = tonic::client::Grpc::new(channel);
+        let path = tonic::codegen::http::uri::PathAndQuery::from_maybe_shared(format!(
+            "/{service_name}/{method_name}"
+        ))?;
+        // `make_endpoint` only bounds connection setup, so the call itself gets the same
+        // deadline — otherwise a server that accepts the connection and then never answers
+        // hangs route startup forever.
+        let deadline = config.timeout_ms.map(Duration::from_millis);
+        let response = if method.is_server_streaming() {
+            let call = client.server_streaming(Request::new(request_bytes), path, RawProtobufCodec);
+            DynamicResponse::Streaming(Box::new(with_deadline(call, deadline).await?.into_inner()))
+        } else {
+            let call = client.unary(Request::new(request_bytes), path, RawProtobufCodec);
+            DynamicResponse::Unary(Some(with_deadline(call, deadline).await?.into_inner()))
+        };
+        Ok(Self {
+            response,
+            output: method.output(),
+            exit_on_empty: false,
+        })
+    }
+
+    /// A body that does not match the descriptor is a permanent error, not a connection
+    /// one: reconnecting re-reads the same bytes and fails identically.
+    fn decode_message(&self, bytes: &[u8]) -> Result<CanonicalMessage, ConsumerError> {
+        let message = DynamicMessage::decode(self.output.clone(), bytes)
+            .map_err(|error| ConsumerError::Permanent(error.into()))?;
+        let payload =
+            serde_json::to_vec(&message).map_err(|error| ConsumerError::Permanent(error.into()))?;
+        Ok(CanonicalMessage::new(payload, None))
+    }
+}
+
+#[async_trait]
+impl MessageConsumer for DynamicConsumer {
+    fn set_exit_on_empty(&mut self, exit_on_empty: bool) {
+        self.exit_on_empty = exit_on_empty;
+    }
+
+    async fn receive_batch(
+        &mut self,
+        max_messages: usize,
+    ) -> Result<crate::outcomes::ReceivedBatch, ConsumerError> {
+        let max_messages = max_messages.max(1);
+        let mut raw = Vec::with_capacity(max_messages);
+        match &mut self.response {
+            DynamicResponse::Unary(message) => {
+                if let Some(message) = message.take() {
+                    raw.push(message);
+                }
+            }
+            DynamicResponse::Streaming(stream) => {
+                while raw.len() < max_messages {
+                    let next = if raw.is_empty() {
+                        match crate::traits::drain_gated(self.exit_on_empty, stream.message()).await
+                        {
+                            Some(result) => result,
+                            None => return Ok(crate::outcomes::ReceivedBatch::empty()),
+                        }
+                    } else {
+                        match tokio::time::timeout(
+                            Duration::from_millis(GRPC_BATCH_POLL_MS),
+                            stream.message(),
+                        )
+                        .await
+                        {
+                            Ok(result) => result,
+                            Err(_) => break,
+                        }
+                    };
+                    match next {
+                        Ok(Some(message)) => raw.push(message),
+                        Ok(None) => break,
+                        Err(error) => return Err(ConsumerError::Connection(error.into())),
+                    }
+                }
+            }
+        }
+        if raw.is_empty() {
+            return Err(ConsumerError::EndOfStream);
+        }
+        // Skip what will not decode rather than failing the batch: these bytes are already
+        // off the stream and cannot be re-read, so discarding the whole batch for one bad
+        // message would silently drop every healthy message alongside it.
+        let mut messages = Vec::with_capacity(raw.len());
+        for bytes in &raw {
+            match self.decode_message(bytes) {
+                Ok(message) => messages.push(message),
+                Err(error) => {
+                    warn!(%error, "Dropping a dynamic gRPC response that does not match the descriptor")
+                }
+            }
+        }
+        if messages.is_empty() {
+            return Err(ConsumerError::Permanent(anyhow::anyhow!(
+                "every message in the dynamic gRPC batch failed to decode"
+            )));
+        }
+        Ok(crate::outcomes::ReceivedBatch {
+            messages,
+            commit: Box::new(|_| Box::pin(async { Ok(()) })),
+        })
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
 struct ClientModeConsumer {
-    _client: BridgeClient<Channel>,
+    client: BridgeClient<Channel>,
     stream: tonic::Streaming<BridgeMessage>,
+    consumer_id: String,
     /// Drain mode: only then does an idle first-message read time out into an empty batch.
     exit_on_empty: bool,
 }
@@ -140,13 +401,25 @@ impl ClientModeConsumer {
     async fn new(config: &GrpcConfig, url: &str) -> Result<Self> {
         debug!(grpc_url = %url, "Creating gRPC client consumer (client mode)");
         let endpoint = make_endpoint(config, url).await?;
-        let mut client = BridgeClient::new(endpoint.connect().await?);
+        let channel = endpoint.connect().await?;
+        let mut client = configured_client(config, channel);
         let topic = config
             .topic
             .clone()
             .unwrap_or_else(|| "default".to_string());
         debug!(grpc_url = %config.url, subscribe_topic = %topic, "gRPC client consumer subscribing to topic");
-        let request = Request::new(SubscribeRequest { topic });
+        // A fresh id per consumer, not the topic: competing consumers on one topic would
+        // otherwise share a pending set, so the first ack would remove the entry and every
+        // other consumer's ack for the same message would be rejected as unknown. Set
+        // `consumer_id` explicitly to keep redelivery across reconnects.
+        let consumer_id = config
+            .consumer_id
+            .clone()
+            .unwrap_or_else(|| fast_uuid_v7::gen_id().to_string());
+        let request = Request::new(SubscribeRequest {
+            topic: topic.clone(),
+            consumer_id: consumer_id.clone(),
+        });
         let stream = if let Some(ms) = config.timeout_ms {
             tokio::time::timeout(Duration::from_millis(ms), client.subscribe(request))
                 .await
@@ -157,8 +430,9 @@ impl ClientModeConsumer {
         .into_inner();
         info!(grpc_url = %url, "gRPC client consumer connected and subscription started");
         Ok(Self {
-            _client: client,
+            client,
             stream,
+            consumer_id,
             exit_on_empty: false,
         })
     }
@@ -173,7 +447,14 @@ impl MessageConsumer for ClientModeConsumer {
         &mut self,
         max_messages: usize,
     ) -> Result<crate::outcomes::ReceivedBatch, ConsumerError> {
-        receive_from_stream(&mut self.stream, max_messages, self.exit_on_empty).await
+        receive_from_stream(
+            &mut self.stream,
+            self.client.clone(),
+            self.consumer_id.clone(),
+            max_messages,
+            self.exit_on_empty,
+        )
+        .await
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -185,10 +466,14 @@ impl MessageConsumer for ClientModeConsumer {
 /// Blocks on the first message; polls briefly for subsequent ones to fill the batch.
 async fn receive_from_stream(
     stream: &mut tonic::Streaming<BridgeMessage>,
+    client: BridgeClient<Channel>,
+    consumer_id: String,
     max_messages: usize,
     exit_on_empty: bool,
 ) -> Result<crate::outcomes::ReceivedBatch, ConsumerError> {
+    let max_messages = max_messages.max(1);
     let mut messages = Vec::with_capacity(max_messages);
+    let mut message_ids = Vec::with_capacity(max_messages);
     loop {
         let result = if messages.is_empty() {
             // Drain mode: a brief idle timeout on the first message yields an empty batch.
@@ -201,6 +486,7 @@ async fn receive_from_stream(
         };
         match result {
             Ok(Ok(Some(msg))) => {
+                message_ids.push(msg.id.clone());
                 messages.push(bridge_to_canonical(msg));
                 if messages.len() >= max_messages {
                     break;
@@ -223,10 +509,106 @@ async fn receive_from_stream(
     if messages.is_empty() {
         Err(ConsumerError::EndOfStream)
     } else {
-        Ok(crate::outcomes::ReceivedBatch {
-            messages,
-            commit: Box::new(|_| Box::pin(async { Ok(()) })),
+        let commit = grpc_client_commit(client, consumer_id, message_ids);
+        Ok(crate::outcomes::ReceivedBatch { messages, commit })
+    }
+}
+
+fn grpc_client_commit(
+    client: BridgeClient<Channel>,
+    consumer_id: String,
+    message_ids: Vec<String>,
+) -> crate::traits::BatchCommitFunc {
+    Box::new(move |dispositions| {
+        Box::pin(async move {
+            if dispositions.len() != message_ids.len() {
+                anyhow::bail!(
+                    "gRPC batch commit length mismatch: dispositions={}, messages={}",
+                    dispositions.len(),
+                    message_ids.len()
+                );
+            }
+            // Acks are independent, so they go out concurrently. Awaiting them one at a
+            // time would cost `batch_size` round trips per commit.
+            let client = &client;
+            let consumer_id = &consumer_id;
+            futures::stream::iter(message_ids.into_iter().zip(dispositions))
+                .map(|(id, disposition)| async move {
+                    let status = match disposition {
+                        MessageDisposition::Ack | MessageDisposition::Reply(_) => {
+                            proto::ack::Status::Ack
+                        }
+                        MessageDisposition::Nack => proto::ack::Status::Nack,
+                    };
+                    let mut metadata = HashMap::new();
+                    metadata.insert("mq_bridge.consumer_id".to_string(), consumer_id.clone());
+                    let response = client
+                        .clone()
+                        .acknowledge(Request::new(proto::Ack {
+                            id,
+                            status: status as i32,
+                            reason: String::new(),
+                            metadata,
+                        }))
+                        .await?
+                        .into_inner();
+                    if !response.success {
+                        anyhow::bail!("gRPC acknowledge rejected: {}", response.error);
+                    }
+                    Ok(())
+                })
+                .buffer_unordered(GRPC_ACK_CONCURRENCY)
+                .try_collect::<Vec<()>>()
+                .await?;
+            Ok(())
         })
+    })
+}
+
+fn publish_response_for_disposition(
+    id: String,
+    disposition: MessageDisposition,
+) -> proto::PublishResponse {
+    match disposition {
+        MessageDisposition::Reply(message) => proto::PublishResponse {
+            result: Some(proto::publish_response::Result::Reply(canonical_to_bridge(
+                message, None,
+            ))),
+        },
+        MessageDisposition::Ack => proto::PublishResponse {
+            result: Some(proto::publish_response::Result::Ack(proto::Ack {
+                id,
+                status: proto::ack::Status::Ack as i32,
+                reason: String::new(),
+                metadata: Default::default(),
+            })),
+        },
+        MessageDisposition::Nack => proto::PublishResponse {
+            result: Some(proto::publish_response::Result::Ack(proto::Ack {
+                id,
+                status: proto::ack::Status::Nack as i32,
+                reason: "Downstream processing failed".to_string(),
+                metadata: Default::default(),
+            })),
+        },
+    }
+}
+
+fn canonical_to_bridge(message: CanonicalMessage, topic: Option<&str>) -> BridgeMessage {
+    let mut metadata: HashMap<String, String> = message
+        .metadata
+        .into_iter()
+        .filter(|(key, _)| !crate::canonical_message::is_source_metadata_key(key))
+        .collect();
+    if let Some(topic) = topic {
+        metadata
+            .entry("mq_bridge.topic".to_string())
+            .or_insert_with(|| topic.to_string());
+    }
+    BridgeMessage {
+        payload: message.payload.to_vec(),
+        id: fast_uuid_v7::format_uuid(message.message_id).to_string(),
+        metadata,
     }
 }
 
@@ -238,7 +620,7 @@ struct ServerModeConsumer {
     bound_addr: std::net::SocketAddr,
     // One receive channel per shard; publishes are spread round-robin across the
     // shards so many concurrent producers don't all contend on one channel.
-    rxs: Vec<mpsc::Receiver<BridgeMessage>>,
+    rxs: Vec<mpsc::Receiver<InboundDelivery>>,
     // Round-robin cursor for the next shard to drain first, so none starves.
     drain_start: usize,
     /// Drain mode: only then does an idle first-message poll time out into an empty batch.
@@ -249,6 +631,31 @@ struct ServerModeConsumer {
 /// broadcast stream and a reliable internal queue for the server-mode consumer.
 struct BridgeService {
     router: Arc<SharedGrpcRouter>,
+    /// How long to wait for the consuming route to commit a published message before
+    /// answering NACK. `None` (no `timeout_ms`) waits indefinitely, so a route that never
+    /// commits blocks the publisher — set `timeout_ms` to bound it.
+    commit_timeout: Option<Duration>,
+}
+
+/// Wait for the route's disposition, treating an expired `commit_timeout` or a dropped
+/// sender as a NACK: either way the message was not confirmed committed.
+async fn await_disposition(
+    receipt: oneshot::Receiver<MessageDisposition>,
+    commit_timeout: Option<Duration>,
+) -> MessageDisposition {
+    match commit_timeout {
+        Some(limit) => match tokio::time::timeout(limit, receipt).await {
+            Ok(disposition) => disposition.unwrap_or(MessageDisposition::Nack),
+            Err(_) => {
+                warn!(
+                    ?limit,
+                    "gRPC publish timed out waiting for the route to commit"
+                );
+                MessageDisposition::Nack
+            }
+        },
+        None => receipt.await.unwrap_or(MessageDisposition::Nack),
+    }
 }
 
 struct SharedGrpcRouter {
@@ -262,9 +669,161 @@ struct SharedGrpcRoute {
     topic: String,
     // Sharded senders; `cursor` round-robins publishes across them. `cursor` is
     // shared (Arc) so all clones of this route advance the same counter.
-    txs: Vec<mpsc::Sender<BridgeMessage>>,
+    txs: Vec<mpsc::Sender<InboundDelivery>>,
     cursor: Arc<AtomicUsize>,
     broadcast_tx: broadcast::Sender<BridgeMessage>,
+    subscriber_pending: Arc<Mutex<SubscriberPending>>,
+    /// `consumer_id`s with a live subscribe stream, so a duplicate is rejected rather than
+    /// silently sharing the first one's retention set.
+    active_subscribers: Arc<Mutex<HashSet<String>>>,
+}
+
+struct InboundDelivery {
+    message: BridgeMessage,
+    completion: oneshot::Sender<MessageDisposition>,
+}
+
+/// A `publish_batch` message that has been dispatched and is waiting for its response.
+enum Pending {
+    /// Resolves to the disposition the consuming route committed.
+    Receipt(oneshot::Receiver<MessageDisposition>),
+    /// Never reached a consumer; answered with this reason.
+    Nack(&'static str),
+}
+
+/// Unacknowledged messages retained for one subscriber, so a consumer reconnecting with
+/// the same `consumer_id` is redelivered them.
+///
+/// Both caps are hard: retention is a redelivery aid for a running server, not durable
+/// storage, and a subscriber that never acks would otherwise grow the server without
+/// bound. `unacked` is authoritative — `queue` keeps arrival order and may hold already
+/// acked entries until it is compacted, which keeps every operation O(1) amortized.
+#[derive(Default)]
+struct PendingMessages {
+    queue: VecDeque<BridgeMessage>,
+    unacked: HashSet<String>,
+}
+
+impl PendingMessages {
+    fn retain(&mut self, msg: &BridgeMessage) {
+        if !self.unacked.insert(msg.id.clone()) {
+            return;
+        }
+        if self.queue.len() >= MAX_PENDING_PER_CONSUMER {
+            self.queue.retain(|held| self.unacked.contains(&held.id));
+        }
+        if self.queue.len() >= MAX_PENDING_PER_CONSUMER {
+            if let Some(dropped) = self.queue.pop_front() {
+                warn!(
+                    msg_id = %dropped.id,
+                    "gRPC subscriber holds too many unacknowledged messages, dropping the oldest"
+                );
+                self.unacked.remove(&dropped.id);
+            }
+        }
+        self.queue.push_back(msg.clone());
+    }
+
+    fn is_unacked(&self, msg_id: &str) -> bool {
+        self.unacked.contains(msg_id)
+    }
+
+    /// `true` if the id was still awaiting acknowledgement.
+    fn acknowledge(&mut self, msg_id: &str) -> bool {
+        self.unacked.remove(msg_id)
+    }
+
+    fn replay(&self) -> Vec<BridgeMessage> {
+        self.queue
+            .iter()
+            .filter(|msg| self.unacked.contains(&msg.id))
+            .cloned()
+            .collect()
+    }
+}
+
+/// Per-subscriber retention for one route, capped in both dimensions.
+#[derive(Default)]
+struct SubscriberPending {
+    by_consumer: HashMap<String, PendingMessages>,
+    /// Insertion order of `by_consumer`, so the oldest subscriber can be evicted. A
+    /// consumer that never reconnects (the default id is per-instance) would otherwise
+    /// leave its entry behind forever.
+    order: VecDeque<String>,
+}
+
+impl SubscriberPending {
+    fn entry(&mut self, consumer_id: &str) -> &mut PendingMessages {
+        if !self.by_consumer.contains_key(consumer_id) {
+            if self.order.len() >= MAX_PENDING_CONSUMERS {
+                if let Some(evicted) = self.order.pop_front() {
+                    warn!(
+                        consumer_id = %evicted,
+                        "gRPC subscriber retention is full, dropping the oldest subscriber"
+                    );
+                    self.by_consumer.remove(&evicted);
+                }
+            }
+            self.order.push_back(consumer_id.to_string());
+            self.by_consumer
+                .insert(consumer_id.to_string(), PendingMessages::default());
+        }
+        self.by_consumer
+            .get_mut(consumer_id)
+            .expect("entry was just inserted")
+    }
+
+    fn get(&self, consumer_id: &str) -> Option<&PendingMessages> {
+        self.by_consumer.get(consumer_id)
+    }
+
+    fn get_mut(&mut self, consumer_id: &str) -> Option<&mut PendingMessages> {
+        self.by_consumer.get_mut(consumer_id)
+    }
+
+    fn remove(&mut self, consumer_id: &str) {
+        self.by_consumer.remove(consumer_id);
+        self.order.retain(|held| held != consumer_id);
+    }
+}
+
+/// Holds a `consumer_id` for the lifetime of one subscribe stream, so a second stream
+/// cannot claim the same id while the first is live. Released on drop, however the
+/// stream's task ends.
+struct SubscriptionClaim {
+    consumer_id: String,
+    active: Arc<Mutex<HashSet<String>>>,
+    /// Set for a server-generated id, whose retention is worthless once the stream ends
+    /// because no client can ever reconnect under it.
+    drop_pending: Option<Arc<Mutex<SubscriberPending>>>,
+}
+
+impl SubscriptionClaim {
+    fn acquire(route: &SharedGrpcRoute, consumer_id: String, ephemeral: bool) -> Option<Self> {
+        let mut active = route.active_subscribers.lock().ok()?;
+        if !active.insert(consumer_id.clone()) {
+            return None;
+        }
+        drop(active);
+        Some(Self {
+            consumer_id,
+            active: route.active_subscribers.clone(),
+            drop_pending: ephemeral.then(|| route.subscriber_pending.clone()),
+        })
+    }
+}
+
+impl Drop for SubscriptionClaim {
+    fn drop(&mut self) {
+        if let Ok(mut active) = self.active.lock() {
+            active.remove(&self.consumer_id);
+        }
+        if let Some(pending) = &self.drop_pending {
+            if let Ok(mut pending) = pending.lock() {
+                pending.remove(&self.consumer_id);
+            }
+        }
+    }
 }
 
 struct SharedGrpcServer {
@@ -319,7 +878,7 @@ impl SharedGrpcRouter {
         &self,
         route_id: u64,
         topic: String,
-        txs: Vec<mpsc::Sender<BridgeMessage>>,
+        txs: Vec<mpsc::Sender<InboundDelivery>>,
     ) -> Result<()> {
         let mut routes = self
             .routes
@@ -339,6 +898,8 @@ impl SharedGrpcRouter {
                 txs,
                 cursor: Arc::new(AtomicUsize::new(0)),
                 broadcast_tx,
+                subscriber_pending: Arc::new(Mutex::new(SubscriberPending::default())),
+                active_subscribers: Arc::new(Mutex::new(HashSet::new())),
             },
         );
         Ok(())
@@ -359,12 +920,7 @@ impl SharedGrpcRouter {
         routes.values().find(|route| route.topic == topic).cloned()
     }
 
-    fn subscribe_to_topic(&self, topic: &str) -> Option<broadcast::Receiver<BridgeMessage>> {
-        self.route_for_topic(topic)
-            .map(|route| route.broadcast_tx.subscribe())
-    }
-
-    async fn dispatch(&self, msg: BridgeMessage) -> Result<()> {
+    async fn dispatch(&self, msg: BridgeMessage) -> Result<oneshot::Receiver<MessageDisposition>> {
         let topic = bridge_message_topic(&msg);
         let route = self
             .route_for_topic(&topic)
@@ -374,11 +930,15 @@ impl SharedGrpcRouter {
             let _ = route.broadcast_tx.send(msg.clone());
         }
         let shard = route.cursor.fetch_add(1, Ordering::Relaxed) % route.txs.len();
+        let (completion, receipt) = oneshot::channel();
         route.txs[shard]
-            .send(msg)
+            .send(InboundDelivery {
+                message: msg,
+                completion,
+            })
             .await
             .map_err(|_| anyhow::anyhow!("No active gRPC consumer for topic '{}'", topic))?;
-        Ok(())
+        Ok(receipt)
     }
 }
 
@@ -392,37 +952,70 @@ impl proto::bridge_server::Bridge for BridgeService {
         let msg_id = msg.id.clone();
         let topic = bridge_message_topic(&msg);
         trace!(msg_id = %msg_id, topic = %topic, "BridgeService::publish received message");
-        if self.router.dispatch(msg).await.is_err() {
-            warn!(msg_id = %msg_id, topic = %topic, "BridgeService::publish failed: internal server queue is closed");
-            return Ok(Response::new(proto::PublishResponse {
-                result: Some(proto::publish_response::Result::Ack(proto::Ack {
-                    id: msg_id,
-                    status: 1, // NACK
-                    reason: "Internal queue closed".to_string(),
-                    metadata: Default::default(),
-                })),
-            }));
-        }
-        Ok(Response::new(proto::PublishResponse {
-            result: Some(proto::publish_response::Result::Ack(proto::Ack {
-                id: msg_id,
-                status: 0,
-                reason: String::new(),
-                metadata: Default::default(),
-            })),
-        }))
+        let receipt = match self.router.dispatch(msg).await {
+            Ok(receipt) => receipt,
+            Err(_) => {
+                warn!(msg_id = %msg_id, topic = %topic, "BridgeService::publish failed: internal server queue is closed");
+                return Ok(Response::new(proto::PublishResponse {
+                    result: Some(proto::publish_response::Result::Ack(proto::Ack {
+                        id: msg_id,
+                        status: 1, // NACK
+                        reason: "Internal queue closed".to_string(),
+                        metadata: Default::default(),
+                    })),
+                }));
+            }
+        };
+        let disposition = await_disposition(receipt, self.commit_timeout).await;
+        Ok(Response::new(publish_response_for_disposition(
+            msg_id,
+            disposition,
+        )))
     }
 
     async fn acknowledge(
         &self,
         request: Request<proto::Ack>,
     ) -> Result<Response<proto::AckResponse>, Status> {
-        // Minimal implementation: accept the ack and return success.
         let ack = request.into_inner();
         trace!(ack_id = %ack.id, "BridgeService::acknowledge received ack");
+        // Without an id there is no retention set to resolve the ack against, so reporting
+        // success would tell the caller its message was committed when nothing was tracked.
+        let Some(consumer_id) = ack.metadata.get("mq_bridge.consumer_id") else {
+            return Ok(Response::new(proto::AckResponse {
+                success: false,
+                error: "Ack is missing the mq_bridge.consumer_id metadata entry".to_string(),
+            }));
+        };
+        let acked = ack.status == proto::ack::Status::Ack as i32;
+        let mut found = false;
+        if let Ok(routes) = self.router.routes.read() {
+            for route in routes.values() {
+                let Ok(mut pending) = route.subscriber_pending.lock() else {
+                    continue;
+                };
+                let Some(messages) = pending.get_mut(consumer_id) else {
+                    continue;
+                };
+                if !messages.is_unacked(&ack.id) {
+                    continue;
+                }
+                // A NACK leaves the message pending so it is redelivered on reconnect.
+                found = if acked {
+                    messages.acknowledge(&ack.id)
+                } else {
+                    true
+                };
+                break;
+            }
+        }
         Ok(Response::new(proto::AckResponse {
-            success: true,
-            error: String::new(),
+            success: found,
+            error: if found {
+                String::new()
+            } else {
+                "Unknown consumer or message".to_string()
+            },
         }))
     }
 
@@ -436,32 +1029,29 @@ impl proto::bridge_server::Bridge for BridgeService {
         let (tx, rx) = mpsc::channel(32);
         let router = self.router.clone();
 
+        // Dispatch and commit-wait run in separate tasks. Awaiting a receipt inline would
+        // keep the next message from reaching the consumer until this one had committed,
+        // and the consumer lingers for more messages before returning a batch — so the two
+        // would wait on each other and every batch would hold exactly one message.
+        let (pending_tx, mut pending_rx) =
+            mpsc::channel::<(String, Pending)>(PUBLISH_BATCH_INFLIGHT);
+
+        let commit_timeout = self.commit_timeout;
         tokio::spawn(async move {
-            while let Ok(Some(msg)) = stream.message().await {
-                let msg_id = msg.id.clone();
-                let topic = bridge_message_topic(&msg);
-                trace!(msg_id = %msg_id, topic = %topic, "BridgeService::publish_batch received message");
-                if router.dispatch(msg).await.is_err() {
-                    warn!("publish_batch: internal server queue closed, stopping responder task");
-                    // Send an explicit NACK for this message so clients receive a terminal response
-                    let nack = proto::PublishResponse {
+            while let Some((msg_id, pending)) = pending_rx.recv().await {
+                let resp = match pending {
+                    Pending::Receipt(receipt) => publish_response_for_disposition(
+                        msg_id,
+                        await_disposition(receipt, commit_timeout).await,
+                    ),
+                    Pending::Nack(reason) => proto::PublishResponse {
                         result: Some(proto::publish_response::Result::Ack(proto::Ack {
-                            id: msg_id.clone(),
-                            status: 1,
-                            reason: "Internal queue closed".to_string(),
+                            id: msg_id,
+                            status: proto::ack::Status::Nack as i32,
+                            reason: reason.to_string(),
                             metadata: Default::default(),
                         })),
-                    };
-                    let _ = tx.send(Ok(nack)).await;
-                    break;
-                }
-                let resp = proto::PublishResponse {
-                    result: Some(proto::publish_response::Result::Ack(proto::Ack {
-                        id: msg_id,
-                        status: 0,
-                        reason: String::new(),
-                        metadata: Default::default(),
-                    })),
+                    },
                 };
                 if tx.send(Ok(resp)).await.is_err() {
                     warn!("publish_batch: client stream closed, stopping responder task");
@@ -469,6 +1059,32 @@ impl proto::bridge_server::Bridge for BridgeService {
                 }
             }
             trace!("publish_batch responder task exiting");
+        });
+
+        tokio::spawn(async move {
+            while let Ok(Some(msg)) = stream.message().await {
+                let msg_id = msg.id.clone();
+                let topic = bridge_message_topic(&msg);
+                trace!(msg_id = %msg_id, topic = %topic, "BridgeService::publish_batch received message");
+                let pending = match router.dispatch(msg).await {
+                    Ok(receipt) => Pending::Receipt(receipt),
+                    Err(_) => {
+                        warn!(
+                            "publish_batch: internal server queue closed, stopping dispatch task"
+                        );
+                        // Queued rather than sent directly, so this terminal NACK still
+                        // arrives after the responses for the messages before it.
+                        let _ = pending_tx
+                            .send((msg_id, Pending::Nack("Internal queue closed")))
+                            .await;
+                        break;
+                    }
+                };
+                if pending_tx.send((msg_id, pending)).await.is_err() {
+                    break;
+                }
+            }
+            trace!("publish_batch dispatch task exiting");
         });
 
         Ok(Response::new(ReceiverStream::new(rx)))
@@ -480,16 +1096,54 @@ impl proto::bridge_server::Bridge for BridgeService {
         &self,
         request: Request<SubscribeRequest>,
     ) -> Result<Response<Self::SubscribeStream>, Status> {
-        let topic = normalize_grpc_topic(Some(request.into_inner().topic.as_str()));
-        let mut rx = self
+        let request = request.into_inner();
+        let topic = normalize_grpc_topic(Some(request.topic.as_str()));
+        // An id the server made up cannot be reconnected to, so its retention is dropped
+        // when the stream ends instead of waiting to be evicted by the cap.
+        let ephemeral = request.consumer_id.is_empty();
+        let consumer_id = if ephemeral {
+            fast_uuid_v7::gen_id().to_string()
+        } else {
+            request.consumer_id
+        };
+        let route = self
             .router
-            .subscribe_to_topic(&topic)
+            .route_for_topic(&topic)
             .ok_or_else(|| Status::not_found(format!("No active gRPC topic '{}'", topic)))?;
+
+        // One stream per id. Two live subscriptions sharing an id would both be fanned the
+        // same broadcast messages but share one retention set, so whichever acked first
+        // would remove the entry and the other's ack would come back rejected.
+        let claim = SubscriptionClaim::acquire(&route, consumer_id.clone(), ephemeral).ok_or_else(|| {
+            Status::already_exists(format!(
+                "gRPC consumer_id '{consumer_id}' already has an active subscription on topic '{topic}'"
+            ))
+        })?;
+
+        let mut rx = route.broadcast_tx.subscribe();
+        let replay = route
+            .subscriber_pending
+            .lock()
+            .ok()
+            .and_then(|pending| pending.get(&consumer_id).map(PendingMessages::replay))
+            .unwrap_or_default();
+        let pending = route.subscriber_pending.clone();
         let (tx_stream, rx_stream) = mpsc::channel(32);
         tokio::spawn(async move {
+            // Releases the id, and an ephemeral consumer's retention with it, however this
+            // task ends.
+            let _claim = claim;
+            for msg in replay {
+                if tx_stream.send(Ok(msg)).await.is_err() {
+                    return;
+                }
+            }
             loop {
                 match rx.recv().await {
                     Ok(msg) => {
+                        if let Ok(mut pending) = pending.lock() {
+                            pending.entry(&consumer_id).retain(&msg);
+                        }
                         if tx_stream.send(Ok(msg)).await.is_err() {
                             warn!("subscribe: downstream consumer disconnected");
                             break;
@@ -555,7 +1209,7 @@ async fn get_or_create_shared_grpc_server(
     key: &GrpcServerKey,
     route_id: u64,
     topic: String,
-    txs: Vec<mpsc::Sender<BridgeMessage>>,
+    txs: Vec<mpsc::Sender<InboundDelivery>>,
 ) -> Result<Arc<SharedGrpcServer>> {
     if let Ok(registry) = grpc_server_registry().lock() {
         for (existing_key, server) in registry.iter() {
@@ -621,6 +1275,7 @@ async fn get_or_create_shared_grpc_server(
 
     let mut service = proto::bridge_server::BridgeServer::new(BridgeService {
         router: router.clone(),
+        commit_timeout: config.timeout_ms.map(Duration::from_millis),
     });
     if let Some(max) = config.max_decoding_message_size {
         service = service.max_decoding_message_size(max);
@@ -701,13 +1356,15 @@ impl MessageConsumer for ServerModeConsumer {
         let max_messages = max_messages.max(1);
         let shard_count = self.rxs.len();
         let mut messages = Vec::with_capacity(max_messages);
+        let mut completions = Vec::with_capacity(max_messages);
         'fill: loop {
             // Greedily sweep all shards for whatever is immediately available.
             let mut got_any = false;
             for offset in 0..shard_count {
                 let idx = (self.drain_start + offset) % shard_count;
-                if let Ok(msg) = self.rxs[idx].try_recv() {
-                    messages.push(bridge_to_canonical(msg));
+                if let Ok(delivery) = self.rxs[idx].try_recv() {
+                    messages.push(bridge_to_canonical(delivery.message));
+                    completions.push(delivery.completion);
                     got_any = true;
                     if messages.len() >= max_messages {
                         break 'fill;
@@ -754,17 +1411,32 @@ impl MessageConsumer for ServerModeConsumer {
                 }
             };
             match next {
-                Some(msg) => messages.push(bridge_to_canonical(msg)),
+                Some(delivery) => {
+                    messages.push(bridge_to_canonical(delivery.message));
+                    completions.push(delivery.completion);
+                }
                 None => break, // every shard closed
             }
         }
         if messages.is_empty() {
             Err(ConsumerError::EndOfStream)
         } else {
-            Ok(crate::outcomes::ReceivedBatch {
-                messages,
-                commit: Box::new(|_| Box::pin(async { Ok(()) })),
-            })
+            let commit = Box::new(move |dispositions: Vec<MessageDisposition>| {
+                Box::pin(async move {
+                    if dispositions.len() != completions.len() {
+                        anyhow::bail!(
+                            "gRPC server batch commit length mismatch: dispositions={}, messages={}",
+                            dispositions.len(),
+                            completions.len()
+                        );
+                    }
+                    for (completion, disposition) in completions.into_iter().zip(dispositions) {
+                        let _ = completion.send(disposition);
+                    }
+                    Ok(())
+                }) as futures::future::BoxFuture<'static, anyhow::Result<()>>
+            });
+            Ok(crate::outcomes::ReceivedBatch { messages, commit })
         }
     }
 
@@ -799,6 +1471,10 @@ impl GrpcPublisher {
             &config.tls.key_file,
             config.tls.accept_invalid_certs,
             config.timeout_ms,
+            config.initial_stream_window_size,
+            config.initial_connection_window_size,
+            config.http2_keepalive_interval_ms,
+            config.http2_keepalive_timeout_ms,
         ));
         let config_clone = config.clone();
         let url_for_build = url.clone();
@@ -812,7 +1488,7 @@ impl GrpcPublisher {
             },
         )
         .await?;
-        let client = BridgeClient::new((*shared_channel).clone());
+        let client = configured_client(config, (*shared_channel).clone());
         Ok(Self {
             client,
             _shared_channel: shared_channel,
@@ -841,22 +1517,7 @@ impl MessagePublisher for GrpcPublisher {
         let bridge_messages_vec: Vec<BridgeMessage> = original_messages
             .iter()
             .cloned()
-            .map(|msg| {
-                let mut md: std::collections::HashMap<String, String> = msg
-                    .metadata
-                    .into_iter()
-                    .filter(|(key, _)| !crate::canonical_message::is_source_metadata_key(key))
-                    .collect();
-                if let Some(topic) = &self.topic {
-                    md.entry("mq_bridge.topic".to_string())
-                        .or_insert_with(|| topic.clone());
-                }
-                BridgeMessage {
-                    payload: msg.payload.to_vec(),
-                    id: fast_uuid_v7::format_uuid(msg.message_id).to_string(),
-                    metadata: md.into_iter().collect(),
-                }
-            })
+            .map(|msg| canonical_to_bridge(msg, self.topic.as_deref()))
             .collect();
 
         // Process responses and enforce an overall timeout if configured.
@@ -1025,8 +1686,31 @@ async fn make_endpoint(config: &GrpcConfig, url: &str) -> Result<tonic::transpor
     if let Some(ms) = config.timeout_ms {
         endpoint = endpoint.connect_timeout(Duration::from_millis(ms));
     }
+    if let Some(v) = config.initial_stream_window_size {
+        endpoint = endpoint.initial_stream_window_size(v);
+    }
+    if let Some(v) = config.initial_connection_window_size {
+        endpoint = endpoint.initial_connection_window_size(v);
+    }
+    if let Some(ms) = config.http2_keepalive_interval_ms {
+        endpoint = endpoint.http2_keep_alive_interval(Duration::from_millis(ms));
+    }
+    if let Some(ms) = config.http2_keepalive_timeout_ms {
+        endpoint = endpoint.keep_alive_timeout(Duration::from_millis(ms));
+    }
 
     Ok(endpoint)
+}
+
+fn configured_client(config: &GrpcConfig, channel: Channel) -> BridgeClient<Channel> {
+    let mut client = BridgeClient::new(channel);
+    if let Some(max) = config.max_decoding_message_size {
+        client = client.max_decoding_message_size(max);
+    }
+    if let Some(max) = config.max_encoding_message_size {
+        client = client.max_encoding_message_size(max);
+    }
+    client
 }
 
 fn parse_addr(url: &str) -> Result<std::net::SocketAddr> {
@@ -1368,5 +2052,181 @@ mod tests {
         assert!(ack_resp.unwrap().into_inner().success);
 
         server_handle.abort();
+    }
+
+    /// `publish_batch` must dispatch without waiting for each message to commit. Awaiting
+    /// receipts inline deadlocked against the consumer's batch-fill linger: the consumer
+    /// waited for a second message that the publisher would not send until the first had
+    /// committed, so every batch held exactly one message and throughput collapsed to
+    /// roughly one message per `GRPC_BATCH_POLL_MS`.
+    ///
+    /// Uses the real `BridgeService`, not `MockBridge` — the mock answers immediately and
+    /// cannot catch this.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn publish_batch_does_not_serialize_on_commits() {
+        const COUNT: usize = 200;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+
+        let mut consumer = GrpcConsumer::new(&GrpcConfig {
+            url: url.clone(),
+            topic: Some("batching".into()),
+            server_mode: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+        let drain = tokio::spawn(async move {
+            let (mut total, mut batches) = (0usize, 0usize);
+            while total < COUNT {
+                let batch = consumer.receive_batch(512).await.expect("receive");
+                let n = batch.messages.len();
+                if n == 0 {
+                    continue;
+                }
+                total += n;
+                batches += 1;
+                (batch.commit)(vec![MessageDisposition::Ack; n])
+                    .await
+                    .expect("commit");
+            }
+            (total, batches)
+        });
+
+        // Let the embedded server bind before the publisher connects.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let publisher = GrpcPublisher::new(&GrpcConfig {
+            url,
+            topic: Some("batching".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+        let messages = (0..COUNT)
+            .map(|i| CanonicalMessage::from(format!("m{i}")))
+            .collect();
+        publisher.send_batch(messages).await.unwrap();
+
+        let (total, batches) = tokio::time::timeout(Duration::from_secs(30), drain)
+            .await
+            .expect("route did not drain")
+            .unwrap();
+
+        assert_eq!(total, COUNT, "every message must arrive");
+        assert!(
+            batches < COUNT / 4,
+            "publish_batch is serializing on commits: {batches} batches for {COUNT} messages"
+        );
+    }
+
+    fn bridge_msg(id: &str) -> BridgeMessage {
+        BridgeMessage {
+            payload: id.as_bytes().to_vec(),
+            id: id.to_string(),
+            metadata: Default::default(),
+        }
+    }
+
+    #[test]
+    fn pending_messages_replays_only_unacknowledged() {
+        let mut pending = PendingMessages::default();
+        for id in ["a", "b", "c"] {
+            pending.retain(&bridge_msg(id));
+        }
+        // Retaining the same id twice must not duplicate it.
+        pending.retain(&bridge_msg("b"));
+
+        assert!(pending.acknowledge("b"));
+        assert!(!pending.acknowledge("b"), "a second ack finds nothing");
+        assert!(!pending.is_unacked("b"));
+
+        let replayed: Vec<String> = pending.replay().into_iter().map(|msg| msg.id).collect();
+        assert_eq!(replayed, vec!["a".to_string(), "c".to_string()]);
+    }
+
+    #[test]
+    fn pending_messages_caps_retention_and_drops_the_oldest() {
+        let mut pending = PendingMessages::default();
+        for i in 0..MAX_PENDING_PER_CONSUMER + 10 {
+            pending.retain(&bridge_msg(&format!("m{i}")));
+        }
+        assert_eq!(pending.replay().len(), MAX_PENDING_PER_CONSUMER);
+        assert!(!pending.is_unacked("m0"), "the oldest is evicted");
+        assert!(pending.is_unacked(&format!("m{}", MAX_PENDING_PER_CONSUMER + 9)));
+    }
+
+    fn service_with_topic(topic: &str) -> BridgeService {
+        let router = Arc::new(SharedGrpcRouter::new());
+        let (tx, _rx) = mpsc::channel::<InboundDelivery>(8);
+        router
+            .register_route(1, topic.to_string(), vec![tx])
+            .unwrap();
+        BridgeService {
+            router,
+            commit_timeout: None,
+        }
+    }
+
+    /// Two live subscriptions under one id would be fanned the same broadcast messages
+    /// while sharing a single retention set, so the first ack would remove the entry and
+    /// the second consumer's ack would come back rejected.
+    #[tokio::test]
+    async fn subscribe_rejects_a_duplicate_active_consumer_id() {
+        let service = service_with_topic("dup");
+        let subscribe = |consumer_id: &str| {
+            service.subscribe(Request::new(SubscribeRequest {
+                topic: "dup".to_string(),
+                consumer_id: consumer_id.to_string(),
+            }))
+        };
+
+        let _first = subscribe("shared").await.expect("first subscription");
+        let err = subscribe("shared")
+            .await
+            .expect_err("duplicate is rejected");
+        assert_eq!(err.code(), tonic::Code::AlreadyExists);
+        assert!(
+            err.message().contains("shared"),
+            "the error should name the id: {}",
+            err.message()
+        );
+
+        subscribe("other").await.expect("a distinct id still works");
+    }
+
+    /// Without the id there is no retention set to resolve the ack against, so reporting
+    /// success would claim a commit that never tracked anything.
+    #[tokio::test]
+    async fn acknowledge_without_a_consumer_id_reports_failure() {
+        let service = service_with_topic("acks");
+        let response = service
+            .acknowledge(Request::new(proto::Ack {
+                id: "m1".to_string(),
+                status: proto::ack::Status::Ack as i32,
+                reason: String::new(),
+                metadata: Default::default(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!response.success);
+        assert!(response.error.contains("mq_bridge.consumer_id"));
+    }
+
+    #[test]
+    fn subscriber_pending_caps_the_number_of_subscribers() {
+        let mut subscribers = SubscriberPending::default();
+        for i in 0..MAX_PENDING_CONSUMERS + 5 {
+            subscribers.entry(&format!("c{i}")).retain(&bridge_msg("x"));
+        }
+        assert!(subscribers.get("c0").is_none(), "the oldest is evicted");
+        assert!(subscribers
+            .get(&format!("c{}", MAX_PENDING_CONSUMERS + 4))
+            .is_some());
     }
 }

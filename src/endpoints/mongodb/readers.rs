@@ -332,6 +332,7 @@ pub struct MongoDbChangeStreamReader {
     source_metadata: bool,
     /// `<database>.<collection>`, precomputed for the `mqb.src.mongodb_namespace` key.
     namespace: String,
+    exit_on_empty: bool,
 }
 
 impl MongoDbChangeStreamReader {
@@ -461,6 +462,7 @@ impl MongoDbChangeStreamReader {
             )),
             source_metadata,
             namespace: format!("{}.{}", config.database, collection_name),
+            exit_on_empty: false,
         })
     }
 
@@ -769,8 +771,20 @@ impl MessageConsumer for MongoDbChangeStreamReader {
         // other state. `next_if_any` borrows the stream instead of replacing that state, so the
         // token stays readable when the timeout fires mid-poll.
         let mut last_refresh = Instant::now();
+        let drain_deadline = self
+            .exit_on_empty
+            .then(|| Instant::now() + crate::traits::drain_idle_timeout());
         loop {
-            match tokio::time::timeout(IDLE_RESUME_REFRESH, stream.next_if_any()).await {
+            let poll = if let Some(deadline) = drain_deadline {
+                tokio::time::timeout_at(
+                    tokio::time::Instant::from_std(deadline),
+                    stream.next_if_any(),
+                )
+                .await
+            } else {
+                tokio::time::timeout(IDLE_RESUME_REFRESH, stream.next_if_any()).await
+            };
+            match poll {
                 Ok(Ok(Some(event))) => {
                     let token = event.id.clone();
                     if let Some(msg) =
@@ -786,7 +800,7 @@ impl MessageConsumer for MongoDbChangeStreamReader {
                 }
                 Ok(Err(e)) => return Err(ConsumerError::Connection(e.into())),
                 // No change ready: the getMore came back empty, or it outran the refresh interval.
-                Ok(Ok(None)) | Err(_) => {
+                Ok(Ok(None)) => {
                     if !stream.is_alive() {
                         return Err(anyhow!("MongoDB change stream ended unexpectedly").into());
                     }
@@ -796,6 +810,12 @@ impl MessageConsumer for MongoDbChangeStreamReader {
                         self.refresh_idle_checkpoint(token).await;
                         last_refresh = Instant::now();
                     }
+                }
+                Err(_) if self.exit_on_empty => return Ok(ReceivedBatch::empty()),
+                Err(_) => {
+                    let token = stream.resume_token();
+                    self.refresh_idle_checkpoint(token).await;
+                    last_refresh = Instant::now();
                 }
             }
         }
@@ -894,6 +914,10 @@ impl MessageConsumer for MongoDbChangeStreamReader {
             }),
             ..Default::default()
         }
+    }
+
+    fn set_exit_on_empty(&mut self, exit_on_empty: bool) {
+        self.exit_on_empty = exit_on_empty;
     }
 
     fn as_any(&self) -> &dyn Any {

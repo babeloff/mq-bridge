@@ -109,9 +109,9 @@ fn parse_document_takes_wrapped_fields_and_falls_back_otherwise() {
 #[test]
 fn resolved_consume_defaults_and_change_stream_alias() {
     use crate::models::{MongoConsume, MongoDbConfig};
-    // Default: durable queue consumer.
+    // Default: non-destructive capture of the existing collection, then changes.
     let cfg = MongoDbConfig::new("mongodb://localhost", "db");
-    assert_eq!(cfg.resolved_consume(), MongoConsume::Consumer);
+    assert_eq!(cfg.resolved_consume(), MongoConsume::CaptureAll);
     // Deprecated `change_stream: true` (no `consume`) still maps to the subscriber mode.
     let mut legacy = MongoDbConfig::new("mongodb://localhost", "db");
     legacy.change_stream = true;

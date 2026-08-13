@@ -326,6 +326,47 @@ async fn drain_cdc(reader: &mut MongoDbChangeStreamReader, want: usize) -> usize
     got
 }
 
+pub async fn test_mongodb_capture_all_exits_on_empty() {
+    setup_logging();
+    run_test_with_docker(
+        "tests/integration/docker-compose/mongodb-replica.yml",
+        || async {
+            use mq_bridge::traits::{MessageConsumer, MessageDisposition};
+
+            let collection = format!("capture_all_drain_{}", fast_uuid_v7::gen_id());
+            let client = mongodb::Client::with_uri_str(CDC_URL).await.unwrap();
+            let coll = client
+                .database(CDC_DB)
+                .collection::<mongodb::bson::Document>(&collection);
+            coll.insert_many([
+                mongodb::bson::doc! { "id": 1 },
+                mongodb::bson::doc! { "id": 2 },
+            ])
+            .await
+            .expect("seed collection");
+
+            let mut reader = MongoDbChangeStreamReader::new(&cdc_reader_cfg(&collection), true)
+                .await
+                .expect("create capture_all reader");
+            reader.set_exit_on_empty(true);
+
+            let snapshot = reader.receive_batch(10).await.expect("read snapshot");
+            assert_eq!(snapshot.messages.len(), 2);
+            (snapshot.commit)(vec![MessageDisposition::Ack; 2])
+                .await
+                .expect("commit snapshot");
+
+            let empty =
+                tokio::time::timeout(std::time::Duration::from_secs(5), reader.receive_batch(10))
+                    .await
+                    .expect("capture_all drain did not finish after its idle timeout")
+                    .expect("receive empty batch");
+            assert!(empty.messages.is_empty());
+        },
+    )
+    .await;
+}
+
 pub async fn test_mongodb_cdc_read_throughput() {
     setup_logging();
     run_test_with_docker(

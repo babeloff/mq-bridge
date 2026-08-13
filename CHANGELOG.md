@@ -2,10 +2,52 @@
 
 All notable changes to `mq-bridge`. Newest first.
 
-## Unreleased
+## 0.4.0
+
+### Breaking
+
+- **Changed defaults.** Four defaults were chosen for safety or speed rather than history.
+  Set the field explicitly to keep the old behaviour:
+  - `batch_size` is **512** instead of 1. Batches fill opportunistically — the consumer waits
+    for one message and takes whatever else is already there — so this raises throughput
+    without adding idle latency. It does widen the blast radius of a failed batch, and
+    nothing caps a batch by bytes, so lower it on routes carrying large payloads.
+  - MongoDB `consume` defaults to **`capture_all`** instead of `consumer`. The old default
+    claimed, re-fetched and **deleted** each document, so pointing a route at a collection to
+    read it destroyed it — and it only ever worked on collections written by the mq-bridge
+    MongoDB publisher. `capture_all` is non-destructive, reads arbitrary collections, and is
+    ~5x faster. It wants a replica set; on a standalone server it degrades to an insert-only
+    `_id` read that terminates on drain. On a replica set, `capture_all` follows the change
+    stream after its snapshot; a one-shot `exit_on_empty` / `--drain` job now finishes when
+    that stream stays quiet for the drain idle timeout.
+  - ZeroMQ `format` defaults to **`raw_framed`** instead of `json`: binary-safe payloads with
+    a JSON metadata frame in front, so headers still travel. This is a wire-format change —
+    a 0.4 peer and a 0.3 peer no longer interoperate on the same socket unless one sets
+    `format: json`.
+  - ZeroMQ `backend` defaults to **`try_omq`**, which uses the faster omq backend when the
+    `zeromq-omq` feature is compiled in and falls back to `zmq` otherwise. Naming `omq` or
+    `zmq` explicitly still makes that backend a hard requirement.
+- `extensions::register_endpoint_factory` and `register_middleware_factory` return
+  `anyhow::Result<()>` instead of `()`, and registering a name that is already taken is now an
+  error instead of silently replacing the previous factory. A duplicate name meant one of the
+  two registrations was quietly ignored, which is impossible to diagnose from a route that then
+  behaves like the wrong endpoint. Existing callers add `?` or `.unwrap()`; anything that relied
+  on re-registering the same name must pick distinct names.
 
 ### Added
 
+- gRPC consumers can call arbitrary unary and server-streaming services without generated
+  Rust clients. Point an endpoint at a compiled protobuf `FileDescriptorSet`, name the
+  service and method, and provide the request as JSON; responses are decoded dynamically
+  with `prost-reflect` and emitted using protobuf's canonical JSON representation. The
+  existing generated `mqbridge.Bridge` protocol remains the default.
+- The omq ZeroMQ backend covers **REQ/REP** as well as PUSH/PULL and PUB/SUB, so the whole
+  `zeromq` endpoint surface — including request-reply — works on either backend. REQ exchanges
+  are serialised and bounded by `request_timeout_ms`, and a timed-out socket is rebuilt rather
+  than reused, because ZMTP requires strict send/recv alternation.
+- Custom endpoints and middleware can be written in Python and Node.js, not just Rust —
+  `register_endpoint` / `register_middleware` in both bindings, with the same batch, ack and
+  request-reply semantics as a Rust `CustomEndpointFactory`. See [EXTENDING.md](docs/EXTENDING.md).
 - Native endpoint plugins. An endpoint can live in its own crate and package and be loaded
   into any mq-bridge process at runtime — `mq_bridge::plugin::load_endpoint_plugin(path)` in
   Rust, `mq_bridge.load_endpoint_plugin(path)` in Python, `loadEndpointPlugin(path)` in
@@ -19,6 +61,33 @@ All notable changes to `mq-bridge`. Newest first.
   endpoint): it returns one entry per message — `None` drops it — while the
   wrapper around the endpoint stays on the host side, so nothing calls back
   across the boundary. See [PLUGINS.md](docs/PLUGINS.md).
+
+### Fixed
+
+- The built-in `mqbridge.Bridge` gRPC transport now commits messages with real ACK/NACK
+  RPCs instead of a no-op. Embedded publishers wait for downstream processing to commit
+  before receiving an ACK, and unacknowledged subscription messages are retained in memory
+  and redelivered to the same `consumer_id`. This provides at-least-once delivery while the
+  server process is running; durable restart recovery and exactly-once processing still
+  require persistent state or downstream deduplication by message ID. Arbitrary dynamic
+  services retain the delivery semantics of their own API because protobuf descriptors do
+  not define a generic acknowledgement operation.
+  Retention is capped (1024 messages per subscriber, 64 subscribers per route, oldest
+  evicted first) so a consumer that never acknowledges cannot grow the server without bound.
+  `consumer_id` defaults to a fresh id per consumer rather than to the topic, so competing
+  consumers on one topic no longer share a retention set; set it explicitly to be
+  redelivered unacknowledged messages after a reconnect.
+- A **non-retryable handler failure no longer discards the rest of its batch**. The default
+  `Handler::handle_many` aborted the remaining messages after any failure; for retryable and
+  connection errors that is right (the batch is nacked and redelivered together), but a
+  non-retryable message is dropped and never redelivered, so every healthy message behind it
+  was silently lost. How many depended purely on `batch_size` — at the old default of 1 the
+  collateral was zero, which is why this went unnoticed. The behaviour now matches what
+  `CommandPublisher::send_batch` already documented and tested.
+- ZeroMQ REQ/REP with `format: raw` or `raw_framed` decoded the reply using that format, but the
+  REP side always answers with a JSON array of canonical messages, so the caller got one message
+  whose payload was the JSON text instead of the decoded replies. Both backends now decode replies
+  as JSON. This was invisible while `json` was the default format.
 
 ## 0.3.10
 

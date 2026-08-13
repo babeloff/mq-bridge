@@ -50,4 +50,7 @@ message AckResponse {
 
 message SubscribeRequest {
     string topic = 1;
+    // Stable for the lifetime of a consumer, including reconnects. Servers use
+    // it to retain and redeliver messages that have not been acknowledged yet.
+    string consumer_id = 2;
 }

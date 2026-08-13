@@ -2,6 +2,106 @@
 //  © Copyright 2025, by Marco Mengelkoch
 //  Licensed under MIT License, see License file for more details
 //  git clone https://github.com/marcomq/mq-bridge
+//! Move messages between brokers, databases, files, HTTP services, and in-memory
+//! channels without coupling application code to a specific transport.
+//!
+//! `mq-bridge` is an asynchronous, embeddable integration library. It gives each
+//! transport the same message, consumer, and publisher interfaces, then composes
+//! them into routes. A route can transform, filter, batch, retry, rate-limit,
+//! deduplicate, or fan out messages before they reach their destination.
+//!
+//! Unlike a standalone message broker or ETL service, `mq-bridge` runs inside
+//! your Rust application. If you prefer a zero-code service configured with YAML,
+//! see [`mq-bridge-app`](https://github.com/marcomq/mq-bridge-app).
+//!
+//! # Quick start
+//!
+//! Every endpoint implements the same [`traits::MessagePublisher`] interface.
+//! This example uses an in-memory endpoint, so it runs without external services:
+//!
+//! ```
+//! use mq_bridge::{
+//!     CanonicalMessage,
+//!     endpoints::memory::MemoryPublisher,
+//!     traits::MessagePublisher,
+//! };
+//!
+//! # #[tokio::main]
+//! # async fn main() -> anyhow::Result<()> {
+//! let publisher = MemoryPublisher::new_local("docs-quick-start", 16);
+//! let channel = publisher.channel();
+//!
+//! publisher
+//!     .send(CanonicalMessage::from("hello from mq-bridge"))
+//!     .await?;
+//!
+//! let messages = channel.drain_messages();
+//! assert_eq!(messages[0].get_payload_str(), "hello from mq-bridge");
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! Replace the memory endpoint with Kafka, NATS, AMQP, MQTT, MongoDB, SQL,
+//! HTTP, WebSocket, or another supported endpoint without changing the message
+//! model. Transport integrations are enabled with [Cargo features](#cargo-features).
+//!
+//! # Core concepts
+//!
+//! - [`CanonicalMessage`] is the transport-independent payload and metadata format.
+//! - [`models::Endpoint`] configures a message source or destination.
+//! - [`Route`] connects an input endpoint to an output endpoint and optionally
+//!   applies a handler.
+//! - [`Publisher`] creates a reusable publisher from endpoint configuration.
+//! - [`traits::MessageConsumer`] and [`traits::MessagePublisher`] are the extension
+//!   points for custom transports.
+//! - [`middleware`] contains reusable reliability and processing layers.
+//!
+//! Most applications work through [`Route`] and [`Publisher`]. Direct consumer
+//! usage is available when an application needs to control acknowledgement,
+//! batching, and concurrency itself.
+//!
+//! # Cargo features
+//!
+//! The core crate has no default features. Enable only the integrations your
+//! application uses:
+//!
+//! ```toml
+//! [dependencies]
+//! mq-bridge = { version = "0.4", features = ["kafka", "http"] }
+//! ```
+//!
+//! Common feature groups include:
+//!
+//! - `middleware` — metrics, deduplication, compression, and encryption.
+//! - `portable` — integrations that build on common operating systems without
+//!   specialized native SDKs.
+//! - `full` — all supported integrations; some require native build tools or
+//!   runtime libraries.
+//!
+//! See the [README feature matrix](https://github.com/marcomq/mq-bridge#backend-features--configuration)
+//! for individual transports, platform requirements, and configuration examples.
+//!
+//! # Where to go next
+//!
+//! - Start with [`Route`], [`Publisher`], and [`CanonicalMessage`] for the primary API.
+//! - Browse [`endpoints`] for transport implementations and [`models`] for their
+//!   configuration types.
+//! - Read the [architecture guide](https://github.com/marcomq/mq-bridge/blob/dev/docs/ARCHITECTURE.md)
+//!   for routing, handlers, batching, and delivery semantics.
+//! - Read the [project README](https://github.com/marcomq/mq-bridge) for complete
+//!   setup and backend-specific examples.
+//!
+//! # Reliability model
+//!
+//! Publishing can distinguish success, partial success, retryable failure, and
+//! permanent failure. Consumers return explicit commit callbacks, allowing routes
+//! to preserve correct acknowledgement ordering for both cumulative-ack brokers
+//! and transports with independent acknowledgements. See [`SentBatch`],
+//! [`ReceivedBatch`], and [`traits::MessageDisposition`] for the underlying types.
+
+#![warn(rustdoc::broken_intra_doc_links)]
+#![warn(rustdoc::missing_crate_level_docs)]
+
 pub mod canonical_message;
 #[cfg(any(
     feature = "mongodb",

@@ -55,6 +55,15 @@ impl From<Handled> for MessageDisposition {
 pub trait Handler: Send + Sync + 'static {
     async fn handle(&self, msg: CanonicalMessage) -> Result<Handled, HandlerError>;
 
+    /// Handle a batch one message at a time.
+    ///
+    /// A **retryable** or **connection** failure aborts the rest of the batch: those
+    /// messages are nacked and redelivered together, so stopping early keeps the batch
+    /// intact and preserves order.
+    ///
+    /// A **non-retryable** failure only poisons its own message. The remaining ones are
+    /// still handled, because a dropped message is never redelivered — aborting here
+    /// would silently discard healthy messages, and how many depends on `batch_size`.
     async fn handle_many(&self, msgs: Vec<CanonicalMessage>) -> Vec<Result<Handled, HandlerError>> {
         let mut results = Vec::with_capacity(msgs.len());
         let mut remaining = msgs.len();
@@ -64,8 +73,7 @@ pub trait Handler: Send + Sync + 'static {
             let aborted = match &result {
                 Err(HandlerError::Retryable(_)) => Some("retryable"),
                 Err(HandlerError::Connection(_)) => Some("connection"),
-                Err(HandlerError::NonRetryable(_)) => Some("non-retryable"),
-                Ok(_) => None,
+                Err(HandlerError::NonRetryable(_)) | Ok(_) => None,
             };
             results.push(result);
             if let Some(kind) = aborted {
@@ -74,11 +82,8 @@ pub trait Handler: Send + Sync + 'static {
                         "retryable" => HandlerError::Retryable(anyhow!(
                             "batch aborted after earlier retryable handler failure"
                         )),
-                        "connection" => HandlerError::Connection(anyhow!(
+                        _ => HandlerError::Connection(anyhow!(
                             "batch aborted after earlier handler connection failure"
-                        )),
-                        _ => HandlerError::NonRetryable(anyhow!(
-                            "batch aborted after earlier non-retryable handler failure"
                         )),
                     }));
                 }
@@ -665,6 +670,76 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
         Arc,
     };
+
+    /// Fails on the message whose payload is `poison`, with a configurable error kind.
+    struct PoisonHandler {
+        retryable: bool,
+        handled: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Handler for PoisonHandler {
+        async fn handle(&self, msg: CanonicalMessage) -> Result<Handled, HandlerError> {
+            self.handled.fetch_add(1, Ordering::SeqCst);
+            if msg.get_payload_str() == "poison" {
+                return Err(if self.retryable {
+                    HandlerError::Retryable(anyhow!("boom"))
+                } else {
+                    HandlerError::NonRetryable(anyhow!("boom"))
+                });
+            }
+            Ok(Handled::Publish(msg))
+        }
+    }
+
+    /// A non-retryable failure is never redelivered, so aborting the rest of the batch
+    /// would silently drop healthy messages — how many depending only on `batch_size`.
+    #[tokio::test]
+    async fn handle_many_keeps_going_after_a_non_retryable_failure() {
+        let handled = Arc::new(AtomicUsize::new(0));
+        let handler = PoisonHandler {
+            retryable: false,
+            handled: Arc::clone(&handled),
+        };
+
+        let results = handler
+            .handle_many(vec!["one".into(), "poison".into(), "three".into()])
+            .await;
+
+        assert_eq!(
+            handled.load(Ordering::SeqCst),
+            3,
+            "every message is handled"
+        );
+        assert_eq!(results.len(), 3);
+        assert!(matches!(results[0], Ok(Handled::Publish(_))));
+        assert!(matches!(results[1], Err(HandlerError::NonRetryable(_))));
+        assert!(
+            matches!(results[2], Ok(Handled::Publish(_))),
+            "a message behind a poison one must still be handled"
+        );
+    }
+
+    /// Retryable failures still abort: the whole batch is nacked and redelivered
+    /// together, so stopping early loses nothing and keeps the batch ordered.
+    #[tokio::test]
+    async fn handle_many_aborts_the_batch_after_a_retryable_failure() {
+        let handled = Arc::new(AtomicUsize::new(0));
+        let handler = PoisonHandler {
+            retryable: true,
+            handled: Arc::clone(&handled),
+        };
+
+        let results = handler
+            .handle_many(vec!["one".into(), "poison".into(), "three".into()])
+            .await;
+
+        assert_eq!(handled.load(Ordering::SeqCst), 2, "aborts before the third");
+        assert_eq!(results.len(), 3);
+        assert!(matches!(results[0], Ok(Handled::Publish(_))));
+        assert!(matches!(results[1], Err(HandlerError::Retryable(_))));
+        assert!(matches!(results[2], Err(HandlerError::Retryable(_))));
+    }
 
     struct MockPublisher;
     #[async_trait]

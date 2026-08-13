@@ -11,7 +11,8 @@ Everything here plugs into the same two extension points:
 | A step that inspects/rewrites/drops messages in flight | `CustomMiddlewareFactory` | `register_middleware_factory` |
 
 Registration is process-global and keyed by name. **Register before starting any
-route that names it**; registering the same name twice keeps the last one.
+route that names it**; registering the same name twice is an error, so each
+factory needs its own name.
 
 > Looking for the built-in endpoints and middleware instead? See
 > [REFERENCE.md](REFERENCE.md). To ship a Rust endpoint as a loadable library
@@ -125,8 +126,8 @@ impl CustomEndpointFactory for PulsarFactory {
 }
 
 /// Call once, before starting any route that uses `pulsar`.
-pub fn register() {
-    mq_bridge::extensions::register_endpoint_factory("pulsar", Arc::new(PulsarFactory));
+pub fn register() -> anyhow::Result<()> {
+    mq_bridge::extensions::register_endpoint_factory("pulsar", Arc::new(PulsarFactory))
 }
 ```
 
