@@ -16,10 +16,21 @@ All notable changes to `mq-bridge`. Newest first.
     claimed, re-fetched and **deleted** each document, so pointing a route at a collection to
     read it destroyed it — and it only ever worked on collections written by the mq-bridge
     MongoDB publisher. `capture_all` is non-destructive, reads arbitrary collections, and is
-    ~5x faster. It wants a replica set; on a standalone server it degrades to an insert-only
-    `_id` read that terminates on drain. On a replica set, `capture_all` follows the change
-    stream after its snapshot; a one-shot `exit_on_empty` / `--drain` job now finishes when
-    that stream stays quiet for the drain idle timeout.
+    ~5x faster. On a replica set it snapshots, then follows the change stream; a one-shot
+    `exit_on_empty` / `--drain` job finishes once that stream goes quiet.
+    **`capture_all` and `capture_new` now require a replica set** (a single-node one is enough)
+    and refuse to start without one. `capture_all` used to fall back to paging `_id` forward on
+    a standalone `mongod`; that reader only ever matches ids above its high-water mark, so any
+    document a concurrent writer commits below it was dropped — silently, with no error and no
+    gap in the delivery count. On a standalone server use the new `consume: snapshot`, or
+    `consume: consumer` for a work queue.
+  - MongoDB `consume: subscriber` and the `MongoDbSubscriber` type are **removed**. It polled
+    `seq > last_seq` and advanced the watermark to the highest seq it saw, so a batch whose seq
+    block was reserved first but committed second was skipped for good — the same silent loss as
+    above, and present on a replica set too. Once a replica set is required it is also redundant:
+    `consume: capture_new` without a `cursor_id` is ephemeral fan-out from now on, and reads
+    arbitrary collections rather than only the bridge's own wrapped documents. The deprecated
+    `change_stream: true` boolean now resolves to `capture_new` instead of `subscriber`.
   - ZeroMQ `format` defaults to **`raw_framed`** instead of `json`: binary-safe payloads with
     a JSON metadata frame in front, so headers still travel. This is a wire-format change —
     a 0.4 peer and a 0.3 peer no longer interoperate on the same socket unless one sets
@@ -36,6 +47,14 @@ All notable changes to `mq-bridge`. Newest first.
 
 ### Added
 
+- MongoDB `consume: snapshot` — a one-shot, non-destructive read that pages the collection by
+  `_id` and ends the route on drain. It needs no replica set, reads arbitrary collections, and is
+  the supported way to read a standalone `mongod` without deleting anything. Its contract is
+  deliberately narrow: it delivers what exists when the run starts, and it is **not** a tail.
+  `cursor_id` is rejected at startup — resuming above a stored `_id` would skip whatever a
+  concurrent writer commits below that mark, and `_id` is assigned client-side before the insert,
+  so it does not follow commit order. Incremental reads need commit order, i.e. the oplog, i.e. a
+  replica set.
 - gRPC consumers can call arbitrary unary and server-streaming services without generated
   Rust clients. Point an endpoint at a compiled protobuf `FileDescriptorSet`, name the
   service and method, and provide the request as JSON; responses are decoded dynamically

@@ -2087,9 +2087,9 @@
           "const": "consumer"
         },
         {
-          "description": "**Queue, ephemeral** — receive only new messages, no durable position (fan-out subscriber).",
+          "description": "**One-shot read** — page the existing documents by `_id`, then end the route. Non-destructive,\nneeds no replica set, reads arbitrary collections. Delivers what exists when the run starts;\nit is not a tail, so documents written during the run belong to the next run.",
           "type": "string",
-          "const": "subscriber"
+          "const": "snapshot"
         },
         {
           "description": "**Watch existing collection** — capture changes from now on (insert/update/delete), resuming\nunder `cursor_id`. Reads an existing collection non-destructively; never ends on drain.",
@@ -2097,7 +2097,7 @@
           "const": "capture_new"
         },
         {
-          "description": "**Watch existing collection** — read the existing documents first, then capture changes.\nNon-destructive and the fastest read mode; use this for bulk reads and ETL. Default.\nChange streams need a replica set; on a standalone `mongod` set `consume` explicitly.",
+          "description": "**Watch existing collection** — read the existing documents first, then capture changes.\nNon-destructive and the fastest read mode; use this for bulk reads and ETL. Default.\nNeeds a replica set; on a standalone `mongod` use `snapshot` or `consumer`.",
           "type": "string",
           "const": "capture_all"
         }
@@ -2116,7 +2116,7 @@
           "format": "int64"
         },
         "change_stream": {
-          "description": "(Consumer only) **Deprecated** — use `consume: subscriber`. Kept for compatibility.",
+          "description": "(Consumer only) **Deprecated** — use `consume: capture_new`. Kept for compatibility.",
           "type": "boolean",
           "default": false
         },
@@ -2136,7 +2136,7 @@
           ]
         },
         "consume": {
-          "description": "(Consumer only) How to consume the collection: `capture_all` (default, read existing\ndocuments first, then watch for changes — non-destructive, for bulk reads and ETL),\n`capture_new` (watch an existing collection for changes only), `subscriber` (ephemeral\nqueue), or `consumer` (competing-consumers work queue — destructive and ~5x slower).\nThe bridge selects the underlying mechanism automatically. If unset, the deprecated\n`change_stream` boolean is honored for backward compatibility.",
+          "description": "(Consumer only) How to consume the collection: `capture_all` (default, read existing\ndocuments first, then watch for changes — non-destructive, for bulk reads and ETL),\n`capture_new` (watch an existing collection for changes only), `snapshot` (one-shot\nnon-destructive read that ends on drain, the option without a replica set), or\n`consumer` (competing-consumers work queue — destructive and ~5x slower).\nThe bridge selects the underlying mechanism automatically. If unset, the deprecated\n`change_stream` boolean is honored for backward compatibility.",
           "anyOf": [
             {
               "$ref": "#/$defs/MongoConsume"

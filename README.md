@@ -207,7 +207,7 @@ Databases have no native pub/sub, so `mq-bridge` reads them as a source in one o
 
 *   **Change Data Capture (CDC)** — tails the database's own change log, capturing inserts **and** updates/deletes and resuming from a durable log position.
     *   On **PostgreSQL**, the `postgres_cdc` endpoint streams a logical-replication slot (`pgoutput`). It emits flat JSON rows tagged with `postgres.operation` metadata (`insert`/`update`/`delete`/`truncate`). Acking a batch confirms the LSN back to the server (`standby_status_update`); a nack (or an interrupted run) does **not** advance the confirmed LSN, so replication resumes from the last acknowledged position on reconnect — at-least-once, verified by a restart-safety integration test. Enable with the `postgres-cdc` feature; requires `wal_level = logical` and a publication. See below.
-    *   On **MongoDB**, set `consume: capture_new` to watch an existing collection for changes from now on, or `consume: capture_all` to read the existing documents first and then keep capturing changes (no gap, at-least-once). It emits `insert`/`update`/`replace`/`delete` events tagged with `mongodb.operation` metadata and checkpoints progress under `cursor_id`. These use the change stream (full post-image via `updateLookup`) and need a replica set; on a standalone server `capture_all` falls back to an insert-only read.
+    *   On **MongoDB**, set `consume: capture_new` to watch an existing collection for changes from now on, or `consume: capture_all` to read the existing documents first and then keep capturing changes (no gap, at-least-once). It emits `insert`/`update`/`replace`/`delete` events tagged with `mongodb.operation` metadata and checkpoints progress under `cursor_id`. Both use the change stream (full post-image via `updateLookup`) and therefore need a replica set — a single-node one is enough. Without one they refuse to start; use `consume: snapshot` for a one-shot non-destructive read, or `consume: consumer` for a work queue.
 *   **Cursor polling** — pages an existing table by a monotonic `cursor_column` (`WHERE col > $last ORDER BY col ASC`), persisting the last read value under `cursor_id`. Captures **appends only** — updates and deletes are not observed. Available on **SQLx** (PostgreSQL / MySQL / MariaDB / SQLite) and **ClickHouse**; while idle the poll interval backs off exponentially between `polling_interval_ms` and `max_polling_interval_ms`. **SQLite** and **ClickHouse** are polling-only — they have no server-side change log.
 
 > **SQLx read mode is chosen by config, not by driver.** With **no** `cursor_column`, an SQLx source (`?table=` / `table:`) is a **competing-consumers work queue**: it atomically claims rows via a `locked_until` lease and deletes them on ack, so several readers drain the same table as competing consumers — each row goes to one reader at a time, at-least-once (a lease that expires before ack, e.g. after a crash, redelivers the row), not exactly once. This requires the table to carry the queue schema — an `id`, a `payload`, and a `locked_until` column — on **every** driver (PostgreSQL, MySQL/MariaDB, and SQLite behave identically here); it is **not** a plain full-table read. To read an existing or arbitrary table non-destructively (the ETL path), set **`cursor_column`** to switch to the cursor polling above. A source table missing `locked_until` fails fast with a permanent error rather than reconnecting forever.
@@ -227,23 +227,35 @@ claim → re-fetch → delete on ack) buy exclusivity you aren't using, and cost
 
 | `consume` | mechanism | modifies source | ends on drain | use for |
 | :--- | :--- | :--- | :--- | :--- |
-| `capture_all` (default) | `_id` snapshot, then change stream | no | with drain options | bulk read / ETL |
+| `capture_all` (default) | snapshot, then change stream | no | with drain options | bulk read / ETL |
 | `consumer` | claim → lock → re-fetch → delete | **yes** | yes | work queues, competing readers |
-| `subscriber` | polls `seq > last_seq`, advancing a cursor | no | yes | ephemeral fan-out |
+| `snapshot` | one `_id`-ordered pass over the collection | no | **always** | reads without a replica set |
 | `capture_new` | change stream, new changes only | no | **no** | ongoing CDC |
 
 500k documents, `batch_size: 1024`, release build, standalone MongoDB: `consumer` → `null`
-**23,667 rows/s**, `capture_all` → jsonl **120,308 rows/s** (`postgres` → `null` reference: 115,924).
+**23,667 rows/s** (`postgres` → `null` reference: 115,924). The previously quoted `capture_all`
+figure was measured on that same standalone server, i.e. through the `_id` fallback that has since
+been removed as unsound — it is not comparable and needs re-measuring on a replica set.
 
 *   `concurrency` does not speed up a MongoDB source — batches are fetched serially; it only widens
     the downstream side.
-*   `consumer` and `subscriber` only read collections written by the mq-bridge MongoDB publisher
-    (UUID `_id` / wrapped `seq` field); other documents are skipped or rejected at startup.
-*   `capture_*` need a replica set. `capture_new` errors without one; `capture_all` degrades to an
-    insert-only `_id` read on a standalone server. With `exit_on_empty` / `--drain`, a replica-set
-    reader finishes after the snapshot and any immediately following changes, once the drain idle
-    timeout expires.
+*   `consumer` only reads collections written by the mq-bridge MongoDB publisher (UUID `_id` /
+    wrapped envelope); other documents are skipped or rejected at startup. `snapshot` and the
+    `capture_*` modes read arbitrary collections.
+*   `capture_*` need a replica set — a single-node one is enough — and both error without it. With
+    `exit_on_empty` / `--drain`, a replica-set reader finishes after the snapshot and any
+    immediately following changes, once the drain idle timeout expires.
+*   `snapshot` is one-shot by design: it delivers what exists when the run starts and then ends the
+    route. It rejects `cursor_id`, because resuming above a stored `_id` would skip anything a
+    concurrent writer commits below that mark — see the note below.
 *   Wart: `capture_all`'s snapshot also emits the internal `<collection>:sequencer` document.
+
+> **Why `snapshot` does not resume.** A `_id` cursor can only match documents *above* its
+> high-water mark, and `_id` is assigned client-side before the insert, so it does not follow
+> commit order. Any writer that commits below the mark — concurrent producers, a route with
+> `concurrency > 1`, a retried write — is skipped permanently and silently. Incremental reads
+> therefore need commit order, which on MongoDB means the oplog, which means a replica set.
+> There is no sound `_id`-based substitute.
 
 
 ### Deduplication & idempotent writes

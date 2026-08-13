@@ -34,10 +34,6 @@ pub(crate) fn namespaced_sequencer_id(collection_name: &str) -> String {
     format!("{}:sequencer", collection_name)
 }
 
-pub(crate) fn namespaced_cursor_id(collection_name: &str, cursor_id: &str) -> String {
-    format!("{}:cursor:{}", collection_name, cursor_id)
-}
-
 impl MongoDbPublisher {
     fn uses_sequencer(&self) -> bool {
         mongodb_uses_sequencer(self.request_reply, &self.format)

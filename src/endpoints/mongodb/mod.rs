@@ -25,7 +25,7 @@ use mongodb::{Client, Collection, Database};
 use serde::{Deserialize, Serialize};
 use std::any::Any;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 use tracing::{info, trace, warn};
@@ -36,15 +36,13 @@ mod dedup;
 mod publisher;
 mod readers;
 
-pub use consumer::{MongoDbConsumer, MongoDbSubscriber};
+pub use consumer::MongoDbConsumer;
 pub use publisher::MongoDbPublisher;
 pub use readers::{MongoDbChangeStreamReader, MongoDbIdReader};
 
 #[cfg(feature = "dedup")]
 pub(crate) use dedup::build_mongo_dedup_store;
 pub(crate) use readers::is_change_stream_unsupported;
-// The subscriber (sibling module) reuses the publisher's id-namespacing helpers.
-pub(crate) use publisher::{namespaced_cursor_id, namespaced_sequencer_id};
 // Referenced only by the unit tests below.
 #[cfg(test)]
 pub(crate) use publisher::{tag_outcome, OUTCOME_EXISTED, OUTCOME_INSERTED, OUTCOME_KEY};

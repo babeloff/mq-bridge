@@ -5,10 +5,17 @@
 
 use super::*;
 
-/// A non-destructive, resumable reader over an **arbitrary** MongoDB collection. Pages by
-/// `_id` (`find({_id:{$gt:last}}).sort({_id:1})`), never mutates the source, and persists
-/// the last successfully-sunk `_id` (keyed by `cursor_id`) to a pluggable checkpoint store
-/// (a separate `mqb_cursors` collection by default, or a local file). At-least-once.
+/// A non-destructive, **one-shot** reader over an arbitrary MongoDB collection (`consume: snapshot`).
+/// Pages by `_id` (`find({_id:{$gt:last}}).sort({_id:1})`), never mutates the source, and ends the
+/// route once the collection is drained. At-least-once.
+///
+/// It deliberately does not resume across runs. The `_id` cursor only ever matches documents above
+/// its high-water mark, so a document a concurrent writer commits *below* that mark is skipped
+/// permanently — `_id` is assigned client-side before the insert, so it does not follow commit
+/// order. Within one run that is the mode's documented boundary ("everything present at the start");
+/// carried across runs it would be silent data loss, which is why `cursor_id` is rejected at
+/// startup. Incremental reads need commit order, i.e. a change stream (`capture_all`) on a replica
+/// set. The checkpoint plumbing below is kept for that future, not reachable today.
 pub struct MongoDbIdReader {
     collection: Collection<Document>,
     db: Database,
@@ -36,6 +43,15 @@ impl MongoDbIdReader {
             None
         };
 
+        if config.cursor_id.is_some() {
+            return Err(anyhow!(
+                "MongoDB 'snapshot' does not support 'cursor_id' (collection '{}'). Resuming above a \
+                 stored `_id` skips anything a concurrent writer commits below it, which is silent \
+                 data loss. Use 'capture_all' on a replica set to read incrementally.",
+                collection_name
+            ));
+        }
+
         let checkpoint: Option<Arc<dyn crate::checkpoint::CheckpointStore>> = if let Some(cid) =
             &config.cursor_id
         {
@@ -58,10 +74,6 @@ impl MongoDbIdReader {
             };
             Some(store)
         } else {
-            warn!(
-                collection = %collection_name,
-                "MongoDB resumable reader has no cursor_id; resume is disabled and every restart re-copies from the beginning. Set cursor_id to persist progress."
-            );
             None
         };
 
@@ -75,7 +87,7 @@ impl MongoDbIdReader {
             }),
             None => None,
         };
-        info!(collection = %collection_name, cursor_id = ?config.cursor_id, has_checkpoint = %last_id.is_some(), "MongoDB id-cursor reader initialized");
+        info!(collection = %collection_name, "MongoDB snapshot reader initialized; reads the current contents once, then ends the route");
 
         Ok(Self {
             collection,
@@ -155,11 +167,9 @@ impl MessageConsumer for MongoDbIdReader {
         }
 
         if messages.is_empty() {
-            // Exhausted: surface an empty batch so the route can pause or terminate.
-            return Ok(ReceivedBatch {
-                messages: Vec::new(),
-                commit: Box::new(|_| Box::pin(async { Ok(()) })),
-            });
+            // Drained. End the route rather than returning an empty batch: polling on would turn a
+            // snapshot into a tail, and an `_id` cursor cannot tail a collection being written.
+            return Err(ConsumerError::EndOfStream);
         }
 
         let checkpoint = self.checkpoint.clone();

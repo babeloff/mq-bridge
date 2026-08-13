@@ -112,10 +112,11 @@ fn resolved_consume_defaults_and_change_stream_alias() {
     // Default: non-destructive capture of the existing collection, then changes.
     let cfg = MongoDbConfig::new("mongodb://localhost", "db");
     assert_eq!(cfg.resolved_consume(), MongoConsume::CaptureAll);
-    // Deprecated `change_stream: true` (no `consume`) still maps to the subscriber mode.
+    // Deprecated `change_stream: true` (no `consume`) now maps to the change-stream reader that
+    // replaced the removed subscriber mode.
     let mut legacy = MongoDbConfig::new("mongodb://localhost", "db");
     legacy.change_stream = true;
-    assert_eq!(legacy.resolved_consume(), MongoConsume::Subscriber);
+    assert_eq!(legacy.resolved_consume(), MongoConsume::CaptureNew);
     // Explicit `consume` wins over the deprecated boolean.
     let mut explicit = MongoDbConfig::new("mongodb://localhost", "db");
     explicit.change_stream = true;

@@ -1175,14 +1175,16 @@ pub enum MongoConsume {
     /// **Queue** — competing consumers: claim, process, delete, so each document goes to exactly one
     /// reader. Destructive and ~5x slower than `capture_all`; for jobs, not bulk reads.
     Consumer,
-    /// **Queue, ephemeral** — receive only new messages, no durable position (fan-out subscriber).
-    Subscriber,
+    /// **One-shot read** — page the existing documents by `_id`, then end the route. Non-destructive,
+    /// needs no replica set, reads arbitrary collections. Delivers what exists when the run starts;
+    /// it is not a tail, so documents written during the run belong to the next run.
+    Snapshot,
     /// **Watch existing collection** — capture changes from now on (insert/update/delete), resuming
     /// under `cursor_id`. Reads an existing collection non-destructively; never ends on drain.
     CaptureNew,
     /// **Watch existing collection** — read the existing documents first, then capture changes.
     /// Non-destructive and the fastest read mode; use this for bulk reads and ETL. Default.
-    /// Change streams need a replica set; on a standalone `mongod` set `consume` explicitly.
+    /// Needs a replica set; on a standalone `mongod` use `snapshot` or `consumer`.
     #[default]
     CaptureAll,
 }
@@ -1221,8 +1223,9 @@ pub struct MongoDbConfig {
     pub request_reply: bool,
     /// (Consumer only) How to consume the collection: `capture_all` (default, read existing
     /// documents first, then watch for changes — non-destructive, for bulk reads and ETL),
-    /// `capture_new` (watch an existing collection for changes only), `subscriber` (ephemeral
-    /// queue), or `consumer` (competing-consumers work queue — destructive and ~5x slower).
+    /// `capture_new` (watch an existing collection for changes only), `snapshot` (one-shot
+    /// non-destructive read that ends on drain, the option without a replica set), or
+    /// `consumer` (competing-consumers work queue — destructive and ~5x slower).
     /// The bridge selects the underlying mechanism automatically. If unset, the deprecated
     /// `change_stream` boolean is honored for backward compatibility.
     pub consume: Option<MongoConsume>,
@@ -1232,7 +1235,7 @@ pub struct MongoDbConfig {
     /// source positions. Defaults to false.
     #[serde(default)]
     pub source_metadata: bool,
-    /// (Consumer only) **Deprecated** — use `consume: subscriber`. Kept for compatibility.
+    /// (Consumer only) **Deprecated** — use `consume: capture_new`. Kept for compatibility.
     #[serde(default)]
     pub change_stream: bool,
     /// (Consumer only) Where to persist the resume cursor in `capture_new`/`capture_all` mode. A URL

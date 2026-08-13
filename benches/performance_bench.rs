@@ -106,46 +106,6 @@ pub mod mongodb_helper {
     }
 }
 
-#[cfg(feature = "mongodb")]
-pub mod mongodb_subscriber_helper {
-    use mq_bridge::endpoints::mongodb::{MongoDbPublisher, MongoDbSubscriber};
-    use mq_bridge::models::MongoDbConfig;
-    use mq_bridge::traits::{MessageConsumer, MessagePublisher};
-    use std::sync::Arc;
-    use tokio::sync::Mutex;
-
-    fn get_config(collection_name: &str) -> MongoDbConfig {
-        MongoDbConfig {
-            url: "mongodb://localhost:27017".to_string(),
-            database: "mq_bridge_test_db".to_string(),
-            collection: Some(collection_name.to_string()),
-            change_stream: true,
-            ..Default::default()
-        }
-    }
-    pub async fn create_publisher() -> Arc<dyn MessagePublisher> {
-        let collection_name = "perf_mongodb_sub_direct";
-        let config = get_config(collection_name);
-        Arc::new(MongoDbPublisher::new(&config).await.unwrap())
-    }
-
-    pub async fn create_consumer() -> Arc<Mutex<dyn MessageConsumer>> {
-        let collection_name = "perf_mongodb_sub_direct";
-        let config = get_config(collection_name);
-
-        // Drop collection before test
-        let client = mongodb::Client::with_uri_str(&config.url).await.unwrap();
-        client
-            .database(&config.database)
-            .collection::<mongodb::bson::Document>(collection_name)
-            .drop()
-            .await
-            .ok();
-
-        Arc::new(Mutex::new(MongoDbSubscriber::new(&config).await.unwrap()))
-    }
-}
-
 #[cfg(feature = "sqlx")]
 pub mod sqlx_helper {
     use mq_bridge::endpoints::sqlx::{SqlxConsumer, SqlxPublisher};
@@ -1017,18 +977,6 @@ fn performance_benchmarks(c: &mut Criterion) {
         "mongodb",
         "tests/integration/docker-compose/mongodb.yml",
         mongodb_helper,
-        group,
-        &rt,
-        &BENCH_RESULTS,
-        PERF_TEST_MESSAGE_COUNT,
-        PERF_TEST_CONCURRENCY,
-        std::time::Duration::from_millis(100)
-    );
-    bench_backend!(
-        "mongodb",
-        "mongodb_subscriber",
-        "tests/integration/docker-compose/mongodb.yml",
-        mongodb_subscriber_helper,
         group,
         &rt,
         &BENCH_RESULTS,

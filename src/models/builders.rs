@@ -500,7 +500,7 @@ impl MongoDbConfig {
             return mode;
         }
         if self.change_stream {
-            MongoConsume::Subscriber
+            MongoConsume::CaptureNew
         } else {
             MongoConsume::default()
         }

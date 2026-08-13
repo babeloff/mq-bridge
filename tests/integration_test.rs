@@ -86,13 +86,6 @@ async fn test_all_subscriber_logic() {
             integration::kafka::test_kafka_subscriber_logic().await;
         }
     }
-    #[cfg(feature = "mongodb")]
-    {
-        if should_run("mongodb") {
-            println!("\n\n>>> Starting MongoDB Subscriber Logic Test...");
-            integration::mongodb::test_mongodb_subscriber_logic().await;
-        }
-    }
     #[cfg(feature = "mqtt")]
     {
         if should_run("mqtt") {

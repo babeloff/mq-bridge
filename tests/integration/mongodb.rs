@@ -3,9 +3,7 @@ use std::sync::Arc;
 
 use mq_bridge::test_utils::PERF_TEST_MESSAGE_COUNT;
 
-use mq_bridge::endpoints::mongodb::{
-    MongoDbChangeStreamReader, MongoDbConsumer, MongoDbPublisher, MongoDbSubscriber,
-};
+use mq_bridge::endpoints::mongodb::{MongoDbChangeStreamReader, MongoDbConsumer, MongoDbPublisher};
 use mq_bridge::test_utils::{
     add_performance_result, run_chaos_pipeline_test, run_direct_perf_test,
     run_performance_pipeline_test, run_performance_pipeline_test_at_least_once_named,
@@ -40,6 +38,82 @@ routes:
       memory: { topic: "test-out-mongodb", capacity: {out_capacity} }
 "#;
 
+/// `consume: snapshot` on a standalone mongod: seed the collection, then read it non-destructively
+/// in one pass. Asserts the two properties that define the mode — every seeded document arrives,
+/// and the route ends itself on drain instead of polling on as a (lossy) tail.
+#[tokio::test]
+#[ignore = "requires docker compose"]
+async fn test_mongodb_snapshot_reads_all_and_ends() {
+    if !should_run("mongodb") {
+        return;
+    }
+    use mq_bridge::models::{Endpoint, EndpointType, MongoConsume, MongoDbConfig, Route};
+    use mq_bridge::traits::MessagePublisher;
+
+    setup_logging();
+    run_test_with_docker("tests/integration/docker-compose/mongodb.yml", || async {
+        let collection = format!("snapshot_{}", fast_uuid_v7::gen_id());
+        let config = MongoDbConfig {
+            url: "mongodb://localhost:27017".to_string(),
+            database: "mq_bridge_test".to_string(),
+            collection: Some(collection.clone()),
+            consume: Some(MongoConsume::Snapshot),
+            ..Default::default()
+        };
+
+        let publisher = MongoDbPublisher::new(&config).await.unwrap();
+        let seeded = 250usize;
+        for i in 0..seeded {
+            publisher
+                .send(format!("snapshot-{}", i).as_str().into())
+                .await
+                .unwrap();
+        }
+
+        let route_name = format!("snapshot_route_{}", fast_uuid_v7::gen_id());
+        let out = Endpoint::new_memory(&route_name, seeded + 100);
+        let out_channel = out.channel().unwrap();
+        let route = Route::new(Endpoint::new(EndpointType::MongoDb(config)), out);
+        route.deploy(&route_name).await.unwrap();
+
+        // Track the seeded payloads rather than a message count: the snapshot also emits the
+        // publisher's internal `<collection>:sequencer` document, so counting would both overshoot
+        // and race (250 messages can be 249 real ones plus the sequencer).
+        let mut seen = std::collections::HashSet::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while seen.len() < seeded && std::time::Instant::now() < deadline {
+            for msg in out_channel.drain_messages() {
+                seen.insert(msg.get_payload_str().to_string());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let missing: Vec<usize> = (0..seeded)
+            .filter(|i| !seen.contains(&format!("snapshot-{}", i)))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "snapshot dropped {} of {} documents: {:?}",
+            missing.len(),
+            seeded,
+            missing
+        );
+
+        // Drained -> EndOfStream -> the route ends itself. It stays in the registry (only `stop()`
+        // removes it), so the terminal outcome is what proves it finished rather than tailed on.
+        let ended = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while mq_bridge::route_outcome(&route_name).is_none() && std::time::Instant::now() < ended {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert_eq!(
+            mq_bridge::route_outcome(&route_name),
+            Some(mq_bridge::RouteOutcome::Completed),
+            "snapshot route must complete on drain instead of tailing"
+        );
+        mq_bridge::stop_route(&route_name).await;
+    })
+    .await;
+}
+
 pub async fn test_mongodb_pipeline() {
     setup_logging();
     run_test_with_docker("tests/integration/docker-compose/mongodb.yml", || async {
@@ -67,34 +141,12 @@ pub async fn test_mongodb_chaos() {
     .await;
 }
 
-pub async fn test_mongodb_subscriber_logic() {
-    setup_logging();
-    run_test_with_docker("tests/integration/docker-compose/mongodb.yml", || async {
-        let collection = format!("sub_logic_{}", fast_uuid_v7::gen_id());
-        let config = mq_bridge::models::MongoDbConfig {
-            url: "mongodb://localhost:27017".to_string(),
-            database: "mq_bridge_test".to_string(),
-            collection: Some(collection),
-            change_stream: true,
-            ..Default::default()
-        };
-
-        let publisher = Arc::new(MongoDbPublisher::new(&config).await.unwrap());
-        let sub1 = Arc::new(tokio::sync::Mutex::new(
-            MongoDbSubscriber::new(&config).await.unwrap(),
-        ));
-        let sub2 = Arc::new(tokio::sync::Mutex::new(
-            MongoDbSubscriber::new(&config).await.unwrap(),
-        ));
-
-        verify_subscriber_logic(publisher, sub1, sub2).await;
-    })
-    .await;
-}
-
+// Queue mode (`consume: consumer`) is the standalone-safe reader that still round-trips the
+// wrapped envelope, so the handler sees the `kind` metadata. It replaces the removed subscriber
+// mode this test used to exercise.
 #[tokio::test]
 #[ignore = "requires docker compose"]
-async fn test_mongodb_subscriber_no_duplicates() {
+async fn test_mongodb_consumer_no_duplicates() {
     if !should_run("mongodb") {
         return;
     }
@@ -132,7 +184,7 @@ async fn test_mongodb_subscriber_no_duplicates() {
                 url: url.to_string(),
                 database: db_name.to_string(),
                 collection: Some(collection_name.to_string()),
-                change_stream: true, // Subscriber mode
+                consume: Some(mq_bridge::models::MongoConsume::Consumer),
                 polling_interval_ms: Some(10),
                 format: mq_bridge::models::MongoDbFormat::Json,
                 ..Default::default()
