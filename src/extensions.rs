@@ -8,6 +8,9 @@ static CUSTOM_MIDDLEWARE_REGISTRY: OnceLock<
     RwLock<HashMap<String, Arc<dyn CustomMiddlewareFactory>>>,
 > = OnceLock::new();
 
+/// Registers an endpoint factory under `name` in the process-global registry.
+///
+/// Returns an error when that name is already registered (or the registry lock is poisoned).
 pub fn register_endpoint_factory(
     name: &str,
     factory: Arc<dyn CustomEndpointFactory>,
@@ -25,6 +28,8 @@ pub fn register_endpoint_factory(
     Ok(())
 }
 
+/// Returns the process-global endpoint factory registered under `name`, or `None` when no factory
+/// has that name or the registry cannot be read.
 pub fn get_endpoint_factory(name: &str) -> Option<Arc<dyn CustomEndpointFactory>> {
     let registry = CUSTOM_ENDPOINT_REGISTRY.get_or_init(|| RwLock::new(HashMap::new()));
     let map = registry.read().ok()?;
@@ -40,6 +45,9 @@ pub(crate) fn unregister_endpoint_factory(name: &str) {
     }
 }
 
+/// Registers a middleware factory under `name` in the process-global registry.
+///
+/// Returns an error when that name is already registered (or the registry lock is poisoned).
 pub fn register_middleware_factory(
     name: &str,
     factory: Arc<dyn CustomMiddlewareFactory>,
@@ -57,6 +65,8 @@ pub fn register_middleware_factory(
     Ok(())
 }
 
+/// Returns the process-global middleware factory registered under `name`, or `None` when no factory
+/// has that name or the registry cannot be read.
 pub fn get_middleware_factory(name: &str) -> Option<Arc<dyn CustomMiddlewareFactory>> {
     let registry = CUSTOM_MIDDLEWARE_REGISTRY.get_or_init(|| RwLock::new(HashMap::new()));
     let map = registry.read().ok()?;

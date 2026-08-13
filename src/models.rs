@@ -1173,11 +1173,12 @@ pub enum MongoDbFormat {
 #[serde(rename_all = "snake_case")]
 pub enum MongoConsume {
     /// **Queue** — competing consumers: claim, process, delete, so each document goes to exactly one
-    /// reader. Destructive and ~5x slower than `capture_all`; for jobs, not bulk reads.
+    /// reader. Destructive and intended for jobs, not bulk reads.
     Consumer,
-    /// **One-shot read** — page the existing documents by `_id`, then end the route. Non-destructive,
-    /// needs no replica set, reads arbitrary collections. Delivers what exists when the run starts;
-    /// it is not a tail, so documents written during the run belong to the next run.
+    /// **One-shot read** — page documents by `_id`, then end the route. Non-destructive and
+    /// non-resumable; needs no replica set and reads arbitrary collections. This is not a
+    /// point-in-time snapshot: separate page queries can observe concurrent inserts and deletes,
+    /// while inserts below the current `_id` high-water mark can be missed.
     Snapshot,
     /// **Watch existing collection** — capture changes from now on (insert/update/delete), resuming
     /// under `cursor_id`. Reads an existing collection non-destructively; never ends on drain.
@@ -1225,7 +1226,7 @@ pub struct MongoDbConfig {
     /// documents first, then watch for changes — non-destructive, for bulk reads and ETL),
     /// `capture_new` (watch an existing collection for changes only), `snapshot` (one-shot
     /// non-destructive read that ends on drain, the option without a replica set), or
-    /// `consumer` (competing-consumers work queue — destructive and ~5x slower).
+    /// `consumer` (competing-consumers work queue — destructive and intended for jobs).
     /// The bridge selects the underlying mechanism automatically. If unset, the deprecated
     /// `change_stream` boolean is honored for backward compatibility.
     pub consume: Option<MongoConsume>,

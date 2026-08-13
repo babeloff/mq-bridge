@@ -498,6 +498,16 @@ async fn test_mongodb_capture_all_exits_on_empty() {
     }
 }
 
+/// Standalone MongoDB supports snapshot, but change-stream modes require a replica set.
+#[cfg(feature = "mongodb")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires docker compose (standalone mongodb)"]
+async fn test_mongodb_standalone_mode_boundaries() {
+    if should_run("mongodb") {
+        integration::mongodb::test_mongodb_standalone_mode_boundaries().await;
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires docker compose, takes long time to run"]
 async fn test_all_performance_pipeline() {

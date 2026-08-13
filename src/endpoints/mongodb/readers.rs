@@ -9,13 +9,13 @@ use super::*;
 /// Pages by `_id` (`find({_id:{$gt:last}}).sort({_id:1})`), never mutates the source, and ends the
 /// route once the collection is drained. At-least-once.
 ///
-/// It deliberately does not resume across runs. The `_id` cursor only ever matches documents above
-/// its high-water mark, so a document a concurrent writer commits *below* that mark is skipped
-/// permanently — `_id` is assigned client-side before the insert, so it does not follow commit
-/// order. Within one run that is the mode's documented boundary ("everything present at the start");
-/// carried across runs it would be silent data loss, which is why `cursor_id` is rejected at
-/// startup. Incremental reads need commit order, i.e. a change stream (`capture_all`) on a replica
-/// set. The checkpoint plumbing below is kept for that future, not reachable today.
+/// It deliberately does not resume across runs and does not provide a point-in-time snapshot.
+/// Each `_id` page is a separate query, so concurrent inserts above the current high-water mark may
+/// be included, inserts below it may be missed, and deletes may disappear before a later page reads
+/// them. Carrying the cursor across runs would turn that visibility boundary into silent data loss,
+/// which is why `cursor_id` is rejected at startup. Incremental reads need commit order, i.e. a
+/// change stream (`capture_all`) on a replica set. The checkpoint plumbing below is kept for that
+/// future, not reachable today.
 pub struct MongoDbIdReader {
     collection: Collection<Document>,
     db: Database,
@@ -246,7 +246,7 @@ impl MessageConsumer for MongoDbIdReader {
             target: self.collection.name().to_string(),
             pending,
             capacity: None,
-            details: serde_json::json!({ "cursor_id": self.cursor_id, "mode": "resumable" }),
+            details: serde_json::json!({ "mode": "snapshot" }),
             error,
         }
     }

@@ -180,7 +180,7 @@ The table below summarizes the capabilities and configuration for each backend:
 | **AMQP** | Set `subscribe_mode: true` | Emulated (Property) | **Yes** (Basic.nack) |
 | **AWS** | N/A (Use SNS) | No | **Yes** (Visibility Timeout) |
 | **File** | Set `mode: subscribe` | No | Simulated (In-Memory) |
-| **gRPC** | N/A | No | **Yes** for the built-in Bridge protocol; dynamic services depend on their API |
+| **gRPC** | N/A | No | **Yes** for the built-in Bridge protocol (NACK replays); **No** for dynamic services unless their API defines an acknowledgement contract |
 | **HTTP** | N/A | **Native** (Implicit) | **Yes** (HTTP 500) |
 | **IBM MQ** | Set `topic` | No | **Yes** (Tx Rollback) |
 | **Kafka** | Omit `group_id` | Emulated (Header) | Eventual (Skip Offset) |
@@ -222,7 +222,7 @@ thing for dispatching jobs or commands, and destructive by design.
 
 Pick by semantics first. Where both would do — a one-shot bulk read or ETL pass with a single
 reader — **use `capture_all`**, the default: `consumer`'s four round trips per batch (find ids →
-claim → re-fetch → delete on ack) buy exclusivity you aren't using, and cost ~5x. Set
+claim → re-fetch → delete on ack) buy exclusivity you aren't using. Set
 `consume: consumer` explicitly when you want the destructive work-queue semantics.
 
 | `consume` | mechanism | modifies source | ends on drain | use for |
@@ -260,9 +260,10 @@ been removed as unsound — it is not comparable and needs re-measuring on a rep
 
 ### Deduplication & idempotent writes
 
-`mq-bridge` is **at-least-once**: nothing is lost on a crash, but a replay can redeliver. Pair it
-with an **idempotent write at the sink** and you get effective exactly-once — the record lands once
-however often it is delivered. Which sink absorbs a duplicate, which source gives you a stable key to
+With a durable source and durable checkpoint configuration, `mq-bridge` is **at-least-once** across
+crashes: a replay can redeliver, while in-process Memory endpoint state is not crash-durable. Pair a
+stable replay identity with an **idempotent sink operation** and that covered sink effect is
+effectively exactly-once, however often the message is delivered. Which sink absorbs a duplicate, which source gives you a stable key to
 deduplicate on, and what a handler in the route changes about all of this, is covered in full by:
 
 > **[docs/DELIVERY.md](docs/DELIVERY.md) — delivery guarantees.** Per-source identity and

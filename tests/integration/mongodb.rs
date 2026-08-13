@@ -3,7 +3,9 @@ use std::sync::Arc;
 
 use mq_bridge::test_utils::PERF_TEST_MESSAGE_COUNT;
 
-use mq_bridge::endpoints::mongodb::{MongoDbChangeStreamReader, MongoDbConsumer, MongoDbPublisher};
+use mq_bridge::endpoints::mongodb::{
+    MongoDbChangeStreamReader, MongoDbConsumer, MongoDbIdReader, MongoDbPublisher,
+};
 use mq_bridge::test_utils::{
     add_performance_result, run_chaos_pipeline_test, run_direct_perf_test,
     run_performance_pipeline_test, run_performance_pipeline_test_at_least_once_named,
@@ -110,6 +112,31 @@ async fn test_mongodb_snapshot_reads_all_and_ends() {
             "snapshot route must complete on drain instead of tailing"
         );
         mq_bridge::stop_route(&route_name).await;
+    })
+    .await;
+}
+
+pub async fn test_mongodb_standalone_mode_boundaries() {
+    setup_logging();
+    run_test_with_docker("tests/integration/docker-compose/mongodb.yml", || async {
+        let base = mq_bridge::models::MongoDbConfig {
+            url: "mongodb://localhost:27017".to_string(),
+            database: "mq_bridge_test".to_string(),
+            collection: Some(format!("mode_boundaries_{}", fast_uuid_v7::gen_id())),
+            ..Default::default()
+        };
+
+        MongoDbIdReader::new(&base)
+            .await
+            .expect("snapshot must work on standalone MongoDB");
+        assert!(
+            MongoDbChangeStreamReader::new(&base, false).await.is_err(),
+            "capture_new must reject standalone MongoDB"
+        );
+        assert!(
+            MongoDbChangeStreamReader::new(&base, true).await.is_err(),
+            "capture_all must reject standalone MongoDB"
+        );
     })
     .await;
 }
@@ -405,18 +432,50 @@ pub async fn test_mongodb_capture_all_exits_on_empty() {
                 .expect("create capture_all reader");
             reader.set_exit_on_empty(true);
 
-            let snapshot = reader.receive_batch(10).await.expect("read snapshot");
-            assert_eq!(snapshot.messages.len(), 2);
-            (snapshot.commit)(vec![MessageDisposition::Ack; 2])
+            // Advance the snapshot high-water mark by one page, then insert while snapshot paging
+            // is still active. The document may also be visible to a later snapshot query, but the
+            // change-stream phase must deliver its insert event; duplicates are valid at-least-once.
+            let snapshot = reader.receive_batch(1).await.expect("read snapshot page");
+            assert_eq!(snapshot.messages.len(), 1);
+            (snapshot.commit)(vec![MessageDisposition::Ack])
                 .await
                 .expect("commit snapshot");
+            coll.insert_one(mongodb::bson::doc! { "id": 3, "written": "during-snapshot" })
+                .await
+                .expect("insert during snapshot");
 
-            let empty =
-                tokio::time::timeout(std::time::Duration::from_secs(10), reader.receive_batch(10))
+            let mut saw_stream_insert = false;
+            loop {
+                let batch = tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    reader.receive_batch(1),
+                )
+                .await
+                .expect("capture_all drain did not finish after its idle timeout")
+                .expect("receive capture_all batch");
+                if batch.messages.is_empty() {
+                    break;
+                }
+                saw_stream_insert |= batch.messages.iter().any(|message| {
+                    message
+                        .metadata
+                        .get("mongodb.operation")
+                        .map(String::as_str)
+                        == Some("insert")
+                        && serde_json::from_slice::<serde_json::Value>(&message.payload)
+                            .ok()
+                            .and_then(|body| body.get("id").and_then(|id| id.as_i64()))
+                            == Some(3)
+                });
+                let count = batch.messages.len();
+                (batch.commit)(vec![MessageDisposition::Ack; count])
                     .await
-                    .expect("capture_all drain did not finish after its idle timeout")
-                    .expect("receive empty batch");
-            assert!(empty.messages.is_empty());
+                    .expect("commit capture_all batch");
+            }
+            assert!(
+                saw_stream_insert,
+                "change-stream phase must deliver an insert committed during snapshot paging"
+            );
         },
     )
     .await;

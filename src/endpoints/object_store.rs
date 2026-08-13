@@ -31,7 +31,10 @@ use crate::CanonicalMessage;
 use anyhow::{anyhow, Context};
 use async_trait::async_trait;
 use futures::StreamExt;
-use object_store::{path::Path as ObjPath, ObjectStore, ObjectStoreExt, PutPayload};
+use object_store::{
+    path::Path as ObjPath, Error as ObjectStoreError, ObjectStore, ObjectStoreExt, PutMode,
+    PutOptions, PutPayload,
+};
 use std::any::Any;
 use std::sync::Arc;
 use std::time::Duration;
@@ -316,14 +319,25 @@ impl ObjectStorePublisher {
             }
             let body = self.encode_object_body(body)?;
             let key = self.base.clone().join(name.as_str());
-            self.store
-                .put(&key, PutPayload::from(body))
+            match self
+                .store
+                .put_opts(
+                    &key,
+                    PutPayload::from(body),
+                    PutOptions {
+                        mode: PutMode::Create,
+                        ..Default::default()
+                    },
+                )
                 .await
-                .map_err(|error| {
-                    PublisherError::Retryable(
+            {
+                Ok(_) | Err(ObjectStoreError::AlreadyExists { .. }) => {}
+                Err(error) => {
+                    return Err(PublisherError::Retryable(
                         anyhow!(error).context(format!("object-store put idempotent '{key}'")),
-                    )
-                })?;
+                    ));
+                }
+            }
             covered
                 .insert(run.source, run.start, run.end)
                 .map_err(PublisherError::NonRetryable)?;
@@ -989,6 +1003,26 @@ mod tests {
                 "data/part-orders-0-2-2.jsonl".to_string(),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn idempotent_sink_does_not_overwrite_an_existing_range_object() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let key = ObjPath::from("data/part-orders-0-0-1.jsonl");
+        store
+            .put(&key, PutPayload::from("already committed"))
+            .await
+            .unwrap();
+
+        let mut publisher = test_publisher(store.clone());
+        publisher.idempotency = true;
+        publisher
+            .send_batch(vec![kafka_message(0), kafka_message(1)])
+            .await
+            .expect("an existing deterministic object is a successful retry");
+
+        let stored = store.get(&key).await.unwrap().bytes().await.unwrap();
+        assert_eq!(stored.as_ref(), b"already committed");
     }
 
     #[tokio::test]

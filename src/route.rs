@@ -526,7 +526,9 @@ impl Route {
             }
             EndpointType::Sqlx(config) => {
                 let query = config.insert_query.as_deref()?.to_ascii_uppercase();
-                (query.contains("ON CONFLICT") || query.contains("ON DUPLICATE KEY"))
+                query
+                    .split_once("ON CONFLICT")
+                    .is_some_and(|(_, conflict_action)| conflict_action.contains("DO NOTHING"))
                     .then_some("SQL unique-key conflict handling")
             }
             EndpointType::File(config) if config.idempotency => {
@@ -1871,6 +1873,20 @@ mod tests {
             sql.inferred_idempotency_mechanism(),
             Some("SQL unique-key conflict handling")
         );
+
+        for query in [
+            "INSERT INTO orders (id) VALUES (?) ON CONFLICT (id) DO UPDATE SET id = excluded.id",
+            "INSERT INTO orders (id) VALUES (?) ON DUPLICATE KEY UPDATE id = VALUES(id)",
+        ] {
+            let updating_sql = Route::new(
+                Endpoint::new_memory("delivery_in", 1),
+                Endpoint::new(EndpointType::Sqlx(SqlxConfig {
+                    insert_query: Some(query.to_string()),
+                    ..Default::default()
+                })),
+            );
+            assert_eq!(updating_sql.inferred_idempotency_mechanism(), None);
+        }
 
         let ordinary = Route::new(
             Endpoint::new_memory("delivery_in", 1),
