@@ -158,12 +158,19 @@ class FileConfig(TypedDict, total=False):
 
 class GrpcConfig(TypedDict, total=False):
     concurrency_limit_per_connection: Optional[int]
+    consumer_id: Optional[str]
+    descriptor_set_path: Optional[str]
     http2_keepalive_interval_ms: Optional[int]
     http2_keepalive_timeout_ms: Optional[int]
     initial_connection_window_size: Optional[int]
     initial_stream_window_size: Optional[int]
     max_decoding_message_size: Optional[int]
+    max_encoding_message_size: Optional[int]
+    method_name: Optional[str]
+    request: Any
     server_mode: bool
+    server_streaming: bool
+    service_name: Optional[str]
     shared: Optional[bool]
     timeout_ms: Optional[int]
     tls: TlsConfig
@@ -272,6 +279,7 @@ class Middleware(TypedDict, total=False):
     delay: DelayMiddleware
     dlq: DeadLetterQueueMiddleware
     encryption: EncryptionConfig
+    id: str
     limiter: LimiterMiddleware
     metrics: MetricsMiddleware
     random_panic: RandomPanicMiddleware
@@ -554,7 +562,7 @@ StaticConfig = Union[str, Dict[str, Any]]
 TransformErrorPolicy = Literal["reject", "pass_through"]
 WeakJoinTimeout = Literal["fire", "discard"]
 WebSocketExecutionMode = Literal["auto", "direct_only", "routed"]
-ZeroMqBackend = Literal["zmq", "omq"]
+ZeroMqBackend = Union[Literal["zmq", "omq"], Literal["try_omq"]]
 ZeroMqFormat = Literal["json", "raw", "raw_framed"]
 ZeroMqSocketType = Literal["push", "pull", "pub", "sub", "req", "rep"]
 

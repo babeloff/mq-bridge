@@ -513,6 +513,32 @@ async fn send_batch_and_commit(
 }
 
 impl Route {
+    /// Returns the sink mechanism that makes replayed writes idempotent, when it can be
+    /// established from configuration alone. This is informational: the route remains
+    /// at-least-once internally, while the observable sink result is effectively-once.
+    fn inferred_idempotency_mechanism(&self) -> Option<&'static str> {
+        if self.output.handler.is_some() {
+            return None;
+        }
+        match &self.output.endpoint_type {
+            EndpointType::MongoDb(config) if config.id_field.is_some() => {
+                Some("MongoDB unique _id")
+            }
+            EndpointType::Sqlx(config) => {
+                let query = config.insert_query.as_deref()?.to_ascii_uppercase();
+                (query.contains("ON CONFLICT") || query.contains("ON DUPLICATE KEY"))
+                    .then_some("SQL unique-key conflict handling")
+            }
+            EndpointType::File(config) if config.idempotency => {
+                Some("deterministic file source ranges")
+            }
+            EndpointType::ObjectStore(config) if config.idempotency => {
+                Some("deterministic object source ranges")
+            }
+            _ => None,
+        }
+    }
+
     /// Creates a new route with default concurrency (1) and batch size (512).
     ///
     /// # Arguments
@@ -734,6 +760,20 @@ impl Route {
         let warnings = self.check(name_str, None)?;
         for warning in warnings {
             tracing::warn!(route = name_str, "Configuration warning: {}", warning);
+        }
+        if let Some(mechanism) = self.inferred_idempotency_mechanism() {
+            tracing::info!(
+                route = name_str,
+                delivery = "effectively-once",
+                mechanism,
+                "Inferred delivery guarantee from idempotent sink configuration"
+            );
+        } else {
+            tracing::info!(
+                route = name_str,
+                delivery = "at-least-once",
+                "Inferred delivery guarantee"
+            );
         }
         let startup_timeout = std::time::Duration::from_millis(self.options.startup_timeout_ms);
         let reconnect_interval =
@@ -1792,7 +1832,8 @@ pub async fn stop_route(name: &str) -> bool {
 mod tests {
     use super::*;
     use crate::models::{
-        Endpoint, EndpointType, FaultMode, Middleware, RandomPanicMiddleware, RouteOptions,
+        Endpoint, EndpointType, FaultMode, Middleware, MongoDbConfig, RandomPanicMiddleware,
+        RouteOptions, SqlxConfig,
     };
     use crate::traits::{
         CustomMiddlewareFactory, MessageConsumer, MessagePublisher, ReceivedBatch,
@@ -1802,6 +1843,41 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
+
+    #[test]
+    fn infers_idempotent_sink_mechanisms() {
+        let mongo = Route::new(
+            Endpoint::new_memory("delivery_in", 1),
+            Endpoint::new(EndpointType::MongoDb(MongoDbConfig {
+                id_field: Some("${metadata:mqb.id}".to_string()),
+                ..Default::default()
+            })),
+        );
+        assert_eq!(
+            mongo.inferred_idempotency_mechanism(),
+            Some("MongoDB unique _id")
+        );
+
+        let sql = Route::new(
+            Endpoint::new_memory("delivery_in", 1),
+            Endpoint::new(EndpointType::Sqlx(SqlxConfig {
+                insert_query: Some(
+                    "INSERT INTO orders (id) VALUES (?) ON CONFLICT (id) DO NOTHING".to_string(),
+                ),
+                ..Default::default()
+            })),
+        );
+        assert_eq!(
+            sql.inferred_idempotency_mechanism(),
+            Some("SQL unique-key conflict handling")
+        );
+
+        let ordinary = Route::new(
+            Endpoint::new_memory("delivery_in", 1),
+            Endpoint::new_memory("delivery_out", 1),
+        );
+        assert_eq!(ordinary.inferred_idempotency_mechanism(), None);
+    }
 
     #[test]
     fn test_route_check_rejects_zero_execution_options() {

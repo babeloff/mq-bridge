@@ -1257,8 +1257,9 @@ pub struct MongoDbConfig {
     /// Format for storing messages. Defaults to Normal.
     #[serde(default)]
     pub format: MongoDbFormat,
-    /// (Publisher only) Top-level payload field whose value becomes the document `_id`, for
-    /// idempotent inserts via the unique `_id` index. Sink collections only.
+    /// (Publisher only) Top-level payload field whose value becomes the document `_id`, or a
+    /// replay-stable `${...}` template such as `${metadata:mqb.id}`. Enables idempotent inserts
+    /// through MongoDB's unique `_id` index. Sink collections only.
     pub id_field: Option<String>,
     /// (Publisher only) Return the message with metadata `mongodb.outcome` = `inserted`/`existed`
     /// (dup-key) so a `request`+`switch` can branch. Sink collections only; pair with `id_field`.

@@ -17,6 +17,7 @@ pub struct MongoDbPublisher {
     reply_polling_interval: Duration,
     format: MongoDbFormat,
     id_field: Option<String>,
+    id_template: Option<CompiledTemplate>,
     report_outcome: bool,
 }
 
@@ -43,6 +44,26 @@ impl MongoDbPublisher {
     }
 
     pub async fn new(config: &MongoDbConfig) -> anyhow::Result<Self> {
+        let id_template = config
+            .id_field
+            .as_deref()
+            .filter(|value| value.contains("${"))
+            .map(|template| {
+                let compiled = CompiledTemplate::compile(template, None)
+                    .context("invalid MongoDB `id_field` template")?;
+                if !compiled.is_dynamic() || !compiled.has_only_replay_stable_tokens() {
+                    anyhow::bail!(
+                        "MongoDB `id_field` template must contain only replay-stable payload or metadata tokens"
+                    );
+                }
+                Ok(compiled)
+            })
+            .transpose()?;
+        let id_field = config
+            .id_field
+            .as_ref()
+            .filter(|value| !value.contains("${"))
+            .cloned();
         let collection_name = config
             .collection
             .as_deref()
@@ -146,7 +167,8 @@ impl MongoDbPublisher {
             request_timeout: Duration::from_millis(config.request_timeout_ms.unwrap_or(30000)),
             reply_polling_interval: Duration::from_millis(config.reply_polling_ms.unwrap_or(50)),
             format: config.format.clone(),
-            id_field: config.id_field.clone(),
+            id_field,
+            id_template,
             report_outcome: config.report_outcome,
         })
     }
@@ -158,14 +180,15 @@ impl MongoDbPublisher {
         // Look up by the same `_id` message_to_document wrote: the id_field value when
         // configured, else the message_id UUID. Otherwise an explicit-id duplicate is
         // never found and the request retries forever.
-        let id_bson = match self.id_field.as_deref() {
-            Some(field) => {
-                extract_id_bson(&message.payload, field).map_err(PublisherError::NonRetryable)?
-            }
-            None => Bson::from(mongodb::bson::Uuid::from_bytes(
-                message.message_id.to_be_bytes(),
-            )),
-        };
+        let id_bson =
+            match explicit_id_bson(message, self.id_field.as_deref(), self.id_template.as_ref())
+                .map_err(PublisherError::NonRetryable)?
+            {
+                Some(id) => id,
+                None => Bson::from(mongodb::bson::Uuid::from_bytes(
+                    message.message_id.to_be_bytes(),
+                )),
+            };
         let filter = doc! { "_id": id_bson };
         match self.collection.find_one(filter).await {
             Ok(Some(existing_doc)) => {
@@ -223,8 +246,13 @@ impl MessagePublisher for MongoDbPublisher {
     async fn send(&self, mut message: CanonicalMessage) -> Result<Sent, PublisherError> {
         if !self.request_reply {
             trace!(message_id = %format!("{:032x}", message.message_id), collection = %self.collection_name, uses_sequencer = self.uses_sequencer(), "Publishing document to MongoDB");
-            let mut doc = message_to_document(&message, &self.format, self.id_field.as_deref())
-                .map_err(PublisherError::NonRetryable)?;
+            let mut doc = message_to_document(
+                &message,
+                &self.format,
+                self.id_field.as_deref(),
+                self.id_template.as_ref(),
+            )
+            .map_err(PublisherError::NonRetryable)?;
 
             if self.uses_sequencer() {
                 // Atomically increment a sequence counter. This is safe without a transaction for just getting a sequence number.
@@ -297,8 +325,13 @@ impl MessagePublisher for MongoDbPublisher {
             .insert("reply_to".to_string(), reply_collection_name.clone());
 
         trace!(message_id = %format!("{:032x}", message.message_id), correlation_id = %correlation_id, collection = %self.collection_name, "Publishing request document to MongoDB");
-        let doc = message_to_document(&message, &self.format, self.id_field.as_deref())
-            .map_err(PublisherError::NonRetryable)?;
+        let doc = message_to_document(
+            &message,
+            &self.format,
+            self.id_field.as_deref(),
+            self.id_template.as_ref(),
+        )
+        .map_err(PublisherError::NonRetryable)?;
         match self.collection.insert_one(doc).await {
             Ok(_) => {}
             Err(e) => {
@@ -377,7 +410,12 @@ impl MessagePublisher for MongoDbPublisher {
         let mut valid_messages = Vec::with_capacity(messages.len());
 
         for message in messages {
-            match message_to_document(&message, &self.format, self.id_field.as_deref()) {
+            match message_to_document(
+                &message,
+                &self.format,
+                self.id_field.as_deref(),
+                self.id_template.as_ref(),
+            ) {
                 Ok(doc) => {
                     docs.push(doc);
                     valid_messages.push(message);

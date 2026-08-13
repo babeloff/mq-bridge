@@ -1,5 +1,6 @@
 use crate::canonical_message::tracing_support::LazyMessageIds;
 use crate::models::{MongoDbConfig, MongoDbFormat};
+use crate::support::interpolation::CompiledTemplate;
 use crate::traits::{
     BatchCommitFunc, BoxFuture, ConsumerError, EndpointStatus, MessageConsumer, MessageDisposition,
     MessagePublisher, PublisherError, Received, ReceivedBatch, Sent, SentBatch,
@@ -131,20 +132,41 @@ fn extract_id_bson(payload: &[u8], id_field: &str) -> anyhow::Result<Bson> {
     Ok(bson)
 }
 
+fn render_id_bson(message: &CanonicalMessage, template: &CompiledTemplate) -> anyhow::Result<Bson> {
+    let rendered = template
+        .render_resolved(Some(message))
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow!("id_field template did not fully resolve for this message"))?;
+    Ok(Bson::String(
+        String::from_utf8(rendered).expect("interpolation renders UTF-8 by construction"),
+    ))
+}
+
+fn explicit_id_bson(
+    message: &CanonicalMessage,
+    id_field: Option<&str>,
+    id_template: Option<&CompiledTemplate>,
+) -> anyhow::Result<Option<Bson>> {
+    match (id_field, id_template) {
+        (Some(field), None) => extract_id_bson(&message.payload, field).map(Some),
+        (None, Some(template)) => render_id_bson(message, template).map(Some),
+        (None, None) => Ok(None),
+        (Some(_), Some(_)) => unreachable!("MongoDB id sources are validated at startup"),
+    }
+}
+
 fn message_to_document(
     message: &CanonicalMessage,
     format: &MongoDbFormat,
     id_field: Option<&str>,
+    id_template: Option<&CompiledTemplate>,
 ) -> anyhow::Result<Document> {
     // If request-reply metadata is present, we must use the wrapped format to preserve it,
     // regardless of whether the original format was raw.
     let force_wrapped = message.metadata.contains_key("correlation_id")
         || message.metadata.contains_key("reply_to");
 
-    let explicit_id = match id_field {
-        Some(field) => Some(extract_id_bson(&message.payload, field)?),
-        None => None,
-    };
+    let explicit_id = explicit_id_bson(message, id_field, id_template)?;
 
     if !force_wrapped && matches!(format, MongoDbFormat::Raw) {
         if let Ok(mut doc) = serde_json::from_slice::<Document>(&message.payload) {
@@ -273,7 +295,7 @@ async fn handle_reply(
             resp.metadata
                 .insert("correlation_id".to_string(), cid.clone());
         }
-        let doc = message_to_document(&resp, &MongoDbFormat::Normal, None).map_err(|e| {
+        let doc = message_to_document(&resp, &MongoDbFormat::Normal, None, None).map_err(|e| {
             tracing::error!(collection = %coll_name, error = %e, "Failed to serialize MongoDB reply");
             anyhow!("Failed to serialize MongoDB reply: {}", e)
         })?;

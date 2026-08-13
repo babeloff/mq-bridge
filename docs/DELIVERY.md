@@ -9,6 +9,42 @@ source/sink combinations give you which guarantee.
 > you get *effective exactly-once*: the record lands once no matter how many times it is delivered.
 > Everything below is about how to arrange that.
 
+## Enabling effective exactly-once
+
+There is no global `exactly_once` switch. The guarantee follows from ordinary endpoint
+configuration: provide a replay-stable identity when the source does not already have one, then
+configure an idempotent sink write. At startup, `mq-bridge` inspects the route and reports the
+inferred guarantee as `effectively-once` or `at-least-once`; it does not silently change how the
+sink writes data.
+
+| Sink | Configuration recognised as effectively-once |
+|---|---|
+| MongoDB | `id_field` set to a payload field or replay-stable template such as `${metadata:mqb.id}` |
+| PostgreSQL / SQLite | `sqlx.insert_query` uses a unique key with `ON CONFLICT` |
+| MySQL / MariaDB | `sqlx.insert_query` uses a unique key with `ON DUPLICATE KEY` |
+| File / object store | `idempotency: true` with a replayable Kafka or Postgres CDC source |
+
+For a source without stable identity, derive one once and consume it at the sink:
+
+```yaml
+input:
+  middlewares:
+    - id: "${payload:order_id}"       # writes metadata mqb.id
+  file: { path: "orders.jsonl" }
+
+output:
+  sqlx:
+    url: "sqlite://orders.db"
+    table: orders
+    insert_query: >
+      INSERT INTO orders (id, body)
+      VALUES (${metadata:mqb.id}, ${payload:body})
+      ON CONFLICT (id) DO NOTHING
+```
+
+The target column must actually have a `PRIMARY KEY` or `UNIQUE` constraint. `DO NOTHING` gives
+insert-once semantics; an appropriate `DO UPDATE` clause gives convergent upsert semantics.
+
 ## What exactly-once actually requires
 
 It is four separate properties, and they fail independently:
@@ -139,7 +175,8 @@ state store is needed. Both database sinks lean on this instead of an applicatio
 
 ### MongoDB — `id_field`
 
-Point `id_field` at a top-level payload field and its value becomes the document `_id`. Re-inserting
+Point `id_field` at a top-level payload field and its value becomes the document `_id`. Alternatively,
+use the template form `id_field: "${metadata:mqb.id}"` to consume an identity produced by the input `id` middleware. Re-inserting
 the same business key then hits the unique `_id` index and is treated as an idempotent success (the
 duplicate is skipped, not errored):
 
@@ -154,6 +191,21 @@ orders_to_mongo:
       format: json
       id_field: "order_id"   # payload {"order_id": "A-1", ...} → _id = "A-1"
 ```
+
+The equivalent configuration using the shared identity carrier is:
+
+```yaml
+input:
+  middlewares:
+    - id: "${payload:order_id}"
+output:
+  mongodb:
+    # ... connection and collection ...
+    id_field: "${metadata:mqb.id}"
+```
+
+A plain `id_field` preserves the payload value's BSON type; the template form renders a string and
+accepts only replay-stable payload or metadata tokens.
 
 The field's JSON type is preserved (a number stays a BSON integer). The payload must be JSON and
 contain the field, otherwise the message is dead-lettered rather than written with a random `_id` —

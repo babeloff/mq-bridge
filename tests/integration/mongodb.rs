@@ -13,6 +13,9 @@ use mq_bridge::test_utils::{
     run_test_with_docker_controller, setup_logging, should_run, verify_subscriber_logic,
     PerformanceResult,
 };
+// Queue pipeline: `consume: consumer` is explicit because the default (`capture_all`) needs a
+// replica set and otherwise degrades to an `_id`-ordered reader, which cannot tail a collection
+// written by 4 concurrent workers — a batch landing out of `_id` order is skipped for good.
 const CONFIG_YAML: &str = r#"
 routes:
   memory_to_mongodb:
@@ -32,7 +35,7 @@ routes:
     concurrency: 4
     batch_size: 1024
     input:
-      mongodb: { url: "mongodb://localhost:27017", database: "mq_bridge_test", collection: "test_collection" }
+      mongodb: { url: "mongodb://localhost:27017", database: "mq_bridge_test", collection: "test_collection", consume: consumer }
     output:
       memory: { topic: "test-out-mongodb", capacity: {out_capacity} }
 "#;

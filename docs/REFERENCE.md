@@ -361,7 +361,7 @@ dedup to survive a re-read.
 ```
 
 When MongoDB is your sink and messages carry a business key, prefer the sink's own unique
-index (`id_field` on the mongodb output) over this middleware — the target collection then
+index (`id_field`, which also accepts templates, on the mongodb output) over this middleware — the target collection then
 *is* the deduplication authority, with no second write. See the idempotency notes in README.
 
 ### `weak_join`

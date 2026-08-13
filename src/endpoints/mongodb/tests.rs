@@ -185,7 +185,7 @@ fn message_to_document_strips_source_metadata_but_keeps_user_keys() {
     msg.metadata
         .insert("mqb.src.kafka_offset".to_string(), "42".to_string());
 
-    let doc = message_to_document(&msg, &MongoDbFormat::Text, None).unwrap();
+    let doc = message_to_document(&msg, &MongoDbFormat::Text, None, None).unwrap();
     let metadata = doc.get_document("metadata").unwrap();
 
     assert_eq!(metadata.get_str("kind").unwrap(), "order");
@@ -198,12 +198,12 @@ fn message_to_document_strips_source_metadata_but_keeps_user_keys() {
 #[test]
 fn message_to_document_id_field_sets_typed_id() {
     let msg = CanonicalMessage::new(br#"{"order_id":"A-1","qty":3}"#.to_vec(), None);
-    let doc = message_to_document(&msg, &MongoDbFormat::Json, Some("order_id")).unwrap();
+    let doc = message_to_document(&msg, &MongoDbFormat::Json, Some("order_id"), None).unwrap();
     assert_eq!(doc.get_str("_id").unwrap(), "A-1");
 
     // Numeric key keeps its BSON integer type.
     let msg = CanonicalMessage::new(br#"{"order_id":42}"#.to_vec(), None);
-    let doc = message_to_document(&msg, &MongoDbFormat::Json, Some("order_id")).unwrap();
+    let doc = message_to_document(&msg, &MongoDbFormat::Json, Some("order_id"), None).unwrap();
     assert_eq!(doc.get_i64("_id").unwrap(), 42);
 }
 
@@ -211,7 +211,7 @@ fn message_to_document_id_field_sets_typed_id() {
 fn message_to_document_id_field_overrides_raw_id() {
     // Raw inserts the payload verbatim; id_field still wins.
     let msg = CanonicalMessage::new(br#"{"order_id":"A-1","_id":"ignored"}"#.to_vec(), None);
-    let doc = message_to_document(&msg, &MongoDbFormat::Raw, Some("order_id")).unwrap();
+    let doc = message_to_document(&msg, &MongoDbFormat::Raw, Some("order_id"), None).unwrap();
     assert_eq!(doc.get_str("_id").unwrap(), "A-1");
 }
 
@@ -219,8 +219,28 @@ fn message_to_document_id_field_overrides_raw_id() {
 fn message_to_document_id_field_missing_or_non_json_errors() {
     for payload in [&br#"{"other":1}"#[..], b"not json", br#"{"order_id":null}"#] {
         let msg = CanonicalMessage::new(payload.to_vec(), None);
-        assert!(message_to_document(&msg, &MongoDbFormat::Json, Some("order_id")).is_err());
+        assert!(message_to_document(&msg, &MongoDbFormat::Json, Some("order_id"), None).is_err());
     }
+}
+
+#[test]
+fn message_to_document_id_template_uses_replay_stable_metadata() {
+    let mut msg = CanonicalMessage::new(br#"{"order_id":"A-1"}"#.to_vec(), None);
+    msg.metadata
+        .insert("mqb.id".to_string(), "order-A-1".to_string());
+    let template = CompiledTemplate::compile("${metadata:mqb.id}", None).unwrap();
+
+    let doc = message_to_document(&msg, &MongoDbFormat::Json, None, Some(&template)).unwrap();
+
+    assert_eq!(doc.get_str("_id").unwrap(), "order-A-1");
+}
+
+#[test]
+fn message_to_document_id_template_must_fully_resolve() {
+    let msg = CanonicalMessage::new(br#"{"order_id":"A-1"}"#.to_vec(), None);
+    let template = CompiledTemplate::compile("${metadata:mqb.id}", None).unwrap();
+
+    assert!(message_to_document(&msg, &MongoDbFormat::Json, None, Some(&template)).is_err());
 }
 
 #[test]
