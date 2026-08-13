@@ -277,22 +277,6 @@ pub(crate) fn deserialize_middlewares_from_value(
     Ok(middlewares)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn middleware_map_rejects_non_numeric_keys() {
-        let value = serde_json::json!({
-            "0": { "metrics": {} },
-            "typo": { "limiter": { "rate_per_second": 1 } }
-        });
-
-        let error = deserialize_middlewares_from_value(value).unwrap_err();
-        assert!(error.to_string().contains("found 'typo'"));
-    }
-}
-
 // Hand-written schema: the `Deserialize` impl below accepts either a bare string
 // or a map where only `body` is required, so the derived all-fields-required
 // object schema would reject valid configs.
@@ -658,4 +642,20 @@ pub(crate) fn ibm_tls_config_schema_transform(schema: &mut schemars::Schema) {
             "format": "password"
         }),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn middleware_map_rejects_non_numeric_keys() {
+        let value = serde_json::json!({
+            "0": { "metrics": {} },
+            "typo": { "limiter": { "rate_per_second": 1 } }
+        });
+
+        let error = deserialize_middlewares_from_value(value).unwrap_err();
+        assert!(error.to_string().contains("found 'typo'"));
+    }
 }
