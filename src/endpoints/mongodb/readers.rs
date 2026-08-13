@@ -20,7 +20,6 @@ pub struct MongoDbIdReader {
     collection: Collection<Document>,
     db: Database,
     checkpoint: Option<Arc<dyn crate::checkpoint::CheckpointStore>>,
-    cursor_id: Option<String>,
     last_id: Arc<Mutex<Option<Bson>>>,
     receive_query: Option<Document>,
 }
@@ -93,7 +92,6 @@ impl MongoDbIdReader {
             collection,
             db,
             checkpoint,
-            cursor_id: config.cursor_id.clone(),
             last_id: Arc::new(Mutex::new(last_id)),
             receive_query,
         })
