@@ -199,7 +199,7 @@ async fn uncommitted_batch_redelivers(
         if batch.messages.iter().any(|message| {
             payload
                 .iter()
-                .any(|value| value == message.get_payload_str())
+                .any(|value| value.as_str() == message.get_payload_str())
         }) {
             drop(batch); // deliberately without calling `batch.commit`
             break;
@@ -307,7 +307,7 @@ async fn receive(
         for message in batch.messages {
             if expected
                 .iter()
-                .any(|value| value == message.get_payload_str())
+                .any(|value| value.as_str() == message.get_payload_str())
             {
                 collected.push(message);
                 dispositions.push(disposition.clone());
