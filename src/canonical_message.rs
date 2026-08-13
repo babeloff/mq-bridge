@@ -260,6 +260,14 @@ pub fn is_source_metadata_key(key: &str) -> bool {
     key.starts_with(SOURCE_METADATA_PREFIX)
 }
 
+/// Metadata key holding a message's business identity, set by the `id` middleware.
+///
+/// Deliberately outside [`SOURCE_METADATA_PREFIX`]: an identity describes the *record*, not the
+/// hop it was read on, so it propagates downstream instead of being stripped. Unlike
+/// `message_id` (a `u128`) it keeps the key in its original string form, so a sink can use it
+/// verbatim.
+pub const MESSAGE_IDENTITY_KEY: &str = "mqb.id";
+
 /// Whether the deprecated `MQB_SOURCE_METADATA` compatibility fallback is enabled.
 ///
 /// Off by default — the per-message origin (topic/subject/queue, offset, …) is only

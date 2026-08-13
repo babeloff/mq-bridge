@@ -71,6 +71,7 @@ middlewares:
 | [`retry`](#retry) | – | ✅ | – | Exponential-backoff retry of failed sends |
 | [`dlq`](#dlq) | – | ✅ | – | Route permanently-failed messages to another endpoint |
 | [`transform`](#transform) | ✅ | ✅ | – | Declarative JSON mapping, coercion, validation |
+| [`id`](#id) | ✅ | – | – | Derive a replay-stable business identity into `mqb.id` |
 | [`deduplication`](#deduplication) | ✅ | – | `dedup` | Drop repeated keys within a TTL |
 | [`weak_join`](#weak_join) | ✅ | – | – | Correlate and join related messages |
 | [`buffer`](#buffer) | ✅ | ✅ | – | Coalesce single sends into batches |
@@ -97,7 +98,7 @@ middlewares:
 above rather than assuming:
 
 - `dlq` / `retry` on an input log a warning and are skipped. The route still starts.
-- `deduplication` and `weak_join` on an output are **hard startup errors**. Deduplication
+- `deduplication`, `weak_join` and `id` on an output are **hard startup errors**. Deduplication
   cannot work on the publish side, and silently starting an un-deduplicated route is worse
   than refusing to start.
 
@@ -268,6 +269,46 @@ the `mqb.transform_error` metadata key, which a [`switch`](#switch) can route on
 
 Schemas and paths compile once at startup; `schema_file` is read a single time. A `transform`
 with neither stage configured leaves the payload untouched without parsing it.
+
+### `id`
+
+Renders a template into the `mqb.id` metadata key, giving a message a **business identity**
+that survives a re-read. Input only.
+
+The value is a bare interpolation template string (see `${namespace:selector}`).
+
+```yaml middleware
+- id: "${payload:order_id}"
+```
+
+Most sources mint a fresh `message_id` on every read, so it identifies the *delivery*, not the
+record — see [DELIVERY.md](DELIVERY.md#sources-what-identity-you-get) for which ones do carry a
+stable id. `mqb.id` fills that gap: derived from the message itself, it is the same on every
+re-read. Unlike `message_id` (a `u128`) it keeps the key as a string, so a sink can use it
+verbatim, and unlike `mqb.src.*` it is **not** stripped on publish — an identity describes the
+record, not the hop, so it propagates downstream.
+
+**Order matters, and not the way it reads.** Consumer middlewares wrap in reverse, so the entry
+*closest to the end of the list* touches an incoming message *first*. Anything that consumes
+`mqb.id` must therefore be listed **before** the `id` that produces it:
+
+```yaml middleware
+- deduplication: { store: "sled:///var/lib/mq-bridge/dedup", ttl_seconds: 3600, key: "${metadata:mqb.id}" }
+- id: "${payload:order_id}"
+```
+
+Reversing those two leaves `mqb.id` unset when `deduplication` reads it, which falls back to
+`message_id` with only a warning. Pinned by
+`middleware::id::tests::the_last_listed_consumer_middleware_runs_first`.
+
+**A partial identity is no identity.** The key is set only when *every* selector in the template
+resolves; if any one is missing the message passes through with `mqb.id` unset (warned once per
+route, then at `debug`). This matters for multi-part templates: `"${payload:tenant}-${payload:order_id}"`
+would otherwise render `"acme-"` for every message missing `order_id` and hand them all the same
+identity — which, used as a `deduplication` key, drops all but the first.
+
+Malformed templates fail at startup, and so does a template with no `${...}` token at all, since a
+constant would give every message one identity.
 
 ### `deduplication`
 
@@ -873,5 +914,6 @@ key. Endpoints can also be written in Python (`register_endpoint`) or JavaScript
 
 - [README.md](../README.md) — overview, data endpoints, request/response and CQRS patterns
 - [CONFIGURATION.md](CONFIGURATION.md) — full YAML examples, env vars, TLS, IDE schema validation
+- [DELIVERY.md](DELIVERY.md) — delivery guarantees, per-source identity, per-sink idempotency
 - [ARCHITECTURE.md](ARCHITECTURE.md) — internals, batching/concurrency, extension traits
 - [EXTENDING.md](EXTENDING.md) — writing your own endpoint or middleware, in Rust, Python or Node

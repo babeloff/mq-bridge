@@ -249,6 +249,13 @@ async fn wrong_side_middleware_matches_documented_behaviour() {
         "weak_join on an output must fail at startup, as documented"
     );
 
+    // Same, for `id`: the table lists it alongside weak_join as a hard error.
+    let id = publisher_for(vec![Middleware::Id("${payload:order_id}".to_string())]).await;
+    assert!(
+        id.is_err(),
+        "id on an output must fail at startup, as documented"
+    );
+
     // Documented as warn-and-skip on the consumer side: the route still starts.
     let mut input = Endpoint::new_memory("reference_docs_wrong_side_in", 10);
     input.middlewares = vec![Middleware::Retry(Default::default())];

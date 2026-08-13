@@ -182,7 +182,7 @@ impl<'de> Deserialize<'de> for Endpoint {
 pub(crate) fn is_known_middleware_name(name: &str) -> bool {
     matches!(
         name,
-        "deduplication"
+        "id" | "deduplication"
             | "metrics"
             | "dlq"
             | "retry"

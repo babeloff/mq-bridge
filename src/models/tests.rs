@@ -189,6 +189,7 @@ kafka_to_nats:
                 Middleware::Transform(_) => {}
                 Middleware::Encryption(_) => {}
                 Middleware::Compression(_) => {}
+                Middleware::Id(_) => {}
             }
         }
 

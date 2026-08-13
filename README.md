@@ -248,183 +248,25 @@ claim → re-fetch → delete on ack) buy exclusivity you aren't using, and cost
 
 ### Deduplication & idempotent writes
 
-For ETL, at-least-once delivery plus an **idempotent write** gives you effective exactly-once: a
-replayed or retried record must not create a duplicate row. The most robust place to enforce this is
-the sink database's own **unique constraint** — it is already shared across every writer, so no extra
-state store is needed. Both database sinks lean on this instead of an application-side cache.
+`mq-bridge` is **at-least-once**: nothing is lost on a crash, but a replay can redeliver. Pair it
+with an **idempotent write at the sink** and you get effective exactly-once — the record lands once
+however often it is delivered. Which sink absorbs a duplicate, which source gives you a stable key to
+deduplicate on, and what a handler in the route changes about all of this, is covered in full by:
 
-**MongoDB — `id_field`.** Point `id_field` at a top-level payload field and its value becomes the
-document `_id`. Re-inserting the same business key then hits the unique `_id` index and is treated as
-an idempotent success (the duplicate is skipped, not errored):
+> **[docs/DELIVERY.md](docs/DELIVERY.md) — delivery guarantees.** Per-source identity and
+> per-sink idempotency tables, the `deduplication` middleware, Mongo `id_field` and `report_outcome`,
+> SQL `ON CONFLICT`, ClickHouse `ReplacingMergeTree`, file/object-store `idempotency: true`, what
+> handlers change, and what `mq-bridge` deliberately does not provide.
 
-```yaml
-orders_to_mongo:
-  input:  { kafka:   { topic: "orders", url: "localhost:9092" } }
-  output:
-    mongodb:
-      url: "mongodb://localhost:27017"
-      database: "shop"
-      collection: "orders"
-      format: json
-      id_field: "order_id"   # payload {"order_id": "A-1", ...} → _id = "A-1"
-```
-
-The field's JSON type is preserved (a number stays a BSON integer). The payload must be JSON and
-contain the field, otherwise the message is dead-lettered rather than written with a random `_id` —
-silently minting one would defeat deduplication. Use `id_field` on **sink** collections only: a
-business-key `_id` is not compatible with the `consumer`/`subscriber` competing-consumer modes, which
-require a UUID `_id`.
-
-**SQL (`sqlx`) — `ON CONFLICT` / `ON DUPLICATE KEY`.** The `insert_query` is user-supplied, so you
-write the dialect's upsert directly. This requires a pre-existing `UNIQUE`/`PRIMARY KEY` on the key
-column, and is incompatible with `bulk_copy` (COPY cannot express `ON CONFLICT`) — so you trade peak
-throughput for deduplication.
-
-```yaml
-# PostgreSQL — insert if absent (drop duplicates):
-insert_query: "INSERT INTO orders (id, body) VALUES (${payload:id}, ${payload:body}) ON CONFLICT (id) DO NOTHING"
-
-# PostgreSQL — upsert (last write wins):
-insert_query: "INSERT INTO orders (id, body) VALUES (${payload:id}, ${payload:body}) ON CONFLICT (id) DO UPDATE SET body = EXCLUDED.body"
-
-# MySQL / MariaDB:
-insert_query: "INSERT INTO orders (id, body) VALUES (${payload:id}, ${payload:body}) ON DUPLICATE KEY UPDATE body = VALUES(body)"
-
-# SQLite:
-insert_query: "INSERT INTO orders (id, body) VALUES (${payload:id}, ${payload:body}) ON CONFLICT (id) DO NOTHING"
-```
-
-A plain `INSERT` without a conflict clause instead fails the row as a **non-retryable** error: a
-configured `dlq` captures it, and without one it is logged and dropped. Add the conflict clause
-when replays are expected. `${payload:field}` binds a typed value from the JSON payload;
-`${metadata:key}` binds a metadata string.
-
-**ClickHouse — `ReplacingMergeTree`.** ClickHouse has no unique constraints; dedup is a table-engine
-property. Create the target as `ReplacingMergeTree(version)` keyed by your business key via
-`ORDER BY`, using a monotonic column as the version (e.g. an ingest timestamp, or `postgres.lsn` from
-a CDC source). ClickHouse collapses rows with the same sort key at merge time, keeping the highest
-version; read with `FINAL` (or `argMax`) to see the deduplicated result:
-
-```sql
-CREATE TABLE orders (id UInt64, body String, version UInt64)
-ENGINE = ReplacingMergeTree(version) ORDER BY id;
--- mq-bridge just inserts rows; duplicates for the same id collapse on merge.
-SELECT * FROM orders FINAL;
-```
-
-`ReplacingMergeTree` deduplicates by business key at merge time. Separately, ClickHouse also dedupes
-identical *re-inserted blocks* natively: a retried `send_batch` that resends the same block is dropped
-server-side (default one-hour window) — `insert_deduplication_token` lets you make that explicit, but
-mq-bridge does not set one, so rely on `ReplacingMergeTree` for logical dedup and treat block-level
-dedup only as retry-safety.
-
-**Postgres CDC — deterministic id + `postgres.key`.** The `postgres_cdc` source resumes from the slot's
-durable `confirmed_flush_lsn`. In-band standby feedback is asynchronous and is *not* flushed when the
-stream stops, so the last acks are made durable by the consumer's `Drop`, which stops the stream and
-advances the slot synchronously. Re-delivery is therefore avoided only on a restart that actually runs
-that teardown — a host process that exits without dropping the route (or one on a current-thread Tokio
-runtime, where the blocking advance is skipped) replays everything since the last asynchronous feedback
-tick. Set `checkpoint_store` to a `file://` path for a second, per-ack durable position that survives
-teardown regardless. Treat the source as at-least-once and make the sink idempotent. Each change event
-carries the full row (so the primary key is in the payload), `postgres.lsn` (a monotonic version),
-`postgres.operation`/`schema`/`table`, and — when the table has a primary key / replica identity —
-`postgres.key` (the key value). The event's `message_id` is a stable hash of `schema.table + key +
-lsn`, so a replayed change deduplicates through the `deduplication` middleware, and Mongo `id_field`
-or a SQL `ON CONFLICT` on the key column make the sink write idempotent. Use `postgres.lsn` as the
-version to drop stale replays (`... DO UPDATE ... WHERE excluded.lsn > orders.lsn`).
-
-*Known edge:* if the same primary key is changed twice **within a single transaction**, both events
-share that transaction's commit LSN, so they produce the same `message_id`. The `deduplication`
-middleware then treats the second as a duplicate and drops it. The sink still converges to the final
-row state, but the intermediate change is not delivered — if you need every intra-txn revision, do not
-rely on the `message_id`/middleware path for those rows.
-
-The `deduplication` middleware is a complement, not a replacement: it filters duplicates *before* the
-sink, keyed on `message_id`, but its `sled` store is single-instance — prefer the sink constraint for
-multi-writer ETL.
-
-**MongoDB — branch on insert vs. duplicate (`report_outcome`).** Sometimes you need to *act* on
-whether a record was newly inserted or already existed — enrich only fresh rows, or reply with the
-existing entry for duplicates. Set `report_outcome: true` and the Mongo publisher returns the message
-tagged with metadata `mongodb.outcome` = `inserted` (fresh write) or `existed` (dup-key on the
-unique `_id`). Wrap it in a `request` endpoint to forward that tagged message into a `switch` that
-routes on `mongodb.outcome`:
-
-```yaml
-orders_upsert_branch:
-  input: { kafka: { topic: "orders", url: "localhost:9092" } }
-  output:
-    request:                       # calls `to`, forwards its response to `forward_to`
-      to:
-        mongodb:
-          url: "mongodb://localhost:27017"
-          database: "shop"
-          collection: "orders"
-          format: json
-          id_field: "order_id"     # deterministic _id → insert-if-absent
-          report_outcome: true     # → mongodb.outcome = inserted | existed
-      forward_to:
-        switch:
-          metadata_key: "mongodb.outcome"
-          cases:
-            inserted: { ref: "enrich_new_order" }   # e.g. build entry X, reply
-            existed:  { ref: "handle_duplicate" }    # e.g. reply with parts of X
-```
-
-`report_outcome` is sink-only and pairs with `id_field`; without a deterministic `_id` there is no
-duplicate to detect. Left
-unwrapped by `request`, the tagged message is returned as the route's response as usual.
-
-**Files & object storage — `idempotency`.** A filesystem has no unique constraint, so the `file` and
-`object_store` sinks get replay safety a different way: **deterministic names plus covered-range
-recovery**. Set `idempotency: true` and the sink stops writing UUID-named objects. Instead it groups
-each batch into runs of consecutive source positions and writes one immutable part per run, named
-for the range it covers:
-
-```yaml
-kafka_to_s3:
-  input:
-    kafka: { topic: "orders", url: "localhost:9092", source_metadata: true }
-  output:
-    object_store:
-      url: "s3://my-bucket/orders"
-      idempotency: true          # → s3://my-bucket/orders/part-orders-0-0-1023.jsonl
-```
-
-On startup the sink lists what is already there, parses the ranges out of the part names, and drops
-any incoming record whose position falls inside one. Filtering is **per record, not per batch**, so
-batch boundaries are free to differ across restarts — that is what makes it work without a
-checkpoint protocol. Local files stage to a temp name, `fsync`, then `rename` (atomic within a
-filesystem); object stores have no atomic rename, so a single PUT under the final name *is* the
-commit.
-
-This needs a replayable source position, which today means **Kafka** (topic/partition/offset) or
-**`postgres_cdc`** (commit LSN plus in-transaction ordinal). A route with an idempotent output turns
-`source_metadata` on for its input automatically; set it explicitly only when you want the
-`mqb.src.*` keys for something else. Any other input is rejected when the route starts. NATS, AMQP
-and MongoDB CDC also accept `source_metadata` and emit provenance keys, but a subject or routing key
-is not a replayable offset, so they cannot drive an idempotent sink.
-
-For the `file` sink, `idempotency: true` changes what `path` means: it is the directory that receives
-the part files, not the file that is appended to. The sink creates it on startup, so pointing it at an
-existing regular file fails there with "Failed to create idempotent file sink directory".
-
-`compression` and `encryption` work as usual.
-
-Current limits, all of which the sink rejects or logs rather than silently mishandling:
-
-*   No `csv` (each part would need its own header row).
-*   `date_partition` is ignored — parts are written flat under the prefix, since the name already
-    carries the range. Logged at startup.
-*   **One part file per contiguous run per batch.** There is no size-based rolling yet, so a large
-    backfill produces many small files (~1000 per 1M rows at `batch_size: 1024`). For `postgres_cdc`
-    this is per-transaction, so a high-commit-rate stream produces one small file per commit. Rolling
-    would require buffering across batches the route has already acked, which is not safe today.
+The short form: point the sink at a deterministic business key (`id_field` for MongoDB, an
+`ON CONFLICT` column for SQL) and let its unique constraint be the authority — it is already shared
+across every writer, so no extra state store is needed. Add the `deduplication` middleware on the
+**input** only when the sink has no constraint to lean on, or to keep duplicates away from a handler.
 
 ### Cloud Object Storage (S3 / GCS / Azure)
 The `object_store` endpoint (alias `s3`) reads and writes cloud object stores — Amazon S3, Google Cloud Storage, Azure Blob, Cloudflare R2, and anything else the [`object_store`](https://crates.io/crates/object_store) crate speaks — behind the same `receive_batch` / `send_batch` API. Enable it with the `object-store` feature. Credentials and backend options are read from the process environment (`AWS_ACCESS_KEY_ID`, `AWS_ENDPOINT`, `AWS_REGION`, `GOOGLE_SERVICE_ACCOUNT`, `AZURE_STORAGE_ACCOUNT`, ...); the URL scheme picks the backend (`s3://`, `gs://`, `az://`).
 
-*   **As a sink**, each flushed batch is encoded with the same file endpoint formats (`normal` JSONL, `json`, `text`, `raw`) and written as **one immutable object** at `<prefix>/[YYYY/MM/DD/]<uuidv7>.<ext>`. Objects are write-once — nothing is appended or mutated. The uuidv7 name already sorts by write time; the optional `date_partition` prefix (on by default, derived from that same id's timestamp) is a readability / lifecycle-rule convenience. This naming applies only while `idempotency` is off — with `idempotency: true` the parts are instead named for the source range they cover and written flat under the prefix, and `date_partition` is ignored (see "Files & object storage — `idempotency`" above).
+*   **As a sink**, each flushed batch is encoded with the same file endpoint formats (`normal` JSONL, `json`, `text`, `raw`) and written as **one immutable object** at `<prefix>/[YYYY/MM/DD/]<uuidv7>.<ext>`. Objects are write-once — nothing is appended or mutated. The uuidv7 name already sorts by write time; the optional `date_partition` prefix (on by default, derived from that same id's timestamp) is a readability / lifecycle-rule convenience. This naming applies only while `idempotency` is off — with `idempotency: true` the parts are instead named for the source range they cover and written flat under the prefix, and `date_partition` is ignored (see [Files & object storage — `idempotency`](docs/DELIVERY.md#files--object-storage--idempotency)).
 *   **As a source**, objects under the prefix are listed in key order, fetched whole, split on the delimiter, and emitted. Progress is a durable cursor holding the last fully-acked object key: set `cursor_id` and an external `checkpoint_store` (`file://`, `s3://`, `postgres://`, `mongodb://`) so a restart resumes without re-emitting. Objects are **never deleted or rewritten** — resume is non-destructive and at-least-once at object granularity (a nacked batch is redelivered; the cursor only advances once an object is fully acked). `csv` is supported on the source only.
 
 ```yaml

@@ -353,6 +353,10 @@ pub struct EncryptionConfig {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum Middleware {
+    /// Renders a template into the `mqb.id` metadata key, e.g. `id: "${payload:order_id}"`.
+    /// Consumer-only; list it *after* anything that reads `mqb.id`, since the last consumer
+    /// middleware in the list runs first.
+    Id(String),
     Deduplication(DeduplicationMiddleware),
     Metrics(MetricsMiddleware),
     Dlq(Box<DeadLetterQueueMiddleware>),
