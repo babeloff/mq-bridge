@@ -205,12 +205,17 @@ pub(crate) fn deserialize_middlewares_from_value(
     let arr = match value {
         serde_json::Value::Array(arr) => arr,
         serde_json::Value::Object(map) => {
-            let mut middlewares: Vec<_> = map
-                .into_iter()
-                // The config crate can produce maps with numeric string keys ("0", "1", ...)
-                // from environment variables. We need to sort by these keys to maintain order.
-                .filter_map(|(key, value)| key.parse::<usize>().ok().map(|index| (index, value)))
-                .collect();
+            // The config crate can produce maps with numeric string keys ("0", "1", ...)
+            // from environment variables. We sort by these keys to maintain order.
+            let mut middlewares = Vec::with_capacity(map.len());
+            for (key, value) in map {
+                let index = key.parse::<usize>().map_err(|_| {
+                    anyhow::anyhow!(
+                        "Invalid middleware configuration: expected numeric keys, found '{key}'"
+                    )
+                })?;
+                middlewares.push((index, value));
+            }
             middlewares.sort_by_key(|(index, _)| *index);
 
             middlewares.into_iter().map(|(_, value)| value).collect()
@@ -270,6 +275,22 @@ pub(crate) fn deserialize_middlewares_from_value(
         }
     }
     Ok(middlewares)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn middleware_map_rejects_non_numeric_keys() {
+        let value = serde_json::json!({
+            "0": { "metrics": {} },
+            "typo": { "limiter": { "rate_per_second": 1 } }
+        });
+
+        let error = deserialize_middlewares_from_value(value).unwrap_err();
+        assert!(error.to_string().contains("found 'typo'"));
+    }
 }
 
 // Hand-written schema: the `Deserialize` impl below accepts either a bare string

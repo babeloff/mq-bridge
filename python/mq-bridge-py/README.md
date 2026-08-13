@@ -288,6 +288,7 @@ route = mq_bridge.Route.from_config({
     "input": {"pulsar": {"url": "pulsar://localhost:6650", "topic": "orders"}},
     "output": {"file": {"path": "orders.jsonl"}},
 }, "ingest")
+route.start()
 ```
 
 Implement `send_batch(messages)` instead of `receive_batch` for an output. A

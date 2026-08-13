@@ -70,22 +70,22 @@ pub trait Handler: Send + Sync + 'static {
         for msg in msgs {
             remaining -= 1;
             let result = self.handle(msg).await;
-            let aborted = match &result {
-                Err(HandlerError::Retryable(_)) => Some("retryable"),
-                Err(HandlerError::Connection(_)) => Some("connection"),
+            type Abort = fn(anyhow::Error) -> HandlerError;
+            let aborted: Option<(Abort, &'static str)> = match &result {
+                Err(HandlerError::Retryable(_)) => Some((
+                    HandlerError::Retryable,
+                    "batch aborted after earlier retryable handler failure",
+                )),
+                Err(HandlerError::Connection(_)) => Some((
+                    HandlerError::Connection,
+                    "batch aborted after earlier handler connection failure",
+                )),
                 Err(HandlerError::NonRetryable(_)) | Ok(_) => None,
             };
             results.push(result);
-            if let Some(kind) = aborted {
+            if let Some((make_error, reason)) = aborted {
                 for _ in 0..remaining {
-                    results.push(Err(match kind {
-                        "retryable" => HandlerError::Retryable(anyhow!(
-                            "batch aborted after earlier retryable handler failure"
-                        )),
-                        _ => HandlerError::Connection(anyhow!(
-                            "batch aborted after earlier handler connection failure"
-                        )),
-                    }));
+                    results.push(Err(make_error(anyhow!(reason))));
                 }
                 break;
             }

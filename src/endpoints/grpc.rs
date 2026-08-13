@@ -97,8 +97,8 @@ impl GrpcConsumer {
 
 #[async_trait]
 impl MessageConsumer for GrpcConsumer {
-    // Both modes use no-op commits (client mode subscribes to a server stream with
-    // no ack; server mode replies per call), so commits are order-independent.
+    // Client mode sends acknowledgement RPCs and server mode resolves per-message
+    // completion channels. Both operations are independent across messages.
     fn commit_requires_order(&self) -> bool {
         false
     }
@@ -553,7 +553,7 @@ fn grpc_client_commit(
                         .await?
                         .into_inner();
                     if !response.success {
-                        anyhow::bail!("gRPC acknowledge rejected: {}", response.error);
+                        warn!(ack_id = %id, error = %response.error, "gRPC acknowledge rejected");
                     }
                     Ok(())
                 })
@@ -570,11 +570,13 @@ fn publish_response_for_disposition(
     disposition: MessageDisposition,
 ) -> proto::PublishResponse {
     match disposition {
-        MessageDisposition::Reply(message) => proto::PublishResponse {
-            result: Some(proto::publish_response::Result::Reply(canonical_to_bridge(
-                message, None,
-            ))),
-        },
+        MessageDisposition::Reply(message) => {
+            let mut reply = canonical_to_bridge(message, None);
+            reply.id = id;
+            proto::PublishResponse {
+                result: Some(proto::publish_response::Result::Reply(reply)),
+            }
+        }
         MessageDisposition::Ack => proto::PublishResponse {
             result: Some(proto::publish_response::Result::Ack(proto::Ack {
                 id,
@@ -2130,6 +2132,18 @@ mod tests {
             id: id.to_string(),
             metadata: Default::default(),
         }
+    }
+
+    #[test]
+    fn reply_preserves_the_request_id() {
+        let response = publish_response_for_disposition(
+            "request-id".to_string(),
+            MessageDisposition::Reply(CanonicalMessage::from("reply")),
+        );
+        let Some(proto::publish_response::Result::Reply(reply)) = response.result else {
+            panic!("expected a reply response");
+        };
+        assert_eq!(reply.id, "request-id");
     }
 
     #[test]

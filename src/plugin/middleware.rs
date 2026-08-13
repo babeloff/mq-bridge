@@ -21,7 +21,8 @@ use super::LoadedPlugin;
 use crate::errors::{ConsumerError, PublisherError};
 use crate::support::plugin_abi::{
     MqbBuffer, MqbFilterHandle, MqbMessage, MqbMiddlewareHandle, MqbSlice, MqbStatus,
-    MQB_ERR_CONNECTION, MQB_ERR_PERMANENT, MQB_MESSAGE_KEPT, MQB_MIDDLEWARE_RECEIVE,
+    MQB_END_OF_STREAM, MQB_ERR_CONNECTION, MQB_ERR_INVALID_CONFIG, MQB_ERR_PANIC,
+    MQB_ERR_PERMANENT, MQB_ERR_UNSUPPORTED, MQB_MESSAGE_KEPT, MQB_MIDDLEWARE_RECEIVE,
     MQB_MIDDLEWARE_SEND, MQB_OK,
 };
 use crate::traits::{
@@ -334,11 +335,19 @@ impl MessagePublisher for PluginMiddlewarePublisher {
         if messages.is_empty() {
             return Ok(SentBatch::Ack);
         }
-        let filtered = self
-            .middleware
-            .apply(messages)
-            .await
-            .map_err(|failure| PublisherError::Retryable(failure.cause))?;
+        let filtered =
+            self.middleware
+                .apply(messages)
+                .await
+                .map_err(|failure| match failure.status {
+                    MQB_ERR_CONNECTION => PublisherError::Connection(failure.cause),
+                    MQB_ERR_PERMANENT
+                    | MQB_ERR_INVALID_CONFIG
+                    | MQB_ERR_UNSUPPORTED
+                    | MQB_ERR_PANIC
+                    | MQB_END_OF_STREAM => PublisherError::NonRetryable(failure.cause),
+                    _ => PublisherError::Retryable(failure.cause),
+                })?;
         if filtered.kept.is_empty() {
             // Everything was dropped on purpose, which is a successful publish.
             return Ok(SentBatch::Ack);

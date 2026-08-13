@@ -33,6 +33,15 @@ pub fn get_endpoint_factory(name: &str) -> Option<Arc<dyn CustomEndpointFactory>
     map.get(name).cloned()
 }
 
+#[cfg(feature = "plugin")]
+pub(crate) fn unregister_endpoint_factory(name: &str) {
+    if let Some(registry) = CUSTOM_ENDPOINT_REGISTRY.get() {
+        if let Ok(mut factories) = registry.write() {
+            factories.remove(name);
+        }
+    }
+}
+
 pub fn register_middleware_factory(
     name: &str,
     factory: Arc<dyn CustomMiddlewareFactory>,

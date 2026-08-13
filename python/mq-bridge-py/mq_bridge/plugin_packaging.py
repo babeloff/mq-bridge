@@ -57,10 +57,20 @@ def main() -> int:
 
     output = (root / args.out).resolve()
     project = package.parent
+    existing = (
+        {wheel: (wheel.stat().st_mtime_ns, wheel.stat().st_size) for wheel in output.glob("*.whl")}
+        if output.is_dir()
+        else {}
+    )
     run(sys.executable, "-m", "build", "--wheel", "--outdir", str(output), cwd=project)
-    wheels = sorted(output.glob("*-py3-none-any.whl"))
+    wheels = [
+        wheel
+        for wheel in output.glob("*-py3-none-any.whl")
+        if existing.get(wheel) != (wheel.stat().st_mtime_ns, wheel.stat().st_size)
+    ]
     if not wheels:
         raise SystemExit(f"no wheel produced in {output}")
+    wheel_path = max(wheels, key=lambda path: path.stat().st_mtime)
     platform_tag = sysconfig.get_platform().replace("-", "_").replace(".", "_")
     run(
         sys.executable,
@@ -70,7 +80,7 @@ def main() -> int:
         "--platform-tag",
         platform_tag,
         "--remove",
-        str(wheels[-1]),
+        str(wheel_path),
         cwd=root,
     )
     return 0

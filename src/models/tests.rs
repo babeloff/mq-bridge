@@ -234,6 +234,39 @@ kafka_to_nats:
 
     #[test]
     fn test_deserialize_from_env() {
+        const VARS: [&str; 11] = [
+            "MQB__KAFKA_TO_NATS__CONCURRENCY",
+            "MQB__KAFKA_TO_NATS__INPUT__KAFKA__TOPIC",
+            "MQB__KAFKA_TO_NATS__INPUT__KAFKA__URL",
+            "MQB__KAFKA_TO_NATS__INPUT__KAFKA__GROUP_ID",
+            "MQB__KAFKA_TO_NATS__INPUT__KAFKA__TLS__REQUIRED",
+            "MQB__KAFKA_TO_NATS__INPUT__KAFKA__TLS__CA_FILE",
+            "MQB__KAFKA_TO_NATS__INPUT__KAFKA__TLS__ACCEPT_INVALID_CERTS",
+            "MQB__KAFKA_TO_NATS__OUTPUT__NATS__SUBJECT",
+            "MQB__KAFKA_TO_NATS__OUTPUT__NATS__URL",
+            "MQB__KAFKA_TO_NATS__INPUT__MIDDLEWARES__0__DLQ__ENDPOINT__NATS__SUBJECT",
+            "MQB__KAFKA_TO_NATS__INPUT__MIDDLEWARES__0__DLQ__ENDPOINT__NATS__URL",
+        ];
+        struct EnvCleanup(Vec<(&'static str, Option<std::ffi::OsString>)>);
+        impl Drop for EnvCleanup {
+            fn drop(&mut self) {
+                unsafe {
+                    for (name, previous) in self.0.drain(..) {
+                        if let Some(value) = previous {
+                            std::env::set_var(name, value);
+                        } else {
+                            std::env::remove_var(name);
+                        }
+                    }
+                }
+            }
+        }
+        let _cleanup = EnvCleanup(
+            VARS.into_iter()
+                .map(|name| (name, std::env::var_os(name)))
+                .collect(),
+        );
+
         // Set environment variables based on README
         unsafe {
             std::env::set_var("MQB__KAFKA_TO_NATS__CONCURRENCY", "10");
@@ -421,24 +454,26 @@ kafka_to_nats:
 
         // Verify config cleared
         let route = config.get("test_route").unwrap();
-        if let EndpointType::Kafka(k) = &route.input.endpoint_type {
-            assert!(k.url.is_empty());
-            assert!(k.username.is_none());
-            assert!(k.password.is_none());
-            assert!(k.tls.cert_password.is_none());
-        }
-        if let EndpointType::Http(h) = &route.output.endpoint_type {
-            assert!(h.url.is_empty());
-            assert!(h.basic_auth.is_none());
-            assert!(!h.custom_headers.contains_key("X-API-Key"));
-            assert!(!h.custom_headers.contains_key("X-Access-Token"));
-            assert!(!h.custom_headers.contains_key("X-Authentication"));
-            assert!(!h.custom_headers.contains_key("Authorization"));
-            assert_eq!(
-                h.custom_headers.get("X-Trace-Id").map(|s| s.as_str()),
-                Some("trace-value")
-            );
-        }
+        let EndpointType::Kafka(k) = &route.input.endpoint_type else {
+            panic!("expected Kafka input");
+        };
+        assert!(k.url.is_empty());
+        assert!(k.username.is_none());
+        assert!(k.password.is_none());
+        assert!(k.tls.cert_password.is_none());
+        let EndpointType::Http(h) = &route.output.endpoint_type else {
+            panic!("expected HTTP output");
+        };
+        assert!(h.url.is_empty());
+        assert!(h.basic_auth.is_none());
+        assert!(!h.custom_headers.contains_key("X-API-Key"));
+        assert!(!h.custom_headers.contains_key("X-Access-Token"));
+        assert!(!h.custom_headers.contains_key("X-Authentication"));
+        assert!(!h.custom_headers.contains_key("Authorization"));
+        assert_eq!(
+            h.custom_headers.get("X-Trace-Id").map(|s| s.as_str()),
+            Some("trace-value")
+        );
     }
 
     #[test]
@@ -494,31 +529,34 @@ kafka_to_nats:
 
         let secrets = extract_config_secrets(&mut config);
 
-        if let EndpointType::Http(http) = &config.get("path_at_route").unwrap().output.endpoint_type
-        {
-            assert_eq!(
-                http.url,
-                "https://example.com/path/user@example.com?email=a@b.test"
-            );
-        }
-        if let EndpointType::Http(http) =
-            &config.get("query_at_route").unwrap().output.endpoint_type
-        {
-            assert_eq!(http.url, "https://example.com?next=a@b.test");
-        }
-        if let EndpointType::Http(http) = &config
+        let EndpointType::Http(http) = &config.get("path_at_route").unwrap().output.endpoint_type
+        else {
+            panic!("expected HTTP output");
+        };
+        assert_eq!(
+            http.url,
+            "https://example.com/path/user@example.com?email=a@b.test"
+        );
+        let EndpointType::Http(http) = &config.get("query_at_route").unwrap().output.endpoint_type
+        else {
+            panic!("expected HTTP output");
+        };
+        assert_eq!(http.url, "https://example.com?next=a@b.test");
+        let EndpointType::Http(http) = &config
             .get("fragment_at_route")
             .unwrap()
             .output
             .endpoint_type
-        {
-            assert_eq!(http.url, "https://example.com#user@example.com");
-        }
-        if let EndpointType::Http(http) =
+        else {
+            panic!("expected HTTP output");
+        };
+        assert_eq!(http.url, "https://example.com#user@example.com");
+        let EndpointType::Http(http) =
             &config.get("credential_route").unwrap().output.endpoint_type
-        {
-            assert!(http.url.is_empty());
-        }
+        else {
+            panic!("expected HTTP output");
+        };
+        assert!(http.url.is_empty());
         assert_eq!(
             secrets
                 .get("MQB__CREDENTIAL_ROUTE__OUTPUT__HTTP__URL")

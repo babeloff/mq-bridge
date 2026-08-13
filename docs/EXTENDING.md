@@ -70,7 +70,7 @@ never lands in mq-bridge's build or CI.
 ```toml
 # Cargo.toml
 [dependencies]
-mq-bridge = { version = "0.3", default-features = false }
+mq-bridge = { version = "0.4", default-features = false }
 pulsar = "6"
 async-trait = "0.1"
 anyhow = "1"
@@ -111,7 +111,9 @@ impl CustomEndpointFactory for PulsarFactory {
         let mut config: PulsarConfig = serde_json::from_value(config.clone())?;
         // Convention: default the topic to the route name, like kafka/nats do.
         let topic = config.topic.take().unwrap_or_else(|| route_name.to_string());
-        Ok(Box::new(PulsarConsumer::connect(&config.url, &topic).await?))
+        Ok(Box::new(
+            PulsarConsumer::connect(&config.url, &topic, config.subscription.as_deref()).await?,
+        ))
     }
 
     async fn create_publisher(
@@ -225,7 +227,7 @@ reports itself ready — use it to warm a pool or create tables.
 ```rust
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    mq_bridge_pulsar::register();
+    mq_bridge_pulsar::register()?;
     mq_bridge::Route::from_file("routes.yaml", Some("pulsar_to_file"))?
         .run("pulsar_to_file")
         .await
@@ -242,6 +244,7 @@ import mq_bridge
 class PulsarSource:
     def __init__(self, config):
         import pulsar
+        self.pulsar = pulsar
         client = pulsar.Client(config["url"])
         self.consumer = client.subscribe(config["topic"], config.get("subscription", "mq-bridge"))
         self.pending = []
@@ -249,12 +252,15 @@ class PulsarSource:
     def receive_batch(self, max_messages):
         # Return [] / None for "nothing right now"; raise StopIteration to end.
         batch = []
+        self.pending = []
         for _ in range(max_messages):
             try:
-                batch.append(self.consumer.receive(timeout_millis=100).data())
-            except Exception:
+                message = self.consumer.receive(timeout_millis=100)
+            # pulsar-client 3.4.x exposes an expired receive as pulsar.Timeout.
+            except self.pulsar.Timeout:
                 break
-        self.pending = batch
+            self.pending.append(message)
+            batch.append(message.data())
         return batch
 
     def commit(self, dispositions):
@@ -340,19 +346,32 @@ const mqb = require("mq-bridge");
 mqb.registerEndpoint("pulsar", (routeName, config) => {
   const client = new Pulsar.Client({ serviceUrl: config.url });
   let consumer;
+  let pending = [];
   return {
     async receiveBatch(maxMessages) {
       consumer ??= await client.subscribe({ topic: config.topic, subscription: "mq-bridge" });
       const batch = [];
+      pending = [];
       for (let i = 0; i < maxMessages; i += 1) {
-        const message = await consumer.receive(100).catch(() => null);
-        if (!message) break;
+        let message;
+        try {
+          message = await consumer.receive(100);
+        } catch (error) {
+          // pulsar-client 1.18.x reports an expired receive as `TimeOut`.
+          if (error instanceof Error && error.message.endsWith(": TimeOut")) break;
+          throw error;
+        }
+        pending.push(message);
         batch.push(message.getData());
       }
       return batch;                       // [] means "nothing right now"
     },
     async commit(dispositions) {
-      // one "ack" / "nack" per message in the batch
+      for (let i = 0; i < dispositions.length; i += 1) {
+        if (dispositions[i] === "nack") consumer.negativeAcknowledge(pending[i]);
+        else await consumer.acknowledge(pending[i]);
+      }
+      pending = [];
     },
     async close() {
       await client.close();

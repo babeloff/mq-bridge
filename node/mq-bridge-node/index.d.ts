@@ -183,7 +183,7 @@ export interface CustomEndpoint {
  * `factory` is called once per route leg. The returned object must implement
  * `receiveBatch` to be usable as an input and/or `sendBatch` to be usable as an
  * output. Register before starting a route that names it; registering the same
- * name twice keeps the last factory.
+ * name twice throws and preserves the first factory.
  */
 export function registerEndpoint(
   name: string,

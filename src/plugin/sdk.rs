@@ -196,6 +196,7 @@ struct FactoryState {
 struct ConsumerState {
     consumer: Arc<Mutex<Box<dyn MessageConsumer>>>,
     runtime: Arc<Runtime>,
+    shutdown: tokio::sync::watch::Sender<bool>,
     /// Read once at creation: querying it later could deadlock against an
     /// in-flight `receive_batch` that holds the consumer lock.
     commit_requires_order: bool,
@@ -415,9 +416,11 @@ unsafe extern "C" fn consumer_create(
             Err(failure) => return task_failed(err, failure),
         };
 
+        let (shutdown, _) = tokio::sync::watch::channel(false);
         *out = MqbConsumerHandle(into_handle(ConsumerState {
             consumer: Arc::new(Mutex::new(consumer)),
             runtime,
+            shutdown,
             commit_requires_order,
         }));
         MQB_OK
@@ -438,16 +441,21 @@ unsafe extern "C" fn consumer_receive_batch(
             return MQB_ERR_PERMANENT;
         };
         let shared = Arc::clone(&state.consumer);
+        let mut shutdown = state.shutdown.subscribe();
         let received = block_on(&state.runtime, async move {
-            shared.lock().await.receive_batch(max_messages).await
+            tokio::select! {
+                batch = async { shared.lock().await.receive_batch(max_messages).await } => Some(batch),
+                _ = shutdown.wait_for(|closed| *closed) => None,
+            }
         });
         let batch = match received {
-            Ok(Ok(batch)) => batch,
-            Ok(Err(error)) => {
+            Ok(Some(Ok(batch))) => batch,
+            Ok(Some(Err(error))) => {
                 let status = consumer_status(&error);
                 set_error(err, format!("{error:#}"));
                 return status;
             }
+            Ok(None) => return MQB_END_OF_STREAM,
             Err(failure) => return task_failed(err, failure),
         };
 
@@ -485,6 +493,7 @@ unsafe extern "C" fn consumer_close(consumer: MqbConsumerHandle, err: *mut MqbBu
         let Some(state) = borrow::<ConsumerState>(consumer.0) else {
             return MQB_OK;
         };
+        let _ = state.shutdown.send(true);
         let shared = Arc::clone(&state.consumer);
         let closed = block_on(
             &state.runtime,

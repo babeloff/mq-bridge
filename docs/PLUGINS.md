@@ -60,7 +60,7 @@ no-op, and the **plugin loader** rejects a second library claiming a name that i
 already registered, rather than silently replacing it. That check belongs to the
 loader alone: registering the same name twice in-process (via
 `register_endpoint_factory` / `register_middleware_factory`, see
-[EXTENDING.md](EXTENDING.md)) still keeps the last factory. Rust users who link
+[EXTENDING.md](EXTENDING.md)) returns an error and preserves the first factory. Rust users who link
 the endpoint crate directly can skip loading entirely and call its `register()`.
 
 The `plugin` feature (in `full` and `portable`) provides the loader.
@@ -81,7 +81,7 @@ export the factory:
 
 ```toml
 [dependencies]
-mq-bridge = { version = "0.3", default-features = false, features = ["plugin-sdk"] }
+mq-bridge = { version = "0.4", default-features = false, features = ["plugin-sdk"] }
 
 [lib]
 crate-type = ["rlib", "cdylib"]

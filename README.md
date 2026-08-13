@@ -227,7 +227,7 @@ claim → re-fetch → delete on ack) buy exclusivity you aren't using, and cost
 
 | `consume` | mechanism | modifies source | ends on drain | use for |
 | :--- | :--- | :--- | :--- | :--- |
-| `capture_all` (default) | `_id` snapshot, then change stream | no | standalone only | bulk read / ETL |
+| `capture_all` (default) | `_id` snapshot, then change stream | no | with drain options | bulk read / ETL |
 | `consumer` | claim → lock → re-fetch → delete | **yes** | yes | work queues, competing readers |
 | `subscriber` | polls `seq > last_seq`, advancing a cursor | no | yes | ephemeral fan-out |
 | `capture_new` | change stream, new changes only | no | **no** | ongoing CDC |

@@ -39,7 +39,8 @@ console.log(`staged ${fileName} for ${target}`);
 if (process.argv.includes("--pack")) {
   const output = path.resolve(root, option("--out", "npm"));
   fs.mkdirSync(output, { recursive: true });
-  execFileSync("npm", ["pack", packageDirectory, "--pack-destination", output], {
+  const npm = process.platform === "win32" ? "npm.cmd" : "npm";
+  execFileSync(npm, ["pack", packageDirectory, "--pack-destination", output], {
     stdio: "inherit",
   });
 }

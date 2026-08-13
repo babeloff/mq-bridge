@@ -98,6 +98,12 @@ impl Endpoint {
             .iter()
             .any(|m| matches!(m, Middleware::Retry(_)))
     }
+
+    pub fn has_dlq_middleware(&self) -> bool {
+        self.middlewares
+            .iter()
+            .any(|m| matches!(m, Middleware::Dlq(_)))
+    }
     pub fn add_middleware(mut self, middleware: Middleware) -> Self {
         self.middlewares.push(middleware);
         self

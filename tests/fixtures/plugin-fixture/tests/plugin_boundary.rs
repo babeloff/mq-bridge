@@ -75,6 +75,29 @@ async fn receive_one_batch(
     }
 }
 
+/// Receives at least `expected` messages, or panics after `timeout`.
+async fn receive_at_least(
+    consumer: &mut dyn mq_bridge::traits::MessageConsumer,
+    expected: usize,
+    timeout: Duration,
+) -> Vec<CanonicalMessage> {
+    let deadline = std::time::Instant::now() + timeout;
+    let mut messages = Vec::new();
+    while messages.len() < expected {
+        let batch = consumer.receive_batch(16).await.expect("receive batch");
+        messages.extend(batch.messages);
+        assert!(
+            std::time::Instant::now() < deadline,
+            "only {} of {expected} messages arrived within {timeout:?}",
+            messages.len()
+        );
+        if messages.len() < expected {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+    messages
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn the_endpoint_conforms_when_linked_directly() {
     let report = conformance::run(
@@ -133,9 +156,8 @@ async fn a_route_moves_messages_through_plugin_endpoints() {
         .create_consumer("drain", &json!({ "queue": "route-out" }))
         .await
         .expect("create consumer");
-    let batch = receive_one_batch(&mut *consumer, Duration::from_secs(5)).await;
-    let mut payloads: Vec<String> = batch
-        .messages
+    let messages = receive_at_least(&mut *consumer, 3, Duration::from_secs(5)).await;
+    let mut payloads: Vec<String> = messages
         .iter()
         .map(|message| message.get_payload_str().to_string())
         .collect();
@@ -430,14 +452,13 @@ async fn run_route(route: mq_bridge::route::Route, name: &str) {
     .await;
 }
 
-async fn drain(factory: &dyn CustomEndpointFactory, queue: &str) -> Vec<String> {
+async fn drain(factory: &dyn CustomEndpointFactory, queue: &str, expected: usize) -> Vec<String> {
     let mut consumer = factory
         .create_consumer("drain", &json!({ "queue": queue }))
         .await
         .expect("create consumer");
-    let batch = receive_one_batch(&mut *consumer, Duration::from_secs(5)).await;
-    let mut payloads: Vec<String> = batch
-        .messages
+    let messages = receive_at_least(&mut *consumer, expected, Duration::from_secs(5)).await;
+    let mut payloads: Vec<String> = messages
         .iter()
         .map(|message| message.get_payload_str().to_string())
         .collect();
@@ -467,7 +488,7 @@ async fn plugin_middleware_rewrites_and_drops_on_the_input_side() {
     .await;
 
     assert_eq!(
-        drain(factory.as_ref(), "mw-in-out").await,
+        drain(factory.as_ref(), "mw-in-out", 2).await,
         vec!["keep-one-seen", "keep-three-seen"]
     );
 }
@@ -494,7 +515,7 @@ async fn plugin_middleware_rewrites_and_drops_on_the_output_side() {
     .await;
 
     assert_eq!(
-        drain(factory.as_ref(), "mw-out-out").await,
+        drain(factory.as_ref(), "mw-out-out", 2).await,
         vec!["keep-one-sent", "keep-three-sent"]
     );
 }
@@ -518,7 +539,7 @@ async fn messages_dropped_by_a_plugin_middleware_are_acknowledged() {
     .await;
 
     assert_eq!(
-        drain(factory.as_ref(), "mw-drop-out").await,
+        drain(factory.as_ref(), "mw-drop-out", 1).await,
         vec!["keep-me"]
     );
 

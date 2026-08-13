@@ -58,7 +58,7 @@ use anyhow::{anyhow, Context};
 
 use crate::extensions::{
     get_endpoint_factory, get_middleware_factory, register_endpoint_factory,
-    register_middleware_factory,
+    register_middleware_factory, unregister_endpoint_factory,
 };
 
 pub use endpoint::PluginEndpointFactory;
@@ -186,10 +186,15 @@ pub fn load_endpoint_plugin(path: impl AsRef<Path>) -> anyhow::Result<PluginInfo
         )?;
     }
     if info.supports_middleware {
-        register_middleware_factory(
+        if let Err(error) = register_middleware_factory(
             plugin.name(),
             Arc::new(PluginMiddlewareFactory::new(Arc::clone(&plugin))),
-        )?;
+        ) {
+            if info.supports_consumer || info.supports_publisher {
+                unregister_endpoint_factory(plugin.name());
+            }
+            return Err(error);
+        }
     }
     loaded.insert(resolved, plugin);
     tracing::info!(

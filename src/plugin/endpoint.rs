@@ -282,15 +282,14 @@ impl MessageConsumer for PluginConsumer {
                     &mut err,
                 )
             };
-            if status != MQB_OK {
-                return Err(consumer_error(&plugin, status, err, "receive a batch"));
-            }
-            // Take ownership of the handle first, so an unexpected message
-            // layout below still releases the batch.
+            // Take ownership even when the plugin wrote a handle before failing.
             let guard = PluginBatch {
                 plugin: Arc::clone(&plugin),
                 handle: batch,
             };
+            if status != MQB_OK {
+                return Err(consumer_error(&plugin, status, err, "receive a batch"));
+            }
             let messages = unsafe { super::message::from_abi(messages, len) };
             Ok(AssertSend((guard, messages)))
         })
