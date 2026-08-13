@@ -107,6 +107,17 @@ impl ZeroMqPublisher {
                         Err(e) => {
                             tracing::error!(error = %e, "Failed to rebuild ZeroMQ REQ socket after a timeout; retrying on the next request");
                             needs_req_reset = true;
+                            let reset_error =
+                                zeromq::ZmqError::Other("ZeroMQ REQ socket reconstruction failed");
+                            match job {
+                                PublisherJob::Send(_, ack_tx) => {
+                                    let _ = ack_tx.send(Err(reset_error));
+                                }
+                                PublisherJob::Request(_, reply_tx) => {
+                                    let _ = reply_tx.send(Err(reset_error));
+                                }
+                            }
+                            continue;
                         }
                     }
                 }

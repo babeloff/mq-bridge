@@ -503,6 +503,7 @@ async fn send_batch_and_commit(
             let commit_result = commit(vec![disposition; batch_len]).await;
             debug!("Failure commit result: {:?}", commit_result);
             if non_retryable && !has_dlq_middleware {
+                commit_result?;
                 Ok(())
             } else {
                 Err(e.into())

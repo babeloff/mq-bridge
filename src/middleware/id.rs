@@ -37,6 +37,11 @@ impl IdConsumer {
                 "`id` middleware template has no `${{namespace:selector}}` token, so every message would be given the same identity"
             );
         }
+        if !template.has_only_replay_stable_tokens() {
+            anyhow::bail!(
+                "`id` middleware template may only use replay-stable `payload` or `metadata` tokens"
+            );
+        }
         Ok(Self {
             inner,
             template,
@@ -57,7 +62,10 @@ impl IdConsumer {
                     .metadata
                     .insert(MESSAGE_IDENTITY_KEY.to_string(), id);
             }
-            _ => self.warn_unresolved(message),
+            _ => {
+                message.metadata.remove(MESSAGE_IDENTITY_KEY);
+                self.warn_unresolved(message);
+            }
         }
     }
 
@@ -261,6 +269,37 @@ mod tests {
         let config = MemoryConfig::new("id_mw_bad".to_string(), None);
         let inner = MemoryConsumer::new(&config).unwrap();
         assert!(IdConsumer::new(Box::new(inner), "${gen:not_a_generator}").is_err());
+    }
+
+    #[tokio::test]
+    async fn delivery_varying_tokens_fail_at_construction() {
+        for template in ["${gen:uuid}", "${message:id}"] {
+            let config =
+                MemoryConfig::new(format!("id_mw_unstable_{}", fast_uuid_v7::gen_id()), None);
+            let inner = MemoryConsumer::new(&config).unwrap();
+            let err = IdConsumer::new(Box::new(inner), template)
+                .err()
+                .expect("a delivery-varying identity must not be accepted");
+            assert!(
+                err.to_string().contains("replay-stable"),
+                "error should say why, got {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unresolved_template_clears_a_prior_identity() {
+        let config = MemoryConfig::new(format!("id_mw_stale_{}", fast_uuid_v7::gen_id()), None);
+        let inner = MemoryConsumer::new(&config).unwrap();
+        let mut consumer = IdConsumer::new(Box::new(inner), "${payload:order_id}").unwrap();
+        let mut message = CanonicalMessage::from(r#"{"other":"x"}"#);
+        message
+            .metadata
+            .insert(MESSAGE_IDENTITY_KEY.to_string(), "stale".to_string());
+
+        consumer.stamp(&mut message);
+
+        assert_eq!(message.metadata.get(MESSAGE_IDENTITY_KEY), None);
     }
 
     /// A tokenless template renders the same string for every message, which is the collapse

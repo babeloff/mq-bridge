@@ -207,6 +207,16 @@ impl CompiledTemplate {
         self.segments.iter().any(|s| matches!(s, Segment::Token(_)))
     }
 
+    /// Whether every token is derived from data that remains stable across message replays.
+    pub fn has_only_replay_stable_tokens(&self) -> bool {
+        self.segments.iter().all(|segment| match segment {
+            Segment::Literal(_) => true,
+            Segment::Token(token) => {
+                matches!(token.source, Source::Payload(_) | Source::Metadata(_))
+            }
+        })
+    }
+
     /// Render the template against an optional message. On the source side (no
     /// input message) `payload`/`metadata`/`message` tokens resolve to empty.
     pub fn render(&self, msg: Option<&CanonicalMessage>) -> Vec<u8> {
