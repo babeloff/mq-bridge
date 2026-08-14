@@ -58,7 +58,21 @@ pub enum RouteOutcome {
 struct OutcomeGuard {
     outcome: Arc<RwLock<Option<RouteOutcome>>>,
     status: Arc<RwLock<EndpointStatus>>,
+    drops: Arc<RwLock<DropReport>>,
     resolved: Option<RouteOutcome>,
+}
+
+/// Messages the route discarded because the sink rejected them permanently and
+/// no DLQ was configured.
+///
+/// Accumulated by the route task and published by [`OutcomeGuard`] as the route
+/// ends, rather than written to the status directly: the reconnect loop clears
+/// `EndpointStatus::error` when a pass reports ready, so a drop recorded inline
+/// races that reset and is usually erased before anyone can read it.
+#[derive(Default)]
+pub(crate) struct DropReport {
+    count: u64,
+    last_cause: Option<String>,
 }
 
 impl OutcomeGuard {
@@ -77,6 +91,22 @@ impl Drop for OutcomeGuard {
             s.error = Some("route task panicked or was aborted".to_string());
             RouteOutcome::Failed
         });
+        // A route that discarded data did not run clean, whatever its outcome.
+        // Never overwrite a recorded failure cause: that one explains why the
+        // route stopped, which is the more urgent of the two.
+        {
+            let drops = recover_read_lock(&self.drops, "route_drop_report");
+            if drops.count > 0 {
+                let mut s = recover_write_lock(&self.status, "route_handle_status");
+                if s.error.is_none() {
+                    s.error = Some(format!(
+                        "dropped {} message(s): sink rejected them permanently and no dlq middleware is configured: {}",
+                        drops.count,
+                        drops.last_cause.as_deref().unwrap_or("unknown cause")
+                    ));
+                }
+            }
+        }
         *recover_write_lock(&self.outcome, "route_handle_outcome") = Some(outcome);
     }
 }
@@ -350,24 +380,22 @@ fn report_route_error(err_tx: &Sender<anyhow::Error>, err: anyhow::Error, contex
     }
 }
 
-/// Attaches the cause of a permanent sink rejection to the route's status.
+/// Records a batch the route discarded after a permanent sink rejection.
 ///
-/// Dropping the batch is deliberate — it is what stops a poison message from
-/// wedging the route — but `err_tx` only carries route-*stopping* errors, so
-/// without this a drop is invisible: the route resolves to
-/// [`RouteOutcome::Completed`] with `error: None` and the caller cannot tell a
-/// clean run from one that discarded data. The route still finishes; it just no
-/// longer claims the run was clean.
+/// Dropping is deliberate — it is what stops a poison message from wedging the
+/// route — but `err_tx` only carries route-*stopping* errors, so without this a
+/// drop is invisible: the route resolves to [`RouteOutcome::Completed`] with
+/// `error: None` and the caller cannot tell a clean run from one that threw data
+/// away. [`OutcomeGuard`] publishes the tally when the route ends.
 fn record_dropped_messages(
-    status: Option<&Arc<RwLock<EndpointStatus>>>,
+    drops: Option<&Arc<RwLock<DropReport>>>,
     dropped: usize,
     cause: &PublisherError,
 ) {
-    let Some(status) = status else { return };
-    let mut s = recover_write_lock(status, "route_handle_status");
-    s.error = Some(format!(
-        "dropped {dropped} message(s): sink rejected them permanently and no dlq middleware is configured: {cause}"
-    ));
+    let Some(drops) = drops else { return };
+    let mut report = recover_write_lock(drops, "route_drop_report");
+    report.count += dropped as u64;
+    report.last_cause = Some(cause.to_string());
 }
 
 struct BatchScratch {
@@ -408,7 +436,7 @@ async fn send_batch_and_commit(
     commit_semaphore: Option<&Arc<tokio::sync::Semaphore>>,
     commit_tasks: &mut JoinSet<()>,
     scratch: &mut BatchScratch,
-    status: Option<&Arc<RwLock<EndpointStatus>>>,
+    drops: Option<&Arc<RwLock<DropReport>>>,
 ) -> anyhow::Result<()> {
     let batch_len = messages.len();
     scratch.fill_from(&messages);
@@ -496,7 +524,7 @@ async fn send_batch_and_commit(
             }
             if !has_dlq_middleware {
                 if let Some((_, first)) = failed.first() {
-                    record_dropped_messages(status, failed.len(), first);
+                    record_dropped_messages(drops, failed.len(), first);
                 }
             }
             let err_tx = err_tx.clone();
@@ -540,7 +568,7 @@ async fn send_batch_and_commit(
                         id, e
                     );
                 }
-                record_dropped_messages(status, batch_len, &e);
+                record_dropped_messages(drops, batch_len, &e);
                 Ok(())
             } else {
                 Err(e.into())
@@ -835,9 +863,12 @@ impl Route {
         let status_loop = Arc::clone(&status);
         // Terminal outcome cell, published by `OutcomeGuard` as the task exits.
         let outcome = Arc::new(RwLock::new(None::<RouteOutcome>));
+        // Tally of discarded messages, published alongside the terminal outcome.
+        let drops = Arc::new(RwLock::new(DropReport::default()));
         let mut outcome_guard = OutcomeGuard {
             outcome: Arc::clone(&outcome),
             status: Arc::clone(&status),
+            drops: Arc::clone(&drops),
             resolved: None,
         };
 
@@ -863,14 +894,14 @@ impl Route {
                 let (iter_ready_tx, iter_ready_rx) = bounded(1);
 
                 // The actual route logic is in `run_until_err`.
-                let status_run = Arc::clone(&status_loop);
+                let drops_run = Arc::clone(&drops);
                 let mut run_task = tokio::spawn(async move {
                     route_arc
                         .run_until_err_reporting_to(
                             &name_arc,
                             Some(internal_shutdown_rx),
                             Some(iter_ready_tx),
-                            Some(&status_run),
+                            Some(&drops_run),
                         )
                         .await
                 });
@@ -1064,7 +1095,7 @@ impl Route {
         name: &str,
         shutdown_rx: Option<async_channel::Receiver<()>>,
         ready_tx: Option<Sender<()>>,
-        status: Option<&Arc<RwLock<EndpointStatus>>>,
+        drops: Option<&Arc<RwLock<DropReport>>>,
     ) -> anyhow::Result<bool> {
         let (_internal_shutdown_tx, internal_shutdown_rx) = bounded(1);
         let shutdown_rx = shutdown_rx.unwrap_or(internal_shutdown_rx);
@@ -1079,10 +1110,10 @@ impl Route {
             return result;
         }
         if self.options.concurrency == 1 {
-            self.run_sequentially(name, shutdown_rx, ready_tx, status)
+            self.run_sequentially(name, shutdown_rx, ready_tx, drops)
                 .await
         } else {
-            self.run_concurrently(name, shutdown_rx, ready_tx, status)
+            self.run_concurrently(name, shutdown_rx, ready_tx, drops)
                 .await
         }
     }
@@ -1093,7 +1124,7 @@ impl Route {
         name: &str,
         shutdown_rx: async_channel::Receiver<()>,
         ready_tx: Option<Sender<()>>,
-        status: Option<&Arc<RwLock<EndpointStatus>>>,
+        drops: Option<&Arc<RwLock<DropReport>>>,
     ) -> anyhow::Result<bool> {
         let source_metadata_required = output_requires_source_metadata(name, &self.output)?;
         let publisher = create_publisher_from_route(name, &self.output).await?;
@@ -1190,7 +1221,7 @@ impl Route {
                         commit_semaphore.as_ref(),
                         &mut commit_tasks,
                         &mut batch_scratch,
-                        status,
+                        drops,
                     )
                     .await
                     {
@@ -1236,7 +1267,7 @@ impl Route {
         name: &str,
         shutdown_rx: async_channel::Receiver<()>,
         ready_tx: Option<Sender<()>>,
-        status: Option<&Arc<RwLock<EndpointStatus>>>,
+        drops: Option<&Arc<RwLock<DropReport>>>,
     ) -> anyhow::Result<bool> {
         let source_metadata_required = output_requires_source_metadata(name, &self.output)?;
         let publisher = create_publisher_from_route(name, &self.output).await?;
@@ -1288,7 +1319,7 @@ impl Route {
             let has_dlq_middleware = self.output.has_dlq_middleware();
             let batch_size = self.options.batch_size;
             // Owned per worker: the borrow cannot outlive this loop iteration.
-            let status = status.cloned();
+            let drops = drops.cloned();
             join_set.spawn(async move {
                 debug!("Starting worker {}", i);
                 let mut batch_scratch = BatchScratch::with_capacity(batch_size);
@@ -1305,7 +1336,7 @@ impl Route {
                         commit_semaphore.as_ref(),
                         &mut commit_tasks,
                         &mut batch_scratch,
-                        status.as_ref(),
+                        drops.as_ref(),
                     )
                     .await
                     {
