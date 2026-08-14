@@ -98,6 +98,12 @@ impl Endpoint {
             .iter()
             .any(|m| matches!(m, Middleware::Retry(_)))
     }
+
+    pub fn has_dlq_middleware(&self) -> bool {
+        self.middlewares
+            .iter()
+            .any(|m| matches!(m, Middleware::Dlq(_)))
+    }
     pub fn add_middleware(mut self, middleware: Middleware) -> Self {
         self.middlewares.push(middleware);
         self
@@ -388,11 +394,11 @@ fn check_consumer_recursive(
         EndpointType::MongoDb(cfg) => {
             use crate::models::MongoConsume;
             let mode = cfg.resolved_consume();
-            if mode == MongoConsume::Subscriber
-                && matches!(cfg.format, crate::models::MongoDbFormat::Raw)
-            {
+            if mode == MongoConsume::Snapshot && cfg.cursor_id.is_some() {
                 return Err(anyhow!(
-                    "[route:{}] MongoDB raw format cannot be used with subscriber mode because raw documents do not include the seq ordering field",
+                    "[route:{}] MongoDB 'snapshot' does not support 'cursor_id'. Resuming above a stored \
+                     `_id` skips anything a concurrent writer commits below it, which is silent data loss. \
+                     Use 'capture_all' on a replica set to read incrementally.",
                     route_name
                 ));
             }
@@ -403,7 +409,7 @@ fn check_consumer_recursive(
                 );
             } else if cfg.change_stream {
                 warnings.push(
-                    "Endpoint 'mongodb' option 'change_stream' is deprecated; use 'consume: subscriber'."
+                    "Endpoint 'mongodb' option 'change_stream' is deprecated; use 'consume: capture_new'."
                     .to_string(),
                 );
             }
@@ -1100,11 +1106,10 @@ async fn create_base_consumer(
                     // Durable queue drain (auto-uses a change stream when available, else polls).
                     Ok(boxed(mongodb::MongoDbConsumer::new(&config).await?))
                 }
-                MongoConsume::Subscriber => {
-                    if config.ttl_seconds.is_none() {
-                        config.ttl_seconds = Some(86400); // Remove events by default after 24 hours
-                    }
-                    Ok(boxed(mongodb::MongoDbSubscriber::new(&config).await?))
+                MongoConsume::Snapshot => {
+                    // One-shot, non-destructive read of what is already there. Ends on drain, so it
+                    // never becomes a tail — see the `_id` ordering note on `CaptureAll` below.
+                    Ok(boxed(mongodb::MongoDbIdReader::new(&config).await?))
                 }
                 MongoConsume::CaptureNew => {
                     // Watch an existing collection for changes from now on (needs a replica set;
@@ -1119,25 +1124,31 @@ async fn create_base_consumer(
                     ))
                 }
                 MongoConsume::CaptureAll => {
-                    // Read existing documents first, then capture changes. Prefer a change stream
-                    // (captures updates/deletes); on a standalone server change streams are
-                    // unavailable, so fall back to a non-destructive `_id` read (inserts only).
-                    match mongodb::MongoDbChangeStreamReader::new_with_source_metadata(
+                    // Read existing documents first, then capture changes via a change stream.
+                    // There is deliberately no standalone fallback: an `_id`-ordered read can only
+                    // return documents above its high-water mark, so anything a concurrent writer
+                    // commits below it is skipped for good. That loss is silent and unrecoverable,
+                    // so refuse to start instead and name the two sound alternatives.
+                    mongodb::MongoDbChangeStreamReader::new_with_source_metadata(
                         &config,
                         true,
                         _source_metadata,
                     )
                     .await
-                    {
-                        Ok(reader) => Ok(boxed(reader)),
-                        // Only fall back for the "change streams need a replica set" error (40573);
-                        // auth/network/config and other startup errors propagate untouched.
-                        Err(e) if mongodb::is_change_stream_unsupported(&e) => {
-                            tracing::warn!(error = %e, "MongoDB change streams unavailable (needs a replica set); 'capture_all' falling back to an insert-only read");
-                            Ok(boxed(mongodb::MongoDbIdReader::new(&config).await?))
+                    .map(boxed)
+                    .map_err(|e| {
+                        if mongodb::is_change_stream_unsupported(&e) {
+                            anyhow!(
+                                "[route:{}] MongoDB 'capture_all' needs a replica set (a single-node one is enough). \
+                                 On a standalone mongod use 'consume: snapshot' for a one-shot non-destructive read, \
+                                 or 'consume: consumer' for a destructive work queue: {}",
+                                route_name,
+                                e
+                            )
+                        } else {
+                            e
                         }
-                        Err(e) => Err(e),
-                    }
+                    })
                 }
             }
         }

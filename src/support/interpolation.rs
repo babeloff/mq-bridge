@@ -207,9 +207,33 @@ impl CompiledTemplate {
         self.segments.iter().any(|s| matches!(s, Segment::Token(_)))
     }
 
+    /// Whether every token is derived from data that remains stable across message replays.
+    pub fn has_only_replay_stable_tokens(&self) -> bool {
+        self.segments.iter().all(|segment| match segment {
+            Segment::Literal(_) => true,
+            Segment::Token(token) => {
+                matches!(token.source, Source::Payload(_) | Source::Metadata(_))
+            }
+        })
+    }
+
     /// Render the template against an optional message. On the source side (no
     /// input message) `payload`/`metadata`/`message` tokens resolve to empty.
     pub fn render(&self, msg: Option<&CanonicalMessage>) -> Vec<u8> {
+        self.render_inner(msg, false).unwrap_or_default()
+    }
+
+    /// Render, but `None` as soon as a token has no value for this message.
+    ///
+    /// Use this when the result is a key or an identity rather than a body. [`Self::render`]
+    /// substitutes an empty string for a missing selector, so `"${payload:a}-${payload:b}"`
+    /// still yields `"x-"` when `b` is absent — a non-empty value that every such message
+    /// shares. Only a whole-template check catches that.
+    pub fn render_resolved(&self, msg: Option<&CanonicalMessage>) -> Option<Vec<u8>> {
+        self.render_inner(msg, true)
+    }
+
+    fn render_inner(&self, msg: Option<&CanonicalMessage>, strict: bool) -> Option<Vec<u8>> {
         let payload = self.parse_payload(msg);
 
         let mut out = Vec::with_capacity(self.literal_len + 16);
@@ -217,7 +241,11 @@ impl CompiledTemplate {
             match seg {
                 Segment::Literal(b) => out.extend_from_slice(b),
                 Segment::Token(tok) => {
-                    let value = self.resolve(tok, msg, &payload);
+                    let value = match self.resolve(tok, msg, &payload) {
+                        Some(value) => value,
+                        None if strict => return None,
+                        None => String::new(),
+                    };
                     if tok.raw || self.escape == EscapeMode::None {
                         out.extend_from_slice(value.as_bytes());
                     } else {
@@ -226,7 +254,7 @@ impl CompiledTemplate {
                 }
             }
         }
-        out
+        Some(out)
     }
 
     /// Parse as little of the payload as the template actually asks for.
@@ -246,21 +274,24 @@ impl CompiledTemplate {
         }
     }
 
-    fn resolve(&self, tok: &Token, msg: Option<&CanonicalMessage>, payload: &Payload) -> String {
+    /// `None` when the token has nothing to resolve against — an absent payload path or
+    /// metadata key, or no message at all. A token that resolves to a genuinely empty value
+    /// is `Some("")`.
+    fn resolve(
+        &self,
+        tok: &Token,
+        msg: Option<&CanonicalMessage>,
+        payload: &Payload,
+    ) -> Option<String> {
         match &tok.source {
             Source::Payload(path) => match payload {
-                Payload::Field(value) => value.as_ref().map(value_to_string).unwrap_or_default(),
-                Payload::Doc(doc) => walk(doc, path).map(value_to_string).unwrap_or_default(),
-                Payload::None => String::new(),
+                Payload::Field(value) => value.as_ref().map(value_to_string),
+                Payload::Doc(doc) => walk(doc, path).map(value_to_string),
+                Payload::None => None,
             },
-            Source::Metadata(key) => msg
-                .and_then(|m| m.metadata.get(key))
-                .cloned()
-                .unwrap_or_default(),
-            Source::MessageId => msg
-                .map(|m| format_message_id(m.message_id))
-                .unwrap_or_default(),
-            Source::Gen(gen) => match gen {
+            Source::Metadata(key) => msg.and_then(|m| m.metadata.get(key)).cloned(),
+            Source::MessageId => msg.map(|m| format_message_id(m.message_id)),
+            Source::Gen(gen) => Some(match gen {
                 Gen::Uuid => format_message_id(fast_uuid_v7::gen_id()),
                 Gen::Now => rfc3339_utc_now(),
                 Gen::Timestamp => unix_millis().to_string(),
@@ -269,7 +300,7 @@ impl CompiledTemplate {
                     let span = (*max as i128 - *min as i128 + 1) as u128;
                     (*min as i128 + (rand::random::<u64>() as u128 % span) as i128).to_string()
                 }
-            },
+            }),
         }
     }
 }
@@ -680,6 +711,34 @@ mod tests {
         let tpl = CompiledTemplate::compile("plain body", None).unwrap();
         assert!(!tpl.is_dynamic());
         assert_eq!(String::from_utf8(tpl.render(None)).unwrap(), "plain body");
+    }
+
+    /// `render` cannot distinguish "field absent" from "field empty" — both come out as an
+    /// empty substitution — so key/identity callers need `render_resolved` instead.
+    #[test]
+    fn render_resolved_rejects_any_unresolved_token() {
+        let msg = msg_with(r#"{"tenant":"acme","blank":""}"#, &[]);
+
+        let resolved = |body: &str| {
+            CompiledTemplate::compile(body, None)
+                .unwrap()
+                .render_resolved(Some(&msg))
+                .map(|out| String::from_utf8(out).unwrap())
+        };
+
+        assert_eq!(resolved("${payload:tenant}"), Some("acme".to_string()));
+        // A present-but-empty value is resolved; it is the caller's business whether to use it.
+        assert_eq!(resolved("${payload:blank}"), Some(String::new()));
+        assert_eq!(resolved("${payload:missing}"), None);
+        // The cases a plain emptiness check misses, because the render is non-empty.
+        assert_eq!(resolved("${payload:tenant}-${payload:missing}"), None);
+        assert_eq!(resolved("order-${payload:missing}"), None);
+        assert_eq!(resolved("${metadata:absent}"), None);
+        // `render` keeps substituting empty, so existing bodies are unaffected.
+        assert_eq!(
+            render_str("order-${payload:missing}", None, Some(&msg)),
+            "order-"
+        );
     }
 
     #[test]

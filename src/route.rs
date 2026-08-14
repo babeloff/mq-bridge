@@ -383,6 +383,7 @@ async fn send_batch_and_commit(
     messages: Vec<crate::CanonicalMessage>,
     commit: BatchCommitFunc,
     has_retry_middleware: bool,
+    has_dlq_middleware: bool,
     err_tx: &Sender<anyhow::Error>,
     commit_semaphore: Option<&Arc<tokio::sync::Semaphore>>,
     commit_tasks: &mut JoinSet<()>,
@@ -451,6 +452,7 @@ async fn send_batch_and_commit(
                     responses,
                     &failed,
                     &scratch.request_ids,
+                    has_dlq_middleware,
                 );
                 if let Err(commit_err) = commit(dispositions).await {
                     warn!("Commit after transient failure also failed: {}", commit_err);
@@ -477,6 +479,7 @@ async fn send_batch_and_commit(
                 responses,
                 &failed,
                 &scratch.request_ids,
+                has_dlq_middleware,
             );
             let permit = acquire_commit_permit(commit_semaphore).await;
             // Reap finished commits so completed results don't accumulate until shutdown.
@@ -491,16 +494,54 @@ async fn send_batch_and_commit(
             Ok(())
         }
         Err(e) => {
-            warn!("Publisher error, sending {} Nacks to commit", batch_len);
-            let nack_result = commit(vec![MessageDisposition::Nack; batch_len]).await;
-            debug!("Nack commit result: {:?}", nack_result);
-            Err(e.into())
+            let non_retryable = matches!(e, PublisherError::NonRetryable(_));
+            let disposition = if non_retryable && !has_dlq_middleware {
+                MessageDisposition::Ack
+            } else {
+                MessageDisposition::Nack
+            };
+            let commit_result = commit(vec![disposition; batch_len]).await;
+            debug!("Failure commit result: {:?}", commit_result);
+            if non_retryable && !has_dlq_middleware {
+                commit_result?;
+                Ok(())
+            } else {
+                Err(e.into())
+            }
         }
     }
 }
 
 impl Route {
-    /// Creates a new route with default concurrency (1) and batch size (1).
+    /// Returns the sink mechanism that makes replayed writes idempotent, when it can be
+    /// established from configuration alone. This is informational: the route remains
+    /// at-least-once internally, while the observable sink result is effectively-once.
+    fn inferred_idempotency_mechanism(&self) -> Option<&'static str> {
+        if self.output.handler.is_some() {
+            return None;
+        }
+        match &self.output.endpoint_type {
+            EndpointType::MongoDb(config) if config.id_field.is_some() => {
+                Some("MongoDB unique _id")
+            }
+            EndpointType::Sqlx(config) => {
+                let query = config.insert_query.as_deref()?.to_ascii_uppercase();
+                query
+                    .split_once("ON CONFLICT")
+                    .is_some_and(|(_, conflict_action)| conflict_action.contains("DO NOTHING"))
+                    .then_some("SQL unique-key conflict handling")
+            }
+            EndpointType::File(config) if config.idempotency => {
+                Some("deterministic file source ranges")
+            }
+            EndpointType::ObjectStore(config) if config.idempotency => {
+                Some("deterministic object source ranges")
+            }
+            _ => None,
+        }
+    }
+
+    /// Creates a new route with default concurrency (1) and batch size (512).
     ///
     /// # Arguments
     /// * `input` - The input/source endpoint for the route
@@ -721,6 +762,20 @@ impl Route {
         let warnings = self.check(name_str, None)?;
         for warning in warnings {
             tracing::warn!(route = name_str, "Configuration warning: {}", warning);
+        }
+        if let Some(mechanism) = self.inferred_idempotency_mechanism() {
+            tracing::info!(
+                route = name_str,
+                delivery = "effectively-once",
+                mechanism,
+                "Inferred delivery guarantee from idempotent sink configuration"
+            );
+        } else {
+            tracing::info!(
+                route = name_str,
+                delivery = "at-least-once",
+                "Inferred delivery guarantee"
+            );
         }
         let startup_timeout = std::time::Duration::from_millis(self.options.startup_timeout_ms);
         let reconnect_interval =
@@ -1015,6 +1070,7 @@ impl Route {
         let mut batch_scratch = BatchScratch::with_capacity(self.options.batch_size);
         // Check if retry middleware is present on output
         let has_retry_middleware = self.output.has_retry_middleware();
+        let has_dlq_middleware = self.output.has_dlq_middleware();
         // Messages processed since the last cooperative yield (see YIELD_EVERY_MSGS).
         let mut since_yield = 0usize;
         let run_result = loop {
@@ -1068,6 +1124,7 @@ impl Route {
                         received_batch.messages,
                         commit,
                         has_retry_middleware,
+                        has_dlq_middleware,
                         &err_tx,
                         commit_semaphore.as_ref(),
                         &mut commit_tasks,
@@ -1165,6 +1222,7 @@ impl Route {
             let commit_semaphore = commit_semaphore.clone();
             let mut commit_tasks = JoinSet::new();
             let has_retry_middleware = self.output.has_retry_middleware();
+            let has_dlq_middleware = self.output.has_dlq_middleware();
             let batch_size = self.options.batch_size;
             join_set.spawn(async move {
                 debug!("Starting worker {}", i);
@@ -1177,6 +1235,7 @@ impl Route {
                         messages,
                         commit_func,
                         has_retry_middleware,
+                        has_dlq_middleware,
                         &err_tx,
                         commit_semaphore.as_ref(),
                         &mut commit_tasks,
@@ -1627,6 +1686,7 @@ fn map_responses_to_dispositions(
     responses: Option<Vec<crate::CanonicalMessage>>,
     failed: &[(crate::CanonicalMessage, PublisherError)],
     request_ids: &std::collections::HashSet<u128>,
+    has_dlq_middleware: bool,
 ) -> Vec<MessageDisposition> {
     let len = message_ids.len();
     if responses.is_none() && failed.is_empty() && (len == 0 || request_ids.is_empty()) {
@@ -1636,8 +1696,14 @@ fn map_responses_to_dispositions(
     // Fast path for single message batches (very common for high-concurrency low-batch setups)
     if len == 1 {
         let id = message_ids[0];
-        if !failed.is_empty() {
-            return vec![MessageDisposition::Nack];
+        if let Some((_, error)) = failed.first() {
+            return vec![
+                if matches!(error, PublisherError::NonRetryable(_)) && !has_dlq_middleware {
+                    MessageDisposition::Ack
+                } else {
+                    MessageDisposition::Nack
+                },
+            ];
         }
         if let Some(mut resps) = responses {
             if let Some(resp) = resps.pop() {
@@ -1653,9 +1719,9 @@ fn map_responses_to_dispositions(
 
     let mut dispositions = Vec::with_capacity(len);
     // Build failed_ids manually to avoid collect() overhead
-    let mut failed_ids = std::collections::HashSet::with_capacity(failed.len());
-    for (m, _) in failed {
-        failed_ids.insert(m.message_id);
+    let mut failed_ids = std::collections::HashMap::with_capacity(failed.len());
+    for (message, error) in failed {
+        failed_ids.insert(message.message_id, error);
     }
 
     // Create a map from message_id to response message for efficient lookup.
@@ -1666,8 +1732,14 @@ fn map_responses_to_dispositions(
         .collect();
 
     for id in message_ids {
-        if failed_ids.contains(id) {
-            dispositions.push(MessageDisposition::Nack);
+        if let Some(error) = failed_ids.get(id) {
+            dispositions.push(
+                if matches!(error, PublisherError::NonRetryable(_)) && !has_dlq_middleware {
+                    MessageDisposition::Ack
+                } else {
+                    MessageDisposition::Nack
+                },
+            );
         } else if let Some(resp) = response_map.remove(id) {
             // If a response exists for this specific ID, use it.
             dispositions.push(MessageDisposition::Reply(resp));
@@ -1705,13 +1777,23 @@ fn test_map_responses_to_dispositions_logic() {
 
     let mut request_ids = std::collections::HashSet::new();
     request_ids.insert(3); // id 3 expects a reply but won't get one
-    let dispositions = map_responses_to_dispositions(&ids, responses, &failed, &request_ids);
+    let dispositions = map_responses_to_dispositions(&ids, responses, &failed, &request_ids, false);
 
     assert_eq!(dispositions.len(), 4);
     assert!(matches!(dispositions[0], MessageDisposition::Reply(_))); // from responses
-    assert!(matches!(dispositions[1], MessageDisposition::Nack)); // from failed
+    assert!(matches!(dispositions[1], MessageDisposition::Ack)); // permanent failure dropped
     assert!(matches!(dispositions[2], MessageDisposition::Nack)); // missing reply
     assert!(matches!(dispositions[3], MessageDisposition::Reply(_))); // from responses
+
+    let mut dlq_msg = CanonicalMessage::from("msg2");
+    dlq_msg.message_id = 2;
+    let dlq_failed = vec![(
+        dlq_msg,
+        PublisherError::NonRetryable(anyhow!("DLQ send failed")),
+    )];
+    let dlq_dispositions =
+        map_responses_to_dispositions(&ids, None, &dlq_failed, &request_ids, true);
+    assert!(matches!(dlq_dispositions[1], MessageDisposition::Nack));
 }
 
 pub fn get_route(name: &str) -> Option<Route> {
@@ -1752,7 +1834,8 @@ pub async fn stop_route(name: &str) -> bool {
 mod tests {
     use super::*;
     use crate::models::{
-        Endpoint, EndpointType, FaultMode, Middleware, RandomPanicMiddleware, RouteOptions,
+        Endpoint, EndpointType, FaultMode, Middleware, MongoDbConfig, RandomPanicMiddleware,
+        RouteOptions, SqlxConfig,
     };
     use crate::traits::{
         CustomMiddlewareFactory, MessageConsumer, MessagePublisher, ReceivedBatch,
@@ -1762,6 +1845,55 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
+
+    #[test]
+    fn infers_idempotent_sink_mechanisms() {
+        let mongo = Route::new(
+            Endpoint::new_memory("delivery_in", 1),
+            Endpoint::new(EndpointType::MongoDb(MongoDbConfig {
+                id_field: Some("${metadata:mqb.id}".to_string()),
+                ..Default::default()
+            })),
+        );
+        assert_eq!(
+            mongo.inferred_idempotency_mechanism(),
+            Some("MongoDB unique _id")
+        );
+
+        let sql = Route::new(
+            Endpoint::new_memory("delivery_in", 1),
+            Endpoint::new(EndpointType::Sqlx(SqlxConfig {
+                insert_query: Some(
+                    "INSERT INTO orders (id) VALUES (?) ON CONFLICT (id) DO NOTHING".to_string(),
+                ),
+                ..Default::default()
+            })),
+        );
+        assert_eq!(
+            sql.inferred_idempotency_mechanism(),
+            Some("SQL unique-key conflict handling")
+        );
+
+        for query in [
+            "INSERT INTO orders (id) VALUES (?) ON CONFLICT (id) DO UPDATE SET id = excluded.id",
+            "INSERT INTO orders (id) VALUES (?) ON DUPLICATE KEY UPDATE id = VALUES(id)",
+        ] {
+            let updating_sql = Route::new(
+                Endpoint::new_memory("delivery_in", 1),
+                Endpoint::new(EndpointType::Sqlx(SqlxConfig {
+                    insert_query: Some(query.to_string()),
+                    ..Default::default()
+                })),
+            );
+            assert_eq!(updating_sql.inferred_idempotency_mechanism(), None);
+        }
+
+        let ordinary = Route::new(
+            Endpoint::new_memory("delivery_in", 1),
+            Endpoint::new_memory("delivery_out", 1),
+        );
+        assert_eq!(ordinary.inferred_idempotency_mechanism(), None);
+    }
 
     #[test]
     fn test_route_check_rejects_zero_execution_options() {
@@ -1941,11 +2073,13 @@ mod tests {
                 observation: Arc::clone(&observation),
                 requires_order: true,
             }),
-        );
+        )
+        .unwrap();
         register_middleware_factory(
             &reorder_name,
             Arc::new(ReorderingPublisherMiddlewareFactory),
-        );
+        )
+        .unwrap();
 
         let input = Endpoint::new_memory(&in_topic, 32).add_middleware(Middleware::Custom {
             name: tracking_name,
@@ -2016,7 +2150,8 @@ mod tests {
                 observation: Arc::clone(&observation),
                 requires_order: false,
             }),
-        );
+        )
+        .unwrap();
 
         let input = Endpoint::new_memory(&in_topic, 64).add_middleware(Middleware::Custom {
             name: tracking_name,
@@ -2336,7 +2471,8 @@ mod tests {
             Arc::new(FailingMiddlewareFactory {
                 fail_flag: fail_flag.clone(),
             }),
-        );
+        )
+        .unwrap();
 
         let input = Endpoint::new_memory(&in_topic, 100);
         let output = Endpoint::new_memory(&out_topic, 100).add_middleware(Middleware::Custom {
@@ -2675,7 +2811,7 @@ mod tests {
             }) as Box<dyn MessagePublisher>)
         }));
 
-        register_endpoint_factory(&factory_name, Arc::new(factory));
+        register_endpoint_factory(&factory_name, Arc::new(factory)).unwrap();
 
         let input = Endpoint {
             endpoint_type: EndpointType::Custom {
@@ -2775,7 +2911,7 @@ mod tests {
             create_consumer_fail: true,
             ..MockEndpointFactory::new()
         });
-        register_endpoint_factory(&factory_name, factory);
+        register_endpoint_factory(&factory_name, factory).unwrap();
 
         let input = Endpoint {
             endpoint_type: EndpointType::Custom {
@@ -2848,7 +2984,7 @@ mod tests {
 
         let mut factory = MockEndpointFactory::new();
         factory.consumer_behavior = Arc::new(Mutex::new(consumer_logic));
-        register_endpoint_factory(&factory_name, Arc::new(factory));
+        register_endpoint_factory(&factory_name, Arc::new(factory)).unwrap();
 
         let input = Endpoint {
             endpoint_type: EndpointType::Custom {
@@ -2916,7 +3052,7 @@ mod tests {
 
         let mut factory = MockEndpointFactory::new();
         factory.consumer_behavior = Arc::new(Mutex::new(consumer_logic));
-        register_endpoint_factory(&factory_name, Arc::new(factory));
+        register_endpoint_factory(&factory_name, Arc::new(factory)).unwrap();
 
         let input = Endpoint {
             endpoint_type: EndpointType::Custom {
@@ -2989,7 +3125,7 @@ mod tests {
             }
             Ok(Box::new(CountingFailPublisher(sends_pub.clone())) as Box<dyn MessagePublisher>)
         }));
-        register_endpoint_factory(&factory_name, Arc::new(factory));
+        register_endpoint_factory(&factory_name, Arc::new(factory)).unwrap();
 
         let handler_calls = Arc::new(AtomicUsize::new(0));
         let handler_calls_inner = handler_calls.clone();
@@ -3077,7 +3213,7 @@ mod tests {
             }
             Ok(Box::new(DeadPublisher) as Box<dyn MessagePublisher>)
         }));
-        register_endpoint_factory(&factory_name, Arc::new(factory));
+        register_endpoint_factory(&factory_name, Arc::new(factory)).unwrap();
 
         // A file source, like the reported repro: it re-reads the same records after a
         // reconnect, so the failing batch comes back around every pass. That is what
@@ -3155,7 +3291,7 @@ mod tests {
             }
             Ok(Box::new(DeadLeg) as Box<dyn MessagePublisher>)
         }));
-        register_endpoint_factory(&factory_name, Arc::new(factory));
+        register_endpoint_factory(&factory_name, Arc::new(factory)).unwrap();
 
         let dir = tempfile::tempdir().unwrap();
         let in_path = dir.path().join("in5.jsonl");
@@ -3235,7 +3371,7 @@ mod tests {
             }
             Ok(Box::new(AlwaysFails) as Box<dyn MessagePublisher>)
         }));
-        register_endpoint_factory(&factory_name, Arc::new(factory));
+        register_endpoint_factory(&factory_name, Arc::new(factory)).unwrap();
 
         let dir = tempfile::tempdir().unwrap();
         let in_path = dir.path().join("fan_in.jsonl");
@@ -3391,7 +3527,7 @@ mod tests {
                 }
                 Ok(Box::new(Disconnected) as Box<dyn MessagePublisher>)
             }));
-            register_endpoint_factory(&factory_name, Arc::new(factory));
+            register_endpoint_factory(&factory_name, Arc::new(factory)).unwrap();
 
             let dir = tempfile::tempdir().unwrap();
             let in_path = dir.path().join("in.jsonl");
@@ -3570,7 +3706,7 @@ mod tests {
                 Ok(Box::new(NoOpPublisher) as Box<dyn MessagePublisher>)
             }
         }));
-        register_endpoint_factory(&factory_name, Arc::new(factory));
+        register_endpoint_factory(&factory_name, Arc::new(factory)).unwrap();
 
         let in_topic = format!("recovering_in_{}", unique_id);
         let input = Endpoint::new_memory(&in_topic, 10);

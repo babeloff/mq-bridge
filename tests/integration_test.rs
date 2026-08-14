@@ -86,13 +86,6 @@ async fn test_all_subscriber_logic() {
             integration::kafka::test_kafka_subscriber_logic().await;
         }
     }
-    #[cfg(feature = "mongodb")]
-    {
-        if should_run("mongodb") {
-            println!("\n\n>>> Starting MongoDB Subscriber Logic Test...");
-            integration::mongodb::test_mongodb_subscriber_logic().await;
-        }
-    }
     #[cfg(feature = "mqtt")]
     {
         if should_run("mqtt") {
@@ -492,6 +485,26 @@ async fn test_mongodb_cdc_latency() {
 async fn test_mongodb_cdc_survives_idle_resume_refresh() {
     if should_run("mongodb_cdc") || should_run("mongodb") {
         integration::mongodb::test_mongodb_cdc_survives_idle_resume_refresh().await;
+    }
+}
+
+/// Regression: capture_all must surface an empty batch after its snapshot stays quiet in drain mode.
+#[cfg(feature = "mongodb")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires docker compose (mongodb replica set)"]
+async fn test_mongodb_capture_all_exits_on_empty() {
+    if should_run("mongodb_cdc") || should_run("mongodb") {
+        integration::mongodb::test_mongodb_capture_all_exits_on_empty().await;
+    }
+}
+
+/// Standalone MongoDB supports snapshot, but change-stream modes require a replica set.
+#[cfg(feature = "mongodb")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires docker compose (standalone mongodb)"]
+async fn test_mongodb_standalone_mode_boundaries() {
+    if should_run("mongodb") {
+        integration::mongodb::test_mongodb_standalone_mode_boundaries().await;
     }
 }
 

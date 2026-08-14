@@ -4,7 +4,7 @@ use std::sync::Arc;
 use mq_bridge::test_utils::PERF_TEST_MESSAGE_COUNT;
 
 use mq_bridge::endpoints::mongodb::{
-    MongoDbChangeStreamReader, MongoDbConsumer, MongoDbPublisher, MongoDbSubscriber,
+    MongoDbChangeStreamReader, MongoDbConsumer, MongoDbIdReader, MongoDbPublisher,
 };
 use mq_bridge::test_utils::{
     add_performance_result, run_chaos_pipeline_test, run_direct_perf_test,
@@ -13,6 +13,9 @@ use mq_bridge::test_utils::{
     run_test_with_docker_controller, setup_logging, should_run, verify_subscriber_logic,
     PerformanceResult,
 };
+// Queue pipeline: `consume: consumer` is explicit because the default (`capture_all`) needs a
+// replica set and otherwise degrades to an `_id`-ordered reader, which cannot tail a collection
+// written by 4 concurrent workers — a batch landing out of `_id` order is skipped for good.
 const CONFIG_YAML: &str = r#"
 routes:
   memory_to_mongodb:
@@ -32,10 +35,111 @@ routes:
     concurrency: 4
     batch_size: 1024
     input:
-      mongodb: { url: "mongodb://localhost:27017", database: "mq_bridge_test", collection: "test_collection" }
+      mongodb: { url: "mongodb://localhost:27017", database: "mq_bridge_test", collection: "test_collection", consume: consumer }
     output:
       memory: { topic: "test-out-mongodb", capacity: {out_capacity} }
 "#;
+
+/// `consume: snapshot` on a standalone mongod: seed the collection, then read it non-destructively
+/// in one pass. Asserts the two properties that define the mode — every seeded document arrives,
+/// and the route ends itself on drain instead of polling on as a (lossy) tail.
+#[tokio::test]
+#[ignore = "requires docker compose"]
+async fn test_mongodb_snapshot_reads_all_and_ends() {
+    if !should_run("mongodb") {
+        return;
+    }
+    use mq_bridge::models::{Endpoint, EndpointType, MongoConsume, MongoDbConfig, Route};
+    use mq_bridge::traits::MessagePublisher;
+
+    setup_logging();
+    run_test_with_docker("tests/integration/docker-compose/mongodb.yml", || async {
+        let collection = format!("snapshot_{}", fast_uuid_v7::gen_id());
+        let config = MongoDbConfig {
+            url: "mongodb://localhost:27017".to_string(),
+            database: "mq_bridge_test".to_string(),
+            collection: Some(collection.clone()),
+            consume: Some(MongoConsume::Snapshot),
+            ..Default::default()
+        };
+
+        let publisher = MongoDbPublisher::new(&config).await.unwrap();
+        let seeded = 250usize;
+        for i in 0..seeded {
+            publisher
+                .send(format!("snapshot-{}", i).as_str().into())
+                .await
+                .unwrap();
+        }
+
+        let route_name = format!("snapshot_route_{}", fast_uuid_v7::gen_id());
+        let out = Endpoint::new_memory(&route_name, seeded + 100);
+        let out_channel = out.channel().unwrap();
+        let route = Route::new(Endpoint::new(EndpointType::MongoDb(config)), out);
+        route.deploy(&route_name).await.unwrap();
+
+        // Track the seeded payloads rather than a message count: the snapshot also emits the
+        // publisher's internal `<collection>:sequencer` document, so counting would both overshoot
+        // and race (250 messages can be 249 real ones plus the sequencer).
+        let mut seen = std::collections::HashSet::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while seen.len() < seeded && std::time::Instant::now() < deadline {
+            for msg in out_channel.drain_messages() {
+                seen.insert(msg.get_payload_str().to_string());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let missing: Vec<usize> = (0..seeded)
+            .filter(|i| !seen.contains(&format!("snapshot-{}", i)))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "snapshot dropped {} of {} documents: {:?}",
+            missing.len(),
+            seeded,
+            missing
+        );
+
+        // Drained -> EndOfStream -> the route ends itself. It stays in the registry (only `stop()`
+        // removes it), so the terminal outcome is what proves it finished rather than tailed on.
+        let ended = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while mq_bridge::route_outcome(&route_name).is_none() && std::time::Instant::now() < ended {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert_eq!(
+            mq_bridge::route_outcome(&route_name),
+            Some(mq_bridge::RouteOutcome::Completed),
+            "snapshot route must complete on drain instead of tailing"
+        );
+        mq_bridge::stop_route(&route_name).await;
+    })
+    .await;
+}
+
+pub async fn test_mongodb_standalone_mode_boundaries() {
+    setup_logging();
+    run_test_with_docker("tests/integration/docker-compose/mongodb.yml", || async {
+        let base = mq_bridge::models::MongoDbConfig {
+            url: "mongodb://localhost:27017".to_string(),
+            database: "mq_bridge_test".to_string(),
+            collection: Some(format!("mode_boundaries_{}", fast_uuid_v7::gen_id())),
+            ..Default::default()
+        };
+
+        MongoDbIdReader::new(&base)
+            .await
+            .expect("snapshot must work on standalone MongoDB");
+        assert!(
+            MongoDbChangeStreamReader::new(&base, false).await.is_err(),
+            "capture_new must reject standalone MongoDB"
+        );
+        assert!(
+            MongoDbChangeStreamReader::new(&base, true).await.is_err(),
+            "capture_all must reject standalone MongoDB"
+        );
+    })
+    .await;
+}
 
 pub async fn test_mongodb_pipeline() {
     setup_logging();
@@ -64,34 +168,12 @@ pub async fn test_mongodb_chaos() {
     .await;
 }
 
-pub async fn test_mongodb_subscriber_logic() {
-    setup_logging();
-    run_test_with_docker("tests/integration/docker-compose/mongodb.yml", || async {
-        let collection = format!("sub_logic_{}", fast_uuid_v7::gen_id());
-        let config = mq_bridge::models::MongoDbConfig {
-            url: "mongodb://localhost:27017".to_string(),
-            database: "mq_bridge_test".to_string(),
-            collection: Some(collection),
-            change_stream: true,
-            ..Default::default()
-        };
-
-        let publisher = Arc::new(MongoDbPublisher::new(&config).await.unwrap());
-        let sub1 = Arc::new(tokio::sync::Mutex::new(
-            MongoDbSubscriber::new(&config).await.unwrap(),
-        ));
-        let sub2 = Arc::new(tokio::sync::Mutex::new(
-            MongoDbSubscriber::new(&config).await.unwrap(),
-        ));
-
-        verify_subscriber_logic(publisher, sub1, sub2).await;
-    })
-    .await;
-}
-
+// Queue mode (`consume: consumer`) is the standalone-safe reader that still round-trips the
+// wrapped envelope, so the handler sees the `kind` metadata. It replaces the removed subscriber
+// mode this test used to exercise.
 #[tokio::test]
 #[ignore = "requires docker compose"]
-async fn test_mongodb_subscriber_no_duplicates() {
+async fn test_mongodb_consumer_no_duplicates() {
     if !should_run("mongodb") {
         return;
     }
@@ -129,7 +211,7 @@ async fn test_mongodb_subscriber_no_duplicates() {
                 url: url.to_string(),
                 database: db_name.to_string(),
                 collection: Some(collection_name.to_string()),
-                change_stream: true, // Subscriber mode
+                consume: Some(mq_bridge::models::MongoConsume::Consumer),
                 polling_interval_ms: Some(10),
                 format: mq_bridge::models::MongoDbFormat::Json,
                 ..Default::default()
@@ -324,6 +406,79 @@ async fn drain_cdc(reader: &mut MongoDbChangeStreamReader, want: usize) -> usize
         got += n;
     }
     got
+}
+
+pub async fn test_mongodb_capture_all_exits_on_empty() {
+    setup_logging();
+    run_test_with_docker(
+        "tests/integration/docker-compose/mongodb-replica.yml",
+        || async {
+            use mq_bridge::traits::{MessageConsumer, MessageDisposition};
+
+            let collection = format!("capture_all_drain_{}", fast_uuid_v7::gen_id());
+            let client = mongodb::Client::with_uri_str(CDC_URL).await.unwrap();
+            let coll = client
+                .database(CDC_DB)
+                .collection::<mongodb::bson::Document>(&collection);
+            coll.insert_many([
+                mongodb::bson::doc! { "id": 1 },
+                mongodb::bson::doc! { "id": 2 },
+            ])
+            .await
+            .expect("seed collection");
+
+            let mut reader = MongoDbChangeStreamReader::new(&cdc_reader_cfg(&collection), true)
+                .await
+                .expect("create capture_all reader");
+            reader.set_exit_on_empty(true);
+
+            // Advance the snapshot high-water mark by one page, then insert while snapshot paging
+            // is still active. The document may also be visible to a later snapshot query, but the
+            // change-stream phase must deliver its insert event; duplicates are valid at-least-once.
+            let snapshot = reader.receive_batch(1).await.expect("read snapshot page");
+            assert_eq!(snapshot.messages.len(), 1);
+            (snapshot.commit)(vec![MessageDisposition::Ack])
+                .await
+                .expect("commit snapshot");
+            coll.insert_one(mongodb::bson::doc! { "id": 3, "written": "during-snapshot" })
+                .await
+                .expect("insert during snapshot");
+
+            let mut saw_stream_insert = false;
+            loop {
+                let batch = tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    reader.receive_batch(1),
+                )
+                .await
+                .expect("capture_all drain did not finish after its idle timeout")
+                .expect("receive capture_all batch");
+                if batch.messages.is_empty() {
+                    break;
+                }
+                saw_stream_insert |= batch.messages.iter().any(|message| {
+                    message
+                        .metadata
+                        .get("mongodb.operation")
+                        .map(String::as_str)
+                        == Some("insert")
+                        && serde_json::from_slice::<serde_json::Value>(&message.payload)
+                            .ok()
+                            .and_then(|body| body.get("id").and_then(|id| id.as_i64()))
+                            == Some(3)
+                });
+                let count = batch.messages.len();
+                (batch.commit)(vec![MessageDisposition::Ack; count])
+                    .await
+                    .expect("commit capture_all batch");
+            }
+            assert!(
+                saw_stream_insert,
+                "change-stream phase must deliver an insert committed during snapshot paging"
+            );
+        },
+    )
+    .await;
 }
 
 pub async fn test_mongodb_cdc_read_throughput() {

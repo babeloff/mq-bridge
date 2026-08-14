@@ -5,15 +5,21 @@
 
 use super::*;
 
-/// A non-destructive, resumable reader over an **arbitrary** MongoDB collection. Pages by
-/// `_id` (`find({_id:{$gt:last}}).sort({_id:1})`), never mutates the source, and persists
-/// the last successfully-sunk `_id` (keyed by `cursor_id`) to a pluggable checkpoint store
-/// (a separate `mqb_cursors` collection by default, or a local file). At-least-once.
+/// A non-destructive, **one-shot** reader over an arbitrary MongoDB collection (`consume: snapshot`).
+/// Pages by `_id` (`find({_id:{$gt:last}}).sort({_id:1})`), never mutates the source, and ends the
+/// route once the collection is drained. At-least-once.
+///
+/// It deliberately does not resume across runs and does not provide a point-in-time snapshot.
+/// Each `_id` page is a separate query, so concurrent inserts above the current high-water mark may
+/// be included, inserts below it may be missed, and deletes may disappear before a later page reads
+/// them. Carrying the cursor across runs would turn that visibility boundary into silent data loss,
+/// which is why `cursor_id` is rejected at startup. Incremental reads need commit order, i.e. a
+/// change stream (`capture_all`) on a replica set. The checkpoint plumbing below is kept for that
+/// future, not reachable today.
 pub struct MongoDbIdReader {
     collection: Collection<Document>,
     db: Database,
     checkpoint: Option<Arc<dyn crate::checkpoint::CheckpointStore>>,
-    cursor_id: Option<String>,
     last_id: Arc<Mutex<Option<Bson>>>,
     receive_query: Option<Document>,
 }
@@ -35,6 +41,15 @@ impl MongoDbIdReader {
         } else {
             None
         };
+
+        if config.cursor_id.is_some() {
+            return Err(anyhow!(
+                "MongoDB 'snapshot' does not support 'cursor_id' (collection '{}'). Resuming above a \
+                 stored `_id` skips anything a concurrent writer commits below it, which is silent \
+                 data loss. Use 'capture_all' on a replica set to read incrementally.",
+                collection_name
+            ));
+        }
 
         let checkpoint: Option<Arc<dyn crate::checkpoint::CheckpointStore>> = if let Some(cid) =
             &config.cursor_id
@@ -58,10 +73,6 @@ impl MongoDbIdReader {
             };
             Some(store)
         } else {
-            warn!(
-                collection = %collection_name,
-                "MongoDB resumable reader has no cursor_id; resume is disabled and every restart re-copies from the beginning. Set cursor_id to persist progress."
-            );
             None
         };
 
@@ -75,13 +86,12 @@ impl MongoDbIdReader {
             }),
             None => None,
         };
-        info!(collection = %collection_name, cursor_id = ?config.cursor_id, has_checkpoint = %last_id.is_some(), "MongoDB id-cursor reader initialized");
+        info!(collection = %collection_name, "MongoDB snapshot reader initialized; reads the current contents once, then ends the route");
 
         Ok(Self {
             collection,
             db,
             checkpoint,
-            cursor_id: config.cursor_id.clone(),
             last_id: Arc::new(Mutex::new(last_id)),
             receive_query,
         })
@@ -155,11 +165,9 @@ impl MessageConsumer for MongoDbIdReader {
         }
 
         if messages.is_empty() {
-            // Exhausted: surface an empty batch so the route can pause or terminate.
-            return Ok(ReceivedBatch {
-                messages: Vec::new(),
-                commit: Box::new(|_| Box::pin(async { Ok(()) })),
-            });
+            // Drained. End the route rather than returning an empty batch: polling on would turn a
+            // snapshot into a tail, and an `_id` cursor cannot tail a collection being written.
+            return Err(ConsumerError::EndOfStream);
         }
 
         let checkpoint = self.checkpoint.clone();
@@ -236,7 +244,7 @@ impl MessageConsumer for MongoDbIdReader {
             target: self.collection.name().to_string(),
             pending,
             capacity: None,
-            details: serde_json::json!({ "cursor_id": self.cursor_id, "mode": "resumable" }),
+            details: serde_json::json!({ "mode": "snapshot" }),
             error,
         }
     }
@@ -332,6 +340,7 @@ pub struct MongoDbChangeStreamReader {
     source_metadata: bool,
     /// `<database>.<collection>`, precomputed for the `mqb.src.mongodb_namespace` key.
     namespace: String,
+    exit_on_empty: bool,
 }
 
 impl MongoDbChangeStreamReader {
@@ -461,6 +470,7 @@ impl MongoDbChangeStreamReader {
             )),
             source_metadata,
             namespace: format!("{}.{}", config.database, collection_name),
+            exit_on_empty: false,
         })
     }
 
@@ -769,8 +779,20 @@ impl MessageConsumer for MongoDbChangeStreamReader {
         // other state. `next_if_any` borrows the stream instead of replacing that state, so the
         // token stays readable when the timeout fires mid-poll.
         let mut last_refresh = Instant::now();
+        let drain_deadline = self
+            .exit_on_empty
+            .then(|| Instant::now() + crate::traits::drain_idle_timeout());
         loop {
-            match tokio::time::timeout(IDLE_RESUME_REFRESH, stream.next_if_any()).await {
+            let poll = if let Some(deadline) = drain_deadline {
+                tokio::time::timeout_at(
+                    tokio::time::Instant::from_std(deadline),
+                    stream.next_if_any(),
+                )
+                .await
+            } else {
+                tokio::time::timeout(IDLE_RESUME_REFRESH, stream.next_if_any()).await
+            };
+            match poll {
                 Ok(Ok(Some(event))) => {
                     let token = event.id.clone();
                     if let Some(msg) =
@@ -786,7 +808,7 @@ impl MessageConsumer for MongoDbChangeStreamReader {
                 }
                 Ok(Err(e)) => return Err(ConsumerError::Connection(e.into())),
                 // No change ready: the getMore came back empty, or it outran the refresh interval.
-                Ok(Ok(None)) | Err(_) => {
+                Ok(Ok(None)) => {
                     if !stream.is_alive() {
                         return Err(anyhow!("MongoDB change stream ended unexpectedly").into());
                     }
@@ -796,6 +818,12 @@ impl MessageConsumer for MongoDbChangeStreamReader {
                         self.refresh_idle_checkpoint(token).await;
                         last_refresh = Instant::now();
                     }
+                }
+                Err(_) if self.exit_on_empty => return Ok(ReceivedBatch::empty()),
+                Err(_) => {
+                    let token = stream.resume_token();
+                    self.refresh_idle_checkpoint(token).await;
+                    last_refresh = Instant::now();
                 }
             }
         }
@@ -894,6 +922,10 @@ impl MessageConsumer for MongoDbChangeStreamReader {
             }),
             ..Default::default()
         }
+    }
+
+    fn set_exit_on_empty(&mut self, exit_on_empty: bool) {
+        self.exit_on_empty = exit_on_empty;
     }
 
     fn as_any(&self) -> &dyn Any {

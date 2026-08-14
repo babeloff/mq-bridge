@@ -250,6 +250,720 @@ fn handler_error(label: &str, err: napi::Error) -> HandlerError {
     HandlerError::NonRetryable(anyhow::anyhow!("Node handler '{label}' failed: {err}"))
 }
 
+// --- Custom endpoints implemented in JavaScript -----------------------------
+
+/// One operation on a JS endpoint instance. A single dispatch callback per
+/// registered name carries all of them: JS objects are not `Send`, so the
+/// instance table lives on the JS side and Rust refers to instances by id.
+#[napi(object)]
+pub struct EndpointCall {
+    /// `create` | `receive` | `commit` | `send` | `close`.
+    pub op: String,
+    /// Identifies the endpoint instance the op applies to.
+    pub instance: u32,
+    pub route_name: String,
+    /// The endpoint's config block. `create` only.
+    pub config: Option<JsonValue>,
+    /// `receive` only.
+    pub max_messages: Option<u32>,
+    /// `send` only.
+    pub messages: Option<Vec<NativeMessage>>,
+    /// `commit` only: one `"ack"`/`"nack"` per message in the batch.
+    pub dispositions: Option<Vec<String>>,
+}
+
+/// What the JS dispatcher reports back. Failures come back as a populated
+/// `error` rather than a rejected promise, so the retryable flag survives.
+#[napi(object)]
+pub struct EndpointReply {
+    /// `receive` only. Absent or empty means "nothing right now".
+    pub messages: Option<Vec<NativeMessage>>,
+    /// `receive` only: the source is finished, so the route can stop.
+    pub end_of_stream: Option<bool>,
+    /// `create` only: whether the instance implements `receiveBatch`.
+    pub consumer: Option<bool>,
+    /// `create` only: whether the instance implements `sendBatch`.
+    pub publisher: Option<bool>,
+    /// `create` only: whether the instance implements `onReceive`.
+    pub on_receive: Option<bool>,
+    /// `create` only: whether the instance implements `onSend`.
+    pub on_send: Option<bool>,
+    /// `onReceive`/`onSend` only: one slot per input message, `null` for dropped.
+    pub filtered: Option<Vec<Option<NativeMessage>>>,
+    pub error: Option<String>,
+    /// Whether `error` should be retried. When absent, consumer errors are retried
+    /// as connection failures while publisher errors are non-retryable.
+    pub retryable: Option<bool>,
+}
+
+/// Strongly referenced (`Weak = false`) on purpose: a weak dispatch does not keep
+/// the event loop referenced, so on an otherwise idle loop the endpoint's queued
+/// calls are never drained and the route silently stalls.
+type EndpointDispatch =
+    ThreadsafeFunction<EndpointCall, Promise<EndpointReply>, EndpointCall, Status, true, false>;
+
+static NEXT_ENDPOINT_INSTANCE: AtomicU32 = AtomicU32::new(1);
+
+struct JsEndpointFactory {
+    name: String,
+    dispatch: Arc<EndpointDispatch>,
+}
+
+impl std::fmt::Debug for JsEndpointFactory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JsEndpointFactory")
+            .field("name", &self.name)
+            .finish()
+    }
+}
+
+/// Runs one op and turns a rejected promise, a dispatcher failure, or a reported
+/// `error` into a single uniform failure.
+async fn call_js_endpoint(
+    dispatch: &EndpointDispatch,
+    name: &str,
+    call: EndpointCall,
+) -> std::result::Result<EndpointReply, (String, Option<bool>)> {
+    let op = call.op.clone();
+    let reply = dispatch
+        .call_async(Ok(call))
+        .await
+        .map_err(|err| (format!("Node endpoint '{name}' {op} failed: {err}"), None))?
+        .await
+        .map_err(|err| (format!("Node endpoint '{name}' {op} failed: {err}"), None))?;
+    if let Some(error) = reply.error {
+        return Err((
+            format!("Node endpoint '{name}' {op} failed: {error}"),
+            reply.retryable,
+        ));
+    }
+    Ok(reply)
+}
+
+/// Which side of the endpoint a handle drives, so the lazy `create` can check
+/// that the host object actually implements it.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum JsEndpointRole {
+    Consumer,
+    Publisher,
+    Middleware(JsMiddlewareSide),
+}
+
+#[async_trait]
+impl core::traits::CustomEndpointFactory for JsEndpointFactory {
+    async fn create_consumer(
+        &self,
+        route_name: &str,
+        config: &JsonValue,
+    ) -> anyhow::Result<Box<dyn MessageConsumer>> {
+        Ok(Box::new(JsEndpointConsumer {
+            inner: Arc::new(self.instance(route_name, config, JsEndpointRole::Consumer)),
+        }))
+    }
+
+    async fn create_publisher(
+        &self,
+        route_name: &str,
+        config: &JsonValue,
+    ) -> anyhow::Result<Box<dyn core::traits::MessagePublisher>> {
+        Ok(Box::new(JsEndpointPublisher {
+            inner: Arc::new(self.instance(route_name, config, JsEndpointRole::Publisher)),
+        }))
+    }
+}
+
+impl JsEndpointFactory {
+    fn instance(
+        &self,
+        route_name: &str,
+        config: &JsonValue,
+        role: JsEndpointRole,
+    ) -> JsEndpointInstance {
+        JsEndpointInstance {
+            name: self.name.clone(),
+            route_name: route_name.to_string(),
+            config: config.clone(),
+            role,
+            instance: tokio::sync::OnceCell::new(),
+            dispatch: Arc::clone(&self.dispatch),
+        }
+    }
+}
+
+/// A handle to one JS endpoint instance, shared by the endpoint itself and the
+/// commit closures it hands to the route.
+///
+/// The host object is built on first use rather than at route startup: `start()`
+/// blocks the JS thread while it deploys the route, so a `create` dispatched
+/// from there could never be serviced by the event loop.
+struct JsEndpointInstance {
+    name: String,
+    route_name: String,
+    config: JsonValue,
+    role: JsEndpointRole,
+    /// `Some(id)` once the host object exists; `Some(None)` when it exists but
+    /// does not implement this middleware side, which means "pass through".
+    instance: tokio::sync::OnceCell<Option<u32>>,
+    dispatch: Arc<EndpointDispatch>,
+}
+
+impl JsEndpointInstance {
+    /// Builds the host object once. A failure leaves the cell empty, so a
+    /// genuinely transient connect failure is retried on the next call.
+    async fn instance_id(&self) -> std::result::Result<Option<u32>, (String, Option<bool>)> {
+        self.instance
+            .get_or_try_init(|| async {
+                let id = NEXT_ENDPOINT_INSTANCE.fetch_add(1, Ordering::SeqCst);
+                let reply = match call_js_endpoint(
+                    &self.dispatch,
+                    &self.name,
+                    EndpointCall {
+                        op: "create".to_string(),
+                        instance: id,
+                        route_name: self.route_name.clone(),
+                        config: Some(self.config.clone()),
+                        max_messages: None,
+                        messages: None,
+                        dispositions: None,
+                    },
+                )
+                .await
+                {
+                    Ok(reply) => reply,
+                    Err(err) => {
+                        self.close_instance(id);
+                        return Err(err);
+                    }
+                };
+                // JS has already put the instance in its table, so every path
+                // that does not keep the id has to close it or the host object
+                // (and whatever connection it opened) leaks for the process.
+                // A missing method is a config error, not a transport blip:
+                // flag it non-retryable so the route stops instead of looping.
+                let outcome = match self.role {
+                    JsEndpointRole::Consumer if reply.consumer != Some(true) => Err((
+                        format!(
+                            "Node endpoint '{}' has no receiveBatch(maxMessages) method, so it cannot be used as an input",
+                            self.name
+                        ),
+                        Some(false),
+                    )),
+                    JsEndpointRole::Publisher if reply.publisher != Some(true) => Err((
+                        format!(
+                            "Node endpoint '{}' has no sendBatch(messages) method, so it cannot be used as an output",
+                            self.name
+                        ),
+                        Some(false),
+                    )),
+                    // A missing middleware hook is not an error — the caller
+                    // reads `None` as "pass through".
+                    JsEndpointRole::Middleware(JsMiddlewareSide::Receive)
+                        if reply.on_receive != Some(true) =>
+                    {
+                        Ok(None)
+                    }
+                    JsEndpointRole::Middleware(JsMiddlewareSide::Send)
+                        if reply.on_send != Some(true) =>
+                    {
+                        Ok(None)
+                    }
+                    _ => Ok(Some(id)),
+                };
+                if !matches!(outcome, Ok(Some(_))) {
+                    self.close_instance(id);
+                }
+                outcome
+            })
+            .await
+            .copied()
+    }
+
+    /// Like `instance_id`, for the endpoint roles where "no instance" cannot
+    /// happen — a missing method is reported as an error there instead.
+    async fn endpoint_instance_id(&self) -> std::result::Result<u32, (String, Option<bool>)> {
+        self.instance_id().await?.ok_or_else(|| {
+            (
+                format!("Node endpoint '{}' was not created", self.name),
+                Some(false),
+            )
+        })
+    }
+
+    /// Drops the JS-side instance-table entry and lets the host object release
+    /// whatever it opened. Fire-and-forget: nothing here can await a reply.
+    fn close_instance(&self, instance: u32) {
+        let _ = self.dispatch.call(
+            Ok(self.call("close", instance)),
+            napi::threadsafe_function::ThreadsafeFunctionCallMode::NonBlocking,
+        );
+    }
+
+    fn call(&self, op: &str, instance: u32) -> EndpointCall {
+        EndpointCall {
+            op: op.to_string(),
+            instance,
+            route_name: self.route_name.clone(),
+            config: None,
+            max_messages: None,
+            messages: None,
+            dispositions: None,
+        }
+    }
+
+    async fn run(
+        &self,
+        call: EndpointCall,
+    ) -> std::result::Result<EndpointReply, (String, Option<bool>)> {
+        call_js_endpoint(&self.dispatch, &self.name, call).await
+    }
+}
+
+impl Drop for JsEndpointInstance {
+    /// Let JS drop its instance-table entry, and give a host object holding a
+    /// real connection the chance to close it. Nothing to do if it was never
+    /// built.
+    fn drop(&mut self) {
+        // Only the id we kept: the paths that discarded one closed it already.
+        let Some(&Some(instance)) = self.instance.get() else {
+            return;
+        };
+        self.close_instance(instance);
+    }
+}
+
+struct JsEndpointConsumer {
+    inner: Arc<JsEndpointInstance>,
+}
+
+#[async_trait]
+impl MessageConsumer for JsEndpointConsumer {
+    async fn receive_batch(
+        &mut self,
+        max_messages: usize,
+    ) -> std::result::Result<core::ReceivedBatch, core::errors::ConsumerError> {
+        let instance = self
+            .inner
+            .endpoint_instance_id()
+            .await
+            .map_err(js_consumer_error)?;
+        let mut call = self.inner.call("receive", instance);
+        call.max_messages = Some(max_messages.min(u32::MAX as usize) as u32);
+        let reply = self.inner.run(call).await.map_err(js_consumer_error)?;
+        if reply.end_of_stream == Some(true) {
+            return Err(core::errors::ConsumerError::EndOfStream);
+        }
+        let messages = reply
+            .messages
+            .unwrap_or_default()
+            .into_iter()
+            .map(NativeMessage::into_canonical)
+            .collect::<Result<Vec<_>>>()
+            .map_err(|err| {
+                core::errors::ConsumerError::Permanent(anyhow::anyhow!(err.to_string()))
+            })?;
+        if messages.is_empty() {
+            return Ok(core::ReceivedBatch::empty());
+        }
+        let inner = Arc::clone(&self.inner);
+        let commit: BatchCommitFunc = Box::new(move |dispositions| {
+            let names = dispositions.iter().map(disposition_name).collect();
+            Box::pin(async move {
+                let instance = inner
+                    .endpoint_instance_id()
+                    .await
+                    .map_err(|(message, _)| anyhow::anyhow!(message))?;
+                let mut call = inner.call("commit", instance);
+                call.dispositions = Some(names);
+                inner
+                    .run(call)
+                    .await
+                    .map(|_| ())
+                    .map_err(|(message, _)| anyhow::anyhow!(message))
+            })
+        });
+        Ok(core::ReceivedBatch { messages, commit })
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+struct JsEndpointPublisher {
+    inner: Arc<JsEndpointInstance>,
+}
+
+#[async_trait]
+impl core::traits::MessagePublisher for JsEndpointPublisher {
+    async fn send_batch(
+        &self,
+        messages: Vec<CanonicalMessage>,
+    ) -> std::result::Result<SentBatch, core::errors::PublisherError> {
+        let instance = self
+            .inner
+            .endpoint_instance_id()
+            .await
+            .map_err(js_publisher_error)?;
+        let mut call = self.inner.call("send", instance);
+        call.messages = Some(messages.iter().map(NativeMessage::from_canonical).collect());
+        self.inner
+            .run(call)
+            .await
+            .map(|_| SentBatch::Ack)
+            .map_err(js_publisher_error)
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+/// A failed read is a transport problem unless the host explicitly said the
+/// error cannot heal, so the route reconnects rather than dropping the source.
+fn js_consumer_error((message, retryable): (String, Option<bool>)) -> core::errors::ConsumerError {
+    match retryable {
+        Some(false) => core::errors::ConsumerError::Permanent(anyhow::anyhow!(message)),
+        _ => core::errors::ConsumerError::Connection(anyhow::anyhow!(message)),
+    }
+}
+
+/// A failed write is non-retryable unless the host flagged it, matching Node
+/// handlers, so `dlq` catches it and `retry` does not spin on it.
+fn js_publisher_error(
+    (message, retryable): (String, Option<bool>),
+) -> core::errors::PublisherError {
+    match retryable {
+        Some(true) => core::errors::PublisherError::Retryable(anyhow::anyhow!(message)),
+        _ => core::errors::PublisherError::NonRetryable(anyhow::anyhow!(message)),
+    }
+}
+
+/// The string a `MessageDisposition` is reported as to a JS `commit`.
+/// A `Reply` payload is not delivered to host endpoints yet; it acks.
+fn disposition_name(disposition: &MessageDisposition) -> String {
+    match disposition {
+        MessageDisposition::Ack | MessageDisposition::Reply(_) => "ack".to_string(),
+        MessageDisposition::Nack => "nack".to_string(),
+    }
+}
+
+/// Which hook a middleware handle drives.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum JsMiddlewareSide {
+    Receive,
+    Send,
+}
+
+struct JsMiddlewareFactory {
+    name: String,
+    dispatch: Arc<EndpointDispatch>,
+}
+
+impl std::fmt::Debug for JsMiddlewareFactory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JsMiddlewareFactory")
+            .field("name", &self.name)
+            .finish()
+    }
+}
+
+impl JsMiddlewareFactory {
+    /// Wraps unconditionally and decides pass-through on first use: `apply_*`
+    /// runs while `start()` blocks the JS thread, so nothing may dispatch to JS
+    /// here — the event loop could not service it.
+    fn handle(
+        &self,
+        route_name: &str,
+        config: &JsonValue,
+        side: JsMiddlewareSide,
+    ) -> Arc<JsEndpointInstance> {
+        Arc::new(JsEndpointInstance {
+            name: self.name.clone(),
+            route_name: route_name.to_string(),
+            config: config.clone(),
+            role: JsEndpointRole::Middleware(side),
+            instance: tokio::sync::OnceCell::new(),
+            dispatch: Arc::clone(&self.dispatch),
+        })
+    }
+}
+
+#[async_trait]
+impl core::traits::CustomMiddlewareFactory for JsMiddlewareFactory {
+    async fn apply_consumer(
+        &self,
+        consumer: Box<dyn MessageConsumer>,
+        route_name: &str,
+        config: &JsonValue,
+    ) -> anyhow::Result<Box<dyn MessageConsumer>> {
+        Ok(Box::new(JsMiddlewareConsumer {
+            inner: consumer,
+            middleware: self.handle(route_name, config, JsMiddlewareSide::Receive),
+        }))
+    }
+
+    async fn apply_publisher(
+        &self,
+        publisher: Box<dyn core::traits::MessagePublisher>,
+        route_name: &str,
+        config: &JsonValue,
+    ) -> anyhow::Result<Box<dyn core::traits::MessagePublisher>> {
+        Ok(Box::new(JsMiddlewarePublisher {
+            inner: publisher,
+            middleware: self.handle(route_name, config, JsMiddlewareSide::Send),
+        }))
+    }
+}
+
+/// Runs one middleware hook, returning one slot per input message. The caller
+/// resolves `instance` first so a pass-through side never has to copy the batch.
+async fn run_js_filter(
+    handle: &JsEndpointInstance,
+    op: &str,
+    instance: u32,
+    messages: &[CanonicalMessage],
+) -> std::result::Result<Vec<Option<CanonicalMessage>>, (String, Option<bool>)> {
+    let expected = messages.len();
+    let mut call = handle.call(op, instance);
+    call.messages = Some(messages.iter().map(NativeMessage::from_canonical).collect());
+    let reply = handle.run(call).await?;
+    let filtered = reply.filtered.unwrap_or_default();
+    if filtered.len() != expected {
+        return Err((
+            format!(
+                "Node middleware '{}' {op} returned {} items for a batch of {expected}; return one item per message (null to drop it)",
+                handle.name,
+                filtered.len()
+            ),
+            Some(false),
+        ));
+    }
+    filtered
+        .into_iter()
+        .map(|slot| slot.map(NativeMessage::into_canonical).transpose())
+        .collect::<Result<Vec<_>>>()
+        .map_err(|err| (err.to_string(), Some(false)))
+}
+
+struct JsMiddlewareConsumer {
+    inner: Box<dyn MessageConsumer>,
+    middleware: Arc<JsEndpointInstance>,
+}
+
+#[async_trait]
+impl MessageConsumer for JsMiddlewareConsumer {
+    async fn receive_batch(
+        &mut self,
+        max_messages: usize,
+    ) -> std::result::Result<core::ReceivedBatch, core::errors::ConsumerError> {
+        // Keep pulling until something survives the filter. Returning an empty
+        // batch here would be read as "the source is drained" and would end an
+        // `exit_on_empty` route early; only the inner consumer may say that.
+        loop {
+            let batch = self.inner.receive_batch(max_messages).await?;
+            if batch.messages.is_empty() {
+                return Ok(batch);
+            }
+            let Some(instance) = self
+                .middleware
+                .instance_id()
+                .await
+                .map_err(js_consumer_error)?
+            else {
+                return Ok(batch);
+            };
+            let core::ReceivedBatch { messages, commit } = batch;
+            let results = run_js_filter(&self.middleware, "onReceive", instance, &messages)
+                .await
+                .map_err(js_consumer_error)?;
+
+            let mut kept = Vec::with_capacity(results.len());
+            let mut keep_flags = Vec::with_capacity(results.len());
+            for result in results {
+                keep_flags.push(result.is_some());
+                if let Some(message) = result {
+                    kept.push(message);
+                }
+            }
+
+            let inner_commit = commit;
+            if kept.is_empty() {
+                // The route will never commit a batch it never sees, so ack the
+                // dropped messages here or the source redelivers them forever.
+                inner_commit(vec![MessageDisposition::Ack; keep_flags.len()])
+                    .await
+                    .map_err(core::errors::ConsumerError::Connection)?;
+                continue;
+            }
+
+            // The route only sees the kept messages, so expand its dispositions
+            // back to one per source message, acking the ones we dropped.
+            let commit: BatchCommitFunc = Box::new(move |dispositions| {
+                let mut kept_dispositions = dispositions.into_iter();
+                let expanded: Vec<MessageDisposition> = keep_flags
+                    .iter()
+                    .map(|keep| {
+                        if *keep {
+                            kept_dispositions.next().unwrap_or(MessageDisposition::Ack)
+                        } else {
+                            MessageDisposition::Ack
+                        }
+                    })
+                    .collect();
+                inner_commit(expanded)
+            });
+            return Ok(core::ReceivedBatch {
+                messages: kept,
+                commit,
+            });
+        }
+    }
+
+    fn commit_requires_order(&self) -> bool {
+        self.inner.commit_requires_order()
+    }
+
+    async fn close(&mut self) -> anyhow::Result<()> {
+        self.inner.close().await
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+struct JsMiddlewarePublisher {
+    inner: Box<dyn core::traits::MessagePublisher>,
+    middleware: Arc<JsEndpointInstance>,
+}
+
+#[async_trait]
+impl core::traits::MessagePublisher for JsMiddlewarePublisher {
+    async fn send_batch(
+        &self,
+        messages: Vec<CanonicalMessage>,
+    ) -> std::result::Result<SentBatch, core::errors::PublisherError> {
+        let Some(instance) = self
+            .middleware
+            .instance_id()
+            .await
+            .map_err(js_publisher_error)?
+        else {
+            return self.inner.send_batch(messages).await;
+        };
+        let results = run_js_filter(&self.middleware, "onSend", instance, &messages)
+            .await
+            .map_err(js_publisher_error)?;
+        let kept: Vec<CanonicalMessage> = results.into_iter().flatten().collect();
+        if kept.is_empty() {
+            return Ok(SentBatch::Ack);
+        }
+        self.inner.send_batch(kept).await
+    }
+
+    async fn flush(&self) -> anyhow::Result<()> {
+        self.inner.flush().await
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+/// Register a JS middleware dispatcher under `name`. Called by the
+/// `registerMiddleware` wrapper in `index.js` — do not call directly.
+#[napi(js_name = "registerMiddlewareDispatch")]
+pub fn register_middleware_dispatch(
+    name: String,
+    dispatch: ThreadsafeFunction<
+        EndpointCall,
+        Promise<EndpointReply>,
+        EndpointCall,
+        Status,
+        true,
+        false,
+    >,
+) -> Result<()> {
+    if name.trim().is_empty() {
+        return Err(Error::from_reason("middleware name must not be empty"));
+    }
+    core::extensions::register_middleware_factory(
+        &name,
+        Arc::new(JsMiddlewareFactory {
+            name: name.clone(),
+            dispatch: Arc::new(dispatch),
+        }),
+    )
+    .map_err(|err| Error::from_reason(format!("{err:#}")))?;
+    Ok(())
+}
+
+/// Unregister a JS middleware dispatcher after all routes using it have stopped.
+#[napi(js_name = "unregisterMiddlewareDispatch")]
+pub fn unregister_middleware_dispatch(name: String) -> bool {
+    core::extensions::unregister_middleware_factory(&name)
+}
+
+/// Load a native endpoint plugin and register the endpoint it provides.
+///
+/// `path` is the compiled plugin library shipped by an endpoint package (for
+/// example `mq-bridge-pulsar`); those packages expose a `register()` helper that
+/// resolves the bundled file and calls this. Returns the registered endpoint
+/// name, usable as a route's endpoint type.
+///
+/// Call once, before starting routes. Loading the same file again is a no-op.
+/// A plugin is native code with the same privileges as the Node process.
+#[napi(js_name = "loadEndpointPlugin")]
+pub fn load_endpoint_plugin(path: String) -> Result<String> {
+    #[cfg(feature = "plugin")]
+    {
+        core::plugin::load_endpoint_plugin(&path)
+            .map(|info| info.name)
+            .map_err(|err| Error::from_reason(format!("{err:#}")))
+    }
+    #[cfg(not(feature = "plugin"))]
+    {
+        let _ = path;
+        Err(Error::from_reason(
+            "this mq-bridge build was compiled without native plugin support",
+        ))
+    }
+}
+
+/// Register a JS endpoint dispatcher under `name`. Called by the `registerEndpoint`
+/// wrapper in `index.js`, which owns the instance table — do not call directly.
+#[napi(js_name = "registerEndpointDispatch")]
+pub fn register_endpoint_dispatch(
+    name: String,
+    dispatch: ThreadsafeFunction<
+        EndpointCall,
+        Promise<EndpointReply>,
+        EndpointCall,
+        Status,
+        true,
+        false,
+    >,
+) -> Result<()> {
+    if name.trim().is_empty() {
+        return Err(Error::from_reason("endpoint name must not be empty"));
+    }
+    core::extensions::register_endpoint_factory(
+        &name,
+        Arc::new(JsEndpointFactory {
+            name: name.clone(),
+            dispatch: Arc::new(dispatch),
+        }),
+    )
+    .map_err(|err| Error::from_reason(format!("{err:#}")))?;
+    Ok(())
+}
+
+/// Unregister a JS endpoint dispatcher after all routes using it have stopped.
+#[napi(js_name = "unregisterEndpointDispatch")]
+pub fn unregister_endpoint_dispatch(name: String) -> bool {
+    core::extensions::unregister_endpoint_factory(&name)
+}
+
 #[napi]
 pub struct Route {
     runtime: Arc<Runtime>,

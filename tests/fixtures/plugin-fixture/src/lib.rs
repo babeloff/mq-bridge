@@ -1,0 +1,442 @@
+//! An in-memory endpoint that exists to exercise the plugin boundary.
+//!
+//! It is deliberately trivial — a named queue in a `Mutex` — so that a test
+//! failure means the ABI, loader or SDK is wrong rather than a broker being
+//! slow. Failure injection lets the tests assert that error classes survive the
+//! round trip through C.
+//!
+//! Configuration:
+//!
+//! ```yaml
+//! custom:
+//!   name: fixture
+//!   config:
+//!     queue: orders            # required: which in-process queue to attach to
+//!     fail_receive: retryable  # none | retryable | permanent | end_of_stream
+//!     fail_send: none          # none | retryable | permanent
+//!     panic_on_receive: false  # exercises the SDK's panic containment
+//!     commit_requires_order: true
+//! ```
+//!
+//! The same plugin also exports a middleware under the name `fixture`:
+//!
+//! ```yaml
+//! middlewares:
+//!   - custom:
+//!       name: fixture
+//!       config:
+//!         drop_prefix: "skip-"  # messages starting with this are dropped
+//!         suffix: "-seen"       # appended to every surviving payload
+//!         fail: false           # make the middleware return an error
+//! ```
+//!
+//! Note that the queues live in whichever copy of this library is loaded: a
+//! directly linked fixture and a `dlopen`ed one do not share state, which is
+//! exactly what makes it a useful plugin test.
+
+use std::any::Any;
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Mutex, OnceLock};
+
+use anyhow::{anyhow, Context};
+use async_trait::async_trait;
+use mq_bridge::errors::{ConsumerError, PublisherError};
+use mq_bridge::traits::{
+    BatchCommitFunc, CustomEndpointFactory, MessageConsumer, MessageDisposition, MessagePublisher,
+};
+use mq_bridge::{CanonicalMessage, ReceivedBatch, SentBatch};
+use serde::Deserialize;
+
+mq_bridge::export_endpoint_plugin! {
+    name: "fixture",
+    factory: FixtureFactory,
+    middleware: FixtureMiddlewareFactory,
+}
+
+/// Injected failure for the input side.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReceiveFailure {
+    #[default]
+    None,
+    Retryable,
+    Permanent,
+    EndOfStream,
+}
+
+/// Injected failure for the output side.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SendFailure {
+    #[default]
+    None,
+    Retryable,
+    Permanent,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FixtureConfig {
+    /// Queue to attach to. Defaults to the route name.
+    #[serde(default)]
+    pub queue: Option<String>,
+    #[serde(default)]
+    pub fail_receive: ReceiveFailure,
+    #[serde(default)]
+    pub fail_send: SendFailure,
+    #[serde(default)]
+    pub panic_on_receive: bool,
+    #[serde(default = "default_true")]
+    pub commit_requires_order: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// The queue backing one fixture endpoint name.
+#[derive(Default)]
+struct Queue {
+    ready: VecDeque<CanonicalMessage>,
+}
+
+type SharedQueue = Arc<Mutex<Queue>>;
+
+fn queue(name: &str) -> SharedQueue {
+    static QUEUES: OnceLock<Mutex<HashMap<String, SharedQueue>>> = OnceLock::new();
+    let queues = QUEUES.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut queues = queues.lock().expect("fixture queue registry poisoned");
+    Arc::clone(queues.entry(name.to_string()).or_default())
+}
+
+/// Number of messages waiting in a queue.
+pub fn queue_depth(name: &str) -> usize {
+    queue(name)
+        .lock()
+        .expect("fixture queue poisoned")
+        .ready
+        .len()
+}
+
+/// Queue that records each committed message, so a test on the *other* side of
+/// the ABI can observe when acknowledgement actually happened. Every commit
+/// appends the message with a `disposition` of `ack` or `nack`.
+pub fn commit_log_queue(name: &str) -> String {
+    format!("{name}#committed")
+}
+
+#[derive(Debug, Default)]
+pub struct FixtureFactory;
+
+fn resolve(route_name: &str, value: &serde_json::Value) -> anyhow::Result<(FixtureConfig, String)> {
+    let config: FixtureConfig =
+        serde_json::from_value(value.clone()).context("invalid fixture endpoint configuration")?;
+    let name = config
+        .queue
+        .clone()
+        .unwrap_or_else(|| route_name.to_owned());
+    if name.trim().is_empty() {
+        return Err(anyhow!("fixture `queue` must not be empty"));
+    }
+    Ok((config, name))
+}
+
+#[async_trait]
+impl CustomEndpointFactory for FixtureFactory {
+    async fn create_consumer(
+        &self,
+        route_name: &str,
+        config: &serde_json::Value,
+    ) -> anyhow::Result<Box<dyn MessageConsumer>> {
+        let (config, name) = resolve(route_name, config)?;
+        Ok(Box::new(FixtureConsumer {
+            queue: queue(&name),
+            name,
+            config,
+        }))
+    }
+
+    async fn create_publisher(
+        &self,
+        route_name: &str,
+        config: &serde_json::Value,
+    ) -> anyhow::Result<Box<dyn MessagePublisher>> {
+        let (config, name) = resolve(route_name, config)?;
+        Ok(Box::new(FixturePublisher {
+            queue: queue(&name),
+            config,
+        }))
+    }
+}
+
+struct FixtureConsumer {
+    queue: SharedQueue,
+    name: String,
+    config: FixtureConfig,
+}
+
+/// Messages handed out but not yet committed.
+///
+/// Dropping the batch's commit function — which is what happens when a route
+/// shuts down mid-batch, and what the plugin loader does for an uncommitted
+/// batch — must put them back, exactly like a broker redelivering unacked
+/// messages.
+struct InFlight {
+    queue: SharedQueue,
+    messages: Option<Vec<CanonicalMessage>>,
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        let Some(messages) = self.messages.take() else {
+            return;
+        };
+        let mut queue = self.queue.lock().expect("fixture queue poisoned");
+        for message in messages.into_iter().rev() {
+            queue.ready.push_front(message);
+        }
+    }
+}
+
+#[async_trait]
+impl MessageConsumer for FixtureConsumer {
+    async fn receive_batch(&mut self, max_messages: usize) -> Result<ReceivedBatch, ConsumerError> {
+        if self.config.panic_on_receive {
+            panic!("fixture was configured to panic on receive");
+        }
+        match self.config.fail_receive {
+            ReceiveFailure::None => {}
+            ReceiveFailure::Retryable => {
+                return Err(ConsumerError::Connection(anyhow!(
+                    "fixture injected a retryable receive failure"
+                )))
+            }
+            ReceiveFailure::Permanent => {
+                return Err(ConsumerError::Permanent(anyhow!(
+                    "fixture injected a permanent receive failure"
+                )))
+            }
+            ReceiveFailure::EndOfStream => return Err(ConsumerError::EndOfStream),
+        }
+
+        let mut in_flight = Vec::new();
+        {
+            let mut queue = self.queue.lock().expect("fixture queue poisoned");
+            while in_flight.len() < max_messages {
+                match queue.ready.pop_front() {
+                    Some(message) => in_flight.push(message),
+                    None => break,
+                }
+            }
+        }
+        if in_flight.is_empty() {
+            return Ok(ReceivedBatch::empty());
+        }
+
+        let messages = in_flight.clone();
+        let shared = Arc::clone(&self.queue);
+        let commit_log = queue(&commit_log_queue(&self.name));
+        let mut in_flight = InFlight {
+            queue: Arc::clone(&self.queue),
+            messages: Some(in_flight),
+        };
+        let commit: BatchCommitFunc = Box::new(move |dispositions| {
+            Box::pin(async move {
+                // Check before taking, so a miscount leaves the messages for
+                // `InFlight::drop` to requeue instead of losing them.
+                let pending = in_flight.messages.as_ref().map_or(0, Vec::len);
+                if dispositions.len() != pending {
+                    return Err(anyhow!(
+                        "fixture commit got {} dispositions for {pending} messages",
+                        dispositions.len(),
+                    ));
+                }
+                let in_flight = in_flight.messages.take().unwrap_or_default();
+                // Requeue at the front so a nack is redelivered before newer
+                // messages, the way a broker's unacked redelivery behaves.
+                let mut queue = shared.lock().expect("fixture queue poisoned");
+                let mut log = commit_log.lock().expect("fixture queue poisoned");
+                for (message, disposition) in in_flight.into_iter().zip(dispositions).rev() {
+                    let nacked = matches!(disposition, MessageDisposition::Nack);
+                    let mut record = message.clone();
+                    record.metadata.insert(
+                        "disposition".to_string(),
+                        if nacked { "nack" } else { "ack" }.to_string(),
+                    );
+                    log.ready.push_back(record);
+                    if nacked {
+                        queue.ready.push_front(message);
+                    }
+                }
+                Ok(())
+            })
+        });
+        Ok(ReceivedBatch { messages, commit })
+    }
+
+    fn commit_requires_order(&self) -> bool {
+        self.config.commit_requires_order
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+struct FixturePublisher {
+    queue: SharedQueue,
+    config: FixtureConfig,
+}
+
+#[async_trait]
+impl MessagePublisher for FixturePublisher {
+    async fn send_batch(
+        &self,
+        messages: Vec<CanonicalMessage>,
+    ) -> Result<SentBatch, PublisherError> {
+        match self.config.fail_send {
+            SendFailure::None => {}
+            SendFailure::Retryable => {
+                return Err(PublisherError::Retryable(anyhow!(
+                    "fixture injected a retryable send failure"
+                )))
+            }
+            SendFailure::Permanent => {
+                return Err(PublisherError::NonRetryable(anyhow!(
+                    "fixture injected a permanent send failure"
+                )))
+            }
+        }
+        let mut queue = self.queue.lock().expect("fixture queue poisoned");
+        queue.ready.extend(messages);
+        Ok(SentBatch::Ack)
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_nacked_message_is_requeued_at_the_front() {
+        let factory = FixtureFactory;
+        let config = serde_json::json!({ "queue": "unit-nack" });
+        let publisher = factory.create_publisher("route", &config).await.unwrap();
+        let mut consumer = factory.create_consumer("route", &config).await.unwrap();
+
+        publisher
+            .send_batch(vec![
+                CanonicalMessage::from("first"),
+                CanonicalMessage::from("second"),
+            ])
+            .await
+            .unwrap();
+
+        let batch = consumer.receive_batch(2).await.unwrap();
+        assert_eq!(batch.messages.len(), 2);
+        (batch.commit)(vec![MessageDisposition::Nack, MessageDisposition::Ack])
+            .await
+            .unwrap();
+
+        let batch = consumer.receive_batch(2).await.unwrap();
+        assert_eq!(batch.messages.len(), 1);
+        assert_eq!(batch.messages[0].get_payload_str(), "first");
+    }
+
+    #[tokio::test]
+    async fn an_empty_queue_yields_an_empty_batch() {
+        let factory = FixtureFactory;
+        let config = serde_json::json!({ "queue": "unit-empty" });
+        let mut consumer = factory.create_consumer("route", &config).await.unwrap();
+        assert!(consumer.receive_batch(4).await.unwrap().messages.is_empty());
+    }
+}
+
+/// Configuration of the middleware this plugin also exports.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FixtureMiddlewareConfig {
+    /// Messages whose payload starts with this are dropped.
+    #[serde(default)]
+    pub drop_prefix: Option<String>,
+    /// Appended to every surviving payload, so a test can tell whether the
+    /// middleware ran and on which side.
+    #[serde(default)]
+    pub suffix: Option<String>,
+    /// Return an error instead of filtering.
+    #[serde(default)]
+    pub fail: bool,
+}
+
+#[derive(Debug, Default)]
+pub struct FixtureMiddlewareFactory;
+
+#[async_trait]
+impl mq_bridge::plugin::sdk::MiddlewareFactory for FixtureMiddlewareFactory {
+    async fn create(
+        &self,
+        _route_name: &str,
+        config: &serde_json::Value,
+    ) -> anyhow::Result<Box<dyn mq_bridge::plugin::sdk::BatchFilter>> {
+        let config: FixtureMiddlewareConfig = serde_json::from_value(config.clone())
+            .context("invalid fixture middleware configuration")?;
+        Ok(Box::new(FixtureFilter { config }))
+    }
+}
+
+struct FixtureFilter {
+    config: FixtureMiddlewareConfig,
+}
+
+impl FixtureFilter {
+    fn filter(
+        &self,
+        messages: Vec<CanonicalMessage>,
+    ) -> anyhow::Result<Vec<Option<CanonicalMessage>>> {
+        if self.config.fail {
+            return Err(anyhow!("fixture middleware was configured to fail"));
+        }
+        Ok(messages
+            .into_iter()
+            .map(|message| {
+                let payload = message.get_payload_str().to_string();
+                if self
+                    .config
+                    .drop_prefix
+                    .as_ref()
+                    .is_some_and(|prefix| payload.starts_with(prefix))
+                {
+                    return None;
+                }
+                let Some(suffix) = &self.config.suffix else {
+                    return Some(message);
+                };
+                let mut rewritten = CanonicalMessage::from(format!("{payload}{suffix}"));
+                rewritten.message_id = message.message_id;
+                rewritten.metadata = message.metadata;
+                Some(rewritten)
+            })
+            .collect())
+    }
+}
+
+#[async_trait]
+impl mq_bridge::plugin::sdk::BatchFilter for FixtureFilter {
+    async fn on_receive(
+        &self,
+        messages: Vec<CanonicalMessage>,
+    ) -> anyhow::Result<Vec<Option<CanonicalMessage>>> {
+        self.filter(messages)
+    }
+
+    async fn on_send(
+        &self,
+        messages: Vec<CanonicalMessage>,
+    ) -> anyhow::Result<Vec<Option<CanonicalMessage>>> {
+        self.filter(messages)
+    }
+}

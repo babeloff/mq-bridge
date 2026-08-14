@@ -1134,8 +1134,24 @@
           "default": null,
           "minimum": 0
         },
+        "consumer_id": {
+          "description": "Stable subscription identity used for ACK tracking and redelivery. Defaults to a\nfresh id per consumer; set it to be redelivered unacknowledged messages on reconnect.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "descriptor_set_path": {
+          "description": "Compiled protobuf FileDescriptorSet for dynamic client mode.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
         "http2_keepalive_interval_ms": {
-          "description": "HTTP/2 keepalive ping interval in milliseconds. **Server-mode only.** Default disabled",
+          "description": "HTTP/2 keepalive ping interval in milliseconds. Applies in both modes. Default disabled",
           "type": [
             "integer",
             "null"
@@ -1145,7 +1161,7 @@
           "minimum": 0
         },
         "http2_keepalive_timeout_ms": {
-          "description": "Timeout for a keepalive ping acknowledgement in milliseconds. **Server-mode only.**",
+          "description": "Timeout for a keepalive ping acknowledgement in milliseconds. Applies in both modes.",
           "type": [
             "integer",
             "null"
@@ -1155,7 +1171,7 @@
           "minimum": 0
         },
         "initial_connection_window_size": {
-          "description": "HTTP/2 connection-level initial window size in bytes. **Server-mode only.**",
+          "description": "HTTP/2 connection-level initial window size in bytes. Applies in both modes.",
           "type": [
             "integer",
             "null"
@@ -1165,7 +1181,7 @@
           "minimum": 0
         },
         "initial_stream_window_size": {
-          "description": "HTTP/2 stream-level initial window size in bytes. **Server-mode only.**",
+          "description": "HTTP/2 stream-level initial window size in bytes. Applies in both modes.",
           "type": [
             "integer",
             "null"
@@ -1175,7 +1191,7 @@
           "minimum": 0
         },
         "max_decoding_message_size": {
-          "description": "Maximum size of a decoded incoming message in bytes. **Server-mode only.** Default 4 MiB.",
+          "description": "Maximum size of a decoded incoming message in bytes. Applies in both modes. Default 4 MiB.",
           "type": [
             "integer",
             "null"
@@ -1184,10 +1200,45 @@
           "default": null,
           "minimum": 0
         },
+        "max_encoding_message_size": {
+          "description": "Maximum size of an encoded outgoing message in bytes. Default unlimited.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "default": null,
+          "minimum": 0
+        },
+        "method_name": {
+          "description": "RPC method name for dynamic client mode.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "request": {
+          "description": "JSON request mapped to the dynamic protobuf input message.",
+          "default": null
+        },
         "server_mode": {
           "description": "If `true`, start an embedded tonic gRPC server that accepts incoming `Publish` /\n`PublishBatch` RPCs. If `false` (the default), connect to a remote server as a client.",
           "type": "boolean",
           "default": false
+        },
+        "server_streaming": {
+          "description": "Use a server-streaming dynamic RPC. False selects unary.",
+          "type": "boolean",
+          "default": false
+        },
+        "service_name": {
+          "description": "Fully-qualified protobuf service name for dynamic client mode.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
         },
         "shared": {
           "description": "(Publisher only) Share one gRPC channel per connection (default: true); false forces a dedicated channel.",
@@ -1835,6 +1886,19 @@
       "description": "An enumeration of all supported middleware types.",
       "oneOf": [
         {
+          "description": "Renders a template into the `mqb.id` metadata key, e.g. `id: \"${payload:order_id}\"`.\nConsumer-only; list it *after* anything that reads `mqb.id`, since the last consumer\nmiddleware in the list runs first.",
+          "type": "object",
+          "properties": {
+            "id": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "id"
+          ]
+        },
+        {
           "type": "object",
           "properties": {
             "deduplication": {
@@ -2015,17 +2079,17 @@
       ]
     },
     "MongoConsume": {
-      "description": "How a MongoDB endpoint consumes a collection. One intent-named selector — the bridge picks the\nunderlying mechanism (change stream vs. polling) automatically. Defaults to `consumer`.",
+      "description": "How a MongoDB endpoint consumes a collection. One intent-named selector — the bridge picks the\nunderlying mechanism (change stream vs. polling) automatically. Defaults to `capture_all`.",
       "oneOf": [
         {
-          "description": "**Queue** — competing consumers: claim, process, delete, so each document goes to exactly one\nreader. Default. Destructive and ~5x slower than `capture_all`; for jobs, not bulk reads.",
+          "description": "**Queue** — competing consumers: claim, process, delete, so each document goes to exactly one\nreader. Destructive and intended for jobs, not bulk reads.",
           "type": "string",
           "const": "consumer"
         },
         {
-          "description": "**Queue, ephemeral** — receive only new messages, no durable position (fan-out subscriber).",
+          "description": "**One-shot read** — page documents by `_id`, then end the route. Non-destructive and\nnon-resumable; needs no replica set and reads arbitrary collections. This is not a\npoint-in-time snapshot: separate page queries can observe concurrent inserts and deletes,\nwhile inserts below the current `_id` high-water mark can be missed.",
           "type": "string",
-          "const": "subscriber"
+          "const": "snapshot"
         },
         {
           "description": "**Watch existing collection** — capture changes from now on (insert/update/delete), resuming\nunder `cursor_id`. Reads an existing collection non-destructively; never ends on drain.",
@@ -2033,7 +2097,7 @@
           "const": "capture_new"
         },
         {
-          "description": "**Watch existing collection** — read the existing documents first, then capture changes.\nNon-destructive and the fastest read mode; use this for bulk reads and ETL.",
+          "description": "**Watch existing collection** — read the existing documents first, then capture changes.\nNon-destructive and the fastest read mode; use this for bulk reads and ETL. Default.\nNeeds a replica set; on a standalone `mongod` use `snapshot` or `consumer`.",
           "type": "string",
           "const": "capture_all"
         }
@@ -2052,7 +2116,7 @@
           "format": "int64"
         },
         "change_stream": {
-          "description": "(Consumer only) **Deprecated** — use `consume: subscriber`. Kept for compatibility.",
+          "description": "(Consumer only) **Deprecated** — use `consume: capture_new`. Kept for compatibility.",
           "type": "boolean",
           "default": false
         },
@@ -2072,7 +2136,7 @@
           ]
         },
         "consume": {
-          "description": "(Consumer only) How to consume the collection: `consumer` (default, competing-consumers work\nqueue — destructive and ~5x slower), `subscriber` (ephemeral queue), `capture_new` (watch an\nexisting collection for changes), or `capture_all` (read existing documents first, then watch\nfor changes — use this for single-reader bulk reads and ETL). The bridge selects the\nunderlying mechanism automatically. If unset, the deprecated `change_stream` boolean is\nhonored for backward compatibility.",
+          "description": "(Consumer only) How to consume the collection: `capture_all` (default, read existing\ndocuments first, then watch for changes — non-destructive, for bulk reads and ETL),\n`capture_new` (watch an existing collection for changes only), `snapshot` (one-shot\nnon-destructive read that ends on drain, the option without a replica set), or\n`consumer` (competing-consumers work queue — destructive and intended for jobs).\nThe bridge selects the underlying mechanism automatically. If unset, the deprecated\n`change_stream` boolean is honored for backward compatibility.",
           "anyOf": [
             {
               "$ref": "#/$defs/MongoConsume"
@@ -2099,7 +2163,7 @@
           "default": "normal"
         },
         "id_field": {
-          "description": "(Publisher only) Top-level payload field whose value becomes the document `_id`, for\nidempotent inserts via the unique `_id` index. Sink collections only.",
+          "description": "(Publisher only) Top-level payload field whose value becomes the document `_id`, or a\nreplay-stable `${...}` template such as `${metadata:mqb.id}`. Enables idempotent inserts\nthrough MongoDB's unique `_id` index. Sink collections only.",
           "type": [
             "string",
             "null"
@@ -2894,10 +2958,10 @@
           "default": false
         },
         "batch_size": {
-          "description": "(Optional) Maximum number of messages to process in a single batch. The consumer waits for at least one message\nand then attempts to fetch more if available. Increasing this improves throughput but also increases\nthe potential impact of a single batch processing failure. Defaults to 1.",
+          "description": "(Optional) Maximum number of messages to process in a single batch. The consumer waits for at least one message\nand then attempts to fetch more if available. Increasing this improves throughput but also increases\nthe potential impact of a single batch processing failure. Defaults to 512.",
           "type": "integer",
           "format": "uint",
-          "default": 1,
+          "default": 512,
           "minimum": 1
         },
         "commit_concurrency_limit": {
@@ -3545,20 +3609,29 @@
       ]
     },
     "ZeroMqBackend": {
-      "description": "ZeroMQ backend implementation.\n\n`zmq` (default) uses the `zeromq` crate (pure-Rust zmq.rs). `omq` uses\n`omq-tokio` (omq.rs) — much faster on the per-message `raw`/`raw_framed`\npath and adds CURVE/PLAIN security, but currently covers PUSH/PULL + PUB/SUB\nonly and requires the `zeromq-omq` build feature (MSRV 1.93).",
-      "type": "string",
-      "enum": [
-        "zmq",
-        "omq"
+      "description": "ZeroMQ backend implementation.\n\n`omq` uses `omq-tokio` (omq.rs) — much faster on the per-message `raw`/`raw_framed`\npath and adds CURVE/PLAIN security — and requires the `zeromq-omq` build feature\n(MSRV 1.93). `zmq` uses the `zeromq` crate (pure-Rust zmq.rs) and covers every\nsocket type.\n\n`try_omq` is the default: it picks `omq` when that feature is compiled in and the\nconfigured socket type is supported there, and falls back to `zmq` otherwise, so a\nbuild without `zeromq-omq` still runs. Name a backend explicitly to make the choice\na hard requirement instead — a missing feature is then a startup error.",
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "zmq",
+            "omq"
+          ]
+        },
+        {
+          "description": "Prefer `omq`, fall back to `zmq` when it is unavailable for this build or socket.",
+          "type": "string",
+          "const": "try_omq"
+        }
       ]
     },
     "ZeroMqConfig": {
       "type": "object",
       "properties": {
         "backend": {
-          "description": "Backend: `zmq` (default, the `zeromq` crate) or `omq` (the `omq-tokio` PoC — PUSH/PULL + PUB/SUB only). `omq` needs the `zeromq-omq` build feature.",
+          "description": "Backend: `try_omq` (default, prefer `omq` and fall back to `zmq`), `zmq` (the `zeromq` crate) or `omq` (the `omq-tokio` backend). `omq` needs the `zeromq-omq` build feature.",
           "$ref": "#/$defs/ZeroMqBackend",
-          "default": "zmq"
+          "default": "try_omq"
         },
         "bind": {
           "description": "If true, bind to the address. If false, connect.",
@@ -3566,12 +3639,12 @@
           "default": false
         },
         "format": {
-          "description": "Wire format: `json` wraps the CanonicalMessage; `raw` sends payload bytes per frame; `raw_framed` adds a JSON metadata frame. Default `json`.",
+          "description": "Wire format: `json` wraps the CanonicalMessage; `raw` sends payload bytes per frame; `raw_framed` adds a JSON metadata frame. Default `raw_framed`.\nREQ/REP replies are the exception: a REP peer always answers with a JSON array of\ncanonical messages and a REQ publisher always decodes one, whatever `format` is set to.",
           "$ref": "#/$defs/ZeroMqFormat",
-          "default": "json"
+          "default": "raw_framed"
         },
         "internal_buffer_size": {
-          "description": "Internal buffer size for the channel. Defaults to 128.",
+          "description": "Internal buffer size for the channel. Defaults to 128. `zmq` backend only — `omq`\napplies HWM backpressure on the socket itself and ignores this.",
           "type": [
             "integer",
             "null"
@@ -3621,7 +3694,7 @@
       ]
     },
     "ZeroMqFormat": {
-      "description": "ZeroMQ wire format.\n\n`json` wraps each message as a JSON CanonicalMessage (batched into one frame);\n`raw` sends/receives the payload bytes directly, one frame per message (metadata\nis not transmitted); `raw_framed` sends a two-frame message — a JSON metadata frame\nfollowed by the raw payload frame — keeping the payload binary-safe while still\ncarrying headers. Use `raw`/`raw_framed` for binary feeds such as JPEG, Avro or Protobuf.",
+      "description": "ZeroMQ wire format.\n\n`json` wraps each message as a JSON CanonicalMessage (batched into one frame);\n`raw` sends/receives the payload bytes directly, one frame per message (metadata\nis not transmitted); `raw_framed` (default) sends a two-frame message — a JSON metadata\nframe followed by the raw payload frame — keeping the payload binary-safe while still\ncarrying headers. Use `raw`/`raw_framed` for binary feeds such as JPEG, Avro or Protobuf.",
       "type": "string",
       "enum": [
         "json",

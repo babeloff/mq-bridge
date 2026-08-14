@@ -9,7 +9,7 @@
 //! message flow and appear wherever an endpoint is expected. Their config variants
 //! are tagged `"format": "structural_endpoint"` in the JSON schema.
 //!
-//! See `REFERENCE.md` for fields, defaults and examples.
+//! See `docs/REFERENCE.md` for fields, defaults and examples.
 
 pub mod fanout;
 pub mod null;

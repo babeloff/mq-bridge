@@ -116,8 +116,14 @@ zeromq_pipeline:
       url: "tcp://localhost:5556"
       socket_type: "push"
       bind: false
-      # format: "raw"         # send/receive raw payload bytes per frame instead of JSON-wrapping (e.g. JPEG, Protobuf)
-      # format: "raw_framed"  # like "raw" but prepends a JSON metadata frame so headers still travel. Default "json".
+      # format: "raw_framed"  # default: raw payload bytes with a JSON metadata frame in front, so headers still travel
+      # format: "raw"         # raw payload bytes per frame, no metadata (e.g. JPEG, Protobuf)
+      # format: "json"        # JSON-wrapped CanonicalMessage, whole batch in one frame
+      # backend: "try_omq"    # default: use the omq backend when built in, else zmq. Or pin "omq" / "zmq".
+      # NOTE: REQ/REP replies ignore `format`. A "rep" consumer always answers with a JSON
+      # array of canonical messages and a "req" publisher always decodes one, even under
+      # "raw"/"raw_framed" — there `format` still frames the request only. An external REP
+      # service answering a mq-bridge "req" endpoint has to reply in that JSON shape.
 
 # Route 8: PostgreSQL via SQLx
 sqlx_postgres_route:
@@ -329,6 +335,36 @@ orders_out:
 *   **gRPC**: a shared channel multiplexes over one HTTP/2 connection; at very high
     concurrency its max-concurrent-streams cap can bottleneck — `shared: false` gives a
     dedicated channel.
+
+### Dynamic gRPC sources
+
+The existing generated `mqbridge.Bridge` protocol remains the default. To call an
+arbitrary unary or server-streaming gRPC method, provide a compiled protobuf descriptor
+set plus the service, method, and JSON request:
+
+```yaml
+input:
+  grpc:
+    url: https://grpc.example.com:443
+    descriptor_set_path: proto/events.bin
+    service_name: events.EventService
+    method_name: Tail
+    server_streaming: true
+    request:
+      topic: audit
+```
+
+Generate the descriptor with imports included:
+
+```bash
+protoc --descriptor_set_out=proto/events.bin --include_imports -I proto proto/events.proto
+```
+
+Responses use protobuf's canonical JSON representation as the canonical message payload.
+Dynamic mode supports unary and server-streaming RPCs; client-streaming methods are
+rejected. A descriptor describes the wire format but does not define broker acknowledgement
+semantics, so dynamic sources have no generic ACK operation. Use the built-in
+`mqbridge.Bridge` mode when route-level ACK/NACK and at-least-once delivery are required.
 
 ### Specialized Endpoints
 

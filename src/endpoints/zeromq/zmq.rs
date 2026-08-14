@@ -107,6 +107,17 @@ impl ZeroMqPublisher {
                         Err(e) => {
                             tracing::error!(error = %e, "Failed to rebuild ZeroMQ REQ socket after a timeout; retrying on the next request");
                             needs_req_reset = true;
+                            let reset_error =
+                                zeromq::ZmqError::Other("ZeroMQ REQ socket reconstruction failed");
+                            match job {
+                                PublisherJob::Send(_, ack_tx) => {
+                                    let _ = ack_tx.send(Err(reset_error));
+                                }
+                                PublisherJob::Request(_, reply_tx) => {
+                                    let _ = reply_tx.send(Err(reset_error));
+                                }
+                            }
+                            continue;
                         }
                     }
                 }
@@ -134,6 +145,9 @@ impl ZeroMqPublisher {
                             };
                             match tokio::time::timeout(request_timeout, exchange).await {
                                 Ok(res) => {
+                                    if res.is_err() {
+                                        needs_req_reset = true;
+                                    }
                                     let _ = reply_tx.send(res);
                                 }
                                 Err(_) => {
@@ -220,8 +234,10 @@ impl ZeroMqPublisher {
                         continue;
                     }
                 };
-                // REQ/REP replies are never SUB traffic, so no topic cursor applies.
-                match ZeroMqConsumer::decode_batch(response_zmq, false, &self.format) {
+                // The REP side always answers with a JSON array of canonical messages
+                // (see the commit path), whatever `format` the request used. Replies are
+                // never SUB traffic either, so no topic cursor applies.
+                match ZeroMqConsumer::decode_batch(response_zmq, false, &ZeroMqFormat::Json) {
                     Ok(decoded) => responses.extend(decoded),
                     Err(e) => failed.push((message, PublisherError::NonRetryable(anyhow!(e)))),
                 }

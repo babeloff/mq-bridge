@@ -12,11 +12,17 @@ keywords = ["messaging", "kafka", "nats", "amqp", "cqrs"]
 categories = ["asynchronous", "network-programming"]
 
 [workspace]
-members = ["bindings-common", "python/mq-bridge-py", "node/mq-bridge-node"]
+members = [
+    "bindings-common",
+    "python/mq-bridge-py",
+    "node/mq-bridge-node",
+    "tests/fixtures/plugin-fixture",
+    "tests/fixtures/plugin-fixture-bad-abi",
+]
 resolver = "2"
 
 [workspace.package]
-version = "0.3.10"
+version = "0.4.0"
 
 [workspace.dependencies]
 anyhow = "1.0"
@@ -54,6 +60,7 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "ti
 # - "amqp" (lapin 4.10) requires Rust 1.88+; "http" (hyper-rustls 0.27) requires Rust 1.85+.
 # - "websocket" (tokio-websockets 0.13) requires Rust 1.89+.
 # - "mongodb" (mongodb 3.8) requires Rust 1.88+; "nats" (async-nats 0.50) requires Rust 1.88+.
+# - "plugin" (libloading 0.9) requires Rust 1.88+.
 # - "aws" (aws-sdk-*) may require a newer stable toolchain than the base MSRV.
 # Use `rustup override set stable` or a `rust-toolchain.toml` file when enabling these features.
 async-trait.workspace = true
@@ -67,6 +74,10 @@ async-channel = { version = "2.5" }
 # Unix sockets and Windows named pipes). Already in the tree transitively.
 tokio-util = { version = "0.7", features = ["codec"] }
 once_cell = { version = "1.21" }
+# Dynamic loading for native endpoint plugins (`plugin` feature). Pure Rust,
+# no C toolchain; the ABI itself lives in src/support/plugin_abi.rs.
+# 0.9 needs Rust 1.88+, like the amqp/mongodb/nats features.
+libloading = { version = "0.9", optional = true }
 # SHA-256 for hashing connection-registry identities so secret-bearing fields
 # (URL/TLS passwords) are never retained verbatim in cache keys.
 sha2 = "0.11"
@@ -172,7 +183,7 @@ zeromq = { version = "0.6", optional = true }
 # benchmarks and adds CURVE/PLAIN security, but requires MSRV 1.93 / edition
 # 2024 — so it is kept behind its own opt-in feature and out of `full`/`portable`
 # to preserve the crate's 1.85 MSRV on the default build.
-omq-tokio = { version = "0.20", optional = true }
+omq-tokio = { version = "0.21", optional = true }
 
 # Redis Streams. Pure-Rust client (no C bindings). TLS via rustls (ring), so
 # `rediss://` URLs work; webpki-roots ships the CA bundle so there's no system
@@ -183,6 +194,7 @@ redis = { version = "1.4", default-features = false, features = ["tokio-comp", "
 tonic = { version = "0.14", optional = true, default-features = false, features = ["codegen", "transport", "tls-webpki-roots"] }
 tonic-prost = { version = "0.14", optional = true }
 prost = { version = "0.14", optional = true, default-features = false, features = ["std", "derive"] }
+prost-reflect = { version = "0.16", optional = true, features = ["serde"] }
 tokio-stream = { version = "0.1", optional = true, features = ["net"] }
 
 url = { version = "2.5", optional = true }
@@ -217,7 +229,7 @@ float-roundtrip = ["serde_json/float_roundtrip"]
 # runtime the client is loaded lazily only when an ibm-mq endpoint is opened
 # (clear error if the client isn't installed). Use `ibm-mq-static` instead for
 # static linking.
-full = ["middleware", "mongodb", "kafka", "amqp", "nats", "mqtt", "http", "aws", "zeromq", "zeromq-omq", "redis-streams", "sled", "grpc", "sqlx", "clickhouse", "websocket", "postgres-cdc", "object-store", "rustls-aws-lc", "ibm-mq"]
+full = ["middleware", "plugin", "mongodb", "kafka", "amqp", "nats", "mqtt", "http", "aws", "zeromq", "zeromq-omq", "redis-streams", "sled", "grpc", "sqlx", "clickhouse", "websocket", "postgres-cdc", "object-store", "rustls-aws-lc", "ibm-mq"]
 
 # Endpoints that build across most OS targets (glibc/musl/Alpine, macOS,
 # Windows, aarch64/armv7) without a special toolchain — no librdkafka, protoc,
@@ -227,7 +239,7 @@ full = ["middleware", "mongodb", "kafka", "amqp", "nats", "mqtt", "http", "aws",
 # kafka (librdkafka), sqlx (libsqlite3-sys), grpc (protoc), ibm-mq/ibm-mq-static
 # (IBM C client). postgres-cdc is excluded too: its wire protocol is pure Rust
 # but it pulls in sqlx (C).
-portable = ["metrics", "dedup", "mongodb", "amqp", "nats", "mqtt", "http", "aws", "zeromq", "redis-streams", "clickhouse", "websocket", "object-store", "rustls-aws-lc"]
+portable = ["metrics", "dedup", "plugin", "mongodb", "amqp", "nats", "mqtt", "http", "aws", "zeromq", "redis-streams", "clickhouse", "websocket", "object-store", "rustls-aws-lc"]
 
 # Functionality features
 dedup = ["sled"]
@@ -238,6 +250,13 @@ compression = ["dep:flate2", "dep:lz4_flex", "dep:zstd"]
 # `encryption` field on the file/object_store endpoints.
 encryption = ["dep:chacha20poly1305", "dep:aes-gcm"]
 metrics = ["dep:metrics"]
+# Load endpoints from native plugin libraries at runtime (`mq_bridge::plugin`).
+# The endpoint itself lives in its own crate and package; see docs/PLUGINS.md.
+plugin = ["dep:libloading"]
+# Author an endpoint plugin: the export macro, the FFI adapters and the
+# conformance suite (`mq_bridge::plugin::sdk` / `::conformance`). Endpoint
+# crates enable this; hosts only need `plugin`.
+plugin-sdk = ["plugin"]
 test-utils = ["dep:tracing-appender", "dep:tracing-subscriber", "dep:serde_yaml_ng"]
 # Opt-in produce/consume-only isolation benchmarks (throwaway diagnostics, off by default)
 perf-diagnostics = ["test-utils"]
@@ -277,12 +296,13 @@ ibm-mq = ["dep:mqi", "mqi/dlopen2", "mqi/mqai", "mqi/mqc_9_3_0_0", "dep:libmqm-s
 # at build.
 ibm-mq-static = ["dep:mqi", "mqi/link", "mqi/mqc_9_3_0_0"]
 zeromq = ["dep:zeromq"]
-# PoC alternative ZeroMQ backend (omq.rs). Opt-in only; NOT in `full`/`portable`
-# because omq-tokio needs MSRV 1.93 / edition 2024. Covers PUSH/PULL + PUB/SUB.
+# Alternative ZeroMQ backend (omq.rs), covering PUSH/PULL, PUB/SUB and REQ/REP.
+# In `full` but not `portable`.
+# The default `backend: try_omq` uses it when present and falls back to zmq.
 zeromq-omq = ["dep:omq-tokio"]
 redis-streams = ["dep:redis"]
 # Note: The grpc feature requires protobuf-src which can significantly increase build times.
-grpc = ["tonic", "prost", "tokio-stream", "tonic-prost", "tonic-prost-build", "protoc-bin-vendored", "rustls"]
+grpc = ["tonic", "prost", "prost-reflect", "tokio-stream", "tonic-prost", "tonic-prost-build", "protoc-bin-vendored", "rustls"]
 sqlx = ["dep:sqlx", "url"]
 clickhouse = ["dep:reqwest", "dep:flate2", "dep:lz4_flex", "dep:zstd", "url"]
 # Cloud object-store checkpoint backend (S3/GCS/Azure/R2). Talks cloud REST via reqwest.

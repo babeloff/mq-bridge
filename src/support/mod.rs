@@ -5,7 +5,7 @@
 
 //! Cross-cutting support utilities used across endpoints and middleware:
 //! cryptographic primitives, payload (de)compression, `${...}` string
-//! interpolation, and the shared connection registry.
+//! interpolation, the shared connection registry, and the endpoint-plugin C ABI.
 
 pub mod base64_engine;
 #[cfg(feature = "compression")]
@@ -15,4 +15,7 @@ pub mod connection_registry;
 pub mod crypto;
 pub(crate) mod crypto_envelope;
 pub mod interpolation;
+/// The stable C ABI shared with dynamically loaded endpoint plugins.
+#[cfg(feature = "plugin")]
+pub mod plugin_abi;
 pub mod source_ranges;

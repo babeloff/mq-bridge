@@ -1,0 +1,16 @@
+[package]
+name = "mq-bridge-plugin-fixture-bad-abi"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+publish = false
+description = "A plugin built against an incompatible ABI major version, to test host rejection"
+license = "MIT"
+
+[lib]
+crate-type = ["cdylib"]
+doctest = false
+
+[dependencies]
+async-trait.workspace = true
+mq-bridge = { path = "../../..", default-features = false, features = ["plugin-sdk"] }

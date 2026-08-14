@@ -303,8 +303,21 @@ batch.commit(vec![MessageDisposition::Ack; batch.messages.len()]).await.unwrap()
 ```
 
 ## Extending mq-bridge
-- **Custom Endpoints:** Implement the `CustomEndpointFactory` trait and register your type.
-- **Custom Middleware:** Implement the `CustomMiddlewareFactory` trait.
+
+See **[EXTENDING.md](EXTENDING.md)** for the full guide, with worked examples in
+all three languages.
+
+- **Custom Endpoints:** Implement the `CustomEndpointFactory` trait and register it with
+  `extensions::register_endpoint_factory`. Any endpoint key mq-bridge does not recognise is
+  looked up in that registry, so a registered `pulsar` factory makes `input: { pulsar: {...} }`
+  work with no core change. Endpoints for transports we do not want in this repository's
+  dependency tree live in their own crates.
+- **Custom Middleware:** Implement the `CustomMiddlewareFactory` trait and register it with
+  `extensions::register_middleware_factory`; use it as `custom: { name, config }` in an
+  endpoint's `middlewares` list.
+- **From Python / Node:** `register_endpoint` / `register_middleware` (Python) and
+  `registerEndpoint` / `registerMiddleware` (Node) take a host-language object instead of a
+  Rust type, for endpoints that only have a Python/JS SDK.
 - **Typed Handlers:** Use `TypeHandler` to add new message types and logic.
 
 ## Configuration

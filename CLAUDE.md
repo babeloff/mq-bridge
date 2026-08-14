@@ -1,8 +1,8 @@
 # mq-bridge Project Context
 
 > **Looking for what middleware or structural endpoints exist, and how to configure them?**
-> [REFERENCE.md](REFERENCE.md) is the complete, authoritative list — every middleware
-> (`retry`, `dlq`, `transform`, `deduplication`, `weak_join`, `buffer`, `limiter`, `delay`,
+> [REFERENCE.md](docs/REFERENCE.md) is the complete, authoritative list — every middleware
+> (`retry`, `dlq`, `transform`, `id`, `deduplication`, `weak_join`, `buffer`, `limiter`, `delay`,
 > `cookie_jar`, `encryption`, `compression`, `metrics`, `random_panic`, `custom`) and every structural endpoint (`ref`,
 > `fanout`, `switch`, `request`, `response`, `reader`, `static`, `stream_buffer`, `null`,
 > `custom`), each with its fields, defaults, and a working YAML example. Do not infer these
@@ -79,6 +79,7 @@ src/
 │   ├── delay.rs         # Artificial delay
 │   ├── dlq.rs           # Dead-letter queue
 │   ├── encryption.rs    # AEAD payload encryption
+│   ├── id.rs            # Replay-stable business identity into `mqb.id`
 │   ├── limiter.rs       # Throughput limiting (msg/s)
 │   ├── metrics.rs       # Metrics collection
 │   ├── random_panic.rs  # Testing middleware

@@ -19,6 +19,7 @@ mod delay;
 mod dlq;
 #[cfg(feature = "encryption")]
 mod encryption;
+mod id;
 mod limiter;
 #[cfg(feature = "metrics")]
 mod metrics;
@@ -37,6 +38,7 @@ use delay::{DelayConsumer, DelayPublisher};
 use dlq::DlqPublisher;
 #[cfg(feature = "encryption")]
 use encryption::{EncryptionConsumer, EncryptionPublisher};
+use id::IdConsumer;
 use limiter::{LimiterConsumer, LimiterPublisher};
 #[cfg(feature = "metrics")]
 use metrics::{MetricsConsumer, MetricsPublisher};
@@ -56,6 +58,7 @@ pub async fn apply_middlewares_to_consumer(
 ) -> Result<Box<dyn MessageConsumer>> {
     for middleware in endpoint.middlewares.iter().rev() {
         consumer = match middleware {
+            Middleware::Id(template) => Box::new(IdConsumer::new(consumer, template)?),
             #[cfg(feature = "dedup")]
             Middleware::Deduplication(cfg) => {
                 Box::new(DeduplicationConsumer::new(consumer, cfg, route_name).await?)
@@ -118,7 +121,7 @@ pub async fn apply_middlewares_to_consumer(
 /// ```
 ///
 /// Reversing those two would put `retry` outside `dlq`, so the DLQ would never see an
-/// exhausted-retry failure. See `REFERENCE.md` for the full ordering rules.
+/// exhausted-retry failure. See `docs/REFERENCE.md` for the full ordering rules.
 ///
 /// A route handler is wrapped *around* the result of this function (see `wrap_handler` in
 /// `endpoints/mod.rs`), so it runs once per message and nothing here re-invokes it.
@@ -129,6 +132,13 @@ pub async fn apply_middlewares_to_publisher(
 ) -> Result<Arc<dyn MessagePublisher>> {
     for middleware in &endpoint.middlewares {
         publisher = match middleware {
+            // Consumer-only: identity is derived where a record enters the pipeline, so that
+            // everything downstream — dedup, sink keying, handlers — sees the same value.
+            Middleware::Id(_) => {
+                return Err(anyhow::anyhow!(
+                    "[middleware:{route_name}] `id` is a consumer-only middleware and does nothing on an output endpoint. Move it to the route's input endpoint."
+                ))
+            }
             Middleware::Dlq(cfg) => Box::new(DlqPublisher::new(publisher, cfg, route_name).await?),
             #[cfg(feature = "metrics")]
             Middleware::Metrics(cfg) => {

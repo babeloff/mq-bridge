@@ -12,6 +12,7 @@ requires-python = ">=3.9"
 dependencies = [
   "typing-extensions>=4.0",
 ]
+
 license = { text = "MIT" }
 license-files = ["LICENSE.python"]
 keywords = ["messaging", "tokio", "pyo3", "maturin", "mq-bridge"]
@@ -26,6 +27,9 @@ classifiers = [
   "Programming Language :: Python :: 3.13",
   "Programming Language :: Rust",
 ]
+
+[project.optional-dependencies]
+plugin-packaging = ["build>=1", "wheel>=0.45"]
 
 [project.urls]
 Homepage = "https://github.com/marcomq/mq-bridge"

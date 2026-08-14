@@ -3,6 +3,25 @@
 //  Licensed under MIT License, see License file for more details
 //  git clone https://github.com/marcomq/mq-bridge
 
+//! Configuration types: every endpoint config, middleware and option struct the
+//! YAML/JSON/env layers deserialize into. Everything that is not a definition lives in a
+//! submodule — defaults, hand-written serde impls, builder methods and secret extraction —
+//! and is glob-imported back here, so the function names in `serde(default = "...")` and
+//! `schemars(transform = ...)` attributes keep resolving in this module.
+
+mod builders;
+mod defaults;
+mod secrets;
+mod serde_support;
+#[cfg(test)]
+mod tests;
+
+use defaults::*;
+use serde_support::*;
+
+pub use defaults::DEFAULT_KAFKA_PARTITIONS;
+pub use secrets::{extract_config_secrets, SecretExtractor};
+
 use serde::{
     de::{MapAccess, Visitor},
     Deserialize, Deserializer, Serialize,
@@ -98,16 +117,6 @@ pub struct Route {
     pub options: RouteOptions,
 }
 
-impl Default for Route {
-    fn default() -> Self {
-        Self {
-            input: Endpoint::null(),
-            output: Endpoint::null(),
-            options: RouteOptions::default(),
-        }
-    }
-}
-
 /// Fine-tuning options for a route's execution.
 ///
 /// These options control concurrency, batching, and commit behavior for message processing.
@@ -140,7 +149,7 @@ pub struct RouteOptions {
     pub concurrency: usize,
     /// (Optional) Maximum number of messages to process in a single batch. The consumer waits for at least one message
     /// and then attempts to fetch more if available. Increasing this improves throughput but also increases
-    /// the potential impact of a single batch processing failure. Defaults to 1.
+    /// the potential impact of a single batch processing failure. Defaults to 512.
     #[serde(default = "default_batch_size")]
     #[cfg_attr(feature = "schema", schemars(range(min = 1)))]
     pub batch_size: usize,
@@ -171,147 +180,6 @@ pub struct RouteOptions {
     pub exit_on_empty: bool,
 }
 
-impl Default for RouteOptions {
-    fn default() -> Self {
-        Self {
-            description: String::new(),
-            concurrency: default_concurrency(),
-            batch_size: default_batch_size(),
-            commit_concurrency_limit: default_commit_concurrency_limit(),
-            startup_timeout_ms: default_startup_timeout_ms(),
-            reconnect_interval_ms: default_reconnect_interval_ms(),
-            empty_batch_delay_ms: default_empty_batch_delay_ms(),
-            allow_fault_injection: false,
-            exit_on_empty: false,
-        }
-    }
-}
-
-impl RouteOptions {
-    pub fn validate(&self) -> anyhow::Result<()> {
-        if self.concurrency == 0 {
-            return Err(anyhow::anyhow!("route concurrency must be at least 1"));
-        }
-        if self.batch_size == 0 {
-            return Err(anyhow::anyhow!("route batch_size must be at least 1"));
-        }
-        if self.commit_concurrency_limit == 0 {
-            return Err(anyhow::anyhow!(
-                "route commit_concurrency_limit must be at least 1"
-            ));
-        }
-        Ok(())
-    }
-}
-
-pub(crate) fn default_concurrency() -> usize {
-    1
-}
-
-pub(crate) fn default_batch_size() -> usize {
-    1
-}
-
-pub(crate) fn default_commit_concurrency_limit() -> usize {
-    4096
-}
-
-pub(crate) fn default_startup_timeout_ms() -> u64 {
-    5000
-}
-
-pub(crate) fn default_reconnect_interval_ms() -> u64 {
-    5000
-}
-
-pub(crate) fn default_empty_batch_delay_ms() -> u64 {
-    10
-}
-
-fn is_false(value: &bool) -> bool {
-    !*value
-}
-
-fn default_false() -> bool {
-    false
-}
-
-#[cfg(feature = "schema")]
-fn default_inline_response_fast_path_schema() -> Option<bool> {
-    Some(true)
-}
-
-/// Schema default for `shared` fields, whose runtime default is `true`.
-#[cfg(feature = "schema")]
-fn default_shared_schema() -> Option<bool> {
-    Some(true)
-}
-
-/// Schema default for Kafka `partitions`, whose runtime default is 6.
-#[cfg(feature = "schema")]
-fn default_kafka_partitions_schema() -> Option<i32> {
-    Some(DEFAULT_KAFKA_PARTITIONS)
-}
-
-/// Partition count used when auto-creating a Kafka topic if none is configured.
-/// ordering is per-key (we key by message_id), not global across the topic if > 1
-pub const DEFAULT_KAFKA_PARTITIONS: i32 = 6;
-
-fn default_output_endpoint() -> Endpoint {
-    Endpoint::new(EndpointType::Null)
-}
-
-fn default_retry_attempts() -> usize {
-    3
-}
-fn default_initial_interval_ms() -> u64 {
-    100
-}
-fn default_max_interval_ms() -> u64 {
-    5000
-}
-fn default_multiplier() -> f64 {
-    2.0
-}
-fn default_clean_session() -> bool {
-    false
-}
-fn default_cookie_metadata_key() -> String {
-    "cookie".to_string()
-}
-fn default_set_cookie_metadata_key() -> String {
-    "set-cookie".to_string()
-}
-
-fn is_known_endpoint_name(name: &str) -> bool {
-    matches!(
-        name,
-        "aws"
-            | "kafka"
-            | "nats"
-            | "file"
-            | "static"
-            | "memory"
-            | "sled"
-            | "amqp"
-            | "mongodb"
-            | "mqtt"
-            | "http"
-            | "websocket"
-            | "ibmmq"
-            | "zeromq"
-            | "grpc"
-            | "fanout"
-            | "stream_buffer"
-            | "ref"
-            | "switch"
-            | "response"
-            | "reader"
-            | "null"
-            | "sqlx"
-    )
-}
-
 /// Represents a connection point for messages, which can be a source (input) or a sink (output).
 #[derive(Serialize, Clone, Default)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
@@ -330,221 +198,6 @@ pub struct Endpoint {
     #[cfg_attr(feature = "schema", schemars(skip))]
     /// Internal handler for processing messages (not serialized).
     pub handler: Option<Arc<dyn Handler>>,
-}
-
-impl std::fmt::Debug for Endpoint {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Endpoint")
-            .field("middlewares", &self.middlewares)
-            .field("endpoint_type", &self.endpoint_type)
-            .field(
-                "handler",
-                &if self.handler.is_some() {
-                    "Some(<Handler>)"
-                } else {
-                    "None"
-                },
-            )
-            .finish()
-    }
-}
-
-impl<'de> Deserialize<'de> for Endpoint {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        struct EndpointVisitor;
-
-        impl<'de> Visitor<'de> for EndpointVisitor {
-            type Value = Endpoint;
-
-            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-                formatter.write_str("a map representing an endpoint, the string \"null\", or null")
-            }
-
-            fn visit_unit<E>(self) -> Result<Self::Value, E>
-            where
-                E: serde::de::Error,
-            {
-                Ok(Endpoint::new(EndpointType::Null))
-            }
-
-            /// Unit variants of `EndpointType` serialize as a bare string (and are advertised
-            /// that way in the JSON schema). `Null` is currently the only one.
-            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
-            where
-                E: serde::de::Error,
-            {
-                if value == "null" {
-                    Ok(Endpoint::new(EndpointType::Null))
-                } else {
-                    Err(serde::de::Error::unknown_variant(value, &["null"]))
-                }
-            }
-
-            fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
-            where
-                E: serde::de::Error,
-            {
-                self.visit_str(&value)
-            }
-
-            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
-            where
-                A: MapAccess<'de>,
-            {
-                // Buffer the map into a temporary serde_json::Map.
-                // This allows us to separate the `middlewares` field from the rest.
-                let mut temp_map = serde_json::Map::new();
-                let mut middlewares_val = None;
-
-                while let Some((key, value)) = map.next_entry::<String, serde_json::Value>()? {
-                    if key == "middlewares" {
-                        middlewares_val = Some(value);
-                    } else {
-                        temp_map.insert(key, value);
-                    }
-                }
-
-                // Deserialize the rest of the map into the flattened EndpointType.
-                let temp_val = serde_json::Value::Object(temp_map);
-                let endpoint_type: EndpointType = match serde_json::from_value(temp_val.clone()) {
-                    Ok(et) => et,
-                    Err(original_err) => {
-                        if let serde_json::Value::Object(map) = &temp_val {
-                            if map.len() == 1 {
-                                let (name, config) = map.iter().next().unwrap();
-                                if is_known_endpoint_name(name) {
-                                    return Err(serde::de::Error::custom(original_err));
-                                }
-                                trace!("Falling back to Custom endpoint for key: {}", name);
-                                EndpointType::Custom {
-                                    name: name.clone(),
-                                    config: config.clone(),
-                                }
-                            } else if map.is_empty() {
-                                EndpointType::Null
-                            } else {
-                                return Err(serde::de::Error::custom(
-                                    "Invalid endpoint configuration: multiple keys found or unknown endpoint type",
-                                ));
-                            }
-                        } else {
-                            return Err(serde::de::Error::custom("Invalid endpoint configuration"));
-                        }
-                    }
-                };
-
-                // Deserialize the extracted middlewares value using the existing helper logic.
-                let middlewares = match middlewares_val {
-                    Some(val) => {
-                        deserialize_middlewares_from_value(val).map_err(serde::de::Error::custom)?
-                    }
-                    None => Vec::new(),
-                };
-
-                Ok(Endpoint {
-                    middlewares,
-                    endpoint_type,
-                    handler: None,
-                })
-            }
-        }
-
-        deserializer.deserialize_any(EndpointVisitor)
-    }
-}
-
-fn is_known_middleware_name(name: &str) -> bool {
-    matches!(
-        name,
-        "deduplication"
-            | "metrics"
-            | "dlq"
-            | "retry"
-            | "random_panic"
-            | "delay"
-            | "weak_join"
-            | "limiter"
-            | "buffer"
-            | "cookie_jar"
-            | "custom"
-    )
-}
-
-/// Deserialize middlewares from a generic serde_json::Value.
-///
-/// This logic was extracted from `deserialize_middlewares_from_map_or_seq` to be reused by the custom `Endpoint` deserializer.
-fn deserialize_middlewares_from_value(value: serde_json::Value) -> anyhow::Result<Vec<Middleware>> {
-    let arr = match value {
-        serde_json::Value::Array(arr) => arr,
-        serde_json::Value::Object(map) => {
-            let mut middlewares: Vec<_> = map
-                .into_iter()
-                // The config crate can produce maps with numeric string keys ("0", "1", ...)
-                // from environment variables. We need to sort by these keys to maintain order.
-                .filter_map(|(key, value)| key.parse::<usize>().ok().map(|index| (index, value)))
-                .collect();
-            middlewares.sort_by_key(|(index, _)| *index);
-
-            middlewares.into_iter().map(|(_, value)| value).collect()
-        }
-        _ => return Err(anyhow::anyhow!("Expected an array or object")),
-    };
-
-    let mut middlewares = Vec::new();
-    for item in arr {
-        // Check if it is a map with a single key that matches a known middleware
-        let known_name = if let serde_json::Value::Object(map) = &item {
-            if map.len() == 1 {
-                let (name, _) = map.iter().next().unwrap();
-                if is_known_middleware_name(name) {
-                    Some(name.clone())
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        if let Some(name) = known_name {
-            match serde_json::from_value::<Middleware>(item.clone()) {
-                Ok(m) => middlewares.push(m),
-                Err(e) => {
-                    return Err(anyhow::anyhow!(
-                        "Failed to deserialize known middleware '{}': {}",
-                        name,
-                        e
-                    ))
-                }
-            }
-        } else if let Ok(m) = serde_json::from_value::<Middleware>(item.clone()) {
-            middlewares.push(m);
-        } else if let serde_json::Value::Object(map) = &item {
-            if map.len() == 1 {
-                let (name, config) = map.iter().next().unwrap();
-                middlewares.push(Middleware::Custom {
-                    name: name.clone(),
-                    config: config.clone(),
-                });
-            } else {
-                return Err(anyhow::anyhow!(
-                    "Invalid middleware configuration: {:?}",
-                    item
-                ));
-            }
-        } else {
-            return Err(anyhow::anyhow!(
-                "Invalid middleware configuration: {:?}",
-                item
-            ));
-        }
-    }
-    Ok(middlewares)
 }
 
 /// Configuration for the `static` endpoint.
@@ -584,121 +237,6 @@ pub struct StaticConfig {
     pub raw: bool,
     /// Extra metadata entries attached to the produced message.
     pub metadata: std::collections::HashMap<String, String>,
-}
-
-// Hand-written schema: the `Deserialize` impl below accepts either a bare string
-// or a map where only `body` is required, so the derived all-fields-required
-// object schema would reject valid configs.
-#[cfg(feature = "schema")]
-impl schemars::JsonSchema for StaticConfig {
-    fn schema_name() -> std::borrow::Cow<'static, str> {
-        "StaticConfig".into()
-    }
-
-    fn json_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
-        schemars::json_schema!({
-            "description": "Configuration for the `static` endpoint. Accepts either a bare string (the response body, JSON-encoded for backward compatibility) or a map where only `body` is required and `raw` / `metadata` are optional.",
-            "oneOf": [
-                {
-                    "type": "string",
-                    "description": "The response body, JSON-encoded as a string."
-                },
-                {
-                    "type": "object",
-                    "properties": {
-                        "body": {
-                            "type": "string",
-                            "description": "The static response body."
-                        },
-                        "raw": {
-                            "type": "boolean",
-                            "description": "Send the body verbatim instead of JSON-encoding it as a string.",
-                            "default": false
-                        },
-                        "metadata": {
-                            "type": "object",
-                            "description": "Extra metadata entries attached to the produced message.",
-                            "additionalProperties": { "type": "string" }
-                        }
-                    },
-                    "required": ["body"],
-                    "additionalProperties": false
-                }
-            ]
-        })
-    }
-}
-
-impl Serialize for StaticConfig {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        // Backward-compatible: when no extra options are set, serialize as a bare
-        // string exactly like the historical `Static(String)` so configs written
-        // by this version remain readable by older versions.
-        if !self.raw && self.metadata.is_empty() {
-            return serializer.serialize_str(&self.body);
-        }
-        use serde::ser::SerializeStruct;
-        let mut state = serializer.serialize_struct("StaticConfig", 3)?;
-        state.serialize_field("body", &self.body)?;
-        state.serialize_field("raw", &self.raw)?;
-        state.serialize_field("metadata", &self.metadata)?;
-        state.end()
-    }
-}
-
-impl From<String> for StaticConfig {
-    fn from(body: String) -> Self {
-        StaticConfig {
-            body,
-            raw: false,
-            metadata: std::collections::HashMap::new(),
-        }
-    }
-}
-
-impl From<&str> for StaticConfig {
-    fn from(body: &str) -> Self {
-        StaticConfig::from(body.to_string())
-    }
-}
-
-impl<'de> Deserialize<'de> for StaticConfig {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        #[derive(Deserialize)]
-        #[serde(untagged)]
-        enum Repr {
-            Str(String),
-            Map {
-                body: String,
-                #[serde(default)]
-                raw: bool,
-                #[serde(default)]
-                metadata: std::collections::HashMap<String, String>,
-            },
-        }
-        Ok(match Repr::deserialize(deserializer)? {
-            Repr::Str(body) => StaticConfig {
-                body,
-                raw: false,
-                metadata: std::collections::HashMap::new(),
-            },
-            Repr::Map {
-                body,
-                raw,
-                metadata,
-            } => StaticConfig {
-                body,
-                raw,
-                metadata,
-            },
-        })
-    }
 }
 
 /// An enumeration of all supported endpoint types.
@@ -776,60 +314,6 @@ pub enum EndpointType {
     Null,
 }
 
-impl EndpointType {
-    pub fn name(&self) -> &'static str {
-        match self {
-            EndpointType::Aws(_) => "aws",
-            EndpointType::Kafka(_) => "kafka",
-            EndpointType::Nats(_) => "nats",
-            EndpointType::File(_) => "file",
-            EndpointType::ObjectStore(_) => "object_store",
-            EndpointType::Static(_) => "static",
-            EndpointType::Ref(_) => "ref",
-            EndpointType::Memory(_) => "memory",
-            EndpointType::Sled(_) => "sled",
-            EndpointType::Amqp(_) => "amqp",
-            EndpointType::MongoDb(_) => "mongodb",
-            EndpointType::Mqtt(_) => "mqtt",
-            EndpointType::Http(_) => "http",
-            EndpointType::WebSocket(_) => "websocket",
-            EndpointType::IbmMq(_) => "ibmmq",
-            EndpointType::ZeroMq(_) => "zeromq",
-            EndpointType::RedisStreams(_) => "redis_streams",
-            EndpointType::Grpc(_) => "grpc",
-            EndpointType::Sqlx(_) => "sqlx",
-            EndpointType::ClickHouse(_) => "clickhouse",
-            EndpointType::PostgresCdc(_) => "postgres_cdc",
-            EndpointType::Fanout(_) => "fanout",
-            EndpointType::StreamBuffer(_) => "stream_buffer",
-            EndpointType::Switch(_) => "switch",
-            EndpointType::Response(_) => "response",
-            EndpointType::Reader(_) => "reader",
-            EndpointType::Request(_) => "request",
-            EndpointType::Custom { .. } => "custom",
-            EndpointType::Null => "null",
-        }
-    }
-
-    pub fn is_core(&self) -> bool {
-        matches!(
-            self,
-            EndpointType::File(_)
-                | EndpointType::Static(_)
-                | EndpointType::Ref(_)
-                | EndpointType::Memory(_)
-                | EndpointType::Fanout(_)
-                | EndpointType::StreamBuffer(_)
-                | EndpointType::Switch(_)
-                | EndpointType::Response(_)
-                | EndpointType::Reader(_)
-                | EndpointType::Request(_)
-                | EndpointType::Custom { .. }
-                | EndpointType::Null
-        )
-    }
-}
-
 /// AEAD cipher selection for [`EncryptionConfig`].
 #[derive(Debug, Deserialize, Serialize, Clone, Copy, Default, PartialEq, Eq)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
@@ -864,26 +348,15 @@ pub struct EncryptionConfig {
     pub decrypt_keys: HashMap<String, String>,
 }
 
-fn default_encryption_key_id() -> String {
-    "default".to_string()
-}
-
-impl Default for EncryptionConfig {
-    fn default() -> Self {
-        Self {
-            cipher: CipherKind::default(),
-            key_id: default_encryption_key_id(),
-            key: String::new(),
-            decrypt_keys: HashMap::new(),
-        }
-    }
-}
-
 /// An enumeration of all supported middleware types.
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum Middleware {
+    /// Renders a template into the `mqb.id` metadata key, e.g. `id: "${payload:order_id}"`.
+    /// Consumer-only; list it *after* anything that reads `mqb.id`, since the last consumer
+    /// middleware in the list runs first.
+    Id(String),
     Deduplication(DeduplicationMiddleware),
     Metrics(MetricsMiddleware),
     Dlq(Box<DeadLetterQueueMiddleware>),
@@ -1049,19 +522,6 @@ pub struct CookieJarMiddleware {
     pub inject_metadata: HashMap<String, String>,
 }
 
-impl Default for CookieJarMiddleware {
-    fn default() -> Self {
-        Self {
-            shared_scope: None,
-            cookie_metadata_key: default_cookie_metadata_key(),
-            set_cookie_metadata_key: default_set_cookie_metadata_key(),
-            capture_metadata_keys: Vec::new(),
-            export_metadata_prefix: None,
-            inject_metadata: HashMap::new(),
-        }
-    }
-}
-
 /// Weak Join middleware configuration.
 ///
 /// Correlates messages by a metadata key and joins them within a timeout window.
@@ -1140,24 +600,6 @@ pub struct TransformMiddleware {
     pub on_error: TransformErrorPolicy,
 }
 
-// Hand-written rather than derived: `coerce` and `apply_defaults` default to *true*, which
-// a derived `Default` would silently turn into `false`. That would make
-// `TransformMiddleware { ..Default::default() }` in Rust behave differently from the same
-// config parsed from YAML.
-impl Default for TransformMiddleware {
-    fn default() -> Self {
-        Self {
-            mapping: HashMap::new(),
-            schema: None,
-            schema_file: None,
-            coerce: default_true(),
-            apply_defaults: default_true(),
-            coerce_empty_as_null: false,
-            on_error: TransformErrorPolicy::default(),
-        }
-    }
-}
-
 /// How one output field is produced from the input document.
 ///
 /// Either a bare path string (`"$.first_name"`) or an object with a `path` plus an
@@ -1185,16 +627,6 @@ pub struct DetailedMappingRule {
     /// Reject the message when the source path is absent and no `default` is set.
     #[serde(default)]
     pub required: bool,
-}
-
-impl MappingRule {
-    /// The source path this rule reads from.
-    pub fn path(&self) -> &str {
-        match self {
-            MappingRule::Path(p) => p,
-            MappingRule::Detailed(d) => &d.path,
-        }
-    }
 }
 
 /// Action taken on a message that fails to transform.
@@ -1227,18 +659,6 @@ pub enum FaultMode {
     Nack,
 }
 
-impl std::fmt::Display for FaultMode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            FaultMode::Panic => write!(f, "panic"),
-            FaultMode::Disconnect => write!(f, "disconnect"),
-            FaultMode::Timeout => write!(f, "timeout"),
-            FaultMode::JsonFormatError => write!(f, "json_format_error"),
-            FaultMode::Nack => write!(f, "nack"),
-        }
-    }
-}
-
 /// Middleware for fault injection testing.
 ///
 /// Allows testing error handling and recovery mechanisms by injecting faults
@@ -1268,22 +688,6 @@ pub struct RandomPanicMiddleware {
     #[serde(skip, default = "default_atomic_usize_arc")]
     #[cfg_attr(feature = "schema", schemars(skip))]
     pub message_count: Arc<AtomicUsize>,
-}
-
-fn default_true() -> bool {
-    true
-}
-
-fn default_atomic_usize_arc() -> Arc<AtomicUsize> {
-    Arc::new(AtomicUsize::new(0))
-}
-
-fn deserialize_null_as_false<'de, D>(deserializer: D) -> Result<bool, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let opt = Option::<bool>::deserialize(deserializer)?;
-    Ok(opt.unwrap_or(false))
 }
 
 // --- AWS Specific Configuration ---
@@ -1319,43 +723,6 @@ pub struct AwsConfig {
     /// Use binary payloads in SQS/SNS messages.
     #[serde(default)]
     pub binary_payload_mode: bool,
-}
-
-impl AwsConfig {
-    /// Creates a new AWS configuration with default settings.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn with_queue_url(mut self, queue_url: impl Into<String>) -> Self {
-        self.queue_url = Some(queue_url.into());
-        self
-    }
-
-    pub fn with_topic_arn(mut self, topic_arn: impl Into<String>) -> Self {
-        self.topic_arn = Some(topic_arn.into());
-        self
-    }
-
-    pub fn with_region(mut self, region: impl Into<String>) -> Self {
-        self.region = Some(region.into());
-        self
-    }
-
-    pub fn with_endpoint_url(mut self, endpoint_url: impl Into<String>) -> Self {
-        self.endpoint_url = Some(endpoint_url.into());
-        self
-    }
-
-    pub fn with_credentials(
-        mut self,
-        access_key: impl Into<String>,
-        secret_key: impl Into<String>,
-    ) -> Self {
-        self.access_key = Some(access_key.into());
-        self.secret_key = Some(secret_key.into());
-        self
-    }
 }
 
 // --- Kafka Specific Configuration ---
@@ -1414,56 +781,6 @@ pub struct KafkaConfig {
     pub partition_key: Option<String>,
 }
 
-impl KafkaConfig {
-    /// Creates a new Kafka configuration with the specified broker URL.
-    pub fn new(url: impl Into<String>) -> Self {
-        Self {
-            url: url.into(),
-            ..Default::default()
-        }
-    }
-
-    pub fn with_topic(mut self, topic: impl Into<String>) -> Self {
-        self.topic = Some(topic.into());
-        self
-    }
-
-    pub fn with_group_id(mut self, group_id: impl Into<String>) -> Self {
-        self.group_id = Some(group_id.into());
-        self
-    }
-
-    pub fn with_credentials(
-        mut self,
-        username: impl Into<String>,
-        password: impl Into<String>,
-    ) -> Self {
-        self.username = Some(username.into());
-        self.password = Some(password.into());
-        self
-    }
-
-    pub fn with_producer_option(
-        mut self,
-        key: impl Into<String>,
-        value: impl Into<String>,
-    ) -> Self {
-        let options = self.producer_options.get_or_insert_with(Vec::new);
-        options.push((key.into(), value.into()));
-        self
-    }
-
-    pub fn with_consumer_option(
-        mut self,
-        key: impl Into<String>,
-        value: impl Into<String>,
-    ) -> Self {
-        let options = self.consumer_options.get_or_insert_with(Vec::new);
-        options.push((key.into(), value.into()));
-        self
-    }
-}
-
 // --- Sled Specific Configuration ---
 
 /// General Sled database configuration
@@ -1481,26 +798,6 @@ pub struct SledConfig {
     /// (Consumer only) If true, delete messages after processing (Queue mode).
     #[serde(default)]
     pub delete_after_read: bool,
-}
-
-impl SledConfig {
-    /// Creates a new Sled configuration with the specified database path.
-    pub fn new(path: impl Into<String>) -> Self {
-        Self {
-            path: path.into(),
-            ..Default::default()
-        }
-    }
-
-    pub fn with_tree(mut self, tree: impl Into<String>) -> Self {
-        self.tree = Some(tree.into());
-        self
-    }
-
-    pub fn with_read_from_start(mut self, read_from_start: bool) -> Self {
-        self.read_from_start = read_from_start;
-        self
-    }
 }
 
 /// Format for messages written to or read from a file.
@@ -1539,10 +836,6 @@ pub enum Compression {
     Zstd,
 }
 
-fn default_compression_algorithm() -> Compression {
-    Compression::Zstd
-}
-
 /// Payload-compression middleware configuration.
 ///
 /// Compresses each message payload on the output side and decompresses it on the input
@@ -1560,15 +853,6 @@ pub struct CompressionMiddleware {
     /// Consumer side only; unset means no limit.
     #[serde(default)]
     pub max_decompressed_bytes: Option<u64>,
-}
-
-impl Default for CompressionMiddleware {
-    fn default() -> Self {
-        Self {
-            algorithm: default_compression_algorithm(),
-            max_decompressed_bytes: None,
-        }
-    }
 }
 
 // --- File Specific Configuration ---
@@ -1637,37 +921,6 @@ pub enum FileConsumerMode {
     },
 }
 
-impl Default for FileConsumerMode {
-    fn default() -> Self {
-        Self::Consume { delete: false }
-    }
-}
-
-impl FileConfig {
-    /// Creates a new File configuration with the specified path.
-    pub fn new(path: impl Into<String>) -> Self {
-        Self {
-            path: path.into(),
-            idempotency: false,
-            mode: Some(FileConsumerMode::default()),
-            delimiter: None,
-            format: FileFormat::default(),
-            compression: Compression::default(),
-            encryption: None,
-        }
-    }
-
-    pub fn with_mode(mut self, mode: FileConsumerMode) -> Self {
-        self.mode = Some(mode);
-        self
-    }
-
-    /// Returns the effective consumer mode, defaulting to `Consume` if not set.
-    pub fn effective_mode(&self) -> FileConsumerMode {
-        self.mode.clone().unwrap_or_default()
-    }
-}
-
 // --- Object Store (S3/GCS/Azure) Specific Configuration ---
 
 /// Configuration for a cloud object-store endpoint (S3, GCS, Azure Blob, R2, ...).
@@ -1724,25 +977,6 @@ pub struct ObjectStoreConfig {
     /// At-rest AEAD encryption applied after compression. Requires the `encryption` feature.
     #[serde(default)]
     pub encryption: Option<EncryptionConfig>,
-}
-
-impl Default for ObjectStoreConfig {
-    fn default() -> Self {
-        Self {
-            url: String::new(),
-            idempotency: false,
-            format: FileFormat::default(),
-            delimiter: None,
-            checkpoint_store: None,
-            cursor_id: None,
-            polling_interval_ms: None,
-            max_object_bytes: None,
-            date_partition: true,
-            extension: None,
-            compression: Compression::default(),
-            encryption: None,
-        }
-    }
 }
 
 // --- NATS Specific Configuration ---
@@ -1820,41 +1054,6 @@ pub enum NatsDeliverPolicy {
     LastPerSubject,
 }
 
-impl NatsConfig {
-    /// Creates a new NATS configuration with the specified server URL.
-    pub fn new(url: impl Into<String>) -> Self {
-        Self {
-            url: url.into(),
-            ..Default::default()
-        }
-    }
-
-    pub fn with_subject(mut self, subject: impl Into<String>) -> Self {
-        self.subject = Some(subject.into());
-        self
-    }
-
-    pub fn with_stream(mut self, stream: impl Into<String>) -> Self {
-        self.stream = Some(stream.into());
-        self
-    }
-
-    pub fn with_deliver_policy(mut self, policy: NatsDeliverPolicy) -> Self {
-        self.deliver_policy = Some(policy);
-        self
-    }
-
-    pub fn with_credentials(
-        mut self,
-        username: impl Into<String>,
-        password: impl Into<String>,
-    ) -> Self {
-        self.username = Some(username.into());
-        self.password = Some(password.into());
-        self
-    }
-}
-
 #[derive(Debug, Serialize, Clone, Default)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[cfg_attr(feature = "schema", schemars(transform = memory_config_schema_transform))]
@@ -1891,252 +1090,6 @@ pub struct MemoryConfig {
     pub enable_nack_overridden: bool,
 }
 
-impl MemoryConfig {
-    pub fn new(topic: impl Into<String>, capacity: Option<usize>) -> Self {
-        Self {
-            topic: topic.into(),
-            url: None,
-            capacity,
-            ..Default::default()
-        }
-    }
-
-    pub fn new_with_url(url: impl Into<String>, capacity: Option<usize>) -> Self {
-        let url = url.into();
-        Self {
-            topic: url.clone(),
-            url: Some(url),
-            capacity,
-            ..Default::default()
-        }
-    }
-
-    pub fn with_subscribe(self, subscribe_mode: bool) -> Self {
-        Self {
-            subscribe_mode,
-            ..self
-        }
-    }
-
-    pub fn with_request_reply(mut self, request_reply: bool) -> Self {
-        self.request_reply = request_reply;
-        self
-    }
-
-    /// Gets the effective transport identifier.
-    /// If topic contains ://, it's treated as a URL, otherwise as memory://topic.
-    pub fn get_transport_identifier(&self) -> anyhow::Result<String> {
-        let identifier = if !self.topic.is_empty() {
-            &self.topic
-        } else if let Some(url) = self.url.as_ref().filter(|url| !url.is_empty()) {
-            url
-        } else {
-            return Err(anyhow::anyhow!(
-                "MemoryConfig: 'topic' (or 'url' alias) is required."
-            ));
-        };
-
-        // If topic doesn't contain ://, treat it as memory://topic for backward compatibility
-        if identifier.contains("://") {
-            Ok(identifier.clone())
-        } else {
-            Ok(format!("memory://{}", identifier))
-        }
-    }
-
-    /// Check if the transport URL scheme suggests IPC (inter-process communication).
-    /// IPC transports should enable nack by default for reliability.
-    pub fn is_ipc_transport(&self) -> bool {
-        if let Ok(identifier) = self.get_transport_identifier() {
-            identifier.starts_with("ipc://")
-                || identifier.starts_with("unix://")
-                || identifier.starts_with("pipe://")
-        } else {
-            false
-        }
-    }
-
-    /// Apply smart defaults based on the transport type.
-    /// For IPC transports, enable_nack defaults to true for reliability.
-    pub fn with_smart_defaults(mut self) -> Self {
-        if !self.enable_nack_overridden && self.is_ipc_transport() {
-            self.enable_nack = true;
-        }
-        self
-    }
-}
-
-impl<'de> Deserialize<'de> for MemoryConfig {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        #[derive(Deserialize, Default)]
-        #[serde(deny_unknown_fields)]
-        struct MemoryConfigSerde {
-            #[serde(default)]
-            topic: String,
-            #[serde(default)]
-            url: Option<String>,
-            capacity: Option<usize>,
-            #[serde(default)]
-            request_reply: bool,
-            request_timeout_ms: Option<u64>,
-            #[serde(default)]
-            subscribe_mode: bool,
-            #[serde(default)]
-            enable_nack: Option<bool>,
-        }
-
-        let raw = MemoryConfigSerde::deserialize(deserializer)?;
-        if raw.topic.is_empty() && raw.url.as_deref().is_none_or(str::is_empty) {
-            return Err(serde::de::Error::custom(
-                "MemoryConfig: 'topic' (or 'url' alias) is required.",
-            ));
-        }
-        let topic = if raw.topic.is_empty() {
-            raw.url.clone().unwrap_or_default()
-        } else {
-            raw.topic
-        };
-        Ok(Self {
-            topic,
-            url: raw.url,
-            capacity: raw.capacity,
-            request_reply: raw.request_reply,
-            request_timeout_ms: raw.request_timeout_ms,
-            subscribe_mode: raw.subscribe_mode,
-            enable_nack: raw.enable_nack.unwrap_or(false),
-            enable_nack_overridden: raw.enable_nack.is_some(),
-        })
-    }
-}
-
-#[cfg(feature = "schema")]
-fn memory_config_schema_transform(schema: &mut schemars::Schema) {
-    let Some(schema_obj) = schema.as_object_mut() else {
-        return;
-    };
-
-    let Some(properties) = schema_obj
-        .get_mut("properties")
-        .and_then(serde_json::Value::as_object_mut)
-    else {
-        return;
-    };
-
-    properties.insert(
-        "url".to_string(),
-        serde_json::json!({
-            "description": "Alias for `topic`. Use either `topic` or `url`.",
-            "type": "string",
-            "minLength": 1
-        }),
-    );
-
-    // Mirror the runtime check (see `MemoryConfig::deserialize`): an empty
-    // `topic`/`url` is rejected, so the schema must require a non-empty value.
-    if let Some(topic) = properties
-        .get_mut("topic")
-        .and_then(serde_json::Value::as_object_mut)
-    {
-        topic.insert("minLength".to_string(), serde_json::json!(1));
-    }
-
-    schema_obj.insert(
-        "anyOf".to_string(),
-        serde_json::json!([
-            { "required": ["topic"] },
-            { "required": ["url"] }
-        ]),
-    );
-}
-
-/// `null` is a unit variant, so schemars emits it as the bare string `"null"` — which can
-/// never validate inside `Endpoint`'s object schema. Flattened, it serialises as
-/// `{ "null": null }`; rewrite the branch to that object form.
-#[cfg(feature = "schema")]
-fn endpoint_schema_transform(schema: &mut schemars::Schema) {
-    let Some(one_of) = schema
-        .as_object_mut()
-        .and_then(|schema_obj| schema_obj.get_mut("oneOf"))
-        .and_then(serde_json::Value::as_array_mut)
-    else {
-        return;
-    };
-
-    for branch in one_of.iter_mut() {
-        if branch.get("const") == Some(&serde_json::Value::String("null".to_string())) {
-            *branch = serde_json::json!({
-                "type": "object",
-                "format": "structural_endpoint",
-                "properties": { "null": { "type": "null" } },
-                "required": ["null"]
-            });
-        }
-    }
-}
-
-#[cfg(feature = "schema")]
-fn route_schema_transform(schema: &mut schemars::Schema) {
-    let Some(properties) = schema
-        .as_object_mut()
-        .and_then(|schema_obj| schema_obj.get_mut("properties"))
-        .and_then(serde_json::Value::as_object_mut)
-    else {
-        return;
-    };
-
-    // `output: null` (the documented "no output" form) is valid; accept an Endpoint or null.
-    // Input stays endpoint-only.
-    if let Some(output) = properties
-        .get_mut("output")
-        .and_then(serde_json::Value::as_object_mut)
-    {
-        let reference = output.remove("$ref");
-        let default = output.remove("default");
-        let description = output.remove("description");
-        output.clear();
-        let mut any_of = Vec::new();
-        if let Some(reference) = reference {
-            any_of.push(serde_json::json!({ "$ref": reference }));
-        }
-        any_of.push(serde_json::json!({ "type": "null" }));
-        output.insert("anyOf".to_string(), serde_json::Value::Array(any_of));
-        if let Some(description) = description {
-            output.insert("description".to_string(), description);
-        }
-        if let Some(default) = default {
-            output.insert("default".to_string(), default);
-        }
-    }
-
-    let Some(allow_fault_injection) = properties
-        .get_mut("allow_fault_injection")
-        .and_then(serde_json::Value::as_object_mut)
-    else {
-        return;
-    };
-
-    allow_fault_injection.insert("default".to_string(), serde_json::Value::Bool(false));
-}
-
-/// `schema` and `schema_file` are mutually exclusive; reject a config setting both.
-#[cfg(feature = "schema")]
-fn transform_middleware_schema_transform(schema: &mut schemars::Schema) {
-    if let Some(schema_obj) = schema.as_object_mut() {
-        // Only reject a non-null `schema_file` alongside `schema`; `schema_file: null`
-        // is allowed with `schema`, matching the runtime compiler (Option is None).
-        schema_obj.insert(
-            "not".to_string(),
-            serde_json::json!({
-                "required": ["schema", "schema_file"],
-                "properties": { "schema_file": { "type": "string" } }
-            }),
-        );
-    }
-}
-
 /// Configuration for the correlated in-process stream response buffer.
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
@@ -2154,32 +1107,6 @@ pub struct StreamBufferConfig {
     /// Capacity of each correlation partition. Defaults to 100.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capacity: Option<usize>,
-}
-
-impl StreamBufferConfig {
-    /// Creates a `stream_buffer` config for the given topic.
-    ///
-    /// Add `with_correlation_id` when constructing a consumer for one stream.
-    /// Leave the correlation id unset when constructing the publisher buffer
-    /// used by `HttpConfig::stream_response_to`.
-    pub fn new(topic: impl Into<String>) -> Self {
-        Self {
-            topic: topic.into(),
-            ..Default::default()
-        }
-    }
-
-    /// Selects the response stream partition that a consumer should read.
-    pub fn with_correlation_id(mut self, correlation_id: impl Into<String>) -> Self {
-        self.correlation_id = Some(correlation_id.into());
-        self
-    }
-
-    /// Sets the per-correlation partition capacity.
-    pub fn with_capacity(mut self, capacity: usize) -> Self {
-        self.capacity = Some(capacity);
-        self
-    }
 }
 
 // --- AMQP Specific Configuration ---
@@ -2225,36 +1152,6 @@ pub struct AmqpConfig {
     pub delayed_ack: bool,
 }
 
-impl AmqpConfig {
-    /// Creates a new AMQP configuration with the specified connection URL.
-    pub fn new(url: impl Into<String>) -> Self {
-        Self {
-            url: url.into(),
-            ..Default::default()
-        }
-    }
-
-    pub fn with_queue(mut self, queue: impl Into<String>) -> Self {
-        self.queue = Some(queue.into());
-        self
-    }
-
-    pub fn with_exchange(mut self, exchange: impl Into<String>) -> Self {
-        self.exchange = Some(exchange.into());
-        self
-    }
-
-    pub fn with_credentials(
-        mut self,
-        username: impl Into<String>,
-        password: impl Into<String>,
-    ) -> Self {
-        self.username = Some(username.into());
-        self.password = Some(password.into());
-        self
-    }
-}
-
 /// MongoDB message storage format.
 ///
 /// Determines how messages are stored and retrieved from MongoDB collections.
@@ -2270,22 +1167,26 @@ pub enum MongoDbFormat {
 }
 
 /// How a MongoDB endpoint consumes a collection. One intent-named selector — the bridge picks the
-/// underlying mechanism (change stream vs. polling) automatically. Defaults to `consumer`.
+/// underlying mechanism (change stream vs. polling) automatically. Defaults to `capture_all`.
 #[derive(Debug, Deserialize, Serialize, Clone, Copy, Default, PartialEq, Eq)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum MongoConsume {
     /// **Queue** — competing consumers: claim, process, delete, so each document goes to exactly one
-    /// reader. Default. Destructive and ~5x slower than `capture_all`; for jobs, not bulk reads.
-    #[default]
+    /// reader. Destructive and intended for jobs, not bulk reads.
     Consumer,
-    /// **Queue, ephemeral** — receive only new messages, no durable position (fan-out subscriber).
-    Subscriber,
+    /// **One-shot read** — page documents by `_id`, then end the route. Non-destructive and
+    /// non-resumable; needs no replica set and reads arbitrary collections. This is not a
+    /// point-in-time snapshot: separate page queries can observe concurrent inserts and deletes,
+    /// while inserts below the current `_id` high-water mark can be missed.
+    Snapshot,
     /// **Watch existing collection** — capture changes from now on (insert/update/delete), resuming
     /// under `cursor_id`. Reads an existing collection non-destructively; never ends on drain.
     CaptureNew,
     /// **Watch existing collection** — read the existing documents first, then capture changes.
-    /// Non-destructive and the fastest read mode; use this for bulk reads and ETL.
+    /// Non-destructive and the fastest read mode; use this for bulk reads and ETL. Default.
+    /// Needs a replica set; on a standalone `mongod` use `snapshot` or `consumer`.
+    #[default]
     CaptureAll,
 }
 
@@ -2321,12 +1222,13 @@ pub struct MongoDbConfig {
     /// (Publisher only) If true, the publisher will wait for a response in a dedicated collection. Defaults to false.
     #[serde(default)]
     pub request_reply: bool,
-    /// (Consumer only) How to consume the collection: `consumer` (default, competing-consumers work
-    /// queue — destructive and ~5x slower), `subscriber` (ephemeral queue), `capture_new` (watch an
-    /// existing collection for changes), or `capture_all` (read existing documents first, then watch
-    /// for changes — use this for single-reader bulk reads and ETL). The bridge selects the
-    /// underlying mechanism automatically. If unset, the deprecated `change_stream` boolean is
-    /// honored for backward compatibility.
+    /// (Consumer only) How to consume the collection: `capture_all` (default, read existing
+    /// documents first, then watch for changes — non-destructive, for bulk reads and ETL),
+    /// `capture_new` (watch an existing collection for changes only), `snapshot` (one-shot
+    /// non-destructive read that ends on drain, the option without a replica set), or
+    /// `consumer` (competing-consumers work queue — destructive and intended for jobs).
+    /// The bridge selects the underlying mechanism automatically. If unset, the deprecated
+    /// `change_stream` boolean is honored for backward compatibility.
     pub consume: Option<MongoConsume>,
     /// (Consumer only) Optional custom MongoDB query to filter messages. Provided as a JSON string (e.g., '{"type": "notification"}').
     pub receive_query: Option<String>,
@@ -2334,7 +1236,7 @@ pub struct MongoDbConfig {
     /// source positions. Defaults to false.
     #[serde(default)]
     pub source_metadata: bool,
-    /// (Consumer only) **Deprecated** — use `consume: subscriber`. Kept for compatibility.
+    /// (Consumer only) **Deprecated** — use `consume: capture_new`. Kept for compatibility.
     #[serde(default)]
     pub change_stream: bool,
     /// (Consumer only) Where to persist the resume cursor in `capture_new`/`capture_all` mode. A URL
@@ -2359,8 +1261,9 @@ pub struct MongoDbConfig {
     /// Format for storing messages. Defaults to Normal.
     #[serde(default)]
     pub format: MongoDbFormat,
-    /// (Publisher only) Top-level payload field whose value becomes the document `_id`, for
-    /// idempotent inserts via the unique `_id` index. Sink collections only.
+    /// (Publisher only) Top-level payload field whose value becomes the document `_id`, or a
+    /// replay-stable `${...}` template such as `${metadata:mqb.id}`. Enables idempotent inserts
+    /// through MongoDB's unique `_id` index. Sink collections only.
     pub id_field: Option<String>,
     /// (Publisher only) Return the message with metadata `mongodb.outcome` = `inserted`/`existed`
     /// (dup-key) so a `request`+`switch` can branch. Sink collections only; pair with `id_field`.
@@ -2374,50 +1277,6 @@ pub struct MongoDbConfig {
     #[serde(default)]
     #[cfg_attr(feature = "schema", schemars(default = "default_shared_schema"))]
     pub shared: Option<bool>,
-}
-
-impl MongoDbConfig {
-    /// Creates a new MongoDB configuration with the specified URL and database name.
-    pub fn new(url: impl Into<String>, database: impl Into<String>) -> Self {
-        Self {
-            url: url.into(),
-            database: database.into(),
-            ..Default::default()
-        }
-    }
-
-    pub fn with_collection(mut self, collection: impl Into<String>) -> Self {
-        self.collection = Some(collection.into());
-        self
-    }
-
-    pub fn with_credentials(
-        mut self,
-        username: impl Into<String>,
-        password: impl Into<String>,
-    ) -> Self {
-        self.username = Some(username.into());
-        self.password = Some(password.into());
-        self
-    }
-
-    pub fn with_change_stream(mut self, change_stream: bool) -> Self {
-        self.change_stream = change_stream;
-        self
-    }
-
-    /// The effective consume mode: the explicit `consume` field if set, otherwise derived from the
-    /// deprecated `change_stream` boolean.
-    pub fn resolved_consume(&self) -> MongoConsume {
-        if let Some(mode) = self.consume {
-            return mode;
-        }
-        if self.change_stream {
-            MongoConsume::Subscriber
-        } else {
-            MongoConsume::Consumer
-        }
-    }
 }
 
 // --- MQTT Specific Configuration ---
@@ -2467,36 +1326,6 @@ pub struct MqttConfig {
     pub delayed_ack: bool,
 }
 
-impl MqttConfig {
-    /// Creates a new MQTT configuration with the specified broker URL.
-    pub fn new(url: impl Into<String>) -> Self {
-        Self {
-            url: url.into(),
-            ..Default::default()
-        }
-    }
-
-    pub fn with_topic(mut self, topic: impl Into<String>) -> Self {
-        self.topic = Some(topic.into());
-        self
-    }
-
-    pub fn with_client_id(mut self, client_id: impl Into<String>) -> Self {
-        self.client_id = Some(client_id.into());
-        self
-    }
-
-    pub fn with_credentials(
-        mut self,
-        username: impl Into<String>,
-        password: impl Into<String>,
-    ) -> Self {
-        self.username = Some(username.into());
-        self.password = Some(password.into());
-        self
-    }
-}
-
 /// MQTT protocol version.
 ///
 /// Specifies which version of the MQTT protocol to use for connections.
@@ -2526,13 +1355,16 @@ pub struct ZeroMqConfig {
     /// If true, bind to the address. If false, connect.
     #[serde(default)]
     pub bind: bool,
-    /// Internal buffer size for the channel. Defaults to 128.
+    /// Internal buffer size for the channel. Defaults to 128. `zmq` backend only — `omq`
+    /// applies HWM backpressure on the socket itself and ignores this.
     #[serde(default)]
     pub internal_buffer_size: Option<usize>,
-    /// Wire format: `json` wraps the CanonicalMessage; `raw` sends payload bytes per frame; `raw_framed` adds a JSON metadata frame. Default `json`.
+    /// Wire format: `json` wraps the CanonicalMessage; `raw` sends payload bytes per frame; `raw_framed` adds a JSON metadata frame. Default `raw_framed`.
+    /// REQ/REP replies are the exception: a REP peer always answers with a JSON array of
+    /// canonical messages and a REQ publisher always decodes one, whatever `format` is set to.
     #[serde(default)]
     pub format: ZeroMqFormat,
-    /// Backend: `zmq` (default, the `zeromq` crate) or `omq` (the `omq-tokio` PoC — PUSH/PULL + PUB/SUB only). `omq` needs the `zeromq-omq` build feature.
+    /// Backend: `try_omq` (default, prefer `omq` and fall back to `zmq`), `zmq` (the `zeromq` crate) or `omq` (the `omq-tokio` backend). `omq` needs the `zeromq-omq` build feature.
     #[serde(default)]
     pub backend: ZeroMqBackend,
     /// (REQ publisher only) Timeout in ms for one request/reply exchange before it is reported as failed. Defaults to 30000.
@@ -2540,40 +1372,20 @@ pub struct ZeroMqConfig {
     pub request_timeout_ms: Option<u64>,
 }
 
-impl ZeroMqConfig {
-    /// Creates a new ZeroMQ configuration with the specified URL.
-    pub fn new(url: impl Into<String>) -> Self {
-        Self {
-            url: url.into(),
-            ..Default::default()
-        }
-    }
-
-    pub fn with_socket_type(mut self, socket_type: ZeroMqSocketType) -> Self {
-        self.socket_type = Some(socket_type);
-        self
-    }
-
-    pub fn with_bind(mut self, bind: bool) -> Self {
-        self.bind = bind;
-        self
-    }
-}
-
 /// ZeroMQ wire format.
 ///
 /// `json` wraps each message as a JSON CanonicalMessage (batched into one frame);
 /// `raw` sends/receives the payload bytes directly, one frame per message (metadata
-/// is not transmitted); `raw_framed` sends a two-frame message — a JSON metadata frame
-/// followed by the raw payload frame — keeping the payload binary-safe while still
+/// is not transmitted); `raw_framed` (default) sends a two-frame message — a JSON metadata
+/// frame followed by the raw payload frame — keeping the payload binary-safe while still
 /// carrying headers. Use `raw`/`raw_framed` for binary feeds such as JPEG, Avro or Protobuf.
 #[derive(Debug, Deserialize, Serialize, Clone, Default, PartialEq, Eq)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum ZeroMqFormat {
-    #[default]
     Json,
     Raw,
+    #[default]
     RawFramed,
 }
 
@@ -2595,15 +1407,23 @@ pub enum ZeroMqSocketType {
 
 /// ZeroMQ backend implementation.
 ///
-/// `zmq` (default) uses the `zeromq` crate (pure-Rust zmq.rs). `omq` uses
-/// `omq-tokio` (omq.rs) — much faster on the per-message `raw`/`raw_framed`
-/// path and adds CURVE/PLAIN security, but currently covers PUSH/PULL + PUB/SUB
-/// only and requires the `zeromq-omq` build feature (MSRV 1.93).
+/// `omq` uses `omq-tokio` (omq.rs) — much faster on the per-message `raw`/`raw_framed`
+/// path and adds CURVE/PLAIN security — and requires the `zeromq-omq` build feature
+/// (MSRV 1.93). `zmq` uses the `zeromq` crate (pure-Rust zmq.rs) and covers every
+/// socket type.
+///
+/// `try_omq` is the default: it picks `omq` when that feature is compiled in and the
+/// configured socket type is supported there, and falls back to `zmq` otherwise, so a
+/// build without `zeromq-omq` still runs. Name a backend explicitly to make the choice
+/// a hard requirement instead — a missing feature is then a startup error.
 #[derive(Debug, Deserialize, Serialize, Clone, Default, PartialEq, Eq)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "lowercase")]
 pub enum ZeroMqBackend {
+    /// Prefer `omq`, fall back to `zmq` when it is unavailable for this build or socket.
     #[default]
+    #[serde(rename = "try_omq", alias = "try-omq")]
+    TryOmq,
     Zmq,
     Omq,
 }
@@ -2654,36 +1474,6 @@ pub struct RedisStreamsConfig {
     pub reader_connections: Option<usize>,
 }
 
-impl RedisStreamsConfig {
-    /// Creates a new Redis Streams configuration with the specified URL.
-    pub fn new(url: impl Into<String>) -> Self {
-        Self {
-            url: url.into(),
-            ..Default::default()
-        }
-    }
-
-    pub fn with_stream(mut self, stream: impl Into<String>) -> Self {
-        self.stream = Some(stream.into());
-        self
-    }
-
-    pub fn with_group(mut self, group: impl Into<String>) -> Self {
-        self.group = Some(group.into());
-        self
-    }
-
-    pub fn with_subscriber(mut self, subscriber: bool) -> Self {
-        self.subscriber_mode = subscriber;
-        self
-    }
-
-    pub fn with_reader_connections(mut self, connections: usize) -> Self {
-        self.reader_connections = Some(connections);
-        self
-    }
-}
-
 // --- gRPC Specific Configuration ---
 
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
@@ -2695,6 +1485,10 @@ pub struct GrpcConfig {
     pub url: String,
     /// Topic / subject used for both subscribe and publish paths.
     pub topic: Option<String>,
+    /// Stable subscription identity used for ACK tracking and redelivery. Defaults to a
+    /// fresh id per consumer; set it to be redelivered unacknowledged messages on reconnect.
+    #[serde(default)]
+    pub consumer_id: Option<String>,
     /// Timeout in milliseconds.
     /// - Client mode: used as the connection timeout and per-request deadline.
     /// - Server mode: applied as the per-request deadline on the embedded server.
@@ -2706,49 +1500,46 @@ pub struct GrpcConfig {
     /// `PublishBatch` RPCs. If `false` (the default), connect to a remote server as a client.
     #[serde(default)]
     pub server_mode: bool,
-    /// HTTP/2 stream-level initial window size in bytes. **Server-mode only.**
+    /// HTTP/2 stream-level initial window size in bytes. Applies in both modes.
     #[serde(default)]
     pub initial_stream_window_size: Option<u32>,
-    /// HTTP/2 connection-level initial window size in bytes. **Server-mode only.**
+    /// HTTP/2 connection-level initial window size in bytes. Applies in both modes.
     #[serde(default)]
     pub initial_connection_window_size: Option<u32>,
     /// Maximum number of concurrent requests handled per connection. **Server-mode only.**
     #[serde(default)]
     pub concurrency_limit_per_connection: Option<usize>,
-    /// HTTP/2 keepalive ping interval in milliseconds. **Server-mode only.** Default disabled
+    /// HTTP/2 keepalive ping interval in milliseconds. Applies in both modes. Default disabled
     #[serde(default)]
     pub http2_keepalive_interval_ms: Option<u64>,
-    /// Timeout for a keepalive ping acknowledgement in milliseconds. **Server-mode only.**
+    /// Timeout for a keepalive ping acknowledgement in milliseconds. Applies in both modes.
     #[serde(default)]
     pub http2_keepalive_timeout_ms: Option<u64>,
-    /// Maximum size of a decoded incoming message in bytes. **Server-mode only.** Default 4 MiB.
+    /// Maximum size of a decoded incoming message in bytes. Applies in both modes. Default 4 MiB.
     #[serde(default)]
     pub max_decoding_message_size: Option<usize>,
+    /// Maximum size of an encoded outgoing message in bytes. Default unlimited.
+    #[serde(default)]
+    pub max_encoding_message_size: Option<usize>,
+    /// Compiled protobuf FileDescriptorSet for dynamic client mode.
+    #[serde(default)]
+    pub descriptor_set_path: Option<String>,
+    /// Fully-qualified protobuf service name for dynamic client mode.
+    #[serde(default)]
+    pub service_name: Option<String>,
+    /// RPC method name for dynamic client mode.
+    #[serde(default)]
+    pub method_name: Option<String>,
+    /// JSON request mapped to the dynamic protobuf input message.
+    #[serde(default)]
+    pub request: Option<serde_json::Value>,
+    /// Use a server-streaming dynamic RPC. False selects unary.
+    #[serde(default)]
+    pub server_streaming: bool,
     /// (Publisher only) Share one gRPC channel per connection (default: true); false forces a dedicated channel.
     #[serde(default)]
     #[cfg_attr(feature = "schema", schemars(default = "default_shared_schema"))]
     pub shared: Option<bool>,
-}
-
-impl GrpcConfig {
-    /// Creates a new gRPC configuration with the specified server URL.
-    pub fn new(url: impl Into<String>) -> Self {
-        Self {
-            url: url.into(),
-            ..Default::default()
-        }
-    }
-
-    pub fn with_topic(mut self, topic: impl Into<String>) -> Self {
-        self.topic = Some(topic.into());
-        self
-    }
-
-    /// Enable or disable server mode for this gRPC endpoint.
-    pub fn with_server_mode(mut self, server_mode: bool) -> Self {
-        self.server_mode = server_mode;
-        self
-    }
 }
 
 // --- HTTP Specific Configuration ---
@@ -2899,133 +1690,6 @@ pub struct WebSocketConfig {
     pub execution_mode: WebSocketExecutionMode,
 }
 
-fn deserialize_basic_auth<'de, D>(deserializer: D) -> Result<Option<(String, String)>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let val = serde_json::Value::deserialize(deserializer)?;
-    match val {
-        serde_json::Value::Null => Ok(None),
-        serde_json::Value::Array(arr) => {
-            if arr.len() != 2 {
-                return Err(serde::de::Error::custom("basic_auth must have 2 elements"));
-            }
-            let u = arr[0]
-                .as_str()
-                .ok_or_else(|| serde::de::Error::custom("basic_auth[0] must be string"))?
-                .to_string();
-            let p = arr[1]
-                .as_str()
-                .ok_or_else(|| serde::de::Error::custom("basic_auth[1] must be string"))?
-                .to_string();
-            Ok(Some((u, p)))
-        }
-        serde_json::Value::Object(map) => {
-            let u = map
-                .get("0")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| serde::de::Error::custom("basic_auth map missing '0'"))?
-                .to_string();
-            let p = map
-                .get("1")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| serde::de::Error::custom("basic_auth map missing '1'"))?
-                .to_string();
-            Ok(Some((u, p)))
-        }
-        _ => Err(serde::de::Error::custom("invalid type for basic_auth")),
-    }
-}
-
-impl HttpConfig {
-    /// Creates a new HTTP configuration with the specified URL.
-    pub fn new(url: impl Into<String>) -> Self {
-        Self {
-            url: url.into(),
-            ..Default::default()
-        }
-    }
-
-    pub fn with_workers(mut self, workers: usize) -> Self {
-        self.workers = Some(workers);
-        self
-    }
-
-    pub fn with_method(mut self, method: impl Into<String>) -> Self {
-        self.method = Some(method.into());
-        self
-    }
-
-    pub fn with_path(mut self, path: impl Into<String>) -> Self {
-        self.path = Some(path.into());
-        self
-    }
-
-    pub fn with_receive_streamable(mut self, receive_streamable: bool) -> Self {
-        self.receive_streamable = receive_streamable;
-        self
-    }
-
-    pub fn with_inline_response_fast_path(mut self, inline_response_fast_path: bool) -> Self {
-        self.inline_response_fast_path = Some(inline_response_fast_path);
-        self
-    }
-
-    pub fn with_server_protocol(mut self, server_protocol: HttpServerProtocol) -> Self {
-        self.server_protocol = server_protocol;
-        self
-    }
-
-    pub fn inline_response_fast_path_enabled(&self) -> bool {
-        self.inline_response_fast_path.unwrap_or(true)
-    }
-
-    /// Request-body codec for a publisher: explicit `compression`, else gzip when
-    /// `compression_enabled`, else none.
-    pub fn publisher_compression(&self) -> Compression {
-        match self.compression {
-            Compression::None if self.compression_enabled == Some(true) => Compression::Gzip,
-            other => other,
-        }
-    }
-
-    /// Whether a consumer compresses responses (then it negotiates the best codec the client
-    /// accepts). Driven by `compression_enabled`; the publisher-only `compression` codec is ignored.
-    pub fn consumer_compression_enabled(&self) -> bool {
-        self.compression_enabled == Some(true)
-    }
-
-    pub fn with_stream_response_to(mut self, endpoint: Endpoint) -> Self {
-        self.stream_response_to = Some(Box::new(endpoint));
-        self
-    }
-}
-
-impl WebSocketConfig {
-    /// Creates a new WebSocket configuration with the specified URL.
-    pub fn new(url: impl Into<String>) -> Self {
-        Self {
-            url: url.into(),
-            ..Default::default()
-        }
-    }
-
-    pub fn with_path(mut self, path: impl Into<String>) -> Self {
-        self.path = Some(path.into());
-        self
-    }
-
-    pub fn with_backlog(mut self, backlog: u32) -> Self {
-        self.backlog = Some(backlog);
-        self
-    }
-
-    pub fn with_execution_mode(mut self, execution_mode: WebSocketExecutionMode) -> Self {
-        self.execution_mode = execution_mode;
-        self
-    }
-}
-
 // --- IBM MQ Specific Configuration ---
 
 /// TLS configuration for the IBM MQ native client.
@@ -3055,39 +1719,6 @@ pub struct IbmTlsConfig {
     /// If true, disable server certificate verification (insecure).
     #[serde(default)]
     pub accept_invalid_certs: bool,
-}
-
-// schemars ignores serde `alias`, so the MQ-native names accepted at runtime
-// (`key_repository`, `key_repository_password`) must be added to the schema by
-// hand, otherwise `additionalProperties: false` rejects otherwise-valid configs.
-#[cfg(feature = "schema")]
-fn ibm_tls_config_schema_transform(schema: &mut schemars::Schema) {
-    let Some(properties) = schema
-        .as_object_mut()
-        .and_then(|schema_obj| schema_obj.get_mut("properties"))
-        .and_then(serde_json::Value::as_object_mut)
-    else {
-        return;
-    };
-
-    properties.insert(
-        "key_repository".to_string(),
-        serde_json::json!({
-            "description": "MQ-native alias for `cert_file`: the CMS key repository stem \
-                (e.g. `/path/to/tls` for `tls.kdb`/`tls.sth`).",
-            "type": ["string", "null"]
-        }),
-    );
-
-    properties.insert(
-        "key_repository_password".to_string(),
-        serde_json::json!({
-            "description": "MQ-native alias for `cert_password`: password unlocking the key \
-                repository. Requires an IBM MQ client/server at 9.3.0.0+.",
-            "type": ["string", "null"],
-            "format": "password"
-        }),
-    );
 }
 
 /// Connection settings for the IBM MQ Queue Manager.
@@ -3129,70 +1760,6 @@ pub struct IbmMqConfig {
     /// If false, attempt to open the queue with INQUIRE permissions to fetch queue depth for status checks. Defaults to false.
     #[serde(default)]
     pub disable_status_inq: bool,
-}
-
-impl IbmMqConfig {
-    /// Creates a new IBM MQ configuration with the specified connection URL, queue manager, and channel.
-    pub fn new(
-        url: impl Into<String>,
-        queue_manager: impl Into<String>,
-        channel: impl Into<String>,
-    ) -> Self {
-        Self {
-            url: url.into(),
-            queue_manager: queue_manager.into(),
-            channel: channel.into(),
-            disable_status_inq: false,
-            ..Default::default()
-        }
-    }
-
-    pub fn with_queue(mut self, queue: impl Into<String>) -> Self {
-        self.queue = Some(queue.into());
-        self
-    }
-
-    pub fn with_topic(mut self, topic: impl Into<String>) -> Self {
-        self.topic = Some(topic.into());
-        self
-    }
-
-    pub fn with_credentials(
-        mut self,
-        username: impl Into<String>,
-        password: impl Into<String>,
-    ) -> Self {
-        self.username = Some(username.into());
-        self.password = Some(password.into());
-        self
-    }
-}
-
-impl Default for IbmMqConfig {
-    fn default() -> Self {
-        Self {
-            url: String::new(),
-            queue: None,
-            topic: None,
-            queue_manager: String::new(),
-            channel: String::new(),
-            username: None,
-            password: None,
-            tls: IbmTlsConfig::default(),
-            max_message_size: default_max_message_size(),
-            wait_timeout_ms: default_wait_timeout_ms(),
-            internal_buffer_size: None,
-            disable_status_inq: false,
-        }
-    }
-}
-
-fn default_max_message_size() -> usize {
-    4 * 1024 * 1024 // 4MB default
-}
-
-fn default_wait_timeout_ms() -> i32 {
-    1000 // 1 second default
 }
 
 // --- Switch/Router Configuration ---
@@ -3280,14 +1847,6 @@ pub struct PostgresCdcConfig {
     /// TLS configuration for the replication connection.
     #[serde(default)]
     pub tls: TlsConfig,
-}
-
-fn default_pg_cdc_slot() -> String {
-    "mq_bridge_slot".to_string()
-}
-
-fn default_pg_cdc_status_interval_ms() -> u64 {
-    10_000
 }
 
 // --- SQLx Specific Configuration ---
@@ -3477,10 +2036,6 @@ pub struct ClickHouseConfig {
     pub compression: Compression,
 }
 
-fn default_gzip_compression() -> Compression {
-    Compression::Gzip
-}
-
 // --- Common Configuration ---
 
 /// TLS configuration for secure connections.
@@ -3520,1110 +2075,4 @@ pub struct TlsConfig {
     /// If true, disable server certificate verification (insecure).
     #[serde(default)]
     pub accept_invalid_certs: bool,
-}
-
-impl TlsConfig {
-    /// Creates a new TLS configuration with default settings (TLS not required).
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn with_ca_file(mut self, ca_file: impl Into<String>) -> Self {
-        self.ca_file = Some(ca_file.into());
-        self.required = true;
-        self
-    }
-
-    pub fn with_client_cert(
-        mut self,
-        cert_file: impl Into<String>,
-        key_file: impl Into<String>,
-    ) -> Self {
-        self.cert_file = Some(cert_file.into());
-        self.key_file = Some(key_file.into());
-        self.required = true;
-        self
-    }
-
-    pub fn with_insecure(mut self, accept_invalid_certs: bool) -> Self {
-        self.accept_invalid_certs = accept_invalid_certs;
-        self
-    }
-
-    /// Checks if mutual TLS (mTLS) client authentication is configured.
-    pub fn is_mtls_client_configured(&self) -> bool {
-        self.required && self.cert_file.is_some() && self.key_file.is_some()
-    }
-
-    /// Checks if TLS server certificate authentication is configured.
-    pub fn is_tls_server_configured(&self) -> bool {
-        self.required && self.cert_file.is_some() && self.key_file.is_some()
-    }
-
-    /// Checks if the TLS configuration is sufficient to make a TLS client connection.
-    pub fn is_tls_client_configured(&self) -> bool {
-        self.required
-            || self.ca_file.is_some()
-            || (self.cert_file.is_some() && self.key_file.is_some())
-    }
-
-    /// Helper to normalize a URL by adding the appropriate scheme prefix (http:// or https://) if missing.
-    pub fn normalize_url(&self, url: &str) -> String {
-        if url
-            .get(..7)
-            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("http://"))
-            || url
-                .get(..8)
-                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("https://"))
-        {
-            url.to_string()
-        } else {
-            let is_tls = self.required;
-            let scheme = if is_tls { "https" } else { "http" };
-            format!("{}://{}", scheme, url)
-        }
-    }
-}
-
-/// Trait for extracting secrets from configuration structures.
-pub trait SecretExtractor {
-    /// Extracts secrets into the provided map using the given prefix, and clears them from self.
-    fn extract_secrets(&mut self, prefix: &str, secrets: &mut HashMap<String, String>);
-}
-
-fn extract_sensitive_string_map_entries(
-    values: &mut HashMap<String, String>,
-    prefix: &str,
-    field_name: &str,
-    secrets: &mut HashMap<String, String>,
-) {
-    let secret_keys = values
-        .keys()
-        .filter(|key| {
-            let key = key.to_ascii_lowercase();
-            key.contains("key") || key.contains("token") || key.contains("auth")
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-
-    for key in secret_keys {
-        if let Some(value) = values.remove(&key) {
-            secrets.insert(
-                sanitize_secret_key(&format!("{}__{}__{}", prefix, field_name, key)),
-                value,
-            );
-        }
-    }
-}
-
-fn url_has_userinfo(url: &str) -> bool {
-    let Some(authority_start) = url.find("://").map(|idx| idx + 3) else {
-        return false;
-    };
-    let authority_end = url[authority_start..]
-        .find(['/', '?', '#'])
-        .map(|idx| authority_start + idx)
-        .unwrap_or(url.len());
-    url[authority_start..authority_end].contains('@')
-}
-
-fn sanitize_secret_key(key: &str) -> String {
-    key.chars()
-        .map(|ch| {
-            let ch = ch.to_ascii_uppercase();
-            if ch.is_ascii_alphanumeric() || ch == '_' {
-                ch
-            } else {
-                '_'
-            }
-        })
-        .collect()
-}
-
-fn extract_sensitive_url(
-    url: &mut String,
-    prefix: &str,
-    field_name: &str,
-    secrets: &mut HashMap<String, String>,
-) {
-    if !url.is_empty() && url_has_userinfo(url) {
-        secrets.insert(
-            sanitize_secret_key(&format!("{}__{}", prefix, field_name)),
-            std::mem::take(url),
-        );
-    }
-}
-
-fn extract_sensitive_optional_url(
-    url: &mut Option<String>,
-    prefix: &str,
-    field_name: &str,
-    secrets: &mut HashMap<String, String>,
-) {
-    if url.as_ref().is_some_and(|url| url_has_userinfo(url)) {
-        if let Some(url) = url.take() {
-            secrets.insert(
-                sanitize_secret_key(&format!("{}__{}", prefix, field_name)),
-                url,
-            );
-        }
-    }
-}
-
-impl SecretExtractor for Route {
-    fn extract_secrets(&mut self, prefix: &str, secrets: &mut HashMap<String, String>) {
-        self.input
-            .extract_secrets(&format!("{}__{}", prefix, "INPUT"), secrets);
-        self.output
-            .extract_secrets(&format!("{}__{}", prefix, "OUTPUT"), secrets);
-    }
-}
-
-impl SecretExtractor for Endpoint {
-    fn extract_secrets(&mut self, prefix: &str, secrets: &mut HashMap<String, String>) {
-        for (i, middleware) in self.middlewares.iter_mut().enumerate() {
-            middleware.extract_secrets(&format!("{}__{}__{}", prefix, "MIDDLEWARES", i), secrets);
-        }
-        self.endpoint_type.extract_secrets(prefix, secrets);
-    }
-}
-
-impl SecretExtractor for EndpointType {
-    fn extract_secrets(&mut self, prefix: &str, secrets: &mut HashMap<String, String>) {
-        match self {
-            EndpointType::Aws(cfg) => {
-                cfg.extract_secrets(&format!("{}__{}", prefix, "AWS"), secrets)
-            }
-            EndpointType::Kafka(cfg) => {
-                cfg.extract_secrets(&format!("{}__{}", prefix, "KAFKA"), secrets)
-            }
-            EndpointType::Nats(cfg) => {
-                cfg.extract_secrets(&format!("{}__{}", prefix, "NATS"), secrets)
-            }
-            EndpointType::Amqp(cfg) => {
-                cfg.extract_secrets(&format!("{}__{}", prefix, "AMQP"), secrets)
-            }
-            EndpointType::MongoDb(cfg) => {
-                cfg.extract_secrets(&format!("{}__{}", prefix, "MONGODB"), secrets)
-            }
-            EndpointType::Mqtt(cfg) => {
-                cfg.extract_secrets(&format!("{}__{}", prefix, "MQTT"), secrets)
-            }
-            EndpointType::Http(cfg) => {
-                cfg.extract_secrets(&format!("{}__{}", prefix, "HTTP"), secrets)
-            }
-            EndpointType::WebSocket(cfg) => {
-                cfg.extract_secrets(&format!("{}__{}", prefix, "WEBSOCKET"), secrets)
-            }
-            EndpointType::IbmMq(cfg) => {
-                cfg.extract_secrets(&format!("{}__{}", prefix, "IBMMQ"), secrets)
-            }
-            EndpointType::ZeroMq(cfg) => {
-                cfg.extract_secrets(&format!("{}__{}", prefix, "ZEROMQ"), secrets)
-            }
-            EndpointType::RedisStreams(cfg) => {
-                cfg.extract_secrets(&format!("{}__{}", prefix, "REDIS_STREAMS"), secrets)
-            }
-            EndpointType::Sqlx(cfg) => {
-                cfg.extract_secrets(&format!("{}__{}", prefix, "SQLX"), secrets)
-            }
-            EndpointType::ClickHouse(cfg) => {
-                cfg.extract_secrets(&format!("{}__{}", prefix, "CLICKHOUSE"), secrets)
-            }
-            EndpointType::PostgresCdc(cfg) => {
-                cfg.extract_secrets(&format!("{}__{}", prefix, "POSTGRES_CDC"), secrets)
-            }
-            EndpointType::Grpc(cfg) => {
-                cfg.extract_secrets(&format!("{}__{}", prefix, "GRPC"), secrets)
-            }
-            EndpointType::Fanout(endpoints) => {
-                for (i, ep) in endpoints.iter_mut().enumerate() {
-                    ep.extract_secrets(&format!("{}__{}__{}", prefix, "FANOUT", i), secrets);
-                }
-            }
-            EndpointType::Switch(cfg) => {
-                for (key, ep) in cfg.cases.iter_mut() {
-                    ep.extract_secrets(
-                        &format!(
-                            "{}__{}__{}",
-                            prefix,
-                            "SWITCH__CASES",
-                            sanitize_secret_key(key)
-                        ),
-                        secrets,
-                    );
-                }
-                if let Some(default) = &mut cfg.default {
-                    default.extract_secrets(&format!("{}__{}", prefix, "SWITCH__DEFAULT"), secrets);
-                }
-            }
-            EndpointType::Reader(ep) => {
-                ep.extract_secrets(&format!("{}__{}", prefix, "READER"), secrets)
-            }
-            EndpointType::Request(cfg) => {
-                cfg.to
-                    .extract_secrets(&format!("{}__{}", prefix, "REQUEST__TO"), secrets);
-                cfg.forward_to
-                    .extract_secrets(&format!("{}__{}", prefix, "REQUEST__FORWARD_TO"), secrets);
-            }
-            EndpointType::File(cfg) => {
-                if let Some(enc) = &mut cfg.encryption {
-                    enc.extract_secrets(&format!("{}__{}", prefix, "FILE__ENCRYPTION"), secrets);
-                }
-            }
-            EndpointType::ObjectStore(cfg) => {
-                if let Some(enc) = &mut cfg.encryption {
-                    enc.extract_secrets(
-                        &format!("{}__{}", prefix, "OBJECT_STORE__ENCRYPTION"),
-                        secrets,
-                    );
-                }
-            }
-            _ => {}
-        }
-    }
-}
-
-impl SecretExtractor for Middleware {
-    fn extract_secrets(&mut self, prefix: &str, secrets: &mut HashMap<String, String>) {
-        match self {
-            Middleware::Dlq(cfg) => {
-                cfg.endpoint
-                    .extract_secrets(&format!("{}__{}__{}", prefix, "DLQ", "ENDPOINT"), secrets);
-            }
-            Middleware::Encryption(cfg) => {
-                cfg.extract_secrets(&format!("{}__{}", prefix, "ENCRYPTION"), secrets);
-            }
-            _ => {}
-        }
-    }
-}
-
-impl SecretExtractor for EncryptionConfig {
-    fn extract_secrets(&mut self, prefix: &str, secrets: &mut HashMap<String, String>) {
-        if !self.key.is_empty() {
-            secrets.insert(
-                sanitize_secret_key(&format!("{}__{}", prefix, "KEY")),
-                std::mem::take(&mut self.key),
-            );
-        }
-        for (id, k) in std::mem::take(&mut self.decrypt_keys) {
-            secrets.insert(
-                sanitize_secret_key(&format!("{}__{}__{}", prefix, "DECRYPT_KEYS", id)),
-                k,
-            );
-        }
-    }
-}
-
-impl SecretExtractor for AwsConfig {
-    fn extract_secrets(&mut self, prefix: &str, secrets: &mut HashMap<String, String>) {
-        if let Some(val) = self.access_key.take() {
-            secrets.insert(format!("{}__{}", prefix, "ACCESS_KEY"), val);
-        }
-        if let Some(val) = self.secret_key.take() {
-            secrets.insert(format!("{}__{}", prefix, "SECRET_KEY"), val);
-        }
-        if let Some(val) = self.session_token.take() {
-            secrets.insert(format!("{}__{}", prefix, "SESSION_TOKEN"), val);
-        }
-        extract_sensitive_optional_url(&mut self.queue_url, prefix, "QUEUE_URL", secrets);
-        extract_sensitive_optional_url(&mut self.endpoint_url, prefix, "ENDPOINT_URL", secrets);
-    }
-}
-
-impl SecretExtractor for KafkaConfig {
-    fn extract_secrets(&mut self, prefix: &str, secrets: &mut HashMap<String, String>) {
-        extract_sensitive_url(&mut self.url, prefix, "URL", secrets);
-        if let Some(val) = self.username.take() {
-            secrets.insert(format!("{}__{}", prefix, "USERNAME"), val);
-        }
-        if let Some(val) = self.password.take() {
-            secrets.insert(format!("{}__{}", prefix, "PASSWORD"), val);
-        }
-        self.tls
-            .extract_secrets(&format!("{}__{}", prefix, "TLS"), secrets);
-    }
-}
-
-impl SecretExtractor for NatsConfig {
-    fn extract_secrets(&mut self, prefix: &str, secrets: &mut HashMap<String, String>) {
-        extract_sensitive_url(&mut self.url, prefix, "URL", secrets);
-        if let Some(val) = self.username.take() {
-            secrets.insert(format!("{}__{}", prefix, "USERNAME"), val);
-        }
-        if let Some(val) = self.password.take() {
-            secrets.insert(format!("{}__{}", prefix, "PASSWORD"), val);
-        }
-        if let Some(val) = self.token.take() {
-            secrets.insert(format!("{}__{}", prefix, "TOKEN"), val);
-        }
-        self.tls
-            .extract_secrets(&format!("{}__{}", prefix, "TLS"), secrets);
-    }
-}
-
-impl SecretExtractor for AmqpConfig {
-    fn extract_secrets(&mut self, prefix: &str, secrets: &mut HashMap<String, String>) {
-        extract_sensitive_url(&mut self.url, prefix, "URL", secrets);
-        if let Some(val) = self.username.take() {
-            secrets.insert(format!("{}__{}", prefix, "USERNAME"), val);
-        }
-        if let Some(val) = self.password.take() {
-            secrets.insert(format!("{}__{}", prefix, "PASSWORD"), val);
-        }
-        self.tls
-            .extract_secrets(&format!("{}__{}", prefix, "TLS"), secrets);
-    }
-}
-
-impl SecretExtractor for MongoDbConfig {
-    fn extract_secrets(&mut self, prefix: &str, secrets: &mut HashMap<String, String>) {
-        extract_sensitive_url(&mut self.url, prefix, "URL", secrets);
-        if let Some(val) = self.username.take() {
-            secrets.insert(format!("{}__{}", prefix, "USERNAME"), val);
-        }
-        if let Some(val) = self.password.take() {
-            secrets.insert(format!("{}__{}", prefix, "PASSWORD"), val);
-        }
-        // The checkpoint store URL may embed connection credentials.
-        extract_sensitive_optional_url(
-            &mut self.checkpoint_store,
-            prefix,
-            "CHECKPOINT_STORE",
-            secrets,
-        );
-        self.tls
-            .extract_secrets(&format!("{}__{}", prefix, "TLS"), secrets);
-    }
-}
-
-impl SecretExtractor for MqttConfig {
-    fn extract_secrets(&mut self, prefix: &str, secrets: &mut HashMap<String, String>) {
-        extract_sensitive_url(&mut self.url, prefix, "URL", secrets);
-        if let Some(val) = self.username.take() {
-            secrets.insert(format!("{}__{}", prefix, "USERNAME"), val);
-        }
-        if let Some(val) = self.password.take() {
-            secrets.insert(format!("{}__{}", prefix, "PASSWORD"), val);
-        }
-        self.tls
-            .extract_secrets(&format!("{}__{}", prefix, "TLS"), secrets);
-    }
-}
-
-impl SecretExtractor for HttpConfig {
-    fn extract_secrets(&mut self, prefix: &str, secrets: &mut HashMap<String, String>) {
-        extract_sensitive_url(&mut self.url, prefix, "URL", secrets);
-        if let Some((u, p)) = self.basic_auth.take() {
-            secrets.insert(format!("{}__{}__{}", prefix, "BASIC_AUTH", 0), u);
-            secrets.insert(format!("{}__{}__{}", prefix, "BASIC_AUTH", 1), p);
-        }
-        extract_sensitive_string_map_entries(
-            &mut self.custom_headers,
-            prefix,
-            "CUSTOM_HEADERS",
-            secrets,
-        );
-        self.tls
-            .extract_secrets(&format!("{}__{}", prefix, "TLS"), secrets);
-        if let Some(endpoint) = &mut self.stream_response_to {
-            endpoint.extract_secrets(&format!("{}__{}", prefix, "STREAM_RESPONSE_TO"), secrets);
-        }
-    }
-}
-
-impl SecretExtractor for WebSocketConfig {
-    fn extract_secrets(&mut self, prefix: &str, secrets: &mut HashMap<String, String>) {
-        extract_sensitive_url(&mut self.url, prefix, "URL", secrets);
-    }
-}
-
-impl SecretExtractor for IbmMqConfig {
-    fn extract_secrets(&mut self, prefix: &str, secrets: &mut HashMap<String, String>) {
-        extract_sensitive_url(&mut self.url, prefix, "URL", secrets);
-        if let Some(val) = self.username.take() {
-            secrets.insert(format!("{}__{}", prefix, "USERNAME"), val);
-        }
-        if let Some(val) = self.password.take() {
-            secrets.insert(format!("{}__{}", prefix, "PASSWORD"), val);
-        }
-        self.tls
-            .extract_secrets(&format!("{}__{}", prefix, "TLS"), secrets);
-    }
-}
-
-impl SecretExtractor for ZeroMqConfig {
-    fn extract_secrets(&mut self, prefix: &str, secrets: &mut HashMap<String, String>) {
-        extract_sensitive_url(&mut self.url, prefix, "URL", secrets);
-    }
-}
-
-impl SecretExtractor for RedisStreamsConfig {
-    fn extract_secrets(&mut self, prefix: &str, secrets: &mut HashMap<String, String>) {
-        extract_sensitive_url(&mut self.url, prefix, "URL", secrets);
-        if let Some(val) = self.username.take() {
-            secrets.insert(format!("{}__{}", prefix, "USERNAME"), val);
-        }
-        if let Some(val) = self.password.take() {
-            secrets.insert(format!("{}__{}", prefix, "PASSWORD"), val);
-        }
-    }
-}
-
-impl SecretExtractor for SqlxConfig {
-    fn extract_secrets(&mut self, prefix: &str, secrets: &mut HashMap<String, String>) {
-        extract_sensitive_url(&mut self.url, prefix, "URL", secrets);
-        if let Some(val) = self.username.take() {
-            secrets.insert(format!("{}__{}", prefix, "USERNAME"), val);
-        }
-        if let Some(val) = self.password.take() {
-            secrets.insert(format!("{}__{}", prefix, "PASSWORD"), val);
-        }
-        self.tls
-            .extract_secrets(&format!("{}__{}", prefix, "TLS"), secrets);
-    }
-}
-
-impl SecretExtractor for ClickHouseConfig {
-    fn extract_secrets(&mut self, prefix: &str, secrets: &mut HashMap<String, String>) {
-        extract_sensitive_url(&mut self.url, prefix, "URL", secrets);
-        if let Some(val) = self.username.take() {
-            secrets.insert(format!("{}__{}", prefix, "USERNAME"), val);
-        }
-        if let Some(val) = self.password.take() {
-            secrets.insert(format!("{}__{}", prefix, "PASSWORD"), val);
-        }
-        if let Some(val) = self.checkpoint_store.take() {
-            secrets.insert(format!("{}__{}", prefix, "CHECKPOINT_STORE"), val);
-        }
-        self.tls
-            .extract_secrets(&format!("{}__{}", prefix, "TLS"), secrets);
-    }
-}
-
-impl SecretExtractor for PostgresCdcConfig {
-    fn extract_secrets(&mut self, prefix: &str, secrets: &mut HashMap<String, String>) {
-        extract_sensitive_url(&mut self.url, prefix, "URL", secrets);
-        if let Some(val) = self.checkpoint_store.take() {
-            secrets.insert(format!("{}__{}", prefix, "CHECKPOINT_STORE"), val);
-        }
-        self.tls
-            .extract_secrets(&format!("{}__{}", prefix, "TLS"), secrets);
-    }
-}
-
-impl SecretExtractor for GrpcConfig {
-    fn extract_secrets(&mut self, prefix: &str, secrets: &mut HashMap<String, String>) {
-        extract_sensitive_url(&mut self.url, prefix, "URL", secrets);
-        self.tls
-            .extract_secrets(&format!("{}__{}", prefix, "TLS"), secrets);
-    }
-}
-
-impl SecretExtractor for TlsConfig {
-    fn extract_secrets(&mut self, prefix: &str, secrets: &mut HashMap<String, String>) {
-        if let Some(val) = self.cert_password.take() {
-            secrets.insert(format!("{}__{}", prefix, "CERT_PASSWORD"), val);
-        }
-    }
-}
-
-impl SecretExtractor for IbmTlsConfig {
-    fn extract_secrets(&mut self, prefix: &str, secrets: &mut HashMap<String, String>) {
-        if let Some(val) = self.key_repository_password.take() {
-            // Wire/env name matches the serde rename (`cert_password`), so the config
-            // crate's env override resolves back to this field.
-            secrets.insert(format!("{}__{}", prefix, "CERT_PASSWORD"), val);
-        }
-    }
-}
-
-/// Extracts sensitive values (passwords, keys, tokens) from the configuration
-/// and returns them as a map of environment variables (key-value pairs).
-/// The extracted fields in the configuration are set to `None`.
-///
-/// The keys in the returned map follow the `MQB__{ROUTE}__{ENDPOINT}__{FIELD}` pattern
-/// compatible with the `config` crate's environment variable override mechanism.
-pub fn extract_config_secrets(config: &mut Config) -> HashMap<String, String> {
-    let mut secrets = HashMap::new();
-    for (route_name, route) in config.iter_mut() {
-        let prefix = sanitize_secret_key(&format!("MQB__{}", route_name));
-        route.extract_secrets(&prefix, &mut secrets);
-    }
-    secrets
-}
-
-#[cfg(test)]
-mod null_endpoint_tests {
-    use super::*;
-
-    #[test]
-    fn null_endpoint_json_round_trip() {
-        let value = serde_json::to_value(Endpoint::null()).expect("serialize");
-        let back: Endpoint = serde_json::from_value(value).expect("deserialize");
-        assert!(matches!(back.endpoint_type, EndpointType::Null));
-    }
-
-    /// The schema advertises unit variants as bare strings, so `"null"` must parse.
-    #[test]
-    fn null_endpoint_accepts_string_and_unit_forms() {
-        for input in ["\"null\"", "null", "{}"] {
-            let endpoint: Endpoint = serde_json::from_str(input).unwrap_or_else(|e| {
-                panic!("failed to parse {input}: {e}");
-            });
-            assert!(matches!(endpoint.endpoint_type, EndpointType::Null));
-        }
-    }
-
-    #[test]
-    fn unknown_endpoint_string_is_rejected() {
-        let err = serde_json::from_str::<Endpoint>("\"kafka\"").expect_err("should fail");
-        assert!(
-            err.to_string().contains("unknown variant"),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[test]
-    fn nested_null_endpoint_json_round_trip() {
-        let config =
-            HttpConfig::new("http://localhost:8080").with_stream_response_to(Endpoint::null());
-        let value = serde_json::to_value(&config).expect("serialize");
-        let back: HttpConfig = serde_json::from_value(value).expect("deserialize");
-        let nested = back.stream_response_to.expect("stream_response_to present");
-        assert!(matches!(nested.endpoint_type, EndpointType::Null));
-    }
-
-    #[test]
-    fn nested_null_endpoint_yaml_forms() {
-        for yaml in [
-            "url: http://localhost:8080\nstream_response_to: \"null\"\n",
-            "url: http://localhost:8080\nstream_response_to: {}\n",
-        ] {
-            let config: HttpConfig = serde_yaml_ng::from_str(yaml)
-                .unwrap_or_else(|e| panic!("failed to parse {yaml:?}: {e}"));
-            let nested = config
-                .stream_response_to
-                .expect("stream_response_to present");
-            assert!(matches!(nested.endpoint_type, EndpointType::Null));
-        }
-    }
-
-    /// In an `Option<Box<Endpoint>>` field, a bare `null` is consumed by serde's `Option`
-    /// layer as `None` and never reaches the endpoint visitor.
-    #[test]
-    fn nested_bare_null_yaml_is_none() {
-        let config: HttpConfig =
-            serde_yaml_ng::from_str("url: http://localhost:8080\nstream_response_to: null\n")
-                .expect("deserialize");
-        assert!(config.stream_response_to.is_none());
-    }
-
-    #[test]
-    fn null_endpoint_yaml_round_trip() {
-        let yaml = serde_yaml_ng::to_string(&Endpoint::null()).expect("serialize");
-        let back: Endpoint = serde_yaml_ng::from_str(&yaml).expect("deserialize");
-        assert!(matches!(back.endpoint_type, EndpointType::Null));
-    }
-
-    #[test]
-    fn source_metadata_is_a_source_configuration_option() {
-        let endpoint: Endpoint =
-            serde_yaml_ng::from_str("kafka:\n  url: localhost:9092\n  source_metadata: true\n")
-                .expect("deserialize Kafka source metadata option");
-        let EndpointType::Kafka(config) = endpoint.endpoint_type else {
-            panic!("expected Kafka endpoint");
-        };
-        assert!(config.source_metadata);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use config::{Config as ConfigBuilder, Environment};
-
-    const TEST_YAML: &str = r#"
-kafka_to_nats:
-  concurrency: 10
-  input:
-    middlewares:
-      - deduplication:
-          sled_path: "/tmp/mq-bridge/dedup_db"
-          ttl_seconds: 3600
-      - metrics: {}
-      - retry:
-          max_attempts: 5
-          initial_interval_ms: 200
-      - random_panic:
-          mode: nack
-      - dlq:
-          endpoint:
-            nats:
-              subject: "dlq-subject"
-              url: "nats://localhost:4222"
-    kafka:
-      topic: "input-topic"
-      url: "localhost:9092"
-      group_id: "my-consumer-group"
-      tls:
-        required: true
-        ca_file: "/path_to_ca"
-        cert_file: "/path_to_cert"
-        key_file: "/path_to_key"
-        cert_password: "password"
-        accept_invalid_certs: true
-  output:
-    middlewares:
-      - metrics: {}
-      - dlq:
-          endpoint:
-            file:
-              path: "error.out"
-    nats:
-      subject: "output-subject"
-      url: "nats://localhost:4222"
-"#;
-
-    fn assert_config_values(config: &Config) {
-        assert_eq!(config.len(), 1);
-        let route = config.get("kafka_to_nats").expect("Route should exist");
-
-        assert_eq!(route.options.concurrency, 10);
-
-        // --- Assert Input ---
-        let input = &route.input;
-        assert_eq!(input.middlewares.len(), 5);
-
-        let mut has_dedup = false;
-        let mut has_metrics = false;
-        let mut has_dlq = false;
-        let mut has_retry = false;
-        let mut has_random_panic = false;
-        for middleware in &input.middlewares {
-            match middleware {
-                Middleware::Deduplication(dedup) => {
-                    assert_eq!(dedup.sled_path.as_deref(), Some("/tmp/mq-bridge/dedup_db"));
-                    assert_eq!(dedup.ttl_seconds, 3600);
-                    has_dedup = true;
-                }
-                Middleware::Metrics(_) => {
-                    has_metrics = true;
-                }
-                Middleware::Custom { .. } => {}
-                Middleware::Dlq(dlq) => {
-                    assert!(dlq.endpoint.middlewares.is_empty());
-                    if let EndpointType::Nats(nats_cfg) = &dlq.endpoint.endpoint_type {
-                        assert_eq!(nats_cfg.subject, Some("dlq-subject".to_string()));
-                        assert_eq!(nats_cfg.url, "nats://localhost:4222");
-                    }
-                    has_dlq = true;
-                }
-                Middleware::Retry(retry) => {
-                    assert_eq!(retry.max_attempts, 5);
-                    assert_eq!(retry.initial_interval_ms, 200);
-                    has_retry = true;
-                }
-                Middleware::RandomPanic(rp) => {
-                    assert!(rp.mode == FaultMode::Nack);
-                    has_random_panic = true;
-                }
-                Middleware::Delay(_) => {}
-                Middleware::WeakJoin(_) => {}
-                Middleware::Limiter(_) => {}
-                Middleware::Buffer(_) => {}
-                Middleware::CookieJar(_) => {}
-                Middleware::Transform(_) => {}
-                Middleware::Encryption(_) => {}
-                Middleware::Compression(_) => {}
-            }
-        }
-
-        if let EndpointType::Kafka(kafka) = &input.endpoint_type {
-            assert_eq!(kafka.topic, Some("input-topic".to_string()));
-            assert_eq!(kafka.url, "localhost:9092");
-            assert_eq!(kafka.group_id, Some("my-consumer-group".to_string()));
-            let tls = &kafka.tls;
-            assert!(tls.required);
-            assert_eq!(tls.ca_file.as_deref(), Some("/path_to_ca"));
-            assert!(tls.accept_invalid_certs);
-        } else {
-            panic!("Input endpoint should be Kafka");
-        }
-        assert!(has_dedup);
-        assert!(has_metrics);
-        assert!(has_dlq);
-        assert!(has_retry);
-        assert!(has_random_panic);
-
-        // --- Assert Output ---
-        let output = &route.output;
-        assert_eq!(output.middlewares.len(), 2);
-        assert!(matches!(output.middlewares[0], Middleware::Metrics(_)));
-
-        if let EndpointType::Nats(nats) = &output.endpoint_type {
-            assert_eq!(nats.subject, Some("output-subject".to_string()));
-            assert_eq!(nats.url, "nats://localhost:4222");
-        } else {
-            panic!("Output endpoint should be NATS");
-        }
-    }
-
-    #[test]
-    fn test_deserialize_from_yaml() {
-        // We use serde_yaml directly here because the `config` crate's processing
-        // can interfere with complex deserialization logic.
-        let result: Result<Config, _> = serde_yaml_ng::from_str(TEST_YAML);
-        println!("Deserialized from YAML: {:#?}", result);
-        let config = result.expect("Failed to deserialize TEST_YAML");
-        assert_config_values(&config);
-    }
-
-    #[test]
-    fn test_deserialize_from_env() {
-        // Set environment variables based on README
-        unsafe {
-            std::env::set_var("MQB__KAFKA_TO_NATS__CONCURRENCY", "10");
-            std::env::set_var("MQB__KAFKA_TO_NATS__INPUT__KAFKA__TOPIC", "input-topic");
-            std::env::set_var("MQB__KAFKA_TO_NATS__INPUT__KAFKA__URL", "localhost:9092");
-            std::env::set_var(
-                "MQB__KAFKA_TO_NATS__INPUT__KAFKA__GROUP_ID",
-                "my-consumer-group",
-            );
-            std::env::set_var("MQB__KAFKA_TO_NATS__INPUT__KAFKA__TLS__REQUIRED", "true");
-            std::env::set_var(
-                "MQB__KAFKA_TO_NATS__INPUT__KAFKA__TLS__CA_FILE",
-                "/path_to_ca",
-            );
-            std::env::set_var(
-                "MQB__KAFKA_TO_NATS__INPUT__KAFKA__TLS__ACCEPT_INVALID_CERTS",
-                "true",
-            );
-            std::env::set_var(
-                "MQB__KAFKA_TO_NATS__OUTPUT__NATS__SUBJECT",
-                "output-subject",
-            );
-            std::env::set_var(
-                "MQB__KAFKA_TO_NATS__OUTPUT__NATS__URL",
-                "nats://localhost:4222",
-            );
-            std::env::set_var(
-                "MQB__KAFKA_TO_NATS__INPUT__MIDDLEWARES__0__DLQ__ENDPOINT__NATS__SUBJECT",
-                "dlq-subject",
-            );
-            std::env::set_var(
-                "MQB__KAFKA_TO_NATS__INPUT__MIDDLEWARES__0__DLQ__ENDPOINT__NATS__URL",
-                "nats://localhost:4222",
-            );
-        }
-
-        let builder = ConfigBuilder::builder()
-            // Enable automatic type parsing for values from environment variables.
-            .add_source(
-                Environment::with_prefix("MQB")
-                    .separator("__")
-                    .try_parsing(true),
-            );
-
-        let config: Config = builder
-            .build()
-            .expect("Failed to build config")
-            .try_deserialize()
-            .expect("Failed to deserialize config");
-
-        // We can't test all values from env, but we can check the ones we set.
-        assert_eq!(config.get("kafka_to_nats").unwrap().options.concurrency, 10);
-        if let EndpointType::Kafka(k) = &config.get("kafka_to_nats").unwrap().input.endpoint_type {
-            assert_eq!(k.topic, Some("input-topic".to_string()));
-            assert!(k.tls.required);
-        } else {
-            panic!("Expected Kafka endpoint");
-        }
-
-        let input = &config.get("kafka_to_nats").unwrap().input;
-        assert_eq!(input.middlewares.len(), 1);
-        if let Middleware::Dlq(_) = &input.middlewares[0] {
-            // Correctly parsed
-        } else {
-            panic!("Expected DLQ middleware");
-        }
-    }
-
-    #[test]
-    fn test_extract_secrets() {
-        let mut config = Config::new();
-        let mut route = Route::default();
-
-        // Setup Kafka with secrets
-        let mut kafka_config = KafkaConfig::new("kafka://user:pass@localhost:9092");
-        kafka_config.username = Some("user".to_string());
-        kafka_config.password = Some("pass".to_string());
-        kafka_config.tls.cert_password = Some("certpass".to_string());
-
-        route.input = Endpoint {
-            endpoint_type: EndpointType::Kafka(kafka_config),
-            middlewares: vec![],
-            handler: None,
-        };
-
-        // Setup HTTP with basic auth
-        let mut http_config = HttpConfig::new("http://httpuser:httppass@localhost");
-        http_config.basic_auth = Some(("httpuser".to_string(), "httppass".to_string()));
-        http_config
-            .custom_headers
-            .insert("X-API-Key".to_string(), "http-api-key".to_string());
-        http_config.custom_headers.insert(
-            "X-Access-Token".to_string(),
-            "http-access-token".to_string(),
-        );
-        http_config.custom_headers.insert(
-            "X-Authentication".to_string(),
-            "http-authentication".to_string(),
-        );
-        http_config.custom_headers.insert(
-            "Authorization".to_string(),
-            "Bearer secret-token".to_string(),
-        );
-        http_config
-            .custom_headers
-            .insert("X-Trace-Id".to_string(), "trace-value".to_string());
-
-        route.output = Endpoint {
-            endpoint_type: EndpointType::Http(http_config),
-            middlewares: vec![],
-            handler: None,
-        };
-
-        config.insert("test_route".to_string(), route);
-
-        let secrets = extract_config_secrets(&mut config);
-
-        // Verify secrets extracted
-        assert_eq!(
-            secrets
-                .get("MQB__TEST_ROUTE__INPUT__KAFKA__URL")
-                .map(|s| s.as_str()),
-            Some("kafka://user:pass@localhost:9092")
-        );
-        assert_eq!(
-            secrets
-                .get("MQB__TEST_ROUTE__INPUT__KAFKA__USERNAME")
-                .map(|s| s.as_str()),
-            Some("user")
-        );
-        assert_eq!(
-            secrets
-                .get("MQB__TEST_ROUTE__INPUT__KAFKA__PASSWORD")
-                .map(|s| s.as_str()),
-            Some("pass")
-        );
-        assert_eq!(
-            secrets
-                .get("MQB__TEST_ROUTE__INPUT__KAFKA__TLS__CERT_PASSWORD")
-                .map(|s| s.as_str()),
-            Some("certpass")
-        );
-        assert_eq!(
-            secrets
-                .get("MQB__TEST_ROUTE__OUTPUT__HTTP__URL")
-                .map(|s| s.as_str()),
-            Some("http://httpuser:httppass@localhost")
-        );
-        assert_eq!(
-            secrets
-                .get("MQB__TEST_ROUTE__OUTPUT__HTTP__BASIC_AUTH__0")
-                .map(|s| s.as_str()),
-            Some("httpuser")
-        );
-        assert_eq!(
-            secrets
-                .get("MQB__TEST_ROUTE__OUTPUT__HTTP__BASIC_AUTH__1")
-                .map(|s| s.as_str()),
-            Some("httppass")
-        );
-        assert_eq!(
-            secrets
-                .get("MQB__TEST_ROUTE__OUTPUT__HTTP__CUSTOM_HEADERS__X_API_KEY")
-                .map(|s| s.as_str()),
-            Some("http-api-key")
-        );
-        assert_eq!(
-            secrets
-                .get("MQB__TEST_ROUTE__OUTPUT__HTTP__CUSTOM_HEADERS__X_ACCESS_TOKEN")
-                .map(|s| s.as_str()),
-            Some("http-access-token")
-        );
-        assert_eq!(
-            secrets
-                .get("MQB__TEST_ROUTE__OUTPUT__HTTP__CUSTOM_HEADERS__X_AUTHENTICATION")
-                .map(|s| s.as_str()),
-            Some("http-authentication")
-        );
-        assert_eq!(
-            secrets
-                .get("MQB__TEST_ROUTE__OUTPUT__HTTP__CUSTOM_HEADERS__AUTHORIZATION")
-                .map(|s| s.as_str()),
-            Some("Bearer secret-token")
-        );
-
-        // Verify config cleared
-        let route = config.get("test_route").unwrap();
-        if let EndpointType::Kafka(k) = &route.input.endpoint_type {
-            assert!(k.url.is_empty());
-            assert!(k.username.is_none());
-            assert!(k.password.is_none());
-            assert!(k.tls.cert_password.is_none());
-        }
-        if let EndpointType::Http(h) = &route.output.endpoint_type {
-            assert!(h.url.is_empty());
-            assert!(h.basic_auth.is_none());
-            assert!(!h.custom_headers.contains_key("X-API-Key"));
-            assert!(!h.custom_headers.contains_key("X-Access-Token"));
-            assert!(!h.custom_headers.contains_key("X-Authentication"));
-            assert!(!h.custom_headers.contains_key("Authorization"));
-            assert_eq!(
-                h.custom_headers.get("X-Trace-Id").map(|s| s.as_str()),
-                Some("trace-value")
-            );
-        }
-    }
-
-    #[test]
-    fn test_extract_sensitive_url_only_strips_authority_credentials() {
-        let mut config = Config::new();
-        let path_at_route = Route {
-            output: Endpoint {
-                endpoint_type: EndpointType::Http(HttpConfig::new(
-                    "https://example.com/path/user@example.com?email=a@b.test",
-                )),
-                middlewares: vec![],
-                handler: None,
-            },
-            ..Default::default()
-        };
-        config.insert("path_at_route".to_string(), path_at_route);
-
-        let credential_route = Route {
-            output: Endpoint {
-                endpoint_type: EndpointType::Http(HttpConfig::new(
-                    "https://user:pass@example.com/path",
-                )),
-                middlewares: vec![],
-                handler: None,
-            },
-            ..Default::default()
-        };
-        config.insert("credential_route".to_string(), credential_route);
-
-        let query_at_route = Route {
-            output: Endpoint {
-                endpoint_type: EndpointType::Http(HttpConfig::new(
-                    "https://example.com?next=a@b.test",
-                )),
-                middlewares: vec![],
-                handler: None,
-            },
-            ..Default::default()
-        };
-        config.insert("query_at_route".to_string(), query_at_route);
-
-        let fragment_at_route = Route {
-            output: Endpoint {
-                endpoint_type: EndpointType::Http(HttpConfig::new(
-                    "https://example.com#user@example.com",
-                )),
-                middlewares: vec![],
-                handler: None,
-            },
-            ..Default::default()
-        };
-        config.insert("fragment_at_route".to_string(), fragment_at_route);
-
-        let secrets = extract_config_secrets(&mut config);
-
-        if let EndpointType::Http(http) = &config.get("path_at_route").unwrap().output.endpoint_type
-        {
-            assert_eq!(
-                http.url,
-                "https://example.com/path/user@example.com?email=a@b.test"
-            );
-        }
-        if let EndpointType::Http(http) =
-            &config.get("query_at_route").unwrap().output.endpoint_type
-        {
-            assert_eq!(http.url, "https://example.com?next=a@b.test");
-        }
-        if let EndpointType::Http(http) = &config
-            .get("fragment_at_route")
-            .unwrap()
-            .output
-            .endpoint_type
-        {
-            assert_eq!(http.url, "https://example.com#user@example.com");
-        }
-        if let EndpointType::Http(http) =
-            &config.get("credential_route").unwrap().output.endpoint_type
-        {
-            assert!(http.url.is_empty());
-        }
-        assert_eq!(
-            secrets
-                .get("MQB__CREDENTIAL_ROUTE__OUTPUT__HTTP__URL")
-                .map(String::as_str),
-            Some("https://user:pass@example.com/path")
-        );
-        assert!(!secrets.contains_key("MQB__PATH_AT_ROUTE__OUTPUT__HTTP__URL"));
-        assert!(!secrets.contains_key("MQB__QUERY_AT_ROUTE__OUTPUT__HTTP__URL"));
-        assert!(!secrets.contains_key("MQB__FRAGMENT_AT_ROUTE__OUTPUT__HTTP__URL"));
-    }
-
-    #[test]
-    fn test_memory_config_requires_topic_or_url() {
-        let err = serde_yaml_ng::from_str::<MemoryConfig>("{}").unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("MemoryConfig: 'topic' (or 'url' alias) is required."));
-    }
-
-    #[test]
-    fn test_file_config_inference() {
-        let yaml = r#"
-mode: group_subscribe
-path: "/tmp/test"
-group_id: "my_group"
-"#;
-        let config: FileConfig = serde_yaml_ng::from_str(yaml).unwrap();
-        match config.mode {
-            Some(FileConsumerMode::GroupSubscribe { group_id, .. }) => {
-                assert_eq!(group_id, "my_group")
-            }
-            _ => panic!("Expected GroupSubscribe"),
-        }
-
-        let yaml_queue = r#"
-mode: consume
-path: "/tmp/test"
-"#;
-        let config_queue: FileConfig = serde_yaml_ng::from_str(yaml_queue).unwrap();
-        match config_queue.mode {
-            Some(FileConsumerMode::Consume { delete }) => assert!(!delete),
-            _ => panic!("Expected Consume"),
-        }
-    }
-}
-
-#[cfg(all(test, feature = "schema"))]
-mod schema_tests {
-    use super::*;
-
-    #[test]
-    fn generate_json_schema() {
-        let schema = schemars::schema_for!(Config);
-        let schema_json = serde_json::to_string_pretty(&schema).unwrap();
-
-        let mut path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        path.push("mq-bridge.schema.json");
-        std::fs::write(path, schema_json).expect("Failed to write schema file");
-    }
 }

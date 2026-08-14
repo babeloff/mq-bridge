@@ -18,6 +18,65 @@ def init_logging(level: Optional[str] = ...) -> None:
     Raises if logging was already initialized."""
     ...
 
+def register_endpoint(
+    name: str, factory: Callable[[str, Dict[str, Any]], Any]
+) -> None:
+    """Register a custom endpoint implemented in Python under ``name``, making it
+    usable as an endpoint type in route configs — either as ``{"pulsar": {...}}``
+    or explicitly as ``{"custom": {"name": "pulsar", "config": {...}}}``.
+
+    ``factory`` is called as ``factory(route_name, config)`` once per route leg.
+    It must return an object implementing ``receive_batch(max_messages)`` to be
+    usable as an input and/or ``send_batch(messages)`` to be usable as an output,
+    plus optional ``commit(dispositions)`` and ``close()``.
+
+    ``receive_batch`` returns an iterable of ``Message``/bytes/str/JSON values,
+    or ``None``/``[]`` when nothing is available right now; raise
+    ``StopIteration`` to signal end of stream — that meaning applies only to
+    ``receive_batch``; from any other method it is an ordinary error. ``commit``
+    receives a list of ``"ack"``/``"nack"`` strings, one per message in the batch.
+
+    Register before starting a route that names it; registering the same name
+    twice raises and keeps the first factory. All calls into one endpoint object
+    are serialized on its own thread, so it need not be thread-safe."""
+    ...
+
+def unregister_endpoint(name: str) -> bool:
+    """Drop the endpoint factory registered under ``name``, releasing the
+    reference it holds on the Python factory object.
+
+    Returns ``True`` when a factory was removed, ``False`` when ``name`` was not
+    registered. Call only after every route using the endpoint has stopped;
+    routes already holding an instance keep running."""
+    ...
+
+def register_middleware(
+    name: str, factory: Callable[[str, Dict[str, Any]], Any]
+) -> None:
+    """Register a custom middleware implemented in Python under ``name``, usable
+    in any endpoint's ``middlewares`` list as
+    ``{"custom": {"name": name, "config": {...}}}``.
+
+    ``factory`` is called as ``factory(route_name, config)`` once per endpoint
+    the middleware is attached to. It must return an object implementing
+    ``on_receive(messages)`` (applies on an input endpoint) and/or
+    ``on_send(messages)`` (applies on an output endpoint); a side the object does
+    not implement passes through untouched.
+
+    Both hooks receive the batch and must return one item per input message: a
+    ``Message`` (kept, possibly rewritten) or ``None`` to drop it. Keeping the
+    length fixed is what lets acknowledgements stay aligned with the source
+    batch."""
+    ...
+
+def unregister_middleware(name: str) -> bool:
+    """Drop the middleware factory registered under ``name``, releasing the
+    reference it holds on the Python factory object.
+
+    Returns ``True`` when a factory was removed, ``False`` when ``name`` was not
+    registered. Call only after every route using the middleware has stopped."""
+    ...
+
 JsonValue = Any
 HandlerResult = Optional[Union["Message", bytes, str, Dict[str, JsonValue], List[JsonValue], int, float, bool]]
 

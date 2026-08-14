@@ -37,7 +37,7 @@ If you need to move data or events reliably between systems and you write code (
 
 > **Throughput & footprint.** In our own benchmarks, the same engine — driven the zero-code way through [`mq-bridge-app`](https://github.com/marcomq/mq-bridge-app) — on a CSV→JSONL file conversion (1,000,000 mixed-type rows, ~116 MiB) sustained **1,133,786 rows/s** at ~22 MiB, about **~58x faster** and **~20x leaner in memory** than Meltano (`tap-csv` → `target-jsonl`, ~19,500 rows/s / ~444 MiB). Full setup, methodology, and the exact parameters are in [`benches/ETL_BENCHMARKS.md`](benches/ETL_BENCHMARKS.md).
 
-> **Kafka → file.** In a 1,000,000-row relay with the default file format and no transform, the engine was up to **80% faster than Sea Streamer**. The [`mq-bridge-app` benchmark](https://github.com/marcomq/mq-bridge-app/tree/dev/benches/etl) contains the reproducible helper and native file-format caveats.
+> **Kafka → file.** In a 1,000,000-row relay with the default file format and no transform, the engine was up to **65% faster than Sea Streamer**. The [`mq-bridge-app` benchmark](https://github.com/marcomq/mq-bridge-app/tree/dev/benches/etl) contains the reproducible helper and native file-format caveats.
 
 
 ## Language Bindings
@@ -64,7 +64,7 @@ The Python binding also holds up well under load on the third-party [http-arena.
 
 ## Architecture
 
-See [ARCHITECTURE.md](ARCHITECTURE.md) for a detailed overview of the internal design, extensibility, and usage patterns.
+See [ARCHITECTURE.md](docs/ARCHITECTURE.md) for a detailed overview of the internal design, extensibility, and usage patterns.
 
 **Usage Types:**
 
@@ -72,7 +72,7 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for a detailed overview of the internal d
 2. **Compute Handler:** Generally receive and process messages with a custom handler
 3. **Direct Endpoint Usage:** Use `publish` / `publish_batch` and `receive` / `receive_batch` directly on endpoints. This mode requires manual commit, batch sequencing, and concurrency handling.
 
-For implementation details and quick start examples for each usage type, see the [Architecture Guide](ARCHITECTURE.md).
+For implementation details and quick start examples for each usage type, see the [Architecture Guide](docs/ARCHITECTURE.md).
 
 ## Features
 
@@ -83,7 +83,7 @@ For implementation details and quick start examples for each usage type, see the
     > **TLS**: IBM MQ has its own TLS config shape (`IbmTlsConfig`), since the native client doesn't consume PEM files. The field names mirror the generic `TlsConfig` for config parity, but carry MQ-native semantics: `tls.cert_file` (alias `key_repository`) is a CMS key repository path (e.g. `/path/to/tls` for `tls.kdb`), not a PEM file. The repository can either be passwordless (backed by a `.sth` stash file next to the `.kdb`) or password-protected via `tls.cert_password` (alias `key_repository_password`; requires an IBM MQ client/server at 9.3.0.0 or later, which is the capability level `ibm-mq`/`ibm-mq-static` build against; 9.2 is EOL).
 *   **Configuration**: Routes can be defined via YAML, JSON or environment variables.
 *   **Programmable Logic**: Inject custom Rust handlers to transform or filter messages in-flight.
-*   **Batching**: Every endpoint uses the same `send_batch` / `receive_batch` shape. Routes default to single-message batches, but can switch to larger batches with `batch_size`.
+*   **Batching**: Every endpoint uses the same `send_batch` / `receive_batch` shape. Routes default to batches of up to 512 messages, configurable with `batch_size`.
 *   **Middleware**:
     *   **Retries**: Exponential backoff for transient failures.
     *   **Dead-Letter Queues (DLQ)**: Redirect failed messages.
@@ -98,7 +98,7 @@ The project has one main bias: move data reliably without forcing the rest of th
 
 That means `mq-bridge` tries to keep the boring parts boring. Kafka offsets, RabbitMQ nacks, HTTP responses, MongoDB polling, WebSocket frames, and file rows are all different in real life, but route code should still be able to receive a batch, process it, publish it, and commit it.
 
-Batching is a big part of that design. Every endpoint is optimized around batch-shaped APIs, even when the backend itself only has a single-message primitive. Batching is disabled by default (`batch_size: 1`) because it is the safest behavior and easiest to reason about. When throughput matters, increasing `batch_size` is usually the first knob to try. For example via `batch_size: 128` in yaml or `.with_batch_size(128)` for routes.
+Batching is a big part of that design. Every endpoint is optimized around batch-shaped APIs, even when the backend itself only has a single-message primitive. Routes default to opportunistic batches of up to 512 messages: the consumer waits for the first message, then takes whatever else is already available without adding idle latency. Lower `batch_size` when tighter failure isolation or a smaller per-batch memory footprint matters.
 
 The error handling follows the same idea. Batch publishing can report partial success, retryable failures, and non-retryable failures. Route commits are sequenced for cumulative-ack brokers so later batches cannot acknowledge earlier unresolved messages; transports with independent acknowledgements can commit batches concurrently. In other words: batching is not just a performance trick bolted onto the side; ack/nack behavior and retry/DLQ handling were built to work with it.
 
@@ -160,9 +160,14 @@ Known rough edges (be deliberate here):
 *   **Middleware**: Components that intercept and process messages (e.g., for error handling).
 *   **Handler**: A programmatic component for business logic, such as transforming/consuming messages (`CommandHandler`) or subscribe them (`EventHandler`).
 
-> **[REFERENCE.md](REFERENCE.md)** lists every middleware and every structural endpoint
+> **[REFERENCE.md](docs/REFERENCE.md)** lists every middleware and every structural endpoint
 > (`ref`, `fanout`, `switch`, `request`, `response`, `reader`, `static`, `stream_buffer`,
 > `null`, `custom`) with fields, defaults and working examples.
+>
+> To add an endpoint of your own, see **[EXTENDING.md](docs/EXTENDING.md)** — or
+> **[PLUGINS.md](docs/PLUGINS.md)** to ship a Rust endpoint or middleware as a native
+> library that Rust, Python and Node.js hosts all load at runtime, without compiling it
+> into mq-bridge.
 
 ## Backend Features & Configuration
 
@@ -175,7 +180,7 @@ The table below summarizes the capabilities and configuration for each backend:
 | **AMQP** | Set `subscribe_mode: true` | Emulated (Property) | **Yes** (Basic.nack) |
 | **AWS** | N/A (Use SNS) | No | **Yes** (Visibility Timeout) |
 | **File** | Set `mode: subscribe` | No | Simulated (In-Memory) |
-| **gRPC** | N/A | No | No |
+| **gRPC** | N/A | No | **Yes** for the built-in Bridge protocol (NACK replays); **No** for dynamic services unless their API defines an acknowledgement contract |
 | **HTTP** | N/A | **Native** (Implicit) | **Yes** (HTTP 500) |
 | **IBM MQ** | Set `topic` | No | **Yes** (Tx Rollback) |
 | **Kafka** | Omit `group_id` | Emulated (Header) | Eventual (Skip Offset) |
@@ -202,222 +207,79 @@ Databases have no native pub/sub, so `mq-bridge` reads them as a source in one o
 
 *   **Change Data Capture (CDC)** — tails the database's own change log, capturing inserts **and** updates/deletes and resuming from a durable log position.
     *   On **PostgreSQL**, the `postgres_cdc` endpoint streams a logical-replication slot (`pgoutput`). It emits flat JSON rows tagged with `postgres.operation` metadata (`insert`/`update`/`delete`/`truncate`). Acking a batch confirms the LSN back to the server (`standby_status_update`); a nack (or an interrupted run) does **not** advance the confirmed LSN, so replication resumes from the last acknowledged position on reconnect — at-least-once, verified by a restart-safety integration test. Enable with the `postgres-cdc` feature; requires `wal_level = logical` and a publication. See below.
-    *   On **MongoDB**, set `consume: capture_new` to watch an existing collection for changes from now on, or `consume: capture_all` to read the existing documents first and then keep capturing changes (no gap, at-least-once). It emits `insert`/`update`/`replace`/`delete` events tagged with `mongodb.operation` metadata and checkpoints progress under `cursor_id`. These use the change stream (full post-image via `updateLookup`) and need a replica set; on a standalone server `capture_all` falls back to an insert-only read.
+    *   On **MongoDB**, set `consume: capture_new` to watch an existing collection for changes from now on, or `consume: capture_all` to read the existing documents first and then keep capturing changes (no gap, at-least-once). It emits `insert`/`update`/`replace`/`delete` events tagged with `mongodb.operation` metadata and checkpoints progress under `cursor_id`. Both use the change stream (full post-image via `updateLookup`) and therefore need a replica set — a single-node one is enough. Without one they refuse to start; use `consume: snapshot` for a one-shot non-destructive read, or `consume: consumer` for a work queue.
 *   **Cursor polling** — pages an existing table by a monotonic `cursor_column` (`WHERE col > $last ORDER BY col ASC`), persisting the last read value under `cursor_id`. Captures **appends only** — updates and deletes are not observed. Available on **SQLx** (PostgreSQL / MySQL / MariaDB / SQLite) and **ClickHouse**; while idle the poll interval backs off exponentially between `polling_interval_ms` and `max_polling_interval_ms`. **SQLite** and **ClickHouse** are polling-only — they have no server-side change log.
 
 > **SQLx read mode is chosen by config, not by driver.** With **no** `cursor_column`, an SQLx source (`?table=` / `table:`) is a **competing-consumers work queue**: it atomically claims rows via a `locked_until` lease and deletes them on ack, so several readers drain the same table as competing consumers — each row goes to one reader at a time, at-least-once (a lease that expires before ack, e.g. after a crash, redelivers the row), not exactly once. This requires the table to carry the queue schema — an `id`, a `payload`, and a `locked_until` column — on **every** driver (PostgreSQL, MySQL/MariaDB, and SQLite behave identically here); it is **not** a plain full-table read. To read an existing or arbitrary table non-destructively (the ETL path), set **`cursor_column`** to switch to the cursor polling above. A source table missing `locked_until` fails fast with a permanent error rather than reconnecting forever.
 
 #### Choosing a MongoDB consume mode
 
-These are not interchangeable. The default `consumer` is a **competing-consumers work queue**: its
-lock-and-delete protocol lets several readers drain the same collection with each document going to
-exactly one of them — the right thing for dispatching jobs or commands. The `capture_*` modes are
-**readers**: they fan out, so every reader sees every document, and nothing is claimed or removed.
+These are not interchangeable. The default `capture_all` is a **reader**, like the other `capture_*`
+modes: they fan out, so every reader sees every document, and nothing is claimed or removed. Opting
+into `consumer` instead gives a **competing-consumers work queue**: its lock-and-delete protocol lets
+several readers drain the same collection with each document going to exactly one of them — the right
+thing for dispatching jobs or commands, and destructive by design.
 
 Pick by semantics first. Where both would do — a one-shot bulk read or ETL pass with a single
-reader — **use `capture_all`**: `consumer`'s four round trips per batch (find ids → claim →
-re-fetch → delete on ack) buy exclusivity you aren't using, and cost ~5x.
+reader — **use `capture_all`**, the default: `consumer`'s four round trips per batch (find ids →
+claim → re-fetch → delete on ack) buy exclusivity you aren't using. Set
+`consume: consumer` explicitly when you want the destructive work-queue semantics.
 
 | `consume` | mechanism | modifies source | ends on drain | use for |
 | :--- | :--- | :--- | :--- | :--- |
-| `consumer` (default) | claim → lock → re-fetch → delete | **yes** | yes | work queues, competing readers |
-| `subscriber` | polls `seq > last_seq`, advancing a cursor | no | yes | ephemeral fan-out |
+| `capture_all` (default) | snapshot, then change stream | no | with drain options | bulk read / ETL |
+| `consumer` | claim → lock → re-fetch → delete | **yes** | yes | work queues, competing readers |
+| `snapshot` | one `_id`-ordered pass over the collection | no | **always** | reads without a replica set |
 | `capture_new` | change stream, new changes only | no | **no** | ongoing CDC |
-| `capture_all` | `_id` snapshot, then change stream | no | standalone only | bulk read / ETL |
 
 500k documents, `batch_size: 1024`, release build, standalone MongoDB: `consumer` → `null`
-**23,667 rows/s**, `capture_all` → jsonl **120,308 rows/s** (`postgres` → `null` reference: 115,924).
+**23,667 rows/s** (`postgres` → `null` reference: 115,924). The previously quoted `capture_all`
+figure was measured on that same standalone server, i.e. through the `_id` fallback that has since
+been removed as unsound — it is not comparable and needs re-measuring on a replica set.
 
 *   `concurrency` does not speed up a MongoDB source — batches are fetched serially; it only widens
     the downstream side.
-*   `consumer` and `subscriber` only read collections written by the mq-bridge MongoDB publisher
-    (UUID `_id` / wrapped `seq` field); other documents are skipped or rejected at startup.
-*   `capture_*` need a replica set. `capture_new` errors without one; `capture_all` degrades to an
-    insert-only `_id` read that terminates on drain. On a replica set it streams indefinitely after
-    the snapshot — plan an external stop, not `exit_on_empty`.
+*   `consumer` only reads collections written by the mq-bridge MongoDB publisher (UUID `_id` /
+    wrapped envelope); other documents are skipped or rejected at startup. `snapshot` and the
+    `capture_*` modes read arbitrary collections.
+*   `capture_*` need a replica set — a single-node one is enough — and both error without it. With
+    `exit_on_empty` / `--drain`, a replica-set reader finishes after the snapshot and any
+    immediately following changes, once the drain idle timeout expires.
+*   `snapshot` is one-shot by design: it delivers what exists when the run starts and then ends the
+    route. It rejects `cursor_id`, because resuming above a stored `_id` would skip anything a
+    concurrent writer commits below that mark — see the note below.
 *   Wart: `capture_all`'s snapshot also emits the internal `<collection>:sequencer` document.
+
+> **Why `snapshot` does not resume.** A `_id` cursor can only match documents *above* its
+> high-water mark, and `_id` is assigned client-side before the insert, so it does not follow
+> commit order. Any writer that commits below the mark — concurrent producers, a route with
+> `concurrency > 1`, a retried write — is skipped permanently and silently. Incremental reads
+> therefore need commit order, which on MongoDB means the oplog, which means a replica set.
+> There is no sound `_id`-based substitute.
 
 
 ### Deduplication & idempotent writes
 
-For ETL, at-least-once delivery plus an **idempotent write** gives you effective exactly-once: a
-replayed or retried record must not create a duplicate row. The most robust place to enforce this is
-the sink database's own **unique constraint** — it is already shared across every writer, so no extra
-state store is needed. Both database sinks lean on this instead of an application-side cache.
+With a durable source and durable checkpoint configuration, `mq-bridge` is **at-least-once** across
+crashes: a replay can redeliver, while in-process Memory endpoint state is not crash-durable. Pair a
+stable replay identity with an **idempotent sink operation** and that covered sink effect is
+effectively exactly-once, however often the message is delivered. Which sink absorbs a duplicate, which source gives you a stable key to
+deduplicate on, and what a handler in the route changes about all of this, is covered in full by:
 
-**MongoDB — `id_field`.** Point `id_field` at a top-level payload field and its value becomes the
-document `_id`. Re-inserting the same business key then hits the unique `_id` index and is treated as
-an idempotent success (the duplicate is skipped, not errored):
+> **[docs/DELIVERY.md](docs/DELIVERY.md) — delivery guarantees.** Per-source identity and
+> per-sink idempotency tables, the `deduplication` middleware, Mongo `id_field` and `report_outcome`,
+> SQL `ON CONFLICT`, ClickHouse `ReplacingMergeTree`, file/object-store `idempotency: true`, what
+> handlers change, and what `mq-bridge` deliberately does not provide.
 
-```yaml
-orders_to_mongo:
-  input:  { kafka:   { topic: "orders", url: "localhost:9092" } }
-  output:
-    mongodb:
-      url: "mongodb://localhost:27017"
-      database: "shop"
-      collection: "orders"
-      format: json
-      id_field: "order_id"   # payload {"order_id": "A-1", ...} → _id = "A-1"
-```
-
-The field's JSON type is preserved (a number stays a BSON integer). The payload must be JSON and
-contain the field, otherwise the message is dead-lettered rather than written with a random `_id` —
-silently minting one would defeat deduplication. Use `id_field` on **sink** collections only: a
-business-key `_id` is not compatible with the `consumer`/`subscriber` competing-consumer modes, which
-require a UUID `_id`.
-
-**SQL (`sqlx`) — `ON CONFLICT` / `ON DUPLICATE KEY`.** The `insert_query` is user-supplied, so you
-write the dialect's upsert directly. This requires a pre-existing `UNIQUE`/`PRIMARY KEY` on the key
-column, and is incompatible with `bulk_copy` (COPY cannot express `ON CONFLICT`) — so you trade peak
-throughput for deduplication.
-
-```yaml
-# PostgreSQL — insert if absent (drop duplicates):
-insert_query: "INSERT INTO orders (id, body) VALUES (${payload:id}, ${payload:body}) ON CONFLICT (id) DO NOTHING"
-
-# PostgreSQL — upsert (last write wins):
-insert_query: "INSERT INTO orders (id, body) VALUES (${payload:id}, ${payload:body}) ON CONFLICT (id) DO UPDATE SET body = EXCLUDED.body"
-
-# MySQL / MariaDB:
-insert_query: "INSERT INTO orders (id, body) VALUES (${payload:id}, ${payload:body}) ON DUPLICATE KEY UPDATE body = VALUES(body)"
-
-# SQLite:
-insert_query: "INSERT INTO orders (id, body) VALUES (${payload:id}, ${payload:body}) ON CONFLICT (id) DO NOTHING"
-```
-
-A plain `INSERT` without a conflict clause instead fails the row as a **non-retryable** error: a
-configured `dlq` captures it, and without one it is logged and dropped. Add the conflict clause
-when replays are expected. `${payload:field}` binds a typed value from the JSON payload;
-`${metadata:key}` binds a metadata string.
-
-**ClickHouse — `ReplacingMergeTree`.** ClickHouse has no unique constraints; dedup is a table-engine
-property. Create the target as `ReplacingMergeTree(version)` keyed by your business key via
-`ORDER BY`, using a monotonic column as the version (e.g. an ingest timestamp, or `postgres.lsn` from
-a CDC source). ClickHouse collapses rows with the same sort key at merge time, keeping the highest
-version; read with `FINAL` (or `argMax`) to see the deduplicated result:
-
-```sql
-CREATE TABLE orders (id UInt64, body String, version UInt64)
-ENGINE = ReplacingMergeTree(version) ORDER BY id;
--- mq-bridge just inserts rows; duplicates for the same id collapse on merge.
-SELECT * FROM orders FINAL;
-```
-
-`ReplacingMergeTree` deduplicates by business key at merge time. Separately, ClickHouse also dedupes
-identical *re-inserted blocks* natively: a retried `send_batch` that resends the same block is dropped
-server-side (default one-hour window) — `insert_deduplication_token` lets you make that explicit, but
-mq-bridge does not set one, so rely on `ReplacingMergeTree` for logical dedup and treat block-level
-dedup only as retry-safety.
-
-**Postgres CDC — deterministic id + `postgres.key`.** The `postgres_cdc` source resumes from the slot's
-durable `confirmed_flush_lsn`. In-band standby feedback is asynchronous and is *not* flushed when the
-stream stops, so the last acks are made durable by the consumer's `Drop`, which stops the stream and
-advances the slot synchronously. Re-delivery is therefore avoided only on a restart that actually runs
-that teardown — a host process that exits without dropping the route (or one on a current-thread Tokio
-runtime, where the blocking advance is skipped) replays everything since the last asynchronous feedback
-tick. Set `checkpoint_store` to a `file://` path for a second, per-ack durable position that survives
-teardown regardless. Treat the source as at-least-once and make the sink idempotent. Each change event
-carries the full row (so the primary key is in the payload), `postgres.lsn` (a monotonic version),
-`postgres.operation`/`schema`/`table`, and — when the table has a primary key / replica identity —
-`postgres.key` (the key value). The event's `message_id` is a stable hash of `schema.table + key +
-lsn`, so a replayed change deduplicates through the `deduplication` middleware, and Mongo `id_field`
-or a SQL `ON CONFLICT` on the key column make the sink write idempotent. Use `postgres.lsn` as the
-version to drop stale replays (`... DO UPDATE ... WHERE excluded.lsn > orders.lsn`).
-
-*Known edge:* if the same primary key is changed twice **within a single transaction**, both events
-share that transaction's commit LSN, so they produce the same `message_id`. The `deduplication`
-middleware then treats the second as a duplicate and drops it. The sink still converges to the final
-row state, but the intermediate change is not delivered — if you need every intra-txn revision, do not
-rely on the `message_id`/middleware path for those rows.
-
-The `deduplication` middleware is a complement, not a replacement: it filters duplicates *before* the
-sink, keyed on `message_id`, but its `sled` store is single-instance — prefer the sink constraint for
-multi-writer ETL.
-
-**MongoDB — branch on insert vs. duplicate (`report_outcome`).** Sometimes you need to *act* on
-whether a record was newly inserted or already existed — enrich only fresh rows, or reply with the
-existing entry for duplicates. Set `report_outcome: true` and the Mongo publisher returns the message
-tagged with metadata `mongodb.outcome` = `inserted` (fresh write) or `existed` (dup-key on the
-unique `_id`). Wrap it in a `request` endpoint to forward that tagged message into a `switch` that
-routes on `mongodb.outcome`:
-
-```yaml
-orders_upsert_branch:
-  input: { kafka: { topic: "orders", url: "localhost:9092" } }
-  output:
-    request:                       # calls `to`, forwards its response to `forward_to`
-      to:
-        mongodb:
-          url: "mongodb://localhost:27017"
-          database: "shop"
-          collection: "orders"
-          format: json
-          id_field: "order_id"     # deterministic _id → insert-if-absent
-          report_outcome: true     # → mongodb.outcome = inserted | existed
-          request_reply: true
-      forward_to:
-        switch:
-          metadata_key: "mongodb.outcome"
-          cases:
-            inserted: { ref: "enrich_new_order" }   # e.g. build entry X, reply
-            existed:  { ref: "handle_duplicate" }    # e.g. reply with parts of X
-```
-
-`report_outcome` is sink-only and pairs with `id_field`; without a deterministic `_id` there is no
-duplicate to detect. Left unwrapped by `request`, the tagged message is returned as the route's
-response as usual.
-
-**Files & object storage — `idempotency`.** A filesystem has no unique constraint, so the `file` and
-`object_store` sinks get replay safety a different way: **deterministic names plus covered-range
-recovery**. Set `idempotency: true` and the sink stops writing UUID-named objects. Instead it groups
-each batch into runs of consecutive source positions and writes one immutable part per run, named
-for the range it covers:
-
-```yaml
-kafka_to_s3:
-  input:
-    kafka: { topic: "orders", url: "localhost:9092", source_metadata: true }
-  output:
-    object_store:
-      url: "s3://my-bucket/orders"
-      idempotency: true          # → s3://my-bucket/orders/part-orders-0-0-1023.jsonl
-```
-
-On startup the sink lists what is already there, parses the ranges out of the part names, and drops
-any incoming record whose position falls inside one. Filtering is **per record, not per batch**, so
-batch boundaries are free to differ across restarts — that is what makes it work without a
-checkpoint protocol. Local files stage to a temp name, `fsync`, then `rename` (atomic within a
-filesystem); object stores have no atomic rename, so a single PUT under the final name *is* the
-commit.
-
-This needs a replayable source position, which today means **Kafka** (topic/partition/offset) or
-**`postgres_cdc`** (commit LSN plus in-transaction ordinal). A route with an idempotent output turns
-`source_metadata` on for its input automatically; set it explicitly only when you want the
-`mqb.src.*` keys for something else. Any other input is rejected when the route starts. NATS, AMQP
-and MongoDB CDC also accept `source_metadata` and emit provenance keys, but a subject or routing key
-is not a replayable offset, so they cannot drive an idempotent sink.
-
-For the `file` sink, `idempotency: true` changes what `path` means: it is the directory that receives
-the part files, not the file that is appended to. The sink creates it on startup, so pointing it at an
-existing regular file fails there with "Failed to create idempotent file sink directory".
-
-`compression` and `encryption` work as usual.
-
-Current limits, all of which the sink rejects or logs rather than silently mishandling:
-
-*   No `csv` (each part would need its own header row).
-*   `date_partition` is ignored — parts are written flat under the prefix, since the name already
-    carries the range. Logged at startup.
-*   **One part file per contiguous run per batch.** There is no size-based rolling yet, so a large
-    backfill produces many small files (~1000 per 1M rows at `batch_size: 1024`). For `postgres_cdc`
-    this is per-transaction, so a high-commit-rate stream produces one small file per commit. Rolling
-    would require buffering across batches the route has already acked, which is not safe today.
+The short form: point the sink at a deterministic business key (`id_field` for MongoDB, an
+`ON CONFLICT` column for SQL) and let its unique constraint be the authority — it is already shared
+across every writer, so no extra state store is needed. Add the `deduplication` middleware on the
+**input** only when the sink has no constraint to lean on, or to keep duplicates away from a handler.
 
 ### Cloud Object Storage (S3 / GCS / Azure)
 The `object_store` endpoint (alias `s3`) reads and writes cloud object stores — Amazon S3, Google Cloud Storage, Azure Blob, Cloudflare R2, and anything else the [`object_store`](https://crates.io/crates/object_store) crate speaks — behind the same `receive_batch` / `send_batch` API. Enable it with the `object-store` feature. Credentials and backend options are read from the process environment (`AWS_ACCESS_KEY_ID`, `AWS_ENDPOINT`, `AWS_REGION`, `GOOGLE_SERVICE_ACCOUNT`, `AZURE_STORAGE_ACCOUNT`, ...); the URL scheme picks the backend (`s3://`, `gs://`, `az://`).
 
-*   **As a sink**, each flushed batch is encoded with the same file endpoint formats (`normal` JSONL, `json`, `text`, `raw`) and written as **one immutable object** at `<prefix>/[YYYY/MM/DD/]<uuidv7>.<ext>`. Objects are write-once — nothing is appended or mutated. The uuidv7 name already sorts by write time; the optional `date_partition` prefix (on by default, derived from that same id's timestamp) is a readability / lifecycle-rule convenience. This naming applies only while `idempotency` is off — with `idempotency: true` the parts are instead named for the source range they cover and written flat under the prefix, and `date_partition` is ignored (see "Files & object storage — `idempotency`" above).
+*   **As a sink**, each flushed batch is encoded with the same file endpoint formats (`normal` JSONL, `json`, `text`, `raw`) and written as **one immutable object** at `<prefix>/[YYYY/MM/DD/]<uuidv7>.<ext>`. Objects are write-once — nothing is appended or mutated. The uuidv7 name already sorts by write time; the optional `date_partition` prefix (on by default, derived from that same id's timestamp) is a readability / lifecycle-rule convenience. This naming applies only while `idempotency` is off — with `idempotency: true` the parts are instead named for the source range they cover and written flat under the prefix, and `date_partition` is ignored (see [Files & object storage — `idempotency`](docs/DELIVERY.md#files--object-storage--idempotency)).
 *   **As a source**, objects under the prefix are listed in key order, fetched whole, split on the delimiter, and emitted. Progress is a durable cursor holding the last fully-acked object key: set `cursor_id` and an external `checkpoint_store` (`file://`, `s3://`, `postgres://`, `mongodb://`) so a restart resumes without re-emitting. Objects are **never deleted or rewritten** — resume is non-destructive and at-least-once at object granularity (a nacked batch is redelivered; the cursor only advances once an object is fully acked). `csv` is supported on the source only.
 
 ```yaml
@@ -708,11 +570,11 @@ let projection_handler = TypeHandler::new()
 
 ## Configuration
 
-All routes and endpoints can be defined via a configuration file (for example `mq-bridge.yaml`), JSON, or environment variables. For a complete reference of options, middleware, and examples, see the [Configuration Guide](CONFIGURATION.md).
+All routes and endpoints can be defined via a configuration file (for example `mq-bridge.yaml`), JSON, or environment variables. For a complete reference of options, middleware, and examples, see the [Configuration Guide](docs/CONFIGURATION.md).
 
 Important route-level knobs:
 
-*   `batch_size`: maximum messages per route iteration. Defaults to `1`; increase it when throughput matters.
+*   `batch_size`: maximum messages per route iteration. Defaults to `512`; lower it for tighter failure isolation or large payloads.
 *   `concurrency`: number of route workers. Defaults to `1`; useful for high-latency handlers or endpoints.
 *   `commit_concurrency_limit`: maximum in-flight commit operations, whether they are queued through ordered commit sequencing or run concurrently for independent-ack transports. Defaults to `4096`.
 
@@ -755,7 +617,7 @@ On an **output** endpoint the message is failed so a following `dlq` captures it
 **input** endpoint it is dropped from the batch and acknowledged, which keeps invalid data
 out of the route.
 
-See **[REFERENCE.md](REFERENCE.md#transform)** for the full option list, the supported schema
+See **[REFERENCE.md](docs/REFERENCE.md#transform)** for the full option list, the supported schema
 subset, and the exact set of allowed type coercions.
 
 ## Running Tests
