@@ -16,6 +16,7 @@ use mq_bridge::test_utils::{
 };
 
 const PERF_TEST_MESSAGE_COUNT: usize = 1000;
+const GRPC_SERVER_MESSAGE_COUNT: usize = 25_600;
 
 #[allow(unused)]
 #[cfg(feature = "rustls")]
@@ -1244,6 +1245,7 @@ fn performance_benchmarks(c: &mut Criterion) {
     // report it as both write and read.
     #[cfg(feature = "grpc")]
     if mq_bridge::test_utils::should_run_benchmark("grpc_server") {
+        group.throughput(Throughput::Elements(GRPC_SERVER_MESSAGE_COUNT as u64));
         group.bench_function("grpc_server_batch", |b| {
             b.to_async(&rt).iter_custom(|iters| async move {
                 let (publisher, drain) = grpc_server_helper::setup_coupled().await;
@@ -1253,14 +1255,14 @@ fn performance_benchmarks(c: &mut Criterion) {
                     total += mq_bridge::test_utils::measure_write_performance(
                         "grpc_server_batch",
                         std::sync::Arc::clone(&publisher),
-                        PERF_TEST_MESSAGE_COUNT,
+                        GRPC_SERVER_MESSAGE_COUNT,
                         PERF_TEST_CONCURRENCY,
                     )
                     .await;
                 }
                 grpc_server_helper::finish_drain(drain).await;
                 let msgs_per_sec =
-                    (iters as f64 * PERF_TEST_MESSAGE_COUNT as f64) / total.as_secs_f64();
+                    (iters as f64 * GRPC_SERVER_MESSAGE_COUNT as f64) / total.as_secs_f64();
                 let mut results = BENCH_RESULTS.lock().await;
                 let stats = results.entry("grpc_server".to_string()).or_default();
                 stats.write_performance = msgs_per_sec;
@@ -1281,14 +1283,14 @@ fn performance_benchmarks(c: &mut Criterion) {
                     total += mq_bridge::test_utils::measure_single_write_performance(
                         "grpc_server_single",
                         std::sync::Arc::clone(&publisher),
-                        PERF_TEST_MESSAGE_COUNT,
+                        GRPC_SERVER_MESSAGE_COUNT,
                         PERF_TEST_CONCURRENCY,
                     )
                     .await;
                 }
                 grpc_server_helper::finish_drain(drain).await;
                 let msgs_per_sec =
-                    (iters as f64 * PERF_TEST_MESSAGE_COUNT as f64) / total.as_secs_f64();
+                    (iters as f64 * GRPC_SERVER_MESSAGE_COUNT as f64) / total.as_secs_f64();
                 let mut results = BENCH_RESULTS.lock().await;
                 let stats = results.entry("grpc_server".to_string()).or_default();
                 stats.single_write_performance = msgs_per_sec;
