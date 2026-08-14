@@ -1646,6 +1646,25 @@ pub fn print_incomplete_benchmarks() {
     );
 }
 
+/// Panic when a sub-benchmark timed out, so a deadlocked endpoint cannot exit 0.
+///
+/// Only timeouts fail the run. An exhausted feature budget is not enough on its own: slow but
+/// successful sub-benchmarks can spend it while still reporting their rows, and failing on that
+/// would turn a loaded machine into a red build.
+pub fn fail_on_incomplete_benchmarks() {
+    let timed_out = BENCH_TIMED_OUT_SUBBENCHES.blocking_lock();
+    if timed_out.is_empty() {
+        return;
+    }
+    let mut names: Vec<&str> = timed_out.iter().map(String::as_str).collect();
+    names.sort_unstable();
+    panic!(
+        "benchmark incomplete: {} sub-benchmark(s) blocked and produced no results: {}",
+        names.len(),
+        names.join(", ")
+    );
+}
+
 #[macro_export]
 macro_rules! run_benchmarks {
     ($name:literal, $group:expr, $rt:expr, $results:expr, $msg_count:expr, $concurrency:expr, $sleep_duration:expr) => {

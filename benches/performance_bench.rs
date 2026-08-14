@@ -10,7 +10,10 @@ use tokio::sync::Mutex;
 mod integration; // Still needed for backend modules like kafka, nats etc.
 
 use mq_bridge::bench_backend;
-use mq_bridge::test_utils::{print_benchmark_results, PerformanceResult, PERF_TEST_CONCURRENCY};
+use mq_bridge::test_utils::{
+    fail_on_incomplete_benchmarks, print_benchmark_results, PerformanceResult,
+    PERF_TEST_CONCURRENCY,
+};
 
 const PERF_TEST_MESSAGE_COUNT: usize = 1000;
 
@@ -1302,6 +1305,9 @@ fn performance_benchmarks(c: &mut Criterion) {
     let results = BENCH_RESULTS.blocking_lock();
     print_benchmark_results(&results, PERF_TEST_MESSAGE_COUNT);
     group.finish();
+    // After finish() so Criterion still writes its reports: a blocked endpoint leaves no row
+    // in the table above, which must not be reported as a successful run.
+    fail_on_incomplete_benchmarks();
 }
 
 criterion_group!(benches, performance_benchmarks);

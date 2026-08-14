@@ -1033,8 +1033,7 @@ impl proto::bridge_server::Bridge for BridgeService {
 
         // Dispatch and commit-wait run in separate tasks. Awaiting a receipt inline would
         // keep the next message from reaching the consumer until this one had committed,
-        // and the consumer lingers for more messages before returning a batch — so the two
-        // would wait on each other and every batch would hold exactly one message.
+        // serializing the stream and forcing every consumer batch to hold one message.
         let (pending_tx, mut pending_rx) =
             mpsc::channel::<(String, Pending)>(PUBLISH_BATCH_INFLIGHT);
 
@@ -1378,8 +1377,15 @@ impl MessageConsumer for ServerModeConsumer {
                 continue;
             }
 
-            // Nothing buffered: block for the first message, then linger briefly for
-            // more. Polling every shard registers our waker on each.
+            // Everything currently buffered has been drained. Return a partial batch
+            // immediately so publishers waiting for its commit are not held behind the
+            // stream-oriented batching linger.
+            if !messages.is_empty() {
+                break;
+            }
+
+            // Nothing buffered yet: block for the first message. Polling every shard
+            // registers our waker on each.
             let start = self.drain_start;
             let poll = std::future::poll_fn(|cx| {
                 let mut all_closed = true;
@@ -1400,17 +1406,10 @@ impl MessageConsumer for ServerModeConsumer {
                     std::task::Poll::Pending
                 }
             });
-            let next = if messages.is_empty() {
-                // Drain mode: a brief idle timeout on the first message yields an empty batch.
-                match crate::traits::drain_gated(self.exit_on_empty, poll).await {
-                    Some(value) => value,
-                    None => return Ok(crate::outcomes::ReceivedBatch::empty()),
-                }
-            } else {
-                match tokio::time::timeout(Duration::from_millis(GRPC_BATCH_POLL_MS), poll).await {
-                    Ok(value) => value,
-                    Err(_) => break, // linger window closed
-                }
+            // Drain mode: a brief idle timeout on the first message yields an empty batch.
+            let next = match crate::traits::drain_gated(self.exit_on_empty, poll).await {
+                Some(value) => value,
+                None => return Ok(crate::outcomes::ReceivedBatch::empty()),
             };
             match next {
                 Some(delivery) => {
@@ -2057,10 +2056,8 @@ mod tests {
     }
 
     /// `publish_batch` must dispatch without waiting for each message to commit. Awaiting
-    /// receipts inline deadlocked against the consumer's batch-fill linger: the consumer
-    /// waited for a second message that the publisher would not send until the first had
-    /// committed, so every batch held exactly one message and throughput collapsed to
-    /// roughly one message per `GRPC_BATCH_POLL_MS`.
+    /// receipts inline prevents later messages from reaching the consumer until the first
+    /// has committed, so every batch holds exactly one message and the stream is serialized.
     ///
     /// Uses the real `BridgeService`, not `MockBridge` — the mock answers immediately and
     /// cannot catch this.
@@ -2079,7 +2076,22 @@ mod tests {
         let url = format!("http://{}", consumer.bound_addr.unwrap());
 
         let drain = tokio::spawn(async move {
-            let (mut total, mut batches) = (0usize, 0usize);
+            let first = consumer.receive_batch(512).await.expect("first receive");
+            let first_count = first.messages.len();
+            let second = tokio::time::timeout(Duration::from_secs(1), consumer.receive_batch(512))
+                .await
+                .expect("dispatch waited for the first batch to commit")
+                .expect("second receive");
+            let second_count = second.messages.len();
+
+            (first.commit)(vec![MessageDisposition::Ack; first_count])
+                .await
+                .expect("first commit");
+            (second.commit)(vec![MessageDisposition::Ack; second_count])
+                .await
+                .expect("second commit");
+
+            let mut total = first_count + second_count;
             while total < COUNT {
                 let batch = consumer.receive_batch(512).await.expect("receive");
                 let n = batch.messages.len();
@@ -2087,12 +2099,11 @@ mod tests {
                     continue;
                 }
                 total += n;
-                batches += 1;
                 (batch.commit)(vec![MessageDisposition::Ack; n])
                     .await
                     .expect("commit");
             }
-            (total, batches)
+            total
         });
 
         let publisher = GrpcPublisher::new(&GrpcConfig {
@@ -2108,16 +2119,47 @@ mod tests {
             .collect();
         publisher.send_batch(messages).await.unwrap();
 
-        let (total, batches) = tokio::time::timeout(Duration::from_secs(30), drain)
+        let total = tokio::time::timeout(Duration::from_secs(30), drain)
             .await
             .expect("route did not drain")
             .unwrap();
 
         assert_eq!(total, COUNT, "every message must arrive");
-        assert!(
-            batches < COUNT / 4,
-            "publish_batch is serializing on commits: {batches} batches for {COUNT} messages"
-        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn server_mode_partial_batch_does_not_linger_before_commit() {
+        let (tx, rx) = mpsc::channel(1);
+        let shared_server = Arc::new(SharedGrpcServer {
+            router: Arc::new(SharedGrpcRouter::new()),
+            handle: tokio::spawn(std::future::pending()),
+            bound_addr: "127.0.0.1:0".parse().unwrap(),
+        });
+        let mut consumer = ServerModeConsumer {
+            route_id: GRPC_ROUTE_ID.fetch_add(1, Ordering::Relaxed),
+            shared_server,
+            bound_addr: "127.0.0.1:0".parse().unwrap(),
+            rxs: vec![rx],
+            drain_start: 0,
+            exit_on_empty: false,
+        };
+        let (completion, receipt) = oneshot::channel();
+        tx.send(InboundDelivery {
+            message: bridge_msg("prompt-commit"),
+            completion,
+        })
+        .await
+        .unwrap();
+
+        let batch = tokio::time::timeout(Duration::from_millis(1), consumer.receive_batch(128))
+            .await
+            .expect("server-mode receive must not linger for a partial batch")
+            .expect("receive");
+        assert_eq!(batch.messages.len(), 1);
+        (batch.commit)(vec![MessageDisposition::Ack])
+            .await
+            .expect("commit");
+        assert!(matches!(receipt.await, Ok(MessageDisposition::Ack)));
     }
 
     fn bridge_msg(id: &str) -> BridgeMessage {
