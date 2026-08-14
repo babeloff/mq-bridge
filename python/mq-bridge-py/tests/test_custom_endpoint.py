@@ -397,7 +397,9 @@ def test_middleware_rewrites_on_the_output_side() -> None:
 
 
 def test_unregister_reports_whether_a_registration_existed_and_frees_the_name() -> None:
-    build = lambda route_name, config: ListSink()  # noqa: E731
+    def build(route_name, config):
+        return ListSink()
+
     name = _register("pyunreg", build)
 
     assert unregister_endpoint(name) is True
