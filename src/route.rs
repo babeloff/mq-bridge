@@ -496,6 +496,25 @@ async fn send_batch_and_commit(
                     failed.len(),
                     first_err
                 );
+                // Non-retryable entries in a mixed batch are Ack'ed (dropped) below,
+                // so account for them here before the transient path returns.
+                if !has_dlq_middleware {
+                    let mut dropped = 0usize;
+                    let mut cause = None;
+                    for (msg, e) in &failed {
+                        if matches!(e, PublisherError::NonRetryable(_)) {
+                            error!(
+                                "Dropping message (ID: {:032x}) due to non-retryable error: {}",
+                                msg.message_id, e
+                            );
+                            dropped += 1;
+                            cause.get_or_insert(e);
+                        }
+                    }
+                    if let Some(cause) = cause {
+                        record_dropped_messages(drops, dropped, cause);
+                    }
+                }
                 let dispositions = map_responses_to_dispositions(
                     &scratch.message_ids,
                     responses,
