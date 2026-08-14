@@ -1615,6 +1615,35 @@ pub fn print_benchmark_results(
         }
         println!("---------------------------------------------------------------------------------------\n");
     }
+    print_incomplete_benchmarks();
+}
+
+/// Name the sub-benchmarks that produced no result, next to the table itself.
+///
+/// The table is the artifact people read and paste elsewhere, and a backend that *blocks*
+/// rather than runs slowly leaves no row in it — indistinguishable from one that was never
+/// selected. A slow backend always reports a row, so a missing one means it hung.
+pub fn print_incomplete_benchmarks() {
+    let timed_out = BENCH_TIMED_OUT_SUBBENCHES.blocking_lock();
+    let aborted = BENCH_ABORTED_FEATURES.blocking_lock();
+    if timed_out.is_empty() && aborted.is_empty() {
+        return;
+    }
+    println!("--- INCOMPLETE: the following produced NO results and are missing above ---");
+    let mut subbenches: Vec<&String> = timed_out.iter().collect();
+    subbenches.sort();
+    for key in subbenches {
+        println!("  TIMED OUT  {key}");
+    }
+    let mut features: Vec<&String> = aborted.iter().collect();
+    features.sort();
+    for feature in features {
+        println!("  ABORTED    {feature} (time budget spent; remaining sub-benchmarks skipped)");
+    }
+    println!("A timeout means the endpoint blocked, not that it was slow.");
+    println!(
+        "---------------------------------------------------------------------------------------\n"
+    );
 }
 
 #[macro_export]
