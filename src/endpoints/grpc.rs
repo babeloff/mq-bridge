@@ -927,6 +927,21 @@ impl SharedGrpcRouter {
         let route = self
             .route_for_topic(&topic)
             .ok_or_else(|| anyhow::anyhow!("No route for topic '{}'", topic))?;
+        {
+            let active = route
+                .active_subscribers
+                .lock()
+                .map_err(|_| anyhow::anyhow!("gRPC active subscriber lock poisoned"))?;
+            if !active.is_empty() {
+                let mut pending = route
+                    .subscriber_pending
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("gRPC subscriber retention lock poisoned"))?;
+                for consumer_id in active.iter() {
+                    pending.entry(consumer_id).retain(&msg);
+                }
+            }
+        }
         // Only clone for the broadcast stream when someone is actually subscribed.
         if route.broadcast_tx.receiver_count() > 0 {
             let _ = route.broadcast_tx.send(msg.clone());
@@ -1128,7 +1143,7 @@ impl proto::bridge_server::Bridge for BridgeService {
             .ok()
             .and_then(|pending| pending.get(&consumer_id).map(PendingMessages::replay))
             .unwrap_or_default();
-        let pending = route.subscriber_pending.clone();
+        let replayed_ids: HashSet<_> = replay.iter().map(|msg| msg.id.clone()).collect();
         let (tx_stream, rx_stream) = mpsc::channel(32);
         tokio::spawn(async move {
             // Releases the id, and an ephemeral consumer's retention with it, however this
@@ -1142,15 +1157,23 @@ impl proto::bridge_server::Bridge for BridgeService {
             loop {
                 match rx.recv().await {
                     Ok(msg) => {
-                        if let Ok(mut pending) = pending.lock() {
-                            pending.entry(&consumer_id).retain(&msg);
+                        // A dispatch racing the replay snapshot is both retained and broadcast.
+                        // The retained copy was already sent above, so do not send it twice.
+                        if replayed_ids.contains(&msg.id) {
+                            continue;
                         }
                         if tx_stream.send(Ok(msg)).await.is_err() {
                             warn!("subscribe: downstream consumer disconnected");
                             break;
                         }
                     }
-                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        warn!(
+                            skipped,
+                            "subscribe: subscriber lagged; closing stream for retained replay"
+                        );
+                        break;
+                    }
                     Err(broadcast::error::RecvError::Closed) => break,
                 }
             }
@@ -2247,6 +2270,48 @@ mod tests {
         );
 
         subscribe("other").await.expect("a distinct id still works");
+    }
+
+    #[tokio::test]
+    async fn subscriber_lag_closes_the_stream_and_reconnect_replays_retained_messages() {
+        let router = Arc::new(SharedGrpcRouter::new());
+        let (tx, _rx) = mpsc::channel::<InboundDelivery>(8);
+        let (broadcast_tx, _) = broadcast::channel(2);
+        router.routes.write().unwrap().insert(
+            1,
+            SharedGrpcRoute {
+                topic: "default".to_string(),
+                txs: vec![tx],
+                cursor: Arc::new(AtomicUsize::new(0)),
+                broadcast_tx,
+                subscriber_pending: Arc::new(Mutex::new(SubscriberPending::default())),
+                active_subscribers: Arc::new(Mutex::new(HashSet::new())),
+            },
+        );
+        let service = BridgeService {
+            router: router.clone(),
+            commit_timeout: None,
+        };
+        let request = || {
+            Request::new(SubscribeRequest {
+                topic: "default".to_string(),
+                consumer_id: "durable".to_string(),
+            })
+        };
+
+        let mut first = service.subscribe(request()).await.unwrap().into_inner();
+        for id in ["a", "b", "c"] {
+            router.dispatch(bridge_msg(id)).await.unwrap();
+        }
+        assert!(tokio::time::timeout(Duration::from_secs(1), first.next())
+            .await
+            .expect("lagged stream should terminate")
+            .is_none());
+
+        let mut replay = service.subscribe(request()).await.unwrap().into_inner();
+        for id in ["a", "b", "c"] {
+            assert_eq!(replay.next().await.unwrap().unwrap().id, id);
+        }
     }
 
     /// Without the id there is no retention set to resolve the ack against, so reporting
