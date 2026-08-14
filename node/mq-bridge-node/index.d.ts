@@ -198,6 +198,9 @@ export function registerEndpoint(
   ) => CustomEndpoint | Promise<CustomEndpoint>,
 ): void;
 
+/** Unregister a custom endpoint after all routes using it have stopped. */
+export function unregisterEndpoint(name: string): boolean;
+
 /**
  * Load a native endpoint plugin and register the endpoint it provides.
  *
@@ -249,5 +252,8 @@ export function registerMiddleware(
     config: Record<string, JsonValue>,
   ) => CustomMiddleware | Promise<CustomMiddleware>,
 ): void;
+
+/** Unregister custom middleware after all routes using it have stopped. */
+export function unregisterMiddleware(name: string): boolean;
 
 export const version: string;

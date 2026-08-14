@@ -296,7 +296,10 @@ middleware works the same way via `register_middleware`, with `on_receive` /
 `on_send` hooks that return one slot per input message (`None` drops it).
 
 Each endpoint instance runs on its own thread and never sees concurrent calls, so
-it need not be thread-safe. Register before starting a route that names it.
+it need not be thread-safe. Register before starting a route that names it; the
+registry is process-global and rejects a duplicate name, so use
+`unregister_endpoint(name)` / `unregister_middleware(name)` to release one once
+the routes using it have stopped.
 
 **Full guide, including the Rust path:** [EXTENDING.md](../../docs/EXTENDING.md).
 

@@ -197,8 +197,10 @@ await new Promise((r) => setTimeout(r, 50));
 route.join();
 ```
 
-A registered endpoint also keeps the process alive; call `process.exit()` when
-your script is done.
+A registered endpoint also keeps the process alive. Once the routes using it
+have stopped, `unregisterEndpoint(name)` (or `unregisterMiddleware(name)`)
+releases it so the process can exit on its own — unlike `process.exit()`, which
+skips pending flushes and `close()` hooks.
 
 **Full guide, including the Rust path:** [EXTENDING.md](../../docs/EXTENDING.md).
 

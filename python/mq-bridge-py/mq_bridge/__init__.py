@@ -18,6 +18,8 @@ from ._mq_bridge import (
     load_endpoint_plugin,
     register_endpoint,
     register_middleware,
+    unregister_endpoint,
+    unregister_middleware,
 )
 
 
@@ -81,4 +83,6 @@ __all__ = [
     "plugin_library_path",
     "register_endpoint",
     "register_middleware",
+    "unregister_endpoint",
+    "unregister_middleware",
 ]

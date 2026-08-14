@@ -264,6 +264,11 @@ function registerEndpoint(name, factory) {
   });
 }
 
+/** Unregister a custom endpoint after all routes using it have stopped. */
+function unregisterEndpoint(name) {
+  return native.unregisterEndpointDispatch(name);
+}
+
 /**
  * Report a thrown error back to Rust. `retryable` stays `undefined` unless the
  * host set it explicitly — collapsing it to `false` would classify every
@@ -306,6 +311,11 @@ function registerMiddleware(name, factory) {
       return errorReply(err);
     }
   });
+}
+
+/** Unregister a custom middleware after all routes using it have stopped. */
+function unregisterMiddleware(name) {
+  return native.unregisterMiddlewareDispatch(name);
 }
 
 async function dispatchEndpointCall(instances, factory, call) {
@@ -471,5 +481,7 @@ module.exports = {
   pluginLibraryPath,
   registerEndpoint,
   registerMiddleware,
+  unregisterEndpoint,
+  unregisterMiddleware,
   version: native.VERSION,
 };

@@ -306,6 +306,12 @@ the route down instead of re-reading data that cannot heal.
 even with `concurrency > 1`, so it does not need to be thread-safe. It also means
 one endpoint is one Python thread's worth of throughput.
 
+**Releasing a name.** The registry is process-global and rejects a duplicate
+name. `mq_bridge.unregister_endpoint(name)` (and `unregister_middleware(name)`)
+drops the factory once the routes using it have stopped, freeing the name and the
+reference held on your factory object. Both return `True` when a registration was
+removed.
+
 ### Python middleware
 
 ```python
@@ -414,7 +420,16 @@ For the same reason the host object is built lazily, on first use rather than at
 `start()`: a factory dispatched from inside `start()` could never be serviced.
 
 A registered endpoint also keeps the Node process alive (it is a live resource,
-like an open server). Call `process.exit()` when your script is done.
+like an open server). Once the routes using it have stopped, release it so the
+process can exit on its own:
+
+```js
+mqb.unregisterEndpoint(name);     // mqb.unregisterMiddleware(name) for middleware
+```
+
+Both return `true` when a registration was removed, `false` when the name was
+not registered. `process.exit()` also works, but it skips pending flushes and
+`close()` hooks.
 
 ---
 

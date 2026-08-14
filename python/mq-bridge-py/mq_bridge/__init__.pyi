@@ -36,8 +36,18 @@ def register_endpoint(
     ``receive_batch``; from any other method it is an ordinary error. ``commit``
     receives a list of ``"ack"``/``"nack"`` strings, one per message in the batch.
 
-    Register before starting a route that names it. All calls into one endpoint
-    object are serialized on its own thread, so it need not be thread-safe."""
+    Register before starting a route that names it; registering the same name
+    twice raises and keeps the first factory. All calls into one endpoint object
+    are serialized on its own thread, so it need not be thread-safe."""
+    ...
+
+def unregister_endpoint(name: str) -> bool:
+    """Drop the endpoint factory registered under ``name``, releasing the
+    reference it holds on the Python factory object.
+
+    Returns ``True`` when a factory was removed, ``False`` when ``name`` was not
+    registered. Call only after every route using the endpoint has stopped;
+    routes already holding an instance keep running."""
     ...
 
 def register_middleware(
@@ -57,6 +67,14 @@ def register_middleware(
     ``Message`` (kept, possibly rewritten) or ``None`` to drop it. Keeping the
     length fixed is what lets acknowledgements stay aligned with the source
     batch."""
+    ...
+
+def unregister_middleware(name: str) -> bool:
+    """Drop the middleware factory registered under ``name``, releasing the
+    reference it holds on the Python factory object.
+
+    Returns ``True`` when a factory was removed, ``False`` when ``name`` was not
+    registered. Call only after every route using the middleware has stopped."""
     ...
 
 JsonValue = Any

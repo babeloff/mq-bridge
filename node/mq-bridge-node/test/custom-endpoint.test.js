@@ -9,11 +9,34 @@ const {
   Message,
   Publisher,
   Route,
-  registerEndpoint,
-  registerMiddleware,
+  registerEndpoint: registerEndpointNative,
+  registerMiddleware: registerMiddlewareNative,
+  unregisterEndpoint,
+  unregisterMiddleware,
 } = require("..");
 
 const unique = (prefix) => `${prefix}.${randomUUID().replace(/-/g, "")}`;
+
+/**
+ * A live registration holds the JS dispatcher, which keeps the Node event loop
+ * alive — a leaked one hangs the whole run instead of failing a test. Register
+ * only through these wrappers so cleanup cannot be forgotten.
+ */
+const cleanups = [];
+
+function registerEndpoint(name, factory) {
+  registerEndpointNative(name, factory);
+  cleanups.push(() => unregisterEndpoint(name));
+}
+
+function registerMiddleware(name, factory) {
+  registerMiddlewareNative(name, factory);
+  cleanups.push(() => unregisterMiddleware(name));
+}
+
+test.after(() => {
+  for (const cleanup of cleanups) cleanup();
+});
 
 /** Register under a unique name: the endpoint registry is process-global. */
 function register(prefix, factory) {
@@ -277,6 +300,20 @@ test("a capability getter failure cleans up the endpoint instance", async () => 
 
 test("registerEndpoint rejects a non-callable factory", () => {
   assert.throws(() => registerEndpoint("not_callable", {}), TypeError);
+});
+
+test("unregistering reports whether a registration existed and frees the name", () => {
+  const factory = () => ({ async sendBatch() {} });
+  const name = register("jsunreg", factory);
+
+  assert.equal(unregisterEndpoint(name), true);
+  assert.equal(unregisterEndpoint(name), false, "a second call finds nothing");
+
+  assert.equal(unregisterMiddleware(registerMw("mwunreg", () => ({}))), true);
+  assert.equal(unregisterMiddleware("mw_never_registered"), false);
+
+  // The registry rejects duplicates, so re-registering proves the name is free.
+  registerEndpoint(name, factory);
 });
 
 /** Rewrites every message and drops the ones the config names. */

@@ -2782,7 +2782,8 @@ fn finish_run(run_state: &Arc<Mutex<RouteRunState>>, name: &str) {
 /// must return an object implementing `receive_batch(max_messages)` (input side)
 /// and/or `send_batch(messages)` (output side), optionally `commit(dispositions)`
 /// and `close()`. Register before starting any route that names it; registering
-/// the same name twice keeps the last factory.
+/// the same name twice raises and keeps the first factory — call
+/// `unregister_endpoint(name)` first to replace it.
 #[pyfunction]
 fn register_endpoint(py: Python<'_>, name: &str, factory: Py<PyAny>) -> PyResult<()> {
     if name.trim().is_empty() {
@@ -2802,6 +2803,15 @@ fn register_endpoint(py: Python<'_>, name: &str, factory: Py<PyAny>) -> PyResult
     )
     .map_err(|err| PyValueError::new_err(format!("{err:#}")))?;
     Ok(())
+}
+
+/// Drop the endpoint factory registered under `name`, releasing the reference it
+/// holds on the Python factory object. Returns `True` when a factory was removed,
+/// `False` when `name` was not registered. Call only after every route using the
+/// endpoint has stopped; routes already holding an instance keep running.
+#[pyfunction]
+fn unregister_endpoint(name: &str) -> bool {
+    core::extensions::unregister_endpoint_factory(name)
 }
 
 /// Register a Python middleware factory under `name`, making it usable in any
@@ -2835,6 +2845,15 @@ fn register_middleware(py: Python<'_>, name: &str, factory: Py<PyAny>) -> PyResu
     )
     .map_err(|err| PyValueError::new_err(format!("{err:#}")))?;
     Ok(())
+}
+
+/// Drop the middleware factory registered under `name`, releasing the reference
+/// it holds on the Python factory object. Returns `True` when a factory was
+/// removed, `False` when `name` was not registered. Call only after every route
+/// using the middleware has stopped.
+#[pyfunction]
+fn unregister_middleware(name: &str) -> bool {
+    core::extensions::unregister_middleware_factory(name)
 }
 
 /// Load a native endpoint plugin and register the endpoint it provides.
@@ -2945,6 +2964,8 @@ fn _mq_bridge(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(load_endpoint_plugin, module)?)?;
     module.add_function(wrap_pyfunction!(register_endpoint, module)?)?;
     module.add_function(wrap_pyfunction!(register_middleware, module)?)?;
+    module.add_function(wrap_pyfunction!(unregister_endpoint, module)?)?;
+    module.add_function(wrap_pyfunction!(unregister_middleware, module)?)?;
     module.add("RetryableError", module.py().get_type::<RetryableError>())?;
     module.add(
         "NonRetryableError",

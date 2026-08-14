@@ -898,6 +898,12 @@ pub fn register_middleware_dispatch(
     Ok(())
 }
 
+/// Unregister a JS middleware dispatcher after all routes using it have stopped.
+#[napi(js_name = "unregisterMiddlewareDispatch")]
+pub fn unregister_middleware_dispatch(name: String) -> bool {
+    core::extensions::unregister_middleware_factory(&name)
+}
+
 /// Load a native endpoint plugin and register the endpoint it provides.
 ///
 /// `path` is the compiled plugin library shipped by an endpoint package (for
@@ -950,6 +956,12 @@ pub fn register_endpoint_dispatch(
     )
     .map_err(|err| Error::from_reason(format!("{err:#}")))?;
     Ok(())
+}
+
+/// Unregister a JS endpoint dispatcher after all routes using it have stopped.
+#[napi(js_name = "unregisterEndpointDispatch")]
+pub fn unregister_endpoint_dispatch(name: String) -> bool {
+    core::extensions::unregister_endpoint_factory(&name)
 }
 
 #[napi]

@@ -17,6 +17,8 @@ from mq_bridge import (
     Route,
     register_endpoint,
     register_middleware,
+    unregister_endpoint,
+    unregister_middleware,
 )
 
 
@@ -392,6 +394,20 @@ def test_middleware_rewrites_on_the_output_side() -> None:
         route.join()
 
     assert sink.received == [b"payload!"]
+
+
+def test_unregister_reports_whether_a_registration_existed_and_frees_the_name() -> None:
+    build = lambda route_name, config: ListSink()  # noqa: E731
+    name = _register("pyunreg", build)
+
+    assert unregister_endpoint(name) is True
+    assert unregister_endpoint(name) is False
+    assert unregister_middleware(_register_mw("mwunreg", build)) is True
+    assert unregister_middleware("mw_never_registered") is False
+
+    # The registry rejects duplicates, so re-registering proves the name is free.
+    register_endpoint(name, build)
+    assert unregister_endpoint(name) is True
 
 
 def test_middleware_without_either_hook_passes_through() -> None:

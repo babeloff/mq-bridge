@@ -36,13 +36,19 @@ pub fn get_endpoint_factory(name: &str) -> Option<Arc<dyn CustomEndpointFactory>
     map.get(name).cloned()
 }
 
-#[cfg(feature = "plugin")]
-pub(crate) fn unregister_endpoint_factory(name: &str) {
+/// Removes the endpoint factory registered under `name`, freeing the name for
+/// re-registration and dropping the registry's reference to the factory.
+///
+/// Returns `true` when a factory was removed, and `false` when no factory has
+/// that name, nothing has ever been registered, or the registry cannot be
+/// written. Consumers already built from the factory are unaffected.
+pub fn unregister_endpoint_factory(name: &str) -> bool {
     if let Some(registry) = CUSTOM_ENDPOINT_REGISTRY.get() {
         if let Ok(mut factories) = registry.write() {
-            factories.remove(name);
+            return factories.remove(name).is_some();
         }
     }
+    false
 }
 
 /// Registers a middleware factory under `name` in the process-global registry.
@@ -71,6 +77,21 @@ pub fn get_middleware_factory(name: &str) -> Option<Arc<dyn CustomMiddlewareFact
     let registry = CUSTOM_MIDDLEWARE_REGISTRY.get_or_init(|| RwLock::new(HashMap::new()));
     let map = registry.read().ok()?;
     map.get(name).cloned()
+}
+
+/// Removes the middleware factory registered under `name`, freeing the name for
+/// re-registration and dropping the registry's reference to the factory.
+///
+/// Returns `true` when a factory was removed, and `false` when no factory has
+/// that name, nothing has ever been registered, or the registry cannot be
+/// written. Middlewares already built from the factory are unaffected.
+pub fn unregister_middleware_factory(name: &str) -> bool {
+    if let Some(registry) = CUSTOM_MIDDLEWARE_REGISTRY.get() {
+        if let Ok(mut factories) = registry.write() {
+            return factories.remove(name).is_some();
+        }
+    }
+    false
 }
 
 #[cfg(test)]
@@ -109,5 +130,33 @@ mod tests {
 
         assert!(error.to_string().contains("already registered"));
         assert!(Arc::ptr_eq(&first, &get_middleware_factory(name).unwrap()));
+    }
+
+    #[test]
+    fn unregistering_an_endpoint_frees_the_name_for_re_registration() {
+        let name = "extensions-test-unregister-endpoint";
+        register_endpoint_factory(name, Arc::new(EndpointFactory)).unwrap();
+
+        assert!(unregister_endpoint_factory(name));
+        assert!(get_endpoint_factory(name).is_none());
+        assert!(!unregister_endpoint_factory(name));
+
+        let second: Arc<dyn CustomEndpointFactory> = Arc::new(EndpointFactory);
+        register_endpoint_factory(name, Arc::clone(&second)).unwrap();
+        assert!(Arc::ptr_eq(&second, &get_endpoint_factory(name).unwrap()));
+    }
+
+    #[test]
+    fn unregistering_a_middleware_frees_the_name_for_re_registration() {
+        let name = "extensions-test-unregister-middleware";
+        register_middleware_factory(name, Arc::new(MiddlewareFactory)).unwrap();
+
+        assert!(unregister_middleware_factory(name));
+        assert!(get_middleware_factory(name).is_none());
+        assert!(!unregister_middleware_factory(name));
+
+        let second: Arc<dyn CustomMiddlewareFactory> = Arc::new(MiddlewareFactory);
+        register_middleware_factory(name, Arc::clone(&second)).unwrap();
+        assert!(Arc::ptr_eq(&second, &get_middleware_factory(name).unwrap()));
     }
 }

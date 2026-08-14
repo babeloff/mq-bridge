@@ -48,6 +48,9 @@ jobs:
   test:
     name: Node binding smoke test
     runs-on: ubuntu-latest
+    # Backstop only; the tests carry their own tighter cap. Keep this above a
+    # cold-cache `cargo check` + `napi build`, which the step timeouts don't cover.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
@@ -86,6 +89,9 @@ jobs:
         working-directory: node/mq-bridge-node
         run: npm run build:ci
 
+      # A leaked ThreadsafeFunction keeps the event loop alive and the suite
+      # never exits; cap it here rather than burning the whole job budget.
       - name: Run Node tests
         working-directory: node/mq-bridge-node
+        timeout-minutes: 5
         run: npm test
