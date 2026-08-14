@@ -350,6 +350,26 @@ fn report_route_error(err_tx: &Sender<anyhow::Error>, err: anyhow::Error, contex
     }
 }
 
+/// Attaches the cause of a permanent sink rejection to the route's status.
+///
+/// Dropping the batch is deliberate — it is what stops a poison message from
+/// wedging the route — but `err_tx` only carries route-*stopping* errors, so
+/// without this a drop is invisible: the route resolves to
+/// [`RouteOutcome::Completed`] with `error: None` and the caller cannot tell a
+/// clean run from one that discarded data. The route still finishes; it just no
+/// longer claims the run was clean.
+fn record_dropped_messages(
+    status: Option<&Arc<RwLock<EndpointStatus>>>,
+    dropped: usize,
+    cause: &PublisherError,
+) {
+    let Some(status) = status else { return };
+    let mut s = recover_write_lock(status, "route_handle_status");
+    s.error = Some(format!(
+        "dropped {dropped} message(s): sink rejected them permanently and no dlq middleware is configured: {cause}"
+    ));
+}
+
 struct BatchScratch {
     message_ids: Vec<u128>,
     request_ids: HashSet<u128>,
@@ -388,6 +408,7 @@ async fn send_batch_and_commit(
     commit_semaphore: Option<&Arc<tokio::sync::Semaphore>>,
     commit_tasks: &mut JoinSet<()>,
     scratch: &mut BatchScratch,
+    status: Option<&Arc<RwLock<EndpointStatus>>>,
 ) -> anyhow::Result<()> {
     let batch_len = messages.len();
     scratch.fill_from(&messages);
@@ -473,6 +494,11 @@ async fn send_batch_and_commit(
                     msg.message_id, e
                 );
             }
+            if !has_dlq_middleware {
+                if let Some((_, first)) = failed.first() {
+                    record_dropped_messages(status, failed.len(), first);
+                }
+            }
             let err_tx = err_tx.clone();
             let dispositions = map_responses_to_dispositions(
                 &scratch.message_ids,
@@ -504,6 +530,17 @@ async fn send_batch_and_commit(
             debug!("Failure commit result: {:?}", commit_result);
             if non_retryable && !has_dlq_middleware {
                 commit_result?;
+                // Acking a permanently-rejected batch keeps the route from
+                // re-reading the same poison messages forever, but the data is
+                // gone. Record it: a drop that leaves no trace is how a route
+                // reports a clean success while having discarded messages.
+                for id in scratch.message_ids.iter() {
+                    error!(
+                        "Dropping message (ID: {:032x}) due to non-retryable error: {}",
+                        id, e
+                    );
+                }
+                record_dropped_messages(status, batch_len, &e);
                 Ok(())
             } else {
                 Err(e.into())
@@ -826,9 +863,15 @@ impl Route {
                 let (iter_ready_tx, iter_ready_rx) = bounded(1);
 
                 // The actual route logic is in `run_until_err`.
+                let status_run = Arc::clone(&status_loop);
                 let mut run_task = tokio::spawn(async move {
                     route_arc
-                        .run_until_err(&name_arc, Some(internal_shutdown_rx), Some(iter_ready_tx))
+                        .run_until_err_reporting_to(
+                            &name_arc,
+                            Some(internal_shutdown_rx),
+                            Some(iter_ready_tx),
+                            Some(&status_run),
+                        )
                         .await
                 });
 
@@ -1008,6 +1051,21 @@ impl Route {
         shutdown_rx: Option<async_channel::Receiver<()>>,
         ready_tx: Option<Sender<()>>,
     ) -> anyhow::Result<bool> {
+        self.run_until_err_reporting_to(name, shutdown_rx, ready_tx, None)
+            .await
+    }
+
+    /// [`run_until_err`](Self::run_until_err) with somewhere to report dropped
+    /// messages. A deployed route passes its status cell so that a permanent
+    /// sink rejection is still visible after the route completes; a caller that
+    /// drives a `Route` directly has no such cell and passes `None`.
+    pub(crate) async fn run_until_err_reporting_to(
+        &self,
+        name: &str,
+        shutdown_rx: Option<async_channel::Receiver<()>>,
+        ready_tx: Option<Sender<()>>,
+        status: Option<&Arc<RwLock<EndpointStatus>>>,
+    ) -> anyhow::Result<bool> {
         let (_internal_shutdown_tx, internal_shutdown_rx) = bounded(1);
         let shutdown_rx = shutdown_rx.unwrap_or(internal_shutdown_rx);
         if let Some(result) = crate::endpoints::try_run_fast_path_route(
@@ -1021,9 +1079,11 @@ impl Route {
             return result;
         }
         if self.options.concurrency == 1 {
-            self.run_sequentially(name, shutdown_rx, ready_tx).await
+            self.run_sequentially(name, shutdown_rx, ready_tx, status)
+                .await
         } else {
-            self.run_concurrently(name, shutdown_rx, ready_tx).await
+            self.run_concurrently(name, shutdown_rx, ready_tx, status)
+                .await
         }
     }
 
@@ -1033,6 +1093,7 @@ impl Route {
         name: &str,
         shutdown_rx: async_channel::Receiver<()>,
         ready_tx: Option<Sender<()>>,
+        status: Option<&Arc<RwLock<EndpointStatus>>>,
     ) -> anyhow::Result<bool> {
         let source_metadata_required = output_requires_source_metadata(name, &self.output)?;
         let publisher = create_publisher_from_route(name, &self.output).await?;
@@ -1129,6 +1190,7 @@ impl Route {
                         commit_semaphore.as_ref(),
                         &mut commit_tasks,
                         &mut batch_scratch,
+                        status,
                     )
                     .await
                     {
@@ -1174,6 +1236,7 @@ impl Route {
         name: &str,
         shutdown_rx: async_channel::Receiver<()>,
         ready_tx: Option<Sender<()>>,
+        status: Option<&Arc<RwLock<EndpointStatus>>>,
     ) -> anyhow::Result<bool> {
         let source_metadata_required = output_requires_source_metadata(name, &self.output)?;
         let publisher = create_publisher_from_route(name, &self.output).await?;
@@ -1224,6 +1287,8 @@ impl Route {
             let has_retry_middleware = self.output.has_retry_middleware();
             let has_dlq_middleware = self.output.has_dlq_middleware();
             let batch_size = self.options.batch_size;
+            // Owned per worker: the borrow cannot outlive this loop iteration.
+            let status = status.cloned();
             join_set.spawn(async move {
                 debug!("Starting worker {}", i);
                 let mut batch_scratch = BatchScratch::with_capacity(batch_size);
@@ -1240,6 +1305,7 @@ impl Route {
                         commit_semaphore.as_ref(),
                         &mut commit_tasks,
                         &mut batch_scratch,
+                        status.as_ref(),
                     )
                     .await
                     {
@@ -3951,6 +4017,61 @@ mod tests {
         assert_eq!(attempts.values().filter(|&&c| c == 2).count(), 2);
         // Messages 1 and 3 should be tried once.
         assert_eq!(attempts.values().filter(|&&c| c == 1).count(), 2);
+    }
+
+    /// A sink that rejects permanently with no DLQ configured drops the batch so
+    /// the route is not wedged re-reading a poison message — but the drop must
+    /// not be silent. The route still completes; it just carries the cause, so a
+    /// caller polling only `outcome` cannot mistake a discarded batch for a
+    /// clean delivery.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_dropped_poison_batch_is_recorded_on_the_route_status() {
+        let unique_id = fast_uuid_v7::gen_id().to_string();
+        let in_topic = format!("drop_in_{}", unique_id);
+        let out_topic = format!("drop_out_{}", unique_id);
+        let input = Endpoint::new_memory(&in_topic, 10);
+
+        let mut output = Endpoint::new_memory(&out_topic, 10);
+        output.middlewares = vec![Middleware::RandomPanic(RandomPanicMiddleware {
+            mode: FaultMode::JsonFormatError,
+            trigger_on_message: None,
+            enabled: true,
+            ..Default::default()
+        })];
+
+        let input_ch = input.channel().unwrap();
+        input_ch.send_message("poison".into()).await.unwrap();
+
+        let route = Route::new(input, output)
+            .with_fault_injection(true)
+            .with_exit_on_empty(true);
+        let handle = route.run("test_dropped_poison_recorded").await.unwrap();
+
+        let outcome = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Some(outcome) = handle.outcome() {
+                    return outcome;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the drain finishes rather than retrying the poison batch forever");
+
+        assert_eq!(
+            outcome,
+            RouteOutcome::Completed,
+            "dropping the batch lets the drain finish"
+        );
+        let error = handle.status().error.unwrap_or_default();
+        assert!(
+            error.contains("dropped 1 message"),
+            "the discarded batch is reported, not silently swallowed: {error:?}"
+        );
+        assert!(
+            error.contains("JSON format error"),
+            "the reported cause names the underlying rejection: {error:?}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
