@@ -898,18 +898,85 @@ pub mod grpc_helper {
 
 #[cfg(feature = "grpc")]
 pub mod grpc_server_helper {
-    use super::grpc_helper;
-    use mq_bridge::traits::{MessageConsumer, MessagePublisher};
+    use mq_bridge::endpoints::grpc::{GrpcConsumer, GrpcPublisher};
+    use mq_bridge::models::GrpcConfig;
+    use mq_bridge::traits::{ConsumerError, MessageConsumer, MessageDisposition, MessagePublisher};
+    use std::net::TcpListener;
     use std::sync::Arc;
-    use tokio::sync::Mutex;
 
-    pub async fn create_consumer() -> Arc<Mutex<dyn MessageConsumer>> {
-        // Server-mode consumer
-        grpc_helper::create_consumer_with_mode(true).await
+    /// Server-mode gRPC answers a `publish` only once the consuming route has committed the
+    /// message, so it does not fit the generic write-then-read harness: that harness completes
+    /// the whole write phase before any consumer drains, and here every send would block on a
+    /// commit that only arrives in the read phase. Measure the *coupled* round-trip instead,
+    /// exactly as `http_helper::setup_coupled` does for reliable HTTP.
+    ///
+    /// A background task drains the server-mode consumer and commits every message, which
+    /// resolves the per-message completion channel each `publish` is waiting on. Timing the
+    /// sends therefore yields true end-to-end gRPC throughput. Abort the returned handle to
+    /// stop the drain, then await it (see `finish_drain`) so failures surface.
+    #[allow(clippy::type_complexity)]
+    pub async fn setup_coupled() -> (
+        Arc<dyn MessagePublisher>,
+        tokio::task::JoinHandle<anyhow::Result<()>>,
+    ) {
+        #[cfg(feature = "rustls")]
+        crate::ensure_rustls_installed();
+
+        // Reserve a free port, then release it so the embedded server can bind it.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+
+        let mut consumer = GrpcConsumer::new(&GrpcConfig {
+            url: url.clone(),
+            server_mode: true,
+            ..Default::default()
+        })
+        .await
+        .expect("Failed to create server-mode GrpcConsumer");
+
+        // Drain + commit so every publish gets its response (this is what couples the
+        // round-trip). Propagate failures instead of swallowing them, so a broken round-trip
+        // fails the benchmark rather than reporting bogus throughput.
+        let drain = tokio::spawn(async move {
+            loop {
+                let batch = match consumer.receive_batch(128).await {
+                    Ok(batch) => batch,
+                    // Every shard closed: the server is gone, so there is nothing left to ack.
+                    Err(ConsumerError::EndOfStream) => return Ok(()),
+                    Err(e) => anyhow::bail!("drain receive_batch failed: {e}"),
+                };
+                let count = batch.messages.len();
+                if count == 0 {
+                    continue;
+                }
+                (batch.commit)(vec![MessageDisposition::Ack; count])
+                    .await
+                    .map_err(|e| anyhow::anyhow!("drain commit failed: {e}"))?;
+            }
+        });
+
+        let publisher: Arc<dyn MessagePublisher> = Arc::new(
+            GrpcPublisher::new(&GrpcConfig {
+                url,
+                ..Default::default()
+            })
+            .await
+            .unwrap(),
+        );
+        (publisher, drain)
     }
 
-    pub async fn create_publisher() -> Arc<dyn MessagePublisher> {
-        grpc_helper::create_publisher().await
+    /// Stop the drain task and surface any failure. Aborts the task, then awaits it: an
+    /// expected cancellation is fine, but a task error or panic fails the benchmark.
+    pub async fn finish_drain(drain: tokio::task::JoinHandle<anyhow::Result<()>>) {
+        drain.abort();
+        match drain.await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => panic!("grpc server drain task failed: {e}"),
+            Err(e) if e.is_cancelled() => {}
+            Err(e) => std::panic::resume_unwind(e.into_panic()),
+        }
     }
 }
 
@@ -1168,17 +1235,69 @@ fn performance_benchmarks(c: &mut Criterion) {
         PERF_TEST_CONCURRENCY,
         std::time::Duration::from_millis(20)
     );
-    bench_backend!(
-        "grpc",
-        "grpc_server",
-        grpc_server_helper,
-        group,
-        &rt,
-        &BENCH_RESULTS,
-        PERF_TEST_MESSAGE_COUNT,
-        PERF_TEST_CONCURRENCY,
-        std::time::Duration::from_millis(20)
-    );
+    // Server-mode gRPC answers a publish only after the consuming route commits, so like
+    // reliable HTTP it cannot be measured as decoupled write-then-read: the write phase would
+    // block on a commit that only the read phase performs. Measure the coupled round-trip and
+    // report it as both write and read.
+    #[cfg(feature = "grpc")]
+    if mq_bridge::test_utils::should_run_benchmark("grpc_server") {
+        group.bench_function("grpc_server_batch", |b| {
+            b.to_async(&rt).iter_custom(|iters| async move {
+                let (publisher, drain) = grpc_server_helper::setup_coupled().await;
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                let mut total = Duration::ZERO;
+                for _ in 0..iters {
+                    total += mq_bridge::test_utils::measure_write_performance(
+                        "grpc_server_batch",
+                        std::sync::Arc::clone(&publisher),
+                        PERF_TEST_MESSAGE_COUNT,
+                        PERF_TEST_CONCURRENCY,
+                    )
+                    .await;
+                }
+                grpc_server_helper::finish_drain(drain).await;
+                let msgs_per_sec =
+                    (iters as f64 * PERF_TEST_MESSAGE_COUNT as f64) / total.as_secs_f64();
+                let mut results = BENCH_RESULTS.lock().await;
+                let stats = results.entry("grpc_server".to_string()).or_default();
+                stats.write_performance = msgs_per_sec;
+                stats.read_performance = msgs_per_sec;
+                println!(
+                    "\ngrpc_server batch (coupled round-trip): {:.2} msgs/sec",
+                    msgs_per_sec
+                );
+                total
+            })
+        });
+        group.bench_function("grpc_server_single", |b| {
+            b.to_async(&rt).iter_custom(|iters| async move {
+                let (publisher, drain) = grpc_server_helper::setup_coupled().await;
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                let mut total = Duration::ZERO;
+                for _ in 0..iters {
+                    total += mq_bridge::test_utils::measure_single_write_performance(
+                        "grpc_server_single",
+                        std::sync::Arc::clone(&publisher),
+                        PERF_TEST_MESSAGE_COUNT,
+                        PERF_TEST_CONCURRENCY,
+                    )
+                    .await;
+                }
+                grpc_server_helper::finish_drain(drain).await;
+                let msgs_per_sec =
+                    (iters as f64 * PERF_TEST_MESSAGE_COUNT as f64) / total.as_secs_f64();
+                let mut results = BENCH_RESULTS.lock().await;
+                let stats = results.entry("grpc_server".to_string()).or_default();
+                stats.single_write_performance = msgs_per_sec;
+                stats.single_read_performance = msgs_per_sec;
+                println!(
+                    "\ngrpc_server single (coupled round-trip): {:.2} msgs/sec",
+                    msgs_per_sec
+                );
+                total
+            })
+        });
+    }
     // Print consolidated results
     let results = BENCH_RESULTS.blocking_lock();
     print_benchmark_results(&results, PERF_TEST_MESSAGE_COUNT);
