@@ -127,6 +127,14 @@ impl MessagePublisher for SwitchPublisher {
         }
     }
 
+    /// Ordered if any branch is: batches for a given branch must stay in source order.
+    fn requires_ordered_publish(&self) -> bool {
+        self.cases
+            .values()
+            .chain(self.default.iter())
+            .any(|p| p.requires_ordered_publish())
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }

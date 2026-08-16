@@ -912,6 +912,100 @@ async fn test_file_consumer_subscribe_explicit_no_delete() {
 
 use crate::models::{Endpoint, EndpointType, Route};
 
+// Regression (issue #71): the reporter's repro — 20 numbered rows, file -> file,
+// batch_size 5, concurrency 4 — used to emit whole batches out of source order
+// (e.g. 15..19 first). A file is an ordered log, so `FilePublisher` declares
+// `requires_ordered_publish()` and the route sequences the sends.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_route_file_to_file_preserves_order_at_concurrency() {
+    let dir = tempdir().unwrap();
+    let src = dir.path().join("rows.jsonl");
+    let dst = dir.path().join("out.jsonl");
+    let rows: String = (0..20).map(|i| format!("{i}\n")).collect();
+    tokio::fs::write(&src, rows.as_bytes()).await.unwrap();
+
+    let input = Endpoint::new(EndpointType::File(FileConfig {
+        path: src.to_str().unwrap().to_string(),
+        mode: Some(FileConsumerMode::Consume { delete: false }),
+        format: FileFormat::Raw,
+        ..Default::default()
+    }));
+    let output = Endpoint::new(EndpointType::File(FileConfig {
+        path: dst.to_str().unwrap().to_string(),
+        format: FileFormat::Raw,
+        ..Default::default()
+    }));
+    let route = Route::new(input, output)
+        .with_concurrency(4)
+        .with_batch_size(5)
+        .with_exit_on_empty(true);
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        route.run_until_err("file_order_regression", None, None),
+    )
+    .await
+    .expect("Route should drain and exit")
+    .expect("Route should complete without errors");
+
+    let content = tokio::fs::read_to_string(&dst).await.unwrap();
+    let written: Vec<&str> = content.lines().collect();
+    let expected: Vec<String> = (0..20).map(|i| i.to_string()).collect();
+    assert_eq!(written, expected, "File sink must preserve source order");
+}
+
+// A buffering publisher only returns from `send_batch` once its buffer flushed, so
+// sequencing sends must not let it wait for a batch that is itself waiting to be sent.
+// `max_delay_ms` guarantees the flush, but the interaction is worth pinning: this hangs
+// if the ordered path ever gates on something the sink needs first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_route_ordered_file_sink_with_buffer_does_not_stall() {
+    use crate::models::{BufferMiddleware, Middleware};
+
+    let dir = tempdir().unwrap();
+    let src = dir.path().join("buf_rows.jsonl");
+    let dst = dir.path().join("buf_out.jsonl");
+    let rows: String = (0..20).map(|i| format!("{i}\n")).collect();
+    tokio::fs::write(&src, rows.as_bytes()).await.unwrap();
+
+    let input = Endpoint::new(EndpointType::File(FileConfig {
+        path: src.to_str().unwrap().to_string(),
+        mode: Some(FileConsumerMode::Consume { delete: false }),
+        format: FileFormat::Raw,
+        ..Default::default()
+    }));
+    let mut output = Endpoint::new(EndpointType::File(FileConfig {
+        path: dst.to_str().unwrap().to_string(),
+        format: FileFormat::Raw,
+        ..Default::default()
+    }));
+    // Buffer larger than one batch, so every flush is timer-driven.
+    output
+        .middlewares
+        .push(Middleware::Buffer(BufferMiddleware {
+            max_messages: 50,
+            max_delay_ms: 20,
+        }));
+
+    let route = Route::new(input, output)
+        .with_concurrency(4)
+        .with_batch_size(5)
+        .with_exit_on_empty(true);
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        route.run_until_err("file_order_buffer", None, None),
+    )
+    .await
+    .expect("Ordered sends through a buffer must not stall")
+    .expect("Route should complete without errors");
+
+    let content = tokio::fs::read_to_string(&dst).await.unwrap();
+    let written: Vec<&str> = content.lines().collect();
+    let expected: Vec<String> = (0..20).map(|i| i.to_string()).collect();
+    assert_eq!(written, expected);
+}
+
 #[tokio::test]
 async fn test_route_file_consume_explicit_delete() {
     let dir = tempdir().unwrap();

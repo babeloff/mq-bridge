@@ -442,6 +442,36 @@ pub trait MessagePublisher: Send + Sync + 'static {
             ..Default::default()
         }
     }
+
+    /// Whether batches must reach this publisher in the order the source produced
+    /// them. The publisher-side counterpart to
+    /// [`MessageConsumer::commit_requires_order`].
+    ///
+    /// Defaults to `false`: with `concurrency > 1` the route's workers call
+    /// `send_batch` in parallel, so whole batches can land at the sink out of source
+    /// order (rows keep their order *within* a batch). For an unkeyed SQL, Mongo or
+    /// ClickHouse insert that is meaningless, and serialising sends would cost
+    /// throughput for nothing.
+    ///
+    /// Override to `true` when the destination *is* an ordered log and shuffling it
+    /// corrupts the result — `file` does. The route then admits one batch at a time
+    /// into `send_batch`, in sequence; everything around that call still runs across
+    /// the worker pool, so an ordered route measures within noise of an unordered one.
+    ///
+    /// Only override it where the *cost* is also low, which means a sink whose
+    /// `send_batch` is already serialised internally (the file sink holds a write lock
+    /// for the whole batch). Sequencing a sink that ends in a network round trip costs
+    /// it the whole concurrency factor: one batch in flight instead of N.
+    ///
+    /// Note for keyed transports: Kafka preserves order per partition only if batches
+    /// are *produced* in order, so a route with `partition_key` and `concurrency > 1`
+    /// can publish two batches sharing a key in either order. Kafka leaves this `false`
+    /// (global ordering would serialise an inherently parallel sink); set
+    /// `concurrency: 1` if per-key order matters.
+    fn requires_ordered_publish(&self) -> bool {
+        false
+    }
+
     fn as_any(&self) -> &dyn Any;
 }
 
@@ -472,6 +502,10 @@ impl<T: MessagePublisher + ?Sized> MessagePublisher for Arc<T> {
 
     async fn status(&self) -> EndpointStatus {
         (**self).status().await
+    }
+
+    fn requires_ordered_publish(&self) -> bool {
+        (**self).requires_ordered_publish()
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -506,6 +540,10 @@ impl<T: MessagePublisher + ?Sized> MessagePublisher for Box<T> {
 
     async fn status(&self) -> EndpointStatus {
         (**self).status().await
+    }
+
+    fn requires_ordered_publish(&self) -> bool {
+        (**self).requires_ordered_publish()
     }
 
     fn as_any(&self) -> &dyn Any {

@@ -311,6 +311,14 @@ impl MessagePublisher for DlqPublisher {
         }
     }
 
+    /// Deliberately follows `inner` only, not the DLQ. An order-sensitive DLQ behind an
+    /// unordered sink would sequence *every* batch — paying the primary sink's whole
+    /// concurrency factor — to order a sparse, failure-only side channel. When the gate
+    /// is on, the DLQ send is inside this `send_batch` and is sequenced with it anyway.
+    fn requires_ordered_publish(&self) -> bool {
+        self.inner.requires_ordered_publish()
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }

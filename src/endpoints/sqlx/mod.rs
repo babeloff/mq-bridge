@@ -1723,6 +1723,22 @@ fn mysql_data_type_is_any_safe(data_type: &str) -> bool {
     )
 }
 
+/// SQLite declared column types that sqlx maps to a `DataType` the `Any` driver rejects.
+/// sqlx-sqlite parses `sqlite3_column_decltype` with `DataType::from_str`, and only these exact
+/// spellings yield `Bool`/`Date`/`Time`/`Datetime` — everything else either maps to a supported
+/// type or fails to parse and falls back to the runtime value type, which is always safe.
+/// Notably this covers the `DATETIME` columns our own `auto_create_table` DDL emits.
+fn sqlite_decltype_is_any_safe(decl_type: &str) -> bool {
+    !matches!(
+        decl_type,
+        "boolean" | "bool" | "date" | "time" | "datetime" | "timestamp"
+    )
+}
+
+/// Binds are the table name and its schema (`main` unless the name was `schema.table`).
+const SQLITE_COLUMN_TYPES_SQL: &str =
+    "SELECT name AS name, LOWER(type) AS typname FROM pragma_table_info(?, ?) ORDER BY cid";
+
 /// `$1::regclass` resolves the (optionally schema-qualified) table name against the current
 /// search_path. `pg_attribute.attname`/`pg_type.typname` are Postgres `name`-typed columns,
 /// which `Any` cannot decode directly (distinct from `text`), so cast them explicitly.
@@ -1744,8 +1760,10 @@ const MYSQL_COLUMN_TYPES_SQL: &str = "SELECT COLUMN_NAME AS name, LOWER(DATA_TYP
 /// query on the first type it cannot map (`TIMESTAMPTZ` on Postgres, `DECIMAL`/`TIMESTAMP` on
 /// MySQL). We introspect the table's columns and cast every `Any`-incompatible column to a
 /// string type, so the copy succeeds (unmappable values arrive as strings) instead of failing
-/// every read forever. Any introspection failure (or an unsupported driver, e.g. SQLite, whose
-/// dynamic typing needs no cast) falls back to `*`, preserving the previous behaviour.
+/// every read forever. SQLite is affected too: its type info comes from the *declared* type, so
+/// a `DATETIME` column — including the ones `auto_create_table` writes — breaks the read.
+/// Any introspection failure (or an unsupported driver) falls back to `*`, preserving the
+/// previous behaviour.
 async fn build_cursor_projection(pool: &AnyPool, driver_name: &str, table: &str) -> String {
     type SafeFn = fn(&str) -> bool;
     type CastFn = fn(&str) -> String;
@@ -1770,6 +1788,21 @@ async fn build_cursor_projection(pool: &AnyPool, driver_name: &str, table: &str)
                 vec![schema, name],
                 mysql_data_type_is_any_safe,
                 |ident| format!("CAST({ident} AS CHAR) AS {ident}"),
+            )
+        }
+        "SQLite" => {
+            let (schema, name) = match table.split_once('.') {
+                Some((s, t)) => (
+                    s.trim_matches('"').to_string(),
+                    t.trim_matches('"').to_string(),
+                ),
+                None => ("main".to_string(), table.trim_matches('"').to_string()),
+            };
+            (
+                SQLITE_COLUMN_TYPES_SQL,
+                vec![name, schema],
+                sqlite_decltype_is_any_safe,
+                |ident| format!("CAST({ident} AS TEXT) AS {ident}"),
             )
         }
         _ => return "*".to_string(),

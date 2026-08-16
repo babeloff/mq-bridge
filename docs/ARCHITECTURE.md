@@ -150,6 +150,19 @@ Batch processing is a core concept in mq-bridge and is required for all endpoint
 - Each route can be configured with a `concurrency` parameter, which determines how many worker tasks will process batches in parallel.
 - Batch size is also configurable per route.
 
+#### Ordering
+Two independent guarantees, each decided once per route by the endpoint itself:
+
+- **Commits** follow `MessageConsumer::commit_requires_order()` (default `true`). Cumulative-ack sources such as Kafka funnel their commits through one sequencer; individually-acking sources commit concurrently, bounded by `commit_concurrency_limit`.
+- **Publishing** follows `MessagePublisher::requires_ordered_publish()` (default `false`). Above `concurrency: 1` workers call `send_batch` in parallel, so whole batches can reach the sink out of source order — rows keep their order *within* a batch. The `file` sink declares `true` and the route sequences the `send_batch` calls; batch prep and commits stay parallel, so the ordered path measures within noise of an unordered one.
+
+Only `file` declares it, for two reasons that any other candidate has to clear:
+
+- **The cost must be low.** The file sink already holds a write lock across the whole batch, so sequencing changes who writes, not how many write at once. Sequencing a sink that ends in a network round trip instead costs the whole concurrency factor — one batch in flight instead of N.
+- **The guarantee must be reachable.** `object_store` does *not* declare it: read order there is object-key order, and the uuidv7 key randomises everything below the millisecond, so ordering the writes would buy nothing. Ordered cloud export needs a source-sequenced key first.
+
+Broker sinks keep it off. NATS (both Core and JetStream) publishes a batch through `send_batch_helper`, which keeps up to `SEND_BATCH_CONCURRENCY` publishes in flight, so wire order inside one batch is already unordered — only the results are re-sorted. Kafka and AMQP preserve order within a batch (they submit the whole batch, then await confirms), but for them the order-critical part is the cheap submit loop, not the round trip, so a useful fix would have to release the sequence after submit rather than after `send_batch`. For per-key Kafka ordering today, use `concurrency: 1`.
+
 ### Helper Utilities
 mq-bridge provides several helper functions to make implementing batching easier, especially if your endpoint only supports single-message operations:
 
