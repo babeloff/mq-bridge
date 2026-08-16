@@ -1102,9 +1102,18 @@ async fn test_sqlx_cursor_reader_datetime_cursor_column_resumes() {
     let notes: Vec<String> = b2
         .messages
         .iter()
-        .map(|m| serde_json::from_slice::<serde_json::Value>(&m.payload).unwrap()["note"].as_str().unwrap().to_string())
+        .map(|m| {
+            serde_json::from_slice::<serde_json::Value>(&m.payload).unwrap()["note"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        })
         .collect();
-    assert_eq!(notes, vec!["n2", "n3"], "resume must continue, not repeat or skip");
+    assert_eq!(
+        notes,
+        vec!["n2", "n3"],
+        "resume must continue, not repeat or skip"
+    );
     (b2.commit)(vec![MessageDisposition::Ack; 2]).await.unwrap();
 
     let b3 = reader.receive_batch(2).await.unwrap();
