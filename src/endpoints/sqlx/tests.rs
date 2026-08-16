@@ -1053,6 +1053,64 @@ async fn test_sqlx_auto_created_table_is_cursor_readable() {
     assert!(v["locked_until"].is_null());
 }
 
+// A DATETIME cursor column is now readable on SQLite (the projection casts it to TEXT),
+// so the cursor value round-trips as text while `WHERE`/`ORDER BY` still compare the raw
+// column. Pin that resume neither skips nor re-emits rows.
+#[tokio::test]
+async fn test_sqlx_cursor_reader_datetime_cursor_column_resumes() {
+    sqlx::any::install_default_drivers();
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("dtcursor.db");
+    let url = sqlite_url(&path);
+    drop(tokio::fs::File::create(&path).await.unwrap());
+    let pool = AnyPool::connect(&url).await.unwrap();
+    sqlx::query("CREATE TABLE events (id INTEGER PRIMARY KEY, ts DATETIME, note TEXT)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    for (i, ts) in [
+        "2026-08-16 10:00:00",
+        "2026-08-16 10:00:01",
+        "2026-08-16 10:00:02",
+        "2026-08-16 10:00:03",
+    ]
+    .iter()
+    .enumerate()
+    {
+        sqlx::query("INSERT INTO events (id, ts, note) VALUES (?, ?, ?)")
+            .bind((i + 1) as i64)
+            .bind(*ts)
+            .bind(format!("n{i}"))
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    let config = SqlxConfig {
+        url,
+        table: "events".to_string(),
+        cursor_column: Some("ts".to_string()),
+        cursor_id: Some("dt-1".to_string()),
+        ..Default::default()
+    };
+    let mut reader = SqlxCursorReader::new(&config).await.unwrap();
+    let b1 = reader.receive_batch(2).await.unwrap();
+    assert_eq!(b1.messages.len(), 2);
+    (b1.commit)(vec![MessageDisposition::Ack; 2]).await.unwrap();
+
+    let b2 = reader.receive_batch(2).await.unwrap();
+    let notes: Vec<String> = b2
+        .messages
+        .iter()
+        .map(|m| serde_json::from_slice::<serde_json::Value>(&m.payload).unwrap()["note"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(notes, vec!["n2", "n3"], "resume must continue, not repeat or skip");
+    (b2.commit)(vec![MessageDisposition::Ack; 2]).await.unwrap();
+
+    let b3 = reader.receive_batch(2).await.unwrap();
+    assert!(b3.messages.is_empty(), "drained");
+}
+
 #[tokio::test]
 async fn test_sqlx_auto_create_rejects_tokens() {
     let (_dir, url) = setup_db_file().await;
