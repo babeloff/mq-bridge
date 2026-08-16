@@ -1048,8 +1048,13 @@ async fn test_sqlx_auto_created_table_is_cursor_readable() {
     assert_eq!(batch.messages.len(), 3);
     let v: serde_json::Value = serde_json::from_slice(&batch.messages[0].payload).unwrap();
     assert_eq!(v["id"], 1);
-    // The DATETIME columns survive as strings rather than aborting the read.
-    assert!(v.get("created_at").is_some());
+    // The DATETIME columns survive as strings rather than aborting the read. `is_some()`
+    // alone would also pass on a JSON null, which is what a failed cast looks like.
+    assert!(
+        v["created_at"].as_str().is_some(),
+        "got {}",
+        v["created_at"]
+    );
     assert!(v["locked_until"].is_null());
 }
 
@@ -1098,6 +1103,10 @@ async fn test_sqlx_cursor_reader_datetime_cursor_column_resumes() {
     assert_eq!(b1.messages.len(), 2);
     (b1.commit)(vec![MessageDisposition::Ack; 2]).await.unwrap();
 
+    // Resume from the *checkpoint*, not the in-memory cursor: a text-encoded timestamp has
+    // to survive save/load/decode, which reading on through the same reader never exercises.
+    drop(reader);
+    let mut reader = SqlxCursorReader::new(&config).await.unwrap();
     let b2 = reader.receive_batch(2).await.unwrap();
     let notes: Vec<String> = b2
         .messages
