@@ -101,6 +101,11 @@ impl MessagePublisher for FanoutPublisher {
         }
     }
 
+    /// Ordered if any leg is: a fanout is only as order-tolerant as its strictest sink.
+    fn requires_ordered_publish(&self) -> bool {
+        self.publishers.iter().any(|p| p.requires_ordered_publish())
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }

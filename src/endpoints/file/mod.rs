@@ -1017,6 +1017,12 @@ impl MessagePublisher for FilePublisher {
         Ok(())
     }
 
+    /// A file is an ordered log by construction: appending batches in the order they
+    /// were read is the whole point of exporting to JSONL/CSV.
+    fn requires_ordered_publish(&self) -> bool {
+        true
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }

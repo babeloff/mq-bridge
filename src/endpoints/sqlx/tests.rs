@@ -1009,6 +1009,50 @@ async fn test_sqlx_multicolumn_batch() {
     }
 }
 
+// Regression (issue #71): a table written by the publisher with `auto_create_table` must be
+// readable by this library's own cursor reader. The generated DDL declares `locked_until`/
+// `created_at` as DATETIME, which the `Any` driver refuses to decode, so `SELECT *` failed the
+// whole read. The projection now casts those columns to TEXT.
+#[tokio::test]
+async fn test_sqlx_auto_created_table_is_cursor_readable() {
+    sqlx::any::install_default_drivers();
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("roundtrip.db");
+    let url = sqlite_url(&path);
+    drop(tokio::fs::File::create(&path).await.unwrap());
+
+    let config = SqlxConfig {
+        url: url.clone(),
+        table: "orders".to_string(),
+        auto_create_table: true,
+        ..Default::default()
+    };
+    let publisher = SqlxPublisher::new(&config).await.unwrap();
+    publisher
+        .send_batch(
+            (1..=3)
+                .map(|i| CanonicalMessage::new(format!("row{i}").into_bytes(), None))
+                .collect(),
+        )
+        .await
+        .unwrap();
+
+    let read_config = SqlxConfig {
+        url,
+        table: "orders".to_string(),
+        cursor_column: Some("id".to_string()),
+        ..Default::default()
+    };
+    let mut reader = SqlxCursorReader::new(&read_config).await.unwrap();
+    let batch = reader.receive_batch(10).await.unwrap();
+    assert_eq!(batch.messages.len(), 3);
+    let v: serde_json::Value = serde_json::from_slice(&batch.messages[0].payload).unwrap();
+    assert_eq!(v["id"], 1);
+    // The DATETIME columns survive as strings rather than aborting the read.
+    assert!(v.get("created_at").is_some());
+    assert!(v["locked_until"].is_null());
+}
+
 #[tokio::test]
 async fn test_sqlx_auto_create_rejects_tokens() {
     let (_dir, url) = setup_db_file().await;

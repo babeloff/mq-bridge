@@ -143,7 +143,9 @@ pub struct RouteOptions {
     pub description: String,
     /// (Optional) Number of concurrent processing tasks for this route. While it improves throughput for high-latency
     /// handlers, it adds synchronization overhead for ordered commits and may lead to out-of-order processing
-    /// in the handler. Defaults to 1.
+    /// in the handler. Above 1, whole batches may also reach the sink out of source order (rows keep their order
+    /// within a batch) unless the sink declares itself order-sensitive, as `file` does.
+    /// Defaults to 1.
     #[serde(default = "default_concurrency")]
     #[cfg_attr(feature = "schema", schemars(range(min = 1)))]
     pub concurrency: usize,

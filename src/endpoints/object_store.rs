@@ -9,8 +9,9 @@
 //! - **Sink** ([`ObjectStorePublisher`]): each flushed batch is encoded (reusing the
 //!   file endpoint's [`FileFormat`] codecs) and written as one immutable object at
 //!   `<prefix>/[YYYY/MM/DD/]<uuidv7>.<ext>`. Objects are write-once; nothing is appended
-//!   or mutated. The uuidv7 name sorts by write time; the date prefix is a readability /
-//!   lifecycle-rule convenience only.
+//!   or mutated. The uuidv7 name sorts by write time to *millisecond* granularity only —
+//!   `rand_a`/`rand_b` are random, so objects written within the same millisecond sort in
+//!   arbitrary order. The date prefix is a readability / lifecycle-rule convenience only.
 //! - **Source** ([`ObjectStoreConsumer`]): objects under `prefix` are listed in key order,
 //!   fetched whole, split by `delimiter`, and emitted. Progress is a durable cursor holding
 //!   the last fully-acked object key (via the external checkpoint store), so a restart
@@ -417,6 +418,11 @@ impl MessagePublisher for ObjectStorePublisher {
     async fn flush(&self) -> anyhow::Result<()> {
         Ok(())
     }
+
+    // Deliberately *not* declaring `requires_ordered_publish()`. Unlike the file sink, read
+    // order here is key order, and `next_key` randomises everything below the millisecond, so
+    // sequencing the writes would cost a latency-bound sink its concurrency without buying an
+    // ordering guarantee. Ordered cloud export needs a source-sequenced key first.
 
     fn as_any(&self) -> &dyn Any {
         self
