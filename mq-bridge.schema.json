@@ -2972,7 +2972,7 @@
           "minimum": 1
         },
         "concurrency": {
-          "description": "(Optional) Number of concurrent processing tasks for this route. While it improves throughput for high-latency\nhandlers, it adds synchronization overhead for ordered commits and may lead to out-of-order processing\nin the handler. Defaults to 1.",
+          "description": "(Optional) Number of concurrent processing tasks for this route. While it improves throughput for high-latency\nhandlers, it adds synchronization overhead for ordered commits and may lead to out-of-order processing\nin the handler. Above 1, whole batches may also reach the sink out of source order (rows keep their order\nwithin a batch) unless the sink declares itself order-sensitive, as `file` does.\nDefaults to 1.",
           "type": "integer",
           "format": "uint",
           "default": 1,
