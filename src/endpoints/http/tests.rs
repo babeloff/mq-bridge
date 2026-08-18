@@ -1684,3 +1684,354 @@ async fn consumer_receive_ack(consumer: &mut HttpConsumer) -> CanonicalMessage {
         .unwrap();
     message
 }
+
+// --- Sensitive request headers -------------------------------------------------------------
+// Credential headers reach the handler verbatim, under the reserved `mqb.src.` namespace that
+// every publisher strips on the way out. See `SENSITIVE_HEADER_METADATA_PREFIX`.
+
+fn basic_credentials(user_pass: &str) -> String {
+    format!("Basic {}", general_purpose::STANDARD.encode(user_pass))
+}
+
+fn test_http_client(
+) -> hyper_util::client::legacy::Client<HttpConnector, http_body_util::Full<Bytes>> {
+    let mut connector = HttpConnector::new();
+    connector.set_nodelay(true);
+    hyper_util::client::legacy::Client::builder(TokioExecutor::new()).build(connector)
+}
+
+/// Sends one request carrying `headers` to a bare consumer and returns the metadata the
+/// handler ends up seeing.
+async fn handler_metadata_for_request_headers(headers: &[(&str, &str)]) -> HashMap<String, String> {
+    init_crypto();
+    let port = get_free_port();
+    let addr = format!("127.0.0.1:{port}");
+    let config = HttpConfig {
+        url: addr.clone(),
+        ..Default::default()
+    };
+    let mut consumer = HttpConsumer::new(&config).await.unwrap();
+
+    let receive_task = tokio::spawn(async move {
+        let received = consumer
+            .receive()
+            .await
+            .expect("request never reached the handler");
+        let _ = (received.commit)(crate::traits::MessageDisposition::Ack).await;
+        received.message
+    });
+
+    assert!(wait_for_server_ready(&addr, Duration::from_secs(5)).await);
+
+    let mut request = Request::builder()
+        .method(hyper::Method::POST)
+        .uri(format!("http://{addr}/"));
+    for (name, value) in headers {
+        request = request.header(*name, *value);
+    }
+    let response = test_http_client()
+        .request(
+            request
+                .body(http_body_util::Full::<Bytes>::new(Bytes::from_static(
+                    b"body",
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+    receive_task.await.unwrap().metadata
+}
+
+#[test]
+fn test_sensitive_header_prefix_is_reserved_source_metadata() {
+    // The design rests on this: publishers drop `mqb.src.*` when serializing metadata, so the
+    // credential reaches the handler but never a sink or a response header.
+    assert!(SENSITIVE_HEADER_METADATA_PREFIX
+        .starts_with(crate::canonical_message::SOURCE_METADATA_PREFIX));
+    assert!(crate::canonical_message::is_source_metadata_key(&format!(
+        "{SENSITIVE_HEADER_METADATA_PREFIX}authorization"
+    )));
+}
+
+#[tokio::test]
+async fn test_sensitive_request_headers_reach_handler_verbatim() {
+    let metadata = handler_metadata_for_request_headers(&[
+        ("authorization", "Basic dXNlcjpwYXNzd29yZA=="),
+        ("cookie", "session=abc123"),
+        ("x-api-key", "super-secret-key"),
+        ("x-trace-id", "trace-42"),
+    ])
+    .await;
+
+    // The handler gets what the client actually sent, so "is the client authenticating, and
+    // with what" is answerable while debugging.
+    assert_eq!(
+        metadata
+            .get("mqb.src.http_authorization")
+            .map(String::as_str),
+        Some("Basic dXNlcjpwYXNzd29yZA==")
+    );
+    assert_eq!(
+        metadata.get("mqb.src.http_cookie").map(String::as_str),
+        Some("session=abc123")
+    );
+    assert_eq!(
+        metadata.get("mqb.src.http_x-api-key").map(String::as_str),
+        Some("super-secret-key")
+    );
+
+    // The plain names stay absent, so nothing reading `metadata["authorization"]` today
+    // suddenly starts seeing a credential, and no publisher can forward one.
+    assert!(!metadata.contains_key("authorization"));
+    assert!(!metadata.contains_key("cookie"));
+    assert!(!metadata.contains_key("x-api-key"));
+
+    // Ordinary headers are untouched.
+    assert_eq!(
+        metadata.get("x-trace-id").map(String::as_str),
+        Some("trace-42")
+    );
+
+    // Every key holding a credential is reserved, hence dropped by each publisher.
+    for (key, value) in &metadata {
+        if value.contains("dXNlcjpwYXNzd29yZA==")
+            || value.contains("abc123")
+            || value.contains("super-secret-key")
+        {
+            assert!(
+                crate::canonical_message::is_source_metadata_key(key),
+                "credential sits in forwardable metadata key {key:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_spoofed_source_metadata_request_headers_are_dropped() {
+    // A client must not be able to forge the reserved namespace and have the handler show
+    // its value as if it were the real request header.
+    let metadata = handler_metadata_for_request_headers(&[
+        ("mqb.src.http_authorization", "Basic injected"),
+        ("mqb.src.kafka_offset", "999"),
+        ("x-trace-id", "trace-42"),
+    ])
+    .await;
+
+    assert!(
+        !metadata.keys().any(|key| key.starts_with("mqb.src.")),
+        "spoofed source metadata survived: {metadata:?}"
+    );
+    assert_eq!(
+        metadata.get("x-trace-id").map(String::as_str),
+        Some("trace-42")
+    );
+}
+
+#[tokio::test]
+async fn test_sensitive_header_metadata_is_not_echoed_on_the_reply() {
+    init_crypto();
+    let port = get_free_port();
+    let addr = format!("127.0.0.1:{port}");
+
+    // The routed path applies no request-echo suppression (see
+    // `test_http_route_inline_response_can_be_disabled`), so it is where a reserved-prefix key
+    // would surface as a response header if it were forwardable.
+    let input = Endpoint::new(EndpointType::Http(HttpConfig {
+        url: addr.clone(),
+        path: Some("/echo".to_string()),
+        inline_response_fast_path: Some(false),
+        ..Default::default()
+    }));
+    let output = Endpoint::new(EndpointType::Response(
+        crate::models::ResponseConfig::default(),
+    ));
+    let handle = crate::Route::new(input, output)
+        .run("test_http_sensitive_header_reply")
+        .await
+        .unwrap();
+
+    assert!(wait_for_server_ready(&addr, Duration::from_secs(5)).await);
+
+    let response = test_http_client()
+        .request(
+            Request::builder()
+                .method(hyper::Method::POST)
+                .uri(format!("http://{addr}/echo"))
+                .header("authorization", "Basic dXNlcjpwYXNzd29yZA==")
+                .header("cookie", "session=abc123")
+                .body(http_body_util::Full::<Bytes>::new(Bytes::from_static(
+                    b"echo me",
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let headers: String = response
+        .headers()
+        .iter()
+        .map(|(name, value)| format!("{name}: {}\n", value.to_str().unwrap_or("")))
+        .collect();
+    assert!(
+        !headers.contains("mqb.src."),
+        "reserved metadata leaked as a response header: {headers}"
+    );
+    assert!(
+        !headers.contains("dXNlcjpwYXNzd29yZA==") && !headers.contains("abc123"),
+        "credential echoed on the reply: {headers}"
+    );
+    assert!(response.headers().get("authorization").is_none());
+    assert!(response.headers().get("cookie").is_none());
+
+    handle.stop().await;
+    let _ = handle.join().await;
+}
+
+#[tokio::test]
+async fn test_basic_auth_enforcement_is_unaffected_by_header_capture() {
+    init_crypto();
+    let port = get_free_port();
+    let addr = format!("127.0.0.1:{port}");
+    let config = HttpConfig {
+        url: addr.clone(),
+        basic_auth: Some(("user".to_string(), "password".to_string())),
+        ..Default::default()
+    };
+    let mut consumer = HttpConsumer::new(&config).await.unwrap();
+
+    let receive_task = tokio::spawn(async move {
+        let received = consumer
+            .receive()
+            .await
+            .expect("authorized request never reached the handler");
+        let _ = (received.commit)(crate::traits::MessageDisposition::Ack).await;
+        received.message
+    });
+
+    assert!(wait_for_server_ready(&addr, Duration::from_secs(5)).await);
+    let client = test_http_client();
+
+    let build = |auth: Option<String>| {
+        let mut request = Request::builder()
+            .method(hyper::Method::POST)
+            .uri(format!("http://{addr}/"));
+        if let Some(auth) = auth {
+            request = request.header("authorization", auth);
+        }
+        request
+            .body(http_body_util::Full::<Bytes>::new(Bytes::from_static(
+                b"body",
+            )))
+            .unwrap()
+    };
+
+    // Enforcement reads the request headers directly, before metadata is built.
+    let missing = client.request(build(None)).await.unwrap();
+    assert_eq!(missing.status(), StatusCode::UNAUTHORIZED);
+
+    let wrong = client
+        .request(build(Some(basic_credentials("user:wrong"))))
+        .await
+        .unwrap();
+    assert_eq!(wrong.status(), StatusCode::UNAUTHORIZED);
+
+    let accepted = client
+        .request(build(Some(basic_credentials("user:password"))))
+        .await
+        .unwrap();
+    assert_eq!(accepted.status(), StatusCode::ACCEPTED);
+
+    let metadata = receive_task.await.unwrap().metadata;
+    assert_eq!(
+        metadata
+            .get("mqb.src.http_authorization")
+            .map(String::as_str),
+        Some(basic_credentials("user:password").as_str())
+    );
+}
+
+#[tokio::test]
+async fn test_sensitive_header_metadata_is_not_written_to_a_sink() {
+    // End-to-end proof of the forwarding half: the `json` file sink serialises the whole
+    // metadata map, so if the reserved prefix were forwardable the credential would land on
+    // disk verbatim. Covers the same `strip_source_metadata` contract every other sink uses.
+    init_crypto();
+    let port = get_free_port();
+    let addr = format!("127.0.0.1:{port}");
+    let dir = tempfile::tempdir().unwrap();
+    let out_path = dir.path().join("sink.jsonl");
+
+    let input = Endpoint::new(EndpointType::Http(HttpConfig {
+        url: addr.clone(),
+        path: Some("/ingest".to_string()),
+        fire_and_forget: true,
+        ..Default::default()
+    }));
+    let output = Endpoint::new(EndpointType::File(crate::models::FileConfig {
+        path: out_path.to_string_lossy().to_string(),
+        format: crate::models::FileFormat::Json,
+        ..Default::default()
+    }));
+    let handle = crate::Route::new(input, output)
+        .run("test_http_sensitive_header_sink")
+        .await
+        .unwrap();
+
+    assert!(wait_for_server_ready(&addr, Duration::from_secs(5)).await);
+
+    let response = test_http_client()
+        .request(
+            Request::builder()
+                .method(hyper::Method::POST)
+                .uri(format!("http://{addr}/ingest"))
+                .header("authorization", "Basic dXNlcjpwYXNzd29yZA==")
+                .header("cookie", "session=abc123")
+                .header("x-api-key", "super-secret-key")
+                .header("x-trace-id", "trace-42")
+                .body(http_body_util::Full::<Bytes>::new(Bytes::from_static(
+                    b"{\"v\":1}",
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+    let mut written = String::new();
+    for _ in 0..100 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        written = std::fs::read_to_string(&out_path).unwrap_or_default();
+        if written.contains("trace-42") {
+            break;
+        }
+    }
+    assert!(
+        written.contains("trace-42"),
+        "route never reached the file sink: {written:?}"
+    );
+
+    // The ordinary header survives the hop; every credential-bearing one is gone.
+    assert!(
+        !written.contains("mqb.src."),
+        "reserved metadata written to sink: {written}"
+    );
+    for secret in [
+        "dXNlcjpwYXNzd29yZA==",
+        "abc123",
+        "super-secret-key",
+        "authorization",
+        "cookie",
+        "x-api-key",
+    ] {
+        assert!(
+            !written.contains(secret),
+            "{secret:?} leaked to the file sink: {written}"
+        );
+    }
+
+    handle.stop().await;
+    let _ = handle.join().await;
+}

@@ -1012,7 +1012,7 @@
           "default": "normal"
         },
         "idempotency": {
-          "description": "Write replay-safe source ranges as immutable part files under this directory.\nRequires a source that stamps a replayable position: kafka, postgres_cdc, mongodb CDC or file.",
+          "description": "Write replay-safe source ranges as immutable part files under this directory.\nRequires a source that stamps a replayable position: kafka, postgres_cdc, mongodb CDC, sqlx or file.",
           "type": "boolean",
           "default": false
         },

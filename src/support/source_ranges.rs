@@ -396,8 +396,10 @@ pub fn finalized_name(
     // Zero-padded to fixed width so lexicographic listing order == numeric order.
     // `parse_finalized_name` still accepts legacy unpadded names.
     Ok(format!(
-        "part-{}-{:010}-{start:020}-{end:020}.{extension}",
-        source.topic, source.partition
+        "part-{topic}-{partition:010}-{start:0width$}-{end:0width$}.{extension}",
+        topic = source.topic,
+        partition = source.partition,
+        width = POSITION_WIDTH,
     ))
 }
 

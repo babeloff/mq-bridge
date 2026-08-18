@@ -865,7 +865,7 @@ pub struct FileConfig {
     /// Path to the file, or to the directory holding the part files when `idempotency` is true.
     pub path: String,
     /// Write replay-safe source ranges as immutable part files under this directory.
-    /// Requires a source that stamps a replayable position: kafka, postgres_cdc, mongodb CDC or file.
+    /// Requires a source that stamps a replayable position: kafka, postgres_cdc, mongodb CDC, sqlx or file.
     #[serde(default)]
     pub idempotency: bool,
     /// Optional delimiter for messages. Defaults to newline ("\n").

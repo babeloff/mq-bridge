@@ -340,9 +340,11 @@ pub struct MongoDbChangeStreamReader {
     source_metadata: bool,
     /// `<database>.<collection>`, precomputed for the `mqb.src.mongodb_namespace` key.
     namespace: String,
-    /// Contiguous positions an idempotent sink needs: changes numbered within their cluster
-    /// time, snapshot documents within the scan.
-    ordinals: Arc<Mutex<OrdinalCounter>>,
+    /// Contiguous positions an idempotent sink needs. Kept apart so the two phases cannot
+    /// share a sequence: snapshot documents are numbered within the scan, changes within
+    /// their cluster time.
+    snapshot_ordinals: Arc<Mutex<OrdinalCounter>>,
+    cdc_ordinals: Arc<Mutex<OrdinalCounter>>,
     exit_on_empty: bool,
 }
 
@@ -492,7 +494,8 @@ impl MongoDbChangeStreamReader {
             )),
             source_metadata,
             namespace: format!("{}.{}", config.database, collection_name),
-            ordinals: Arc::new(Mutex::new(OrdinalCounter::default())),
+            snapshot_ordinals: Arc::new(Mutex::new(OrdinalCounter::default())),
+            cdc_ordinals: Arc::new(Mutex::new(OrdinalCounter::default())),
             exit_on_empty: false,
         })
     }
@@ -547,7 +550,7 @@ impl MongoDbChangeStreamReader {
                             &mut msg,
                             &self.namespace,
                             &id,
-                            &self.ordinals,
+                            &self.snapshot_ordinals,
                         );
                     }
                     messages.push(msg);
@@ -857,7 +860,7 @@ impl MessageConsumer for MongoDbChangeStreamReader {
                         &event,
                         self.source_metadata,
                         &self.namespace,
-                        &self.ordinals,
+                        &self.cdc_ordinals,
                     ) {
                         messages.push(msg);
                         tokens.push(token);
@@ -897,7 +900,7 @@ impl MessageConsumer for MongoDbChangeStreamReader {
                         &event,
                         self.source_metadata,
                         &self.namespace,
-                        &self.ordinals,
+                        &self.cdc_ordinals,
                     ) {
                         messages.push(msg);
                         tokens.push(token);

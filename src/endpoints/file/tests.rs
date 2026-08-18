@@ -617,7 +617,6 @@ async fn resuming_file_modes_get_a_run_epoch_so_reruns_cannot_reuse_a_record_ind
 
     // A second run restarts the record index at 0, so the epoch is what stops it from
     // naming those records the same as the first run's and having them dropped.
-    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
     let mut second = FileConsumer::new(&config).await.unwrap();
     let batch = second.receive_batch(10).await.unwrap();
     let second_run = SourcePosition::from_message(&batch.messages[0]).unwrap();
@@ -625,6 +624,41 @@ async fn resuming_file_modes_get_a_run_epoch_so_reruns_cannot_reuse_a_record_ind
     assert_ne!(first_run.source, second_run.source);
     // A later run reads later records, so its objects must sort after the earlier run's.
     assert!(first_run.source < second_run.source);
+}
+
+#[tokio::test]
+async fn run_epochs_are_distinct_for_consumers_created_in_the_same_millisecond() {
+    use crate::support::source_ranges::SourcePosition;
+
+    let dir = tempdir().unwrap();
+    let input = dir.path().join("orders.jsonl");
+    std::fs::write(&input, "{\"id\":1}\n").unwrap();
+
+    let config = FileConfig {
+        path: input.to_string_lossy().into_owned(),
+        source_metadata: true,
+        mode: Some(FileConsumerMode::GroupSubscribe {
+            group_id: "same-ms".into(),
+            read_from_tail: false,
+        }),
+        ..Default::default()
+    };
+
+    // No sleep between them: the epoch is allocated monotonically, not read off the clock.
+    let mut first = FileConsumer::new(&config).await.unwrap();
+    let mut second = FileConsumer::new(&config).await.unwrap();
+
+    let a = first.receive_batch(10).await.unwrap();
+    let b = second.receive_batch(10).await.unwrap();
+    let first_run = SourcePosition::from_message(&a.messages[0]).unwrap();
+    let second_run = SourcePosition::from_message(&b.messages[0]).unwrap();
+
+    assert!(
+        first_run.source < second_run.source,
+        "epochs must be distinct and increasing: {:?} vs {:?}",
+        first_run.source,
+        second_run.source
+    );
 }
 
 #[tokio::test]

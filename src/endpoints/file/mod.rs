@@ -19,7 +19,7 @@ use std::any::Any;
 use std::collections::HashMap;
 use std::io::Seek;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, Weak};
 use std::time::{Duration, SystemTime};
 use tokio::fs::{self, File, OpenOptions};
@@ -2023,6 +2023,25 @@ pub struct FileConsumer {
     exit_on_empty: bool,
 }
 
+/// Hands out a strictly increasing run epoch. Seeded from wall-clock millis so epochs still
+/// sort across process restarts, but never repeats or goes backwards within one process —
+/// consumers built in the same millisecond, or across a clock step back, stay distinct.
+fn next_run_epoch() -> u64 {
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let now = SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let mut last = LAST.load(Ordering::Relaxed);
+    loop {
+        let epoch = now.max(last + 1);
+        match LAST.compare_exchange_weak(last, epoch, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return epoch,
+            Err(observed) => last = observed,
+        }
+    }
+}
+
 impl FileConsumer {
     fn wrap(backend: ConsumerBackend) -> Self {
         Self {
@@ -2051,12 +2070,7 @@ impl FileConsumer {
         // the cost of cross-restart deduplication.
         consumer.run_epoch = (config.source_metadata
             && !matches!(&config.mode, None | Some(FileConsumerMode::Consume { .. })))
-        .then(|| {
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(0)
-        });
+        .then(next_run_epoch);
         Ok(consumer)
     }
 

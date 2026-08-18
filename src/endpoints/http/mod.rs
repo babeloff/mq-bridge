@@ -643,8 +643,9 @@ fn http_version_str(version: hyper::Version) -> &'static str {
     }
 }
 
-/// Credential-bearing request headers that must not be copied into message
-/// metadata, where they could be logged, persisted, or echoed back on the reply.
+/// Credential-bearing request headers. They reach metadata under
+/// [`SENSITIVE_HEADER_METADATA_PREFIX`] rather than under their own name, so they stop at the
+/// route handler instead of being forwarded.
 fn is_sensitive_request_header(name: &str) -> bool {
     const SENSITIVE: [&str; 6] = [
         "authorization",
@@ -656,6 +657,15 @@ fn is_sensitive_request_header(name: &str) -> bool {
     ];
     SENSITIVE.iter().any(|h| name.eq_ignore_ascii_case(h))
 }
+
+/// Metadata namespace for credential-bearing request headers, e.g. `mqb.src.http_authorization`,
+/// keeping the header name verbatim after the prefix.
+///
+/// Sits under [`SOURCE_METADATA_PREFIX`](crate::canonical_message::SOURCE_METADATA_PREFIX), which
+/// is what makes carrying the value safe: every publisher drops this prefix when serializing
+/// metadata, so the route handler sees the header the client actually sent while no sink, and no
+/// response header, ever does. See the `sensitive_header_*` tests.
+pub const SENSITIVE_HEADER_METADATA_PREFIX: &str = "mqb.src.http_";
 
 fn request_metadata_matches(request: &RequestMetadataView<'_>, key: &str, value: &str) -> bool {
     match key {
@@ -1586,14 +1596,23 @@ async fn handle_request_internal(
                 content_encoding = Some(v_str.to_string());
             }
             let k_str = key.as_str();
+            // `mqb.src.*` is reserved for framework provenance, so a request header may never
+            // supply one: without this a client could forge its own `mqb.src.http_authorization`.
             if k_str == HTTP_METHOD
                 || k_str == HTTP_PATH
                 || k_str == HTTP_QUERY
                 || k_str == HTTP_VERSION
                 || k_str.eq_ignore_ascii_case("tls_cipher_suite")
                 || k_str.eq_ignore_ascii_case("tls_protocol_version")
-                || is_sensitive_request_header(k_str)
+                || crate::canonical_message::is_source_metadata_key(k_str)
             {
+                continue;
+            }
+            if is_sensitive_request_header(k_str) {
+                metadata.insert(
+                    format!("{SENSITIVE_HEADER_METADATA_PREFIX}{k_str}"),
+                    v_str.to_string(),
+                );
                 continue;
             }
             metadata.insert(k_str.to_string(), v_str.to_string());
