@@ -1017,6 +1017,10 @@ async fn run_http_inline_response_fast_path(
     Ok(true)
 }
 
+/// `_source_metadata` is honoured by the types [`supports_source_metadata`] admits and by the
+/// NATS and AMQP consumers, which stamp provenance that is not a replay position. The other
+/// branches ignore the flag. Startup only rejects an input for missing replay positions when
+/// `source_metadata_required` is set.
 async fn create_base_consumer(
     route_name: &str,
     endpoint: &Endpoint,
@@ -1092,7 +1096,9 @@ async fn create_base_consumer(
                 redis_streams::RedisStreamsConsumer::new(&config).await?,
             ))
         }
-        EndpointType::File(cfg) => Ok(boxed(file::FileConsumer::new(cfg).await?)),
+        EndpointType::File(cfg) => Ok(boxed(
+            file::FileConsumer::new_with_source_metadata(cfg, _source_metadata).await?,
+        )),
         #[cfg(feature = "object-store")]
         EndpointType::ObjectStore(cfg) => {
             Ok(boxed(object_store::ObjectStoreConsumer::new(cfg).await?))
@@ -2105,6 +2111,82 @@ mod tests {
         assert!(error
             .to_string()
             .contains("requires an input that carries a replay position"));
+    }
+
+    /// The route derives `source_metadata` from an idempotent output, so a plain `file`
+    /// input must be stamped without the caller setting the flag on the source config.
+    #[tokio::test]
+    async fn file_input_is_stamped_when_the_output_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("orders.jsonl");
+        std::fs::write(&input, "{\"id\":1}\n{\"id\":2}\n").unwrap();
+
+        let file = Endpoint::new(EndpointType::File(crate::models::FileConfig::new(
+            input.to_string_lossy(),
+        )));
+        let mut consumer =
+            create_consumer_from_route_with_source_metadata("idempotent-route", &file, true)
+                .await
+                .unwrap();
+
+        let batch = consumer.receive_batch(10).await.unwrap();
+        assert_eq!(batch.messages.len(), 2, "file input produced no rows");
+        for (index, message) in batch.messages.iter().enumerate() {
+            assert_eq!(
+                message
+                    .metadata
+                    .get("mqb.src.file_path")
+                    .map(String::as_str),
+                Some(input.to_string_lossy().as_ref())
+            );
+            // The record index is the replay position, so it has to be the row's own index.
+            assert_eq!(
+                message
+                    .metadata
+                    .get("mqb.src.file_record")
+                    .map(String::as_str),
+                Some(index.to_string().as_str())
+            );
+            // `consume` reproduces its record index, so it carries no epoch.
+            assert!(!message.metadata.contains_key("mqb.src.file_epoch"));
+            assert!(crate::support::source_ranges::SourcePosition::from_message(message).is_ok());
+        }
+    }
+
+    /// The epoch reads the same derived flag: a `group_subscribe` input restarts its record
+    /// index, so without one the second run's names would collide with the first run's.
+    #[tokio::test]
+    async fn derived_source_metadata_also_gives_group_subscribe_a_run_epoch() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("orders.jsonl");
+        std::fs::write(&input, "{\"id\":1}\n").unwrap();
+
+        let file = Endpoint::new(EndpointType::File(crate::models::FileConfig {
+            mode: Some(crate::models::FileConsumerMode::GroupSubscribe {
+                group_id: "derived-epoch".to_string(),
+                read_from_tail: false,
+            }),
+            ..crate::models::FileConfig::new(input.to_string_lossy())
+        }));
+
+        // Two runs of the same input: both restart the record index at 0, so only the epoch
+        // keeps the second run's records from being named like the first run's.
+        let mut positions = Vec::new();
+        for _ in 0..2 {
+            let mut consumer =
+                create_consumer_from_route_with_source_metadata("idempotent-route", &file, true)
+                    .await
+                    .unwrap();
+            let batch = consumer.receive_batch(10).await.unwrap();
+            let first = batch.messages.first().expect("file input produced no rows");
+            assert!(first.metadata.contains_key("mqb.src.file_epoch"));
+            positions
+                .push(crate::support::source_ranges::SourcePosition::from_message(first).unwrap());
+        }
+
+        assert_ne!(positions[0].source, positions[1].source);
+        // A later run reads later records, so its objects must sort after the earlier run's.
+        assert!(positions[0].source < positions[1].source);
     }
 
     #[tokio::test]

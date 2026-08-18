@@ -31,7 +31,7 @@ use crate::endpoints::file::{encode_record, parse_delimiter, parse_message};
 use crate::models::{Compression, FileFormat, ObjectStoreConfig};
 #[cfg(feature = "encryption")]
 use crate::support::crypto::Crypto;
-use crate::support::source_ranges::{finalized_name, CoveredRanges};
+use crate::support::source_ranges::{finalized_name, parse_finalized_name, CoveredRanges};
 use crate::traits::{
     BoxFuture, ConsumerError, MessageConsumer, MessageDisposition, MessagePublisher,
     PublisherError, ReceivedBatch, SentBatch,
@@ -127,18 +127,53 @@ async fn recover_idempotent_object_ranges(
     base: &ObjPath,
     extension: &str,
 ) -> anyhow::Result<CoveredRanges> {
-    let mut names = Vec::new();
+    // Parsed as the listing streams: a bucket holding a long history of parts would otherwise
+    // materialise every key at once, and only the merged ranges are worth keeping.
+    let mut covered = CoveredRanges::default();
     let mut stream = store.list(Some(base));
     while let Some(meta) = stream.next().await {
-        let key = meta?.location.to_string();
-        if let Some(name) = key.rsplit('/').next() {
-            names.push(name.to_string());
+        let location = meta?.location;
+        // The listing is recursive, but this sink writes its parts flat under `base`. A
+        // parseable name below a nested prefix is another sink's part, and counting it here
+        // would mark ranges covered that were never written to this prefix.
+        let Some(mut parts) = location.prefix_match(base) else {
+            continue;
+        };
+        let Some(name) = parts.next() else {
+            continue;
+        };
+        if parts.next().is_some() {
+            continue;
+        }
+        if let Some((source, start, end)) = parse_finalized_name(name.as_ref(), extension) {
+            // `parse_finalized_name` already guarantees a valid range.
+            covered.insert(source, start, end)?;
         }
     }
-    Ok(CoveredRanges::from_finalized_names(
-        names.iter().map(String::as_str),
-        extension,
-    ))
+    Ok(covered)
+}
+
+/// Classifies a failed PUT. A denied credential or a store that does not implement the
+/// requested mode does not become writable by trying again, so those stop the route with the
+/// reason instead of retrying forever. `PutMode::Create` on a store with conditional put
+/// disabled lands here as `NotImplemented`, which is how an idempotent sink reports that the
+/// bucket cannot give it the write-once guarantee it is built on.
+fn classify_put_error(error: ObjectStoreError, context: String) -> PublisherError {
+    let permanent = matches!(
+        error,
+        ObjectStoreError::NotImplemented { .. }
+            | ObjectStoreError::NotSupported { .. }
+            | ObjectStoreError::PermissionDenied { .. }
+            | ObjectStoreError::Unauthenticated { .. }
+            | ObjectStoreError::InvalidPath { .. }
+            | ObjectStoreError::UnknownConfigurationKey { .. }
+    );
+    let error = anyhow!(error).context(context);
+    if permanent {
+        PublisherError::NonRetryable(error)
+    } else {
+        PublisherError::Retryable(error)
+    }
 }
 
 /// Splits a fetched object into record slices on `delimiter`, dropping a trailing empty
@@ -322,7 +357,20 @@ impl ObjectStorePublisher {
         &self,
         messages: Vec<CanonicalMessage>,
     ) -> Result<SentBatch, PublisherError> {
-        let mut covered = self.covered_ranges.lock().await;
+        // The lock guards the shared range map, not the work done with it. Held across the
+        // encode and the PUT it would serialise the whole worker pool onto one in-flight
+        // object — a sink that publishes sequentially, which is what naming by source range
+        // exists to make unnecessary. A snapshot is a handful of merged ranges per partition,
+        // so cloning it costs far less than what it lets run concurrently.
+        //
+        // The route enqueues each message once, so batches in flight together hold disjoint
+        // ranges and cannot race here at all. A re-sent batch repeats a range exactly, and an
+        // identical range is an identical name, which `PutMode::Create` turns into a no-op.
+        // Only a source that redelivers offsets still in flight — a Kafka rebalance mid-batch —
+        // could produce two runs that overlap *partially*; those name two different objects and
+        // the overlap would be written twice. Claiming the range under the lock before the PUT
+        // would close that window, at the cost of unwinding the claim on every failure path.
+        let covered = self.covered_ranges.lock().await.clone();
         let runs = covered
             .uncovered_runs(messages)
             .map_err(PublisherError::NonRetryable)?;
@@ -333,6 +381,10 @@ impl ObjectStorePublisher {
             let mut body = Vec::new();
             for mut message in run.messages {
                 message.strip_source_metadata();
+                // Unlike the ordinary path this cannot report `Partial` and hand one bad record
+                // to a DLQ: the object is named for the whole range, so skipping a record inside
+                // it would mark offsets covered that were never written. The batch fails whole
+                // instead. Runs already PUT stay written and are skipped on the resend.
                 let bytes = encode_record(&message, &self.format)
                     .map_err(|error| PublisherError::NonRetryable(anyhow!(error)))?;
                 body.extend_from_slice(&bytes);
@@ -354,12 +406,15 @@ impl ObjectStorePublisher {
             {
                 Ok(_) | Err(ObjectStoreError::AlreadyExists { .. }) => {}
                 Err(error) => {
-                    return Err(PublisherError::Retryable(
-                        anyhow!(error).context(format!("object-store put idempotent '{key}'")),
+                    return Err(classify_put_error(
+                        error,
+                        format!("object-store put idempotent '{key}'"),
                     ));
                 }
             }
-            covered
+            self.covered_ranges
+                .lock()
+                .await
                 .insert(run.source, run.start, run.end)
                 .map_err(PublisherError::NonRetryable)?;
         }
@@ -421,9 +476,7 @@ impl MessagePublisher for ObjectStorePublisher {
         self.store
             .put(&key, PutPayload::from(body))
             .await
-            .map_err(|e| {
-                PublisherError::Retryable(anyhow!(e).context(format!("object-store put '{key}'")))
-            })?;
+            .map_err(|e| classify_put_error(e, format!("object-store put '{key}'")))?;
         trace!(key = %key, "Wrote object to object store");
         if failed.is_empty() {
             Ok(SentBatch::Ack)
@@ -1010,6 +1063,119 @@ mod tests {
         message
     }
 
+    /// A store whose `put_opts` parks on a barrier, so a put can only complete once as many
+    /// puts are in flight as the barrier expects. A publisher that serialises its writes
+    /// never gets there and hangs, which is what turns "slower" into a failing test.
+    #[derive(Debug)]
+    struct BarrierStore {
+        inner: InMemory,
+        puts: tokio::sync::Barrier,
+    }
+
+    impl BarrierStore {
+        fn new(concurrent_puts: usize) -> Self {
+            Self {
+                inner: InMemory::new(),
+                puts: tokio::sync::Barrier::new(concurrent_puts),
+            }
+        }
+    }
+
+    impl std::fmt::Display for BarrierStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "BarrierStore")
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for BarrierStore {
+        async fn put_opts(
+            &self,
+            location: &ObjPath,
+            payload: PutPayload,
+            opts: PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            self.puts.wait().await;
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &ObjPath,
+            opts: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &ObjPath,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: futures::stream::BoxStream<'static, object_store::Result<ObjPath>>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<ObjPath>> {
+            self.inner.delete_stream(locations)
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&ObjPath>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&ObjPath>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &ObjPath,
+            to: &ObjPath,
+            options: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    /// The idempotent path must not trade the worker pool for its ordering guarantee. Naming
+    /// objects by source range is what makes concurrent writes safe, so the range bookkeeping
+    /// may only be locked around the map itself — never around the encode and the PUT, which
+    /// would leave an ordered sink publishing one object at a time.
+    #[tokio::test]
+    async fn idempotent_sends_are_not_serialised_by_the_covered_range_lock() {
+        let store = Arc::new(BarrierStore::new(2));
+        let mut publisher = test_publisher(store);
+        publisher.idempotency = true;
+        let other = publisher.clone();
+
+        // Disjoint offset runs, so both batches genuinely write and neither is skipped.
+        let first = tokio::spawn(async move {
+            publisher
+                .send_batch_idempotent(vec![kafka_message(0)])
+                .await
+        });
+        let second =
+            tokio::spawn(async move { other.send_batch_idempotent(vec![kafka_message(1)]).await });
+
+        let sends = async {
+            first.await.unwrap().unwrap();
+            second.await.unwrap().unwrap();
+        };
+        tokio::time::timeout(Duration::from_secs(10), sends)
+            .await
+            .expect("both puts must be in flight at once; the covered-range lock is being held across the put");
+    }
+
     /// The guarantee the idempotent sink exists to make, and the one the whole ordering
     /// thread turns on: object order is *source* order even when batches are written
     /// concurrently and out of order. Dispatches the batches in reverse and lets them race,
@@ -1107,6 +1273,44 @@ mod tests {
                 part_key(2, 2, "jsonl").to_string(),
             ]
         );
+    }
+
+    /// `list` is recursive, so a sink whose base is a *sub*prefix of ours shows up in our
+    /// listing with a perfectly parseable part name. Counting it would mark that range
+    /// covered here and silently drop the records that were never written under our prefix.
+    #[tokio::test]
+    async fn recovery_ignores_parseable_parts_under_a_nested_prefix() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let nested = ObjPath::from(format!(
+            "data/other/{}",
+            part_key(0, 1, "jsonl").filename().unwrap()
+        ));
+        store
+            .put(&nested, PutPayload::from("someone else's part"))
+            .await
+            .unwrap();
+
+        let base = ObjPath::from("data");
+        let covered = recover_idempotent_object_ranges(store.as_ref(), &base, "jsonl")
+            .await
+            .unwrap();
+
+        let mut publisher = test_publisher(store.clone());
+        publisher.idempotency = true;
+        publisher.covered_ranges = Arc::new(Mutex::new(covered));
+        publisher
+            .send_batch(vec![kafka_message(0), kafka_message(1)])
+            .await
+            .unwrap();
+
+        let written = store
+            .get(&part_key(0, 1, "jsonl"))
+            .await
+            .expect("the nested part must not count as coverage")
+            .bytes()
+            .await
+            .unwrap();
+        assert!(!written.is_empty());
     }
 
     #[tokio::test]
