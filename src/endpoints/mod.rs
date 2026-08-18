@@ -2133,12 +2133,18 @@ mod tests {
         assert_eq!(batch.messages.len(), 2, "file input produced no rows");
         for (index, message) in batch.messages.iter().enumerate() {
             assert_eq!(
-                message.metadata.get("mqb.src.file_path").map(String::as_str),
+                message
+                    .metadata
+                    .get("mqb.src.file_path")
+                    .map(String::as_str),
                 Some(input.to_string_lossy().as_ref())
             );
             // The record index is the replay position, so it has to be the row's own index.
             assert_eq!(
-                message.metadata.get("mqb.src.file_record").map(String::as_str),
+                message
+                    .metadata
+                    .get("mqb.src.file_record")
+                    .map(String::as_str),
                 Some(index.to_string().as_str())
             );
             // `consume` reproduces its record index, so it carries no epoch.
