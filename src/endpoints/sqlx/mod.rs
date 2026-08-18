@@ -1983,6 +1983,7 @@ pub struct SqlxCursorReader {
     /// Page queries, built once: only the bound cursor and limit vary between polls.
     sql_first: String,
     sql_next: String,
+    source_metadata: bool,
 }
 
 /// Run one keyset page. `from` is the exclusive lower bound (`None` = start of table).
@@ -2004,6 +2005,13 @@ async fn fetch_page(
 
 impl SqlxCursorReader {
     pub async fn new(config: &SqlxConfig) -> anyhow::Result<Self> {
+        Self::new_with_source_metadata(config, config.source_metadata).await
+    }
+
+    pub async fn new_with_source_metadata(
+        config: &SqlxConfig,
+        source_metadata: bool,
+    ) -> anyhow::Result<Self> {
         sqlx::any::install_default_drivers();
         if config.delete_after_read {
             return Err(anyhow!(
@@ -2111,6 +2119,7 @@ impl SqlxCursorReader {
             ),
             checkpoint,
             last_value: Arc::new(Mutex::new(last_value)),
+            source_metadata,
         })
     }
 }
@@ -2122,6 +2131,46 @@ impl SqlxCursorReader {
         } else {
             &self.sql_first
         }
+    }
+
+    /// Stamp the replay position an idempotent sink names its objects from. The cursor value
+    /// *is* the position, so it has to be a unique non-negative integer: a text cursor has no
+    /// contiguous ordering, and a repeated value would make two rows resolve to the same
+    /// output record, silently dropping one. Rows arrive ordered, so ties are adjacent.
+    fn stamp_source_position(
+        &self,
+        message: &mut CanonicalMessage,
+        cursor: &SqlCursor,
+        previous: Option<&SqlCursor>,
+    ) -> Result<(), ConsumerError> {
+        let SqlCursor::Int(value) = cursor else {
+            return Err(ConsumerError::Permanent(anyhow!(
+                "source_metadata requires cursor_column '{}' to be an integer, but it read as \
+                 text. Point it at an integer key column, or CAST one in a view.",
+                self.cursor_column
+            )));
+        };
+        let value = u64::try_from(*value).map_err(|_| {
+            ConsumerError::Permanent(anyhow!(
+                "source_metadata requires cursor_column '{}' to be non-negative; got {value}.",
+                self.cursor_column
+            ))
+        })?;
+        if previous == Some(cursor) {
+            return Err(ConsumerError::Permanent(anyhow!(
+                "source_metadata requires cursor_column '{}' to be unique, but value {value} \
+                 repeats. Both rows would name the same output record and one would be dropped.",
+                self.cursor_column
+            )));
+        }
+
+        message
+            .metadata
+            .insert("mqb.src.sqlx_table".to_string(), self.table.clone());
+        message
+            .metadata
+            .insert("mqb.src.sqlx_cursor".to_string(), value.to_string());
+        Ok(())
     }
 }
 
@@ -2228,7 +2277,10 @@ impl MessageConsumer for SqlxCursorReader {
 
         let mut messages = Vec::with_capacity(fetched.len());
         let mut cursors: Vec<SqlCursor> = Vec::with_capacity(fetched.len());
-        for (cursor, msg) in fetched {
+        for (cursor, mut msg) in fetched {
+            if self.source_metadata {
+                self.stamp_source_position(&mut msg, &cursor, cursors.last())?;
+            }
             cursors.push(cursor.clone());
             messages.push(msg);
             // Advance optimistically so the next page continues past this row; rolled back

@@ -865,7 +865,7 @@ pub struct FileConfig {
     /// Path to the file, or to the directory holding the part files when `idempotency` is true.
     pub path: String,
     /// Write replay-safe source ranges as immutable part files under this directory.
-    /// Requires Kafka source metadata or postgres_cdc commit LSN plus transaction ordinal metadata.
+    /// Requires a source that stamps a replayable position: kafka, postgres_cdc, mongodb CDC, sqlx or file.
     #[serde(default)]
     pub idempotency: bool,
     /// Optional delimiter for messages. Defaults to newline ("\n").
@@ -885,6 +885,9 @@ pub struct FileConfig {
     /// At-rest AEAD encryption applied after compression. Requires the `encryption` feature. Publishers: always. Consumers: must match, and only the default `consume` mode reads it.
     #[serde(default)]
     pub encryption: Option<EncryptionConfig>,
+    /// (Consumer only) Include authoritative `mqb.src.file_*` source positions; only `consume` mode reproduces them across restarts. Defaults to false.
+    #[serde(default)]
+    pub source_metadata: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1937,6 +1940,9 @@ pub struct SqlxConfig {
     /// Needs table-owner privilege: it is auto-published `FOR TABLE {table}`.
     #[serde(default)]
     pub create_publication: bool,
+    /// (Consumer only) Include authoritative `mqb.src.sqlx_*` source positions; `cursor_column` must then be a unique integer. Defaults to false.
+    #[serde(default)]
+    pub source_metadata: bool,
     /// TLS configuration for the database connection.
     #[serde(default)]
     pub tls: TlsConfig,

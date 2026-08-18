@@ -13,6 +13,19 @@ const OFFSET_KEY: &str = "mqb.src.kafka_offset";
 const POSTGRES_SLOT_KEY: &str = "mqb.src.postgres_slot";
 const POSTGRES_LSN_KEY: &str = "mqb.src.postgres_lsn";
 const POSTGRES_ORDINAL_KEY: &str = "mqb.src.postgres_ordinal";
+const MONGODB_NAMESPACE_KEY: &str = "mqb.src.mongodb_namespace";
+const MONGODB_CLUSTER_TIME_KEY: &str = "mqb.src.mongodb_cluster_time";
+const MONGODB_ORDINAL_KEY: &str = "mqb.src.mongodb_ordinal";
+const MONGODB_SNAPSHOT_INDEX_KEY: &str = "mqb.src.mongodb_snapshot_index";
+const FILE_PATH_KEY: &str = "mqb.src.file_path";
+const FILE_RECORD_KEY: &str = "mqb.src.file_record";
+const FILE_EPOCH_KEY: &str = "mqb.src.file_epoch";
+const SQLX_TABLE_KEY: &str = "mqb.src.sqlx_table";
+const SQLX_CURSOR_KEY: &str = "mqb.src.sqlx_cursor";
+
+/// Width of a `u64` embedded in a source key. Numbers inside the key must be fixed-width
+/// or ASCII sort disagrees with numeric sort and the sink replays out of order.
+const POSITION_WIDTH: usize = 20;
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct SourcePartition {
@@ -48,7 +61,20 @@ impl SourcePosition {
         {
             return Self::from_postgres_message(message);
         }
-        bail!("idempotent sink requires Kafka or postgres_cdc source-position metadata");
+        if message.metadata.contains_key(MONGODB_NAMESPACE_KEY) {
+            return Self::from_mongodb_message(message);
+        }
+        if message.metadata.contains_key(FILE_PATH_KEY)
+            || message.metadata.contains_key(FILE_RECORD_KEY)
+        {
+            return Self::from_file_message(message);
+        }
+        if message.metadata.contains_key(SQLX_TABLE_KEY)
+            || message.metadata.contains_key(SQLX_CURSOR_KEY)
+        {
+            return Self::from_sqlx_message(message);
+        }
+        bail!("idempotent sink requires Kafka, postgres_cdc, mongodb, file or sqlx source-position metadata");
     }
 
     fn from_kafka_message(message: &CanonicalMessage) -> Result<Self> {
@@ -84,13 +110,134 @@ impl SourcePosition {
         Ok(Self {
             // A commit LSN is shared by all changes in the transaction. Including it
             // in the source key makes the transaction ordinal a unique range offset.
+            // Padded: the LSN is part of the key text, so an unpadded one sorts
+            // 10000000000 before 9876543210.
             source: SourcePartition {
-                topic: format!("postgres_cdc-{slot}-{lsn}"),
+                topic: format!("postgres_cdc-{slot}-{lsn:00$}", POSITION_WIDTH),
                 partition: 0,
             },
             offset: ordinal,
         })
     }
+
+    /// MongoDB has two phases and they must sort in the order they are read: the initial
+    /// snapshot of existing documents, then the change stream. The phase is numbered into
+    /// the key (`0snapshot` before `1cdc`) so a change never replays ahead of the document
+    /// it modifies.
+    fn from_mongodb_message(message: &CanonicalMessage) -> Result<Self> {
+        let namespace = message
+            .metadata
+            .get(MONGODB_NAMESPACE_KEY)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow!("idempotent sink requires {MONGODB_NAMESPACE_KEY}"))?;
+
+        // Snapshot documents are paged by ascending `_id`, so their scan index is a
+        // contiguous, deterministic position.
+        if message.metadata.contains_key(MONGODB_SNAPSHOT_INDEX_KEY) {
+            let index = parse_unsigned_position(message, MONGODB_SNAPSHOT_INDEX_KEY)?;
+            return Ok(Self {
+                source: SourcePartition {
+                    topic: format!("mongodb-{namespace}-0snapshot"),
+                    partition: 0,
+                },
+                offset: index,
+            });
+        }
+
+        // A cluster time is shared by every change in a transaction, so it identifies the
+        // group and the ordinal positions the change inside it.
+        let cluster_time = parse_unsigned_position(message, MONGODB_CLUSTER_TIME_KEY)?;
+        let ordinal = parse_unsigned_position(message, MONGODB_ORDINAL_KEY)?;
+        Ok(Self {
+            source: SourcePartition {
+                topic: format!(
+                    "mongodb-{namespace}-1cdc-{cluster_time:00$}",
+                    POSITION_WIDTH
+                ),
+                partition: 0,
+            },
+            offset: ordinal,
+        })
+    }
+
+    /// The position is the record's index in the file, not its byte offset: the sink groups
+    /// records into one object by consecutive position, and byte offsets are never
+    /// consecutive, so they would force one object per record.
+    fn from_file_message(message: &CanonicalMessage) -> Result<Self> {
+        let path = message
+            .metadata
+            .get(FILE_PATH_KEY)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow!("idempotent sink requires {FILE_PATH_KEY}"))?;
+        let record = parse_unsigned_position(message, FILE_RECORD_KEY)?;
+        // Modes that do not start at byte 0 carry a run epoch, so a restart cannot reuse
+        // the record indexes of the run before it. Sorted ahead of the index because a
+        // later run always reads later records.
+        let identity = sanitize_path_identity(path);
+        let topic = match message.metadata.get(FILE_EPOCH_KEY) {
+            Some(_) => {
+                let epoch = parse_unsigned_position(message, FILE_EPOCH_KEY)?;
+                format!("file-{identity}-{epoch:00$}", POSITION_WIDTH)
+            }
+            None => format!("file-{identity}"),
+        };
+        Ok(Self {
+            source: SourcePartition {
+                topic,
+                partition: 0,
+            },
+            offset: record,
+        })
+    }
+
+    /// A polling cursor is a replay position in its own right, so the cursor value *is* the
+    /// offset — the same shape Kafka Connect's S3 sink uses for a Kafka offset. Only an
+    /// integer cursor reaches here; the reader rejects text cursors, which have no
+    /// contiguous ordering, before stamping.
+    fn from_sqlx_message(message: &CanonicalMessage) -> Result<Self> {
+        let table = message
+            .metadata
+            .get(SQLX_TABLE_KEY)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow!("idempotent sink requires {SQLX_TABLE_KEY}"))?;
+        let cursor = parse_unsigned_position(message, SQLX_CURSOR_KEY)?;
+
+        Ok(Self {
+            source: SourcePartition {
+                topic: format!("sqlx-{table}"),
+                partition: 0,
+            },
+            offset: cursor,
+        })
+    }
+}
+
+/// A source path is not usable as a key component verbatim — `finalized_name` rejects `/`,
+/// and object stores treat it as a directory separator. Keeps the file name for
+/// readability and appends a hash of the full path so two same-named files in different
+/// directories stay distinct.
+fn sanitize_path_identity(path: &str) -> String {
+    // FNV-1a, spelled out: `DefaultHasher` is explicitly not stable across Rust releases,
+    // and this digest goes into object names that must match after an upgrade.
+    let mut digest: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in path.as_bytes() {
+        digest ^= u64::from(*byte);
+        digest = digest.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+
+    let name = path.rsplit('/').next().unwrap_or(path);
+    let safe: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .take(64)
+        .collect();
+    format!("{safe}-{digest:016x}")
 }
 
 fn parse_signed_position(message: &CanonicalMessage, key: &str) -> Result<i64> {
@@ -246,9 +393,13 @@ pub fn finalized_name(
     {
         bail!("invalid idempotent sink finalized name components");
     }
+    // Zero-padded to fixed width so lexicographic listing order == numeric order.
+    // `parse_finalized_name` still accepts legacy unpadded names.
     Ok(format!(
-        "part-{}-{}-{start}-{end}.{extension}",
-        source.topic, source.partition
+        "part-{topic}-{partition:010}-{start:0width$}-{end:0width$}.{extension}",
+        topic = source.topic,
+        partition = source.partition,
+        width = POSITION_WIDTH,
     ))
 }
 
@@ -309,6 +460,57 @@ mod tests {
         assert!(SourcePosition::from_message(&invalid).is_err());
     }
 
+    fn sqlx_message(table: &str, cursor: u64) -> CanonicalMessage {
+        let mut message = CanonicalMessage::new(b"payload".to_vec(), None);
+        message
+            .metadata
+            .insert(SQLX_TABLE_KEY.into(), table.to_string());
+        message
+            .metadata
+            .insert(SQLX_CURSOR_KEY.into(), cursor.to_string());
+        message
+    }
+
+    /// The cursor value is the offset directly, so consecutive rows coalesce into one run
+    /// and one object — a gap in the ids is what splits them.
+    #[test]
+    fn sqlx_cursor_positions_coalesce_consecutive_rows() {
+        let runs = CoveredRanges::default()
+            .uncovered_runs(vec![
+                sqlx_message("public.orders", 41),
+                sqlx_message("public.orders", 42),
+                sqlx_message("public.orders", 77),
+            ])
+            .unwrap();
+
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0].source.topic, "sqlx-public.orders");
+        assert_eq!(
+            (runs[0].start, runs[0].end, runs[0].messages.len()),
+            (41, 42, 2)
+        );
+        assert_eq!((runs[1].start, runs[1].end), (77, 77));
+
+        // A schema-qualified table carries a `.`, which has to survive into a part name.
+        assert_eq!(
+            finalized_name(&runs[0].source, runs[0].start, runs[0].end, "jsonl").unwrap(),
+            "part-sqlx-public.orders-0000000000-00000000000000000041-00000000000000000042.jsonl"
+        );
+    }
+
+    #[test]
+    fn sqlx_cursor_positions_require_a_table_and_numeric_cursor() {
+        let mut missing_table = sqlx_message("orders", 1);
+        missing_table.metadata.remove(SQLX_TABLE_KEY);
+        assert!(SourcePosition::from_message(&missing_table).is_err());
+
+        let mut text_cursor = sqlx_message("orders", 1);
+        text_cursor
+            .metadata
+            .insert(SQLX_CURSOR_KEY.into(), "2026-08-18T00:00:00Z".into());
+        assert!(SourcePosition::from_message(&text_cursor).is_err());
+    }
+
     #[test]
     fn postgres_cdc_positions_preserve_each_change_in_a_commit() {
         let runs = CoveredRanges::default()
@@ -320,12 +522,18 @@ mod tests {
             .unwrap();
 
         assert_eq!(runs.len(), 2);
-        assert_eq!(runs[0].source.topic, "postgres_cdc-bridge_slot-9876543210");
+        assert_eq!(
+            runs[0].source.topic,
+            "postgres_cdc-bridge_slot-00000000009876543210"
+        );
         assert_eq!(
             (runs[0].start, runs[0].end, runs[0].messages.len()),
             (0, 1, 2)
         );
-        assert_eq!(runs[1].source.topic, "postgres_cdc-bridge_slot-9876543211");
+        assert_eq!(
+            runs[1].source.topic,
+            "postgres_cdc-bridge_slot-00000000009876543211"
+        );
         assert_eq!(
             (runs[1].start, runs[1].end, runs[1].messages.len()),
             (0, 0, 1)
@@ -367,8 +575,19 @@ mod tests {
             partition: 2,
         };
         let name = finalized_name(&source, 41, 59, "jsonl").unwrap();
-        assert_eq!(name, "part-orders-eu-2-41-59.jsonl");
-        assert_eq!(parse_finalized_name(&name, "jsonl"), Some((source, 41, 59)));
+        assert_eq!(
+            name,
+            "part-orders-eu-0000000002-00000000000000000041-00000000000000000059.jsonl"
+        );
+        assert_eq!(
+            parse_finalized_name(&name, "jsonl"),
+            Some((source.clone(), 41, 59))
+        );
+        // legacy unpadded names still read
+        assert_eq!(
+            parse_finalized_name("part-orders-eu-2-41-59.jsonl", "jsonl"),
+            Some((source, 41, 59))
+        );
         assert_eq!(
             parse_finalized_name(".stage-part-orders-2-41-59.jsonl", "jsonl"),
             None
@@ -381,6 +600,140 @@ mod tests {
             parse_finalized_name("part-orders-2-41-59.tmp", "jsonl"),
             None
         );
+    }
+
+    #[test]
+    fn finalized_names_sort_lexicographically_in_numeric_order() {
+        let ranges = [(0u64, 9u64), (10, 19), (99, 99), (100, 100), (100, 1000)];
+        for partition in [9i32, 10] {
+            let source = SourcePartition {
+                topic: "orders".into(),
+                partition,
+            };
+            let names = ranges
+                .iter()
+                .map(|(start, end)| finalized_name(&source, *start, *end, "jsonl").unwrap())
+                .collect::<Vec<_>>();
+            let mut sorted = names.clone();
+            sorted.sort();
+            assert_eq!(names, sorted);
+        }
+
+        let low = finalized_name(
+            &SourcePartition {
+                topic: "orders".into(),
+                partition: 9,
+            },
+            0,
+            0,
+            "jsonl",
+        )
+        .unwrap();
+        let high = finalized_name(
+            &SourcePartition {
+                topic: "orders".into(),
+                partition: 10,
+            },
+            0,
+            0,
+            "jsonl",
+        )
+        .unwrap();
+        assert!(low < high);
+    }
+
+    fn mongo_change(namespace: &str, cluster_time: u64, ordinal: u64) -> CanonicalMessage {
+        let mut message = CanonicalMessage::new(b"payload".to_vec(), None);
+        message
+            .metadata
+            .insert(MONGODB_NAMESPACE_KEY.into(), namespace.into());
+        message
+            .metadata
+            .insert(MONGODB_CLUSTER_TIME_KEY.into(), cluster_time.to_string());
+        message
+            .metadata
+            .insert(MONGODB_ORDINAL_KEY.into(), ordinal.to_string());
+        message
+    }
+
+    fn mongo_snapshot(namespace: &str, index: u64) -> CanonicalMessage {
+        let mut message = CanonicalMessage::new(b"payload".to_vec(), None);
+        message
+            .metadata
+            .insert(MONGODB_NAMESPACE_KEY.into(), namespace.into());
+        message
+            .metadata
+            .insert(MONGODB_SNAPSHOT_INDEX_KEY.into(), index.to_string());
+        message
+    }
+
+    fn file_record(path: &str, record: u64) -> CanonicalMessage {
+        let mut message = CanonicalMessage::new(b"payload".to_vec(), None);
+        message.metadata.insert(FILE_PATH_KEY.into(), path.into());
+        message
+            .metadata
+            .insert(FILE_RECORD_KEY.into(), record.to_string());
+        message
+    }
+
+    #[test]
+    fn mongodb_snapshot_sorts_before_the_change_stream_that_follows_it() {
+        let snapshot = SourcePosition::from_message(&mongo_snapshot("shop.orders", 0)).unwrap();
+        let change = SourcePosition::from_message(&mongo_change("shop.orders", 1, 0)).unwrap();
+        assert!(snapshot.source < change.source);
+
+        // The written names must sort the same way, or a change replays ahead of the
+        // document it modifies.
+        let snapshot_name = finalized_name(&snapshot.source, 0, 9, "jsonl").unwrap();
+        let change_name = finalized_name(&change.source, 0, 9, "jsonl").unwrap();
+        assert!(snapshot_name < change_name);
+    }
+
+    #[test]
+    fn mongodb_cluster_times_sort_numerically_across_digit_widths() {
+        let earlier = SourcePosition::from_message(&mongo_change("shop.orders", 9_999, 0)).unwrap();
+        let later = SourcePosition::from_message(&mongo_change("shop.orders", 10_000, 0)).unwrap();
+        assert!(
+            finalized_name(&earlier.source, 0, 0, "jsonl").unwrap()
+                < finalized_name(&later.source, 0, 0, "jsonl").unwrap()
+        );
+    }
+
+    #[test]
+    fn mongodb_changes_in_one_cluster_time_form_one_contiguous_run() {
+        let runs = CoveredRanges::default()
+            .uncovered_runs(vec![
+                mongo_change("shop.orders", 77, 0),
+                mongo_change("shop.orders", 77, 1),
+                mongo_change("shop.orders", 78, 0),
+            ])
+            .unwrap();
+
+        assert_eq!(runs.len(), 2);
+        assert_eq!((runs[0].start, runs[0].end), (0, 1));
+        assert_eq!((runs[1].start, runs[1].end), (0, 0));
+    }
+
+    #[test]
+    fn file_records_form_one_run_and_distinguish_same_named_files() {
+        let runs = CoveredRanges::default()
+            .uncovered_runs(vec![
+                file_record("/data/in/orders.jsonl", 0),
+                file_record("/data/in/orders.jsonl", 1),
+                file_record("/data/in/orders.jsonl", 2),
+            ])
+            .unwrap();
+        // Consecutive record indexes coalesce into a single object; byte offsets would not.
+        assert_eq!(runs.len(), 1);
+        assert_eq!((runs[0].start, runs[0].end), (0, 2));
+
+        // Same file name, different directory: distinct partitions.
+        let a = SourcePosition::from_message(&file_record("/data/a/orders.jsonl", 0)).unwrap();
+        let b = SourcePosition::from_message(&file_record("/data/b/orders.jsonl", 0)).unwrap();
+        assert_ne!(a.source, b.source);
+
+        // The identity survives `finalized_name`'s rejection of path separators.
+        assert!(finalized_name(&a.source, 0, 2, "jsonl").is_ok());
     }
 
     #[test]

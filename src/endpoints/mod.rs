@@ -674,7 +674,7 @@ pub async fn create_consumer_from_route_with_source_metadata(
     check_consumer(route_name, &resolved_endpoint, None)?;
     if source_metadata_required && !supports_source_metadata(&resolved_endpoint.endpoint_type) {
         return Err(anyhow!(
-            "[route:{route_name}] idempotent file/object_store output requires a Kafka or Postgres CDC input"
+            "[route:{route_name}] idempotent file/object_store output requires an input that carries a replay position: kafka, postgres_cdc, sqlx, mongodb (change stream) or file"
         ));
     }
     let source_metadata =
@@ -692,6 +692,24 @@ fn supports_source_metadata(endpoint_type: &EndpointType) -> bool {
         endpoint_type,
         EndpointType::Kafka(_) | EndpointType::PostgresCdc(_)
     ) || matches!(endpoint_type, EndpointType::Sqlx(config) if config.publication.is_some())
+        // A polling cursor is itself a replay position, provided it is a unique integer;
+        // the reader rejects text and repeated values rather than naming records wrongly.
+        || matches!(endpoint_type, EndpointType::Sqlx(config) if config.cursor_column.is_some())
+        // The change-stream reader positions changes by cluster time and its initial
+        // snapshot by `_id` scan index. The `consumer`/`snapshot` readers have neither.
+        || matches!(
+            endpoint_type,
+            EndpointType::MongoDb(config) if matches!(
+                config.consume,
+                Some(crate::models::MongoConsume::CaptureNew)
+                    | Some(crate::models::MongoConsume::CaptureAll)
+                    | None
+            )
+        )
+        // Every file mode positions records by index. Only `consume` reproduces that index
+        // across runs; the others add a run epoch, which keeps them ordered and distinct
+        // but not deduplicated. That is a weaker guarantee, not an invalid setup.
+        || matches!(endpoint_type, EndpointType::File(_))
 }
 
 fn source_metadata_requested(endpoint_type: &EndpointType) -> bool {
@@ -700,17 +718,49 @@ fn source_metadata_requested(endpoint_type: &EndpointType) -> bool {
         EndpointType::Nats(config) => config.source_metadata,
         EndpointType::Amqp(config) => config.source_metadata,
         EndpointType::PostgresCdc(config) => config.source_metadata,
+        EndpointType::MongoDb(config) => config.source_metadata,
+        EndpointType::File(config) => config.source_metadata,
+        EndpointType::Sqlx(config) => config.source_metadata,
         _ => false,
     }
 }
 
 /// Whether a route's resolved output contains an idempotent file or object-store sink.
 pub fn output_requires_source_metadata(route_name: &str, endpoint: &Endpoint) -> Result<bool> {
+    output_has_sink(route_name, endpoint, &|endpoint_type| match endpoint_type {
+        EndpointType::File(config) => config.idempotency,
+        EndpointType::ObjectStore(config) => config.idempotency,
+        _ => false,
+    })
+}
+
+/// Whether a route's resolved output contains an object-store sink that names objects in
+/// write order. Key order is the only order a bucket has, and above `concurrency: 1` write
+/// order is worker arrival order rather than source order.
+pub fn output_has_write_ordered_object_store(
+    route_name: &str,
+    endpoint: &Endpoint,
+) -> Result<bool> {
+    output_has_sink(
+        route_name,
+        endpoint,
+        &|endpoint_type| matches!(endpoint_type, EndpointType::ObjectStore(config) if !config.idempotency),
+    )
+}
+
+/// Walk a resolved output tree — through `fanout`, `switch`, `reader`, `request` and `ref` —
+/// and report whether any leaf sink matches.
+fn output_has_sink(
+    route_name: &str,
+    endpoint: &Endpoint,
+    matches_leaf: &dyn Fn(&EndpointType) -> bool,
+) -> Result<bool> {
     fn visit(
         route_name: &str,
         endpoint: &Endpoint,
         depth: usize,
         visited_refs: &mut std::collections::HashSet<String>,
+        matches_leaf: &dyn Fn(&EndpointType) -> bool,
     ) -> Result<bool> {
         const MAX_DEPTH: usize = 16;
         if depth > MAX_DEPTH {
@@ -719,18 +769,16 @@ pub fn output_requires_source_metadata(route_name: &str, endpoint: &Endpoint) ->
             ));
         }
         match &endpoint.endpoint_type {
-            EndpointType::File(config) => Ok(config.idempotency),
-            EndpointType::ObjectStore(config) => Ok(config.idempotency),
             EndpointType::Fanout(outputs) => outputs
                 .iter()
-                .map(|output| visit(route_name, output, depth + 1, visited_refs))
+                .map(|output| visit(route_name, output, depth + 1, visited_refs, matches_leaf))
                 .collect::<Result<Vec<_>>>()
                 .map(|requirements| requirements.into_iter().any(|required| required)),
             EndpointType::Switch(config) => {
                 let cases_required = config
                     .cases
                     .values()
-                    .map(|output| visit(route_name, output, depth + 1, visited_refs))
+                    .map(|output| visit(route_name, output, depth + 1, visited_refs, matches_leaf))
                     .collect::<Result<Vec<_>>>()?
                     .into_iter()
                     .any(|required| required);
@@ -738,15 +786,26 @@ pub fn output_requires_source_metadata(route_name: &str, endpoint: &Endpoint) ->
                     Ok(true)
                 } else {
                     config.default.as_deref().map_or(Ok(false), |output| {
-                        visit(route_name, output, depth + 1, visited_refs)
+                        visit(route_name, output, depth + 1, visited_refs, matches_leaf)
                     })
                 }
             }
-            EndpointType::Reader(output) => visit(route_name, output, depth + 1, visited_refs),
-            EndpointType::Request(config) => {
-                Ok(visit(route_name, &config.to, depth + 1, visited_refs)?
-                    || visit(route_name, &config.forward_to, depth + 1, visited_refs)?)
+            EndpointType::Reader(output) => {
+                visit(route_name, output, depth + 1, visited_refs, matches_leaf)
             }
+            EndpointType::Request(config) => Ok(visit(
+                route_name,
+                &config.to,
+                depth + 1,
+                visited_refs,
+                matches_leaf,
+            )? || visit(
+                route_name,
+                &config.forward_to,
+                depth + 1,
+                visited_refs,
+                matches_leaf,
+            )?),
             EndpointType::Ref(name) => {
                 if !visited_refs.insert(name.clone()) {
                     return Err(anyhow!(
@@ -756,11 +815,17 @@ pub fn output_requires_source_metadata(route_name: &str, endpoint: &Endpoint) ->
                 let referenced = crate::route::get_endpoint(name).ok_or_else(|| {
                     anyhow!("[route:{route_name}] referenced output endpoint '{name}' not found")
                 })?;
-                let required = visit(route_name, &referenced, depth + 1, visited_refs);
+                let required = visit(
+                    route_name,
+                    &referenced,
+                    depth + 1,
+                    visited_refs,
+                    matches_leaf,
+                );
                 visited_refs.remove(name);
                 required
             }
-            _ => Ok(false),
+            leaf => Ok(matches_leaf(leaf)),
         }
     }
 
@@ -769,6 +834,7 @@ pub fn output_requires_source_metadata(route_name: &str, endpoint: &Endpoint) ->
         endpoint,
         0,
         &mut std::collections::HashSet::new(),
+        matches_leaf,
     )
 }
 
@@ -1063,7 +1129,9 @@ async fn create_base_consumer(
                 }
             } else if cfg.cursor_column.is_some() {
                 // Non-destructive, resumable cursor read of an arbitrary table.
-                Ok(boxed(sqlx::SqlxCursorReader::new(cfg).await?))
+                Ok(boxed(
+                    sqlx::SqlxCursorReader::new_with_source_metadata(cfg, _source_metadata).await?,
+                ))
             } else {
                 Ok(boxed(sqlx::SqlxConsumer::new(cfg).await?))
             }
@@ -1955,6 +2023,50 @@ mod tests {
         assert!(output_requires_source_metadata("test", &switch).unwrap());
     }
 
+    /// Only a write-ordered object store is worth warning about: an idempotent one names
+    /// objects by source position, so concurrency cannot reorder them.
+    #[cfg(feature = "object-store")]
+    #[test]
+    fn write_ordered_object_store_is_detected_through_the_output_tree() {
+        fn bucket(idempotency: bool) -> Endpoint {
+            Endpoint::new(EndpointType::ObjectStore(
+                crate::models::ObjectStoreConfig {
+                    url: "s3://bucket/data".to_string(),
+                    idempotency,
+                    ..Default::default()
+                },
+            ))
+        }
+
+        let fanout = Endpoint::new(EndpointType::Fanout(vec![
+            Endpoint::new_memory("ordinary", 1),
+            bucket(false),
+        ]));
+        assert!(output_has_write_ordered_object_store("test", &fanout).unwrap());
+
+        let idempotent = Endpoint::new(EndpointType::Fanout(vec![bucket(true)]));
+        assert!(!output_has_write_ordered_object_store("test", &idempotent).unwrap());
+    }
+
+    /// A polling cursor is a replay position, so an idempotent sink accepts it — where a
+    /// plain `sqlx` queue read (no `cursor_column`) still has nothing to sequence by.
+    #[cfg(feature = "sqlx")]
+    #[test]
+    fn sqlx_is_a_replay_source_only_in_cursor_or_cdc_mode() {
+        let cursor = EndpointType::Sqlx(crate::models::SqlxConfig {
+            table: "orders".to_string(),
+            cursor_column: Some("id".to_string()),
+            ..Default::default()
+        });
+        assert!(supports_source_metadata(&cursor));
+
+        let queue = EndpointType::Sqlx(crate::models::SqlxConfig {
+            table: "orders".to_string(),
+            ..Default::default()
+        });
+        assert!(!supports_source_metadata(&queue));
+    }
+
     #[tokio::test]
     async fn idempotent_output_rejects_a_source_without_replay_position() {
         let result = create_consumer_from_route_with_source_metadata(
@@ -1969,7 +2081,7 @@ mod tests {
         };
         assert!(error
             .to_string()
-            .contains("requires a Kafka or Postgres CDC input"));
+            .contains("requires an input that carries a replay position"));
     }
 
     /// NATS emits `mqb.src.*` provenance but no replayable offset. The guard must reject it up
@@ -1992,7 +2104,7 @@ mod tests {
         };
         assert!(error
             .to_string()
-            .contains("requires a Kafka or Postgres CDC input"));
+            .contains("requires an input that carries a replay position"));
     }
 
     #[tokio::test]

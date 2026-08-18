@@ -5,7 +5,8 @@
 
 use crate::endpoints::{
     create_consumer_from_route, create_consumer_from_route_with_source_metadata,
-    create_publisher_from_route, output_requires_source_metadata,
+    create_publisher_from_route, output_has_write_ordered_object_store,
+    output_requires_source_metadata,
 };
 use crate::errors::ProcessingError;
 pub use crate::models::Route;
@@ -1312,6 +1313,16 @@ impl Route {
         drops: Option<&Arc<RwLock<DropReport>>>,
     ) -> anyhow::Result<bool> {
         let source_metadata_required = output_requires_source_metadata(name, &self.output)?;
+        if output_has_write_ordered_object_store(name, &self.output)? {
+            warn!(
+                route = name,
+                concurrency = self.options.concurrency,
+                "object_store sink names objects in write order, which this route's worker pool \
+                 makes arrival order rather than source order. Replaying a change stream through \
+                 the bucket can reorder updates to the same key. Set idempotency: true, or run \
+                 the route at concurrency: 1."
+            );
+        }
         let publisher = create_publisher_from_route(name, &self.output).await?;
         let mut consumer = create_consumer_from_route_with_source_metadata(
             name,

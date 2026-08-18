@@ -21,17 +21,26 @@ fn change_event_source_metadata_is_opt_in_and_orders_by_cluster_time() {
     })
     .expect("change event deserializes");
 
-    let off =
-        super::readers::MongoDbChangeStreamReader::event_to_message(&event, false, "shop.orders")
-            .expect("event carries a payload");
+    let ordinals = std::sync::Mutex::new(super::readers::OrdinalCounter::default());
+    let off = super::readers::MongoDbChangeStreamReader::event_to_message(
+        &event,
+        false,
+        "shop.orders",
+        &ordinals,
+    )
+    .expect("event carries a payload");
     assert!(!off
         .metadata
         .keys()
         .any(|key| crate::canonical_message::is_source_metadata_key(key)));
 
-    let on =
-        super::readers::MongoDbChangeStreamReader::event_to_message(&event, true, "shop.orders")
-            .expect("event carries a payload");
+    let on = super::readers::MongoDbChangeStreamReader::event_to_message(
+        &event,
+        true,
+        "shop.orders",
+        &ordinals,
+    )
+    .expect("event carries a payload");
     assert_eq!(
         on.metadata
             .get("mqb.src.mongodb_namespace")
@@ -46,6 +55,29 @@ fn change_event_source_metadata_is_opt_in_and_orders_by_cluster_time() {
         Some(((1_700_000_000u64 << 32) | 3).to_string()).as_deref()
     );
     assert!(on.metadata.contains_key("mqb.src.mongodb_resume_token"));
+    // First change seen at this cluster time.
+    assert_eq!(
+        on.metadata
+            .get("mqb.src.mongodb_ordinal")
+            .map(String::as_str),
+        Some("0")
+    );
+
+    // A second change in the same transaction gets the next ordinal, so an idempotent
+    // sink can name them as one contiguous range instead of colliding.
+    let next = super::readers::MongoDbChangeStreamReader::event_to_message(
+        &event,
+        true,
+        "shop.orders",
+        &ordinals,
+    )
+    .expect("event carries a payload");
+    assert_eq!(
+        next.metadata
+            .get("mqb.src.mongodb_ordinal")
+            .map(String::as_str),
+        Some("1")
+    );
 }
 
 #[test]
@@ -55,6 +87,7 @@ fn snapshot_source_metadata_uses_namespace_and_document_id() {
         &mut message,
         "shop.orders",
         &mongodb::bson::Bson::String("order-42".into()),
+        &std::sync::Mutex::new(super::readers::OrdinalCounter::default()),
     );
 
     assert_eq!(
@@ -70,6 +103,13 @@ fn snapshot_source_metadata_uses_namespace_and_document_id() {
             .get("mqb.src.mongodb_document_id")
             .map(String::as_str),
         Some("\"order-42\"")
+    );
+    assert_eq!(
+        message
+            .metadata
+            .get("mqb.src.mongodb_snapshot_index")
+            .map(String::as_str),
+        Some("0")
     );
 }
 

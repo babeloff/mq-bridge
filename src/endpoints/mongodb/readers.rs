@@ -340,7 +340,31 @@ pub struct MongoDbChangeStreamReader {
     source_metadata: bool,
     /// `<database>.<collection>`, precomputed for the `mqb.src.mongodb_namespace` key.
     namespace: String,
+    /// Contiguous positions an idempotent sink needs. Kept apart so the two phases cannot
+    /// share a sequence: snapshot documents are numbered within the scan, changes within
+    /// their cluster time.
+    snapshot_ordinals: Arc<Mutex<OrdinalCounter>>,
+    cdc_ordinals: Arc<Mutex<OrdinalCounter>>,
     exit_on_empty: bool,
+}
+
+/// Hands out consecutive ordinals within a group, restarting at 0 when the group changes.
+#[derive(Default)]
+pub(super) struct OrdinalCounter {
+    group: Option<u64>,
+    next: u64,
+}
+
+impl OrdinalCounter {
+    fn next_in(&mut self, group: u64) -> u64 {
+        if self.group != Some(group) {
+            self.group = Some(group);
+            self.next = 0;
+        }
+        let ordinal = self.next;
+        self.next += 1;
+        ordinal
+    }
 }
 
 impl MongoDbChangeStreamReader {
@@ -470,6 +494,8 @@ impl MongoDbChangeStreamReader {
             )),
             source_metadata,
             namespace: format!("{}.{}", config.database, collection_name),
+            snapshot_ordinals: Arc::new(Mutex::new(OrdinalCounter::default())),
+            cdc_ordinals: Arc::new(Mutex::new(OrdinalCounter::default())),
             exit_on_empty: false,
         })
     }
@@ -520,7 +546,12 @@ impl MongoDbChangeStreamReader {
                         msg.metadata.insert("mongodb.document_id".to_string(), enc);
                     }
                     if self.source_metadata {
-                        add_snapshot_source_metadata(&mut msg, &self.namespace, &id);
+                        add_snapshot_source_metadata(
+                            &mut msg,
+                            &self.namespace,
+                            &id,
+                            &self.snapshot_ordinals,
+                        );
                     }
                     messages.push(msg);
                     ids.push(id.clone());
@@ -578,6 +609,7 @@ impl MongoDbChangeStreamReader {
         event: &ChangeStreamEvent<Document>,
         source_metadata: bool,
         namespace: &str,
+        ordinals: &Mutex<OrdinalCounter>,
     ) -> Option<CanonicalMessage> {
         let (op, payload) = match event.operation_type {
             OperationType::Insert | OperationType::Update | OperationType::Replace => {
@@ -605,7 +637,7 @@ impl MongoDbChangeStreamReader {
             }
         }
         if source_metadata {
-            add_source_metadata(&mut msg, event, namespace);
+            add_source_metadata(&mut msg, event, namespace, ordinals);
         }
         Some(msg)
     }
@@ -691,23 +723,40 @@ fn add_source_metadata(
     message: &mut CanonicalMessage,
     event: &ChangeStreamEvent<Document>,
     namespace: &str,
+    ordinals: &Mutex<OrdinalCounter>,
 ) {
-    message.metadata.insert(
-        "mqb.src.mongodb_namespace".to_string(),
-        namespace.to_string(),
-    );
     if let Ok(token) = encode_resume_token(&event.id) {
         message
             .metadata
             .insert("mqb.src.mongodb_resume_token".to_string(), token);
     }
-    if let Some(ts) = event.cluster_time {
-        let packed = (u64::from(ts.time) << 32) | u64::from(ts.increment);
-        message.metadata.insert(
-            "mqb.src.mongodb_cluster_time".to_string(),
-            packed.to_string(),
+    let Some(ts) = event.cluster_time else {
+        // Without a cluster time the event has no orderable position. The namespace is left
+        // off as well: on its own it would select the sink's CDC path, which then fails the
+        // whole batch on the missing cluster time.
+        warn!(
+            "MongoDB change event has no clusterTime; omitting mqb.src.mongodb_* source position"
         );
-    }
+        return;
+    };
+    message.metadata.insert(
+        "mqb.src.mongodb_namespace".to_string(),
+        namespace.to_string(),
+    );
+    let packed = (u64::from(ts.time) << 32) | u64::from(ts.increment);
+    message.metadata.insert(
+        "mqb.src.mongodb_cluster_time".to_string(),
+        packed.to_string(),
+    );
+    // Every change in a transaction shares a cluster time; the ordinal separates them
+    // so an idempotent sink can name them as one contiguous range.
+    let ordinal = ordinals
+        .lock()
+        .expect("ordinal counter poisoned")
+        .next_in(packed);
+    message
+        .metadata
+        .insert("mqb.src.mongodb_ordinal".to_string(), ordinal.to_string());
 }
 
 /// Tags a snapshot document with the stable identity used when it is redelivered.
@@ -715,6 +764,7 @@ pub(super) fn add_snapshot_source_metadata(
     message: &mut CanonicalMessage,
     namespace: &str,
     id: &Bson,
+    ordinals: &Mutex<OrdinalCounter>,
 ) {
     message.metadata.insert(
         "mqb.src.mongodb_namespace".to_string(),
@@ -725,6 +775,17 @@ pub(super) fn add_snapshot_source_metadata(
             .metadata
             .insert("mqb.src.mongodb_document_id".to_string(), document_id);
     }
+    // The scan is ordered by ascending `_id`, so this index is deterministic: a restart
+    // re-scans from the start and reproduces the same names, which an idempotent sink skips.
+    // Group 0 — the whole snapshot is one sequence.
+    let index = ordinals
+        .lock()
+        .expect("ordinal counter poisoned")
+        .next_in(0);
+    message.metadata.insert(
+        "mqb.src.mongodb_snapshot_index".to_string(),
+        index.to_string(),
+    );
 }
 
 /// The change-event operation name stored in message metadata.
@@ -795,9 +856,12 @@ impl MessageConsumer for MongoDbChangeStreamReader {
             match poll {
                 Ok(Ok(Some(event))) => {
                     let token = event.id.clone();
-                    if let Some(msg) =
-                        Self::event_to_message(&event, self.source_metadata, &self.namespace)
-                    {
+                    if let Some(msg) = Self::event_to_message(
+                        &event,
+                        self.source_metadata,
+                        &self.namespace,
+                        &self.cdc_ordinals,
+                    ) {
                         messages.push(msg);
                         tokens.push(token);
                     }
@@ -832,9 +896,12 @@ impl MessageConsumer for MongoDbChangeStreamReader {
             match tokio::time::timeout(Duration::from_millis(10), stream.next_if_any()).await {
                 Ok(Ok(Some(event))) => {
                     let token = event.id.clone();
-                    if let Some(msg) =
-                        Self::event_to_message(&event, self.source_metadata, &self.namespace)
-                    {
+                    if let Some(msg) = Self::event_to_message(
+                        &event,
+                        self.source_metadata,
+                        &self.namespace,
+                        &self.cdc_ordinals,
+                    ) {
                         messages.push(msg);
                         tokens.push(token);
                     }

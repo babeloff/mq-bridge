@@ -22,7 +22,7 @@ sink writes data.
 | MongoDB | `id_field` set to a payload field or replay-stable template such as `${metadata:mqb.id}` |
 | PostgreSQL / SQLite | `sqlx.insert_query` uses a unique key with `ON CONFLICT` |
 | MySQL / MariaDB | `sqlx.insert_query` uses a unique key with `ON DUPLICATE KEY` |
-| File / object store | `idempotency: true` with a replayable Kafka or Postgres CDC source |
+| File / object store | `idempotency: true` with a replayable Kafka, Postgres CDC, SQL cursor, MongoDB CDC or file source |
 
 For a source without stable identity, derive one once and consume it at the sink:
 
@@ -143,7 +143,7 @@ one identity to every message missing the field, so it is dropped instead.
 | `mongodb` | Unique `_id` index; dup-key (11000) is treated as an idempotent success | `id_field` |
 | `sqlx` (PostgreSQL / MySQL / SQLite) | The table's own `UNIQUE`/`PRIMARY KEY` | `ON CONFLICT` / `ON DUPLICATE KEY` in `insert_query` |
 | `clickhouse` | `ReplacingMergeTree` collapses at merge time | Table DDL — no `mq-bridge` config |
-| `file`, `object_store` | Deterministic part names + covered-range recovery | `idempotency: true` (needs a replayable source) |
+| `file`, `object_store` | Deterministic, sortable part names + covered-range recovery | `idempotency: true` (needs a replayable source) |
 | `kafka` | `enable.idempotence` dedups **producer retries within one session** — this is *not* exactly-once semantics | On by default |
 | `nats`, `amqp`, `mqtt`, `redis_streams`, `aws`, `ibm_mq`, `zeromq` | None | Deduplicate at the next consumer instead |
 
@@ -359,6 +359,13 @@ but before the branch's downstream send committed, the replay hits a duplicate k
 
 ### Files & object storage — `idempotency`
 
+> **Check first whether you need any of this.** If your records already carry a business key — an
+> `id` field in the payload, or `mqb.id` from the [`id` middleware](#giving-a-source-an-identity) —
+> then a key-addressed sink (Mongo `id_field`, SQL `ON CONFLICT`) already gives you effective
+> exactly-once, and the order objects happen to land in does not matter. Positional naming below is
+> for the case where the *sink itself* has to recognise a replay, or where a downstream reader
+> depends on replay **order**. Turning it on when you do not need it only adds restrictions.
+
 A filesystem has no unique constraint, so the `file` and `object_store` sinks get replay safety a
 different way: **deterministic names plus covered-range recovery**. Set `idempotency: true` and the
 sink stops writing UUID-named objects. Instead it groups each batch into runs of consecutive source
@@ -371,7 +378,7 @@ kafka_to_s3:
   output:
     object_store:
       url: "s3://my-bucket/orders"
-      idempotency: true          # → s3://my-bucket/orders/part-orders-0-0-1023.jsonl
+      idempotency: true          # → part-orders-<partition>-<start>-<end>.jsonl (zero-padded)
 ```
 
 On startup the sink lists what is already there, parses the ranges out of the part names, and drops
@@ -381,13 +388,58 @@ checkpoint protocol. Local files stage to a temp name, `fsync`, then `rename` (a
 filesystem); object stores have no atomic rename, so a single PUT under the final name *is* the
 commit.
 
-This needs a replayable source position, which today means **Kafka** (topic/partition/offset) or
-**`postgres_cdc`** (commit LSN plus in-transaction ordinal; `sqlx` with `publication` maps onto the
-same consumer). A route with an idempotent output turns `source_metadata` on for its input
-automatically; set it explicitly only when you want the `mqb.src.*` keys for something else. Any
-other input is rejected when the route starts. NATS, AMQP and MongoDB CDC also accept
-`source_metadata` and emit provenance keys, but a subject or routing key is not a replayable offset,
-so they cannot drive an idempotent sink.
+This needs a replayable source position. Today that means:
+
+| Source | Position | Restriction |
+| --- | --- | --- |
+| `kafka` | topic / partition / offset | — |
+| `postgres_cdc` | commit LSN + in-transaction ordinal | `sqlx` with `publication` maps onto the same consumer |
+| `mongodb` | cluster time + ordinal; the initial snapshot uses its `_id` scan index | `capture_new` / `capture_all` only — `consumer` and `snapshot` have no position |
+| `file` | record index within the file | all modes; only `consume` deduplicates across runs (see below) |
+| `sqlx` | the `cursor_column` value | cursor polling only; the column must be a unique, non-negative integer |
+
+A route with an idempotent output turns `source_metadata` on for its input automatically; set it
+explicitly only when you want the `mqb.src.*` keys for something else. Any other input is rejected
+when the route starts. NATS and AMQP also accept `source_metadata` and emit provenance keys, but a
+subject or routing key is not a replayable offset, so they cannot drive an idempotent sink.
+
+**Without `idempotency: true`, an `object_store` sink names objects in write order**, and key order
+is the only order a bucket has. At `concurrency: 1` that is source order; above it the name is minted
+inside the worker pool, so it is arrival order, and replaying a change stream through the bucket can
+reorder updates to the same key. The route logs a warning when it starts in that configuration.
+
+**Numbers inside a part name are zero-padded** so that ASCII sort equals numeric sort — a bucket is
+listed lexicographically and that listing order *is* the replay order. A bucket written by a version
+before this padding contains unpadded names; the two forms do not sort correctly against each other,
+so do not mix them in one prefix.
+
+**MongoDB `capture_all`** reads the collection, then streams changes. Both phases are numbered into
+the key so the snapshot always sorts ahead of the changes; a change can never replay before the
+document it modifies. The snapshot does not resume across runs — it re-scans from the start — but the
+numbering is deterministic, so a restart reproduces the same names and the covered-range recovery
+skips them. The exception is inserts or deletes landing in the collection between the two runs: those
+shift the numbering, and some documents are then written twice.
+
+**The `sqlx` cursor source** uses the `cursor_column` value itself as the position — the same shape
+Kafka Connect's S3 sink gives a Kafka offset. That only works for a unique, non-negative integer
+column: a text cursor pages fine but has no contiguous numeric order, and a repeated value would
+resolve two rows to one position and drop one of them. The reader rejects both at read time rather
+than naming records wrongly. Consecutive ids coalesce into one part file; gaps split it.
+
+**The `file` source** numbers records by their index in the file, not their byte offset (byte offsets
+are not consecutive, so every record would become its own part).
+
+That index repeats across runs only in `consume` mode, which always reads from byte 0 — and repeating
+is the point: a re-read produces the same names, so the sink recognises them as already covered and
+writes nothing. `subscribe` starts at the current end of the file and `group_subscribe` resumes at a
+stored byte offset, so their index restarts at 0 over records an earlier run already numbered. Those
+two modes therefore carry a **run epoch** in the object name.
+
+The epoch keeps names distinct and keeps runs in order (a later run reads later records, so its
+objects sort after the earlier run's). What it does not give you is deduplication across a restart:
+records re-read after a crash are written again under new names. That is ordinary at-least-once, and
+it is the honest guarantee for a source with no durable per-record position — these modes are
+allowed, not rejected, because that guarantee is fine for plenty of pipelines.
 
 For the `file` sink, `idempotency: true` changes what `path` means: it is the directory that receives
 the part files, not the file that is appended to. The sink creates it on startup, so pointing it at an
