@@ -132,11 +132,20 @@ async fn recover_idempotent_object_ranges(
     let mut covered = CoveredRanges::default();
     let mut stream = store.list(Some(base));
     while let Some(meta) = stream.next().await {
-        let key = meta?.location.to_string();
-        let Some(name) = key.rsplit('/').next() else {
+        let location = meta?.location;
+        // The listing is recursive, but this sink writes its parts flat under `base`. A
+        // parseable name below a nested prefix is another sink's part, and counting it here
+        // would mark ranges covered that were never written to this prefix.
+        let Some(mut parts) = location.prefix_match(base) else {
             continue;
         };
-        if let Some((source, start, end)) = parse_finalized_name(name, extension) {
+        let Some(name) = parts.next() else {
+            continue;
+        };
+        if parts.next().is_some() {
+            continue;
+        }
+        if let Some((source, start, end)) = parse_finalized_name(name.as_ref(), extension) {
             // `parse_finalized_name` already guarantees a valid range.
             covered.insert(source, start, end)?;
         }
@@ -1264,6 +1273,44 @@ mod tests {
                 part_key(2, 2, "jsonl").to_string(),
             ]
         );
+    }
+
+    /// `list` is recursive, so a sink whose base is a *sub*prefix of ours shows up in our
+    /// listing with a perfectly parseable part name. Counting it would mark that range
+    /// covered here and silently drop the records that were never written under our prefix.
+    #[tokio::test]
+    async fn recovery_ignores_parseable_parts_under_a_nested_prefix() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let nested = ObjPath::from(format!(
+            "data/other/{}",
+            part_key(0, 1, "jsonl").filename().unwrap()
+        ));
+        store
+            .put(&nested, PutPayload::from("someone else's part"))
+            .await
+            .unwrap();
+
+        let base = ObjPath::from("data");
+        let covered = recover_idempotent_object_ranges(store.as_ref(), &base, "jsonl")
+            .await
+            .unwrap();
+
+        let mut publisher = test_publisher(store.clone());
+        publisher.idempotency = true;
+        publisher.covered_ranges = Arc::new(Mutex::new(covered));
+        publisher
+            .send_batch(vec![kafka_message(0), kafka_message(1)])
+            .await
+            .unwrap();
+
+        let written = store
+            .get(&part_key(0, 1, "jsonl"))
+            .await
+            .expect("the nested part must not count as coverage")
+            .bytes()
+            .await
+            .unwrap();
+        assert!(!written.is_empty());
     }
 
     #[tokio::test]
