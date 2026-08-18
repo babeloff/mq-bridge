@@ -1009,6 +1009,126 @@ async fn test_sqlx_multicolumn_batch() {
     }
 }
 
+// Regression (issue #71): a table written by the publisher with `auto_create_table` must be
+// readable by this library's own cursor reader. The generated DDL declares `locked_until`/
+// `created_at` as DATETIME, which the `Any` driver refuses to decode, so `SELECT *` failed the
+// whole read. The projection now casts those columns to TEXT.
+#[tokio::test]
+async fn test_sqlx_auto_created_table_is_cursor_readable() {
+    sqlx::any::install_default_drivers();
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("roundtrip.db");
+    let url = sqlite_url(&path);
+    drop(tokio::fs::File::create(&path).await.unwrap());
+
+    let config = SqlxConfig {
+        url: url.clone(),
+        table: "orders".to_string(),
+        auto_create_table: true,
+        ..Default::default()
+    };
+    let publisher = SqlxPublisher::new(&config).await.unwrap();
+    publisher
+        .send_batch(
+            (1..=3)
+                .map(|i| CanonicalMessage::new(format!("row{i}").into_bytes(), None))
+                .collect(),
+        )
+        .await
+        .unwrap();
+
+    let read_config = SqlxConfig {
+        url,
+        table: "orders".to_string(),
+        cursor_column: Some("id".to_string()),
+        ..Default::default()
+    };
+    let mut reader = SqlxCursorReader::new(&read_config).await.unwrap();
+    let batch = reader.receive_batch(10).await.unwrap();
+    assert_eq!(batch.messages.len(), 3);
+    let v: serde_json::Value = serde_json::from_slice(&batch.messages[0].payload).unwrap();
+    assert_eq!(v["id"], 1);
+    // The DATETIME columns survive as strings rather than aborting the read. `is_some()`
+    // alone would also pass on a JSON null, which is what a failed cast looks like.
+    assert!(
+        v["created_at"].as_str().is_some(),
+        "got {}",
+        v["created_at"]
+    );
+    assert!(v["locked_until"].is_null());
+}
+
+// A DATETIME cursor column is now readable on SQLite (the projection casts it to TEXT),
+// so the cursor value round-trips as text while `WHERE`/`ORDER BY` still compare the raw
+// column. Pin that resume neither skips nor re-emits rows.
+#[tokio::test]
+async fn test_sqlx_cursor_reader_datetime_cursor_column_resumes() {
+    sqlx::any::install_default_drivers();
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("dtcursor.db");
+    let url = sqlite_url(&path);
+    drop(tokio::fs::File::create(&path).await.unwrap());
+    let pool = AnyPool::connect(&url).await.unwrap();
+    sqlx::query("CREATE TABLE events (id INTEGER PRIMARY KEY, ts DATETIME, note TEXT)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    for (i, ts) in [
+        "2026-08-16 10:00:00",
+        "2026-08-16 10:00:01",
+        "2026-08-16 10:00:02",
+        "2026-08-16 10:00:03",
+    ]
+    .iter()
+    .enumerate()
+    {
+        sqlx::query("INSERT INTO events (id, ts, note) VALUES (?, ?, ?)")
+            .bind((i + 1) as i64)
+            .bind(*ts)
+            .bind(format!("n{i}"))
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    let config = SqlxConfig {
+        url,
+        table: "events".to_string(),
+        cursor_column: Some("ts".to_string()),
+        cursor_id: Some("dt-1".to_string()),
+        ..Default::default()
+    };
+    let mut reader = SqlxCursorReader::new(&config).await.unwrap();
+    let b1 = reader.receive_batch(2).await.unwrap();
+    assert_eq!(b1.messages.len(), 2);
+    (b1.commit)(vec![MessageDisposition::Ack; 2]).await.unwrap();
+
+    // Resume from the *checkpoint*, not the in-memory cursor: a text-encoded timestamp has
+    // to survive save/load/decode, which reading on through the same reader never exercises.
+    drop(reader);
+    let mut reader = SqlxCursorReader::new(&config).await.unwrap();
+    let b2 = reader.receive_batch(2).await.unwrap();
+    let notes: Vec<String> = b2
+        .messages
+        .iter()
+        .map(|m| {
+            serde_json::from_slice::<serde_json::Value>(&m.payload).unwrap()["note"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        })
+        .collect();
+    assert_eq!(
+        notes,
+        vec!["n2", "n3"],
+        "resume must continue, not repeat or skip"
+    );
+    (b2.commit)(vec![MessageDisposition::Ack; 2]).await.unwrap();
+
+    let b3 = reader.receive_batch(2).await.unwrap();
+    assert!(b3.messages.is_empty(), "drained");
+}
+
 #[tokio::test]
 async fn test_sqlx_auto_create_rejects_tokens() {
     let (_dir, url) = setup_db_file().await;
@@ -1250,4 +1370,113 @@ async fn embedded_nul_in_a_bound_value_is_rejected() {
         .await
         .unwrap();
     assert_eq!(count, 0, "the row must not land at all");
+}
+
+// --- `source_metadata`: the polling cursor as a replay position ---
+
+#[tokio::test]
+async fn test_sqlx_cursor_reader_stamps_source_positions() {
+    use crate::support::source_ranges::SourcePosition;
+
+    let (_dir, url, _pool) = setup_arbitrary_table(3).await;
+    let config = SqlxConfig {
+        url,
+        table: "orders".to_string(),
+        cursor_column: Some("id".to_string()),
+        source_metadata: true,
+        ..Default::default()
+    };
+    let mut reader = SqlxCursorReader::new(&config).await.unwrap();
+
+    let batch = reader.receive_batch(3).await.unwrap();
+    assert_eq!(batch.messages.len(), 3);
+    assert_eq!(
+        batch.messages[0].metadata.get("mqb.src.sqlx_table"),
+        Some(&"orders".to_string())
+    );
+
+    // The cursor value is the offset itself, so the rows form one contiguous run and an
+    // idempotent sink names them as a single object.
+    let positions: Vec<u64> = batch
+        .messages
+        .iter()
+        .map(|m| SourcePosition::from_message(m).unwrap().offset)
+        .collect();
+    assert_eq!(positions, vec![1, 2, 3]);
+}
+
+/// A repeated cursor value would resolve two rows to one source position, and the sink
+/// drops the second. Reading it is what fails, not the silent drop later.
+#[tokio::test]
+async fn test_sqlx_cursor_reader_rejects_non_unique_cursor_for_source_metadata() {
+    sqlx::any::install_default_drivers();
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("dup_meta.db");
+    let url = sqlite_url(&path);
+    drop(tokio::fs::File::create(&path).await.unwrap());
+    let pool = AnyPool::connect(&url).await.unwrap();
+    sqlx::query("CREATE TABLE events (id INTEGER PRIMARY KEY, ts INTEGER)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    for (id, ts) in [(1, 10), (2, 20), (3, 20)] {
+        sqlx::query("INSERT INTO events (id, ts) VALUES (?, ?)")
+            .bind(id)
+            .bind(ts)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    let config = SqlxConfig {
+        url,
+        table: "events".to_string(),
+        cursor_column: Some("ts".to_string()),
+        source_metadata: true,
+        ..Default::default()
+    };
+    let mut reader = SqlxCursorReader::new(&config).await.unwrap();
+
+    let err = reader.receive_batch(10).await.unwrap_err();
+    assert!(
+        matches!(err, ConsumerError::Permanent(_)),
+        "expected ConsumerError::Permanent, got {err:?}"
+    );
+    assert!(err.to_string().contains("unique"), "got: {err}");
+}
+
+/// A text cursor orders rows fine for paging but has no contiguous numeric position, so it
+/// cannot name an object range.
+#[tokio::test]
+async fn test_sqlx_cursor_reader_rejects_text_cursor_for_source_metadata() {
+    sqlx::any::install_default_drivers();
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("text_meta.db");
+    let url = sqlite_url(&path);
+    drop(tokio::fs::File::create(&path).await.unwrap());
+    let pool = AnyPool::connect(&url).await.unwrap();
+    sqlx::query("CREATE TABLE events (k TEXT PRIMARY KEY, v INTEGER)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO events (k, v) VALUES ('a', 1)")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let config = SqlxConfig {
+        url,
+        table: "events".to_string(),
+        cursor_column: Some("k".to_string()),
+        source_metadata: true,
+        ..Default::default()
+    };
+    let mut reader = SqlxCursorReader::new(&config).await.unwrap();
+
+    let err = reader.receive_batch(10).await.unwrap_err();
+    assert!(
+        matches!(err, ConsumerError::Permanent(_)),
+        "expected ConsumerError::Permanent, got {err:?}"
+    );
+    assert!(err.to_string().contains("integer"), "got: {err}");
 }

@@ -450,8 +450,8 @@ async fn idempotent_file_sink_replays_only_uncovered_kafka_offsets_after_restart
         names,
         vec![
             ".stage-inflight".to_string(),
-            "part-orders-0-0-1.jsonl".to_string(),
-            "part-orders-0-2-2.jsonl".to_string(),
+            "part-orders-0000000000-00000000000000000000-00000000000000000001.jsonl".to_string(),
+            "part-orders-0000000000-00000000000000000002-00000000000000000002.jsonl".to_string(),
         ]
     );
 }
@@ -489,7 +489,8 @@ async fn idempotent_file_parts_are_compressed_and_named_for_it() {
     drop(publisher);
 
     // One part file, named for the codec, holding one gzip member with both records.
-    let part = output.join("part-orders-0-0-1.jsonl.gz");
+    let part =
+        output.join("part-orders-0000000000-00000000000000000000-00000000000000000001.jsonl.gz");
     let raw = std::fs::read(&part).unwrap();
     let plain =
         crate::support::compression::decompress_all(crate::models::Compression::Gzip, &raw, None)
@@ -512,7 +513,12 @@ async fn idempotent_file_parts_are_compressed_and_named_for_it() {
         .unwrap()
         .map(|entry| entry.unwrap().file_name().into_string().unwrap())
         .collect::<Vec<_>>();
-    assert_eq!(names, vec!["part-orders-0-0-1.jsonl.gz".to_string()]);
+    assert_eq!(
+        names,
+        vec![
+            "part-orders-0000000000-00000000000000000000-00000000000000000001.jsonl.gz".to_string()
+        ]
+    );
 }
 
 #[tokio::test]
@@ -531,6 +537,157 @@ async fn idempotent_file_sink_rejects_records_without_source_metadata() {
         .await
         .is_err());
     assert!(std::fs::read_dir(output).unwrap().next().is_none());
+}
+
+#[tokio::test]
+async fn file_source_metadata_numbers_records_and_feeds_an_idempotent_sink() {
+    use crate::traits::MessageConsumer;
+
+    let dir = tempdir().unwrap();
+    let input = dir.path().join("orders.jsonl");
+    std::fs::write(&input, "{\"id\":1}\n{\"id\":2}\n{\"id\":3}\n").unwrap();
+
+    let source = FileConfig {
+        path: input.to_string_lossy().into_owned(),
+        source_metadata: true,
+        ..Default::default()
+    };
+    let mut consumer = FileConsumer::new(&source).await.unwrap();
+    let batch = consumer.receive_batch(10).await.unwrap();
+    assert_eq!(batch.messages.len(), 3);
+
+    // Records are numbered by index, not byte offset, so they stay consecutive.
+    let records = batch
+        .messages
+        .iter()
+        .map(|m| m.metadata.get("mqb.src.file_record").unwrap().as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(records, vec!["0", "1", "2"]);
+
+    // The whole batch lands as one part file covering records 0-2.
+    let output = dir.path().join("parts");
+    let sink = FileConfig {
+        path: output.to_string_lossy().into_owned(),
+        idempotency: true,
+        ..Default::default()
+    };
+    let publisher = FilePublisher::new(&sink).await.unwrap();
+    publisher.send_batch(batch.messages).await.unwrap();
+
+    let names = std::fs::read_dir(&output)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .filter(|name| !name.starts_with(".stage"))
+        .collect::<Vec<_>>();
+    assert_eq!(names.len(), 1, "one object per contiguous run: {names:?}");
+    assert!(
+        names[0].ends_with("-00000000000000000000-00000000000000000002.jsonl"),
+        "unexpected part name {}",
+        names[0]
+    );
+}
+
+#[tokio::test]
+async fn resuming_file_modes_get_a_run_epoch_so_reruns_cannot_reuse_a_record_index() {
+    use crate::support::source_ranges::SourcePosition;
+    use crate::traits::MessageConsumer;
+
+    let dir = tempdir().unwrap();
+    let input = dir.path().join("orders.jsonl");
+    std::fs::write(&input, "{\"id\":1}\n{\"id\":2}\n").unwrap();
+
+    let config = FileConfig {
+        path: input.to_string_lossy().into_owned(),
+        source_metadata: true,
+        mode: Some(FileConsumerMode::GroupSubscribe {
+            group_id: "g1".into(),
+            read_from_tail: false,
+        }),
+        ..Default::default()
+    };
+
+    // Allowed, not rejected: the setup is only weaker, not wrong.
+    let mut first = FileConsumer::new(&config).await.unwrap();
+    let batch = first.receive_batch(10).await.unwrap();
+    assert!(!batch.messages.is_empty());
+    let first_run = SourcePosition::from_message(&batch.messages[0]).unwrap();
+    assert!(batch.messages[0]
+        .metadata
+        .contains_key("mqb.src.file_epoch"));
+
+    // A second run restarts the record index at 0, so the epoch is what stops it from
+    // naming those records the same as the first run's and having them dropped.
+    let mut second = FileConsumer::new(&config).await.unwrap();
+    let batch = second.receive_batch(10).await.unwrap();
+    let second_run = SourcePosition::from_message(&batch.messages[0]).unwrap();
+
+    assert_ne!(first_run.source, second_run.source);
+    // A later run reads later records, so its objects must sort after the earlier run's.
+    assert!(first_run.source < second_run.source);
+}
+
+#[tokio::test]
+async fn run_epochs_are_distinct_for_consumers_created_in_the_same_millisecond() {
+    use crate::support::source_ranges::SourcePosition;
+
+    let dir = tempdir().unwrap();
+    let input = dir.path().join("orders.jsonl");
+    std::fs::write(&input, "{\"id\":1}\n").unwrap();
+
+    let config = FileConfig {
+        path: input.to_string_lossy().into_owned(),
+        source_metadata: true,
+        mode: Some(FileConsumerMode::GroupSubscribe {
+            group_id: "same-ms".into(),
+            read_from_tail: false,
+        }),
+        ..Default::default()
+    };
+
+    // No sleep between them: the epoch is allocated monotonically, not read off the clock.
+    let mut first = FileConsumer::new(&config).await.unwrap();
+    let mut second = FileConsumer::new(&config).await.unwrap();
+
+    let a = first.receive_batch(10).await.unwrap();
+    let b = second.receive_batch(10).await.unwrap();
+    let first_run = SourcePosition::from_message(&a.messages[0]).unwrap();
+    let second_run = SourcePosition::from_message(&b.messages[0]).unwrap();
+
+    assert!(
+        first_run.source < second_run.source,
+        "epochs must be distinct and increasing: {:?} vs {:?}",
+        first_run.source,
+        second_run.source
+    );
+}
+
+#[tokio::test]
+async fn consume_mode_repeats_its_record_identity_across_runs() {
+    use crate::support::source_ranges::SourcePosition;
+    use crate::traits::MessageConsumer;
+
+    let dir = tempdir().unwrap();
+    let input = dir.path().join("orders.jsonl");
+    std::fs::write(&input, "{\"id\":1}\n{\"id\":2}\n").unwrap();
+
+    let config = FileConfig {
+        path: input.to_string_lossy().into_owned(),
+        source_metadata: true,
+        ..Default::default()
+    };
+
+    let mut first = FileConsumer::new(&config).await.unwrap();
+    let a = first.receive_batch(10).await.unwrap();
+    let mut second = FileConsumer::new(&config).await.unwrap();
+    let b = second.receive_batch(10).await.unwrap();
+
+    // No epoch: re-reading the same file must produce the same names, which is exactly
+    // how the idempotent sink recognises the rewrite and skips it.
+    assert!(!a.messages[0].metadata.contains_key("mqb.src.file_epoch"));
+    assert_eq!(
+        SourcePosition::from_message(&a.messages[0]).unwrap(),
+        SourcePosition::from_message(&b.messages[0]).unwrap()
+    );
 }
 
 #[tokio::test]
@@ -578,8 +735,8 @@ async fn idempotent_file_sink_replays_postgres_cdc_changes_in_one_commit() {
     assert_eq!(
         names,
         vec![
-            "part-postgres_cdc-bridge_slot-9876543210-0-0-1.jsonl".to_string(),
-            "part-postgres_cdc-bridge_slot-9876543210-0-2-2.jsonl".to_string(),
+            "part-postgres_cdc-bridge_slot-00000000009876543210-0000000000-00000000000000000000-00000000000000000001.jsonl".to_string(),
+            "part-postgres_cdc-bridge_slot-00000000009876543210-0000000000-00000000000000000002-00000000000000000002.jsonl".to_string(),
         ]
     );
 }
@@ -911,6 +1068,100 @@ async fn test_file_consumer_subscribe_explicit_no_delete() {
 }
 
 use crate::models::{Endpoint, EndpointType, Route};
+
+// Regression (issue #71): the reporter's repro — 20 numbered rows, file -> file,
+// batch_size 5, concurrency 4 — used to emit whole batches out of source order
+// (e.g. 15..19 first). A file is an ordered log, so `FilePublisher` declares
+// `requires_ordered_publish()` and the route sequences the sends.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_route_file_to_file_preserves_order_at_concurrency() {
+    let dir = tempdir().unwrap();
+    let src = dir.path().join("rows.jsonl");
+    let dst = dir.path().join("out.jsonl");
+    let rows: String = (0..20).map(|i| format!("{i}\n")).collect();
+    tokio::fs::write(&src, rows.as_bytes()).await.unwrap();
+
+    let input = Endpoint::new(EndpointType::File(FileConfig {
+        path: src.to_str().unwrap().to_string(),
+        mode: Some(FileConsumerMode::Consume { delete: false }),
+        format: FileFormat::Raw,
+        ..Default::default()
+    }));
+    let output = Endpoint::new(EndpointType::File(FileConfig {
+        path: dst.to_str().unwrap().to_string(),
+        format: FileFormat::Raw,
+        ..Default::default()
+    }));
+    let route = Route::new(input, output)
+        .with_concurrency(4)
+        .with_batch_size(5)
+        .with_exit_on_empty(true);
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        route.run_until_err("file_order_regression", None, None),
+    )
+    .await
+    .expect("Route should drain and exit")
+    .expect("Route should complete without errors");
+
+    let content = tokio::fs::read_to_string(&dst).await.unwrap();
+    let written: Vec<&str> = content.lines().collect();
+    let expected: Vec<String> = (0..20).map(|i| i.to_string()).collect();
+    assert_eq!(written, expected, "File sink must preserve source order");
+}
+
+// A buffering publisher only returns from `send_batch` once its buffer flushed, so
+// sequencing sends must not let it wait for a batch that is itself waiting to be sent.
+// `max_delay_ms` guarantees the flush, but the interaction is worth pinning: this hangs
+// if the ordered path ever gates on something the sink needs first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_route_ordered_file_sink_with_buffer_does_not_stall() {
+    use crate::models::{BufferMiddleware, Middleware};
+
+    let dir = tempdir().unwrap();
+    let src = dir.path().join("buf_rows.jsonl");
+    let dst = dir.path().join("buf_out.jsonl");
+    let rows: String = (0..20).map(|i| format!("{i}\n")).collect();
+    tokio::fs::write(&src, rows.as_bytes()).await.unwrap();
+
+    let input = Endpoint::new(EndpointType::File(FileConfig {
+        path: src.to_str().unwrap().to_string(),
+        mode: Some(FileConsumerMode::Consume { delete: false }),
+        format: FileFormat::Raw,
+        ..Default::default()
+    }));
+    let mut output = Endpoint::new(EndpointType::File(FileConfig {
+        path: dst.to_str().unwrap().to_string(),
+        format: FileFormat::Raw,
+        ..Default::default()
+    }));
+    // Buffer larger than one batch, so every flush is timer-driven.
+    output
+        .middlewares
+        .push(Middleware::Buffer(BufferMiddleware {
+            max_messages: 50,
+            max_delay_ms: 20,
+        }));
+
+    let route = Route::new(input, output)
+        .with_concurrency(4)
+        .with_batch_size(5)
+        .with_exit_on_empty(true);
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        route.run_until_err("file_order_buffer", None, None),
+    )
+    .await
+    .expect("Ordered sends through a buffer must not stall")
+    .expect("Route should complete without errors");
+
+    let content = tokio::fs::read_to_string(&dst).await.unwrap();
+    let written: Vec<&str> = content.lines().collect();
+    let expected: Vec<String> = (0..20).map(|i| i.to_string()).collect();
+    assert_eq!(written, expected);
+}
 
 #[tokio::test]
 async fn test_route_file_consume_explicit_delete() {

@@ -1723,6 +1723,22 @@ fn mysql_data_type_is_any_safe(data_type: &str) -> bool {
     )
 }
 
+/// SQLite declared column types that sqlx maps to a `DataType` the `Any` driver rejects.
+/// sqlx-sqlite parses `sqlite3_column_decltype` with `DataType::from_str`, and only these exact
+/// spellings yield `Bool`/`Date`/`Time`/`Datetime` — everything else either maps to a supported
+/// type or fails to parse and falls back to the runtime value type, which is always safe.
+/// Notably this covers the `DATETIME` columns our own `auto_create_table` DDL emits.
+fn sqlite_decltype_is_any_safe(decl_type: &str) -> bool {
+    !matches!(
+        decl_type,
+        "boolean" | "bool" | "date" | "time" | "datetime" | "timestamp"
+    )
+}
+
+/// Binds are the table name and its schema (`main` unless the name was `schema.table`).
+const SQLITE_COLUMN_TYPES_SQL: &str =
+    "SELECT name AS name, LOWER(type) AS typname FROM pragma_table_info(?, ?) ORDER BY cid";
+
 /// `$1::regclass` resolves the (optionally schema-qualified) table name against the current
 /// search_path. `pg_attribute.attname`/`pg_type.typname` are Postgres `name`-typed columns,
 /// which `Any` cannot decode directly (distinct from `text`), so cast them explicitly.
@@ -1744,8 +1760,10 @@ const MYSQL_COLUMN_TYPES_SQL: &str = "SELECT COLUMN_NAME AS name, LOWER(DATA_TYP
 /// query on the first type it cannot map (`TIMESTAMPTZ` on Postgres, `DECIMAL`/`TIMESTAMP` on
 /// MySQL). We introspect the table's columns and cast every `Any`-incompatible column to a
 /// string type, so the copy succeeds (unmappable values arrive as strings) instead of failing
-/// every read forever. Any introspection failure (or an unsupported driver, e.g. SQLite, whose
-/// dynamic typing needs no cast) falls back to `*`, preserving the previous behaviour.
+/// every read forever. SQLite is affected too: its type info comes from the *declared* type, so
+/// a `DATETIME` column — including the ones `auto_create_table` writes — breaks the read.
+/// Any introspection failure (or an unsupported driver) falls back to `*`, preserving the
+/// previous behaviour.
 async fn build_cursor_projection(pool: &AnyPool, driver_name: &str, table: &str) -> String {
     type SafeFn = fn(&str) -> bool;
     type CastFn = fn(&str) -> String;
@@ -1770,6 +1788,21 @@ async fn build_cursor_projection(pool: &AnyPool, driver_name: &str, table: &str)
                 vec![schema, name],
                 mysql_data_type_is_any_safe,
                 |ident| format!("CAST({ident} AS CHAR) AS {ident}"),
+            )
+        }
+        "SQLite" => {
+            let (schema, name) = match table.split_once('.') {
+                Some((s, t)) => (
+                    s.trim_matches('"').to_string(),
+                    t.trim_matches('"').to_string(),
+                ),
+                None => ("main".to_string(), table.trim_matches('"').to_string()),
+            };
+            (
+                SQLITE_COLUMN_TYPES_SQL,
+                vec![name, schema],
+                sqlite_decltype_is_any_safe,
+                |ident| format!("CAST({ident} AS TEXT) AS {ident}"),
             )
         }
         _ => return "*".to_string(),
@@ -1950,6 +1983,7 @@ pub struct SqlxCursorReader {
     /// Page queries, built once: only the bound cursor and limit vary between polls.
     sql_first: String,
     sql_next: String,
+    source_metadata: bool,
 }
 
 /// Run one keyset page. `from` is the exclusive lower bound (`None` = start of table).
@@ -1971,6 +2005,13 @@ async fn fetch_page(
 
 impl SqlxCursorReader {
     pub async fn new(config: &SqlxConfig) -> anyhow::Result<Self> {
+        Self::new_with_source_metadata(config, config.source_metadata).await
+    }
+
+    pub async fn new_with_source_metadata(
+        config: &SqlxConfig,
+        source_metadata: bool,
+    ) -> anyhow::Result<Self> {
         sqlx::any::install_default_drivers();
         if config.delete_after_read {
             return Err(anyhow!(
@@ -2078,6 +2119,7 @@ impl SqlxCursorReader {
             ),
             checkpoint,
             last_value: Arc::new(Mutex::new(last_value)),
+            source_metadata,
         })
     }
 }
@@ -2089,6 +2131,46 @@ impl SqlxCursorReader {
         } else {
             &self.sql_first
         }
+    }
+
+    /// Stamp the replay position an idempotent sink names its objects from. The cursor value
+    /// *is* the position, so it has to be a unique non-negative integer: a text cursor has no
+    /// contiguous ordering, and a repeated value would make two rows resolve to the same
+    /// output record, silently dropping one. Rows arrive ordered, so ties are adjacent.
+    fn stamp_source_position(
+        &self,
+        message: &mut CanonicalMessage,
+        cursor: &SqlCursor,
+        previous: Option<&SqlCursor>,
+    ) -> Result<(), ConsumerError> {
+        let SqlCursor::Int(value) = cursor else {
+            return Err(ConsumerError::Permanent(anyhow!(
+                "source_metadata requires cursor_column '{}' to be an integer, but it read as \
+                 text. Point it at an integer key column, or CAST one in a view.",
+                self.cursor_column
+            )));
+        };
+        let value = u64::try_from(*value).map_err(|_| {
+            ConsumerError::Permanent(anyhow!(
+                "source_metadata requires cursor_column '{}' to be non-negative; got {value}.",
+                self.cursor_column
+            ))
+        })?;
+        if previous == Some(cursor) {
+            return Err(ConsumerError::Permanent(anyhow!(
+                "source_metadata requires cursor_column '{}' to be unique, but value {value} \
+                 repeats. Both rows would name the same output record and one would be dropped.",
+                self.cursor_column
+            )));
+        }
+
+        message
+            .metadata
+            .insert("mqb.src.sqlx_table".to_string(), self.table.clone());
+        message
+            .metadata
+            .insert("mqb.src.sqlx_cursor".to_string(), value.to_string());
+        Ok(())
     }
 }
 
@@ -2195,7 +2277,10 @@ impl MessageConsumer for SqlxCursorReader {
 
         let mut messages = Vec::with_capacity(fetched.len());
         let mut cursors: Vec<SqlCursor> = Vec::with_capacity(fetched.len());
-        for (cursor, msg) in fetched {
+        for (cursor, mut msg) in fetched {
+            if self.source_metadata {
+                self.stamp_source_position(&mut msg, &cursor, cursors.last())?;
+            }
             cursors.push(cursor.clone());
             messages.push(msg);
             // Advance optimistically so the next page continues past this row; rolled back

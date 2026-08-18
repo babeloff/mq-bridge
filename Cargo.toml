@@ -22,13 +22,13 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.4.1"
+version = "0.4.3"
 
 [workspace.dependencies]
 anyhow = "1.0"
 async-trait = "0.1"
 bytes = "1"
-fast-uuid-v7 = "0.1.8"
+fast-uuid-v7 = "0.1.9"
 serde = "1.0"
 serde_json = { version = "1.0", features = ["raw_value"] }
 serde_yaml_ng = "0.10"

@@ -1900,9 +1900,9 @@ dependencies = [
 
 [[package]]
 name = "fast-uuid-v7"
-version = "0.1.8"
+version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "65d7a30239eba18ae6a60dc3c3df98af18f00bba69d2b1d5f2816a831e83bff3"
+checksum = "dc759201eb9b09178fb2174087a451d19fd46a8b8b4f5f6103de83b9f5949f52"
 dependencies = [
  "rand 0.10.2",
 ]
@@ -3348,7 +3348,7 @@ dependencies = [
 
 [[package]]
 name = "mq-bridge"
-version = "0.4.1"
+version = "0.4.3"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -3431,7 +3431,7 @@ dependencies = [
 
 [[package]]
 name = "mq-bridge-bindings-common"
-version = "0.4.1"
+version = "0.4.3"
 dependencies = [
  "anyhow",
  "fast-uuid-v7",
@@ -3445,7 +3445,7 @@ dependencies = [
 
 [[package]]
 name = "mq-bridge-node"
-version = "0.4.1"
+version = "0.4.3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3487,7 +3487,7 @@ dependencies = [
 
 [[package]]
 name = "mq-bridge-py"
-version = "0.4.1"
+version = "0.4.3"
 dependencies = [
  "anyhow",
  "async-trait",

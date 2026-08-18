@@ -91,6 +91,10 @@ impl MessagePublisher for DelayPublisher {
         self.inner.send_batch(messages).await
     }
 
+    fn requires_ordered_publish(&self) -> bool {
+        self.inner.requires_ordered_publish()
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }

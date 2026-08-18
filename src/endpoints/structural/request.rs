@@ -99,6 +99,10 @@ impl MessagePublisher for RequestForwardPublisher {
         self.request.status().await
     }
 
+    fn requires_ordered_publish(&self) -> bool {
+        self.request.requires_ordered_publish() || self.forward.requires_ordered_publish()
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }

@@ -5,7 +5,8 @@
 
 use crate::endpoints::{
     create_consumer_from_route, create_consumer_from_route_with_source_metadata,
-    create_publisher_from_route, output_requires_source_metadata,
+    create_publisher_from_route, output_has_write_ordered_object_store,
+    output_requires_source_metadata,
 };
 use crate::errors::ProcessingError;
 pub use crate::models::Route;
@@ -41,6 +42,12 @@ pub use crate::extensions::{
 pub enum RouteOutcome {
     /// The source drained and the route exited on its own — `exit_on_empty`
     /// or an exhausted stream. The job succeeded.
+    ///
+    /// "Completed" describes the *route*, not the data: a run whose sink rejected
+    /// messages permanently with no `dlq` middleware configured still completes, with
+    /// the dropped count and cause reported in [`EndpointStatus::error`] via
+    /// [`RouteHandle::status`]. A caller that must distinguish a clean run from a
+    /// dirty one has to read that field too.
     Completed,
     /// Terminated by an explicit `stop()` or shutdown signal.
     Stopped,
@@ -437,11 +444,26 @@ async fn send_batch_and_commit(
     commit_tasks: &mut JoinSet<()>,
     scratch: &mut BatchScratch,
     drops: Option<&Arc<RwLock<DropReport>>>,
+    ticket: Option<OrderTicket>,
 ) -> anyhow::Result<()> {
     let batch_len = messages.len();
     scratch.fill_from(&messages);
 
-    match publisher.send_batch(messages).await {
+    // An order-sensitive sink admits one send at a time, in source order. Everything
+    // above and below this call stays concurrent.
+    let sent = {
+        let _release = match ticket {
+            Some(mut ticket) => {
+                if let Some(prev) = ticket.prev.take() {
+                    let _ = prev.await;
+                }
+                Some(ticket)
+            }
+            None => None,
+        };
+        publisher.send_batch(messages).await
+    };
+    match sent {
         Ok(SentBatch::Ack) => {
             for id in scratch.message_ids.iter() {
                 if scratch.request_ids.contains(id) {
@@ -1241,6 +1263,8 @@ impl Route {
                         &mut commit_tasks,
                         &mut batch_scratch,
                         drops,
+                        // The sequential runner sends one batch at a time already.
+                        None,
                     )
                     .await
                     {
@@ -1289,6 +1313,16 @@ impl Route {
         drops: Option<&Arc<RwLock<DropReport>>>,
     ) -> anyhow::Result<bool> {
         let source_metadata_required = output_requires_source_metadata(name, &self.output)?;
+        if output_has_write_ordered_object_store(name, &self.output)? {
+            warn!(
+                route = name,
+                concurrency = self.options.concurrency,
+                "object_store sink names objects in write order, which this route's worker pool \
+                 makes arrival order rather than source order. Replaying a change stream through \
+                 the bucket can reorder updates to the same key. Set idempotency: true, or run \
+                 the route at concurrency: 1."
+            );
+        }
         let publisher = create_publisher_from_route(name, &self.output).await?;
         let mut consumer = create_consumer_from_route_with_source_metadata(
             name,
@@ -1310,10 +1344,28 @@ impl Route {
             let _ = tx.send(()).await;
         }
         let (err_tx, err_rx) = bounded(1); // For critical, route-stopping errors
-                                           // channel capacity is measured in batches, not messages
+
+        // --- Publish Dispatch ---
+        // Workers normally send concurrently, which lets whole batches reach the sink out of
+        // source order. A sink that is an ordered log (the file sink) declares
+        // `requires_ordered_publish()` and gets a per-batch [`OrderTicket`] instead, which
+        // sequences the `send_batch` call itself. Only that call: batch prep, disposition
+        // mapping and commits still run across the whole pool, which is why an ordered
+        // route measures within noise of an unordered one.
+        let ordered_publish = publisher.requires_ordered_publish();
+        if ordered_publish {
+            debug!(
+                "Route '{}' publishes to an order-sensitive sink: sends are sequenced.",
+                name
+            );
+        }
+        // channel capacity is measured in batches, not messages
         let work_capacity = self.options.concurrency;
-        let (work_tx, work_rx) =
-            bounded::<(Vec<crate::CanonicalMessage>, BatchCommitFunc)>(work_capacity);
+        let (work_tx, work_rx) = bounded::<(
+            Vec<crate::CanonicalMessage>,
+            BatchCommitFunc,
+            Option<OrderTicket>,
+        )>(work_capacity);
         // --- Commit Dispatch ---
         // Cumulative-ack brokers (Kafka/AMQP) must commit in order, so their commits
         // are funnelled through a single sequencer to prevent data loss. Individual-ack
@@ -1343,7 +1395,7 @@ impl Route {
                 debug!("Starting worker {}", i);
                 let mut batch_scratch = BatchScratch::with_capacity(batch_size);
                 let mut since_yield = 0usize;
-                while let Ok((messages, commit_func)) = work_rx_clone.recv().await {
+                while let Ok((messages, commit_func, ticket)) = work_rx_clone.recv().await {
                     let batch_len = messages.len();
                     if let Err(err) = send_batch_and_commit(
                         &publisher,
@@ -1356,6 +1408,7 @@ impl Route {
                         &mut commit_tasks,
                         &mut batch_scratch,
                         drops.as_ref(),
+                        ticket,
                     )
                     .await
                     {
@@ -1376,6 +1429,9 @@ impl Route {
         }
 
         let mut seq_counter = 0u64;
+        // Tail of the publish-ordering chain: what the *next* batch waits on. `None`
+        // while the sink tolerates unordered sends.
+        let mut prev_publish: Option<tokio::sync::oneshot::Receiver<()>> = None;
         // Messages enqueued to workers since the last cooperative yield (see YIELD_EVERY_MSGS).
         let mut since_yield = 0usize;
         // Holds an error that caused the loop to break, to be returned after graceful shutdown.
@@ -1456,16 +1512,26 @@ impl Route {
                     let seq = seq_counter;
                     let batch_len = messages.len();
                     let wrapped_commit = commit_router.wrap(commit, seq);
+                    let ticket = ordered_publish.then(|| {
+                        let (release, next_prev) = tokio::sync::oneshot::channel();
+                        let ticket = OrderTicket {
+                            prev: prev_publish.take(),
+                            _release: release,
+                        };
+                        prev_publish = Some(next_prev);
+                        ticket
+                    });
 
-                    match work_tx.send((messages, wrapped_commit)).await {
+                    match work_tx.send((messages, wrapped_commit, ticket)).await {
                         Ok(()) => {
                             seq_counter += 1;
                         }
                         Err(e) => {
                             warn!("Work channel closed, cannot process more messages concurrently. Shutting down.");
                             // Recover the moved tuple so we can invoke the wrapped commit
-                            // and resolve the batch with a NACK.
-                            let (msgs_back, wrapped_commit_back) = e.into_inner();
+                            // and resolve the batch with a NACK. Dropping the ticket
+                            // releases whatever batch is queued behind this one.
+                            let (msgs_back, wrapped_commit_back, _) = e.into_inner();
                             let _ = (wrapped_commit_back)(vec![crate::traits::MessageDisposition::Nack; msgs_back.len()]).await;
                             break;
                         }
@@ -1721,6 +1787,16 @@ fn wrap_commit(
             }
         })
     })
+}
+
+/// Hands the right to call `send_batch` from one batch to the next when the sink
+/// declares [`MessagePublisher::requires_ordered_publish`]. `prev` resolves once the
+/// preceding batch's send returned (or its worker went away); dropping `_release` lets
+/// the batch behind it in. Only the `send_batch` call is serialised — per-batch prep,
+/// disposition mapping and commits still run concurrently across the worker pool.
+struct OrderTicket {
+    prev: Option<tokio::sync::oneshot::Receiver<()>>,
+    _release: tokio::sync::oneshot::Sender<()>,
 }
 
 /// Routes batch commits either through the ordered sequencer (cumulative-ack
@@ -2245,6 +2321,158 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_concurrent_route_commits_are_ordered_and_non_overlapping() {
         assert_route_commits_are_ordered_and_non_overlapping(4).await;
+    }
+
+    #[derive(Debug, Default)]
+    struct PublishObservation {
+        /// Batch sequence numbers in the order their `send_batch` completed.
+        arrived: Mutex<Vec<u64>>,
+        active: std::sync::atomic::AtomicUsize,
+        max_active: std::sync::atomic::AtomicUsize,
+    }
+
+    #[derive(Debug)]
+    struct OrderedPublishMiddlewareFactory {
+        observation: Arc<PublishObservation>,
+        /// Drives the wrapped publisher's `requires_ordered_publish()`, so one factory
+        /// exercises both an order-sensitive sink (file, object_store) and a plain one.
+        requires_order: bool,
+    }
+
+    struct OrderedPublishTracker {
+        inner: Box<dyn MessagePublisher>,
+        observation: Arc<PublishObservation>,
+        requires_order: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl CustomMiddlewareFactory for OrderedPublishMiddlewareFactory {
+        async fn apply_publisher(
+            &self,
+            publisher: Box<dyn MessagePublisher>,
+            _route_name: &str,
+            _config: &serde_json::Value,
+        ) -> anyhow::Result<Box<dyn MessagePublisher>> {
+            Ok(Box::new(OrderedPublishTracker {
+                inner: publisher,
+                observation: Arc::clone(&self.observation),
+                requires_order: self.requires_order,
+            }))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl MessagePublisher for OrderedPublishTracker {
+        fn requires_ordered_publish(&self) -> bool {
+            self.requires_order
+        }
+
+        async fn send_batch(
+            &self,
+            messages: Vec<crate::CanonicalMessage>,
+        ) -> Result<SentBatch, PublisherError> {
+            let seq = messages
+                .first()
+                .and_then(|message| message.get_payload_str().parse::<u64>().ok())
+                .expect("tracking test expects numeric payloads");
+            let active_now = self.observation.active.fetch_add(1, Ordering::SeqCst) + 1;
+            let _ = self.observation.max_active.fetch_update(
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+                |current| (active_now > current).then_some(active_now),
+            );
+            // Later batches are faster, so unsequenced sends land in reverse order.
+            tokio::time::sleep(Duration::from_millis(
+                10 * (6u64.saturating_sub(seq.min(6))),
+            ))
+            .await;
+            let result = self.inner.send_batch(messages).await;
+            self.observation.arrived.lock().unwrap().push(seq);
+            self.observation.active.fetch_sub(1, Ordering::SeqCst);
+            result
+        }
+
+        async fn flush(&self) -> anyhow::Result<()> {
+            self.inner.flush().await
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    async fn run_publish_order_route(requires_order: bool) -> Arc<PublishObservation> {
+        let unique_id = fast_uuid_v7::gen_id().to_string();
+        let tracking_name = format!("track_publish_{}", unique_id);
+        let in_topic = format!("publish_order_in_{}", unique_id);
+        let observation = Arc::new(PublishObservation::default());
+
+        register_middleware_factory(
+            &tracking_name,
+            Arc::new(OrderedPublishMiddlewareFactory {
+                observation: Arc::clone(&observation),
+                requires_order,
+            }),
+        )
+        .unwrap();
+
+        let input = Endpoint::new_memory(&in_topic, 32);
+        let output = Endpoint::new(EndpointType::Null).add_middleware(Middleware::Custom {
+            name: tracking_name,
+            config: serde_json::Value::Null,
+        });
+
+        let route = Route::new(input.clone(), output)
+            .with_concurrency(4)
+            .with_batch_size(1);
+
+        let input_channel = input.channel().unwrap();
+        let messages = (0..6)
+            .map(|seq| crate::CanonicalMessage::from(seq.to_string()))
+            .collect();
+        input_channel.fill_messages(messages).await.unwrap();
+        input_channel.close();
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            route.run_until_err("publish_order_test", None, None),
+        )
+        .await
+        .expect("Route should not hang while draining finite input")
+        .expect("Route should complete without errors");
+
+        observation
+    }
+
+    // Regression (issue #71): with `concurrency > 1` the workers used to call `send_batch`
+    // in parallel, so whole batches reached the sink out of source order — silently
+    // shuffling a file/object_store export. A sink that declares
+    // `requires_ordered_publish()` now gets its sends sequenced.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_order_sensitive_sink_receives_batches_in_source_order() {
+        let observation = run_publish_order_route(true).await;
+
+        assert_eq!(
+            *observation.arrived.lock().unwrap(),
+            vec![0, 1, 2, 3, 4, 5],
+            "An order-sensitive sink must see batches in source order",
+        );
+        assert_eq!(
+            observation.max_active.load(Ordering::SeqCst),
+            1,
+            "Sequenced sends must never overlap",
+        );
+    }
+
+    // The default stays unordered so concurrent sinks keep their throughput: batches may
+    // arrive in any order, but every one of them must arrive exactly once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_unordered_sink_still_receives_every_batch() {
+        let observation = run_publish_order_route(false).await;
+
+        let mut arrived = observation.arrived.lock().unwrap().clone();
+        arrived.sort_unstable();
+        assert_eq!(arrived, vec![0, 1, 2, 3, 4, 5]);
     }
 
     /// Drives a route whose consumer reports `commit_requires_order() == false`
