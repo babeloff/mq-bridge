@@ -9,9 +9,17 @@
 //! - **Sink** ([`ObjectStorePublisher`]): each flushed batch is encoded (reusing the
 //!   file endpoint's [`FileFormat`] codecs) and written as one immutable object at
 //!   `<prefix>/[YYYY/MM/DD/]<uuidv7>.<ext>`. Objects are write-once; nothing is appended
-//!   or mutated. The uuidv7 name sorts by write time to *millisecond* granularity only —
-//!   `rand_a`/`rand_b` are random, so objects written within the same millisecond sort in
-//!   arbitrary order. The date prefix is a readability / lifecycle-rule convenience only.
+//!   or mutated. The date prefix is a readability / lifecycle-rule convenience only.
+//!
+//!   **Object order holds only at `concurrency: 1`.** Lexicographic key order is the only
+//!   ordering a bucket offers. The keys are strictly increasing per publisher, so a
+//!   sequential route writes them in source order — but the key is minted inside
+//!   `send_batch`, which the worker pool runs concurrently, so above `concurrency: 1` mint
+//!   order is worker arrival order. Replaying a CDC stream through such a bucket can then
+//!   reorder UPDATE/DELETE events on the same key and yield a silently wrong final state.
+//!   Set `idempotency: true` to get source-sequenced names
+//!   (`part-<topic>-<partition>-<start>-<end>.<ext>`, zero-padded) for sources that stamp a
+//!   position; those sort by source position regardless of write order, at any concurrency.
 //! - **Source** ([`ObjectStoreConsumer`]): objects under `prefix` are listed in key order,
 //!   fetched whole, split by `delimiter`, and emitted. Progress is a durable cursor holding
 //!   the last fully-acked object key (via the external checkpoint store), so a restart
@@ -31,13 +39,14 @@ use crate::traits::{
 use crate::CanonicalMessage;
 use anyhow::{anyhow, Context};
 use async_trait::async_trait;
+use fast_uuid_v7::SequentialGenerator;
 use futures::StreamExt;
 use object_store::{
     path::Path as ObjPath, Error as ObjectStoreError, ObjectStore, ObjectStoreExt, PutMode,
     PutOptions, PutPayload,
 };
 use std::any::Any;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 use tokio::sync::Mutex;
 use tracing::{debug, info, trace, warn};
@@ -199,6 +208,9 @@ pub struct ObjectStorePublisher {
     extension: String,
     idempotency: bool,
     covered_ranges: Arc<Mutex<CoveredRanges>>,
+    // Shared across clones on purpose: the ordering guarantee is per generator instance, so
+    // two independent generators would hand out interleaved keys.
+    keys: Arc<StdMutex<SequentialGenerator>>,
 }
 
 impl ObjectStorePublisher {
@@ -252,16 +264,24 @@ impl ObjectStorePublisher {
             extension,
             idempotency: config.idempotency,
             covered_ranges: Arc::new(Mutex::new(covered_ranges)),
+            keys: Arc::new(StdMutex::new(SequentialGenerator::new())),
         })
     }
 
     /// Object key for the next write: `<prefix>/[YYYY/MM/DD/]<uuidv7>.<ext>`.
     ///
-    /// The uuidv7 name already sorts by write time; the optional date prefix is derived
+    /// The ids are strictly increasing per publisher, so key order is allocation order even
+    /// for objects written within the same millisecond. The optional date prefix is derived
     /// from that same id's embedded millisecond timestamp (no wall-clock dependency), so
-    /// the folder and the name can never disagree.
+    /// the folder and the name can never disagree. A backwards clock jump therefore keeps
+    /// writing under the pre-jump date until the clock catches up, rather than breaking the
+    /// key ordering.
     fn next_key(&self) -> ObjPath {
-        let id = fast_uuid_v7::gen_id();
+        let id = self
+            .keys
+            .lock()
+            .expect("Object-store key generator mutex poisoned")
+            .next_id();
         let name = format!("{}.{}", fast_uuid_v7::format_uuid(id), self.extension);
         if self.date_partition {
             // Top 48 bits of a uuidv7 are the Unix-epoch millisecond timestamp.
@@ -419,10 +439,10 @@ impl MessagePublisher for ObjectStorePublisher {
         Ok(())
     }
 
-    // Deliberately *not* declaring `requires_ordered_publish()`. Unlike the file sink, read
-    // order here is key order, and `next_key` randomises everything below the millisecond, so
-    // sequencing the writes would cost a latency-bound sink its concurrency without buying an
-    // ordering guarantee. Ordered cloud export needs a source-sequenced key first.
+    // Deliberately *not* declaring `requires_ordered_publish()`. Read order here is key order
+    // and `next_key` now hands out strictly increasing keys, but it allocates them inside
+    // `send_batch`, so at concurrency > 1 that order is worker arrival, not source order.
+    // Ordered cloud export needs the key allocated while the batches are still sequenced.
 
     fn as_any(&self) -> &dyn Any {
         self
@@ -861,8 +881,22 @@ impl MessageConsumer for ObjectStoreConsumer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::support::source_ranges::SourcePartition;
     use crate::traits::{MessageConsumer, MessagePublisher};
     use object_store::memory::InMemory;
+
+    /// Key an idempotent write lands on, derived rather than spelled out: the part-name
+    /// format is pinned by the `source_ranges` tests, not by these.
+    fn part_key(start: u64, end: u64, extension: &str) -> ObjPath {
+        let source = SourcePartition {
+            topic: "orders".to_string(),
+            partition: 0,
+        };
+        ObjPath::from(format!(
+            "data/{}",
+            finalized_name(&source, start, end, extension).unwrap()
+        ))
+    }
 
     #[test]
     fn checkpoint_overlap_detection() {
@@ -944,7 +978,22 @@ mod tests {
             extension: "jsonl".to_string(),
             idempotency: false,
             covered_ranges: Arc::new(Mutex::new(CoveredRanges::default())),
+            keys: Arc::new(StdMutex::new(SequentialGenerator::new())),
         }
+    }
+
+    #[test]
+    fn object_keys_sort_in_allocation_order_across_clones() {
+        let publisher = test_publisher(Arc::new(InMemory::new()));
+        let clone = publisher.clone();
+        let keys: Vec<String> = (0..1000)
+            .map(|i| {
+                if i % 2 == 0 { &publisher } else { &clone }
+                    .next_key()
+                    .to_string()
+            })
+            .collect();
+        assert!(keys.windows(2).all(|pair| pair[0] < pair[1]));
     }
 
     fn kafka_message(offset: i64) -> CanonicalMessage {
@@ -959,6 +1008,55 @@ mod tests {
             .metadata
             .insert("mqb.src.kafka_offset".into(), offset.to_string());
         message
+    }
+
+    /// The guarantee the idempotent sink exists to make, and the one the whole ordering
+    /// thread turns on: object order is *source* order even when batches are written
+    /// concurrently and out of order. Dispatches the batches in reverse and lets them race,
+    /// which is what the worker pool does to source order above `concurrency: 1`.
+    #[tokio::test]
+    async fn idempotent_objects_replay_in_source_order_when_written_concurrently() {
+        const BATCHES: i64 = 10;
+
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let mut publisher = test_publisher(store.clone());
+        publisher.idempotency = true;
+        // Raw writes the payload verbatim, so a record read back is the source row itself.
+        publisher.format = FileFormat::Raw;
+
+        let mut writes = tokio::task::JoinSet::new();
+        for batch in (0..BATCHES).rev() {
+            let publisher = publisher.clone();
+            writes.spawn(async move {
+                let base = batch * 2;
+                publisher
+                    .send_batch(vec![kafka_message(base), kafka_message(base + 1)])
+                    .await
+            });
+        }
+        while let Some(joined) = writes.join_next().await {
+            joined.unwrap().unwrap();
+        }
+
+        // Lexicographic listing is the only ordering a bucket offers, so that is what a
+        // reader gets and what this has to reproduce.
+        let mut stream = store.list(Some(&ObjPath::from("data")));
+        let mut names = Vec::new();
+        while let Some(item) = stream.next().await {
+            names.push(item.unwrap().location);
+        }
+        names.sort();
+        assert_eq!(names.len(), BATCHES as usize, "one part file per batch");
+
+        let mut replayed = Vec::new();
+        for name in &names {
+            let bytes = store.get(name).await.unwrap().bytes().await.unwrap();
+            for record in split_records(&bytes, b"\n") {
+                let value: serde_json::Value = serde_json::from_slice(record).unwrap();
+                replayed.push(value["offset"].as_i64().unwrap());
+            }
+        }
+        assert_eq!(replayed, (0..BATCHES * 2).collect::<Vec<_>>());
     }
 
     #[tokio::test]
@@ -1005,8 +1103,8 @@ mod tests {
             vec![
                 // Not a parseable part name, and not ours to delete.
                 "data/.stage-crash".to_string(),
-                "data/part-orders-0-0-1.jsonl".to_string(),
-                "data/part-orders-0-2-2.jsonl".to_string(),
+                part_key(0, 1, "jsonl").to_string(),
+                part_key(2, 2, "jsonl").to_string(),
             ]
         );
     }
@@ -1014,7 +1112,7 @@ mod tests {
     #[tokio::test]
     async fn idempotent_sink_does_not_overwrite_an_existing_range_object() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let key = ObjPath::from("data/part-orders-0-0-1.jsonl");
+        let key = part_key(0, 1, "jsonl");
         store
             .put(&key, PutPayload::from("already committed"))
             .await
@@ -1059,7 +1157,7 @@ mod tests {
             .unwrap();
 
         // The part name advertises the codec, and the bytes really are gzip.
-        let key = ObjPath::from("data/part-orders-0-0-1.jsonl.gz");
+        let key = part_key(0, 1, "jsonl.gz");
         let stored = store.get(&key).await.unwrap().bytes().await.unwrap();
         let plain =
             crate::support::compression::decompress_all(Compression::Gzip, &stored, None).unwrap();
@@ -1085,7 +1183,7 @@ mod tests {
         while let Some(item) = stream.next().await {
             names.push(item.unwrap().location.to_string());
         }
-        assert_eq!(names, vec!["data/part-orders-0-0-1.jsonl.gz".to_string()]);
+        assert_eq!(names, vec![part_key(0, 1, "jsonl.gz").to_string()]);
     }
 
     #[cfg(feature = "compression")]

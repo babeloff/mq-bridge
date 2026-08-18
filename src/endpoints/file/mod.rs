@@ -2013,6 +2013,13 @@ pub struct FileConsumer {
     /// A live tail keeps waiting for the file to appear; a drain (`exit_on_empty`)
     /// cannot, so it fails with this instead of blocking forever.
     startup_open_error: Option<String>,
+    /// Stamp `mqb.src.file_*` so an idempotent sink can name records in source order.
+    source_metadata: bool,
+    /// Index of the next record in this file.
+    next_record: u64,
+    /// Set only for the modes that do not start at byte 0, so their record indexes cannot
+    /// collide with a previous run's. `None` for `consume`, whose names must repeat.
+    run_epoch: Option<u64>,
     exit_on_empty: bool,
 }
 
@@ -2022,6 +2029,9 @@ impl FileConsumer {
             backend,
             path: String::new(),
             startup_open_error: None,
+            source_metadata: false,
+            next_record: 0,
+            run_epoch: None,
             exit_on_empty: false,
         }
     }
@@ -2031,6 +2041,22 @@ impl FileConsumer {
         let mut consumer = Self::new_backend(config).await?;
         consumer.path = config.path.clone();
         consumer.startup_open_error = startup_open_error;
+        consumer.source_metadata = config.source_metadata;
+        // `consume` always reads from byte 0, so its record index is reproducible and two
+        // runs deliberately produce the same names — that is what makes the sink idempotent.
+        // `subscribe` starts at the current end and `group_subscribe` resumes at a stored
+        // byte offset, so their index restarts at 0 over records a previous run already
+        // numbered. Without an epoch those names would collide and the sink would discard
+        // the new records as already-covered; with one they stay distinct and ordered, at
+        // the cost of cross-restart deduplication.
+        consumer.run_epoch = (config.source_metadata
+            && !matches!(&config.mode, None | Some(FileConsumerMode::Consume { .. })))
+        .then(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0)
+        });
         Ok(consumer)
     }
 
@@ -2344,6 +2370,37 @@ impl MessageConsumer for FileConsumer {
     // a cumulative byte offset (the max acked `file_offset`), so out-of-order
     // commits could advance the offset past un-acked messages and lose them.
     async fn receive_batch(&mut self, max_messages: usize) -> Result<ReceivedBatch, ConsumerError> {
+        let mut batch = self.receive_batch_inner(max_messages).await?;
+        if self.source_metadata {
+            for message in &mut batch.messages {
+                message
+                    .metadata
+                    .insert("mqb.src.file_path".to_string(), self.path.clone());
+                message.metadata.insert(
+                    "mqb.src.file_record".to_string(),
+                    self.next_record.to_string(),
+                );
+                if let Some(epoch) = self.run_epoch {
+                    message
+                        .metadata
+                        .insert("mqb.src.file_epoch".to_string(), epoch.to_string());
+                }
+                self.next_record += 1;
+            }
+        }
+        Ok(batch)
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+impl FileConsumer {
+    async fn receive_batch_inner(
+        &mut self,
+        max_messages: usize,
+    ) -> Result<ReceivedBatch, ConsumerError> {
         // The path was unopenable at startup. A live tail waits for it (rotation,
         // a writer that hasn't created it yet), but a drain has nothing to wait
         // for, so re-probe and fail rather than block forever on a typo'd path.
@@ -2565,10 +2622,6 @@ impl MessageConsumer for FileConsumer {
                 })
             }
         }
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 }
 

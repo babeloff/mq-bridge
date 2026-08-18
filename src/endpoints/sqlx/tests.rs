@@ -1371,3 +1371,112 @@ async fn embedded_nul_in_a_bound_value_is_rejected() {
         .unwrap();
     assert_eq!(count, 0, "the row must not land at all");
 }
+
+// --- `source_metadata`: the polling cursor as a replay position ---
+
+#[tokio::test]
+async fn test_sqlx_cursor_reader_stamps_source_positions() {
+    use crate::support::source_ranges::SourcePosition;
+
+    let (_dir, url, _pool) = setup_arbitrary_table(3).await;
+    let config = SqlxConfig {
+        url,
+        table: "orders".to_string(),
+        cursor_column: Some("id".to_string()),
+        source_metadata: true,
+        ..Default::default()
+    };
+    let mut reader = SqlxCursorReader::new(&config).await.unwrap();
+
+    let batch = reader.receive_batch(3).await.unwrap();
+    assert_eq!(batch.messages.len(), 3);
+    assert_eq!(
+        batch.messages[0].metadata.get("mqb.src.sqlx_table"),
+        Some(&"orders".to_string())
+    );
+
+    // The cursor value is the offset itself, so the rows form one contiguous run and an
+    // idempotent sink names them as a single object.
+    let positions: Vec<u64> = batch
+        .messages
+        .iter()
+        .map(|m| SourcePosition::from_message(m).unwrap().offset)
+        .collect();
+    assert_eq!(positions, vec![1, 2, 3]);
+}
+
+/// A repeated cursor value would resolve two rows to one source position, and the sink
+/// drops the second. Reading it is what fails, not the silent drop later.
+#[tokio::test]
+async fn test_sqlx_cursor_reader_rejects_non_unique_cursor_for_source_metadata() {
+    sqlx::any::install_default_drivers();
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("dup_meta.db");
+    let url = sqlite_url(&path);
+    drop(tokio::fs::File::create(&path).await.unwrap());
+    let pool = AnyPool::connect(&url).await.unwrap();
+    sqlx::query("CREATE TABLE events (id INTEGER PRIMARY KEY, ts INTEGER)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    for (id, ts) in [(1, 10), (2, 20), (3, 20)] {
+        sqlx::query("INSERT INTO events (id, ts) VALUES (?, ?)")
+            .bind(id)
+            .bind(ts)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    let config = SqlxConfig {
+        url,
+        table: "events".to_string(),
+        cursor_column: Some("ts".to_string()),
+        source_metadata: true,
+        ..Default::default()
+    };
+    let mut reader = SqlxCursorReader::new(&config).await.unwrap();
+
+    let err = reader.receive_batch(10).await.unwrap_err();
+    assert!(
+        matches!(err, ConsumerError::Permanent(_)),
+        "expected ConsumerError::Permanent, got {err:?}"
+    );
+    assert!(err.to_string().contains("unique"), "got: {err}");
+}
+
+/// A text cursor orders rows fine for paging but has no contiguous numeric position, so it
+/// cannot name an object range.
+#[tokio::test]
+async fn test_sqlx_cursor_reader_rejects_text_cursor_for_source_metadata() {
+    sqlx::any::install_default_drivers();
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("text_meta.db");
+    let url = sqlite_url(&path);
+    drop(tokio::fs::File::create(&path).await.unwrap());
+    let pool = AnyPool::connect(&url).await.unwrap();
+    sqlx::query("CREATE TABLE events (k TEXT PRIMARY KEY, v INTEGER)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO events (k, v) VALUES ('a', 1)")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let config = SqlxConfig {
+        url,
+        table: "events".to_string(),
+        cursor_column: Some("k".to_string()),
+        source_metadata: true,
+        ..Default::default()
+    };
+    let mut reader = SqlxCursorReader::new(&config).await.unwrap();
+
+    let err = reader.receive_batch(10).await.unwrap_err();
+    assert!(
+        matches!(err, ConsumerError::Permanent(_)),
+        "expected ConsumerError::Permanent, got {err:?}"
+    );
+    assert!(err.to_string().contains("integer"), "got: {err}");
+}

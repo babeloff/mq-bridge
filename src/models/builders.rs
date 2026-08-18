@@ -263,6 +263,7 @@ impl FileConfig {
             format: FileFormat::default(),
             compression: Compression::default(),
             encryption: None,
+            source_metadata: false,
         }
     }
 

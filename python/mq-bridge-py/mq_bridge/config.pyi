@@ -154,6 +154,7 @@ class FileConfig(TypedDict, total=False):
     format: FileFormat
     idempotency: bool
     path: Required[str]
+    source_metadata: bool
 
 
 class GrpcConfig(TypedDict, total=False):
@@ -476,6 +477,7 @@ class SqlxConfig(TypedDict, total=False):
     select_query: Optional[str]
     shared: Optional[bool]
     slot_name: Optional[str]
+    source_metadata: bool
     table: Required[str]
     test_before_acquire: Optional[bool]
     tls: TlsConfig
