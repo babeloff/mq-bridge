@@ -2056,11 +2056,20 @@ impl FileConsumer {
     }
 
     pub async fn new(config: &FileConfig) -> anyhow::Result<Self> {
+        Self::new_with_source_metadata(config, config.source_metadata).await
+    }
+
+    /// `source_metadata` is the effective flag: the route enables it for an idempotent
+    /// output even when the input config leaves it unset.
+    pub async fn new_with_source_metadata(
+        config: &FileConfig,
+        source_metadata: bool,
+    ) -> anyhow::Result<Self> {
         let startup_open_error = probe_source_path(&config.path)?;
         let mut consumer = Self::new_backend(config).await?;
         consumer.path = config.path.clone();
         consumer.startup_open_error = startup_open_error;
-        consumer.source_metadata = config.source_metadata;
+        consumer.source_metadata = source_metadata;
         // `consume` always reads from byte 0, so its record index is reproducible and two
         // runs deliberately produce the same names — that is what makes the sink idempotent.
         // `subscribe` starts at the current end and `group_subscribe` resumes at a stored
@@ -2068,7 +2077,7 @@ impl FileConsumer {
         // numbered. Without an epoch those names would collide and the sink would discard
         // the new records as already-covered; with one they stay distinct and ordered, at
         // the cost of cross-restart deduplication.
-        consumer.run_epoch = (config.source_metadata
+        consumer.run_epoch = (source_metadata
             && !matches!(&config.mode, None | Some(FileConsumerMode::Consume { .. })))
         .then(next_run_epoch);
         Ok(consumer)
