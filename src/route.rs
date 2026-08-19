@@ -621,14 +621,26 @@ async fn send_batch_and_commit(
 
 impl Route {
     /// Whether this route's input can stamp a replay position, which is what `name_by: auto`
-    /// resolves against. A `ref` input that cannot be resolved yet counts as no position, so
-    /// `auto` falls back to `write_time` rather than failing the route on a naming choice.
+    /// resolves against. A `ref` input that cannot be resolved counts as no position, so `auto`
+    /// falls back to `write_time` rather than failing the route on a naming choice.
     fn source_has_position(&self) -> bool {
-        match &self.input.endpoint_type {
-            EndpointType::Ref(name) => get_endpoint(name)
-                .is_some_and(|referenced| supports_source_metadata(&referenced.endpoint_type)),
-            endpoint_type => supports_source_metadata(endpoint_type),
+        // A ref may name another ref, so follow the chain the way `resolve_endpoint_recursive`
+        // does. The depth bound doubles as the cycle guard: a loop simply runs out of it.
+        const MAX_DEPTH: usize = 16;
+        let EndpointType::Ref(name) = &self.input.endpoint_type else {
+            return supports_source_metadata(&self.input.endpoint_type);
+        };
+        let mut name = name.clone();
+        for _ in 0..MAX_DEPTH {
+            let Some(referenced) = get_endpoint(&name) else {
+                return false;
+            };
+            match referenced.endpoint_type {
+                EndpointType::Ref(next) => name = next,
+                endpoint_type => return supports_source_metadata(&endpoint_type),
+            }
         }
+        false
     }
 
     /// Returns the sink mechanism that makes replayed writes idempotent, when it can be
@@ -2181,6 +2193,51 @@ mod tests {
         // Memory carries no replay position, so `auto` falls back and claims nothing.
         let positionless = route_from(Endpoint::new_memory("delivery_in", 1));
         assert_eq!(positionless.inferred_idempotency_mechanism(), None);
+    }
+
+    /// A `ref` may name another `ref`. Resolving only the first hop made a chained input look
+    /// positionless, which silently demoted `name_by: auto` to `write_time` — the sink stopped
+    /// recognising a replay rather than failing where anyone would notice.
+    #[test]
+    fn a_chained_ref_input_resolves_to_the_endpoint_at_the_end_of_it() {
+        fn route_with_input(name: &str) -> Route {
+            Route::new(
+                Endpoint::new(EndpointType::Ref(name.to_string())),
+                Endpoint::new_memory("chain_out", 1),
+            )
+        }
+
+        register_endpoint(
+            "chain-file",
+            Endpoint::new(EndpointType::File(crate::models::FileConfig::new(
+                "/tmp/chain.csv",
+            ))),
+        );
+        register_endpoint(
+            "chain-middle",
+            Endpoint::new(EndpointType::Ref("chain-file".to_string())),
+        );
+        register_endpoint(
+            "chain-outer",
+            Endpoint::new(EndpointType::Ref("chain-middle".to_string())),
+        );
+        assert!(route_with_input("chain-outer").source_has_position());
+
+        // Unresolvable chains keep the old answer: no position, so `auto` falls back.
+        assert!(!route_with_input("chain-missing").source_has_position());
+        register_endpoint(
+            "chain-loop",
+            Endpoint::new(EndpointType::Ref("chain-loop".to_string())),
+        );
+        assert!(!route_with_input("chain-loop").source_has_position());
+
+        // A chain ending somewhere positionless still reports none.
+        register_endpoint("chain-memory", Endpoint::new_memory("chain_in", 1));
+        register_endpoint(
+            "chain-to-memory",
+            Endpoint::new(EndpointType::Ref("chain-memory".to_string())),
+        );
+        assert!(!route_with_input("chain-to-memory").source_has_position());
     }
 
     #[test]

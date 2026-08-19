@@ -574,6 +574,11 @@ impl FilePublisher {
         })
     }
 
+    /// Unlike the `object_store` sink, an encode failure here fails the whole batch rather than
+    /// splitting the run around the bad record. That is deliberate: `encode_record` is fallible in
+    /// signature only for the formats this path accepts (`normal`, `json`, `text`, `raw`; CSV is
+    /// rejected at open), so the split would be untestable code guarding a case that cannot occur.
+    /// If a fallible format ever lands, mirror `ObjectStorePublisher::send_batch_by_source_position`.
     async fn send_batch_by_source_position(
         &self,
         messages: Vec<CanonicalMessage>,

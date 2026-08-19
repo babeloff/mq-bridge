@@ -152,7 +152,8 @@ class FileConfig(TypedDict, total=False):
     delimiter: Optional[str]
     encryption: Optional[EncryptionConfig]
     format: FileFormat
-    idempotency: bool
+    idempotency: Optional[bool]
+    name_by: NameBy
     path: Required[str]
     source_metadata: bool
 
@@ -362,13 +363,14 @@ class ObjectStoreConfig(TypedDict, total=False):
     checkpoint_store: Optional[str]
     compression: Compression
     cursor_id: Optional[str]
-    date_partition: bool
+    date_partition: Optional[bool]
     delimiter: Optional[str]
     encryption: Optional[EncryptionConfig]
     extension: Optional[str]
     format: FileFormat
-    idempotency: bool
+    idempotency: Optional[bool]
     max_object_bytes: Optional[int]
+    name_by: NameBy
     polling_interval_ms: Optional[int]
     url: Required[str]
 
@@ -559,6 +561,7 @@ MappingRule = Union[str, DetailedMappingRule]
 MongoConsume = Literal["consumer", "snapshot", "capture_new", "capture_all"]
 MongoDbFormat = Literal["normal", "json", "text", "raw"]
 MqttProtocol = Literal["v5", "v3"]
+NameBy = Literal["auto", "source_position", "write_time"]
 NatsDeliverPolicy = Literal["all", "last", "new", "last_per_subject"]
 StaticConfig = Union[str, Dict[str, Any]]
 TransformErrorPolicy = Literal["reject", "pass_through"]

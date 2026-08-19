@@ -54,6 +54,7 @@ MappingRule = str
 MongoConsume = str
 MongoDbFormat = str
 MqttProtocol = str
+NameBy = str
 NatsDeliverPolicy = str
 StaticConfig = str
 TransformErrorPolicy = str
@@ -103,6 +104,7 @@ __all__ = [
     "MongoDbFormat",
     "MqttConfig",
     "MqttProtocol",
+    "NameBy",
     "NatsConfig",
     "NatsDeliverPolicy",
     "ObjectStoreConfig",

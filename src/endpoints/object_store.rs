@@ -160,8 +160,8 @@ async fn recover_finalized_object_ranges(
 /// reason instead of retrying forever. `PutMode::Create` on a store with conditional put
 /// disabled lands here as `NotImplemented`, which is how an idempotent sink reports that the
 /// bucket cannot give it the write-once guarantee it is built on.
-fn classify_put_error(error: ObjectStoreError, context: String) -> PublisherError {
-    let permanent = matches!(
+fn is_permanent_store_error(error: &ObjectStoreError) -> bool {
+    matches!(
         error,
         ObjectStoreError::NotImplemented { .. }
             | ObjectStoreError::NotSupported { .. }
@@ -169,7 +169,11 @@ fn classify_put_error(error: ObjectStoreError, context: String) -> PublisherErro
             | ObjectStoreError::Unauthenticated { .. }
             | ObjectStoreError::InvalidPath { .. }
             | ObjectStoreError::UnknownConfigurationKey { .. }
-    );
+    )
+}
+
+fn classify_put_error(error: ObjectStoreError, context: String) -> PublisherError {
+    let permanent = is_permanent_store_error(&error);
     let error = anyhow!(error).context(context);
     if permanent {
         PublisherError::NonRetryable(error)
@@ -244,8 +248,8 @@ pub struct ObjectStorePublisher {
     date_partition: bool,
     extension: String,
     name_by: NameBy,
-    /// Ranges already on the store. Filled lazily: recovery only pays for itself once a
-    /// write turns out to be a repeat, so a fresh prefix never lists.
+    /// Ranges already on the store, filled by one listing before the first idempotent write.
+    /// A fresh prefix pays a single empty listing; `recovered` keeps it to one per publisher.
     covered_ranges: Arc<Mutex<CoveredRanges>>,
     recovered: Arc<tokio::sync::OnceCell<()>>,
     // Shared across clones on purpose: the ordering guarantee is per generator instance, so
@@ -360,14 +364,17 @@ impl ObjectStorePublisher {
     }
 
     /// Lists the prefix once per publisher and folds what is already finalized into
-    /// `covered_ranges`. Purely an optimisation: `PutMode::Create` already turns a repeat
-    /// write into a no-op, so this only stops a replay from re-encoding and re-uploading
-    /// bodies that are on the store.
+    /// `covered_ranges`. This is what makes filtering per record rather than per batch:
+    /// `PutMode::Create` only catches a repeat that lands on the same name, so without the
+    /// listing a replay on different batch boundaries would write every record again under
+    /// names that never collide.
     ///
-    /// Infallible by design. It runs only after a PUT reported the object already there, so
-    /// the batch is safe either way; failing it would drop data that is on the store over a
-    /// listing that was never needed. A failure leaves the cell uninitialised, so the next
-    /// repeat retries and the replay meanwhile falls back to re-PUTting no-ops.
+    /// Runs before the first PUT. A fresh prefix costs one empty listing per publisher; a
+    /// populated one pays the scan it needs to be correct.
+    ///
+    /// Infallible by design: a store that allows PUT but denies LIST would otherwise stall
+    /// the route outright. A failure leaves the cell uninitialised, so the next batch retries
+    /// it, and until it succeeds the sink degrades to same-name-only deduplication.
     async fn ensure_recovered(&self) {
         let outcome = self
             .recovered
@@ -382,10 +389,22 @@ impl ObjectStorePublisher {
             })
             .await;
         if let Err(error) = outcome {
+            let permanent = error
+                .downcast_ref::<ObjectStoreError>()
+                .is_some_and(is_permanent_store_error);
             warn!(
                 %error,
-                "object_store could not list the prefix to skip an in-progress replay;                  continuing without it, so repeated writes cost a no-op PUT each"
+                permanent,
+                "object_store could not list the prefix; this run's writes are deduplicated only \
+                 when a replay reproduces the same batch boundaries, so a replay that batches \
+                 differently will write overlapping objects"
             );
+            if permanent {
+                // A denied or unimplemented listing does not become allowed by asking again.
+                // Latching the cell trades the guarantee for one warning and one round trip
+                // instead of one of each per batch, forever.
+                let _ = self.recovered.set(());
+            }
         }
     }
 
@@ -406,6 +425,11 @@ impl ObjectStorePublisher {
         // could produce two runs that overlap *partially*; those name two different objects and
         // the overlap would be written twice. Claiming the range under the lock before the PUT
         // would close that window, at the cost of unwinding the claim on every failure path.
+        //
+        // Recovery has to happen before the first PUT, not after one collides: a replay whose
+        // batches fall on different boundaries names different objects, so nothing collides and
+        // there would be nothing to trigger it.
+        self.ensure_recovered().await;
         let covered = self.covered_ranges.lock().await.clone();
         let runs = covered
             .uncovered_runs(messages)
@@ -417,6 +441,8 @@ impl ObjectStorePublisher {
             // the offsets around it are still written, under names covering exactly what went
             // in, and the bad record goes to the DLQ like it would on the write-time path.
             // Encode failures are a property of the record, so a replay splits identically.
+            // No format this sink accepts can actually fail today, which is why the split has
+            // no test of its own; it guards the fallible signature, not a reachable case.
             let mut segment_start = run.start;
             let mut segment_end = None;
             let mut body = Vec::new();
@@ -486,10 +512,10 @@ impl ObjectStorePublisher {
             .await
         {
             Ok(_) => {}
-            // A repeat write means this prefix already holds an earlier run. Recovering its
-            // ranges once, here, turns the rest of the replay into cheap skips — and a fresh
-            // prefix never reaches this arm, so it never pays for the LIST.
-            Err(ObjectStoreError::AlreadyExists { .. }) => self.ensure_recovered().await,
+            // Same name, same range, same bytes: the object is already the one this PUT would
+            // have written. Recovery ran before the first PUT, so reaching this arm means a
+            // repeat within the run rather than an unrecovered earlier one.
+            Err(ObjectStoreError::AlreadyExists { .. }) => {}
             Err(error) => {
                 return Err(classify_put_error(
                     error,
@@ -1020,6 +1046,7 @@ mod tests {
     use crate::support::source_ranges::SourcePartition;
     use crate::traits::{MessageConsumer, MessagePublisher};
     use object_store::memory::InMemory;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// Key an idempotent write lands on, derived rather than spelled out: the part-name
     /// format is pinned by the `source_ranges` tests, not by these.
@@ -1231,10 +1258,86 @@ mod tests {
         }
     }
 
-    /// `list` fails, `put` works.
+    /// Counts `list` calls, so a test can pin how often recovery scans the prefix.
+    #[derive(Debug)]
+    struct CountingStore {
+        inner: InMemory,
+        lists: Arc<AtomicUsize>,
+    }
+
+    impl std::fmt::Display for CountingStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "CountingStore")
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for CountingStore {
+        async fn put_opts(
+            &self,
+            location: &ObjPath,
+            payload: PutPayload,
+            opts: PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &ObjPath,
+            opts: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &ObjPath,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: futures::stream::BoxStream<'static, object_store::Result<ObjPath>>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<ObjPath>> {
+            self.inner.delete_stream(locations)
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&ObjPath>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.lists.fetch_add(1, Ordering::SeqCst);
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&ObjPath>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &ObjPath,
+            to: &ObjPath,
+            options: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    /// `list` fails, `put` works. `permanent` picks whether the failure is one retrying can
+    /// ever clear.
     #[derive(Debug)]
     struct UnlistableStore {
         inner: InMemory,
+        permanent: bool,
+        lists: Arc<AtomicUsize>,
     }
 
     impl std::fmt::Display for UnlistableStore {
@@ -1282,10 +1385,19 @@ mod tests {
             _prefix: Option<&ObjPath>,
         ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
         {
-            futures::stream::once(async {
-                Err(ObjectStoreError::Generic {
-                    store: "UnlistableStore",
-                    source: "listing denied".into(),
+            self.lists.fetch_add(1, Ordering::SeqCst);
+            let permanent = self.permanent;
+            futures::stream::once(async move {
+                Err(if permanent {
+                    ObjectStoreError::PermissionDenied {
+                        path: "data".to_string(),
+                        source: "listing denied".into(),
+                    }
+                } else {
+                    ObjectStoreError::Generic {
+                        store: "UnlistableStore",
+                        source: "listing unavailable".into(),
+                    }
                 })
             })
             .boxed()
@@ -1315,6 +1427,8 @@ mod tests {
     async fn a_replay_survives_a_prefix_it_may_not_list() {
         let store: Arc<dyn ObjectStore> = Arc::new(UnlistableStore {
             inner: InMemory::new(),
+            permanent: false,
+            lists: Arc::new(AtomicUsize::new(0)),
         });
         let mut publisher = test_publisher(store.clone());
         publisher.name_by = NameBy::SourcePosition;
@@ -1325,8 +1439,8 @@ mod tests {
             SentBatch::Ack
         ));
 
-        // Same offsets again, on a fresh publisher so nothing is remembered in-process. Every
-        // PUT comes back `AlreadyExists`, which is what reaches for the listing.
+        // Same offsets again, on a fresh publisher so nothing is remembered in-process. The
+        // listing it wants before writing is the one this store refuses.
         let mut replay = test_publisher(store.clone());
         replay.name_by = NameBy::SourcePosition;
         assert!(
@@ -1422,23 +1536,120 @@ mod tests {
 
     /// Recovery is an optimisation, not a correctness requirement, so it must not cost a
     /// prefix-wide LIST on the common path: writing into a fresh prefix never triggers it.
+    /// Recovery has to run before the first write, so it can no longer be free on a fresh
+    /// prefix — but it must stay *one* listing per publisher rather than one per batch.
     #[tokio::test]
-    async fn a_fresh_prefix_is_never_listed() {
-        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    async fn a_prefix_is_listed_once_per_publisher() {
+        let lists = Arc::new(AtomicUsize::new(0));
+        let store: Arc<dyn ObjectStore> = Arc::new(CountingStore {
+            inner: InMemory::new(),
+            lists: lists.clone(),
+        });
         let mut publisher = test_publisher(store.clone());
         publisher.name_by = NameBy::SourcePosition;
-        publisher
-            .send_batch(vec![kafka_message(0), kafka_message(1)])
-            .await
-            .unwrap();
-        assert!(
-            !publisher.recovered.initialized(),
-            "a fresh prefix must not pay for recovery"
+        for offset in 0..8 {
+            publisher
+                .send_batch(vec![kafka_message(offset)])
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            lists.load(Ordering::SeqCst),
+            1,
+            "eight batches must share one listing, not pay for one each"
+        );
+
+        let mut written = store.list(Some(&ObjPath::from("data")));
+        let mut count = 0;
+        while written.next().await.is_some() {
+            count += 1;
+        }
+        assert_eq!(count, 8, "an empty prefix must not filter anything out");
+    }
+
+    /// Recovery now runs on every batch until it succeeds, so a bucket that will never allow
+    /// `ListObjects` must not pay a failed round trip and a warning per batch for the life of
+    /// the route.
+    #[tokio::test]
+    async fn a_permanently_denied_listing_is_only_attempted_once() {
+        let lists = Arc::new(AtomicUsize::new(0));
+        let store: Arc<dyn ObjectStore> = Arc::new(UnlistableStore {
+            inner: InMemory::new(),
+            permanent: true,
+            lists: lists.clone(),
+        });
+        let mut publisher = test_publisher(store.clone());
+        publisher.name_by = NameBy::SourcePosition;
+        for offset in 0..5 {
+            publisher
+                .send_batch(vec![kafka_message(offset)])
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            lists.load(Ordering::SeqCst),
+            1,
+            "a listing that is denied outright must not be retried per batch"
+        );
+        for offset in 0..5u64 {
+            assert!(
+                store.get(&part_key(offset, offset, "jsonl")).await.is_ok(),
+                "the sink must keep writing without the listing"
+            );
+        }
+    }
+
+    /// The replay that the collision-triggered recovery got wrong: a restart whose batches
+    /// fall on different boundaries names different objects, so not one PUT collides and
+    /// nothing would ever ask for the listing. Every record would then be written a second
+    /// time under a name that overlaps the first run's without matching it.
+    #[tokio::test]
+    async fn a_replay_on_shifted_batch_boundaries_writes_nothing_twice() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+
+        let mut first = test_publisher(store.clone());
+        first.name_by = NameBy::SourcePosition;
+        for chunk in [[0, 1], [2, 3], [4, 5]] {
+            first
+                .send_batch(chunk.map(kafka_message).to_vec())
+                .await
+                .unwrap();
+        }
+
+        // The same six offsets, re-read in threes. No name in common with the run above.
+        let mut replay = test_publisher(store.clone());
+        replay.name_by = NameBy::SourcePosition;
+        for chunk in [[0, 1, 2], [3, 4, 5]] {
+            replay
+                .send_batch(chunk.map(kafka_message).to_vec())
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(
+            keys(store.as_ref()).await,
+            vec![
+                "data/part-orders-0000000000-00000000000000000000-00000000000000000001.jsonl",
+                "data/part-orders-0000000000-00000000000000000002-00000000000000000003.jsonl",
+                "data/part-orders-0000000000-00000000000000000004-00000000000000000005.jsonl",
+            ],
+            "the replay must add no object; before the fix it added three that overlap these"
         );
     }
 
-    /// A restart into a prefix that already holds parts recovers exactly once, on the first
-    /// repeat write, and then skips the rest of the replay without rewriting anything.
+    /// Sorted keys under the test prefix.
+    async fn keys(store: &dyn ObjectStore) -> Vec<String> {
+        let mut stream = store.list(Some(&ObjPath::from("data")));
+        let mut names = Vec::new();
+        while let Some(item) = stream.next().await {
+            names.push(item.unwrap().location.to_string());
+        }
+        names.sort();
+        names
+    }
+
+    /// A restart into a prefix that already holds parts recovers exactly once, before its
+    /// first write, and then skips the rest of the replay without rewriting anything.
     #[tokio::test]
     async fn a_replay_recovers_once_and_then_skips() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
@@ -1458,7 +1669,7 @@ mod tests {
             .unwrap();
         assert!(
             restarted.recovered.initialized(),
-            "a repeat write must trigger recovery"
+            "a populated prefix must be recovered before it is written to"
         );
 
         // The replayed offsets are now known covered, so the next batch writes only the new one.

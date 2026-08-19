@@ -19,6 +19,12 @@ on:
       - "src/**"
   workflow_dispatch:
 
+# Superseded PR runs are cancelled; push runs always finish so every pre-merge
+# commit keeps its own verdict.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   CARGO_TERM_COLOR: always
 

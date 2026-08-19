@@ -22,7 +22,7 @@ sink writes data.
 | MongoDB | `id_field` set to a payload field or replay-stable template such as `${metadata:mqb.id}` |
 | PostgreSQL / SQLite | `sqlx.insert_query` uses a unique key with `ON CONFLICT` |
 | MySQL / MariaDB | `sqlx.insert_query` uses a unique key with `ON DUPLICATE KEY` |
-| File / object store | `name_by: source_position` (the `object_store` default over a replayable Kafka, Postgres CDC, SQL cursor, MongoDB CDC or file source) |
+| File / object store | `name_by: source_position` (the `object_store` default over a replayable Kafka, Postgres CDC, SQL cursor, MongoDB CDC or `consume`-mode file source). Needs positions that *repeat* across runs — a file source in `subscribe` or `group_subscribe` mode stamps a per-run epoch, so its names never collide and a replay is not recognised |
 
 For a source without stable identity, derive one once and consume it at the sink:
 
@@ -143,7 +143,7 @@ one identity to every message missing the field, so it is dropped instead.
 | `mongodb` | Unique `_id` index; dup-key (11000) is treated as an idempotent success | `id_field` |
 | `sqlx` (PostgreSQL / MySQL / SQLite) | The table's own `UNIQUE`/`PRIMARY KEY` | `ON CONFLICT` / `ON DUPLICATE KEY` in `insert_query` |
 | `clickhouse` | `ReplacingMergeTree` collapses at merge time | Table DDL — no `mq-bridge` config |
-| `file`, `object_store` | Deterministic, sortable part names + covered-range recovery | `name_by: source_position` (needs a replayable source; the `object_store` default under `auto`) |
+| `file`, `object_store` | Deterministic, sortable part names + covered-range recovery | `name_by: source_position` (needs a source that reproduces the same positions on a re-read — a file source only in `consume` mode; the `object_store` default under `auto`) |
 | `kafka` | `enable.idempotence` dedups **producer retries within one session** — this is *not* exactly-once semantics | On by default |
 | `nats`, `amqp`, `mqtt`, `redis_streams`, `aws`, `ibm_mq`, `zeromq` | None | Deduplicate at the next consumer instead |
 
@@ -367,12 +367,14 @@ but before the branch's downstream send committed, the replay hits a duplicate k
 > depends on replay **order**. Turning it on when you do not need it only adds restrictions.
 
 A filesystem has no unique constraint, so the `file` and `object_store` sinks get replay safety
-from the **name** they write under. `name_by` picks the scheme:
+from the **name** they write under — which works only as far as the source repeats its positions:
+a re-read that numbers the same records differently produces different names, and different names
+are not a replay to anything downstream. `name_by` picks the scheme:
 
 | `name_by` | Name | Consequence |
 | --- | --- | --- |
 | `write_time` | `<uuidv7>.<ext>`, optionally under `YYYY/MM/DD/` | unique per write; sorts by write order |
-| `source_position` | `part-<topic>-<partition>-<start>-<end>.<ext>`, zero-padded, flat | repeats exactly on a replay, so a re-write is a no-op; sorts by source order |
+| `source_position` | `part-<topic>-<partition>-<start>-<end>.<ext>`, zero-padded, flat | repeats exactly where the source repeats its positions, making a re-write a no-op; sorts by source order |
 | `auto` (default) | `source_position` where the input carries a replay position, else `write_time` | see below |
 
 Under `source_position` the sink groups each batch into runs of consecutive source positions and
@@ -388,18 +390,21 @@ kafka_to_s3:
       name_by: source_position   # → part-orders-<partition>-<start>-<end>.jsonl (zero-padded)
 ```
 
-**`auto` applies to `object_store` only.** That sink writes one object per batch either way, so only
-the name changes and deriving it is safe. The `file` sink is different: `source_position` turns
+**`auto` applies to `object_store` only.** Either scheme leaves that sink writing whole immutable
+objects — `write_time` one per flushed batch, `source_position` one per contiguous run within it —
+so only the name and the grouping change, and deriving them is safe. The `file` sink is different: `source_position` turns
 `path` from a file into a *directory* of part files, which is a change of structure rather than of
 name, so a `file` sink stays on `write_time` until you ask for parts explicitly.
 
-A repeat write is caught by the name: the object store PUTs under `PutMode::Create` and treats
-`AlreadyExists` as success. The first such repeat also makes the sink list the prefix once and parse
-the ranges out of the part names, so the rest of the replay is skipped without re-encoding or
-re-uploading. Filtering is then **per record, not per batch**, so batch boundaries are free to differ
-across restarts — that is what makes it work without a checkpoint protocol. A fresh prefix never
-lists. Local files stage to a temp name, `fsync`, then `rename` (atomic within a filesystem); object
-stores have no atomic rename, so a single PUT under the final name *is* the commit.
+Before its first write the sink lists the prefix once and parses the ranges out of the part names
+already there, so a replay skips them without re-encoding or re-uploading. Filtering is
+**per record, not per batch**, so batch boundaries are free to differ across restarts — that is what
+makes it work without a checkpoint protocol, and it is why the listing cannot wait for a name to
+collide: a replay on different boundaries names different objects and collides with nothing. A
+repeat that does land on the same name is caught anyway, since the PUT uses `PutMode::Create` and
+treats `AlreadyExists` as success. A fresh prefix pays one empty listing per run. Local files
+stage to a temp name, `fsync`, then `rename` (atomic within a filesystem); object stores have no
+atomic rename, so a single PUT under the final name *is* the commit.
 
 This needs a replayable source position. Today that means:
 

@@ -26,10 +26,13 @@ All notable changes to `mq-bridge`. Newest first.
   only order a bucket has, so this is what makes `mqb copy orders.csv s3://…` come back in
   source order at any `concurrency` without configuring anything — and it is what removed the
   `concurrency > 1` warning from that route. Three consequences to know about:
-  - **A re-run into the same prefix writes nothing.** The names repeat, and a repeat is a
-    no-op. That is the point of positional naming, but it is a change: the same command used
-    to append a second copy under fresh uuid names. Use a fresh prefix, or
-    `name_by: write_time`, if you want the old behaviour.
+  - **A re-run into the same prefix writes nothing — where the source repeats its
+    positions.** The names repeat, and a repeat is a no-op. That covers a re-read of the same
+    file, Kafka offsets, a SQL cursor and a CDC stream. A file source in `subscribe` or
+    `group_subscribe` mode is the exception: it stamps a per-run epoch, so its names stay
+    distinct across runs and a re-run writes a second copy. Where the no-op does apply it is a
+    change of behaviour — the same command used to append a second copy under fresh uuid
+    names. Use a fresh prefix, or `name_by: write_time`, if you want the old behaviour.
   - **`date_partition` does not apply** under `source_position`; parts are written flat.
   - **Do not mix the two families in one prefix.** uuid names and `part-…` names do not sort
     correctly against each other. A prefix written by an older version keeps working on its
@@ -48,12 +51,16 @@ All notable changes to `mq-bridge`. Newest first.
 
 ### Changed
 
-- **The `object_store` sink no longer lists its prefix when it opens.** Recovery is an
-  optimisation — `PutMode::Create` already turns a repeat write into a no-op — so it now runs
-  once, lazily, on the first write that turns out to be a repeat. A fresh prefix never pays
-  for it; a restart into a populated one pays for exactly one `LIST` and then skips the rest
-  of the replay without re-encoding or re-uploading. Opening onto a prefix holding a few
-  thousand leftover objects previously cost roughly 3.5x the job's throughput.
+- **The `object_store` sink lists its prefix only on the `source_position` write path**, and
+  only once per publisher, immediately before its first write rather than when it opens. A
+  `write_time` sink never lists at all; a `source_position` restart into a populated prefix
+  pays for exactly one `LIST` and then skips the rest of the replay without re-encoding or
+  re-uploading. The listing cannot be deferred any further than this: `PutMode::Create` only
+  catches a repeat that lands on the same object name, so a replay whose batches fall on
+  different boundaries collides with nothing and would otherwise write every record a second
+  time under overlapping names. A listing that fails is retried on the next batch, unless it
+  failed for a reason retrying cannot clear (a denied `ListObjects`), in which case the sink
+  warns once and falls back to same-name-only deduplication.
 - **The `concurrency > 1` warning now fires only when it can be acted on**: a `write_time`
   name *and* an input that carries no replay position, which is the only case left with no
   remedy other than `concurrency: 1`. It no longer points at a setting that would fail on
