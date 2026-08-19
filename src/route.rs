@@ -1353,18 +1353,17 @@ impl Route {
         let source_metadata_required =
             output_requires_source_metadata(name, &self.output, source_has_position)?;
         check_source_position_available(name, &self.input, source_metadata_required)?;
-        // Only worth saying when nothing can be done about it from the sink side: the input
-        // carries no replay position, so `name_by` has no better scheme to fall back to.
-        if !source_has_position
-            && output_has_write_time_named_object_store(name, &self.output, source_has_position)?
-        {
+        // A write-time name is minted inside the worker pool, so it is arrival order here
+        // whether or not the input could have supplied a position instead.
+        if output_has_write_time_named_object_store(name, &self.output, source_has_position)? {
             warn!(
                 route = name,
                 concurrency = self.options.concurrency,
                 "object_store sink names objects by write time, which this route's worker pool \
                  makes arrival order rather than source order. Replaying a change stream through \
-                 the bucket can reorder updates to the same key. This input carries no replay \
-                 position, so the only remedy is concurrency: 1."
+                 the bucket can reorder updates to the same key. Set name_by: source_position \
+                 where the input carries a replay position; otherwise concurrency: 1 is the only \
+                 remedy."
             );
         }
         let publisher = create_publisher_from_route_with_source_position(

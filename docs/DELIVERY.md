@@ -396,13 +396,17 @@ so only the name and the grouping change, and deriving them is safe. The `file` 
 `path` from a file into a *directory* of part files, which is a change of structure rather than of
 name, so a `file` sink stays on `write_time` until you ask for parts explicitly.
 
-Before its first write the sink lists the prefix once and parses the ranges out of the part names
-already there, so a replay skips them without re-encoding or re-uploading. Filtering is
-**per record, not per batch**, so batch boundaries are free to differ across restarts — that is what
-makes it work without a checkpoint protocol, and it is why the listing cannot wait for a name to
-collide: a replay on different boundaries names different objects and collides with nothing. A
-repeat that does land on the same name is caught anyway, since the PUT uses `PutMode::Create` and
-treats `AlreadyExists` as success. A fresh prefix pays one empty listing per run. Local files
+All of this belongs to the `source_position` path. Before its first write such a sink lists the
+prefix once and parses the ranges out of the part names already there, so a replay skips them
+without re-encoding or re-uploading. Filtering is **per record, not per batch**, so batch boundaries
+are free to differ across restarts — that is what makes it work without a checkpoint protocol, and
+it is why the listing cannot wait for a name to collide: a replay on different boundaries names
+different objects and collides with nothing. A repeat that does land on the same name is caught
+anyway, since the PUT uses `PutMode::Create` and treats `AlreadyExists` as success. A `write_time`
+sink never lists — its names are unique per write, so there is nothing to recognise; on the
+`source_position` path a fresh prefix pays one empty listing per publisher. A listing that fails is
+logged rather than failing the batch, leaving same-name-only deduplication until it succeeds: a
+transient failure is retried on the next batch, a denied `ListObjects` is not retried. Local files
 stage to a temp name, `fsync`, then `rename` (atomic within a filesystem); object stores have no
 atomic rename, so a single PUT under the final name *is* the commit.
 
@@ -429,8 +433,9 @@ only order a bucket has. At `concurrency: 1` that is source order; above it the 
 the worker pool, so it is arrival order, and replaying a change stream through the bucket can reorder
 updates to the same key. For an input that carries a replay position, `auto` already avoids this. For
 one that does not — NATS, MQTT, HTTP, gRPC, ZeroMQ, IBM MQ, Redis Streams — there is no positional
-name to fall back to, and `concurrency: 1` is the only remedy; the route logs a warning when it
-starts in that configuration.
+name to fall back to, and `concurrency: 1` is the only remedy. A concurrent route into a
+`write_time` object-store sink logs a warning at startup either way: over an input with a position
+it points at `name_by: source_position`, over one without it at `concurrency: 1`.
 
 > **Deprecated:** `idempotency: true|false` is the old spelling of
 > `name_by: source_position|write_time`. It is still read, but an explicit `name_by` wins over it.

@@ -32,7 +32,10 @@ All notable changes to `mq-bridge`. Newest first.
     `group_subscribe` mode is the exception: it stamps a per-run epoch, so its names stay
     distinct across runs and a re-run writes a second copy. Where the no-op does apply it is a
     change of behaviour — the same command used to append a second copy under fresh uuid
-    names. Use a fresh prefix, or `name_by: write_time`, if you want the old behaviour.
+    names. Use a fresh prefix, or `name_by: write_time`, if you want the old behaviour. The
+    no-op also needs the prefix listing to succeed: a replay whose batches fall on different
+    boundaries names different objects, so where the listing is denied the sink can only catch
+    a repeat that lands on the exact same name and the rest is written twice.
   - **`date_partition` does not apply** under `source_position`; parts are written flat.
   - **Do not mix the two families in one prefix.** uuid names and `part-…` names do not sort
     correctly against each other. A prefix written by an older version keeps working on its
@@ -61,10 +64,11 @@ All notable changes to `mq-bridge`. Newest first.
   time under overlapping names. A listing that fails is retried on the next batch, unless it
   failed for a reason retrying cannot clear (a denied `ListObjects`), in which case the sink
   warns once and falls back to same-name-only deduplication.
-- **The `concurrency > 1` warning now fires only when it can be acted on**: a `write_time`
-  name *and* an input that carries no replay position, which is the only case left with no
-  remedy other than `concurrency: 1`. It no longer points at a setting that would fail on
-  such an input.
+- **The `concurrency > 1` warning now fires only for a `write_time` name**, which is the only
+  case where write order is not source order — under `auto` over a replayable input that is
+  now nobody. It names `name_by: source_position` where the input carries a replay position
+  and `concurrency: 1` otherwise, rather than pointing at a setting that would fail on an
+  input with no position.
 - The `source_position` write path reports `SentBatch::Partial` like the ordinary path does.
   A record that cannot be encoded splits the run instead of failing the whole batch: the
   offsets around it are written under names covering exactly what went in, and the bad record
@@ -73,11 +77,11 @@ All notable changes to `mq-bridge`. Newest first.
 
 ### Fixed
 
-- A failed prefix listing no longer fails an `object_store` batch. Range recovery runs only
-  after a PUT reported the object already on the store, so the batch is safe either way — but
-  the listing error was propagated as non-retryable, which dropped a replay's batch on a
-  bucket that denies `ListObjects`, or on a transient listing hiccup. It is now logged, the
-  replay falls back to a no-op PUT per repeat, and the next repeat retries the listing.
+- A failed prefix listing no longer fails an `object_store` batch. The error was propagated as
+  non-retryable, which dropped a replay's batch on a bucket that denies `ListObjects`, or on a
+  transient listing hiccup. It is now logged and the sink degrades to same-name-only
+  deduplication: a transient failure is retried on the next batch, while a denied `ListObjects`
+  is latched after one warning and not retried.
 
 - A route rejected for `name_by: source_position` over an input that carries no replay position
   no longer leaves a directory behind at a `file` sink's `path`. The publisher opens before the
