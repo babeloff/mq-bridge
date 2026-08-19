@@ -22,7 +22,7 @@ sink writes data.
 | MongoDB | `id_field` set to a payload field or replay-stable template such as `${metadata:mqb.id}` |
 | PostgreSQL / SQLite | `sqlx.insert_query` uses a unique key with `ON CONFLICT` |
 | MySQL / MariaDB | `sqlx.insert_query` uses a unique key with `ON DUPLICATE KEY` |
-| File / object store | `idempotency: true` with a replayable Kafka, Postgres CDC, SQL cursor, MongoDB CDC or file source |
+| File / object store | `name_by: source_position` (the `object_store` default over a replayable Kafka, Postgres CDC, SQL cursor, MongoDB CDC or file source) |
 
 For a source without stable identity, derive one once and consume it at the sink:
 
@@ -143,7 +143,7 @@ one identity to every message missing the field, so it is dropped instead.
 | `mongodb` | Unique `_id` index; dup-key (11000) is treated as an idempotent success | `id_field` |
 | `sqlx` (PostgreSQL / MySQL / SQLite) | The table's own `UNIQUE`/`PRIMARY KEY` | `ON CONFLICT` / `ON DUPLICATE KEY` in `insert_query` |
 | `clickhouse` | `ReplacingMergeTree` collapses at merge time | Table DDL — no `mq-bridge` config |
-| `file`, `object_store` | Deterministic, sortable part names + covered-range recovery | `idempotency: true` (needs a replayable source) |
+| `file`, `object_store` | Deterministic, sortable part names + covered-range recovery | `name_by: source_position` (needs a replayable source; the `object_store` default under `auto`) |
 | `kafka` | `enable.idempotence` dedups **producer retries within one session** — this is *not* exactly-once semantics | On by default |
 | `nats`, `amqp`, `mqtt`, `redis_streams`, `aws`, `ibm_mq`, `zeromq` | None | Deduplicate at the next consumer instead |
 
@@ -155,7 +155,7 @@ it a deterministic key (`id_field`, or a `ON CONFLICT` column) and you are done.
 
 **Any source → files or object storage.** A filesystem has no unique constraint, so this route
 needs a replayable source position and therefore works **only from `kafka` or `postgres_cdc`**. See
-[Files & object storage](#files--object-storage--idempotency).
+[Files & object storage](#files--object-storage--name_by).
 
 **A source → a broker sink** (Kafka, NATS, MQTT, …). The sink cannot deduplicate. Either filter
 before it with the [`deduplication` middleware](#the-deduplication-middleware), or accept
@@ -357,7 +357,7 @@ but before the branch's downstream send committed, the replay hits a duplicate k
 `existed`, and a genuinely-new record takes the duplicate branch. Write the `existed` branch as
 "may or may not have been handled — check and repair", not "definitely already done".
 
-### Files & object storage — `idempotency`
+### Files & object storage — `name_by`
 
 > **Check first whether you need any of this.** If your records already carry a business key — an
 > `id` field in the payload, or `mqb.id` from the [`id` middleware](#giving-a-source-an-identity) —
@@ -366,10 +366,17 @@ but before the branch's downstream send committed, the replay hits a duplicate k
 > for the case where the *sink itself* has to recognise a replay, or where a downstream reader
 > depends on replay **order**. Turning it on when you do not need it only adds restrictions.
 
-A filesystem has no unique constraint, so the `file` and `object_store` sinks get replay safety a
-different way: **deterministic names plus covered-range recovery**. Set `idempotency: true` and the
-sink stops writing UUID-named objects. Instead it groups each batch into runs of consecutive source
-positions and writes one immutable part per run, named for the range it covers:
+A filesystem has no unique constraint, so the `file` and `object_store` sinks get replay safety
+from the **name** they write under. `name_by` picks the scheme:
+
+| `name_by` | Name | Consequence |
+| --- | --- | --- |
+| `write_time` | `<uuidv7>.<ext>`, optionally under `YYYY/MM/DD/` | unique per write; sorts by write order |
+| `source_position` | `part-<topic>-<partition>-<start>-<end>.<ext>`, zero-padded, flat | repeats exactly on a replay, so a re-write is a no-op; sorts by source order |
+| `auto` (default) | `source_position` where the input carries a replay position, else `write_time` | see below |
+
+Under `source_position` the sink groups each batch into runs of consecutive source positions and
+writes one immutable part per run, named for the range it covers:
 
 ```yaml
 kafka_to_s3:
@@ -378,15 +385,21 @@ kafka_to_s3:
   output:
     object_store:
       url: "s3://my-bucket/orders"
-      idempotency: true          # → part-orders-<partition>-<start>-<end>.jsonl (zero-padded)
+      name_by: source_position   # → part-orders-<partition>-<start>-<end>.jsonl (zero-padded)
 ```
 
-On startup the sink lists what is already there, parses the ranges out of the part names, and drops
-any incoming record whose position falls inside one. Filtering is **per record, not per batch**, so
-batch boundaries are free to differ across restarts — that is what makes it work without a
-checkpoint protocol. Local files stage to a temp name, `fsync`, then `rename` (atomic within a
-filesystem); object stores have no atomic rename, so a single PUT under the final name *is* the
-commit.
+**`auto` applies to `object_store` only.** That sink writes one object per batch either way, so only
+the name changes and deriving it is safe. The `file` sink is different: `source_position` turns
+`path` from a file into a *directory* of part files, which is a change of structure rather than of
+name, so a `file` sink stays on `write_time` until you ask for parts explicitly.
+
+A repeat write is caught by the name: the object store PUTs under `PutMode::Create` and treats
+`AlreadyExists` as success. The first such repeat also makes the sink list the prefix once and parse
+the ranges out of the part names, so the rest of the replay is skipped without re-encoding or
+re-uploading. Filtering is then **per record, not per batch**, so batch boundaries are free to differ
+across restarts — that is what makes it work without a checkpoint protocol. A fresh prefix never
+lists. Local files stage to a temp name, `fsync`, then `rename` (atomic within a filesystem); object
+stores have no atomic rename, so a single PUT under the final name *is* the commit.
 
 This needs a replayable source position. Today that means:
 
@@ -398,15 +411,24 @@ This needs a replayable source position. Today that means:
 | `file` | record index within the file | all modes; only `consume` deduplicates across runs (see below) |
 | `sqlx` | the `cursor_column` value | cursor polling only; the column must be a unique, non-negative integer |
 
-A route with an idempotent output turns `source_metadata` on for its input automatically; set it
-explicitly only when you want the `mqb.src.*` keys for something else. Any other input is rejected
-when the route starts. NATS and AMQP also accept `source_metadata` and emit provenance keys, but a
-subject or routing key is not a replayable offset, so they cannot drive an idempotent sink.
+A route whose output resolves to `source_position` turns `source_metadata` on for its input
+automatically; set it explicitly only when you want the `mqb.src.*` keys for something else. An input
+from the table above is what `auto` looks for; anything else keeps the sink on `write_time`. An
+*explicit* `name_by: source_position` over an input that has no position is rejected when the route
+starts, because there is then no way to honour what was asked for. NATS and AMQP also accept
+`source_metadata` and emit provenance keys, but a subject or routing key is not a replayable offset,
+so they cannot drive positional naming.
 
-**Without `idempotency: true`, an `object_store` sink names objects in write order**, and key order
-is the only order a bucket has. At `concurrency: 1` that is source order; above it the name is minted
-inside the worker pool, so it is arrival order, and replaying a change stream through the bucket can
-reorder updates to the same key. The route logs a warning when it starts in that configuration.
+**Under `write_time`, an `object_store` sink names objects in write order**, and key order is the
+only order a bucket has. At `concurrency: 1` that is source order; above it the name is minted inside
+the worker pool, so it is arrival order, and replaying a change stream through the bucket can reorder
+updates to the same key. For an input that carries a replay position, `auto` already avoids this. For
+one that does not — NATS, MQTT, HTTP, gRPC, ZeroMQ, IBM MQ, Redis Streams — there is no positional
+name to fall back to, and `concurrency: 1` is the only remedy; the route logs a warning when it
+starts in that configuration.
+
+> **Deprecated:** `idempotency: true|false` is the old spelling of
+> `name_by: source_position|write_time`. It is still read, but an explicit `name_by` wins over it.
 
 **Numbers inside a part name are zero-padded** so that ASCII sort equals numeric sort — a bucket is
 listed lexicographically and that listing order *is* the replay order. A bucket written by a version
@@ -441,9 +463,9 @@ records re-read after a crash are written again under new names. That is ordinar
 it is the honest guarantee for a source with no durable per-record position — these modes are
 allowed, not rejected, because that guarantee is fine for plenty of pipelines.
 
-For the `file` sink, `idempotency: true` changes what `path` means: it is the directory that receives
+For the `file` sink, `name_by: source_position` changes what `path` means: it is the directory that receives
 the part files, not the file that is appended to. The sink creates it on startup, so pointing it at an
-existing regular file fails there with "Failed to create idempotent file sink directory".
+existing regular file fails there with "Failed to create part-file sink directory".
 
 `compression` and `encryption` work as usual.
 

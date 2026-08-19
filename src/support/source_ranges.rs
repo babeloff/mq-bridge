@@ -303,6 +303,17 @@ impl CoveredRanges {
         Ok(())
     }
 
+    /// Folds another set in, keeping the merged-interval invariant. Used when a sink
+    /// recovers what is already on the store after it has begun writing.
+    pub fn merge(&mut self, other: CoveredRanges) -> Result<()> {
+        for (source, ranges) in other.ranges {
+            for (start, end) in ranges {
+                self.insert(source.clone(), start, end)?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn contains(&self, position: &SourcePosition) -> bool {
         self.ranges.get(&position.source).is_some_and(|ranges| {
             ranges

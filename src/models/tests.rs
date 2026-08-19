@@ -642,7 +642,7 @@ path: "/tmp/test"
         let object_store = ObjectStoreConfig::new("s3://bucket/prefix")
             .with_checkpoint("file:///tmp/object-store.json", "orders");
         assert_eq!(object_store.url, "s3://bucket/prefix");
-        assert!(object_store.date_partition);
+        assert!(object_store.date_partition_enabled(NameBy::WriteTime));
         assert_eq!(object_store.cursor_id.as_deref(), Some("orders"));
 
         let postgres_cdc = PostgresCdcConfig::new("postgres://localhost/db", "events")

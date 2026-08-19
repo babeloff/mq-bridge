@@ -2,6 +2,82 @@
 
 All notable changes to `mq-bridge`. Newest first.
 
+## 0.4.4
+
+### Breaking
+
+- **`idempotency` on the `file` and `object_store` sinks is replaced by `name_by`.** The old
+  field described a consequence rather than the thing it set. What it actually chooses is how
+  written objects and parts are *named*, and everything else — sortability, replay dedup,
+  whether `date_partition` applies, how errors are reported — follows from that name:
+
+  | `name_by` | Name | Consequence |
+  | --- | --- | --- |
+  | `write_time` | `<uuidv7>.<ext>`, optionally under `YYYY/MM/DD/` | unique per write, sorts by write order |
+  | `source_position` | `part-<topic>-<partition>-<start>-<end>.<ext>`, zero-padded, flat | repeats exactly on a replay, sorts by source order |
+  | `auto` (new default) | `source_position` where the input carries a replay position, else `write_time` | see below |
+
+  `idempotency: true|false` is still read and still means
+  `name_by: source_position|write_time`, so v0.4.x configs keep loading. An explicit `name_by`
+  wins over it.
+
+- **An `object_store` sink now defaults to `source_position` naming over a replayable input**
+  (Kafka, Postgres CDC, a SQL cursor, a MongoDB change stream, or a file). Key order is the
+  only order a bucket has, so this is what makes `mqb copy orders.csv s3://…` come back in
+  source order at any `concurrency` without configuring anything — and it is what removed the
+  `concurrency > 1` warning from that route. Three consequences to know about:
+  - **A re-run into the same prefix writes nothing.** The names repeat, and a repeat is a
+    no-op. That is the point of positional naming, but it is a change: the same command used
+    to append a second copy under fresh uuid names. Use a fresh prefix, or
+    `name_by: write_time`, if you want the old behaviour.
+  - **`date_partition` does not apply** under `source_position`; parts are written flat.
+  - **Do not mix the two families in one prefix.** uuid names and `part-…` names do not sort
+    correctly against each other. A prefix written by an older version keeps working on its
+    own; point the upgraded route at a new prefix if a reader depends on listing order.
+
+- **The `file` sink stays on `write_time` under `auto`** and must be told
+  `name_by: source_position` explicitly. There, positional naming turns `path` from a file
+  into a *directory* of part files — a change of structure, not of name, and not something to
+  derive on the operator's behalf.
+
+- `object_store` `date_partition` is now `Option<bool>` (unset = on, and only for
+  `write_time`). Side effect: the "`date_partition` is a publisher-only option" warning used
+  to fire for *every* `object_store` consumer, because the field defaulted to `true` and the
+  check could not tell that from an explicit setting. It now fires only when the field was
+  actually set.
+
+### Changed
+
+- **The `object_store` sink no longer lists its prefix when it opens.** Recovery is an
+  optimisation — `PutMode::Create` already turns a repeat write into a no-op — so it now runs
+  once, lazily, on the first write that turns out to be a repeat. A fresh prefix never pays
+  for it; a restart into a populated one pays for exactly one `LIST` and then skips the rest
+  of the replay without re-encoding or re-uploading. Opening onto a prefix holding a few
+  thousand leftover objects previously cost roughly 3.5x the job's throughput.
+- **The `concurrency > 1` warning now fires only when it can be acted on**: a `write_time`
+  name *and* an input that carries no replay position, which is the only case left with no
+  remedy other than `concurrency: 1`. It no longer points at a setting that would fail on
+  such an input.
+- The `source_position` write path reports `SentBatch::Partial` like the ordinary path does.
+  A record that cannot be encoded splits the run instead of failing the whole batch: the
+  offsets around it are written under names covering exactly what went in, and the bad record
+  goes to the DLQ. (Encode failures are unreachable in practice today; this removes an
+  asymmetry rather than fixing an observed bug.)
+
+### Fixed
+
+- A failed prefix listing no longer fails an `object_store` batch. Range recovery runs only
+  after a PUT reported the object already on the store, so the batch is safe either way — but
+  the listing error was propagated as non-retryable, which dropped a replay's batch on a
+  bucket that denies `ListObjects`, or on a transient listing hiccup. It is now logged, the
+  replay falls back to a no-op PUT per repeat, and the next repeat retries the listing.
+
+- A route rejected for `name_by: source_position` over an input that carries no replay position
+  no longer leaves a directory behind at a `file` sink's `path`. The publisher opens before the
+  consumer, and the part-file sink creates its directory as it opens, so the rejected route used
+  to turn the operator's output *file* into an empty directory — after which a corrected run
+  failed on the leftover. The requirement is now checked before any sink opens.
+
 ## 0.4.0
 
 ### Breaking

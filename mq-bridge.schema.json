@@ -1012,12 +1012,19 @@
           "default": "normal"
         },
         "idempotency": {
-          "description": "Write replay-safe source ranges as immutable part files under this directory.\nRequires a source that stamps a replayable position: kafka, postgres_cdc, mongodb CDC, sqlx or file.",
-          "type": "boolean",
-          "default": false
+          "description": "Deprecated: use `name_by`. true = `source_position`, false = `write_time`; ignored when `name_by` is set.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "name_by": {
+          "description": "(Sink only) `write_time` (default here, appends to `path`) or `source_position` (replay-safe part files, `path` is their directory).",
+          "$ref": "#/$defs/NameBy",
+          "default": "auto"
         },
         "path": {
-          "description": "Path to the file, or to the directory holding the part files when `idempotency` is true.",
+          "description": "Path to the file, or to the directory holding the part files under `source_position` naming.",
           "type": "string"
         },
         "source_metadata": {
@@ -2422,6 +2429,26 @@
         "v3"
       ]
     },
+    "NameBy": {
+      "description": "How a `file` or `object_store` sink names what it writes.\n\nThe name decides everything downstream: a name derived from the source position sorts by\nsource order and repeats exactly on a replay (so a re-write is a no-op), while a name\nderived from the write time sorts by write order and is unique per write.\n\n`auto` resolves against the input for `object_store` only. There the two schemes write the\nsame thing under a different name, so the choice is free; on `file` they are different sink\nstructures — one appended file versus a directory of part files — and deriving that from the\ninput would change what `path` means without the operator asking for it.",
+      "oneOf": [
+        {
+          "description": "object_store: `source_position` when the input carries one, else `write_time`. file: always `write_time`.",
+          "type": "string",
+          "const": "auto"
+        },
+        {
+          "description": "`part-<source>-<start>-<end>.<ext>`. Needs a replayable input; on `file` this turns `path` into a directory.",
+          "type": "string",
+          "const": "source_position"
+        },
+        {
+          "description": "object_store: `<uuidv7>.<ext>` under an optional `YYYY/MM/DD/` prefix. file: appends to `path`.",
+          "type": "string",
+          "const": "write_time"
+        }
+      ]
+    },
     "NatsConfig": {
       "description": "General NATS connection configuration.",
       "type": "object",
@@ -2602,9 +2629,12 @@
           ]
         },
         "date_partition": {
-          "description": "(Sink only) Prepend a `YYYY/MM/DD/` path (write time, UTC) to each object key. Purely\nfor readability / lifecycle rules — the uuidv7 name already sorts by time. Default true.",
-          "type": "boolean",
-          "default": true
+          "description": "(Sink only) Prepend a `YYYY/MM/DD/` path (write time, UTC) to each object key. Applies to\n`write_time` naming only; defaults to on. Purely for readability / lifecycle rules.",
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "default": null
         },
         "delimiter": {
           "description": "Record delimiter within an object. Defaults to newline (\"\\n\"). Can be a string or a\nhex sequence (e.g. \"0x00\").",
@@ -2638,9 +2668,11 @@
           "default": "normal"
         },
         "idempotency": {
-          "description": "Write replay-safe source ranges as immutable objects instead of UUID-named objects.\nRequires Kafka source metadata or postgres_cdc commit LSN plus transaction ordinal metadata.",
-          "type": "boolean",
-          "default": false
+          "description": "Deprecated: use `name_by`. true = `source_position`, false = `write_time`; ignored when `name_by` is set.",
+          "type": [
+            "boolean",
+            "null"
+          ]
         },
         "max_object_bytes": {
           "description": "(Source only) Maximum size in bytes of a single object to fetch into memory. An object\nlarger than this fails the read (surfaced as a consumer error) instead of being\nbuffered whole. Unset means no limit (the whole object is materialized).",
@@ -2650,6 +2682,11 @@
           ],
           "format": "uint64",
           "minimum": 0
+        },
+        "name_by": {
+          "description": "(Sink only) `auto`, `write_time` (uuidv7 name) or `source_position` (name carries the source range).",
+          "$ref": "#/$defs/NameBy",
+          "default": "auto"
         },
         "polling_interval_ms": {
           "description": "(Source only) Idle poll interval in milliseconds when no new objects are found.\nDefaults to 1000.",

@@ -4,13 +4,14 @@
 //  git clone https://github.com/marcomq/mq-bridge
 
 use crate::endpoints::{
-    create_consumer_from_route, create_consumer_from_route_with_source_metadata,
-    create_publisher_from_route, output_has_write_ordered_object_store,
-    output_requires_source_metadata,
+    check_source_position_available, create_consumer_from_route,
+    create_consumer_from_route_with_source_metadata,
+    create_publisher_from_route_with_source_position, output_has_write_time_named_object_store,
+    output_requires_source_metadata, supports_source_metadata,
 };
 use crate::errors::ProcessingError;
 pub use crate::models::Route;
-use crate::models::{Endpoint, EndpointType, Middleware, RouteOptions};
+use crate::models::{Endpoint, EndpointType, Middleware, NameBy, RouteOptions};
 use crate::traits::{
     BatchCommitFunc, ConsumerError, EndpointStatus, Handler, HandlerError, MessageConsumer,
     MessageDisposition, MessagePublisher, PublisherError, SentBatch,
@@ -619,6 +620,17 @@ async fn send_batch_and_commit(
 }
 
 impl Route {
+    /// Whether this route's input can stamp a replay position, which is what `name_by: auto`
+    /// resolves against. A `ref` input that cannot be resolved yet counts as no position, so
+    /// `auto` falls back to `write_time` rather than failing the route on a naming choice.
+    fn source_has_position(&self) -> bool {
+        match &self.input.endpoint_type {
+            EndpointType::Ref(name) => get_endpoint(name)
+                .is_some_and(|referenced| supports_source_metadata(&referenced.endpoint_type)),
+            endpoint_type => supports_source_metadata(endpoint_type),
+        }
+    }
+
     /// Returns the sink mechanism that makes replayed writes idempotent, when it can be
     /// established from configuration alone. This is informational: the route remains
     /// at-least-once internally, while the observable sink result is effectively-once.
@@ -626,6 +638,7 @@ impl Route {
         if self.output.handler.is_some() {
             return None;
         }
+        let source_has_position = self.source_has_position();
         match &self.output.endpoint_type {
             EndpointType::MongoDb(config) if config.id_field.is_some() => {
                 Some("MongoDB unique _id")
@@ -637,11 +650,15 @@ impl Route {
                     .is_some_and(|(_, conflict_action)| conflict_action.contains("DO NOTHING"))
                     .then_some("SQL unique-key conflict handling")
             }
-            EndpointType::File(config) if config.idempotency => {
-                Some("deterministic file source ranges")
+            EndpointType::File(config)
+                if config.resolved_name_by(source_has_position) == NameBy::SourcePosition =>
+            {
+                Some("part names carrying the source range")
             }
-            EndpointType::ObjectStore(config) if config.idempotency => {
-                Some("deterministic object source ranges")
+            EndpointType::ObjectStore(config)
+                if config.resolved_name_by(source_has_position) == NameBy::SourcePosition =>
+            {
+                Some("object names carrying the source range")
             }
             _ => None,
         }
@@ -1167,8 +1184,16 @@ impl Route {
         ready_tx: Option<Sender<()>>,
         drops: Option<&Arc<RwLock<DropReport>>>,
     ) -> anyhow::Result<bool> {
-        let source_metadata_required = output_requires_source_metadata(name, &self.output)?;
-        let publisher = create_publisher_from_route(name, &self.output).await?;
+        let source_has_position = self.source_has_position();
+        let source_metadata_required =
+            output_requires_source_metadata(name, &self.output, source_has_position)?;
+        check_source_position_available(name, &self.input, source_metadata_required)?;
+        let publisher = create_publisher_from_route_with_source_position(
+            name,
+            &self.output,
+            source_has_position,
+        )
+        .await?;
         let mut consumer = create_consumer_from_route_with_source_metadata(
             name,
             &self.input,
@@ -1312,18 +1337,30 @@ impl Route {
         ready_tx: Option<Sender<()>>,
         drops: Option<&Arc<RwLock<DropReport>>>,
     ) -> anyhow::Result<bool> {
-        let source_metadata_required = output_requires_source_metadata(name, &self.output)?;
-        if output_has_write_ordered_object_store(name, &self.output)? {
+        let source_has_position = self.source_has_position();
+        let source_metadata_required =
+            output_requires_source_metadata(name, &self.output, source_has_position)?;
+        check_source_position_available(name, &self.input, source_metadata_required)?;
+        // Only worth saying when nothing can be done about it from the sink side: the input
+        // carries no replay position, so `name_by` has no better scheme to fall back to.
+        if !source_has_position
+            && output_has_write_time_named_object_store(name, &self.output, source_has_position)?
+        {
             warn!(
                 route = name,
                 concurrency = self.options.concurrency,
-                "object_store sink names objects in write order, which this route's worker pool \
+                "object_store sink names objects by write time, which this route's worker pool \
                  makes arrival order rather than source order. Replaying a change stream through \
-                 the bucket can reorder updates to the same key. Set idempotency: true, or run \
-                 the route at concurrency: 1."
+                 the bucket can reorder updates to the same key. This input carries no replay \
+                 position, so the only remedy is concurrency: 1."
             );
         }
-        let publisher = create_publisher_from_route(name, &self.output).await?;
+        let publisher = create_publisher_from_route_with_source_position(
+            name,
+            &self.output,
+            source_has_position,
+        )
+        .await?;
         let mut consumer = create_consumer_from_route_with_source_metadata(
             name,
             &self.input,
@@ -2024,10 +2061,39 @@ pub async fn stop_route(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    /// The publisher opens before the consumer, and a `source_position` file sink creates its
+    /// part directory as it opens. A route rejected for its input must not leave that behind
+    /// where the operator asked for a file.
+    #[tokio::test]
+    async fn a_rejected_source_position_file_sink_leaves_no_directory_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let sink = dir.path().join("out.jsonl");
+        let route = Route {
+            input: Endpoint::new(EndpointType::Memory(MemoryConfig::new("probe-in", Some(1)))),
+            output: Endpoint::new(EndpointType::File(
+                FileConfig::new(sink.to_str().unwrap()).with_name_by(NameBy::SourcePosition),
+            )),
+            options: RouteOptions::default(),
+        };
+        let (_tx, rx) = async_channel::bounded(1);
+        let error = route
+            .run_sequentially("probe", rx, None, None)
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("replay position"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            !sink.is_dir(),
+            "the failing route left {sink:?} behind as a directory"
+        );
+    }
     use super::*;
     use crate::models::{
-        Endpoint, EndpointType, FaultMode, Middleware, MongoDbConfig, RandomPanicMiddleware,
-        RouteOptions, SqlxConfig,
+        Endpoint, EndpointType, FaultMode, FileConfig, MemoryConfig, Middleware, MongoDbConfig,
+        NameBy, RandomPanicMiddleware, RouteOptions, SqlxConfig,
     };
     use crate::traits::{
         CustomMiddlewareFactory, MessageConsumer, MessagePublisher, ReceivedBatch,
@@ -2085,6 +2151,36 @@ mod tests {
             Endpoint::new_memory("delivery_out", 1),
         );
         assert_eq!(ordinary.inferred_idempotency_mechanism(), None);
+    }
+
+    /// The object-store sink reports the mechanism it derived, so `name_by: auto` has to be
+    /// resolved against the route's input rather than read off the config.
+    #[cfg(feature = "object-store")]
+    #[test]
+    fn auto_named_object_store_reports_the_mechanism_its_input_earns() {
+        fn route_from(input: Endpoint) -> Route {
+            Route::new(
+                input,
+                Endpoint::new(EndpointType::ObjectStore(
+                    crate::models::ObjectStoreConfig {
+                        url: "s3://bucket/data".to_string(),
+                        ..Default::default()
+                    },
+                )),
+            )
+        }
+
+        let replayable = route_from(Endpoint::new(EndpointType::File(
+            crate::models::FileConfig::new("/tmp/orders.csv"),
+        )));
+        assert_eq!(
+            replayable.inferred_idempotency_mechanism(),
+            Some("object names carrying the source range")
+        );
+
+        // Memory carries no replay position, so `auto` falls back and claims nothing.
+        let positionless = route_from(Endpoint::new_memory("delivery_in", 1));
+        assert_eq!(positionless.inferred_idempotency_mechanism(), None);
     }
 
     #[test]

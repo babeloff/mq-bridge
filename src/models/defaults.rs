@@ -188,25 +188,6 @@ impl Default for FileConsumerMode {
     }
 }
 
-impl Default for ObjectStoreConfig {
-    fn default() -> Self {
-        Self {
-            url: String::new(),
-            idempotency: false,
-            format: FileFormat::default(),
-            delimiter: None,
-            checkpoint_store: None,
-            cursor_id: None,
-            polling_interval_ms: None,
-            max_object_bytes: None,
-            date_partition: true,
-            extension: None,
-            compression: Compression::default(),
-            encryption: None,
-        }
-    }
-}
-
 impl Default for IbmMqConfig {
     fn default() -> Self {
         Self {

@@ -4,7 +4,7 @@
 //  git clone https://github.com/marcomq/mq-bridge
 use crate::canonical_message::{deserialize_u128, tracing_support::LazyMessageIds};
 use crate::event_store::{EventStore, EventStoreConsumer, RetentionPolicy};
-use crate::models::{Compression, FileConfig, FileConsumerMode, FileFormat};
+use crate::models::{Compression, FileConfig, FileConsumerMode, FileFormat, NameBy};
 #[cfg(feature = "encryption")]
 use crate::support::crypto::Crypto;
 use crate::support::source_ranges::{finalized_name, CoveredRanges};
@@ -387,8 +387,8 @@ pub struct FilePublisher {
     file_lock: Arc<Mutex<()>>,
     delimiter: Vec<u8>,
     format: FileFormat,
-    idempotency: bool,
-    idempotent_extension: String,
+    name_by: NameBy,
+    part_extension: String,
     covered_ranges: Arc<Mutex<CoveredRanges>>,
     #[cfg(any(feature = "compression", feature = "encryption"))]
     compression: Compression,
@@ -423,7 +423,7 @@ fn validate_member_settings(config: &FileConfig) -> anyhow::Result<()> {
 /// overlapping restart sharing the directory — so only older ones are treated as crash debris.
 const STAGING_REAP_AGE: Duration = Duration::from_secs(60);
 
-async fn recover_idempotent_file_ranges(
+async fn recover_finalized_file_ranges(
     directory: &Path,
     extension: &str,
 ) -> anyhow::Result<CoveredRanges> {
@@ -488,18 +488,25 @@ async fn write_finalized_file(path: &Path, body: &[u8]) -> Result<(), PublisherE
 }
 
 impl FilePublisher {
+    /// Opens the sink with the naming scheme the config alone implies. Without a route there
+    /// is no input to resolve `auto` against, so it falls back to `write_time`.
     pub async fn new(config: &FileConfig) -> anyhow::Result<Self> {
+        Self::new_with_name_by(config, config.resolved_name_by(false)).await
+    }
+
+    pub async fn new_with_name_by(config: &FileConfig, name_by: NameBy) -> anyhow::Result<Self> {
         validate_member_settings(config)?;
         let path_str = &config.path;
         let path = Path::new(path_str);
-        if config.idempotency {
+        let by_source_position = name_by == NameBy::SourcePosition;
+        if by_source_position {
             if matches!(config.format, FileFormat::Csv) {
                 return Err(anyhow::anyhow!(
-                    "file idempotency does not support CSV (per-part headers are unimplemented)"
+                    "file 'name_by: source_position' does not support CSV (per-part headers are unimplemented)"
                 ));
             }
             tokio::fs::create_dir_all(path).await.with_context(|| {
-                format!("Failed to create idempotent file sink directory: {path_str}")
+                format!("Failed to create part-file sink directory: {path_str}")
             })?;
         }
         if let Some(parent) = path.parent() {
@@ -508,7 +515,7 @@ impl FilePublisher {
             })?;
         }
 
-        if !config.idempotency {
+        if !by_source_position {
             let _ = OpenOptions::new()
                 .create(true)
                 .append(true)
@@ -524,7 +531,7 @@ impl FilePublisher {
         let format = config.format.clone();
         // Part names must advertise what the bytes actually are: a compressed or sealed part
         // holds one member, so it earns the same suffixes the appending sink's file would.
-        let mut idempotent_extension = match format {
+        let mut part_extension = match format {
             FileFormat::Csv => "csv",
             FileFormat::Raw => "bin",
             FileFormat::Normal | FileFormat::Json | FileFormat::Text => "jsonl",
@@ -532,15 +539,16 @@ impl FilePublisher {
         .to_string();
         match config.compression {
             Compression::None => {}
-            Compression::Gzip => idempotent_extension.push_str(".gz"),
-            Compression::Lz4 => idempotent_extension.push_str(".lz4"),
-            Compression::Zstd => idempotent_extension.push_str(".zst"),
+            Compression::Gzip => part_extension.push_str(".gz"),
+            Compression::Lz4 => part_extension.push_str(".lz4"),
+            Compression::Zstd => part_extension.push_str(".zst"),
         }
         if config.encryption.is_some() {
-            idempotent_extension.push_str(".enc");
+            part_extension.push_str(".enc");
         }
-        let covered_ranges = if config.idempotency {
-            recover_idempotent_file_ranges(path, &idempotent_extension).await?
+        let covered_ranges = if by_source_position {
+            // A local directory scan, unlike the object store's networked LIST.
+            recover_finalized_file_ranges(path, &part_extension).await?
         } else {
             CoveredRanges::default()
         };
@@ -550,8 +558,8 @@ impl FilePublisher {
             file_lock,
             delimiter,
             format,
-            idempotency: config.idempotency,
-            idempotent_extension,
+            name_by,
+            part_extension,
             covered_ranges: Arc::new(Mutex::new(covered_ranges)),
             #[cfg(any(feature = "compression", feature = "encryption"))]
             compression: config.compression,
@@ -566,7 +574,7 @@ impl FilePublisher {
         })
     }
 
-    async fn send_batch_idempotent(
+    async fn send_batch_by_source_position(
         &self,
         messages: Vec<CanonicalMessage>,
     ) -> Result<SentBatch, PublisherError> {
@@ -577,12 +585,12 @@ impl FilePublisher {
             .map_err(PublisherError::NonRetryable)?;
 
         for run in runs {
-            let name = finalized_name(&run.source, run.start, run.end, &self.idempotent_extension)
+            let name = finalized_name(&run.source, run.start, run.end, &self.part_extension)
                 .map_err(PublisherError::NonRetryable)?;
             let final_path = Path::new(&self.path).join(&name);
             if !fs::try_exists(&final_path)
                 .await
-                .context("Failed to check idempotent file sink output")?
+                .context("Failed to check part-file sink output")?
             {
                 let mut body = Vec::new();
                 for mut message in run.messages {
@@ -861,8 +869,8 @@ impl MessagePublisher for FilePublisher {
             return Ok(SentBatch::Ack);
         }
 
-        if self.idempotency {
-            return self.send_batch_idempotent(messages).await;
+        if self.name_by == NameBy::SourcePosition {
+            return self.send_batch_by_source_position(messages).await;
         }
 
         #[cfg(any(feature = "compression", feature = "encryption"))]
