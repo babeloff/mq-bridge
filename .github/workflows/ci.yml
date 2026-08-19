@@ -147,6 +147,7 @@ jobs:
     name: Integration — ${{ matrix.name }}
     runs-on: ubuntu-latest
     needs: integration-build
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -185,9 +186,15 @@ jobs:
           find tests/integration/docker-compose -name "*.yml" | xargs -P 5 -I {} docker compose -f {} pull -q
 
       - name: Install JRE (for keytool)
+        timeout-minutes: 5
         run: |
-          sudo apt-get update
-          sudo apt-get install -y default-jre-headless
+          # Runner images ship a JDK; only pay the 46 MB download if they didn't.
+          # A degraded apt mirror used to stall this step for hours.
+          if command -v keytool >/dev/null 2>&1; then exit 0; fi
+          sudo apt-get update -qq
+          sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            -o Acquire::Retries=3 -o Acquire::http::Timeout=20 \
+            default-jre-headless
 
       - name: Generate TLS certs for integration services
         run: |
