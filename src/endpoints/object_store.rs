@@ -28,10 +28,12 @@
 
 use crate::checkpoint::{self, CheckpointBackend, CheckpointStore};
 use crate::endpoints::file::{encode_record, parse_delimiter, parse_message};
-use crate::models::{Compression, FileFormat, ObjectStoreConfig};
+use crate::models::{Compression, FileFormat, NameBy, ObjectStoreConfig};
 #[cfg(feature = "encryption")]
 use crate::support::crypto::Crypto;
-use crate::support::source_ranges::{finalized_name, parse_finalized_name, CoveredRanges};
+use crate::support::source_ranges::{
+    finalized_name, parse_finalized_name, CoveredRanges, SourcePartition,
+};
 use crate::traits::{
     BoxFuture, ConsumerError, MessageConsumer, MessageDisposition, MessagePublisher,
     PublisherError, ReceivedBatch, SentBatch,
@@ -49,7 +51,7 @@ use std::any::Any;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 use tokio::sync::Mutex;
-use tracing::{debug, info, trace, warn};
+use tracing::{info, trace, warn};
 
 /// Builds an `object_store` backend and its base prefix `Path` from a URL, reading
 /// credentials from the environment. Shared with the object-store checkpoint backend so
@@ -122,7 +124,7 @@ fn validate_object_settings(_config: &ObjectStoreConfig) -> anyhow::Result<()> {
 /// the commit here (object stores have no atomic rename), so this path never creates staging
 /// objects and has no leftovers of its own to reap. Anything that is not a parseable part
 /// name — including a `.stage-` object — belongs to someone else and is left untouched.
-async fn recover_idempotent_object_ranges(
+async fn recover_finalized_object_ranges(
     store: &dyn ObjectStore,
     base: &ObjPath,
     extension: &str,
@@ -158,8 +160,8 @@ async fn recover_idempotent_object_ranges(
 /// reason instead of retrying forever. `PutMode::Create` on a store with conditional put
 /// disabled lands here as `NotImplemented`, which is how an idempotent sink reports that the
 /// bucket cannot give it the write-once guarantee it is built on.
-fn classify_put_error(error: ObjectStoreError, context: String) -> PublisherError {
-    let permanent = matches!(
+fn is_permanent_store_error(error: &ObjectStoreError) -> bool {
+    matches!(
         error,
         ObjectStoreError::NotImplemented { .. }
             | ObjectStoreError::NotSupported { .. }
@@ -167,7 +169,11 @@ fn classify_put_error(error: ObjectStoreError, context: String) -> PublisherErro
             | ObjectStoreError::Unauthenticated { .. }
             | ObjectStoreError::InvalidPath { .. }
             | ObjectStoreError::UnknownConfigurationKey { .. }
-    );
+    )
+}
+
+fn classify_put_error(error: ObjectStoreError, context: String) -> PublisherError {
+    let permanent = is_permanent_store_error(&error);
     let error = anyhow!(error).context(context);
     if permanent {
         PublisherError::NonRetryable(error)
@@ -241,15 +247,27 @@ pub struct ObjectStorePublisher {
     crypto: Option<Arc<Crypto>>,
     date_partition: bool,
     extension: String,
-    idempotency: bool,
+    name_by: NameBy,
+    /// Ranges already on the store, filled by one listing before the first idempotent write.
+    /// A fresh prefix pays a single empty listing; `recovered` keeps it to one per publisher.
     covered_ranges: Arc<Mutex<CoveredRanges>>,
+    recovered: Arc<tokio::sync::OnceCell<()>>,
     // Shared across clones on purpose: the ordering guarantee is per generator instance, so
     // two independent generators would hand out interleaved keys.
     keys: Arc<StdMutex<SequentialGenerator>>,
 }
 
 impl ObjectStorePublisher {
+    /// Opens the sink with the naming scheme the config alone implies. Without a route there
+    /// is no input to resolve `auto` against, so it falls back to `write_time`.
     pub async fn new(config: &ObjectStoreConfig) -> anyhow::Result<Self> {
+        Self::new_with_name_by(config, config.resolved_name_by(false)).await
+    }
+
+    pub async fn new_with_name_by(
+        config: &ObjectStoreConfig,
+        name_by: NameBy,
+    ) -> anyhow::Result<Self> {
         if matches!(config.format, FileFormat::Csv) {
             // Each object is independent, so CSV would need its own header row per object.
             // Not implemented for the sink; sources can still read CSV objects.
@@ -268,17 +286,10 @@ impl ObjectStorePublisher {
                 config.encryption.is_some(),
             )
         });
-        let covered_ranges = if config.idempotency {
-            if config.date_partition {
-                // `date_partition` defaults to true, so this cannot tell an explicit
-                // setting from the default — keep it out of the operator's warning log.
-                debug!("object_store 'idempotency' ignores 'date_partition'; part names carry the source range and are written flat under the prefix");
-            }
-            recover_idempotent_object_ranges(store.as_ref(), &base, &extension).await?
-        } else {
-            CoveredRanges::default()
-        };
-        info!(url = %config.url, format = ?config.format, idempotency = config.idempotency, "Object-store sink opened");
+        if name_by == NameBy::SourcePosition && config.date_partition == Some(true) {
+            warn!("object_store 'date_partition' does not apply to 'name_by: source_position'; part names carry the source range and are written flat under the prefix");
+        }
+        info!(url = %config.url, format = ?config.format, ?name_by, "Object-store sink opened");
         Ok(Self {
             store,
             base,
@@ -293,12 +304,11 @@ impl ObjectStorePublisher {
                 .map(Crypto::new)
                 .transpose()?
                 .map(Arc::new),
-            // The idempotent path names objects by source range and writes them flat under the
-            // base prefix; a date layout would just be ignored, so make the override visible.
-            date_partition: config.date_partition && !config.idempotency,
+            date_partition: config.date_partition_enabled(name_by),
             extension,
-            idempotency: config.idempotency,
-            covered_ranges: Arc::new(Mutex::new(covered_ranges)),
+            name_by,
+            covered_ranges: Arc::new(Mutex::new(CoveredRanges::default())),
+            recovered: Arc::new(tokio::sync::OnceCell::new()),
             keys: Arc::new(StdMutex::new(SequentialGenerator::new())),
         })
     }
@@ -353,7 +363,52 @@ impl ObjectStorePublisher {
         Ok(body)
     }
 
-    async fn send_batch_idempotent(
+    /// Lists the prefix once per publisher and folds what is already finalized into
+    /// `covered_ranges`. This is what makes filtering per record rather than per batch:
+    /// `PutMode::Create` only catches a repeat that lands on the same name, so without the
+    /// listing a replay on different batch boundaries would write every record again under
+    /// names that never collide.
+    ///
+    /// Runs before the first PUT. A fresh prefix costs one empty listing per publisher; a
+    /// populated one pays the scan it needs to be correct.
+    ///
+    /// Infallible by design: a store that allows PUT but denies LIST would otherwise stall
+    /// the route outright. A failure leaves the cell uninitialised, so the next batch retries
+    /// it, and until it succeeds the sink degrades to same-name-only deduplication.
+    async fn ensure_recovered(&self) {
+        let outcome = self
+            .recovered
+            .get_or_try_init(|| async {
+                let recovered = recover_finalized_object_ranges(
+                    self.store.as_ref(),
+                    &self.base,
+                    &self.extension,
+                )
+                .await?;
+                self.covered_ranges.lock().await.merge(recovered)
+            })
+            .await;
+        if let Err(error) = outcome {
+            let permanent = error
+                .downcast_ref::<ObjectStoreError>()
+                .is_some_and(is_permanent_store_error);
+            warn!(
+                %error,
+                permanent,
+                "object_store could not list the prefix; this run's writes are deduplicated only \
+                 when a replay reproduces the same batch boundaries, so a replay that batches \
+                 differently will write overlapping objects"
+            );
+            if permanent {
+                // A denied or unimplemented listing does not become allowed by asking again.
+                // Latching the cell trades the guarantee for one warning and one round trip
+                // instead of one of each per batch, forever.
+                let _ = self.recovered.set(());
+            }
+        }
+    }
+
+    async fn send_batch_by_source_position(
         &self,
         messages: Vec<CanonicalMessage>,
     ) -> Result<SentBatch, PublisherError> {
@@ -370,55 +425,109 @@ impl ObjectStorePublisher {
         // could produce two runs that overlap *partially*; those name two different objects and
         // the overlap would be written twice. Claiming the range under the lock before the PUT
         // would close that window, at the cost of unwinding the claim on every failure path.
+        //
+        // Recovery has to happen before the first PUT, not after one collides: a replay whose
+        // batches fall on different boundaries names different objects, so nothing collides and
+        // there would be nothing to trigger it.
+        self.ensure_recovered().await;
         let covered = self.covered_ranges.lock().await.clone();
         let runs = covered
             .uncovered_runs(messages)
             .map_err(PublisherError::NonRetryable)?;
 
+        let mut failed = Vec::new();
         for run in runs {
-            let name = finalized_name(&run.source, run.start, run.end, &self.extension)
-                .map_err(PublisherError::NonRetryable)?;
+            // A record that cannot be encoded splits the run rather than failing the batch:
+            // the offsets around it are still written, under names covering exactly what went
+            // in, and the bad record goes to the DLQ like it would on the write-time path.
+            // Encode failures are a property of the record, so a replay splits identically.
+            // No format this sink accepts can actually fail today, which is why the split has
+            // no test of its own; it guards the fallible signature, not a reachable case.
+            let mut segment_start = run.start;
+            let mut segment_end = None;
             let mut body = Vec::new();
-            for mut message in run.messages {
+            for (index, mut message) in run.messages.into_iter().enumerate() {
+                let offset = run.start.saturating_add(index as u64);
                 message.strip_source_metadata();
-                // Unlike the ordinary path this cannot report `Partial` and hand one bad record
-                // to a DLQ: the object is named for the whole range, so skipping a record inside
-                // it would mark offsets covered that were never written. The batch fails whole
-                // instead. Runs already PUT stay written and are skipped on the resend.
-                let bytes = encode_record(&message, &self.format)
-                    .map_err(|error| PublisherError::NonRetryable(anyhow!(error)))?;
-                body.extend_from_slice(&bytes);
-                body.extend_from_slice(&self.delimiter);
-            }
-            let body = self.encode_object_body(body)?;
-            let key = self.base.clone().join(name.as_str());
-            match self
-                .store
-                .put_opts(
-                    &key,
-                    PutPayload::from(body),
-                    PutOptions {
-                        mode: PutMode::Create,
-                        ..Default::default()
-                    },
-                )
-                .await
-            {
-                Ok(_) | Err(ObjectStoreError::AlreadyExists { .. }) => {}
-                Err(error) => {
-                    return Err(classify_put_error(
-                        error,
-                        format!("object-store put idempotent '{key}'"),
-                    ));
+                match encode_record(&message, &self.format) {
+                    Ok(bytes) => {
+                        body.extend_from_slice(&bytes);
+                        body.extend_from_slice(&self.delimiter);
+                        segment_end = Some(offset);
+                    }
+                    Err(error) => {
+                        if let Some(end) = segment_end.take() {
+                            self.put_source_range(
+                                &run.source,
+                                segment_start,
+                                end,
+                                std::mem::take(&mut body),
+                            )
+                            .await?;
+                        }
+                        // `take` above emptied the body, and it can only be non-empty when
+                        // `segment_end` was set, so there is nothing left to discard here.
+                        segment_start = offset.saturating_add(1);
+                        failed.push((message, PublisherError::NonRetryable(anyhow!(error))));
+                    }
                 }
             }
-            self.covered_ranges
-                .lock()
-                .await
-                .insert(run.source, run.start, run.end)
-                .map_err(PublisherError::NonRetryable)?;
+            if let Some(end) = segment_end {
+                self.put_source_range(&run.source, segment_start, end, body)
+                    .await?;
+            }
         }
-        Ok(SentBatch::Ack)
+        if failed.is_empty() {
+            Ok(SentBatch::Ack)
+        } else {
+            Ok(SentBatch::Partial {
+                responses: None,
+                failed,
+            })
+        }
+    }
+
+    /// Writes one contiguous source range as a single object and records it as covered.
+    async fn put_source_range(
+        &self,
+        source: &SourcePartition,
+        start: u64,
+        end: u64,
+        body: Vec<u8>,
+    ) -> Result<(), PublisherError> {
+        let name = finalized_name(source, start, end, &self.extension)
+            .map_err(PublisherError::NonRetryable)?;
+        let body = self.encode_object_body(body)?;
+        let key = self.base.clone().join(name.as_str());
+        match self
+            .store
+            .put_opts(
+                &key,
+                PutPayload::from(body),
+                PutOptions {
+                    mode: PutMode::Create,
+                    ..Default::default()
+                },
+            )
+            .await
+        {
+            Ok(_) => {}
+            // Same name, same range, same bytes: the object is already the one this PUT would
+            // have written. Recovery ran before the first PUT, so reaching this arm means a
+            // repeat within the run rather than an unrecovered earlier one.
+            Err(ObjectStoreError::AlreadyExists { .. }) => {}
+            Err(error) => {
+                return Err(classify_put_error(
+                    error,
+                    format!("object-store put by source position '{key}'"),
+                ));
+            }
+        }
+        self.covered_ranges
+            .lock()
+            .await
+            .insert(source.clone(), start, end)
+            .map_err(PublisherError::NonRetryable)
     }
 }
 
@@ -447,8 +556,8 @@ impl MessagePublisher for ObjectStorePublisher {
         if messages.is_empty() {
             return Ok(SentBatch::Ack);
         }
-        if self.idempotency {
-            return self.send_batch_idempotent(messages).await;
+        if self.name_by == NameBy::SourcePosition {
+            return self.send_batch_by_source_position(messages).await;
         }
         let mut body = Vec::new();
         let mut failed = Vec::new();
@@ -937,6 +1046,7 @@ mod tests {
     use crate::support::source_ranges::SourcePartition;
     use crate::traits::{MessageConsumer, MessagePublisher};
     use object_store::memory::InMemory;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// Key an idempotent write lands on, derived rather than spelled out: the part-name
     /// format is pinned by the `source_ranges` tests, not by these.
@@ -1029,8 +1139,9 @@ mod tests {
             crypto: None,
             date_partition: false,
             extension: "jsonl".to_string(),
-            idempotency: false,
+            name_by: NameBy::WriteTime,
             covered_ranges: Arc::new(Mutex::new(CoveredRanges::default())),
+            recovered: Arc::new(tokio::sync::OnceCell::new()),
             keys: Arc::new(StdMutex::new(SequentialGenerator::new())),
         }
     }
@@ -1147,6 +1258,201 @@ mod tests {
         }
     }
 
+    /// Counts `list` calls, so a test can pin how often recovery scans the prefix.
+    #[derive(Debug)]
+    struct CountingStore {
+        inner: InMemory,
+        lists: Arc<AtomicUsize>,
+    }
+
+    impl std::fmt::Display for CountingStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "CountingStore")
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for CountingStore {
+        async fn put_opts(
+            &self,
+            location: &ObjPath,
+            payload: PutPayload,
+            opts: PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &ObjPath,
+            opts: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &ObjPath,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: futures::stream::BoxStream<'static, object_store::Result<ObjPath>>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<ObjPath>> {
+            self.inner.delete_stream(locations)
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&ObjPath>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.lists.fetch_add(1, Ordering::SeqCst);
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&ObjPath>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &ObjPath,
+            to: &ObjPath,
+            options: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    /// `list` fails, `put` works. `permanent` picks whether the failure is one retrying can
+    /// ever clear.
+    #[derive(Debug)]
+    struct UnlistableStore {
+        inner: InMemory,
+        permanent: bool,
+        lists: Arc<AtomicUsize>,
+    }
+
+    impl std::fmt::Display for UnlistableStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "UnlistableStore")
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for UnlistableStore {
+        async fn put_opts(
+            &self,
+            location: &ObjPath,
+            payload: PutPayload,
+            opts: PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &ObjPath,
+            opts: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &ObjPath,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: futures::stream::BoxStream<'static, object_store::Result<ObjPath>>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<ObjPath>> {
+            self.inner.delete_stream(locations)
+        }
+
+        fn list(
+            &self,
+            _prefix: Option<&ObjPath>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.lists.fetch_add(1, Ordering::SeqCst);
+            let permanent = self.permanent;
+            futures::stream::once(async move {
+                Err(if permanent {
+                    ObjectStoreError::PermissionDenied {
+                        path: "data".to_string(),
+                        source: "listing denied".into(),
+                    }
+                } else {
+                    ObjectStoreError::Generic {
+                        store: "UnlistableStore",
+                        source: "listing unavailable".into(),
+                    }
+                })
+            })
+            .boxed()
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&ObjPath>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &ObjPath,
+            to: &ObjPath,
+            options: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    /// Recovery is an optimisation and runs only once a PUT reported the object already on the
+    /// store, so a bucket that denies `ListObjects` must cost throughput, not the batch. The
+    /// old code propagated the listing error and failed a replay whose data was already safe.
+    #[tokio::test]
+    async fn a_replay_survives_a_prefix_it_may_not_list() {
+        let store: Arc<dyn ObjectStore> = Arc::new(UnlistableStore {
+            inner: InMemory::new(),
+            permanent: false,
+            lists: Arc::new(AtomicUsize::new(0)),
+        });
+        let mut publisher = test_publisher(store.clone());
+        publisher.name_by = NameBy::SourcePosition;
+
+        let batch = || vec![kafka_message(0), kafka_message(1)];
+        assert!(matches!(
+            publisher.send_batch(batch()).await.unwrap(),
+            SentBatch::Ack
+        ));
+
+        // Same offsets again, on a fresh publisher so nothing is remembered in-process. The
+        // listing it wants before writing is the one this store refuses.
+        let mut replay = test_publisher(store.clone());
+        replay.name_by = NameBy::SourcePosition;
+        assert!(
+            matches!(replay.send_batch(batch()).await.unwrap(), SentBatch::Ack),
+            "a failed prefix listing must not fail a batch that is already on the store"
+        );
+        assert!(
+            !replay.recovered.initialized(),
+            "a failed recovery must stay retryable"
+        );
+    }
+
     /// The idempotent path must not trade the worker pool for its ordering guarantee. Naming
     /// objects by source range is what makes concurrent writes safe, so the range bookkeeping
     /// may only be locked around the map itself — never around the encode and the PUT, which
@@ -1155,17 +1461,20 @@ mod tests {
     async fn idempotent_sends_are_not_serialised_by_the_covered_range_lock() {
         let store = Arc::new(BarrierStore::new(2));
         let mut publisher = test_publisher(store);
-        publisher.idempotency = true;
+        publisher.name_by = NameBy::SourcePosition;
         let other = publisher.clone();
 
         // Disjoint offset runs, so both batches genuinely write and neither is skipped.
         let first = tokio::spawn(async move {
             publisher
-                .send_batch_idempotent(vec![kafka_message(0)])
+                .send_batch_by_source_position(vec![kafka_message(0)])
                 .await
         });
-        let second =
-            tokio::spawn(async move { other.send_batch_idempotent(vec![kafka_message(1)]).await });
+        let second = tokio::spawn(async move {
+            other
+                .send_batch_by_source_position(vec![kafka_message(1)])
+                .await
+        });
 
         let sends = async {
             first.await.unwrap().unwrap();
@@ -1186,7 +1495,7 @@ mod tests {
 
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let mut publisher = test_publisher(store.clone());
-        publisher.idempotency = true;
+        publisher.name_by = NameBy::SourcePosition;
         // Raw writes the payload verbatim, so a record read back is the source row itself.
         publisher.format = FileFormat::Raw;
 
@@ -1225,11 +1534,171 @@ mod tests {
         assert_eq!(replayed, (0..BATCHES * 2).collect::<Vec<_>>());
     }
 
+    /// Recovery is an optimisation, not a correctness requirement, so it must not cost a
+    /// prefix-wide LIST on the common path: writing into a fresh prefix never triggers it.
+    /// Recovery has to run before the first write, so it can no longer be free on a fresh
+    /// prefix — but it must stay *one* listing per publisher rather than one per batch.
+    #[tokio::test]
+    async fn a_prefix_is_listed_once_per_publisher() {
+        let lists = Arc::new(AtomicUsize::new(0));
+        let store: Arc<dyn ObjectStore> = Arc::new(CountingStore {
+            inner: InMemory::new(),
+            lists: lists.clone(),
+        });
+        let mut publisher = test_publisher(store.clone());
+        publisher.name_by = NameBy::SourcePosition;
+        for offset in 0..8 {
+            publisher
+                .send_batch(vec![kafka_message(offset)])
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            lists.load(Ordering::SeqCst),
+            1,
+            "eight batches must share one listing, not pay for one each"
+        );
+
+        let mut written = store.list(Some(&ObjPath::from("data")));
+        let mut count = 0;
+        while written.next().await.is_some() {
+            count += 1;
+        }
+        assert_eq!(count, 8, "an empty prefix must not filter anything out");
+    }
+
+    /// Recovery now runs on every batch until it succeeds, so a bucket that will never allow
+    /// `ListObjects` must not pay a failed round trip and a warning per batch for the life of
+    /// the route.
+    #[tokio::test]
+    async fn a_permanently_denied_listing_is_only_attempted_once() {
+        let lists = Arc::new(AtomicUsize::new(0));
+        let store: Arc<dyn ObjectStore> = Arc::new(UnlistableStore {
+            inner: InMemory::new(),
+            permanent: true,
+            lists: lists.clone(),
+        });
+        let mut publisher = test_publisher(store.clone());
+        publisher.name_by = NameBy::SourcePosition;
+        for offset in 0..5 {
+            publisher
+                .send_batch(vec![kafka_message(offset)])
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            lists.load(Ordering::SeqCst),
+            1,
+            "a listing that is denied outright must not be retried per batch"
+        );
+        for offset in 0..5u64 {
+            assert!(
+                store.get(&part_key(offset, offset, "jsonl")).await.is_ok(),
+                "the sink must keep writing without the listing"
+            );
+        }
+    }
+
+    /// The replay that the collision-triggered recovery got wrong: a restart whose batches
+    /// fall on different boundaries names different objects, so not one PUT collides and
+    /// nothing would ever ask for the listing. Every record would then be written a second
+    /// time under a name that overlaps the first run's without matching it.
+    #[tokio::test]
+    async fn a_replay_on_shifted_batch_boundaries_writes_nothing_twice() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+
+        let mut first = test_publisher(store.clone());
+        first.name_by = NameBy::SourcePosition;
+        for chunk in [[0, 1], [2, 3], [4, 5]] {
+            first
+                .send_batch(chunk.map(kafka_message).to_vec())
+                .await
+                .unwrap();
+        }
+
+        // The same six offsets, re-read in threes. No name in common with the run above.
+        let mut replay = test_publisher(store.clone());
+        replay.name_by = NameBy::SourcePosition;
+        for chunk in [[0, 1, 2], [3, 4, 5]] {
+            replay
+                .send_batch(chunk.map(kafka_message).to_vec())
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(
+            keys(store.as_ref()).await,
+            vec![
+                "data/part-orders-0000000000-00000000000000000000-00000000000000000001.jsonl",
+                "data/part-orders-0000000000-00000000000000000002-00000000000000000003.jsonl",
+                "data/part-orders-0000000000-00000000000000000004-00000000000000000005.jsonl",
+            ],
+            "the replay must add no object; before the fix it added three that overlap these"
+        );
+    }
+
+    /// Sorted keys under the test prefix.
+    async fn keys(store: &dyn ObjectStore) -> Vec<String> {
+        let mut stream = store.list(Some(&ObjPath::from("data")));
+        let mut names = Vec::new();
+        while let Some(item) = stream.next().await {
+            names.push(item.unwrap().location.to_string());
+        }
+        names.sort();
+        names
+    }
+
+    /// A restart into a prefix that already holds parts recovers exactly once, before its
+    /// first write, and then skips the rest of the replay without rewriting anything.
+    #[tokio::test]
+    async fn a_replay_recovers_once_and_then_skips() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let mut first = test_publisher(store.clone());
+        first.name_by = NameBy::SourcePosition;
+        first
+            .send_batch(vec![kafka_message(0), kafka_message(1)])
+            .await
+            .unwrap();
+
+        // A restarted publisher starts with no knowledge of the prefix at all.
+        let mut restarted = test_publisher(store.clone());
+        restarted.name_by = NameBy::SourcePosition;
+        restarted
+            .send_batch(vec![kafka_message(0), kafka_message(1)])
+            .await
+            .unwrap();
+        assert!(
+            restarted.recovered.initialized(),
+            "a populated prefix must be recovered before it is written to"
+        );
+
+        // The replayed offsets are now known covered, so the next batch writes only the new one.
+        restarted
+            .send_batch(vec![kafka_message(0), kafka_message(1), kafka_message(2)])
+            .await
+            .unwrap();
+        let mut stream = store.list(Some(&ObjPath::from("data")));
+        let mut names = Vec::new();
+        while let Some(item) = stream.next().await {
+            names.push(item.unwrap().location.to_string());
+        }
+        names.sort();
+        assert_eq!(
+            names,
+            vec![
+                "data/part-orders-0000000000-00000000000000000000-00000000000000000001.jsonl"
+                    .to_string(),
+                "data/part-orders-0000000000-00000000000000000002-00000000000000000002.jsonl"
+                    .to_string(),
+            ]
+        );
+    }
+
     #[tokio::test]
     async fn idempotent_sink_recovers_finalized_objects_and_leaves_foreign_keys_alone() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let mut publisher = test_publisher(store.clone());
-        publisher.idempotency = true;
+        publisher.name_by = NameBy::SourcePosition;
         publisher
             .send_batch(vec![kafka_message(0), kafka_message(1)])
             .await
@@ -1247,9 +1716,9 @@ mod tests {
             .await
             .unwrap();
         let mut restarted = test_publisher(store.clone());
-        restarted.idempotency = true;
+        restarted.name_by = NameBy::SourcePosition;
         restarted.covered_ranges = Arc::new(Mutex::new(
-            recover_idempotent_object_ranges(store.as_ref(), &restarted.base, "jsonl")
+            recover_finalized_object_ranges(store.as_ref(), &restarted.base, "jsonl")
                 .await
                 .unwrap(),
         ));
@@ -1291,12 +1760,12 @@ mod tests {
             .unwrap();
 
         let base = ObjPath::from("data");
-        let covered = recover_idempotent_object_ranges(store.as_ref(), &base, "jsonl")
+        let covered = recover_finalized_object_ranges(store.as_ref(), &base, "jsonl")
             .await
             .unwrap();
 
         let mut publisher = test_publisher(store.clone());
-        publisher.idempotency = true;
+        publisher.name_by = NameBy::SourcePosition;
         publisher.covered_ranges = Arc::new(Mutex::new(covered));
         publisher
             .send_batch(vec![kafka_message(0), kafka_message(1)])
@@ -1323,7 +1792,7 @@ mod tests {
             .unwrap();
 
         let mut publisher = test_publisher(store.clone());
-        publisher.idempotency = true;
+        publisher.name_by = NameBy::SourcePosition;
         publisher
             .send_batch(vec![kafka_message(0), kafka_message(1)])
             .await
@@ -1334,12 +1803,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn idempotency_overrides_date_partition_rather_than_rejecting_it() {
-        // `date_partition` defaults to true, so erroring would reject every default config.
+    async fn source_position_overrides_date_partition_rather_than_rejecting_it() {
+        // `auto` resolves to source_position on most ETL inputs, so erroring here would
+        // reject configs that never asked for the two to be combined.
         let publisher = ObjectStorePublisher::new(&ObjectStoreConfig {
             url: "memory:///data".to_string(),
-            idempotency: true,
-            date_partition: true,
+            name_by: NameBy::SourcePosition,
+            date_partition: Some(true),
             ..Default::default()
         })
         .await
@@ -1352,7 +1822,7 @@ mod tests {
     async fn idempotent_parts_are_compressed_and_named_for_it() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let mut publisher = test_publisher(store.clone());
-        publisher.idempotency = true;
+        publisher.name_by = NameBy::SourcePosition;
         publisher.compression = Compression::Gzip;
         publisher.extension = extension_for(&FileFormat::Json, Compression::Gzip, false);
         publisher
@@ -1369,11 +1839,11 @@ mod tests {
 
         // A restart parses the longer extension back out, so covered offsets are not rewritten.
         let recovered =
-            recover_idempotent_object_ranges(store.as_ref(), &publisher.base, "jsonl.gz")
+            recover_finalized_object_ranges(store.as_ref(), &publisher.base, "jsonl.gz")
                 .await
                 .unwrap();
         let mut restarted = test_publisher(store.clone());
-        restarted.idempotency = true;
+        restarted.name_by = NameBy::SourcePosition;
         restarted.compression = Compression::Gzip;
         restarted.extension = publisher.extension.clone();
         restarted.covered_ranges = Arc::new(Mutex::new(recovered));

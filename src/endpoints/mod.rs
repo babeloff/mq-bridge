@@ -54,7 +54,7 @@ pub use crate::endpoints::structural::{
 };
 use crate::middleware::apply_middlewares_to_consumer;
 use crate::models::{
-    Endpoint, EndpointType, MemoryConfig, Middleware, ResponseConfig, StreamBufferConfig,
+    Endpoint, EndpointType, MemoryConfig, Middleware, NameBy, ResponseConfig, StreamBufferConfig,
 };
 use crate::route::get_endpoint_factory;
 use crate::traits::{BoxFuture, MessageConsumer, MessagePublisher};
@@ -533,7 +533,7 @@ fn check_consumer_recursive(
             if cfg.extension.is_some() {
                 warnings.push("Endpoint 'object_store' is used as a consumer, but 'extension' is a publisher-only option and will be ignored.".to_string());
             }
-            if cfg.date_partition {
+            if cfg.date_partition.is_some() {
                 warnings.push("Endpoint 'object_store' is used as a consumer, but 'date_partition' is a publisher-only option and will be ignored.".to_string());
             }
             Ok(warnings)
@@ -673,9 +673,7 @@ pub async fn create_consumer_from_route_with_source_metadata(
     let resolved_endpoint = resolve_endpoint(endpoint, route_name)?;
     check_consumer(route_name, &resolved_endpoint, None)?;
     if source_metadata_required && !supports_source_metadata(&resolved_endpoint.endpoint_type) {
-        return Err(anyhow!(
-            "[route:{route_name}] idempotent file/object_store output requires an input that carries a replay position: kafka, postgres_cdc, sqlx, mongodb (change stream) or file"
-        ));
+        return Err(source_position_unavailable(route_name));
     }
     let source_metadata =
         source_metadata_required || source_metadata_requested(&resolved_endpoint.endpoint_type);
@@ -683,11 +681,36 @@ pub async fn create_consumer_from_route_with_source_metadata(
     apply_middlewares_to_consumer(consumer, &resolved_endpoint, route_name).await
 }
 
+fn source_position_unavailable(route_name: &str) -> anyhow::Error {
+    anyhow!(
+        "[route:{route_name}] 'name_by: source_position' on a file/object_store output requires an input that carries a replay position: kafka, postgres_cdc, sqlx, mongodb (change stream) or file"
+    )
+}
+
+/// Rejects a `name_by: source_position` output whose input cannot stamp one. The same check
+/// guards [`create_consumer_from_route_with_source_metadata`]; running it first keeps a route
+/// that is about to be rejected from opening the sink, which for `file` would create the part
+/// directory at `path`.
+pub(crate) fn check_source_position_available(
+    route_name: &str,
+    input: &Endpoint,
+    source_metadata_required: bool,
+) -> Result<()> {
+    if !source_metadata_required {
+        return Ok(());
+    }
+    let resolved = resolve_endpoint(input, route_name)?;
+    if !supports_source_metadata(&resolved.endpoint_type) {
+        return Err(source_position_unavailable(route_name));
+    }
+    Ok(())
+}
+
 /// Sources whose `mqb.src.*` keys [`SourcePosition`](crate::support::source_ranges::SourcePosition)
 /// can turn into a replay position. NATS and AMQP also emit provenance under `source_metadata`,
 /// but a routing key is not a replayable offset, so they do not belong here — admitting them
 /// would start the route and then fail on the first message.
-fn supports_source_metadata(endpoint_type: &EndpointType) -> bool {
+pub(crate) fn supports_source_metadata(endpoint_type: &EndpointType) -> bool {
     matches!(
         endpoint_type,
         EndpointType::Kafka(_) | EndpointType::PostgresCdc(_)
@@ -725,26 +748,35 @@ fn source_metadata_requested(endpoint_type: &EndpointType) -> bool {
     }
 }
 
-/// Whether a route's resolved output contains an idempotent file or object-store sink.
-pub fn output_requires_source_metadata(route_name: &str, endpoint: &Endpoint) -> Result<bool> {
-    output_has_sink(route_name, endpoint, &|endpoint_type| match endpoint_type {
-        EndpointType::File(config) => config.idempotency,
-        EndpointType::ObjectStore(config) => config.idempotency,
-        _ => false,
+/// Whether a route's resolved output contains a sink that names what it writes after the
+/// source position, and therefore needs the input to stamp one.
+pub fn output_requires_source_metadata(
+    route_name: &str,
+    endpoint: &Endpoint,
+    source_has_position: bool,
+) -> Result<bool> {
+    output_has_sink(route_name, endpoint, &|endpoint_type| {
+        let name_by = match endpoint_type {
+            EndpointType::File(config) => config.resolved_name_by(source_has_position),
+            EndpointType::ObjectStore(config) => config.resolved_name_by(source_has_position),
+            _ => return false,
+        };
+        name_by == NameBy::SourcePosition
     })
 }
 
-/// Whether a route's resolved output contains an object-store sink that names objects in
-/// write order. Key order is the only order a bucket has, and above `concurrency: 1` write
-/// order is worker arrival order rather than source order.
-pub fn output_has_write_ordered_object_store(
+/// Whether a route's resolved output contains an object-store sink that names objects by write
+/// time. Key order is the only order a bucket has, and above `concurrency: 1` write order is
+/// worker arrival order rather than source order.
+pub fn output_has_write_time_named_object_store(
     route_name: &str,
     endpoint: &Endpoint,
+    source_has_position: bool,
 ) -> Result<bool> {
     output_has_sink(
         route_name,
         endpoint,
-        &|endpoint_type| matches!(endpoint_type, EndpointType::ObjectStore(config) if !config.idempotency),
+        &|endpoint_type| matches!(endpoint_type, EndpointType::ObjectStore(config) if config.resolved_name_by(source_has_position) == NameBy::WriteTime),
     )
 }
 
@@ -1679,18 +1711,38 @@ fn check_publisher_recursive(
 }
 
 /// Creates a `MessagePublisher` based on the route's "out" configuration.
+///
+/// Sinks that name what they write after the source position need to know whether the input
+/// can supply one; without a route there is no input, so `name_by: auto` resolves to
+/// `write_time`. Use [`create_publisher_from_route_with_source_position`] inside a route.
 pub async fn create_publisher_from_route(
     route_name: &str,
     endpoint: &Endpoint,
 ) -> Result<Arc<dyn MessagePublisher>> {
+    create_publisher_from_route_with_source_position(route_name, endpoint, false).await
+}
+
+/// Creates a route publisher, telling it whether the route's input stamps a replay position.
+pub async fn create_publisher_from_route_with_source_position(
+    route_name: &str,
+    endpoint: &Endpoint,
+    source_has_position: bool,
+) -> Result<Arc<dyn MessagePublisher>> {
     check_publisher(route_name, endpoint, None)?;
-    create_publisher_with_depth(route_name.to_string(), endpoint.clone(), 0).await
+    create_publisher_with_depth(
+        route_name.to_string(),
+        endpoint.clone(),
+        0,
+        source_has_position,
+    )
+    .await
 }
 
 fn create_publisher_with_depth(
     route_name: String,
     endpoint: Endpoint,
     depth: usize,
+    source_has_position: bool,
 ) -> BoxFuture<'static, Result<Arc<dyn MessagePublisher>>> {
     Box::pin(async move {
         const MAX_DEPTH: usize = 16;
@@ -1738,10 +1790,17 @@ fn create_publisher_with_depth(
                 merged.handler = endpoint.handler;
             }
 
-            return create_publisher_with_depth(route_name, merged, depth + 1).await;
+            return create_publisher_with_depth(route_name, merged, depth + 1, source_has_position)
+                .await;
         }
 
-        let publisher = create_base_publisher(&route_name, &endpoint.endpoint_type, depth).await?;
+        let publisher = create_base_publisher(
+            &route_name,
+            &endpoint.endpoint_type,
+            depth,
+            source_has_position,
+        )
+        .await?;
         let publisher =
             crate::middleware::apply_middlewares_to_publisher(publisher, &endpoint, &route_name)
                 .await?;
@@ -1775,6 +1834,7 @@ async fn create_base_publisher(
     route_name: &str,
     endpoint_type: &EndpointType,
     depth: usize,
+    source_has_position: bool,
 ) -> Result<Box<dyn MessagePublisher>> {
     let publisher = match endpoint_type {
         #[cfg(feature = "aws")]
@@ -1851,6 +1911,7 @@ async fn create_base_publisher(
                             route_name.to_string(),
                             stream_response_to.clone(),
                             depth + 1,
+                            source_has_position,
                         )
                         .await?,
                     )
@@ -1876,12 +1937,17 @@ async fn create_base_publisher(
             Ok(Box::new(mongodb::MongoDbPublisher::new(&config).await?)
                 as Box<dyn MessagePublisher>)
         }
-        EndpointType::File(cfg) => {
-            Ok(Box::new(file::FilePublisher::new(cfg).await?) as Box<dyn MessagePublisher>)
-        }
+        EndpointType::File(cfg) => Ok(Box::new(
+            file::FilePublisher::new_with_name_by(cfg, cfg.resolved_name_by(source_has_position))
+                .await?,
+        ) as Box<dyn MessagePublisher>),
         #[cfg(feature = "object-store")]
         EndpointType::ObjectStore(cfg) => Ok(Box::new(
-            object_store::ObjectStorePublisher::new(cfg).await?,
+            object_store::ObjectStorePublisher::new_with_name_by(
+                cfg,
+                cfg.resolved_name_by(source_has_position),
+            )
+            .await?,
         ) as Box<dyn MessagePublisher>),
         EndpointType::Static(cfg) => Ok(Box::new(static_endpoint::StaticEndpointPublisher::new(
             cfg,
@@ -1910,6 +1976,7 @@ async fn create_base_publisher(
                     route_name.to_string(),
                     endpoint.clone(),
                     depth + 1,
+                    source_has_position,
                 )
                 .await?;
                 publishers.push(p);
@@ -1923,6 +1990,7 @@ async fn create_base_publisher(
                     route_name.to_string(),
                     endpoint.clone(),
                     depth + 1,
+                    source_has_position,
                 )
                 .await?;
                 cases.insert(key.clone(), p);
@@ -1933,6 +2001,7 @@ async fn create_base_publisher(
                         route_name.to_string(),
                         (**endpoint).clone(),
                         depth + 1,
+                        source_has_position,
                     )
                     .await?,
                 )
@@ -1953,13 +2022,18 @@ async fn create_base_publisher(
             Ok(Box::new(reader::ReaderPublisher::new(consumer)) as Box<dyn MessagePublisher>)
         }
         EndpointType::Request(cfg) => {
-            let request =
-                create_publisher_with_depth(route_name.to_string(), (*cfg.to).clone(), depth + 1)
-                    .await?;
+            let request = create_publisher_with_depth(
+                route_name.to_string(),
+                (*cfg.to).clone(),
+                depth + 1,
+                source_has_position,
+            )
+            .await?;
             let forward = create_publisher_with_depth(
                 route_name.to_string(),
                 (*cfg.forward_to).clone(),
                 depth + 1,
+                source_has_position,
             )
             .await?;
             Ok(
@@ -2009,15 +2083,19 @@ mod tests {
     use crate::models::{Endpoint, EndpointType};
     use crate::CanonicalMessage;
 
+    fn file_named_by(name_by: NameBy) -> Endpoint {
+        let mut config = crate::models::FileConfig::new("/tmp/parts");
+        config.name_by = name_by;
+        Endpoint::new(EndpointType::File(config))
+    }
+
     #[test]
-    fn idempotent_output_requires_source_metadata_through_fanout_and_switch() {
+    fn source_position_output_requires_source_metadata_through_fanout_and_switch() {
         let ordinary = Endpoint::new_memory("ordinary", 1);
-        let mut idempotent_file = crate::models::FileConfig::new("/tmp/idempotent.jsonl");
-        idempotent_file.idempotency = true;
-        let file = Endpoint::new(EndpointType::File(idempotent_file));
+        let file = file_named_by(NameBy::SourcePosition);
 
         let fanout = Endpoint::new(EndpointType::Fanout(vec![ordinary.clone(), file.clone()]));
-        assert!(output_requires_source_metadata("test", &fanout).unwrap());
+        assert!(output_requires_source_metadata("test", &fanout, false).unwrap());
 
         let mut cases = std::collections::HashMap::new();
         cases.insert("archive".to_string(), file);
@@ -2026,19 +2104,61 @@ mod tests {
             cases,
             default: Some(Box::new(ordinary)),
         }));
-        assert!(output_requires_source_metadata("test", &switch).unwrap());
+        assert!(output_requires_source_metadata("test", &switch, false).unwrap());
     }
 
-    /// Only a write-ordered object store is worth warning about: an idempotent one names
-    /// objects by source position, so concurrency cannot reorder them.
+    /// `auto` is what almost every config carries, so the traversal has to resolve it rather
+    /// than treat it as "not source-positioned".
     #[cfg(feature = "object-store")]
     #[test]
-    fn write_ordered_object_store_is_detected_through_the_output_tree() {
-        fn bucket(idempotency: bool) -> Endpoint {
+    fn auto_naming_follows_what_the_input_can_stamp() {
+        let bucket = Endpoint::new(EndpointType::ObjectStore(
+            crate::models::ObjectStoreConfig {
+                url: "s3://bucket/data".to_string(),
+                ..Default::default()
+            },
+        ));
+        let auto = Endpoint::new(EndpointType::Fanout(vec![bucket]));
+        assert!(output_requires_source_metadata("test", &auto, true).unwrap());
+        assert!(!output_requires_source_metadata("test", &auto, false).unwrap());
+
+        // An explicit choice is not second-guessed by what the input happens to offer.
+        let explicit = Endpoint::new(EndpointType::Fanout(vec![file_named_by(
+            NameBy::SourcePosition,
+        )]));
+        assert!(output_requires_source_metadata("test", &explicit, false).unwrap());
+    }
+
+    /// The file sink keeps `auto` on `write_time`: `source_position` turns `path` from a file
+    /// into a directory of parts, which is not something to derive for the operator.
+    #[test]
+    fn auto_naming_never_turns_a_file_sink_into_part_files() {
+        let auto = Endpoint::new(EndpointType::Fanout(vec![file_named_by(NameBy::Auto)]));
+        assert!(!output_requires_source_metadata("test", &auto, true).unwrap());
+    }
+
+    /// The deprecated `idempotency` alias still decides while `name_by` is `auto`, and loses
+    /// to an explicit `name_by`.
+    #[test]
+    fn idempotency_alias_is_still_read_but_never_overrides_name_by() {
+        let mut config = crate::models::FileConfig::new("/tmp/parts");
+        config.idempotency = Some(true);
+        assert_eq!(config.resolved_name_by(false), NameBy::SourcePosition);
+
+        config.name_by = NameBy::WriteTime;
+        assert_eq!(config.resolved_name_by(true), NameBy::WriteTime);
+    }
+
+    /// Only a write-time-named object store is worth warning about: a source-positioned one
+    /// names objects by source position, so concurrency cannot reorder them.
+    #[cfg(feature = "object-store")]
+    #[test]
+    fn write_time_named_object_store_is_detected_through_the_output_tree() {
+        fn bucket(name_by: NameBy) -> Endpoint {
             Endpoint::new(EndpointType::ObjectStore(
                 crate::models::ObjectStoreConfig {
                     url: "s3://bucket/data".to_string(),
-                    idempotency,
+                    name_by,
                     ..Default::default()
                 },
             ))
@@ -2046,12 +2166,12 @@ mod tests {
 
         let fanout = Endpoint::new(EndpointType::Fanout(vec![
             Endpoint::new_memory("ordinary", 1),
-            bucket(false),
+            bucket(NameBy::WriteTime),
         ]));
-        assert!(output_has_write_ordered_object_store("test", &fanout).unwrap());
+        assert!(output_has_write_time_named_object_store("test", &fanout, false).unwrap());
 
-        let idempotent = Endpoint::new(EndpointType::Fanout(vec![bucket(true)]));
-        assert!(!output_has_write_ordered_object_store("test", &idempotent).unwrap());
+        let by_position = Endpoint::new(EndpointType::Fanout(vec![bucket(NameBy::SourcePosition)]));
+        assert!(!output_has_write_time_named_object_store("test", &by_position, false).unwrap());
     }
 
     /// A polling cursor is a replay position, so an idempotent sink accepts it — where a

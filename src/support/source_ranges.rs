@@ -303,6 +303,17 @@ impl CoveredRanges {
         Ok(())
     }
 
+    /// Folds another set in, keeping the merged-interval invariant. Used when a sink
+    /// recovers what is already on the store after it has begun writing.
+    pub fn merge(&mut self, other: CoveredRanges) -> Result<()> {
+        for (source, ranges) in other.ranges {
+            for (start, end) in ranges {
+                self.insert(source.clone(), start, end)?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn contains(&self, position: &SourcePosition) -> bool {
         self.ranges.get(&position.source).is_some_and(|ranges| {
             ranges
@@ -566,6 +577,42 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(offsets, vec![(1, 7), (1, 16), (2, 11)]);
+    }
+
+    /// `merge` is what folds a recovered listing into what a publisher has already written, so
+    /// it has to coalesce across the two sets rather than just concatenate them: an interval
+    /// recovered from the store that overlaps or abuts one held in memory must come out as a
+    /// single range, or `contains` reports a gap that is not there.
+    #[test]
+    fn covered_ranges_merge_coalesces_across_sets_and_keeps_partitions_apart() {
+        let source = |partition| SourcePartition {
+            topic: "orders".into(),
+            partition,
+        };
+
+        let mut covered = CoveredRanges::default();
+        covered.insert(source(0), 10, 12).unwrap();
+        covered.insert(source(0), 30, 31).unwrap();
+        covered.insert(source(1), 10, 12).unwrap();
+
+        let mut recovered = CoveredRanges::default();
+        // overlaps 10..=12, abuts 30..=31, and lands nowhere near either
+        recovered.insert(source(0), 11, 20).unwrap();
+        recovered.insert(source(0), 32, 35).unwrap();
+        recovered.insert(source(0), 50, 50).unwrap();
+        // same offsets under a different partition stay their own interval
+        recovered.insert(source(1), 40, 41).unwrap();
+
+        covered.merge(recovered).unwrap();
+
+        assert_eq!(
+            covered.ranges.get(&source(0)),
+            Some(&vec![(10, 20), (30, 35), (50, 50)])
+        );
+        assert_eq!(
+            covered.ranges.get(&source(1)),
+            Some(&vec![(10, 12), (40, 41)])
+        );
     }
 
     #[test]

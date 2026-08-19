@@ -257,13 +257,28 @@ impl FileConfig {
     pub fn new(path: impl Into<String>) -> Self {
         Self {
             path: path.into(),
-            idempotency: false,
+            name_by: NameBy::default(),
+            idempotency: None,
             mode: Some(FileConsumerMode::default()),
             delimiter: None,
             format: FileFormat::default(),
             compression: Compression::default(),
             encryption: None,
             source_metadata: false,
+        }
+    }
+
+    /// Naming scheme for this sink, with the deprecated `idempotency` alias folded in.
+    ///
+    /// `auto` never resolves to `source_position` here. The two schemes are different sink
+    /// *structures* — one appended file versus a directory of part files — so deriving part
+    /// files from the input would change what `path` means behind the operator's back. The
+    /// object-store sink writes one object per batch either way, so only its name changes and
+    /// it can safely auto-resolve. The unused argument keeps both sinks callable alike.
+    pub fn resolved_name_by(&self, _source_has_position: bool) -> NameBy {
+        match self.name_by.or_idempotency(self.idempotency) {
+            NameBy::Auto => NameBy::WriteTime,
+            explicit => explicit,
         }
     }
 
@@ -285,6 +300,20 @@ impl ObjectStoreConfig {
             url: url.into(),
             ..Default::default()
         }
+    }
+
+    /// Naming scheme for this sink, with the deprecated `idempotency` alias folded in and
+    /// `auto` resolved against the input.
+    pub fn resolved_name_by(&self, source_has_position: bool) -> NameBy {
+        self.name_by
+            .or_idempotency(self.idempotency)
+            .resolve(source_has_position)
+    }
+
+    /// Whether to prefix object keys with `YYYY/MM/DD/`. Unset means on, and the date layout
+    /// only applies to `write_time` naming — a source-range name is written flat.
+    pub fn date_partition_enabled(&self, name_by: NameBy) -> bool {
+        name_by != NameBy::SourcePosition && self.date_partition.unwrap_or(true)
     }
 
     pub fn with_checkpoint(
@@ -900,11 +929,12 @@ with_optional_setters!(KafkaConfig { with_shared => shared: bool, with_partition
 with_optional_setters!(KafkaConfig { with_producer_options => producer_options: Vec<(String, String)>, with_consumer_options => consumer_options: Vec<(String, String)> });
 with_optional_string_setters!(KafkaConfig { with_partition_key => partition_key });
 with_value_setters!(SledConfig { with_delete_after_read => delete_after_read: bool });
-with_value_setters!(FileConfig { with_idempotency => idempotency: bool, with_format => format: FileFormat, with_compression => compression: Compression });
-with_optional_setters!(FileConfig { with_encryption => encryption: EncryptionConfig });
+with_value_setters!(FileConfig { with_name_by => name_by: NameBy, with_format => format: FileFormat, with_compression => compression: Compression });
+with_optional_setters!(FileConfig { with_idempotency => idempotency: bool, with_encryption => encryption: EncryptionConfig });
 with_optional_string_setters!(FileConfig { with_delimiter => delimiter });
 
-with_value_setters!(ObjectStoreConfig { with_idempotency => idempotency: bool, with_format => format: FileFormat, with_date_partition => date_partition: bool, with_compression => compression: Compression });
+with_value_setters!(ObjectStoreConfig { with_name_by => name_by: NameBy, with_format => format: FileFormat, with_compression => compression: Compression });
+with_optional_setters!(ObjectStoreConfig { with_idempotency => idempotency: bool, with_date_partition => date_partition: bool });
 with_optional_setters!(ObjectStoreConfig { with_polling_interval_ms => polling_interval_ms: u64, with_max_object_bytes => max_object_bytes: u64, with_encryption => encryption: EncryptionConfig });
 with_optional_string_setters!(ObjectStoreConfig { with_delimiter => delimiter, with_checkpoint_store => checkpoint_store, with_cursor_id => cursor_id, with_extension => extension });
 

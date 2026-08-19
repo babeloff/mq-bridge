@@ -857,17 +857,66 @@ pub struct CompressionMiddleware {
     pub max_decompressed_bytes: Option<u64>,
 }
 
+// --- Sink object / part naming ---
+
+/// How a `file` or `object_store` sink names what it writes.
+///
+/// The name decides everything downstream: a name derived from the source position sorts by
+/// source order and repeats exactly on a replay (so a re-write is a no-op), while a name
+/// derived from the write time sorts by write order and is unique per write.
+///
+/// `auto` resolves against the input for `object_store` only. There the two schemes write the
+/// same thing under a different name, so the choice is free; on `file` they are different sink
+/// structures — one appended file versus a directory of part files — and deriving that from the
+/// input would change what `path` means without the operator asking for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub enum NameBy {
+    /// object_store: `source_position` when the input carries one, else `write_time`. file: always `write_time`.
+    #[default]
+    Auto,
+    /// `part-<source>-<start>-<end>.<ext>`. Needs a replayable input; on `file` this turns `path` into a directory.
+    SourcePosition,
+    /// object_store: `<uuidv7>.<ext>` under an optional `YYYY/MM/DD/` prefix. file: appends to `path`.
+    WriteTime,
+}
+
+impl NameBy {
+    /// Resolves `Auto` against the input's ability to stamp a replay position. Explicit
+    /// values pass through, so an unsupported source still fails where it is configured.
+    pub fn resolve(self, source_has_position: bool) -> NameBy {
+        match self {
+            NameBy::Auto if source_has_position => NameBy::SourcePosition,
+            NameBy::Auto => NameBy::WriteTime,
+            explicit => explicit,
+        }
+    }
+
+    /// Folds the deprecated `idempotency` alias in. An explicit `name_by` wins; the alias
+    /// only decides while `name_by` is still `auto`.
+    pub(crate) fn or_idempotency(self, idempotency: Option<bool>) -> NameBy {
+        match (self, idempotency) {
+            (NameBy::Auto, Some(true)) => NameBy::SourcePosition,
+            (NameBy::Auto, Some(false)) => NameBy::WriteTime,
+            (configured, _) => configured,
+        }
+    }
+}
+
 // --- File Specific Configuration ---
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct FileConfig {
-    /// Path to the file, or to the directory holding the part files when `idempotency` is true.
+    /// Path to the file, or to the directory holding the part files under `source_position` naming.
     pub path: String,
-    /// Write replay-safe source ranges as immutable part files under this directory.
-    /// Requires a source that stamps a replayable position: kafka, postgres_cdc, mongodb CDC, sqlx or file.
+    /// (Sink only) `write_time` (default here, appends to `path`) or `source_position` (replay-safe part files, `path` is their directory).
     #[serde(default)]
-    pub idempotency: bool,
+    pub name_by: NameBy,
+    /// Deprecated: use `name_by`. true = `source_position`, false = `write_time`; ignored when `name_by` is set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency: Option<bool>,
     /// Optional delimiter for messages. Defaults to newline ("\n").
     /// Can be a string or a hex sequence (e.g. "0x00").
     /// Currently only single-byte delimiters are supported.
@@ -935,7 +984,7 @@ pub enum FileConsumerMode {
 /// are listed in key order, fetched, split by `delimiter`, and emitted as messages;
 /// progress is persisted to `checkpoint_store` (the last processed object key) so a
 /// restart resumes without re-emitting. Objects are never mutated or deleted in place.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct ObjectStoreConfig {
     /// Object-store URL, e.g. `s3://bucket/prefix`, `gs://bucket/prefix`,
@@ -943,10 +992,12 @@ pub struct ObjectStoreConfig {
     /// the `object_store` crate (same mechanism as the checkpoint backend); R2 uses
     /// `s3://` plus a custom `AWS_ENDPOINT_URL`.
     pub url: String,
-    /// Write replay-safe source ranges as immutable objects instead of UUID-named objects.
-    /// Requires Kafka source metadata or postgres_cdc commit LSN plus transaction ordinal metadata.
+    /// (Sink only) `auto`, `write_time` (uuidv7 name) or `source_position` (name carries the source range).
     #[serde(default)]
-    pub idempotency: bool,
+    pub name_by: NameBy,
+    /// Deprecated: use `name_by`. true = `source_position`, false = `write_time`; ignored when `name_by` is set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency: Option<bool>,
     /// Record encoding within an object, shared with the file endpoint. Defaults to
     /// `normal` (one JSON `CanonicalMessage` per line). CSV is supported for sources only.
     #[serde(default)]
@@ -967,10 +1018,10 @@ pub struct ObjectStoreConfig {
     /// larger than this fails the read (surfaced as a consumer error) instead of being
     /// buffered whole. Unset means no limit (the whole object is materialized).
     pub max_object_bytes: Option<u64>,
-    /// (Sink only) Prepend a `YYYY/MM/DD/` path (write time, UTC) to each object key. Purely
-    /// for readability / lifecycle rules — the uuidv7 name already sorts by time. Default true.
-    #[serde(default = "default_true")]
-    pub date_partition: bool,
+    /// (Sink only) Prepend a `YYYY/MM/DD/` path (write time, UTC) to each object key. Applies to
+    /// `write_time` naming only; defaults to on. Purely for readability / lifecycle rules.
+    #[serde(default)]
+    pub date_partition: Option<bool>,
     /// (Sink only) Extension for written objects, without the dot. Defaults to a value derived
     /// from `format`, `compression` and `encryption` (e.g. `jsonl`, `csv`, `bin`, `jsonl.gz`,
     /// `jsonl.lz4`, `jsonl.gz.enc`); encrypted objects get a trailing `.enc` since they are

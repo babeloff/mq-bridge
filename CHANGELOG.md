@@ -2,6 +2,93 @@
 
 All notable changes to `mq-bridge`. Newest first.
 
+## 0.4.4
+
+### Breaking
+
+- **`idempotency` on the `file` and `object_store` sinks is replaced by `name_by`.** The old
+  field described a consequence rather than the thing it set. What it actually chooses is how
+  written objects and parts are *named*, and everything else — sortability, replay dedup,
+  whether `date_partition` applies, how errors are reported — follows from that name:
+
+  | `name_by` | Name | Consequence |
+  | --- | --- | --- |
+  | `write_time` | `<uuidv7>.<ext>`, optionally under `YYYY/MM/DD/` | unique per write, sorts by write order |
+  | `source_position` | `part-<topic>-<partition>-<start>-<end>.<ext>`, zero-padded, flat | repeats exactly on a replay, sorts by source order |
+  | `auto` (new default) | `source_position` where the input carries a replay position, else `write_time` | see below |
+
+  `idempotency: true|false` is still read and still means
+  `name_by: source_position|write_time`, so v0.4.x configs keep loading. An explicit `name_by`
+  wins over it.
+
+- **An `object_store` sink now defaults to `source_position` naming over a replayable input**
+  (Kafka, Postgres CDC, a SQL cursor, a MongoDB change stream, or a file). Key order is the
+  only order a bucket has, so this is what makes `mqb copy orders.csv s3://…` come back in
+  source order at any `concurrency` without configuring anything — and it is what removed the
+  `concurrency > 1` warning from that route. Three consequences to know about:
+  - **A re-run into the same prefix writes nothing — where the source repeats its
+    positions.** The names repeat, and a repeat is a no-op. That covers a re-read of the same
+    file, Kafka offsets, a SQL cursor and a CDC stream. A file source in `subscribe` or
+    `group_subscribe` mode is the exception: it stamps a per-run epoch, so its names stay
+    distinct across runs and a re-run writes a second copy. Where the no-op does apply it is a
+    change of behaviour — the same command used to append a second copy under fresh uuid
+    names. Use a fresh prefix, or `name_by: write_time`, if you want the old behaviour. The
+    no-op also needs the prefix listing to succeed: a replay whose batches fall on different
+    boundaries names different objects, so where the listing is denied the sink can only catch
+    a repeat that lands on the exact same name and the rest is written twice.
+  - **`date_partition` does not apply** under `source_position`; parts are written flat.
+  - **Do not mix the two families in one prefix.** uuid names and `part-…` names do not sort
+    correctly against each other. A prefix written by an older version keeps working on its
+    own; point the upgraded route at a new prefix if a reader depends on listing order.
+
+- **The `file` sink stays on `write_time` under `auto`** and must be told
+  `name_by: source_position` explicitly. There, positional naming turns `path` from a file
+  into a *directory* of part files — a change of structure, not of name, and not something to
+  derive on the operator's behalf.
+
+- `object_store` `date_partition` is now `Option<bool>` (unset = on, and only for
+  `write_time`). Side effect: the "`date_partition` is a publisher-only option" warning used
+  to fire for *every* `object_store` consumer, because the field defaulted to `true` and the
+  check could not tell that from an explicit setting. It now fires only when the field was
+  actually set.
+
+### Changed
+
+- **The `object_store` sink lists its prefix only on the `source_position` write path**, and
+  only once per publisher, immediately before its first write rather than when it opens. A
+  `write_time` sink never lists at all; a `source_position` restart into a populated prefix
+  pays for exactly one `LIST` and then skips the rest of the replay without re-encoding or
+  re-uploading. The listing cannot be deferred any further than this: `PutMode::Create` only
+  catches a repeat that lands on the same object name, so a replay whose batches fall on
+  different boundaries collides with nothing and would otherwise write every record a second
+  time under overlapping names. A listing that fails is retried on the next batch, unless it
+  failed for a reason retrying cannot clear (a denied `ListObjects`), in which case the sink
+  warns once and falls back to same-name-only deduplication.
+- **The `concurrency > 1` warning now fires only for a `write_time` name**, which is the only
+  case where write order is not source order — under `auto` over a replayable input that is
+  now nobody. It names `name_by: source_position` where the input carries a replay position
+  and `concurrency: 1` otherwise, rather than pointing at a setting that would fail on an
+  input with no position.
+- The `source_position` write path reports `SentBatch::Partial` like the ordinary path does.
+  A record that cannot be encoded splits the run instead of failing the whole batch: the
+  offsets around it are written under names covering exactly what went in, and the bad record
+  goes to the DLQ. (Encode failures are unreachable in practice today; this removes an
+  asymmetry rather than fixing an observed bug.)
+
+### Fixed
+
+- A failed prefix listing no longer fails an `object_store` batch. The error was propagated as
+  non-retryable, which dropped a replay's batch on a bucket that denies `ListObjects`, or on a
+  transient listing hiccup. It is now logged and the sink degrades to same-name-only
+  deduplication: a transient failure is retried on the next batch, while a denied `ListObjects`
+  is latched after one warning and not retried.
+
+- A route rejected for `name_by: source_position` over an input that carries no replay position
+  no longer leaves a directory behind at a `file` sink's `path`. The publisher opens before the
+  consumer, and the part-file sink creates its directory as it opens, so the rejected route used
+  to turn the operator's output *file* into an empty directory — after which a corrected run
+  failed on the leftover. The requirement is now checked before any sink opens.
+
 ## 0.4.0
 
 ### Breaking

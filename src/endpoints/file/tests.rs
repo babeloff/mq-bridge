@@ -1,6 +1,6 @@
 use crate::endpoints::file::{FileConsumer, FilePublisher};
 #[allow(unused_imports)]
-use crate::models::{Compression, FileConfig, FileConsumerMode, FileFormat};
+use crate::models::{Compression, FileConfig, FileConsumerMode, FileFormat, NameBy};
 use crate::msg;
 use crate::traits::MessageConsumer;
 use crate::traits::MessagePublisher;
@@ -407,7 +407,7 @@ async fn idempotent_file_sink_replays_only_uncovered_kafka_offsets_after_restart
     let output = dir.path().join("parts");
     let config = FileConfig {
         path: output.to_string_lossy().into_owned(),
-        idempotency: true,
+        name_by: NameBy::SourcePosition,
         ..Default::default()
     };
     let publisher = FilePublisher::new(&config).await.unwrap();
@@ -477,7 +477,7 @@ async fn idempotent_file_parts_are_compressed_and_named_for_it() {
     let output = dir.path().join("parts");
     let config = FileConfig {
         path: output.to_string_lossy().into_owned(),
-        idempotency: true,
+        name_by: NameBy::SourcePosition,
         compression: crate::models::Compression::Gzip,
         ..Default::default()
     };
@@ -527,7 +527,7 @@ async fn idempotent_file_sink_rejects_records_without_source_metadata() {
     let output = dir.path().join("parts");
     let config = FileConfig {
         path: output.to_string_lossy().into_owned(),
-        idempotency: true,
+        name_by: NameBy::SourcePosition,
         ..Default::default()
     };
     let publisher = FilePublisher::new(&config).await.unwrap();
@@ -568,7 +568,7 @@ async fn file_source_metadata_numbers_records_and_feeds_an_idempotent_sink() {
     let output = dir.path().join("parts");
     let sink = FileConfig {
         path: output.to_string_lossy().into_owned(),
-        idempotency: true,
+        name_by: NameBy::SourcePosition,
         ..Default::default()
     };
     let publisher = FilePublisher::new(&sink).await.unwrap();
@@ -710,7 +710,7 @@ async fn idempotent_file_sink_replays_postgres_cdc_changes_in_one_commit() {
     let output = dir.path().join("parts");
     let config = FileConfig {
         path: output.to_string_lossy().into_owned(),
-        idempotency: true,
+        name_by: NameBy::SourcePosition,
         ..Default::default()
     };
     let publisher = FilePublisher::new(&config).await.unwrap();
@@ -747,7 +747,7 @@ async fn idempotent_file_sink_rejects_unsupported_output_formats() {
     let dir = tempdir().unwrap();
     let csv = FileConfig {
         path: dir.path().join("csv").to_string_lossy().into_owned(),
-        idempotency: true,
+        name_by: NameBy::SourcePosition,
         format: FileFormat::Csv,
         ..Default::default()
     };
