@@ -281,6 +281,7 @@ class Middleware(TypedDict, total=False):
     delay: DelayMiddleware
     dlq: DeadLetterQueueMiddleware
     encryption: EncryptionConfig
+    filter: str
     id: str
     limiter: LimiterMiddleware
     metrics: MetricsMiddleware
@@ -494,10 +495,17 @@ class StreamBufferConfig(TypedDict, total=False):
     topic: Required[str]
 
 
+class SwitchCase(TypedDict, total=False):
+    """One predicate case of a `switch` in `when` mode."""
+    if: Required[str]
+    to: Required[Endpoint]
+
+
 class SwitchConfig(TypedDict, total=False):
-    cases: Required[Dict[str, Endpoint]]
+    cases: Dict[str, Endpoint]
     default: Optional[Endpoint]
-    metadata_key: Required[str]
+    metadata_key: Optional[str]
+    when: List[SwitchCase]
 
 
 class TlsConfig(TypedDict, total=False):
@@ -515,6 +523,7 @@ class TransformMiddleware(TypedDict, total=False):
     apply_defaults: bool
     coerce: bool
     coerce_empty_as_null: bool
+    expression: Optional[str]
     mapping: Dict[str, MappingRule]
     on_error: TransformErrorPolicy
     schema: Any
