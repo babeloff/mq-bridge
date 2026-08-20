@@ -161,6 +161,11 @@ base64 = { version = "0.23" }
 # AEAD ciphers for the `encryption` feature (payload middleware + at-rest file/object).
 chacha20poly1305 = { version = "0.11", optional = true }
 aes-gcm = { version = "0.11", optional = true }
+
+# Expression VM for the `filter` feature. `regex-lite` keeps the regex engine
+# pure Rust; the default features pull a heavier one.
+zen-expression = { version = "0.55.1", optional = true, default-features = false, features = ["regex-lite"] }
+rust_decimal = { version = "1", optional = true }
 tokio-websockets = { version = "0.13", optional = true, default-features = false, features = ["client", "server", "sha1_smol", "fastrand"] }
 
 # AWS
@@ -219,7 +224,7 @@ protoc-bin-vendored = { version = "3.2", optional = true }
 
 [features]
 default = []
-middleware = ["metrics", "dedup", "compression", "encryption"]
+middleware = ["metrics", "dedup", "compression", "encryption", "filter"]
 # Opt-in: parse JSON f64 with full precision so a number round-trips bit-exactly.
 # Off by default because it slows float parsing; without it serde_json shifts ~1 ULP
 # on ~19% of 17-significant-digit doubles (e.g. a Postgres `double precision` value
@@ -249,6 +254,11 @@ compression = ["dep:flate2", "dep:lz4_flex", "dep:zstd"]
 # AEAD payload encryption: the `encryption` middleware and the at-rest
 # `encryption` field on the file/object_store endpoints.
 encryption = ["dep:chacha20poly1305", "dep:aes-gcm"]
+# Expression predicates: the `filter` middleware and the `switch` endpoint's
+# `when` cases. Kept out of `portable` because zen-expression pulls in psm,
+# whose build.rs assembles per-target stack-switching assembly.
+filter = ["zen"]
+zen = ["dep:zen-expression", "dep:rust_decimal"]
 metrics = ["dep:metrics"]
 # Load endpoints from native plugin libraries at runtime (`mq_bridge::plugin`).
 # The endpoint itself lives in its own crate and package; see docs/PLUGINS.md.

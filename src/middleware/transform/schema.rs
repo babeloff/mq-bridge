@@ -339,37 +339,3 @@ impl CompiledSchema {
             && raw.as_bytes().first() == Some(&b'"')
     }
 }
-
-/// The top-level fields of an object, borrowed from the payload: each key as written and
-/// the verbatim JSON span of its value. Keys carrying escapes cannot be borrowed, and
-/// deserialising then fails, which is exactly when the caller should fall back.
-pub(super) struct RawPairs<'a>(pub(super) Vec<(&'a str, &'a serde_json::value::RawValue)>);
-
-impl<'de> serde::Deserialize<'de> for RawPairs<'de> {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        struct PairVisitor;
-
-        impl<'de> serde::de::Visitor<'de> for PairVisitor {
-            type Value = RawPairs<'de>;
-
-            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.write_str("a JSON object")
-            }
-
-            fn visit_map<A: serde::de::MapAccess<'de>>(
-                self,
-                mut map: A,
-            ) -> Result<RawPairs<'de>, A::Error> {
-                let mut pairs = Vec::with_capacity(map.size_hint().unwrap_or(8));
-                while let Some(entry) =
-                    map.next_entry::<&'de str, &'de serde_json::value::RawValue>()?
-                {
-                    pairs.push(entry);
-                }
-                Ok(RawPairs(pairs))
-            }
-        }
-
-        deserializer.deserialize_map(PairVisitor)
-    }
-}

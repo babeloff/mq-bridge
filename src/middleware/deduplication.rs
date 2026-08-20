@@ -2,6 +2,7 @@
 //  © Copyright 2025, by Marco Mengelkoch
 //  Licensed under MIT License, see License file for more details
 //  git clone https://github.com/marcomq/mq-bridge
+use super::deferred_commit::{run_all, DeferredCommits};
 use crate::models::DeduplicationMiddleware;
 use crate::support::interpolation::CompiledTemplate;
 use crate::traits::{
@@ -402,6 +403,9 @@ pub struct DeduplicationConsumer {
     /// Compiled `key` template. `None` keys on `message_id`, which most sources
     /// regenerate per read — so a re-read of the same source dedupes nothing.
     key_template: Option<CompiledTemplate>,
+    /// Commits for batches that were entirely duplicates. See
+    /// [`crate::middleware::deferred_commit`].
+    deferred: DeferredCommits,
 }
 
 /// The dedup key for a message: the rendered `key` template, or the raw `message_id`.
@@ -456,6 +460,7 @@ impl DeduplicationConsumer {
             inner,
             store,
             key_template,
+            deferred: DeferredCommits::new(),
         })
     }
 
@@ -474,6 +479,7 @@ impl DeduplicationConsumer {
             key_template: key
                 .map(|k| CompiledTemplate::compile(k, None))
                 .transpose()?,
+            deferred: DeferredCommits::new(),
         })
     }
 }
@@ -494,12 +500,16 @@ impl MessageConsumer for DeduplicationConsumer {
     fn on_disconnect_hook(&self) -> Option<BoxFuture<'_, anyhow::Result<()>>> {
         let inner_hook = self.inner.on_disconnect_hook();
         let store = self.store.clone();
+        let held = self.deferred.take_shared();
 
         Some(Box::pin(async move {
             let mut first_error = None;
+            if let Err(err) = run_all(held).await {
+                first_error = Some(err);
+            }
             if let Some(hook) = inner_hook {
                 if let Err(err) = hook.await {
-                    first_error = Some(err);
+                    first_error.get_or_insert(err);
                 }
             }
             if let Err(err) = store.flush().await {
@@ -580,6 +590,11 @@ impl MessageConsumer for DeduplicationConsumer {
             // (see `traits::drain_gated`). Looping on it here would spin forever on
             // an already-drained source, so pass it through untouched.
             if messages.is_empty() {
+                run_all(self.deferred.take()).await.map_err(|error| {
+                    ConsumerError::Connection(error.context(
+                        "failed to flush deferred deduplication acknowledgements on drain",
+                    ))
+                })?;
                 return Ok(ReceivedBatch {
                     messages,
                     commit: inner_commit,
@@ -612,12 +627,18 @@ impl MessageConsumer for DeduplicationConsumer {
             }
 
             if filtered_messages.is_empty() {
-                if let Err(e) = inner_commit(vec![MessageDisposition::Ack; total_len]).await {
+                let ordered = self.inner.commit_requires_order();
+                if let Err(e) = self
+                    .deferred
+                    .ack_emptied(ordered, inner_commit, total_len)
+                    .await
+                {
                     warn!("Failed to commit skipped all-duplicate batch: {}", e);
                 }
                 continue;
             }
 
+            let held = self.deferred.take();
             let store = self.store.clone();
 
             let commit: crate::traits::BatchCommitFunc = Box::new(move |dispositions| {
@@ -636,6 +657,7 @@ impl MessageConsumer for DeduplicationConsumer {
                         full_dispositions[slot] = disposition;
                     }
 
+                    run_all(held).await?;
                     inner_commit(full_dispositions).await?;
 
                     let now = SystemTime::now()
@@ -1034,7 +1056,8 @@ mod tests {
     }
 
     /// A batch of nothing but duplicates must not surface as an empty batch — that is the
-    /// drain signal — so the wrapper acks them and fetches again.
+    /// drain signal — so the wrapper skips it and fetches again. On an ordered source its
+    /// ack is held back and released just before the next retained batch commits.
     #[tokio::test]
     async fn an_all_duplicate_batch_is_acked_and_retried() {
         let dir = tempdir().unwrap();
@@ -1067,9 +1090,42 @@ mod tests {
             "the all-duplicate batch is skipped and the next one delivered"
         );
         assert_eq!(
-            committed.lock().unwrap()[1],
-            vec!["ack", "ack"],
-            "every message of the skipped batch is acked"
+            committed.lock().unwrap().len(),
+            1,
+            "the skipped batch must not ack ahead of the ordered sequencer"
+        );
+
+        (second.commit)(vec![MessageDisposition::Ack])
+            .await
+            .unwrap();
+        assert_eq!(
+            committed.lock().unwrap().as_slice(),
+            [vec!["ack"], vec!["ack", "ack"], vec!["ack"]],
+            "every message of the skipped batch is acked, in front of the batch that followed it"
+        );
+    }
+
+    /// An ordered source may drain immediately after an all-duplicate batch. Its deferred
+    /// acknowledgement must be flushed even though no retained batch follows it.
+    #[tokio::test]
+    async fn a_final_all_duplicate_batch_is_acked_when_the_source_drains() {
+        let dir = tempdir().unwrap();
+        let (mut consumer, committed) = dedup_over(
+            &dir,
+            "final_all_dup",
+            vec![vec![keyed("A", 1)], vec![keyed("A", 2)]],
+        )
+        .await;
+
+        let first = consumer.receive_batch(16).await.unwrap();
+        (first.commit)(vec![MessageDisposition::Ack]).await.unwrap();
+
+        let drained = consumer.receive_batch(16).await.unwrap();
+        assert!(drained.messages.is_empty());
+        assert_eq!(
+            committed.lock().unwrap().as_slice(),
+            [vec!["ack"], vec!["ack"]],
+            "the duplicate-only final batch is acknowledged before drain returns"
         );
     }
 

@@ -6,12 +6,17 @@
 use super::coerce::{Crumb, Ty};
 use super::error::{ErrorKind, TransformError};
 use super::path::{insert_at, paths_are_disjoint, CompiledPath, CompiledRule, Seg};
-use super::schema::{CompiledSchema, RawPairs};
+use super::schema::CompiledSchema;
 use super::TRANSFORM_ERROR_KEY;
+use crate::middleware::raw_json::RawPairs;
 use crate::models::{MappingRule, TransformErrorPolicy, TransformMiddleware};
 use crate::CanonicalMessage;
 use bytes::Bytes;
 use serde_json::{Map, Value};
+#[cfg(feature = "zen")]
+use zen_expression::compiler::{FetchFastTarget, Opcode};
+#[cfg(feature = "zen")]
+use zen_expression::{compile_expression, expression::Standard, Expression, Variable};
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct Opts {
@@ -27,6 +32,10 @@ pub(super) struct Opts {
 pub(super) struct Compiled {
     /// Empty when no mapping stage is configured.
     pub(super) rules: Vec<CompiledRule>,
+    #[cfg(feature = "zen")]
+    expression: Option<Expression<Standard>>,
+    #[cfg(feature = "zen")]
+    expression_uses_metadata: bool,
     pub(super) schema: Option<CompiledSchema>,
     pub(super) opts: Opts,
     pub(super) on_error: TransformErrorPolicy,
@@ -119,6 +128,10 @@ pub(super) fn compile_projection(
 
 impl Compiled {
     pub(super) fn new(config: &TransformMiddleware) -> anyhow::Result<Self> {
+        #[cfg(not(feature = "zen"))]
+        if config.expression.is_some() {
+            anyhow::bail!("transform middleware: 'expression' requires the 'zen' Cargo feature");
+        }
         if config.schema.is_some() && config.schema_file.is_some() {
             anyhow::bail!("transform middleware: set either 'schema' or 'schema_file', not both");
         }
@@ -172,13 +185,40 @@ impl Compiled {
             apply_defaults: config.apply_defaults,
             coerce_empty_as_null: config.coerce_empty_as_null,
         };
+        #[cfg(feature = "zen")]
+        let expression = config
+            .expression
+            .as_deref()
+            .map(compile_expression)
+            .transpose()
+            .map_err(|error| {
+                anyhow::anyhow!("transform middleware: invalid expression: {error}")
+            })?;
+        #[cfg(feature = "zen")]
+        let expression_uses_metadata = expression.as_ref().is_some_and(|expression| {
+            expression.bytecode().iter().any(|opcode| match opcode {
+                Opcode::FetchEnv(name) => name.as_ref() == "meta",
+                Opcode::FetchFast(targets) => {
+                    targets.iter().find_map(|target| match target {
+                        FetchFastTarget::String(name) => Some(name.as_ref()),
+                        _ => None,
+                    }) == Some("meta")
+                }
+                _ => false,
+            })
+        });
         let fast_map = compile_projection(&rules, schema.as_ref());
         Ok(Self {
-            fast_eligible: fast_eligible(&rules, schema.as_ref(), opts) || fast_map.is_some(),
+            fast_eligible: config.expression.is_none()
+                && (fast_eligible(&rules, schema.as_ref(), opts) || fast_map.is_some()),
             take_inputs: paths_are_disjoint(&rules),
             fast_map,
             sort_keys: map_sorts_keys(),
             rules,
+            #[cfg(feature = "zen")]
+            expression,
+            #[cfg(feature = "zen")]
+            expression_uses_metadata,
             schema,
             opts,
             on_error: config.on_error,
@@ -187,7 +227,11 @@ impl Compiled {
 
     /// True when neither stage is configured; the message is then never parsed.
     pub(super) fn is_noop(&self) -> bool {
-        self.rules.is_empty() && self.schema.is_none()
+        #[cfg(feature = "zen")]
+        let no_expression = self.expression.is_none();
+        #[cfg(not(feature = "zen"))]
+        let no_expression = true;
+        self.rules.is_empty() && self.schema.is_none() && no_expression
     }
 
     fn apply_mapping(&self, input: &mut Value) -> Result<Value, TransformError> {
@@ -422,6 +466,43 @@ impl Compiled {
         } else {
             self.apply_mapping(&mut input)?
         };
+
+        #[cfg(feature = "zen")]
+        if let Some(expression) = &self.expression {
+            value.as_object().ok_or_else(|| {
+                TransformError::new(
+                    "$".to_string(),
+                    ErrorKind::Expression,
+                    "expression requires a structured JSON object payload",
+                )
+            })?;
+            let mut expression_context;
+            let expression_input = if self.expression_uses_metadata {
+                expression_context = value.clone();
+                let object = expression_context
+                    .as_object_mut()
+                    .expect("expression input was checked above");
+                object.insert(
+                    "meta".to_string(),
+                    Value::Object(
+                        message
+                            .metadata
+                            .iter()
+                            .map(|(key, value)| (key.clone(), Value::String(value.clone())))
+                            .collect(),
+                    ),
+                );
+                &expression_context
+            } else {
+                &value
+            };
+            value = expression
+                .evaluate(Variable::from(expression_input))
+                .map(Value::from)
+                .map_err(|error| {
+                    TransformError::new("$".to_string(), ErrorKind::Expression, error.to_string())
+                })?;
+        }
 
         if let Some(schema) = &self.schema {
             let mut crumbs = Vec::new();

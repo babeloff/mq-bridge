@@ -8,6 +8,8 @@ use crate::traits::PublisherError;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ErrorKind {
     Parse,
+    #[cfg(feature = "zen")]
+    Expression,
     Coercion,
     Content,
     MissingRequired,
@@ -19,6 +21,8 @@ impl ErrorKind {
     pub(super) fn as_str(self) -> &'static str {
         match self {
             ErrorKind::Parse => "parse",
+            #[cfg(feature = "zen")]
+            ErrorKind::Expression => "expression",
             ErrorKind::Coercion => "coercion",
             ErrorKind::Content => "content",
             ErrorKind::MissingRequired => "missing_required",

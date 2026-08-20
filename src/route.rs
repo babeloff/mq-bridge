@@ -7,7 +7,7 @@ use crate::endpoints::{
     check_source_position_available, create_consumer_from_route,
     create_consumer_from_route_with_source_metadata,
     create_publisher_from_route_with_source_position, output_has_write_time_named_object_store,
-    output_requires_source_metadata, supports_source_metadata,
+    output_requires_source_metadata, relax_object_naming, supports_source_metadata,
 };
 use crate::errors::ProcessingError;
 pub use crate::models::Route;
@@ -646,12 +646,12 @@ impl Route {
     /// Returns the sink mechanism that makes replayed writes idempotent, when it can be
     /// established from configuration alone. This is informational: the route remains
     /// at-least-once internally, while the observable sink result is effectively-once.
-    fn inferred_idempotency_mechanism(&self) -> Option<&'static str> {
-        if self.output.handler.is_some() {
+    fn inferred_idempotency_mechanism(&self, output: &Endpoint) -> Option<&'static str> {
+        if output.handler.is_some() {
             return None;
         }
         let source_has_position = self.source_has_position();
-        match &self.output.endpoint_type {
+        match &output.endpoint_type {
             EndpointType::MongoDb(config) if config.id_field.is_some() => {
                 Some("MongoDB unique _id")
             }
@@ -898,7 +898,15 @@ impl Route {
         for warning in warnings {
             tracing::warn!(route = name_str, "Configuration warning: {}", warning);
         }
-        if let Some(mechanism) = self.inferred_idempotency_mechanism() {
+        let relaxed_output = relax_object_naming(
+            name_str,
+            self.source_has_position(),
+            &self.input,
+            &self.output,
+        )?
+        .map(|(output, _)| output);
+        let inferred_output = relaxed_output.as_ref().unwrap_or(&self.output);
+        if let Some(mechanism) = self.inferred_idempotency_mechanism(inferred_output) {
             tracing::info!(
                 route = name_str,
                 delivery = "effectively-once",
@@ -1197,15 +1205,22 @@ impl Route {
         drops: Option<&Arc<RwLock<DropReport>>>,
     ) -> anyhow::Result<bool> {
         let source_has_position = self.source_has_position();
+        let relaxed_output;
+        let output =
+            match relax_object_naming(name, source_has_position, &self.input, &self.output)? {
+                Some((endpoint, reason)) => {
+                    warn!(route = name, "{reason}");
+                    relaxed_output = endpoint;
+                    &relaxed_output
+                }
+                None => &self.output,
+            };
         let source_metadata_required =
-            output_requires_source_metadata(name, &self.output, source_has_position)?;
+            output_requires_source_metadata(name, output, source_has_position)?;
         check_source_position_available(name, &self.input, source_metadata_required)?;
-        let publisher = create_publisher_from_route_with_source_position(
-            name,
-            &self.output,
-            source_has_position,
-        )
-        .await?;
+        let publisher =
+            create_publisher_from_route_with_source_position(name, output, source_has_position)
+                .await?;
         let mut consumer = create_consumer_from_route_with_source_metadata(
             name,
             &self.input,
@@ -1350,12 +1365,23 @@ impl Route {
         drops: Option<&Arc<RwLock<DropReport>>>,
     ) -> anyhow::Result<bool> {
         let source_has_position = self.source_has_position();
+        let relaxed_output;
+        let output =
+            match relax_object_naming(name, source_has_position, &self.input, &self.output)? {
+                Some((endpoint, reason)) => {
+                    warn!(route = name, "{reason}");
+                    relaxed_output = endpoint;
+                    &relaxed_output
+                }
+                None => &self.output,
+            };
         let source_metadata_required =
-            output_requires_source_metadata(name, &self.output, source_has_position)?;
+            output_requires_source_metadata(name, output, source_has_position)?;
         check_source_position_available(name, &self.input, source_metadata_required)?;
         // A write-time name is minted inside the worker pool, so it is arrival order here
-        // whether or not the input could have supplied a position instead.
-        if output_has_write_time_named_object_store(name, &self.output, source_has_position)? {
+        // whether or not the input could have supplied a position instead. Checked after the
+        // relaxation above, so a route it just moved onto write-time names is warned about too.
+        if output_has_write_time_named_object_store(name, output, source_has_position)? {
             warn!(
                 route = name,
                 concurrency = self.options.concurrency,
@@ -1366,12 +1392,9 @@ impl Route {
                  remedy."
             );
         }
-        let publisher = create_publisher_from_route_with_source_position(
-            name,
-            &self.output,
-            source_has_position,
-        )
-        .await?;
+        let publisher =
+            create_publisher_from_route_with_source_position(name, output, source_has_position)
+                .await?;
         let mut consumer = create_consumer_from_route_with_source_metadata(
             name,
             &self.input,
@@ -2125,7 +2148,7 @@ mod tests {
             })),
         );
         assert_eq!(
-            mongo.inferred_idempotency_mechanism(),
+            mongo.inferred_idempotency_mechanism(&mongo.output),
             Some("MongoDB unique _id")
         );
 
@@ -2139,7 +2162,7 @@ mod tests {
             })),
         );
         assert_eq!(
-            sql.inferred_idempotency_mechanism(),
+            sql.inferred_idempotency_mechanism(&sql.output),
             Some("SQL unique-key conflict handling")
         );
 
@@ -2154,14 +2177,20 @@ mod tests {
                     ..Default::default()
                 })),
             );
-            assert_eq!(updating_sql.inferred_idempotency_mechanism(), None);
+            assert_eq!(
+                updating_sql.inferred_idempotency_mechanism(&updating_sql.output),
+                None
+            );
         }
 
         let ordinary = Route::new(
             Endpoint::new_memory("delivery_in", 1),
             Endpoint::new_memory("delivery_out", 1),
         );
-        assert_eq!(ordinary.inferred_idempotency_mechanism(), None);
+        assert_eq!(
+            ordinary.inferred_idempotency_mechanism(&ordinary.output),
+            None
+        );
     }
 
     /// The object-store sink reports the mechanism it derived, so `name_by: auto` has to be
@@ -2185,13 +2214,32 @@ mod tests {
             crate::models::FileConfig::new("/tmp/orders.csv"),
         )));
         assert_eq!(
-            replayable.inferred_idempotency_mechanism(),
+            replayable.inferred_idempotency_mechanism(&replayable.output),
             Some("object names carrying the source range")
         );
 
         // Memory carries no replay position, so `auto` falls back and claims nothing.
         let positionless = route_from(Endpoint::new_memory("delivery_in", 1));
-        assert_eq!(positionless.inferred_idempotency_mechanism(), None);
+        assert_eq!(
+            positionless.inferred_idempotency_mechanism(&positionless.output),
+            None
+        );
+
+        let filtered = route_from(Endpoint {
+            middlewares: vec![Middleware::Filter("amount > 100".to_string())],
+            ..Endpoint::new(EndpointType::File(crate::models::FileConfig::new(
+                "/tmp/orders.csv",
+            )))
+        });
+        let (relaxed, _) = relax_object_naming(
+            "delivery",
+            filtered.source_has_position(),
+            &filtered.input,
+            &filtered.output,
+        )
+        .unwrap()
+        .expect("filter relaxes object naming");
+        assert_eq!(filtered.inferred_idempotency_mechanism(&relaxed), None);
     }
 
     /// A `ref` may name another `ref`. Resolving only the first hop made a chained input look

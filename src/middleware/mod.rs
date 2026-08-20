@@ -15,15 +15,20 @@ mod compression;
 mod cookie_jar;
 #[cfg(feature = "dedup")]
 pub(crate) mod deduplication;
+#[cfg(any(feature = "filter", feature = "dedup"))]
+mod deferred_commit;
 mod delay;
 mod dlq;
 #[cfg(feature = "encryption")]
 mod encryption;
+#[cfg(feature = "filter")]
+pub(crate) mod filter;
 mod id;
 mod limiter;
 #[cfg(feature = "metrics")]
 mod metrics;
 mod random_panic;
+mod raw_json;
 mod retry;
 mod transform;
 mod weak_join;
@@ -38,6 +43,8 @@ use delay::{DelayConsumer, DelayPublisher};
 use dlq::DlqPublisher;
 #[cfg(feature = "encryption")]
 use encryption::{EncryptionConsumer, EncryptionPublisher};
+#[cfg(feature = "filter")]
+use filter::{FilterConsumer, FilterPublisher};
 use id::IdConsumer;
 use limiter::{LimiterConsumer, LimiterPublisher};
 #[cfg(feature = "metrics")]
@@ -86,6 +93,8 @@ pub async fn apply_middlewares_to_consumer(
             Middleware::Encryption(cfg) => Box::new(EncryptionConsumer::new(consumer, cfg)?),
             #[cfg(feature = "compression")]
             Middleware::Compression(cfg) => Box::new(CompressionConsumer::new(consumer, cfg)),
+            #[cfg(feature = "filter")]
+            Middleware::Filter(expression) => Box::new(FilterConsumer::new(consumer, expression)?),
             Middleware::Custom { name, config } => {
                 let factory = get_middleware_factory(name).ok_or_else(|| {
                     anyhow::anyhow!("Custom middleware factory '{}' not found", name)
@@ -163,6 +172,8 @@ pub async fn apply_middlewares_to_publisher(
             Middleware::Encryption(cfg) => Box::new(EncryptionPublisher::new(publisher, cfg)?),
             #[cfg(feature = "compression")]
             Middleware::Compression(cfg) => Box::new(CompressionPublisher::new(publisher, cfg)),
+            #[cfg(feature = "filter")]
+            Middleware::Filter(expression) => Box::new(FilterPublisher::new(publisher, expression)?),
             Middleware::Custom { name, config } => {
                 let factory = get_middleware_factory(name).ok_or_else(|| {
                     anyhow::anyhow!("Custom middleware factory '{}' not found", name)

@@ -372,6 +372,9 @@ pub enum Middleware {
     Transform(TransformMiddleware),
     Encryption(EncryptionConfig),
     Compression(CompressionMiddleware),
+    /// Keeps only messages matching an expression, e.g. `filter: "amount > 100"`.
+    /// Reads payload fields by name and metadata as `meta.<key>`. Input and output.
+    Filter(String),
     Custom {
         name: String,
         config: serde_json::Value,
@@ -564,10 +567,7 @@ pub enum WeakJoinTimeout {
 
 /// JSON transform middleware configuration.
 ///
-/// Reshapes JSON payloads declaratively, in two stages over a single parse: field
-/// `mapping` (rename/move/nest), then `schema` (type coercion, defaults, validation).
-/// Either stage may be omitted; with neither configured the message passes through
-/// untouched and is never parsed.
+/// Applies `mapping`, a Zen `expression`, then an optional `schema`.
 ///
 /// On an output endpoint a rejected message becomes a non-retryable failure, so a `dlq`
 /// middleware listed *after* this one captures it (publisher middlewares are wrapped in
@@ -582,6 +582,9 @@ pub struct TransformMiddleware {
     /// Output field name -> source path (e.g. `firstName: "$.first_name"`). Dots nest the output.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub mapping: HashMap<String, MappingRule>,
+    /// Zen Expression whose result replaces the mapped payload.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expression: Option<String>,
     /// Inline JSON Schema subset (type, properties, required, default, items, nullable, enum).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schema: Option<serde_json::Value>,
@@ -1824,12 +1827,53 @@ pub struct IbmMqConfig {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct SwitchConfig {
-    /// The metadata key to inspect for routing decisions.
-    pub metadata_key: String,
-    /// A map of values to endpoints.
+    /// Value-lookup mode: the metadata key whose value picks the case.
+    #[serde(default)]
+    pub metadata_key: Option<String>,
+    /// Value-lookup mode: a map of metadata values to endpoints.
+    #[serde(default)]
     pub cases: HashMap<String, Endpoint>,
+    /// Predicate mode: ordered cases, first match wins. Needs the `filter` feature.
+    #[serde(default)]
+    pub when: Vec<SwitchCase>,
     /// The default endpoint if no case matches.
     pub default: Option<Box<Endpoint>>,
+}
+
+/// One predicate case of a `switch` in `when` mode.
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct SwitchCase {
+    /// Expression over payload fields and `meta.<key>`, e.g. `amount > 100`.
+    #[serde(rename = "if")]
+    pub condition: String,
+    /// Where a matching message goes.
+    pub to: Endpoint,
+}
+
+impl SwitchConfig {
+    /// Rejects a `switch` that names neither mode or both.
+    ///
+    /// The two modes differ in cost, not just spelling: value lookup is a
+    /// HashMap get on metadata, while a predicate may parse the payload. Mixing
+    /// them in one endpoint would hide which one a message actually took.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        let lookup = self.metadata_key.is_some() || !self.cases.is_empty();
+        let predicate = !self.when.is_empty();
+        match (lookup, predicate) {
+            (true, true) => Err(anyhow::anyhow!(
+                "switch takes either `metadata_key` + `cases` or `when`, not both"
+            )),
+            (false, false) => Err(anyhow::anyhow!(
+                "switch needs either `metadata_key` + `cases` (value lookup) or `when` (predicates)"
+            )),
+            (true, false) if self.metadata_key.is_none() => Err(anyhow::anyhow!(
+                "switch `cases` needs a `metadata_key` to look up"
+            )),
+            _ => Ok(()),
+        }
+    }
 }
 
 // --- Response Endpoint Configuration ---
