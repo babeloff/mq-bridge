@@ -649,7 +649,7 @@ another structural endpoint.
 | Name | Input | Output | Purpose |
 |---|:---:|:---:|---|
 | [`ref`](#ref) | ✅ | ✅ | Reuse an endpoint defined elsewhere by name |
-| [`fanout`](#fanout) | – | ✅ | Send every message to all listed endpoints |
+| [`fanout`](#fanout) | – | ✅ | Send every message to all listed endpoints; one may reply |
 | [`switch`](#switch) | – | ✅ | Content-based routing on a metadata key |
 | [`request`](#request) | – | ✅ | Call a request/reply endpoint, forward the response onward |
 | [`response`](#response) | – | ✅ | Reply to the origin of the current request |
@@ -707,6 +707,55 @@ output:
 The value is a plain list of endpoints, each of which may have its own middleware and may
 itself be structural. All branches receive the same message.
 
+A fan-out can also reply. If one of the branches produces a response — a
+[`response`](#response) or [`static`](#static) leg, or a [`request`](#request) whose
+`forward_to` replies — that response is returned to the caller, so a request/reply input can
+fan its message out and still answer. Branches that must not answer need a `forward_to` that
+does not reply (`{}` is the `null` endpoint, which discards).
+
+```yaml route
+# Mirror every call to staging, but answer the caller from production only.
+proxy:
+  input: { http: { url: "0.0.0.0:8443", path: "test" } }
+  output:
+    fanout:
+      - request:
+          to: { http: { url: "http://127.0.0.1:1444/" } }
+          forward_to: {}                 # discard staging's response
+      - request:
+          to: { http: { url: "http://127.0.0.1:1445/" } }
+          forward_to: { response: {} }   # only this one replies to the caller
+```
+
+A caller has one reply channel, so only one branch may answer a given message: if several do,
+the **first in list order** wins and the others are dropped. That is a configuration mistake
+which would otherwise repeat on every message, so the route warns **once** and logs later
+drops at debug level.
+
+A branch that **fails** nacks the whole fan-out: every branch is delivered at-least-once, so
+the answering branch's response is discarded and the caller gets a `500` rather than an answer
+that hides a lost message. That is stricter than nginx's `mirror`, which ignores failed mirror
+subrequests entirely.
+
+The mirror pattern above is unaffected, because a `request` branch with a non-replying
+`forward_to` absorbs its own failure — that is where nginx's "ignore the mirror" semantics
+live, opted into per branch. For a plain branch (`- kafka: { … }` directly in the list) the
+equivalent is a [`dlq`](#dlq) on that branch: the failure is parked, the branch acks, and the
+answering branch still replies.
+
+```yaml route
+proxy_with_parked_mirror:
+  input: { http: { url: "0.0.0.0:8443", path: "test" } }
+  output:
+    fanout:
+      - kafka: { topic: "audit", url: "localhost:9092" }
+        middlewares:
+          - dlq: { endpoint: { file: { path: "audit-failures.jsonl" } } }
+      - request:
+          to: { http: { url: "http://127.0.0.1:1445/" } }
+          forward_to: { response: {} }
+```
+
 ### `switch`
 
 Content-based routing: picks a destination by the value of a **metadata key**.
@@ -754,6 +803,17 @@ output:
 `request_reply: true`. On error or timeout the **original** message is forwarded instead of a
 response, so nothing is lost — distinguish the two downstream with a [`switch`](#switch) on a
 status key such as `http_status_code`.
+
+Whatever `forward_to` returns is passed back up. A plain sink acks, `forward_to: {}` (the
+`null` endpoint, also spelled `null`) discards, and `forward_to: { response: {} }` replies to
+the origin of the current request — which is how a [`fanout`](#fanout) branch answers the
+caller.
+
+The error fallback never becomes that reply: when `forward_to` would answer the caller, a
+failed request surfaces the error instead of echoing the original back as a success. The route
+then nacks (HTTP `500`), and a [`retry`](#retry) or [`dlq`](#dlq) middleware on the endpoint
+sees the failure as usual. Forwarding-to-a-sink still acks, so the `switch` pattern above is
+unchanged.
 
 ### `response`
 

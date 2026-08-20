@@ -1,27 +1,96 @@
-use crate::traits::{EndpointStatus, MessagePublisher, PublisherError, Sent, SentBatch};
+use crate::traits::{BoxFuture, EndpointStatus, MessagePublisher, PublisherError, Sent, SentBatch};
 use crate::CanonicalMessage;
 use async_trait::async_trait;
 use std::any::Any;
-use std::sync::Arc;
+use std::collections::HashSet;
+use std::sync::{Arc, Once};
+use tracing::{debug, warn};
 
+/// Structural publisher that delivers every message to all of its destinations.
+///
+/// If a destination replies (`response`, `static`, a `request` whose `forward_to` replies, ...)
+/// that reply is returned to the caller. When several destinations reply to the same message
+/// the **first one in list order** wins and the rest are dropped — a caller can only receive
+/// one answer. Give the other legs a non-replying `forward_to` to silence it.
 pub struct FanoutPublisher {
     publishers: Vec<Arc<dyn MessagePublisher>>,
+    /// Latches the "several destinations replied" warning: it reports a misconfiguration that
+    /// repeats on every message, so warning per drop would flood the log at any real rate.
+    extra_response_warned: Once,
 }
 
 impl FanoutPublisher {
     pub fn new(publishers: Vec<Arc<dyn MessagePublisher>>) -> Self {
-        Self { publishers }
+        Self {
+            publishers,
+            extra_response_warned: Once::new(),
+        }
+    }
+
+    /// Reports a dropped duplicate reply: `warn!` for the first one this route sees, `debug!`
+    /// for the rest so individual messages stay diagnosable when logging is turned up.
+    fn warn_extra_response(&self, response: &CanonicalMessage) {
+        let mut warned = false;
+        self.extra_response_warned.call_once(|| {
+            warned = true;
+            warn!(
+                message_id = %format!("{:032x}", response.message_id),
+                "fanout: more than one destination replied; keeping the first in list order and \
+                 dropping the rest. Give the other destinations a non-replying `forward_to`. \
+                 Logged once per route; further drops are logged at debug level."
+            );
+        });
+        if !warned {
+            debug!(
+                message_id = %format!("{:032x}", response.message_id),
+                "fanout: dropped a duplicate destination reply"
+            );
+        }
     }
 }
 
 #[async_trait]
 impl MessagePublisher for FanoutPublisher {
+    fn on_connect_hook(&self) -> Option<BoxFuture<'_, anyhow::Result<()>>> {
+        Some(Box::pin(async move {
+            for publisher in &self.publishers {
+                if let Some(hook) = publisher.on_connect_hook() {
+                    hook.await?;
+                }
+            }
+            Ok(())
+        }))
+    }
+
+    fn on_disconnect_hook(&self) -> Option<BoxFuture<'_, anyhow::Result<()>>> {
+        Some(Box::pin(async move {
+            // Every destination gets torn down even if an earlier one fails, so one bad leg
+            // cannot skip another's durable teardown. The first error is reported.
+            let mut first_error = None;
+            for publisher in &self.publishers {
+                if let Some(hook) = publisher.on_disconnect_hook() {
+                    if let Err(e) = hook.await {
+                        first_error.get_or_insert(e);
+                    }
+                }
+            }
+            first_error.map_or(Ok(()), Err)
+        }))
+    }
+
     async fn send(&self, message: CanonicalMessage) -> Result<Sent, PublisherError> {
+        let mut response: Option<CanonicalMessage> = None;
         for publisher in &self.publishers {
             // We must clone the message for each publisher.
-            publisher.send(message.clone()).await?;
+            if let Sent::Response(r) = publisher.send(message.clone()).await? {
+                if response.is_none() {
+                    response = Some(r);
+                } else {
+                    self.warn_extra_response(&r);
+                }
+            }
         }
-        Ok(Sent::Ack)
+        Ok(response.map_or(Sent::Ack, Sent::Response))
     }
 
     async fn send_batch(
@@ -45,23 +114,35 @@ impl MessagePublisher for FanoutPublisher {
         // A hard error from any publisher propagates. Otherwise per-destination failures merge:
         // a message that failed at any destination is nacked for the whole fan-out (duplicate
         // failures across destinations are harmless — the route keys by message_id). Responses
-        // aren't forwarded: with several destinations there's no single response to attribute.
+        // are collected in destination order, keeping the first reply per message: the caller
+        // has one reply channel, so a second answer for the same message has nowhere to go.
         let mut failed = Vec::new();
+        let mut responses: Vec<CanonicalMessage> = Vec::new();
+        let mut responded: HashSet<u128> = HashSet::new();
         for result in results {
             match result? {
                 SentBatch::Ack => {}
                 SentBatch::Partial {
-                    responses: _,
+                    responses: child_responses,
                     failed: child_failed,
-                } => failed.extend(child_failed),
+                } => {
+                    failed.extend(child_failed);
+                    for response in child_responses.into_iter().flatten() {
+                        if responded.insert(response.message_id) {
+                            responses.push(response);
+                        } else {
+                            self.warn_extra_response(&response);
+                        }
+                    }
+                }
             }
         }
 
-        if failed.is_empty() {
+        if failed.is_empty() && responses.is_empty() {
             Ok(SentBatch::Ack)
         } else {
             Ok(SentBatch::Partial {
-                responses: None,
+                responses: (!responses.is_empty()).then_some(responses),
                 failed,
             })
         }
@@ -116,6 +197,7 @@ mod tests {
     use super::*;
     use crate::errors::ProcessingError;
     use async_trait::async_trait;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
 
     #[derive(Default)]
@@ -249,6 +331,168 @@ mod tests {
         }
     }
 
+    /// A publisher that always replies, standing in for `response` / `static` legs.
+    struct ReplyingPublisher {
+        suffix: &'static str,
+    }
+
+    #[async_trait]
+    impl MessagePublisher for ReplyingPublisher {
+        async fn send(&self, mut message: CanonicalMessage) -> Result<Sent, PublisherError> {
+            message.payload = [&message.payload[..], self.suffix.as_bytes()]
+                .concat()
+                .into();
+            Ok(Sent::Response(message))
+        }
+
+        async fn send_batch(
+            &self,
+            messages: Vec<CanonicalMessage>,
+        ) -> Result<SentBatch, PublisherError> {
+            crate::traits::send_batch_helper(self, messages, |p, m| Box::pin(p.send(m))).await
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    #[tokio::test]
+    async fn test_fanout_send_returns_the_replying_legs_response() {
+        let sink = Arc::new(RecordingPublisher::default());
+        let fanout = FanoutPublisher::new(vec![
+            sink.clone(),
+            Arc::new(ReplyingPublisher { suffix: "-reply" }),
+        ]);
+
+        match fanout.send(CanonicalMessage::from("hello")).await.unwrap() {
+            Sent::Response(reply) => assert_eq!(reply.get_payload_str(), "hello-reply"),
+            Sent::Ack => panic!("expected the replying leg's response"),
+        }
+        // The non-replying leg still received the message.
+        assert_eq!(sink.single_payloads.lock().unwrap().as_slice(), ["hello"]);
+    }
+
+    #[tokio::test]
+    async fn test_fanout_send_keeps_first_response_when_several_legs_reply() {
+        let fanout = FanoutPublisher::new(vec![
+            Arc::new(ReplyingPublisher { suffix: "-first" }),
+            Arc::new(ReplyingPublisher { suffix: "-second" }),
+        ]);
+
+        assert!(!fanout.extra_response_warned.is_completed());
+
+        match fanout.send(CanonicalMessage::from("hello")).await.unwrap() {
+            Sent::Response(reply) => assert_eq!(reply.get_payload_str(), "hello-first"),
+            Sent::Ack => panic!("expected a response"),
+        }
+        assert!(
+            fanout.extra_response_warned.is_completed(),
+            "the first dropped reply must warn"
+        );
+
+        // The latch holds for the rest of the route's life: later drops log at debug level,
+        // and first-in-list-order still decides the reply.
+        match fanout.send(CanonicalMessage::from("again")).await.unwrap() {
+            Sent::Response(reply) => assert_eq!(reply.get_payload_str(), "again-first"),
+            Sent::Ack => panic!("expected a response"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_fanout_send_batch_returns_responses_keyed_by_message() {
+        let sink = Arc::new(RecordingPublisher::default());
+        let fanout = FanoutPublisher::new(vec![
+            sink.clone(),
+            Arc::new(ReplyingPublisher { suffix: "-reply" }),
+        ]);
+
+        let messages = vec![CanonicalMessage::from("one"), CanonicalMessage::from("two")];
+        let ids: Vec<_> = messages.iter().map(|m| m.message_id).collect();
+
+        match fanout.send_batch(messages).await.unwrap() {
+            SentBatch::Partial { responses, failed } => {
+                assert!(failed.is_empty());
+                let responses = responses.expect("replying leg produced responses");
+                assert_eq!(responses.len(), 2);
+                assert_eq!(responses[0].message_id, ids[0]);
+                assert_eq!(responses[0].get_payload_str(), "one-reply");
+                assert_eq!(responses[1].message_id, ids[1]);
+                assert_eq!(responses[1].get_payload_str(), "two-reply");
+            }
+            SentBatch::Ack => panic!("expected responses to be forwarded"),
+        }
+        assert_eq!(sink.batch_payloads.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_fanout_send_batch_keeps_one_response_per_message() {
+        let fanout = FanoutPublisher::new(vec![
+            Arc::new(ReplyingPublisher { suffix: "-first" }),
+            Arc::new(ReplyingPublisher { suffix: "-second" }),
+        ]);
+
+        match fanout
+            .send_batch(vec![CanonicalMessage::from("one")])
+            .await
+            .unwrap()
+        {
+            SentBatch::Partial { responses, .. } => {
+                let responses = responses.expect("expected a response");
+                assert_eq!(responses.len(), 1);
+                assert_eq!(responses[0].get_payload_str(), "one-first");
+            }
+            SentBatch::Ack => panic!("expected a response"),
+        }
+    }
+
+    /// End-to-end: a request/reply input fans out to a plain sink and a `response` leg.
+    /// The sink still gets its copy, and the caller gets the reply.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_fanout_replies_to_caller_while_sibling_gets_a_copy() {
+        use crate::endpoints::memory::{MemoryConsumer, MemoryPublisher};
+        use crate::models::{Endpoint, EndpointType, MemoryConfig};
+        use crate::route::Route;
+        use crate::traits::MessageConsumer;
+
+        let inbox = format!("fanout_rr_in_{}", fast_uuid_v7::gen_id_str());
+        let mirror = format!("fanout_rr_mirror_{}", fast_uuid_v7::gen_id_str());
+
+        // Subscribe before the route starts so the mirrored copy is not dropped.
+        let mut mirror_consumer = MemoryConsumer::new(&MemoryConfig {
+            topic: mirror.clone(),
+            capacity: Some(10),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let output = Endpoint::new(EndpointType::Fanout(vec![
+            Endpoint::new_memory(&mirror, 10),
+            Endpoint::new_response(),
+        ]));
+        let route = Route::new(Endpoint::new_memory(&inbox, 10), output);
+        route.deploy("fanout_rr_test").await.unwrap();
+
+        let publisher = MemoryPublisher::new(&MemoryConfig {
+            topic: inbox.clone(),
+            capacity: Some(10),
+            request_reply: true,
+            request_timeout_ms: Some(2000),
+            ..Default::default()
+        })
+        .unwrap();
+
+        match publisher.send("ping".into()).await.unwrap() {
+            Sent::Response(reply) => assert_eq!(reply.get_payload_str(), "ping"),
+            Sent::Ack => panic!("fanout should have replied through its response leg"),
+        }
+
+        let mirrored = mirror_consumer.receive().await.unwrap();
+        assert_eq!(mirrored.message.get_payload_str(), "ping");
+
+        Route::stop("fanout_rr_test").await;
+    }
+
     #[tokio::test]
     async fn test_fanout_status_aggregates_destination_status() {
         let healthy = Arc::new(RecordingPublisher {
@@ -281,5 +525,91 @@ mod tests {
         assert_eq!(status.capacity, Some(12));
         assert_eq!(status.error.as_deref(), Some("down"));
         assert_eq!(status.details["destinations"].as_array().unwrap().len(), 2);
+    }
+
+    /// Counts hook invocations; `fail_disconnect` makes teardown fail so the "keep going"
+    /// behaviour is observable.
+    #[derive(Default)]
+    struct HookPublisher {
+        connects: AtomicUsize,
+        disconnects: AtomicUsize,
+        fail_disconnect: bool,
+    }
+
+    impl HookPublisher {
+        fn new(fail_disconnect: bool) -> Arc<Self> {
+            Arc::new(Self {
+                fail_disconnect,
+                ..Default::default()
+            })
+        }
+
+        fn counts(&self) -> (usize, usize) {
+            (
+                self.connects.load(Ordering::SeqCst),
+                self.disconnects.load(Ordering::SeqCst),
+            )
+        }
+    }
+
+    #[async_trait]
+    impl MessagePublisher for HookPublisher {
+        fn on_connect_hook(&self) -> Option<BoxFuture<'_, anyhow::Result<()>>> {
+            Some(Box::pin(async move {
+                self.connects.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }))
+        }
+
+        fn on_disconnect_hook(&self) -> Option<BoxFuture<'_, anyhow::Result<()>>> {
+            Some(Box::pin(async move {
+                self.disconnects.fetch_add(1, Ordering::SeqCst);
+                if self.fail_disconnect {
+                    anyhow::bail!("teardown failed");
+                }
+                Ok(())
+            }))
+        }
+
+        async fn send(&self, _message: CanonicalMessage) -> Result<Sent, PublisherError> {
+            Ok(Sent::Ack)
+        }
+
+        async fn send_batch(
+            &self,
+            _messages: Vec<CanonicalMessage>,
+        ) -> Result<SentBatch, PublisherError> {
+            Ok(SentBatch::Ack)
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    /// A nested `request` branch has its own connect hook; the fan-out must run it, and must
+    /// tear every branch down even when one fails.
+    #[tokio::test]
+    async fn test_fanout_forwards_hooks_to_every_destination() {
+        let first = HookPublisher::new(false);
+        let failing = HookPublisher::new(true);
+        let last = HookPublisher::new(false);
+        let fanout = FanoutPublisher::new(vec![
+            first.clone() as Arc<dyn MessagePublisher>,
+            failing.clone(),
+            last.clone(),
+        ]);
+
+        fanout.on_connect_hook().unwrap().await.unwrap();
+        assert_eq!(first.counts().0, 1);
+        assert_eq!(failing.counts().0, 1);
+        assert_eq!(last.counts().0, 1);
+
+        let err = fanout.on_disconnect_hook().unwrap().await.unwrap_err();
+        assert!(err.to_string().contains("teardown failed"));
+        assert_eq!(first.counts().1, 1);
+        assert_eq!(failing.counts().1, 1);
+        // Reached despite the earlier failure.
+        assert_eq!(last.counts().1, 1);
     }
 }

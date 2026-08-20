@@ -1,4 +1,4 @@
-use crate::traits::{MessagePublisher, PublisherError, Sent, SentBatch};
+use crate::traits::{BoxFuture, MessagePublisher, PublisherError, Sent, SentBatch};
 use crate::CanonicalMessage;
 use async_trait::async_trait;
 use std::any::Any;
@@ -25,6 +25,11 @@ impl SwitchPublisher {
         }
     }
 
+    /// Every destination, cases and `default` alike.
+    fn destinations(&self) -> impl Iterator<Item = &Arc<dyn MessagePublisher>> {
+        self.cases.values().chain(self.default.iter())
+    }
+
     fn get_publisher(&self, message: &CanonicalMessage) -> Option<&Arc<dyn MessagePublisher>> {
         if let Some(val) = message.metadata.get(&self.metadata_key) {
             if let Some(publisher) = self.cases.get(val) {
@@ -37,6 +42,33 @@ impl SwitchPublisher {
 
 #[async_trait]
 impl MessagePublisher for SwitchPublisher {
+    fn on_connect_hook(&self) -> Option<BoxFuture<'_, anyhow::Result<()>>> {
+        Some(Box::pin(async move {
+            for publisher in self.destinations() {
+                if let Some(hook) = publisher.on_connect_hook() {
+                    hook.await?;
+                }
+            }
+            Ok(())
+        }))
+    }
+
+    fn on_disconnect_hook(&self) -> Option<BoxFuture<'_, anyhow::Result<()>>> {
+        Some(Box::pin(async move {
+            // Every destination gets torn down even if an earlier one fails, so one bad case
+            // cannot skip another's durable teardown. The first error is reported.
+            let mut first_error = None;
+            for publisher in self.destinations() {
+                if let Some(hook) = publisher.on_disconnect_hook() {
+                    if let Err(e) = hook.await {
+                        first_error.get_or_insert(e);
+                    }
+                }
+            }
+            first_error.map_or(Ok(()), Err)
+        }))
+    }
+
     async fn send(&self, message: CanonicalMessage) -> Result<Sent, PublisherError> {
         if let Some(publisher) = self.get_publisher(&message) {
             publisher.send(message).await
@@ -144,6 +176,7 @@ impl MessagePublisher for SwitchPublisher {
 mod tests {
     use super::*;
     use crate::endpoints::memory::MemoryPublisher;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
     #[tokio::test]
@@ -260,5 +293,90 @@ mod tests {
 
         assert_eq!(chan_a.len(), 1);
         assert_eq!(*pub_default.batches.lock().unwrap(), vec![3]);
+    }
+
+    /// Counts hook invocations; `fail_disconnect` makes teardown fail so the "keep going"
+    /// behaviour is observable.
+    #[derive(Default)]
+    struct HookPublisher {
+        connects: AtomicUsize,
+        disconnects: AtomicUsize,
+        fail_disconnect: bool,
+    }
+
+    impl HookPublisher {
+        fn new(fail_disconnect: bool) -> Arc<Self> {
+            Arc::new(Self {
+                fail_disconnect,
+                ..Default::default()
+            })
+        }
+
+        fn counts(&self) -> (usize, usize) {
+            (
+                self.connects.load(Ordering::SeqCst),
+                self.disconnects.load(Ordering::SeqCst),
+            )
+        }
+    }
+
+    #[async_trait]
+    impl MessagePublisher for HookPublisher {
+        fn on_connect_hook(&self) -> Option<BoxFuture<'_, anyhow::Result<()>>> {
+            Some(Box::pin(async move {
+                self.connects.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }))
+        }
+
+        fn on_disconnect_hook(&self) -> Option<BoxFuture<'_, anyhow::Result<()>>> {
+            Some(Box::pin(async move {
+                self.disconnects.fetch_add(1, Ordering::SeqCst);
+                if self.fail_disconnect {
+                    anyhow::bail!("teardown failed");
+                }
+                Ok(())
+            }))
+        }
+
+        async fn send(&self, _message: CanonicalMessage) -> Result<Sent, PublisherError> {
+            Ok(Sent::Ack)
+        }
+
+        async fn send_batch(
+            &self,
+            _messages: Vec<CanonicalMessage>,
+        ) -> Result<SentBatch, PublisherError> {
+            Ok(SentBatch::Ack)
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    /// Cases and `default` alike are connected and torn down; one failing teardown does not
+    /// skip the others.
+    #[tokio::test]
+    async fn test_switch_forwards_hooks_to_cases_and_default() {
+        let ok_case = HookPublisher::new(false);
+        let failing_case = HookPublisher::new(true);
+        let fallback = HookPublisher::new(false);
+
+        let mut cases: HashMap<String, Arc<dyn MessagePublisher>> = HashMap::new();
+        cases.insert("a".into(), ok_case.clone());
+        cases.insert("b".into(), failing_case.clone());
+        let switch = SwitchPublisher::new("k".into(), cases, Some(fallback.clone()));
+
+        switch.on_connect_hook().unwrap().await.unwrap();
+        assert_eq!(ok_case.counts().0, 1);
+        assert_eq!(failing_case.counts().0, 1);
+        assert_eq!(fallback.counts().0, 1);
+
+        let err = switch.on_disconnect_hook().unwrap().await.unwrap_err();
+        assert!(err.to_string().contains("teardown failed"));
+        assert_eq!(ok_case.counts().1, 1);
+        assert_eq!(failing_case.counts().1, 1);
+        assert_eq!(fallback.counts().1, 1);
     }
 }
