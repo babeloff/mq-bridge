@@ -1674,6 +1674,12 @@ pub struct HttpConfig {
     /// (Consumer only) If true, respond immediately with 202 Accepted without waiting for downstream processing. Defaults to false.
     #[serde(default)]
     pub fire_and_forget: bool,
+    /// (Publisher) Treat every HTTP response status as response data instead of classifying
+    /// non-2xx statuses as publisher errors. Transport and response-read failures remain errors.
+    /// (Consumer) When every output sink opts in, transient sink failures return 502 without
+    /// stopping a non-streaming request/reply route. Defaults to false.
+    #[serde(default)]
+    pub pass_through_status: bool,
     /// (Consumer only) If true, read request bodies as a stream and emit each received stream item as a separate message.
     #[serde(default)]
     pub receive_streamable: bool,

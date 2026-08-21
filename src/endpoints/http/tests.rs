@@ -53,6 +53,7 @@ http_route:
   output:
     http:
       url: "http://localhost:9090"
+      pass_through_status: true
 "#;
     let config: Config = serde_yaml_ng::from_str(yaml).expect("Failed to parse YAML");
     let route = config.get("http_route").expect("Route not found");
@@ -67,6 +68,7 @@ http_route:
     match &route.output.endpoint_type {
         EndpointType::Http(cfg) => {
             assert_eq!(cfg.url, "http://localhost:9090".to_string());
+            assert!(cfg.pass_through_status);
         }
         _ => panic!("Expected HTTP output"),
     }
@@ -92,6 +94,75 @@ http_route:
         }
         _ => panic!("Expected HTTP input"),
     }
+}
+
+#[tokio::test]
+async fn http_publisher_pass_through_status_is_opt_in() {
+    init_crypto();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server_task = tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            tokio::spawn(async move {
+                let service = hyper::service::service_fn(|req: Request<Incoming>| async move {
+                    let status = if req.uri().path() == "/unavailable" {
+                        StatusCode::SERVICE_UNAVAILABLE
+                    } else {
+                        StatusCode::NOT_FOUND
+                    };
+                    Ok::<_, anyhow::Error>(
+                        Response::builder()
+                            .status(status)
+                            .header("x-upstream", "stub")
+                            .body(full(status.as_str().to_string()))
+                            .unwrap(),
+                    )
+                });
+                AutoBuilder::new(TokioExecutor::new())
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await
+                    .unwrap();
+            });
+        }
+    });
+
+    let default_publisher = HttpPublisher::new(&HttpConfig {
+        url: format!("http://{addr}/not-found"),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    assert!(matches!(
+        default_publisher
+            .send(CanonicalMessage::from_vec("request"))
+            .await
+            .unwrap_err(),
+        PublisherError::NonRetryable(_)
+    ));
+
+    for (path, expected_status) in [("not-found", "404"), ("unavailable", "503")] {
+        let publisher = HttpPublisher::new(&HttpConfig {
+            url: format!("http://{addr}/{path}"),
+            pass_through_status: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let Sent::Response(response) = publisher
+            .send(CanonicalMessage::from_vec("request"))
+            .await
+            .unwrap()
+        else {
+            panic!("pass-through status returned Ack");
+        };
+        assert_eq!(
+            response.metadata.get(HTTP_STATUS_CODE).map(String::as_str),
+            Some(expected_status)
+        );
+        assert_eq!(response.get_payload_str(), expected_status);
+    }
+    server_task.abort();
 }
 
 #[test]

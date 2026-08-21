@@ -1022,6 +1022,20 @@ fn output_has_sink(
     )
 }
 
+pub(crate) fn output_passes_through_http_status(
+    route_name: &str,
+    endpoint: &Endpoint,
+) -> Result<bool> {
+    output_has_sink(
+        route_name,
+        endpoint,
+        &|endpoint_type| {
+            !matches!(endpoint_type, EndpointType::Http(cfg) if cfg.pass_through_status)
+        },
+    )
+    .map(|has_non_opted_in_sink| !has_non_opted_in_sink)
+}
+
 pub(crate) async fn try_run_fast_path_route(
     route: &crate::models::Route,
     name: &str,

@@ -194,6 +194,7 @@ class HttpConfig(TypedDict, total=False):
     internal_buffer_size: Optional[int]
     message_id_header: Optional[str]
     method: Optional[str]
+    pass_through_status: bool
     path: Optional[str]
     pool_idle_timeout_ms: Optional[int]
     receive_streamable: bool
