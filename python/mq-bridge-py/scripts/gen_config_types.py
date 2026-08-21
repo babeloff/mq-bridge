@@ -19,6 +19,7 @@ A test (test_config_types.py) asserts the checked-in output is up to date.
 from __future__ import annotations
 
 import json
+import keyword
 from pathlib import Path
 
 PKG_DIR = Path(__file__).resolve().parents[1]
@@ -135,6 +136,26 @@ def doc_comment(defn: dict) -> str:
 
 
 def render_typeddict(name: str, fields: dict, required: set, defn: dict) -> str:
+    def wrap(key: str) -> str:
+        expr = fields[key]
+        return f"Required[{expr}]" if key in required else expr
+
+    # Fields like `if` are not valid in class syntax; use the functional form.
+    if any(not key.isidentifier() or keyword.iskeyword(key) for key in fields):
+        lines = []
+        desc = defn.get("description")
+        if desc:
+            lines.append(f"# {desc.strip().splitlines()[0]}")
+        lines.append(f'{name} = TypedDict(')
+        lines.append(f'    "{name}",')
+        lines.append("    {")
+        for key in sorted(fields):
+            lines.append(f'        "{key}": {wrap(key)},')
+        lines.append("    },")
+        lines.append("    total=False,")
+        lines.append(")")
+        return "\n".join(lines) + "\n"
+
     lines = [f"class {name}(TypedDict, total=False):"]
     doc = doc_comment(defn)
     if doc:
@@ -142,9 +163,7 @@ def render_typeddict(name: str, fields: dict, required: set, defn: dict) -> str:
     if not fields:
         lines.append("    pass")
     for key in sorted(fields):
-        expr = fields[key]
-        wrapped = f"Required[{expr}]" if key in required else expr
-        lines.append(f"    {key}: {wrapped}")
+        lines.append(f"    {key}: {wrap(key)}")
     return "\n".join(lines) + "\n"
 
 

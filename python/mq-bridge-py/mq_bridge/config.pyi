@@ -495,10 +495,15 @@ class StreamBufferConfig(TypedDict, total=False):
     topic: Required[str]
 
 
-class SwitchCase(TypedDict, total=False):
-    """One predicate case of a `switch` in `when` mode."""
-    if: Required[str]
-    to: Required[Endpoint]
+# One predicate case of a `switch` in `when` mode.
+SwitchCase = TypedDict(
+    "SwitchCase",
+    {
+        "if": Required[str],
+        "to": Required[Endpoint],
+    },
+    total=False,
+)
 
 
 class SwitchConfig(TypedDict, total=False):
