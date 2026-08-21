@@ -151,6 +151,7 @@ impl Default for TransformMiddleware {
     fn default() -> Self {
         Self {
             mapping: HashMap::new(),
+            expression: None,
             schema: None,
             schema_file: None,
             coerce: default_true(),

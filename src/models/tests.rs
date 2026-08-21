@@ -190,6 +190,7 @@ kafka_to_nats:
                 Middleware::Encryption(_) => {}
                 Middleware::Compression(_) => {}
                 Middleware::Id(_) => {}
+                Middleware::Filter(_) => {}
             }
         }
 
@@ -677,5 +678,106 @@ mod schema_tests {
         let mut path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         path.push("mq-bridge.schema.json");
         std::fs::write(path, schema_json).expect("Failed to write schema file");
+    }
+}
+
+mod switch_config_tests {
+    use crate::models::{Endpoint, EndpointType, SwitchConfig};
+    use std::collections::HashMap;
+
+    fn null_endpoint() -> Endpoint {
+        Endpoint::new(EndpointType::Null)
+    }
+
+    fn lookup() -> SwitchConfig {
+        let mut cases = HashMap::new();
+        cases.insert("archive".to_string(), null_endpoint());
+        SwitchConfig {
+            metadata_key: "kind".to_string(),
+            cases,
+            when: Vec::new(),
+            default: None,
+        }
+    }
+
+    fn predicate() -> SwitchConfig {
+        SwitchConfig {
+            metadata_key: String::new(),
+            cases: HashMap::new(),
+            when: vec![crate::models::SwitchCase {
+                condition: "amount > 100".to_string(),
+                to: null_endpoint(),
+            }],
+            default: None,
+        }
+    }
+
+    #[test]
+    fn each_mode_on_its_own_is_valid() {
+        lookup().validate().unwrap();
+        predicate().validate().unwrap();
+    }
+
+    /// Mixing the modes would hide which one a message actually took.
+    #[test]
+    fn both_modes_at_once_are_rejected() {
+        let mut config = lookup();
+        config.when = predicate().when;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn neither_mode_is_rejected() {
+        let config = SwitchConfig {
+            metadata_key: String::new(),
+            cases: HashMap::new(),
+            when: Vec::new(),
+            default: Some(Box::new(null_endpoint())),
+        };
+        assert!(config.validate().is_err());
+    }
+
+    /// `cases` without a key to look them up by never matches anything.
+    #[test]
+    fn cases_without_a_metadata_key_are_rejected() {
+        let mut config = lookup();
+        config.metadata_key.clear();
+        assert!(config.validate().is_err());
+    }
+}
+
+#[cfg(feature = "filter")]
+mod filter_expression_deserialization_tests {
+    use crate::models::{Endpoint, Middleware, SwitchCase};
+
+    #[test]
+    fn middleware_rejects_invalid_expression_during_deserialization() {
+        let error = serde_yaml_ng::from_str::<Endpoint>(
+            "middlewares:\n  - filter: 'amount >'\nnull: null\n",
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("invalid filter expression"));
+    }
+
+    #[test]
+    fn switch_case_rejects_invalid_expression_during_deserialization() {
+        let error =
+            serde_yaml_ng::from_str::<SwitchCase>("if: 'items[0].qty > 1'\nto:\n  null: null\n")
+                .unwrap_err();
+
+        assert!(error.to_string().contains("indexed path"));
+    }
+
+    #[test]
+    fn valid_filter_expression_still_deserializes() {
+        let endpoint = serde_yaml_ng::from_str::<Endpoint>(
+            "middlewares:\n  - filter: 'amount > 100'\nnull: null\n",
+        )
+        .unwrap();
+
+        assert!(
+            matches!(&endpoint.middlewares[0], Middleware::Filter(expression) if expression == "amount > 100")
+        );
     }
 }

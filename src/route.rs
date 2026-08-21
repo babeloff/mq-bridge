@@ -7,7 +7,8 @@ use crate::endpoints::{
     check_source_position_available, create_consumer_from_route,
     create_consumer_from_route_with_source_metadata,
     create_publisher_from_route_with_source_position, output_has_write_time_named_object_store,
-    output_requires_source_metadata, supports_source_metadata,
+    output_passes_through_http_status, output_requires_source_metadata, relax_object_naming,
+    supports_source_metadata,
 };
 use crate::errors::ProcessingError;
 pub use crate::models::Route;
@@ -388,6 +389,73 @@ fn report_route_error(err_tx: &Sender<anyhow::Error>, err: anyhow::Error, contex
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TransientPublishFailurePolicy {
+    StopRoute,
+    ReplyBadGateway,
+}
+
+fn transient_publish_failure_policy(
+    input: &Endpoint,
+    pass_through_status: bool,
+) -> TransientPublishFailurePolicy {
+    const MAX_DEPTH: usize = 16;
+
+    let EndpointType::Ref(name) = &input.endpoint_type else {
+        return match &input.endpoint_type {
+            EndpointType::Http(cfg)
+                if !cfg.fire_and_forget && !cfg.receive_streamable && pass_through_status =>
+            {
+                TransientPublishFailurePolicy::ReplyBadGateway
+            }
+            _ => TransientPublishFailurePolicy::StopRoute,
+        };
+    };
+    let mut name = name.clone();
+    for _ in 0..MAX_DEPTH {
+        let Some(referenced) = get_endpoint(&name) else {
+            return TransientPublishFailurePolicy::StopRoute;
+        };
+        match referenced.endpoint_type {
+            EndpointType::Ref(next) => name = next,
+            EndpointType::Http(cfg)
+                if !cfg.fire_and_forget && !cfg.receive_streamable && pass_through_status =>
+            {
+                return TransientPublishFailurePolicy::ReplyBadGateway;
+            }
+            _ => return TransientPublishFailurePolicy::StopRoute,
+        }
+    }
+    TransientPublishFailurePolicy::StopRoute
+}
+
+fn bad_gateway_reply(message_id: u128) -> MessageDisposition {
+    let mut response = crate::CanonicalMessage::new(b"Bad Gateway".to_vec(), Some(message_id));
+    response
+        .metadata
+        .insert("http_status_code".to_string(), "502".to_string());
+    response.metadata.insert(
+        "content-type".to_string(),
+        "text/plain; charset=utf-8".to_string(),
+    );
+    MessageDisposition::Reply(response)
+}
+
+fn apply_server_failure_policy(
+    policy: TransientPublishFailurePolicy,
+    message_ids: &[u128],
+    dispositions: &mut [MessageDisposition],
+) {
+    if policy != TransientPublishFailurePolicy::ReplyBadGateway {
+        return;
+    }
+    for (message_id, disposition) in message_ids.iter().zip(dispositions) {
+        if matches!(disposition, MessageDisposition::Nack) {
+            *disposition = bad_gateway_reply(*message_id);
+        }
+    }
+}
+
 /// Records a batch the route discarded after a permanent sink rejection.
 ///
 /// Dropping is deliberate — it is what stops a poison message from wedging the
@@ -440,6 +508,7 @@ async fn send_batch_and_commit(
     commit: BatchCommitFunc,
     has_retry_middleware: bool,
     has_dlq_middleware: bool,
+    transient_failure_policy: TransientPublishFailurePolicy,
     err_tx: &Sender<anyhow::Error>,
     commit_semaphore: Option<&Arc<tokio::sync::Semaphore>>,
     commit_tasks: &mut JoinSet<()>,
@@ -538,15 +607,27 @@ async fn send_batch_and_commit(
                         record_dropped_messages(drops, dropped, cause);
                     }
                 }
-                let dispositions = map_responses_to_dispositions(
+                let mut dispositions = map_responses_to_dispositions(
                     &scratch.message_ids,
                     responses,
                     &failed,
                     &scratch.request_ids,
                     has_dlq_middleware,
                 );
+                apply_server_failure_policy(
+                    transient_failure_policy,
+                    &scratch.message_ids,
+                    &mut dispositions,
+                );
                 if let Err(commit_err) = commit(dispositions).await {
                     warn!("Commit after transient failure also failed: {}", commit_err);
+                }
+                if transient_failure_policy != TransientPublishFailurePolicy::StopRoute {
+                    warn!(
+                        "Transient publisher error returned to server request; keeping listener active: {}",
+                        err
+                    );
+                    return Ok(());
                 }
                 if !has_retry_middleware {
                     return Err(err);
@@ -591,13 +672,33 @@ async fn send_batch_and_commit(
         }
         Err(e) => {
             let non_retryable = matches!(e, PublisherError::NonRetryable(_));
+            let transient = matches!(
+                e,
+                PublisherError::Retryable(_) | PublisherError::Connection(_)
+            );
             let disposition = if non_retryable && !has_dlq_middleware {
                 MessageDisposition::Ack
             } else {
                 MessageDisposition::Nack
             };
-            let commit_result = commit(vec![disposition; batch_len]).await;
+            let mut dispositions = vec![disposition; batch_len];
+            if transient {
+                apply_server_failure_policy(
+                    transient_failure_policy,
+                    &scratch.message_ids,
+                    &mut dispositions,
+                );
+            }
+            let commit_result = commit(dispositions).await;
             debug!("Failure commit result: {:?}", commit_result);
+            if transient && transient_failure_policy != TransientPublishFailurePolicy::StopRoute {
+                commit_result?;
+                warn!(
+                    "Transient publisher error returned to server request; keeping listener active: {}",
+                    e
+                );
+                return Ok(());
+            }
             if non_retryable && !has_dlq_middleware {
                 commit_result?;
                 // Acking a permanently-rejected batch keeps the route from
@@ -646,12 +747,12 @@ impl Route {
     /// Returns the sink mechanism that makes replayed writes idempotent, when it can be
     /// established from configuration alone. This is informational: the route remains
     /// at-least-once internally, while the observable sink result is effectively-once.
-    fn inferred_idempotency_mechanism(&self) -> Option<&'static str> {
-        if self.output.handler.is_some() {
+    fn inferred_idempotency_mechanism(&self, output: &Endpoint) -> Option<&'static str> {
+        if output.handler.is_some() {
             return None;
         }
         let source_has_position = self.source_has_position();
-        match &self.output.endpoint_type {
+        match &output.endpoint_type {
             EndpointType::MongoDb(config) if config.id_field.is_some() => {
                 Some("MongoDB unique _id")
             }
@@ -898,7 +999,15 @@ impl Route {
         for warning in warnings {
             tracing::warn!(route = name_str, "Configuration warning: {}", warning);
         }
-        if let Some(mechanism) = self.inferred_idempotency_mechanism() {
+        let relaxed_output = relax_object_naming(
+            name_str,
+            self.source_has_position(),
+            &self.input,
+            &self.output,
+        )?
+        .map(|(output, _)| output);
+        let inferred_output = relaxed_output.as_ref().unwrap_or(&self.output);
+        if let Some(mechanism) = self.inferred_idempotency_mechanism(inferred_output) {
             tracing::info!(
                 route = name_str,
                 delivery = "effectively-once",
@@ -1197,15 +1306,26 @@ impl Route {
         drops: Option<&Arc<RwLock<DropReport>>>,
     ) -> anyhow::Result<bool> {
         let source_has_position = self.source_has_position();
+        let relaxed_output;
+        let output =
+            match relax_object_naming(name, source_has_position, &self.input, &self.output)? {
+                Some((endpoint, reason)) => {
+                    warn!(route = name, "{reason}");
+                    relaxed_output = endpoint;
+                    &relaxed_output
+                }
+                None => &self.output,
+            };
         let source_metadata_required =
-            output_requires_source_metadata(name, &self.output, source_has_position)?;
+            output_requires_source_metadata(name, output, source_has_position)?;
         check_source_position_available(name, &self.input, source_metadata_required)?;
-        let publisher = create_publisher_from_route_with_source_position(
-            name,
-            &self.output,
-            source_has_position,
-        )
-        .await?;
+        let publisher =
+            create_publisher_from_route_with_source_position(name, output, source_has_position)
+                .await?;
+        let transient_failure_policy = transient_publish_failure_policy(
+            &self.input,
+            output_passes_through_http_status(name, output)?,
+        );
         let mut consumer = create_consumer_from_route_with_source_metadata(
             name,
             &self.input,
@@ -1295,6 +1415,7 @@ impl Route {
                         commit,
                         has_retry_middleware,
                         has_dlq_middleware,
+                        transient_failure_policy,
                         &err_tx,
                         commit_semaphore.as_ref(),
                         &mut commit_tasks,
@@ -1350,12 +1471,23 @@ impl Route {
         drops: Option<&Arc<RwLock<DropReport>>>,
     ) -> anyhow::Result<bool> {
         let source_has_position = self.source_has_position();
+        let relaxed_output;
+        let output =
+            match relax_object_naming(name, source_has_position, &self.input, &self.output)? {
+                Some((endpoint, reason)) => {
+                    warn!(route = name, "{reason}");
+                    relaxed_output = endpoint;
+                    &relaxed_output
+                }
+                None => &self.output,
+            };
         let source_metadata_required =
-            output_requires_source_metadata(name, &self.output, source_has_position)?;
+            output_requires_source_metadata(name, output, source_has_position)?;
         check_source_position_available(name, &self.input, source_metadata_required)?;
         // A write-time name is minted inside the worker pool, so it is arrival order here
-        // whether or not the input could have supplied a position instead.
-        if output_has_write_time_named_object_store(name, &self.output, source_has_position)? {
+        // whether or not the input could have supplied a position instead. Checked after the
+        // relaxation above, so a route it just moved onto write-time names is warned about too.
+        if output_has_write_time_named_object_store(name, output, source_has_position)? {
             warn!(
                 route = name,
                 concurrency = self.options.concurrency,
@@ -1366,12 +1498,13 @@ impl Route {
                  remedy."
             );
         }
-        let publisher = create_publisher_from_route_with_source_position(
-            name,
-            &self.output,
-            source_has_position,
-        )
-        .await?;
+        let publisher =
+            create_publisher_from_route_with_source_position(name, output, source_has_position)
+                .await?;
+        let transient_failure_policy = transient_publish_failure_policy(
+            &self.input,
+            output_passes_through_http_status(name, output)?,
+        );
         let mut consumer = create_consumer_from_route_with_source_metadata(
             name,
             &self.input,
@@ -1451,6 +1584,7 @@ impl Route {
                         commit_func,
                         has_retry_middleware,
                         has_dlq_middleware,
+                        transient_failure_policy,
                         &err_tx,
                         commit_semaphore.as_ref(),
                         &mut commit_tasks,
@@ -2125,7 +2259,7 @@ mod tests {
             })),
         );
         assert_eq!(
-            mongo.inferred_idempotency_mechanism(),
+            mongo.inferred_idempotency_mechanism(&mongo.output),
             Some("MongoDB unique _id")
         );
 
@@ -2139,7 +2273,7 @@ mod tests {
             })),
         );
         assert_eq!(
-            sql.inferred_idempotency_mechanism(),
+            sql.inferred_idempotency_mechanism(&sql.output),
             Some("SQL unique-key conflict handling")
         );
 
@@ -2154,14 +2288,20 @@ mod tests {
                     ..Default::default()
                 })),
             );
-            assert_eq!(updating_sql.inferred_idempotency_mechanism(), None);
+            assert_eq!(
+                updating_sql.inferred_idempotency_mechanism(&updating_sql.output),
+                None
+            );
         }
 
         let ordinary = Route::new(
             Endpoint::new_memory("delivery_in", 1),
             Endpoint::new_memory("delivery_out", 1),
         );
-        assert_eq!(ordinary.inferred_idempotency_mechanism(), None);
+        assert_eq!(
+            ordinary.inferred_idempotency_mechanism(&ordinary.output),
+            None
+        );
     }
 
     /// The object-store sink reports the mechanism it derived, so `name_by: auto` has to be
@@ -2185,13 +2325,32 @@ mod tests {
             crate::models::FileConfig::new("/tmp/orders.csv"),
         )));
         assert_eq!(
-            replayable.inferred_idempotency_mechanism(),
+            replayable.inferred_idempotency_mechanism(&replayable.output),
             Some("object names carrying the source range")
         );
 
         // Memory carries no replay position, so `auto` falls back and claims nothing.
         let positionless = route_from(Endpoint::new_memory("delivery_in", 1));
-        assert_eq!(positionless.inferred_idempotency_mechanism(), None);
+        assert_eq!(
+            positionless.inferred_idempotency_mechanism(&positionless.output),
+            None
+        );
+
+        let filtered = route_from(Endpoint {
+            middlewares: vec![Middleware::Filter("amount > 100".to_string())],
+            ..Endpoint::new(EndpointType::File(crate::models::FileConfig::new(
+                "/tmp/orders.csv",
+            )))
+        });
+        let (relaxed, _) = relax_object_naming(
+            "delivery",
+            filtered.source_has_position(),
+            &filtered.input,
+            &filtered.output,
+        )
+        .unwrap()
+        .expect("filter relaxes object naming");
+        assert_eq!(filtered.inferred_idempotency_mechanism(&relaxed), None);
     }
 
     /// A `ref` may name another `ref`. Resolving only the first hop made a chained input look
@@ -4170,6 +4329,173 @@ mod tests {
             dlq.contains("o1"),
             "the fanout leg's dlq never received the failed message, got {dlq:?}"
         );
+    }
+
+    #[cfg(feature = "http")]
+    #[tokio::test]
+    async fn referenced_http_input_survives_transient_sink_failure_sequentially_and_concurrently() {
+        #[cfg(feature = "rustls-aws-lc")]
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        #[cfg(all(feature = "rustls-ring", not(feature = "rustls-aws-lc")))]
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        for concurrency in [1, 4] {
+            let port = {
+                let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                listener.local_addr().unwrap().port()
+            };
+            let addr = format!("127.0.0.1:{port}");
+            let input_name = format!("referenced_http_{}", fast_uuid_v7::gen_id());
+            register_endpoint(
+                &input_name,
+                Endpoint::new(EndpointType::Http(crate::models::HttpConfig {
+                    url: addr.clone(),
+                    request_timeout_ms: Some(1_000),
+                    ..Default::default()
+                })),
+            );
+            let input = Endpoint::new(EndpointType::Ref(input_name));
+            let output = Endpoint::new(EndpointType::Http(crate::models::HttpConfig {
+                url: "http://127.0.0.1:1/dead".to_string(),
+                request_timeout_ms: Some(250),
+                pass_through_status: true,
+                ..Default::default()
+            }));
+            let route_name = format!(
+                "referenced_http_listener_survives_{concurrency}_{}",
+                fast_uuid_v7::gen_id()
+            );
+            let handle = Route::new(input, output)
+                .with_concurrency(concurrency)
+                .with_reconnect_interval_ms(10)
+                .run(&route_name)
+                .await
+                .unwrap();
+
+            for _ in 0..200 {
+                if tokio::net::TcpStream::connect(&addr).await.is_ok() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+
+            for attempt in 1..=2 {
+                let response = reqwest::Client::new()
+                    .post(format!("http://{addr}/test"))
+                    .body("x")
+                    .send()
+                    .await
+                    .unwrap_or_else(|e| {
+                        panic!(
+                            "concurrency {concurrency} request {attempt} could not reach listener: {e}"
+                        )
+                    });
+                assert_eq!(
+                    response.status(),
+                    reqwest::StatusCode::BAD_GATEWAY,
+                    "concurrency {concurrency} request {attempt} should receive a request-level failure"
+                );
+                assert_eq!(
+                    handle.outcome(),
+                    None,
+                    "concurrency {concurrency} route stopped after request {attempt}"
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+
+            Route::stop(&route_name).await;
+        }
+    }
+
+    #[test]
+    fn transient_sink_failures_keep_existing_etl_reconnect_policy() {
+        let synchronous_http = Endpoint::new(EndpointType::Http(crate::models::HttpConfig {
+            url: "127.0.0.1:8081".to_string(),
+            ..Default::default()
+        }));
+        let fire_and_forget_http = Endpoint::new(EndpointType::Http(crate::models::HttpConfig {
+            url: "127.0.0.1:8080".to_string(),
+            fire_and_forget: true,
+            ..Default::default()
+        }));
+        let streamable_http = Endpoint::new(EndpointType::Http(crate::models::HttpConfig {
+            url: "127.0.0.1:8082".to_string(),
+            receive_streamable: true,
+            ..Default::default()
+        }));
+        let grpc_server = Endpoint::new(EndpointType::Grpc(crate::models::GrpcConfig {
+            url: "127.0.0.1:50051".to_string(),
+            server_mode: true,
+            ..Default::default()
+        }));
+        let websocket_server =
+            Endpoint::new(EndpointType::WebSocket(crate::models::WebSocketConfig {
+                url: "127.0.0.1:9000".to_string(),
+                ..Default::default()
+            }));
+
+        for input in [
+            &fire_and_forget_http,
+            &streamable_http,
+            &grpc_server,
+            &websocket_server,
+        ] {
+            assert!(matches!(
+                transient_publish_failure_policy(input, false),
+                TransientPublishFailurePolicy::StopRoute
+            ));
+        }
+        assert!(matches!(
+            transient_publish_failure_policy(&synchronous_http, false),
+            TransientPublishFailurePolicy::StopRoute
+        ));
+
+        let opted_in_nested_output = Endpoint::new(EndpointType::Fanout(vec![Endpoint::new(
+            EndpointType::Http(crate::models::HttpConfig {
+                url: "http://127.0.0.1:9001".to_string(),
+                pass_through_status: true,
+                ..Default::default()
+            }),
+        )]));
+        assert!(output_passes_through_http_status("proxy", &opted_in_nested_output).unwrap());
+        let mixed_output = Endpoint::new(EndpointType::Fanout(vec![
+            Endpoint::new(EndpointType::Http(crate::models::HttpConfig {
+                url: "http://127.0.0.1:9001".to_string(),
+                pass_through_status: true,
+                ..Default::default()
+            })),
+            Endpoint::new(EndpointType::Kafka(crate::models::KafkaConfig {
+                url: "127.0.0.1:9092".to_string(),
+                ..Default::default()
+            })),
+        ]));
+        assert!(!output_passes_through_http_status("proxy", &mixed_output).unwrap());
+        assert!(matches!(
+            transient_publish_failure_policy(&synchronous_http, true),
+            TransientPublishFailurePolicy::ReplyBadGateway
+        ));
+
+        let suffix = fast_uuid_v7::gen_id();
+        let http_name = format!("policy_http_{suffix}");
+        let http_alias = format!("policy_http_alias_{suffix}");
+        register_endpoint(&http_name, synchronous_http);
+        register_endpoint(&http_alias, Endpoint::new(EndpointType::Ref(http_name)));
+        assert!(matches!(
+            transient_publish_failure_policy(&Endpoint::new(EndpointType::Ref(http_alias)), true),
+            TransientPublishFailurePolicy::ReplyBadGateway
+        ));
+
+        let memory_name = format!("policy_memory_{suffix}");
+        register_endpoint(&memory_name, Endpoint::new_memory("policy-memory", 1));
+        for input in [
+            Endpoint::new(EndpointType::Ref(memory_name)),
+            Endpoint::new(EndpointType::Ref(format!("missing_policy_input_{suffix}"))),
+        ] {
+            assert!(matches!(
+                transient_publish_failure_policy(&input, true),
+                TransientPublishFailurePolicy::StopRoute
+            ));
+        }
     }
 
     // The flip side of the test above: gating health on "the pass stayed up" must not

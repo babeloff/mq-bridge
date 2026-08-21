@@ -192,6 +192,7 @@ pub(crate) fn is_known_middleware_name(name: &str) -> bool {
             | "limiter"
             | "buffer"
             | "cookie_jar"
+            | "filter"
             | "custom"
     )
 }

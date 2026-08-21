@@ -72,6 +72,7 @@ middlewares:
 | [`dlq`](#dlq) | – | ✅ | – | Route permanently-failed messages to another endpoint |
 | [`transform`](#transform) | ✅ | ✅ | – | Declarative JSON mapping, coercion, validation |
 | [`id`](#id) | ✅ | – | – | Derive a replay-stable business identity into `mqb.id` |
+| [`filter`](#filter) | ✅ | ✅ | `filter` | Keep only the messages matching an expression |
 | [`deduplication`](#deduplication) | ✅ | – | `dedup` | Drop repeated keys within a TTL |
 | [`weak_join`](#weak_join) | ✅ | – | – | Correlate and join related messages |
 | [`buffer`](#buffer) | ✅ | ✅ | – | Coalesce single sends into batches |
@@ -165,12 +166,12 @@ reach this drop path.
 
 ### `transform`
 
-Declarative JSON reshaping: field mapping, then schema-directed coercion, defaults and
-validation — over a single parse. Input and output.
+JSON reshaping with field mapping, Zen Expression, and schema processing, in that order.
 
 | Field | Type | Default |
 |---|---|---|
 | `mapping` | map of output field → rule | `{}` |
+| `expression` | Zen Expression returning the output document | – |
 | `schema` | inline JSON Schema subset | – |
 | `schema_file` | path to a schema file | – |
 | `coerce` | bool | `true` |
@@ -178,8 +179,8 @@ validation — over a single parse. Input and output.
 | `coerce_empty_as_null` | bool | `false` |
 | `on_error` | `reject` \| `pass_through` | `reject` |
 
-`schema` and `schema_file` are mutually exclusive. A mapping rule is either a bare path
-string or `{ path, default, required }`.
+`schema` and `schema_file` are mutually exclusive. A mapping rule is a bare path string or
+`{ path, default, required }`.
 
 `schema` must be a JSON *object*, not a string containing one. A flat `key=value` middleware
 syntax (such as the `|transform?schema=…` form in a connection URI) can only pass strings, so
@@ -193,6 +194,17 @@ the route into a config file.
       id: "$.user_id"
       "address.city": { path: "$.city", default: "unknown" }
     schema_file: "schemas/user.json"
+```
+
+For calculated output, use `expression` (available with the `zen` Cargo feature):
+
+```yaml middleware
+- transform:
+    mapping:
+      first: "$.first_name"
+      last: "$.last_name"
+    expression: >-
+      { fullName: first + ' ' + last, source: meta.source }
 ```
 
 Paths accept `$.field`, `$.a.b`, and `$.items[0]`; the `$.` prefix is optional. Dots in the
@@ -309,6 +321,61 @@ identity — which, used as a `deduplication` key, drops all but the first.
 
 Malformed templates fail at startup, and so does a template with no `${...}` token at all, since a
 constant would give every message one identity.
+
+### `filter`
+
+Keeps only the messages for which an expression is true; the rest are dropped. Input and
+output. Requires the `filter` feature (pulls the `zen-expression` engine), which is part of
+`middleware`/`full` but **not** of `portable`.
+
+The value is a bare expression string:
+
+```yaml middleware
+- filter: "amount > 100"
+```
+
+**Put it on the input whenever you can.** A filter on the input drops the message before the
+rest of the pipeline touches it, and acknowledges it at the source; on the output the
+message has already paid for the whole route.
+
+**What an expression can read:**
+
+- **Payload fields by bare name**, including nested paths — `amount`, `order.status`. The
+  payload must be a JSON object; anything else produces a per-message error and fails the batch.
+  Indexed paths such as `items[0].qty` are unsupported: an expression that uses one is
+  rejected at startup rather than silently dropping every message.
+- **Metadata under the reserved `meta.` prefix** — `meta.http_status_code`,
+  `meta.kind`. Metadata is **always text**, so a numeric comparison needs an explicit cast:
+  `number(meta.http_status_code) >= 400`.
+
+If an expression names no payload field at all, the payload is never parsed — a
+metadata-only filter costs no JSON decode.
+
+```yaml middleware
+- filter: "order.status == \"open\" and number(meta.retry_count) < 3"
+```
+
+`&&` and `||` are rewritten to `and` / `or` for you, so both spellings work.
+
+A field that is absent is supplied to the expression as `null`, so an `or` branch or negation
+can still match. A `null` or non-scalar field (an array or object where the expression expects
+a scalar) logs a warning. A payload that is not a JSON object, or an
+expression that does not evaluate to a boolean, is an **error** and fails the batch; those
+are configuration mistakes, and dropping every message would hide them.
+
+To send the non-matching messages somewhere instead of discarding them, use
+[`switch`](#switch)'s `when` mode rather than a filter.
+
+**With an `object_store` sink on `name_by: auto`, the route switches to `write_time` names.**
+A source-range name covers one *contiguous* run of source positions, so a batch with holes
+punched in it would be written as one object per surviving run — a filter keeping 80% of rows
+turns one upload into roughly a hundred. The route logs one line at startup saying it made the
+switch. The same applies to every other middleware that removes messages from a batch
+(`deduplication`, `weak_join`, `transform` with `on_error: reject`) and to a `switch` in `when`
+mode with no `default`. Set `name_by: source_position` explicitly to keep replay-safe names and
+accept the fragmentation.
+
+---
 
 ### `deduplication`
 
@@ -649,8 +716,8 @@ another structural endpoint.
 | Name | Input | Output | Purpose |
 |---|:---:|:---:|---|
 | [`ref`](#ref) | ✅ | ✅ | Reuse an endpoint defined elsewhere by name |
-| [`fanout`](#fanout) | – | ✅ | Send every message to all listed endpoints |
-| [`switch`](#switch) | – | ✅ | Content-based routing on a metadata key |
+| [`fanout`](#fanout) | – | ✅ | Send every message to all listed endpoints; one may reply |
+| [`switch`](#switch) | – | ✅ | Content-based routing on a metadata value or an expression |
 | [`request`](#request) | – | ✅ | Call a request/reply endpoint, forward the response onward |
 | [`response`](#response) | – | ✅ | Reply to the origin of the current request |
 | [`reader`](#reader) | – | ✅ | Use an incoming message as a trigger to pull from a consumer |
@@ -707,15 +774,69 @@ output:
 The value is a plain list of endpoints, each of which may have its own middleware and may
 itself be structural. All branches receive the same message.
 
+A fan-out can also reply. If one of the branches produces a response — a
+[`response`](#response) or [`static`](#static) leg, or a [`request`](#request) whose
+`forward_to` replies — that response is returned to the caller, so a request/reply input can
+fan its message out and still answer. Branches that must not answer need a `forward_to` that
+does not reply (`{}` is the `null` endpoint, which discards).
+
+```yaml route
+# Mirror every call to staging, but answer the caller from production only.
+proxy:
+  input: { http: { url: "0.0.0.0:8443", path: "test" } }
+  output:
+    fanout:
+      - request:
+          to: { http: { url: "http://127.0.0.1:1444/" } }
+          forward_to: {}                 # discard staging's response
+      - request:
+          to: { http: { url: "http://127.0.0.1:1445/" } }
+          forward_to: { response: {} }   # only this one replies to the caller
+```
+
+A caller has one reply channel, so only one branch may answer a given message: if several do,
+the **first in list order** wins and the others are dropped. That is a configuration mistake
+which would otherwise repeat on every message, so the route warns **once** and logs later
+drops at debug level.
+
+A branch that **fails** nacks the whole fan-out: every branch is delivered at-least-once, so
+the answering branch's response is discarded and the caller gets a `500` rather than an answer
+that hides a lost message. That is stricter than nginx's `mirror`, which ignores failed mirror
+subrequests entirely.
+
+The mirror pattern above is unaffected, because a `request` branch with a non-replying
+`forward_to` absorbs its own failure — that is where nginx's "ignore the mirror" semantics
+live, opted into per branch. For a plain branch (`- kafka: { … }` directly in the list) the
+equivalent is a [`dlq`](#dlq) on that branch: the failure is parked, the branch acks, and the
+answering branch still replies.
+
+```yaml route
+proxy_with_parked_mirror:
+  input: { http: { url: "0.0.0.0:8443", path: "test" } }
+  output:
+    fanout:
+      - kafka: { topic: "audit", url: "localhost:9092" }
+        middlewares:
+          - dlq: { endpoint: { file: { path: "audit-failures.jsonl" } } }
+      - request:
+          to: { http: { url: "http://127.0.0.1:1445/" } }
+          forward_to: { response: {} }
+```
+
 ### `switch`
 
-Content-based routing: picks a destination by the value of a **metadata key**.
+Content-based routing: picks one destination per message. Two modes, and a `switch` uses
+exactly one of them — naming both, or neither, is a startup error.
 
 | Field | Type | Required |
 |---|---|---|
-| `metadata_key` | string | yes |
-| `cases` | map value → Endpoint | yes |
+| `metadata_key` | string | value-lookup mode |
+| `cases` | map value → Endpoint | value-lookup mode |
+| `when` | list of `{ if, to }` | predicate mode |
 | `default` | Endpoint | no |
+
+**Value lookup** matches a **metadata** value exactly. It is a HashMap get and never reads
+the payload, so prefer it when the routing key already is metadata.
 
 ```yaml endpoint
 output:
@@ -727,11 +848,34 @@ output:
     default: { file: { path: "other.jsonl" } }
 ```
 
-Matching is on the **metadata** value, not the payload — it does not read JSON fields. To
-route on payload content, first promote the value into metadata (for example with
-[`transform`](#transform)'s `on_error: pass_through`, which sets `mqb.transform_error`, or an
-endpoint that emits a status key such as `http_status_code`). A message whose key is missing
-or unmatched goes to `default`; without a `default` it is dropped.
+**Predicate mode** routes on an expression, so it can branch on payload content directly.
+Cases are evaluated **in order and the first match wins**, which is what makes overlapping
+thresholds safe to write:
+
+```yaml endpoint
+output:
+  switch:
+    when:
+      - if: "amount > 100"
+        to: { kafka: { topic: "large-orders", url: "localhost:9092" } }
+      - if: "amount <= 100"
+        to: { nats: { subject: "small-orders", url: "nats://localhost:4222" } }
+    default: { file: { path: "unrouted.jsonl" } }
+```
+
+`if` takes the same expression language as the [`filter`](#filter) middleware — payload
+fields by bare name (`amount`, `order.status`), metadata under `meta.` and always as text
+(`number(meta.http_status_code) >= 400`), `and`/`or` or `&&`/`||`. Predicate mode therefore
+needs the `filter` feature; a `when` list in a build without it is a startup error, not a
+silent fallback. A payload the expression cannot read fails the send rather than dropping the
+message silently. As with `filter`, indexed payload paths such as `items[0].qty` are unsupported
+and are rejected at startup.
+
+In either mode, a message that matches nothing goes to `default`; without a `default` it is
+dropped with a warning. Value lookup is the cheaper mode and stays the right choice when the
+key is already in metadata — for payload-derived keys you can either promote the value into
+metadata first (for example with [`transform`](#transform)'s `on_error: pass_through`, which
+sets `mqb.transform_error`) or just use `when`.
 
 ### `request`
 
@@ -754,6 +898,17 @@ output:
 `request_reply: true`. On error or timeout the **original** message is forwarded instead of a
 response, so nothing is lost — distinguish the two downstream with a [`switch`](#switch) on a
 status key such as `http_status_code`.
+
+Whatever `forward_to` returns is passed back up. A plain sink acks, `forward_to: {}` (the
+`null` endpoint, also spelled `null`) discards, and `forward_to: { response: {} }` replies to
+the origin of the current request — which is how a [`fanout`](#fanout) branch answers the
+caller.
+
+The error fallback never becomes that reply: when `forward_to` would answer the caller, a
+failed request surfaces the error instead of echoing the original back as a success. The route
+then nacks (HTTP `500`), and a [`retry`](#retry) or [`dlq`](#dlq) middleware on the endpoint
+sees the failure as usual. Forwarding-to-a-sink still acks, so the `switch` pattern above is
+unchanged.
 
 ### `response`
 

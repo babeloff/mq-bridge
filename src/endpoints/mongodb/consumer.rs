@@ -121,13 +121,23 @@ impl MessageConsumer for MongoDbConsumer {
                 .as_secs() as i64;
             let lock_duration_secs = 60;
             let locked_until = now + lock_duration_secs;
+            // Concurrent consumers can write the same `locked_until` second, so only
+            // this token distinguishes the documents this poll actually won.
+            let claim_token = fast_uuid_v7::gen_id_string();
 
             let claimed_docs = self
-                .find_and_claim_documents(extra_filter.clone(), max_messages, now, locked_until)
+                .find_and_claim_documents(
+                    extra_filter.clone(),
+                    max_messages,
+                    now,
+                    locked_until,
+                    &claim_token,
+                )
                 .await?;
 
             if !claimed_docs.is_empty() {
-                let (messages, commit) = self.process_claimed_documents(claimed_docs)?;
+                let (messages, commit) =
+                    self.process_claimed_documents(claimed_docs, claim_token)?;
                 return Ok(ReceivedBatch { messages, commit });
             }
 
@@ -228,6 +238,7 @@ impl MongoDbConsumer {
         limit: usize,
         now: i64,
         locked_until: i64,
+        claim_token: &str,
     ) -> anyhow::Result<Vec<Document>> {
         if limit == 0 {
             return Ok(Vec::new());
@@ -267,12 +278,13 @@ impl MongoDbConsumer {
         let mut update_filter = doc! { "_id": { "$in": &ids_to_claim } };
         update_filter.extend(base_filter);
 
-        let update = doc! { "$set": { "locked_until": locked_until } };
+        let update = doc! { "$set": { "locked_until": locked_until, "claim_token": claim_token } };
         let update_result = self.collection.update_many(update_filter, update).await?;
 
         // If we successfully modified any documents, retrieve their full content.
         if update_result.modified_count > 0 {
-            self.get_documents_by_ids(&ids_to_claim, locked_until).await
+            self.get_documents_by_ids(&ids_to_claim, locked_until, claim_token)
+                .await
         } else {
             Ok(Vec::new())
         }
@@ -285,6 +297,7 @@ impl MongoDbConsumer {
             .as_secs() as i64;
         let lock_duration_secs = 60;
         let locked_until = now + lock_duration_secs;
+        let claim_token = fast_uuid_v7::gen_id_string();
 
         let filter = if extra_filter.is_empty() {
             Self::available_message_filter(now)
@@ -292,7 +305,8 @@ impl MongoDbConsumer {
             doc! { "$and": [Self::available_message_filter(now), extra_filter] }
         };
 
-        let update = doc! { "$set": { "locked_until": locked_until } };
+        let update =
+            doc! { "$set": { "locked_until": locked_until, "claim_token": claim_token.as_str() } };
 
         let options = FindOneAndUpdateOptions::builder()
             .projection(doc! { "_id": 1, "payload": 1, "metadata": 1 })
@@ -322,6 +336,10 @@ impl MongoDbConsumer {
                     Box::pin(async move {
                         match disposition {
                             MessageDisposition::Reply(resp) => {
+                                if !extend_claim(&collection_clone, &id_val, &claim_token).await? {
+                                    warn!(mongodb_id = %id_val, "Skipping MongoDB reply because the message claim was lost");
+                                    return Ok(());
+                                }
                                 handle_reply(
                                     &db,
                                     reply_collection_name.as_ref(),
@@ -334,8 +352,8 @@ impl MongoDbConsumer {
                             MessageDisposition::Nack => {
                                 collection_clone
                                     .update_one(
-                                        doc! { "_id": id_val.clone() },
-                                        doc! { "$set": { "locked_until": null } },
+                                        doc! { "_id": id_val.clone(), "claim_token": claim_token.as_str() },
+                                        doc! { "$set": { "locked_until": null }, "$unset": { "claim_token": "" } },
                                     )
                                     .await
                                     .context("Failed to unlock Nacked message")?;
@@ -344,14 +362,16 @@ impl MongoDbConsumer {
                         }
 
                         match collection_clone
-                            .delete_one(doc! { "_id": id_val.clone() })
+                            .delete_one(
+                                doc! { "_id": id_val.clone(), "claim_token": claim_token.as_str() },
+                            )
                             .await
                         {
                             Ok(delete_result) => {
                                 if delete_result.deleted_count == 1 {
                                     trace!(mongodb_id = %id_val, "MongoDB message acknowledged and deleted");
                                 } else {
-                                    warn!(mongodb_id = %id_val, "Attempted to ack/delete MongoDB message, but it was not found (already deleted?)");
+                                    warn!(mongodb_id = %id_val, "Attempted to ack/delete MongoDB message, but it was not found (already deleted, or the lock expired and it was re-claimed?)");
                                 }
                             }
                             Err(e) => {
@@ -379,14 +399,20 @@ impl MongoDbConsumer {
     /// Retrieves the documents this claim locked.
     ///
     /// The candidate ids were gathered before the update, so a concurrent consumer may
-    /// have taken some of them. Matching on the exact `locked_until` we wrote narrows the
-    /// result to the documents this call actually won.
+    /// have taken some of them. `locked_until` alone cannot separate the claims — two
+    /// consumers polling in the same second write the same value — so the unique
+    /// `claim_token` is what restricts the result to the documents this call won.
     async fn get_documents_by_ids(
         &self,
         claimed_ids: &[Bson],
         locked_until: i64,
+        claim_token: &str,
     ) -> anyhow::Result<Vec<Document>> {
-        let filter = doc! { "_id": { "$in": claimed_ids }, "locked_until": locked_until };
+        let filter = doc! {
+            "_id": { "$in": claimed_ids },
+            "locked_until": locked_until,
+            "claim_token": claim_token
+        };
         let mut cursor = self
             .collection
             .find(filter)
@@ -404,6 +430,7 @@ impl MongoDbConsumer {
     fn process_claimed_documents(
         &self,
         docs: Vec<Document>,
+        claim_token: String,
     ) -> anyhow::Result<(Vec<CanonicalMessage>, BatchCommitFunc)> {
         let mut messages = Vec::with_capacity(docs.len());
         let mut ids = Vec::with_capacity(docs.len());
@@ -444,6 +471,7 @@ impl MongoDbConsumer {
                     &reply_infos,
                     &ids,
                     dispositions,
+                    &claim_token,
                 )
                 .await
             }) as BoxFuture<'static, anyhow::Result<()>>
@@ -453,12 +481,31 @@ impl MongoDbConsumer {
     }
 }
 
+async fn extend_claim(
+    collection: &Collection<Document>,
+    id: &Bson,
+    claim_token: &str,
+) -> anyhow::Result<bool> {
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)?
+        .as_secs() as i64;
+    let result = collection
+        .update_one(
+            doc! { "_id": id, "claim_token": claim_token },
+            doc! { "$set": { "locked_until": now + 60 } },
+        )
+        .await
+        .context("Failed to extend MongoDB message claim before replying")?;
+    Ok(result.matched_count == 1)
+}
+
 async fn process_mongodb_batch_commit(
     db: &Database,
     collection: &Collection<Document>,
     reply_infos: &[(Option<String>, Option<String>)],
     ids: &[Bson],
     dispositions: Vec<MessageDisposition>,
+    claim_token: &str,
 ) -> anyhow::Result<()> {
     let mut ids_to_delete = Vec::new();
     let mut ids_to_unlock = Vec::new();
@@ -470,21 +517,27 @@ async fn process_mongodb_batch_commit(
         // Only send a reply if the message has a 'reply_to' destination and the disposition is a Reply.
         // This allows for fire-and-forget patterns (no reply_to) or explicit replies.
         match disposition {
-            MessageDisposition::Reply(resp) => match handle_reply(
-                db,
-                reply_coll_opt.as_ref(),
-                correlation_id_opt.as_ref(),
-                resp,
-            )
-            .await
-            {
-                Ok(_) => ids_to_delete.push(id.clone()),
-                Err(e) => {
-                    tracing::error!(id = %id, error = %e, "Failed to send reply");
-                    errors.push(e);
-                    ids_to_unlock.push(id.clone());
+            MessageDisposition::Reply(resp) => {
+                if !extend_claim(collection, id, claim_token).await? {
+                    warn!(mongodb_id = %id, "Skipping MongoDB reply because the message claim was lost");
+                    continue;
                 }
-            },
+                match handle_reply(
+                    db,
+                    reply_coll_opt.as_ref(),
+                    correlation_id_opt.as_ref(),
+                    resp,
+                )
+                .await
+                {
+                    Ok(_) => ids_to_delete.push(id.clone()),
+                    Err(e) => {
+                        tracing::error!(id = %id, error = %e, "Failed to send reply");
+                        errors.push(e);
+                        ids_to_unlock.push(id.clone());
+                    }
+                }
+            }
             MessageDisposition::Ack => {
                 ids_to_delete.push(id.clone());
             }
@@ -495,8 +548,8 @@ async fn process_mongodb_batch_commit(
     }
 
     if !ids_to_unlock.is_empty() {
-        let filter = doc! { "_id": { "$in": &ids_to_unlock } };
-        let update = doc! { "$set": { "locked_until": null } };
+        let filter = doc! { "_id": { "$in": &ids_to_unlock }, "claim_token": claim_token };
+        let update = doc! { "$set": { "locked_until": null }, "$unset": { "claim_token": "" } };
         if let Err(e) = collection.update_many(filter, update).await {
             tracing::error!(error = %e, "Failed to unlock Nacked MongoDB messages");
             return Err(anyhow::anyhow!(
@@ -507,7 +560,9 @@ async fn process_mongodb_batch_commit(
     }
 
     if !ids_to_delete.is_empty() {
-        let filter = doc! { "_id": { "$in": &ids_to_delete } };
+        // Scoped to this claim: a lease that expired and was re-claimed elsewhere must
+        // not be deleted from under its new owner.
+        let filter = doc! { "_id": { "$in": &ids_to_delete }, "claim_token": claim_token };
         // Ack failure may result in redelivery. Enable deduplication middleware to handle duplicates.
         if let Err(e) = collection.delete_many(filter).await {
             tracing::error!(error = %e, "Failed to bulk-ack/delete MongoDB messages");

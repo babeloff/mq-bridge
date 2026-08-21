@@ -194,6 +194,7 @@ class HttpConfig(TypedDict, total=False):
     internal_buffer_size: Optional[int]
     message_id_header: Optional[str]
     method: Optional[str]
+    pass_through_status: bool
     path: Optional[str]
     pool_idle_timeout_ms: Optional[int]
     receive_streamable: bool
@@ -281,6 +282,7 @@ class Middleware(TypedDict, total=False):
     delay: DelayMiddleware
     dlq: DeadLetterQueueMiddleware
     encryption: EncryptionConfig
+    filter: str
     id: str
     limiter: LimiterMiddleware
     metrics: MetricsMiddleware
@@ -494,10 +496,22 @@ class StreamBufferConfig(TypedDict, total=False):
     topic: Required[str]
 
 
+# One predicate case of a `switch` in `when` mode.
+SwitchCase = TypedDict(
+    "SwitchCase",
+    {
+        "if": Required[str],
+        "to": Required[Endpoint],
+    },
+    total=False,
+)
+
+
 class SwitchConfig(TypedDict, total=False):
-    cases: Required[Dict[str, Endpoint]]
+    cases: Dict[str, Endpoint]
     default: Optional[Endpoint]
-    metadata_key: Required[str]
+    metadata_key: str
+    when: List[SwitchCase]
 
 
 class TlsConfig(TypedDict, total=False):
@@ -515,6 +529,7 @@ class TransformMiddleware(TypedDict, total=False):
     apply_defaults: bool
     coerce: bool
     coerce_empty_as_null: bool
+    expression: Optional[str]
     mapping: Dict[str, MappingRule]
     on_error: TransformErrorPolicy
     schema: Any

@@ -1,4 +1,4 @@
-use crate::traits::{MessagePublisher, PublisherError, Sent, SentBatch};
+use crate::traits::{BoxFuture, MessagePublisher, PublisherError, Sent, SentBatch};
 use crate::CanonicalMessage;
 use async_trait::async_trait;
 use std::any::Any;
@@ -6,9 +6,28 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::warn;
 
+/// How a `switch` picks a destination.
+///
+/// The two modes differ in cost, which is why both exist: a lookup is a HashMap
+/// get on metadata, while a predicate may have to parse the payload.
+enum Routing {
+    /// Exact match on a metadata value.
+    Lookup {
+        metadata_key: String,
+        cases: HashMap<String, Arc<dyn MessagePublisher>>,
+    },
+    /// Ordered expression predicates, first match wins.
+    #[cfg(feature = "filter")]
+    Predicate(
+        Vec<(
+            crate::middleware::filter::CompiledFilter,
+            Arc<dyn MessagePublisher>,
+        )>,
+    ),
+}
+
 pub struct SwitchPublisher {
-    metadata_key: String,
-    cases: HashMap<String, Arc<dyn MessagePublisher>>,
+    routing: Routing,
     default: Option<Arc<dyn MessagePublisher>>,
 }
 
@@ -19,31 +38,125 @@ impl SwitchPublisher {
         default: Option<Arc<dyn MessagePublisher>>,
     ) -> Self {
         Self {
-            metadata_key,
-            cases,
+            routing: Routing::Lookup {
+                metadata_key,
+                cases,
+            },
             default,
         }
     }
 
-    fn get_publisher(&self, message: &CanonicalMessage) -> Option<&Arc<dyn MessagePublisher>> {
-        if let Some(val) = message.metadata.get(&self.metadata_key) {
-            if let Some(publisher) = self.cases.get(val) {
-                return Some(publisher);
+    /// Builds the predicate mode from already-compiled expressions, in order.
+    #[cfg(feature = "filter")]
+    pub(crate) fn new_predicate(
+        cases: Vec<(
+            crate::middleware::filter::CompiledFilter,
+            Arc<dyn MessagePublisher>,
+        )>,
+        default: Option<Arc<dyn MessagePublisher>>,
+    ) -> Self {
+        Self {
+            routing: Routing::Predicate(cases),
+            default,
+        }
+    }
+
+    /// Resolves the destination, or `None` to drop the message.
+    ///
+    /// Only predicate mode can fail: an expression pointed at a payload it
+    /// cannot read is a configuration error, and silently dropping every
+    /// message would hide it.
+    fn get_publisher(
+        &self,
+        message: &CanonicalMessage,
+    ) -> Result<Option<&Arc<dyn MessagePublisher>>, PublisherError> {
+        match &self.routing {
+            Routing::Lookup {
+                metadata_key,
+                cases,
+            } => {
+                if let Some(val) = message.metadata.get(metadata_key) {
+                    if let Some(publisher) = cases.get(val) {
+                        return Ok(Some(publisher));
+                    }
+                }
+            }
+            #[cfg(feature = "filter")]
+            Routing::Predicate(cases) => {
+                let mut context = crate::middleware::filter::FilterContext::new();
+                for (filter, publisher) in cases {
+                    if filter
+                        .matches_with_context(message, &mut context)
+                        .map_err(PublisherError::NonRetryable)?
+                    {
+                        return Ok(Some(publisher));
+                    }
+                }
             }
         }
-        self.default.as_ref()
+        Ok(self.default.as_ref())
+    }
+
+    /// Names the routing rule in the drop warning.
+    fn dropped_reason(&self) -> String {
+        match &self.routing {
+            Routing::Lookup { metadata_key, .. } => {
+                format!("metadata key '{metadata_key}' not found or no matching case/default")
+            }
+            #[cfg(feature = "filter")]
+            Routing::Predicate(_) => "no `when` case matched and no default is set".to_string(),
+        }
+    }
+
+    /// Every destination this switch can reach, cases and `default` alike.
+    fn destinations(&self) -> impl Iterator<Item = &Arc<dyn MessagePublisher>> {
+        let routed: Box<dyn Iterator<Item = &Arc<dyn MessagePublisher>> + Send + '_> =
+            match &self.routing {
+                Routing::Lookup { cases, .. } => Box::new(cases.values()),
+                #[cfg(feature = "filter")]
+                Routing::Predicate(cases) => Box::new(cases.iter().map(|(_, publisher)| publisher)),
+            };
+        routed.chain(self.default.iter())
     }
 }
 
 #[async_trait]
 impl MessagePublisher for SwitchPublisher {
+    fn on_connect_hook(&self) -> Option<BoxFuture<'_, anyhow::Result<()>>> {
+        Some(Box::pin(async move {
+            for publisher in self.destinations() {
+                if let Some(hook) = publisher.on_connect_hook() {
+                    hook.await?;
+                }
+            }
+            Ok(())
+        }))
+    }
+
+    fn on_disconnect_hook(&self) -> Option<BoxFuture<'_, anyhow::Result<()>>> {
+        Some(Box::pin(async move {
+            // Every destination gets torn down even if an earlier one fails, so one bad case
+            // cannot skip another's durable teardown. The first error is reported.
+            let mut first_error = None;
+            for publisher in self.destinations() {
+                if let Some(hook) = publisher.on_disconnect_hook() {
+                    if let Err(e) = hook.await {
+                        first_error.get_or_insert(e);
+                    }
+                }
+            }
+            first_error.map_or(Ok(()), Err)
+        }))
+    }
+
     async fn send(&self, message: CanonicalMessage) -> Result<Sent, PublisherError> {
-        if let Some(publisher) = self.get_publisher(&message) {
+        if let Some(publisher) = self.get_publisher(&message)? {
             publisher.send(message).await
         } else {
             warn!(
-                "Switch publisher dropped message with id {:032x}: metadata key '{}' not found or no matching case/default.",
-                message.message_id, self.metadata_key
+                "Switch publisher dropped message with id {:032x}: {}.",
+                message.message_id,
+                self.dropped_reason()
             );
             Ok(Sent::Ack)
         }
@@ -67,21 +180,30 @@ impl MessagePublisher for SwitchPublisher {
             usize,
             (Arc<dyn MessagePublisher>, Vec<CanonicalMessage>),
         > = HashMap::new();
+        let mut dropped = 0usize;
+        // A message whose predicate cannot read it fails on its own: failing the whole
+        // batch would hand `retry`/`dlq` — or the drop report — every sibling message too.
+        let mut failed_routing = Vec::new();
 
         for message in messages {
-            if let Some(publisher) = self.get_publisher(&message) {
-                let key = Arc::as_ptr(publisher) as *const () as usize;
-                grouped_messages
-                    .entry(key)
-                    .or_insert_with(|| (publisher.clone(), Vec::new()))
-                    .1
-                    .push(message);
-            } else {
-                warn!(
-                    "Switch publisher dropped message with id {:032x}: metadata key '{}' not found or no matching case/default.",
-                    message.message_id, self.metadata_key
-                );
+            match self.get_publisher(&message) {
+                Ok(Some(publisher)) => {
+                    let key = Arc::as_ptr(publisher) as *const () as usize;
+                    grouped_messages
+                        .entry(key)
+                        .or_insert_with(|| (publisher.clone(), Vec::new()))
+                        .1
+                        .push(message);
+                }
+                Ok(None) => dropped += 1,
+                Err(e) => failed_routing.push((message, e)),
             }
+        }
+        if dropped > 0 {
+            warn!(
+                "Switch publisher dropped {dropped} messages: {}.",
+                self.dropped_reason()
+            );
         }
 
         // Create futures for sending each group as a batch.
@@ -93,7 +215,7 @@ impl MessagePublisher for SwitchPublisher {
 
         // Aggregate results from all the batch sends.
         let mut all_responses = Vec::new();
-        let mut all_failed = Vec::new();
+        let mut all_failed = failed_routing;
 
         for result in results {
             match result {
@@ -129,10 +251,7 @@ impl MessagePublisher for SwitchPublisher {
 
     /// Ordered if any branch is: batches for a given branch must stay in source order.
     fn requires_ordered_publish(&self) -> bool {
-        self.cases
-            .values()
-            .chain(self.default.iter())
-            .any(|p| p.requires_ordered_publish())
+        self.destinations().any(|p| p.requires_ordered_publish())
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -144,6 +263,7 @@ impl MessagePublisher for SwitchPublisher {
 mod tests {
     use super::*;
     use crate::endpoints::memory::MemoryPublisher;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
     #[tokio::test]
@@ -260,5 +380,266 @@ mod tests {
 
         assert_eq!(chan_a.len(), 1);
         assert_eq!(*pub_default.batches.lock().unwrap(), vec![3]);
+    }
+
+    /// Counts hook invocations; `fail_disconnect` makes teardown fail so the "keep going"
+    /// behaviour is observable.
+    #[derive(Default)]
+    struct HookPublisher {
+        connects: AtomicUsize,
+        disconnects: AtomicUsize,
+        fail_disconnect: bool,
+    }
+
+    impl HookPublisher {
+        fn new(fail_disconnect: bool) -> Arc<Self> {
+            Arc::new(Self {
+                fail_disconnect,
+                ..Default::default()
+            })
+        }
+
+        fn counts(&self) -> (usize, usize) {
+            (
+                self.connects.load(Ordering::SeqCst),
+                self.disconnects.load(Ordering::SeqCst),
+            )
+        }
+    }
+
+    #[async_trait]
+    impl MessagePublisher for HookPublisher {
+        fn on_connect_hook(&self) -> Option<BoxFuture<'_, anyhow::Result<()>>> {
+            Some(Box::pin(async move {
+                self.connects.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }))
+        }
+
+        fn on_disconnect_hook(&self) -> Option<BoxFuture<'_, anyhow::Result<()>>> {
+            Some(Box::pin(async move {
+                self.disconnects.fetch_add(1, Ordering::SeqCst);
+                if self.fail_disconnect {
+                    anyhow::bail!("teardown failed");
+                }
+                Ok(())
+            }))
+        }
+
+        async fn send(&self, _message: CanonicalMessage) -> Result<Sent, PublisherError> {
+            Ok(Sent::Ack)
+        }
+
+        async fn send_batch(
+            &self,
+            _messages: Vec<CanonicalMessage>,
+        ) -> Result<SentBatch, PublisherError> {
+            Ok(SentBatch::Ack)
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    /// Cases and `default` alike are connected and torn down; one failing teardown does not
+    /// skip the others.
+    #[tokio::test]
+    async fn test_switch_forwards_hooks_to_cases_and_default() {
+        let ok_case = HookPublisher::new(false);
+        let failing_case = HookPublisher::new(true);
+        let fallback = HookPublisher::new(false);
+
+        let mut cases: HashMap<String, Arc<dyn MessagePublisher>> = HashMap::new();
+        cases.insert("a".into(), ok_case.clone());
+        cases.insert("b".into(), failing_case.clone());
+        let switch = SwitchPublisher::new("k".into(), cases, Some(fallback.clone()));
+
+        switch.on_connect_hook().unwrap().await.unwrap();
+        assert_eq!(ok_case.counts().0, 1);
+        assert_eq!(failing_case.counts().0, 1);
+        assert_eq!(fallback.counts().0, 1);
+
+        let err = switch.on_disconnect_hook().unwrap().await.unwrap_err();
+        assert!(err.to_string().contains("teardown failed"));
+        assert_eq!(ok_case.counts().1, 1);
+        assert_eq!(failing_case.counts().1, 1);
+        assert_eq!(fallback.counts().1, 1);
+    }
+
+    #[cfg(feature = "filter")]
+    mod predicate {
+        use super::*;
+        use crate::middleware::filter::CompiledFilter;
+
+        fn switch_on(
+            cases: Vec<(&str, Arc<dyn MessagePublisher>)>,
+            default: Option<Arc<dyn MessagePublisher>>,
+        ) -> SwitchPublisher {
+            let compiled = cases
+                .into_iter()
+                .map(|(expression, publisher)| {
+                    (CompiledFilter::new(expression).unwrap(), publisher)
+                })
+                .collect();
+            SwitchPublisher::new_predicate(compiled, default)
+        }
+
+        fn json(amount: i64) -> CanonicalMessage {
+            CanonicalMessage::from(format!(r#"{{"amount":{amount}}}"#).as_str())
+        }
+
+        /// The point of the mode: a threshold splits the stream across two destinations.
+        #[tokio::test]
+        async fn a_threshold_routes_to_either_branch() {
+            let big = Arc::new(RecordingPublisher::default());
+            let small = Arc::new(RecordingPublisher::default());
+            let switch = switch_on(
+                vec![
+                    ("amount > 100", big.clone() as Arc<dyn MessagePublisher>),
+                    ("amount <= 100", small.clone() as Arc<dyn MessagePublisher>),
+                ],
+                None,
+            );
+
+            switch
+                .send_batch(vec![json(500), json(7), json(101), json(100)])
+                .await
+                .unwrap();
+
+            assert_eq!(*big.batches.lock().unwrap(), vec![2]);
+            assert_eq!(*small.batches.lock().unwrap(), vec![2]);
+        }
+
+        /// Cases are ordered, so an overlapping later case never steals a message.
+        #[tokio::test]
+        async fn the_first_matching_case_wins() {
+            let first = Arc::new(RecordingPublisher::default());
+            let second = Arc::new(RecordingPublisher::default());
+            let switch = switch_on(
+                vec![
+                    ("amount > 10", first.clone() as Arc<dyn MessagePublisher>),
+                    ("amount > 100", second.clone() as Arc<dyn MessagePublisher>),
+                ],
+                None,
+            );
+
+            switch.send(json(500)).await.unwrap();
+
+            assert_eq!(*first.batches.lock().unwrap(), vec![1]);
+            assert!(second.batches.lock().unwrap().is_empty());
+        }
+
+        #[tokio::test]
+        async fn an_unmatched_message_falls_through_to_default() {
+            let matched = Arc::new(RecordingPublisher::default());
+            let default = Arc::new(RecordingPublisher::default());
+            let switch = switch_on(
+                vec![("amount > 100", matched.clone() as Arc<dyn MessagePublisher>)],
+                Some(default.clone() as Arc<dyn MessagePublisher>),
+            );
+
+            switch.send(json(1)).await.unwrap();
+
+            assert!(matched.batches.lock().unwrap().is_empty());
+            assert_eq!(*default.batches.lock().unwrap(), vec![1]);
+        }
+
+        /// Without a default an unmatched message is dropped, not failed.
+        #[tokio::test]
+        async fn an_unmatched_message_without_a_default_is_dropped() {
+            let matched = Arc::new(RecordingPublisher::default());
+            let switch = switch_on(
+                vec![("amount > 100", matched.clone() as Arc<dyn MessagePublisher>)],
+                None,
+            );
+
+            switch.send(json(1)).await.unwrap();
+
+            assert!(matched.batches.lock().unwrap().is_empty());
+        }
+
+        /// A payload the expression cannot read is a config error, not a silent drop.
+        #[tokio::test]
+        async fn an_unreadable_payload_surfaces_as_an_error() {
+            let matched = Arc::new(RecordingPublisher::default());
+            let switch = switch_on(
+                vec![("amount > 100", matched as Arc<dyn MessagePublisher>)],
+                None,
+            );
+
+            let result = switch.send(CanonicalMessage::from("not json")).await;
+
+            assert!(matches!(result, Err(PublisherError::NonRetryable(_))));
+        }
+
+        /// One unreadable message must not take its whole batch down with it: the route
+        /// acks a failed batch wholesale when no `dlq` is configured.
+        #[tokio::test]
+        async fn an_unreadable_message_fails_alone_in_a_batch() {
+            let matched = Arc::new(RecordingPublisher::default());
+            let switch = switch_on(
+                vec![("amount > 100", matched.clone() as Arc<dyn MessagePublisher>)],
+                None,
+            );
+
+            let result = switch
+                .send_batch(vec![
+                    json(150),
+                    CanonicalMessage::from("not json"),
+                    json(200),
+                ])
+                .await
+                .unwrap();
+
+            match result {
+                SentBatch::Partial { failed, .. } => assert_eq!(failed.len(), 1),
+                SentBatch::Ack => panic!("the unreadable message should have been reported"),
+            }
+            assert_eq!(*matched.batches.lock().unwrap(), vec![2]);
+        }
+
+        /// Metadata routing needs no payload parse at all.
+        #[tokio::test]
+        async fn metadata_routes_through_the_meta_prefix() {
+            let urgent = Arc::new(RecordingPublisher::default());
+            let switch = switch_on(
+                vec![(
+                    r#"meta.priority == "high""#,
+                    urgent.clone() as Arc<dyn MessagePublisher>,
+                )],
+                None,
+            );
+
+            switch
+                .send(CanonicalMessage::from("not json").with_metadata_kv("priority", "high"))
+                .await
+                .unwrap();
+
+            assert_eq!(*urgent.batches.lock().unwrap(), vec![1]);
+        }
+
+        #[tokio::test]
+        async fn an_early_metadata_match_does_not_parse_the_payload() {
+            let urgent = Arc::new(RecordingPublisher::default());
+            let fallback = Arc::new(RecordingPublisher::default());
+            let switch = switch_on(
+                vec![
+                    (
+                        r#"meta.priority == "high""#,
+                        urgent.clone() as Arc<dyn MessagePublisher>,
+                    ),
+                    ("amount > 100", fallback as Arc<dyn MessagePublisher>),
+                ],
+                None,
+            );
+
+            switch
+                .send(CanonicalMessage::from("not json").with_metadata_kv("priority", "high"))
+                .await
+                .unwrap();
+
+            assert_eq!(*urgent.batches.lock().unwrap(), vec![1]);
+        }
     }
 }

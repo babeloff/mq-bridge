@@ -962,7 +962,7 @@ with_optional_setters!(RedisStreamsConfig { with_block_ms => block_ms: u64, with
 with_value_setters!(GrpcConfig { with_tls => tls: TlsConfig, with_server_streaming => server_streaming: bool });
 with_optional_setters!(GrpcConfig { with_timeout_ms => timeout_ms: u64, with_initial_stream_window_size => initial_stream_window_size: u32, with_initial_connection_window_size => initial_connection_window_size: u32, with_concurrency_limit_per_connection => concurrency_limit_per_connection: usize, with_http2_keepalive_interval_ms => http2_keepalive_interval_ms: u64, with_http2_keepalive_timeout_ms => http2_keepalive_timeout_ms: u64, with_max_decoding_message_size => max_decoding_message_size: usize, with_max_encoding_message_size => max_encoding_message_size: usize, with_request => request: serde_json::Value, with_shared => shared: bool });
 with_optional_string_setters!(GrpcConfig { with_consumer_id => consumer_id, with_descriptor_set_path => descriptor_set_path, with_service_name => service_name, with_method_name => method_name });
-with_value_setters!(HttpConfig { with_tls => tls: TlsConfig, with_fire_and_forget => fire_and_forget: bool, with_compression => compression: Compression, with_custom_headers => custom_headers: HashMap<String, String> });
+with_value_setters!(HttpConfig { with_tls => tls: TlsConfig, with_fire_and_forget => fire_and_forget: bool, with_pass_through_status => pass_through_status: bool, with_compression => compression: Compression, with_custom_headers => custom_headers: HashMap<String, String> });
 with_optional_setters!(HttpConfig { with_request_timeout_ms => request_timeout_ms: u64, with_internal_buffer_size => internal_buffer_size: usize, with_batch_concurrency => batch_concurrency: usize, with_tcp_keepalive_ms => tcp_keepalive_ms: u64, with_pool_idle_timeout_ms => pool_idle_timeout_ms: u64, with_compression_enabled => compression_enabled: bool, with_compression_threshold_bytes => compression_threshold_bytes: usize, with_concurrency_limit => concurrency_limit: usize, with_basic_auth => basic_auth: (String, String), with_shared => shared: bool });
 with_optional_string_setters!(HttpConfig { with_message_id_header => message_id_header });
 with_optional_string_setters!(WebSocketConfig { with_message_id_header => message_id_header });
@@ -973,7 +973,7 @@ with_optional_string_setters!(IbmTlsConfig { with_cipher_spec => cipher_spec, wi
 with_value_setters!(IbmMqConfig { with_tls => tls: IbmTlsConfig, with_max_message_size => max_message_size: usize, with_wait_timeout_ms => wait_timeout_ms: i32, with_disable_status_inq => disable_status_inq: bool });
 with_optional_setters!(IbmMqConfig { with_internal_buffer_size => internal_buffer_size: usize });
 with_string_setters!(SwitchConfig { with_metadata_key => metadata_key });
-with_value_setters!(SwitchConfig { with_cases => cases: HashMap<String, Endpoint> });
+with_value_setters!(SwitchConfig { with_cases => cases: HashMap<String, Endpoint>, with_when => when: Vec<SwitchCase> });
 with_optional_setters!(SwitchConfig { with_default => default: Box<Endpoint> });
 with_value_setters!(RequestForwardConfig { with_to => to: Box<Endpoint>, with_forward_to => forward_to: Box<Endpoint> });
 

@@ -566,6 +566,54 @@ fn test_schema_and_schema_file_together_are_rejected() {
     assert!(error.to_string().contains("not both"), "{error}");
 }
 
+#[cfg(feature = "zen")]
+#[test]
+fn test_expression_runs_after_mapping_and_reads_metadata() {
+    let cfg = compiled(json!({
+        "mapping": {
+            "first": "$.first_name",
+            "last": "$.last_name"
+        },
+        "expression": "{ fullName: first + ' ' + last, source: meta.source }"
+    }));
+    let mut message =
+        CanonicalMessage::from(json!({ "first_name": "Ada", "last_name": "Lovelace" }).to_string());
+    message
+        .metadata
+        .insert("source".to_string(), "postgres".to_string());
+
+    cfg.transform(&mut message).unwrap();
+
+    assert_eq!(
+        serde_json::from_slice::<Value>(&message.payload).unwrap(),
+        json!({ "fullName": "Ada Lovelace", "source": "postgres" })
+    );
+}
+
+#[cfg(feature = "zen")]
+#[test]
+fn test_schema_is_applied_after_expression() {
+    let cfg = compiled(json!({
+        "expression": "{ id: user_id }",
+        "schema": {
+            "type": "object",
+            "properties": { "id": { "type": "integer" } }
+        }
+    }));
+
+    assert_eq!(
+        run(&cfg, json!({ "user_id": "42" })).unwrap(),
+        json!({ "id": 42 })
+    );
+}
+
+#[cfg(feature = "zen")]
+#[test]
+fn test_invalid_expression_is_rejected_at_construction() {
+    let error = Compiled::new(&config(json!({ "expression": "first_name +" }))).unwrap_err();
+    assert!(error.to_string().contains("invalid expression"), "{error}");
+}
+
 #[test]
 fn test_schema_file_is_read_once_at_construction() {
     let dir = tempfile::tempdir().unwrap();

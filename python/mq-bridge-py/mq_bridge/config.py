@@ -39,6 +39,7 @@ Route = dict
 SledConfig = dict
 SqlxConfig = dict
 StreamBufferConfig = dict
+SwitchCase = dict
 SwitchConfig = dict
 TlsConfig = dict
 TransformMiddleware = dict
@@ -121,6 +122,7 @@ __all__ = [
     "SqlxConfig",
     "StaticConfig",
     "StreamBufferConfig",
+    "SwitchCase",
     "SwitchConfig",
     "TlsConfig",
     "TransformErrorPolicy",

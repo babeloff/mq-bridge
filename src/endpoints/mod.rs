@@ -55,8 +55,9 @@ pub use crate::endpoints::structural::{
 use crate::middleware::apply_middlewares_to_consumer;
 use crate::models::{
     Endpoint, EndpointType, MemoryConfig, Middleware, NameBy, ResponseConfig, StreamBufferConfig,
+    TransformErrorPolicy,
 };
-use crate::route::get_endpoint_factory;
+use crate::route::{get_endpoint, get_endpoint_factory};
 use crate::traits::{BoxFuture, MessageConsumer, MessagePublisher};
 use anyhow::{anyhow, Result};
 use std::sync::Arc;
@@ -780,6 +781,156 @@ pub fn output_has_write_time_named_object_store(
     )
 }
 
+/// Names the middleware on `endpoint` that removes messages from a batch, if any.
+///
+/// Only a middleware that drops a message outright counts. One that delays, retries or
+/// rewrites a message leaves the batch dense, which is what matters here.
+fn row_dropping_middleware(endpoint: &Endpoint) -> Option<&'static str> {
+    endpoint
+        .middlewares
+        .iter()
+        .find_map(|middleware| match middleware {
+            Middleware::Filter(_) => Some("the `filter` middleware"),
+            Middleware::Deduplication(_) => Some("the `deduplication` middleware"),
+            // One message per group carrying the first member's position, so a group of
+            // four leaves three holes behind every survivor.
+            Middleware::WeakJoin(_) => Some("the `weak_join` middleware"),
+            // A transform with no configured stage never rejects anything.
+            Middleware::Transform(config)
+                if config.on_error == TransformErrorPolicy::Reject
+                    && !(config.mapping.is_empty()
+                        && config.expression.is_none()
+                        && config.schema.is_none()
+                        && config.schema_file.is_none()) =>
+            {
+                Some("`transform` with `on_error: reject`")
+            }
+            _ => None,
+        })
+}
+
+/// Takes a row-dropping route's object-store sinks off `source_position` naming.
+///
+/// `name_by: auto` resolves to `source_position` whenever the input stamps one, naming each
+/// object after a *contiguous* source range. A batch with holes in it is therefore written as
+/// one object per surviving run: a filter keeping 80% of rows at random turns one PUT into
+/// roughly a hundred, measured at a 220x slowdown. Renumbering positions to close the holes
+/// would forge the replay identity the naming exists to provide, so the honest move is to stop
+/// claiming it.
+///
+/// Only `auto` is relaxed — an explicit `source_position`, or the deprecated `idempotency`
+/// alias, is a request for replay-safe names, holes and all. The `file` sink is untouched:
+/// its `auto` never resolves to `source_position`. A sink behind a `ref` is also left alone,
+/// since the referenced endpoint is resolved from the registry when the publisher is built
+/// and never sees this copy.
+///
+/// Returns the rewritten output and the line to tell the operator, or `None` when nothing
+/// needed relaxing.
+pub fn relax_object_naming(
+    route_name: &str,
+    source_has_position: bool,
+    input: &Endpoint,
+    output: &Endpoint,
+) -> Result<Option<(Endpoint, String)>> {
+    if !source_has_position {
+        return Ok(None);
+    }
+
+    fn visit(
+        route_name: &str,
+        endpoint: &mut Endpoint,
+        dropped_by: Option<&'static str>,
+        depth: usize,
+        relaxed: &mut Option<String>,
+    ) -> Result<()> {
+        const MAX_DEPTH: usize = 16;
+        if depth > MAX_DEPTH {
+            return Err(anyhow!(
+                "[route:{route_name}] output recursion depth exceeded limit of {MAX_DEPTH}"
+            ));
+        }
+        // A dropper anywhere above a sink makes every batch beneath it sparse.
+        let dropped_by = dropped_by.or_else(|| row_dropping_middleware(endpoint));
+        match &mut endpoint.endpoint_type {
+            EndpointType::ObjectStore(config) => {
+                let Some(dropped_by) = dropped_by else {
+                    return Ok(());
+                };
+                if config.name_by != NameBy::Auto || config.idempotency.is_some() {
+                    return Ok(());
+                }
+                config.name_by = NameBy::WriteTime;
+                relaxed.get_or_insert_with(|| {
+                    format!(
+                        "{dropped_by} removes messages from each batch, which would leave every \
+                         object covering one contiguous source range and split each batch into \
+                         many small objects. Naming objects by write time instead; set \
+                         name_by: source_position to keep replay-safe names at that cost."
+                    )
+                });
+            }
+            EndpointType::Fanout(outputs) => {
+                for output in outputs {
+                    visit(route_name, output, dropped_by, depth + 1, relaxed)?;
+                }
+            }
+            EndpointType::Switch(config) => {
+                // Either switch mode without a `default` drops whatever matches nothing.
+                let dropped_by = dropped_by.or_else(|| {
+                    ((!config.when.is_empty() || !config.cases.is_empty())
+                        && config.default.is_none())
+                    .then_some("a `switch` with no `default`")
+                });
+                for output in config.cases.values_mut() {
+                    visit(route_name, output, dropped_by, depth + 1, relaxed)?;
+                }
+                for case in &mut config.when {
+                    visit(route_name, &mut case.to, dropped_by, depth + 1, relaxed)?;
+                }
+                if let Some(output) = config.default.as_deref_mut() {
+                    visit(route_name, output, dropped_by, depth + 1, relaxed)?;
+                }
+            }
+            EndpointType::Reader(output) => {
+                visit(route_name, output, dropped_by, depth + 1, relaxed)?;
+            }
+            EndpointType::Request(config) => {
+                visit(route_name, &mut config.to, dropped_by, depth + 1, relaxed)?;
+                visit(
+                    route_name,
+                    &mut config.forward_to,
+                    dropped_by,
+                    depth + 1,
+                    relaxed,
+                )?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    let mut candidate = output.clone();
+    let mut relaxed = None;
+    let mut resolved_input = input.clone();
+    for _ in 0..16 {
+        let EndpointType::Ref(name) = &resolved_input.endpoint_type else {
+            break;
+        };
+        let Some(referenced) = get_endpoint(name) else {
+            break;
+        };
+        resolved_input = referenced;
+    }
+    visit(
+        route_name,
+        &mut candidate,
+        row_dropping_middleware(input).or_else(|| row_dropping_middleware(&resolved_input)),
+        0,
+        &mut relaxed,
+    )?;
+    Ok(relaxed.map(|reason| (candidate, reason)))
+}
+
 /// Walk a resolved output tree — through `fanout`, `switch`, `reader`, `request` and `ref` —
 /// and report whether any leaf sink matches.
 fn output_has_sink(
@@ -810,6 +961,7 @@ fn output_has_sink(
                 let cases_required = config
                     .cases
                     .values()
+                    .chain(config.when.iter().map(|case| &case.to))
                     .map(|output| visit(route_name, output, depth + 1, visited_refs, matches_leaf))
                     .collect::<Result<Vec<_>>>()?
                     .into_iter()
@@ -868,6 +1020,20 @@ fn output_has_sink(
         &mut std::collections::HashSet::new(),
         matches_leaf,
     )
+}
+
+pub(crate) fn output_passes_through_http_status(
+    route_name: &str,
+    endpoint: &Endpoint,
+) -> Result<bool> {
+    output_has_sink(
+        route_name,
+        endpoint,
+        &|endpoint_type| {
+            !matches!(endpoint_type, EndpointType::Http(cfg) if cfg.pass_through_status)
+        },
+    )
+    .map(|has_non_opted_in_sink| !has_non_opted_in_sink)
 }
 
 pub(crate) async fn try_run_fast_path_route(
@@ -1657,7 +1823,12 @@ fn check_publisher_recursive(
             Ok(warnings)
         }
         EndpointType::Switch(cfg) => {
-            for endpoint in cfg.cases.values() {
+            cfg.validate()?;
+            for endpoint in cfg
+                .cases
+                .values()
+                .chain(cfg.when.iter().map(|case| &case.to))
+            {
                 warnings.extend(check_publisher_recursive(
                     route_name,
                     endpoint,
@@ -1984,6 +2155,7 @@ async fn create_base_publisher(
             Ok(Box::new(fanout::FanoutPublisher::new(publishers)) as Box<dyn MessagePublisher>)
         }
         EndpointType::Switch(cfg) => {
+            cfg.validate()?;
             let mut cases = std::collections::HashMap::new();
             for (key, endpoint) in &cfg.cases {
                 let p = create_publisher_with_depth(
@@ -2008,11 +2180,43 @@ async fn create_base_publisher(
             } else {
                 None
             };
-            Ok(Box::new(switch::SwitchPublisher::new(
-                cfg.metadata_key.clone(),
-                cases,
-                default,
-            )) as Box<dyn MessagePublisher>)
+            if cfg.when.is_empty() {
+                return Ok(Box::new(switch::SwitchPublisher::new(
+                    cfg.metadata_key.clone(),
+                    cases,
+                    default,
+                )) as Box<dyn MessagePublisher>);
+            }
+
+            #[cfg(not(feature = "filter"))]
+            {
+                Err(anyhow!(
+                    "[{route_name}] switch `when` needs the `filter` feature, which this build does not have. Rebuild with `--features filter`, or use `metadata_key` + `cases`."
+                ))
+            }
+            #[cfg(feature = "filter")]
+            {
+                use anyhow::Context as _;
+                let mut predicates = Vec::with_capacity(cfg.when.len());
+                for case in &cfg.when {
+                    let filter = crate::middleware::filter::CompiledFilter::new(&case.condition)
+                        .with_context(|| {
+                            format!("[{route_name}] invalid switch `when` expression")
+                        })?;
+                    let publisher = create_publisher_with_depth(
+                        route_name.to_string(),
+                        case.to.clone(),
+                        depth + 1,
+                        source_has_position,
+                    )
+                    .await?;
+                    predicates.push((filter, publisher));
+                }
+                Ok(
+                    Box::new(switch::SwitchPublisher::new_predicate(predicates, default))
+                        as Box<dyn MessagePublisher>,
+                )
+            }
         }
         EndpointType::Response(_) => {
             Ok(Box::new(response::ResponsePublisher) as Box<dyn MessagePublisher>)
@@ -2102,6 +2306,7 @@ mod tests {
         let switch = Endpoint::new(EndpointType::Switch(crate::models::SwitchConfig {
             metadata_key: "kind".to_string(),
             cases,
+            when: Vec::new(),
             default: Some(Box::new(ordinary)),
         }));
         assert!(output_requires_source_metadata("test", &switch, false).unwrap());
@@ -2464,5 +2669,315 @@ mod tests {
         assert!(warnings
             .iter()
             .any(|w| w.contains("request_reply") && w.contains("publisher-only")));
+    }
+
+    #[cfg(feature = "object-store")]
+    mod relaxed_naming {
+        use super::*;
+        use crate::models::{
+            DeduplicationMiddleware, Middleware, ObjectStoreConfig, TransformErrorPolicy,
+            TransformMiddleware, WeakJoinMiddleware,
+        };
+        use crate::register_endpoint;
+
+        fn bucket(name_by: NameBy) -> Endpoint {
+            Endpoint::new(EndpointType::ObjectStore(ObjectStoreConfig {
+                url: "s3://bucket/orders".to_string(),
+                name_by,
+                ..Default::default()
+            }))
+        }
+
+        fn with_middleware(mut endpoint: Endpoint, middleware: Middleware) -> Endpoint {
+            endpoint.middlewares.push(middleware);
+            endpoint
+        }
+
+        fn filtered_source() -> Endpoint {
+            with_middleware(
+                Endpoint::new_memory("orders", 1),
+                Middleware::Filter("amount > 100".to_string()),
+            )
+        }
+
+        fn deduplication() -> Middleware {
+            Middleware::Deduplication(DeduplicationMiddleware {
+                store: None,
+                sled_path: None,
+                ttl_seconds: 60,
+                key: None,
+            })
+        }
+
+        fn rejecting_transform() -> Middleware {
+            Middleware::Transform(TransformMiddleware {
+                schema: Some(serde_json::json!({"type": "object"})),
+                on_error: TransformErrorPolicy::Reject,
+                ..Default::default()
+            })
+        }
+
+        fn resolved_name_by(endpoint: &Endpoint) -> NameBy {
+            match &endpoint.endpoint_type {
+                EndpointType::ObjectStore(config) => config.name_by,
+                other => panic!("not an object-store sink: {other:?}"),
+            }
+        }
+
+        /// The measured case: a filter leaves holes in every batch, and each hole would
+        /// start another object under source-range names.
+        #[test]
+        fn a_filter_takes_an_auto_named_object_store_off_source_position() {
+            let (relaxed, reason) =
+                relax_object_naming("test", true, &filtered_source(), &bucket(NameBy::Auto))
+                    .unwrap()
+                    .expect("naming relaxed");
+
+            assert!(reason.contains("`filter`"), "names the cause: {reason}");
+            assert_eq!(resolved_name_by(&relaxed), NameBy::WriteTime);
+        }
+
+        #[test]
+        fn a_filter_on_a_referenced_input_relaxes_object_naming() {
+            register_endpoint("filtered-reference", filtered_source());
+            let input = Endpoint::new(EndpointType::Ref("filtered-reference".to_string()));
+
+            let (relaxed, _) = relax_object_naming("test", true, &input, &bucket(NameBy::Auto))
+                .unwrap()
+                .expect("naming relaxed");
+
+            assert_eq!(resolved_name_by(&relaxed), NameBy::WriteTime);
+        }
+
+        #[test]
+        fn an_expression_transform_relaxes_object_naming() {
+            let input = with_middleware(
+                Endpoint::new_memory("orders", 1),
+                Middleware::Transform(TransformMiddleware {
+                    expression: Some("{ id: id }".to_string()),
+                    on_error: TransformErrorPolicy::Reject,
+                    ..Default::default()
+                }),
+            );
+
+            let (relaxed, _) = relax_object_naming("test", true, &input, &bucket(NameBy::Auto))
+                .unwrap()
+                .expect("naming relaxed");
+            assert_eq!(resolved_name_by(&relaxed), NameBy::WriteTime);
+        }
+
+        /// `auto` is the only setting this may touch: an explicit `source_position` is a
+        /// request for replay-safe names, and the fragmentation is its price.
+        #[test]
+        fn an_explicitly_named_sink_keeps_source_position_under_a_filter() {
+            assert!(relax_object_naming(
+                "test",
+                true,
+                &filtered_source(),
+                &bucket(NameBy::SourcePosition)
+            )
+            .unwrap()
+            .is_none());
+        }
+
+        /// `idempotency: true` is the deprecated spelling of the same explicit request.
+        #[test]
+        fn the_deprecated_idempotency_alias_counts_as_explicit() {
+            let sink = Endpoint::new(EndpointType::ObjectStore(ObjectStoreConfig {
+                url: "s3://bucket/orders".to_string(),
+                idempotency: Some(true),
+                ..Default::default()
+            }));
+
+            assert!(relax_object_naming("test", true, &filtered_source(), &sink)
+                .unwrap()
+                .is_none());
+        }
+
+        /// The filter is the newest dropper, but three older ones fragment identically.
+        #[test]
+        fn deduplication_weak_join_and_a_rejecting_transform_relax_the_naming_too() {
+            let weak_join = Middleware::WeakJoin(WeakJoinMiddleware {
+                group_by: "correlation_id".to_string(),
+                expected_count: 4,
+                timeout_ms: 1000,
+                branch_by: None,
+                required: Vec::new(),
+                on_timeout: Default::default(),
+            });
+
+            for middleware in [deduplication(), weak_join, rejecting_transform()] {
+                let input = with_middleware(Endpoint::new_memory("orders", 1), middleware);
+                let (relaxed, _) = relax_object_naming("test", true, &input, &bucket(NameBy::Auto))
+                    .unwrap()
+                    .expect("naming relaxed");
+
+                assert_eq!(resolved_name_by(&relaxed), NameBy::WriteTime);
+            }
+        }
+
+        /// A rejecting transform on the *sink* drops from the batch the object-store producer
+        /// beneath it writes, so it counts wherever it sits.
+        #[test]
+        fn a_dropping_middleware_on_the_sink_counts_too() {
+            let sink = with_middleware(bucket(NameBy::Auto), rejecting_transform());
+
+            let (relaxed, _) =
+                relax_object_naming("test", true, &Endpoint::new_memory("orders", 1), &sink)
+                    .unwrap()
+                    .expect("naming relaxed");
+
+            assert_eq!(resolved_name_by(&relaxed), NameBy::WriteTime);
+        }
+
+        /// A transform that rewrites nothing never rejects anything, and one set to pass
+        /// through keeps the rejected message in the batch. Neither leaves a hole.
+        #[test]
+        fn a_transform_that_cannot_drop_a_message_leaves_the_naming_alone() {
+            for transform in [
+                TransformMiddleware {
+                    on_error: TransformErrorPolicy::Reject,
+                    ..Default::default()
+                },
+                TransformMiddleware {
+                    schema: Some(serde_json::json!({"type": "object"})),
+                    on_error: TransformErrorPolicy::PassThrough,
+                    ..Default::default()
+                },
+            ] {
+                let input = with_middleware(
+                    Endpoint::new_memory("orders", 1),
+                    Middleware::Transform(transform),
+                );
+
+                assert!(
+                    relax_object_naming("test", true, &input, &bucket(NameBy::Auto))
+                        .unwrap()
+                        .is_none()
+                );
+            }
+        }
+
+        /// An unfiltered route is the fast, replay-safe path the default exists for.
+        #[test]
+        fn middlewares_that_keep_every_message_leave_source_position_naming_in_place() {
+            let input = with_middleware(
+                Endpoint::new_memory("orders", 1),
+                Middleware::Limiter(crate::models::LimiterMiddleware {
+                    messages_per_second: 100.0,
+                }),
+            );
+
+            assert!(
+                relax_object_naming("test", true, &input, &bucket(NameBy::Auto))
+                    .unwrap()
+                    .is_none()
+            );
+        }
+
+        /// A dropper nested in the output tree makes only the sinks beneath it sparse.
+        #[test]
+        fn a_nested_dropper_relaxes_only_the_sinks_beneath_it() {
+            let filtered_leg = with_middleware(
+                bucket(NameBy::Auto),
+                Middleware::Filter("amount > 100".to_string()),
+            );
+            let fanout = Endpoint::new(EndpointType::Fanout(vec![
+                filtered_leg,
+                bucket(NameBy::Auto),
+            ]));
+
+            let (relaxed, _) =
+                relax_object_naming("test", true, &Endpoint::new_memory("orders", 1), &fanout)
+                    .unwrap()
+                    .expect("naming relaxed");
+
+            let EndpointType::Fanout(legs) = &relaxed.endpoint_type else {
+                panic!("not a fanout");
+            };
+            assert_eq!(resolved_name_by(&legs[0]), NameBy::WriteTime);
+            assert_eq!(resolved_name_by(&legs[1]), NameBy::Auto);
+        }
+
+        /// The file sink resolves `auto` to write_time on its own, since the two schemes are
+        /// different sink structures there. Nothing to relax.
+        #[test]
+        fn a_file_sink_is_left_untouched() {
+            assert!(relax_object_naming(
+                "test",
+                true,
+                &filtered_source(),
+                &file_named_by(NameBy::Auto)
+            )
+            .unwrap()
+            .is_none());
+        }
+
+        /// A `when` switch with no `default` drops whatever matches nothing, so its own cases
+        /// receive a sparse stream even when the route carries no filter middleware.
+        #[cfg(feature = "filter")]
+        #[test]
+        fn a_when_switch_without_a_default_relaxes_its_cases() {
+            use crate::models::{SwitchCase, SwitchConfig};
+
+            fn switch_to(bucket: Endpoint, default: Option<Endpoint>) -> Endpoint {
+                Endpoint::new(EndpointType::Switch(SwitchConfig {
+                    metadata_key: String::new(),
+                    cases: std::collections::HashMap::new(),
+                    when: vec![SwitchCase {
+                        condition: "amount > 100".to_string(),
+                        to: bucket,
+                    }],
+                    default: default.map(Box::new),
+                }))
+            }
+
+            let ordinary = Endpoint::new_memory("ordinary", 1);
+            assert!(
+                relax_object_naming("test", false, &filtered_source(), &bucket(NameBy::Auto))
+                    .unwrap()
+                    .is_none()
+            );
+
+            let (relaxed, _) = relax_object_naming(
+                "test",
+                true,
+                &ordinary,
+                &switch_to(bucket(NameBy::Auto), None),
+            )
+            .unwrap()
+            .expect("naming relaxed");
+            let EndpointType::Switch(config) = &relaxed.endpoint_type else {
+                panic!("not a switch");
+            };
+            assert_eq!(resolved_name_by(&config.when[0].to), NameBy::WriteTime);
+
+            let mut cases = std::collections::HashMap::new();
+            cases.insert("paid".to_string(), bucket(NameBy::Auto));
+            let metadata_switch = Endpoint::new(EndpointType::Switch(SwitchConfig {
+                metadata_key: "status".to_string(),
+                cases,
+                when: Vec::new(),
+                default: None,
+            }));
+            let (relaxed, _) = relax_object_naming("test", true, &ordinary, &metadata_switch)
+                .unwrap()
+                .expect("metadata switch naming relaxed");
+            let EndpointType::Switch(config) = &relaxed.endpoint_type else {
+                panic!("not a switch");
+            };
+            assert_eq!(resolved_name_by(&config.cases["paid"]), NameBy::WriteTime);
+
+            // With a default every message still lands somewhere, so the switch itself drops
+            // nothing and the naming is left to the route's own middlewares.
+            assert!(relax_object_naming(
+                "test",
+                true,
+                &ordinary,
+                &switch_to(bucket(NameBy::Auto), Some(ordinary.clone()))
+            )
+            .unwrap()
+            .is_none());
+        }
     }
 }

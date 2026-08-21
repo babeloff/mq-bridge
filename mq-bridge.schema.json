@@ -1405,6 +1405,11 @@
             "null"
           ]
         },
+        "pass_through_status": {
+          "description": "(Publisher) Treat every HTTP response status as response data instead of classifying\nnon-2xx statuses as publisher errors. Transport and response-read failures remain errors.\n(Consumer) When every output sink opts in, transient sink failures return 502 without\nstopping a non-streaming request/reply route. Defaults to false.",
+          "type": "boolean",
+          "default": false
+        },
         "path": {
           "description": "(Consumer only) Optional request path filter. If set, only requests whose URI path matches exactly are delivered to this consumer.",
           "type": [
@@ -2064,6 +2069,19 @@
           "additionalProperties": false,
           "required": [
             "compression"
+          ]
+        },
+        {
+          "description": "Keeps only messages matching an expression, e.g. `filter: \"amount > 100\"`.\nReads payload fields by name and metadata as `meta.<key>`. Input and output.",
+          "type": "object",
+          "properties": {
+            "filter": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "filter"
           ]
         },
         {
@@ -3371,15 +3389,35 @@
         "topic"
       ]
     },
+    "SwitchCase": {
+      "description": "One predicate case of a `switch` in `when` mode.",
+      "type": "object",
+      "properties": {
+        "if": {
+          "description": "Expression over payload fields and `meta.<key>`, e.g. `amount > 100`.",
+          "type": "string"
+        },
+        "to": {
+          "description": "Where a matching message goes.",
+          "$ref": "#/$defs/Endpoint"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "if",
+        "to"
+      ]
+    },
     "SwitchConfig": {
       "type": "object",
       "properties": {
         "cases": {
-          "description": "A map of values to endpoints.",
+          "description": "Value-lookup mode: a map of metadata values to endpoints.",
           "type": "object",
           "additionalProperties": {
             "$ref": "#/$defs/Endpoint"
-          }
+          },
+          "default": {}
         },
         "default": {
           "description": "The default endpoint if no case matches.",
@@ -3393,15 +3431,20 @@
           ]
         },
         "metadata_key": {
-          "description": "The metadata key to inspect for routing decisions.",
-          "type": "string"
+          "description": "Value-lookup mode: the metadata key whose value picks the case.",
+          "type": "string",
+          "default": ""
+        },
+        "when": {
+          "description": "Predicate mode: ordered cases, first match wins. Needs the `filter` feature.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/SwitchCase"
+          }
         }
       },
-      "additionalProperties": false,
-      "required": [
-        "metadata_key",
-        "cases"
-      ]
+      "additionalProperties": false
     },
     "TlsConfig": {
       "description": "TLS configuration for secure connections.\n\nConfigures Transport Layer Security (TLS/SSL) for encrypted communication.\nSupports both client certificate (mutual TLS) and server certificate validation.\n\n# Examples\n\n```\nuse mq_bridge::models::TlsConfig;\n\nlet tls = TlsConfig {\n    required: true,\n    ca_file: Some(\"/path/to/ca.pem\".to_string()),\n    cert_file: Some(\"/path/to/cert.pem\".to_string()),\n    key_file: Some(\"/path/to/key.pem\".to_string()),\n    ..Default::default()\n};\n```",
@@ -3465,7 +3508,7 @@
       ]
     },
     "TransformMiddleware": {
-      "description": "JSON transform middleware configuration.\n\nReshapes JSON payloads declaratively, in two stages over a single parse: field\n`mapping` (rename/move/nest), then `schema` (type coercion, defaults, validation).\nEither stage may be omitted; with neither configured the message passes through\nuntouched and is never parsed.\n\nOn an output endpoint a rejected message becomes a non-retryable failure, so a `dlq`\nmiddleware listed *after* this one captures it (publisher middlewares are wrapped in\nlist order, so the last entry is the outermost layer). On an input endpoint a rejected\nmessage is dropped from the batch and acknowledged, which is how invalid input is kept\nout of the route.",
+      "description": "JSON transform middleware configuration.\n\nApplies `mapping`, a Zen `expression`, then an optional `schema`.\n\nOn an output endpoint a rejected message becomes a non-retryable failure, so a `dlq`\nmiddleware listed *after* this one captures it (publisher middlewares are wrapped in\nlist order, so the last entry is the outermost layer). On an input endpoint a rejected\nmessage is dropped from the batch and acknowledged, which is how invalid input is kept\nout of the route.",
       "type": "object",
       "properties": {
         "apply_defaults": {
@@ -3482,6 +3525,13 @@
           "description": "Read an empty string as `null`, so a nullable field or its default wins. Defaults to false.",
           "type": "boolean",
           "default": false
+        },
+        "expression": {
+          "description": "Zen Expression whose result replaces the mapped payload.",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "mapping": {
           "description": "Output field name -> source path (e.g. `firstName: \"$.first_name\"`). Dots nest the output.",

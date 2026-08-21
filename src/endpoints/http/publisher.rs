@@ -151,6 +151,7 @@ pub struct HttpPublisher {
     compression_threshold_bytes: usize,
     basic_auth_header: Option<String>,
     custom_headers: HashMap<String, String>,
+    pass_through_status: bool,
     stream_response_sink: Option<std::sync::Arc<dyn MessagePublisher>>,
 }
 
@@ -201,6 +202,7 @@ impl HttpPublisher {
             compression_threshold_bytes,
             basic_auth_header: basic_auth_header_value(config.basic_auth.as_ref()),
             custom_headers: config.custom_headers.clone(),
+            pass_through_status: config.pass_through_status,
             stream_response_sink,
         })
     }
@@ -419,7 +421,7 @@ impl HttpPublisher {
                 PublisherError::Retryable(anyhow::anyhow!("Failed to decompress response: {}", e))
             })?;
 
-        if !response_status.is_success() {
+        if !response_status.is_success() && !self.pass_through_status {
             debug!(
                 message_id = %format!("{:032x}", message.message_id),
                 status = %response_status,

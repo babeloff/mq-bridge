@@ -306,6 +306,13 @@ input:
 
 This is useful when you want stable, explicit semantics regardless of future optimizations, or when you want to avoid the inline path's response behavior differences. In particular, the inline path does not automatically echo unchanged request metadata back as HTTP response headers.
 
+For HTTP publishers, `pass_through_status: true` treats non-2xx response statuses as response
+data instead of publisher errors. On a non-streaming HTTP request/reply route, it also keeps the
+listener running after a transient sink failure and returns HTTP 502 to the request. For composite
+outputs such as `fanout`, every leaf sink must opt in; mixed outputs retain the normal
+stop-and-reconnect policy. Streamable HTTP inputs retain their protocol-specific error frames;
+neither they nor `fire_and_forget` consumers use this 502 behavior.
+
 ### Connection Sharing
 
 Publishers that target the same server reuse one underlying transport client by
