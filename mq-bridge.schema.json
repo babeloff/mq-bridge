@@ -3432,11 +3432,8 @@
         },
         "metadata_key": {
           "description": "Value-lookup mode: the metadata key whose value picks the case.",
-          "type": [
-            "string",
-            "null"
-          ],
-          "default": null
+          "type": "string",
+          "default": ""
         },
         "when": {
           "description": "Predicate mode: ordered cases, first match wins. Needs the `filter` feature.",

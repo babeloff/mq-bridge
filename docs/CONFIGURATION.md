@@ -309,9 +309,9 @@ This is useful when you want stable, explicit semantics regardless of future opt
 For HTTP publishers, `pass_through_status: true` treats non-2xx response statuses as response
 data instead of publisher errors. On a non-streaming HTTP request/reply route, it also keeps the
 listener running after a transient sink failure and returns HTTP 502 to the request. For composite
-outputs such as `fanout`, every leaf sink must opt in; mixed outputs retain the normal stop-and-
-reconnect policy. Streamable HTTP inputs retain their protocol-specific error frames and do not use
-this 502 behavior.
+outputs such as `fanout`, every leaf sink must opt in; mixed outputs retain the normal
+stop-and-reconnect policy. Streamable HTTP inputs retain their protocol-specific error frames;
+neither they nor `fire_and_forget` consumers use this 502 behavior.
 
 ### Connection Sharing
 

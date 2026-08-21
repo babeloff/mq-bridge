@@ -336,6 +336,10 @@ impl MongoDbConsumer {
                     Box::pin(async move {
                         match disposition {
                             MessageDisposition::Reply(resp) => {
+                                if !extend_claim(&collection_clone, &id_val, &claim_token).await? {
+                                    warn!(mongodb_id = %id_val, "Skipping MongoDB reply because the message claim was lost");
+                                    return Ok(());
+                                }
                                 handle_reply(
                                     &db,
                                     reply_collection_name.as_ref(),
@@ -477,6 +481,24 @@ impl MongoDbConsumer {
     }
 }
 
+async fn extend_claim(
+    collection: &Collection<Document>,
+    id: &Bson,
+    claim_token: &str,
+) -> anyhow::Result<bool> {
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)?
+        .as_secs() as i64;
+    let result = collection
+        .update_one(
+            doc! { "_id": id, "claim_token": claim_token },
+            doc! { "$set": { "locked_until": now + 60 } },
+        )
+        .await
+        .context("Failed to extend MongoDB message claim before replying")?;
+    Ok(result.matched_count == 1)
+}
+
 async fn process_mongodb_batch_commit(
     db: &Database,
     collection: &Collection<Document>,
@@ -495,21 +517,27 @@ async fn process_mongodb_batch_commit(
         // Only send a reply if the message has a 'reply_to' destination and the disposition is a Reply.
         // This allows for fire-and-forget patterns (no reply_to) or explicit replies.
         match disposition {
-            MessageDisposition::Reply(resp) => match handle_reply(
-                db,
-                reply_coll_opt.as_ref(),
-                correlation_id_opt.as_ref(),
-                resp,
-            )
-            .await
-            {
-                Ok(_) => ids_to_delete.push(id.clone()),
-                Err(e) => {
-                    tracing::error!(id = %id, error = %e, "Failed to send reply");
-                    errors.push(e);
-                    ids_to_unlock.push(id.clone());
+            MessageDisposition::Reply(resp) => {
+                if !extend_claim(collection, id, claim_token).await? {
+                    warn!(mongodb_id = %id, "Skipping MongoDB reply because the message claim was lost");
+                    continue;
                 }
-            },
+                match handle_reply(
+                    db,
+                    reply_coll_opt.as_ref(),
+                    correlation_id_opt.as_ref(),
+                    resp,
+                )
+                .await
+                {
+                    Ok(_) => ids_to_delete.push(id.clone()),
+                    Err(e) => {
+                        tracing::error!(id = %id, error = %e, "Failed to send reply");
+                        errors.push(e);
+                        ids_to_unlock.push(id.clone());
+                    }
+                }
+            }
             MessageDisposition::Ack => {
                 ids_to_delete.push(id.clone());
             }

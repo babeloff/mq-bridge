@@ -2181,14 +2181,11 @@ async fn create_base_publisher(
                 None
             };
             if cfg.when.is_empty() {
-                let metadata_key = cfg
-                    .metadata_key
-                    .clone()
-                    .expect("validate() rejects lookup mode without a metadata_key");
-                return Ok(
-                    Box::new(switch::SwitchPublisher::new(metadata_key, cases, default))
-                        as Box<dyn MessagePublisher>,
-                );
+                return Ok(Box::new(switch::SwitchPublisher::new(
+                    cfg.metadata_key.clone(),
+                    cases,
+                    default,
+                )) as Box<dyn MessagePublisher>);
             }
 
             #[cfg(not(feature = "filter"))]
@@ -2307,7 +2304,7 @@ mod tests {
         let mut cases = std::collections::HashMap::new();
         cases.insert("archive".to_string(), file);
         let switch = Endpoint::new(EndpointType::Switch(crate::models::SwitchConfig {
-            metadata_key: Some("kind".to_string()),
+            metadata_key: "kind".to_string(),
             cases,
             when: Vec::new(),
             default: Some(Box::new(ordinary)),
@@ -2925,7 +2922,7 @@ mod tests {
 
             fn switch_to(bucket: Endpoint, default: Option<Endpoint>) -> Endpoint {
                 Endpoint::new(EndpointType::Switch(SwitchConfig {
-                    metadata_key: None,
+                    metadata_key: String::new(),
                     cases: std::collections::HashMap::new(),
                     when: vec![SwitchCase {
                         condition: "amount > 100".to_string(),
@@ -2958,7 +2955,7 @@ mod tests {
             let mut cases = std::collections::HashMap::new();
             cases.insert("paid".to_string(), bucket(NameBy::Auto));
             let metadata_switch = Endpoint::new(EndpointType::Switch(SwitchConfig {
-                metadata_key: Some("status".to_string()),
+                metadata_key: "status".to_string(),
                 cases,
                 when: Vec::new(),
                 default: None,

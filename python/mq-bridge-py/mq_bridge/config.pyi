@@ -510,7 +510,7 @@ SwitchCase = TypedDict(
 class SwitchConfig(TypedDict, total=False):
     cases: Dict[str, Endpoint]
     default: Optional[Endpoint]
-    metadata_key: Optional[str]
+    metadata_key: str
     when: List[SwitchCase]
 
 

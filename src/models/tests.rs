@@ -693,7 +693,7 @@ mod switch_config_tests {
         let mut cases = HashMap::new();
         cases.insert("archive".to_string(), null_endpoint());
         SwitchConfig {
-            metadata_key: Some("kind".to_string()),
+            metadata_key: "kind".to_string(),
             cases,
             when: Vec::new(),
             default: None,
@@ -702,7 +702,7 @@ mod switch_config_tests {
 
     fn predicate() -> SwitchConfig {
         SwitchConfig {
-            metadata_key: None,
+            metadata_key: String::new(),
             cases: HashMap::new(),
             when: vec![crate::models::SwitchCase {
                 condition: "amount > 100".to_string(),
@@ -729,7 +729,7 @@ mod switch_config_tests {
     #[test]
     fn neither_mode_is_rejected() {
         let config = SwitchConfig {
-            metadata_key: None,
+            metadata_key: String::new(),
             cases: HashMap::new(),
             when: Vec::new(),
             default: Some(Box::new(null_endpoint())),
@@ -741,7 +741,7 @@ mod switch_config_tests {
     #[test]
     fn cases_without_a_metadata_key_are_rejected() {
         let mut config = lookup();
-        config.metadata_key = None;
+        config.metadata_key.clear();
         assert!(config.validate().is_err());
     }
 }

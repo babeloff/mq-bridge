@@ -1852,7 +1852,7 @@ pub struct IbmMqConfig {
 pub struct SwitchConfig {
     /// Value-lookup mode: the metadata key whose value picks the case.
     #[serde(default)]
-    pub metadata_key: Option<String>,
+    pub metadata_key: String,
     /// Value-lookup mode: a map of metadata values to endpoints.
     #[serde(default)]
     pub cases: HashMap<String, Endpoint>,
@@ -1886,7 +1886,7 @@ impl SwitchConfig {
     /// HashMap get on metadata, while a predicate may parse the payload. Mixing
     /// them in one endpoint would hide which one a message actually took.
     pub fn validate(&self) -> anyhow::Result<()> {
-        let lookup = self.metadata_key.is_some() || !self.cases.is_empty();
+        let lookup = !self.metadata_key.is_empty() || !self.cases.is_empty();
         let predicate = !self.when.is_empty();
         match (lookup, predicate) {
             (true, true) => Err(anyhow::anyhow!(
@@ -1895,7 +1895,7 @@ impl SwitchConfig {
             (false, false) => Err(anyhow::anyhow!(
                 "switch needs either `metadata_key` + `cases` (value lookup) or `when` (predicates)"
             )),
-            (true, false) if self.metadata_key.is_none() => Err(anyhow::anyhow!(
+            (true, false) if self.metadata_key.is_empty() => Err(anyhow::anyhow!(
                 "switch `cases` needs a `metadata_key` to look up"
             )),
             _ => Ok(()),

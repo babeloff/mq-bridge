@@ -972,7 +972,7 @@ with_value_setters!(IbmTlsConfig { with_required => required: bool, with_accept_
 with_optional_string_setters!(IbmTlsConfig { with_cipher_spec => cipher_spec, with_key_repository => key_repository, with_key_repository_password => key_repository_password });
 with_value_setters!(IbmMqConfig { with_tls => tls: IbmTlsConfig, with_max_message_size => max_message_size: usize, with_wait_timeout_ms => wait_timeout_ms: i32, with_disable_status_inq => disable_status_inq: bool });
 with_optional_setters!(IbmMqConfig { with_internal_buffer_size => internal_buffer_size: usize });
-with_optional_string_setters!(SwitchConfig { with_metadata_key => metadata_key });
+with_string_setters!(SwitchConfig { with_metadata_key => metadata_key });
 with_value_setters!(SwitchConfig { with_cases => cases: HashMap<String, Endpoint>, with_when => when: Vec<SwitchCase> });
 with_optional_setters!(SwitchConfig { with_default => default: Box<Endpoint> });
 with_value_setters!(RequestForwardConfig { with_to => to: Box<Endpoint>, with_forward_to => forward_to: Box<Endpoint> });
