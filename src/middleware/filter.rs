@@ -19,8 +19,8 @@ use zen_expression::{compile_expression, Expression, Variable};
 use super::deferred_commit::{run_all, DeferredCommits};
 use super::raw_json::RawPairs;
 use crate::traits::{
-    BatchCommitFunc, BoxFuture, ConsumerError, EndpointStatus, MessageConsumer, MessageDisposition,
-    MessagePublisher, PublisherError, Received, ReceivedBatch, Sent, SentBatch,
+    BatchCommitFunc, BoxFuture, CommitFunc, ConsumerError, EndpointStatus, MessageConsumer,
+    MessageDisposition, MessagePublisher, PublisherError, Received, ReceivedBatch, Sent, SentBatch,
 };
 use crate::CanonicalMessage;
 
@@ -38,7 +38,6 @@ pub(crate) struct CompiledFilter {
     /// Metadata keys the expression reads via the `meta` prefix.
     metadata_keys: Vec<String>,
     uses_all_metadata: bool,
-    has_unsupported_path: bool,
     warned_unusable_field: AtomicBool,
 }
 
@@ -143,10 +142,11 @@ impl FilterContext {
             .or_insert_with(|| Value::Object(Map::new()))
             .as_object_mut()
             .expect("filter metadata context is an object");
+        // Overwrites: `meta` shadows a payload field of the same name, and re-inserting
+        // the same message's metadata on a reused context is idempotent.
         if all {
             for (key, value) in &message.metadata {
-                meta.entry(key.clone())
-                    .or_insert_with(|| Value::String(value.clone()));
+                meta.insert(key.clone(), Value::String(value.clone()));
             }
         } else {
             for key in keys {
@@ -154,7 +154,7 @@ impl FilterContext {
                     .metadata
                     .get(key)
                     .map_or(Value::Null, |value| Value::String(value.clone()));
-                meta.entry(key.clone()).or_insert(value);
+                meta.insert(key.clone(), value);
             }
         }
     }
@@ -168,13 +168,20 @@ impl CompiledFilter {
         let fast_predicate = compile_fast_predicate(&expression);
         let (payload_paths, metadata_keys, uses_all_metadata, has_unsupported_path) =
             referenced_paths(&expression);
+        // An indexed path never resolves, so tolerating it per message would drop every
+        // message while the route reported itself healthy. Refuse to start instead.
+        if has_unsupported_path {
+            bail!(
+                "filter expression uses an indexed path, which is unsupported; \
+                 index into the array before the filter, or compare a scalar field"
+            );
+        }
         Ok(Self {
             expression,
             fast_predicate,
             payload_paths,
             metadata_keys,
             uses_all_metadata,
-            has_unsupported_path,
             warned_unusable_field: AtomicBool::new(false),
         })
     }
@@ -226,17 +233,15 @@ impl CompiledFilter {
             context.load_payload(message)?;
         }
 
-        if self.has_unsupported_path {
-            self.warn_unusable_field("indexed payload paths are unsupported");
-            return Ok(false);
-        }
-
         let mut has_unusable_field = false;
+        let mut synthesized = Vec::new();
         for path in &self.payload_paths {
             if resolve(&context.document, path).is_none() {
                 has_unusable_field = true;
                 self.warn_unusable_field(&path.join("."));
-                insert_null_if_absent(&mut context.document, path);
+                if let Some(created) = insert_null_if_absent(&mut context.document, path) {
+                    synthesized.push(created);
+                }
             }
         }
 
@@ -249,18 +254,28 @@ impl CompiledFilter {
 
         context.add_metadata(message, &self.metadata_keys, self.uses_all_metadata);
 
+        let result = self.evaluate(&context.document, has_unusable_field);
+        // A context is shared across a `switch`'s predicates, so the nulls this one
+        // synthesized must not make the next one see an object where a field is absent.
+        for path in synthesized {
+            remove_path(&mut context.document, &path);
+        }
+        result
+    }
+
+    fn evaluate(&self, document: &Value, has_unusable_field: bool) -> anyhow::Result<bool> {
         if let Some(predicate) = &self.fast_predicate {
-            return Ok(predicate.evaluate(&context.document));
+            return Ok(predicate.evaluate(document));
         }
 
-        let evaluated = match self.expression.evaluate(Variable::from(&context.document)) {
+        let evaluated = match self.expression.evaluate(Variable::from(document)) {
             Ok(evaluated) => evaluated,
             Err(_) if has_unusable_field => return Ok(false),
             Err(error) => {
                 let mut text_fields = self
                     .payload_paths
                     .iter()
-                    .filter(|path| resolve(&context.document, path).is_some_and(Value::is_string))
+                    .filter(|path| resolve(document, path).is_some_and(Value::is_string))
                     .map(|path| path.join("."))
                     .collect::<Vec<_>>();
                 text_fields.extend(
@@ -349,19 +364,44 @@ fn resolve_any<'a>(document: &'a Value, path: &[String]) -> Option<&'a Value> {
 }
 
 /// Makes a genuinely absent path visible to the expression VM as `null`.
-fn insert_null_if_absent(document: &mut Value, path: &[String]) {
+///
+/// Returns the shallowest prefix it had to create, so the caller can undo the whole
+/// insertion with [`remove_path`].
+fn insert_null_if_absent(document: &mut Value, path: &[String]) -> Option<Vec<String>> {
+    let mut created = None;
     let mut current = document;
     for (index, segment) in path.iter().enumerate() {
         let Some(object) = current.as_object_mut() else {
-            return;
+            return created;
         };
+        if created.is_none() && !object.contains_key(segment.as_str()) {
+            created = Some(path[..=index].to_vec());
+        }
         if index + 1 == path.len() {
             object.entry(segment.clone()).or_insert(Value::Null);
-            return;
+            return created;
         }
         current = object
             .entry(segment.clone())
             .or_insert_with(|| Value::Object(Map::new()));
+    }
+    created
+}
+
+/// Removes what [`insert_null_if_absent`] added.
+fn remove_path(document: &mut Value, path: &[String]) {
+    let Some((last, parents)) = path.split_last() else {
+        return;
+    };
+    let mut current = document;
+    for segment in parents {
+        let Some(next) = current.as_object_mut().and_then(|o| o.get_mut(segment)) else {
+            return;
+        };
+        current = next;
+    }
+    if let Some(object) = current.as_object_mut() {
+        object.remove(last.as_str());
     }
 }
 
@@ -498,6 +538,12 @@ impl FilterConsumer {
 
 #[async_trait]
 impl MessageConsumer for FilterConsumer {
+    /// Reads until a message is kept, holding the acks for what it dropped.
+    ///
+    /// The caller may ask for the next message before committing this one, so on a
+    /// source with cumulative acks an inline drop ack would jump ahead of a retained
+    /// message the caller still holds. Those acks run from inside its commit instead,
+    /// exactly as [`Self::receive_batch`] does.
     async fn receive(&mut self) -> Result<Received, ConsumerError> {
         loop {
             let received = self.inner.receive().await?;
@@ -506,9 +552,35 @@ impl MessageConsumer for FilterConsumer {
                 .matches(&received.message)
                 .map_err(ConsumerError::Permanent)?
             {
-                return Ok(received);
+                let held = self.deferred.take();
+                if held.is_empty() {
+                    return Ok(received);
+                }
+                let inner_commit = received.commit;
+                let commit: CommitFunc = Box::new(move |disposition| {
+                    Box::pin(async move {
+                        run_all(held).await?;
+                        inner_commit(disposition).await
+                    })
+                });
+                return Ok(Received {
+                    message: received.message,
+                    commit,
+                });
             }
-            (received.commit)(MessageDisposition::Ack)
+
+            let ordered = self.inner.commit_requires_order();
+            let dropped_commit = received.commit;
+            let commit: BatchCommitFunc = Box::new(move |dispositions| {
+                dropped_commit(
+                    dispositions
+                        .into_iter()
+                        .next()
+                        .unwrap_or(MessageDisposition::Ack),
+                )
+            });
+            self.deferred
+                .ack_emptied(ordered, commit, 1)
                 .await
                 .map_err(ConsumerError::Connection)?;
         }
@@ -876,12 +948,12 @@ mod tests {
     }
 
     #[test]
-    fn indexed_payload_paths_are_unsupported() {
-        let filter = CompiledFilter::new("items[0].qty == 1").unwrap();
-        assert!(filter.has_unsupported_path);
-        assert!(!filter
-            .matches(&message(r#"{"items": [{"qty": 1}]}"#, &[]))
-            .unwrap());
+    fn indexed_payload_paths_are_rejected_at_compile_time() {
+        let error = CompiledFilter::new("items[0].qty == 1")
+            .err()
+            .expect("an indexed path must not compile")
+            .to_string();
+        assert!(error.contains("indexed path"), "unexpected error: {error}");
     }
 
     #[test]
@@ -907,7 +979,7 @@ mod tests {
             "x > 1",
             "number(meta.count) >= 2",
             "x == 1 or y == 2",
-            "items[0] == 1",
+            "x + 1 == 2",
         ] {
             assert!(
                 CompiledFilter::new(expression)
@@ -949,6 +1021,42 @@ mod tests {
                 "{expression} with {payload}"
             );
         }
+    }
+
+    /// The documented rule: `meta` is the metadata namespace, so a payload field of
+    /// the same name must not decide the predicate.
+    #[test]
+    fn message_metadata_shadows_a_payload_field_named_meta() {
+        let filter = CompiledFilter::new("x > 1 and meta.kind == 'real'").unwrap();
+        let payload = r#"{"x": 2, "meta": {"kind": "payload"}}"#;
+        assert!(filter
+            .matches(&message(payload, &[("kind", "real")]))
+            .unwrap());
+        assert!(!filter
+            .matches(&message(payload, &[("kind", "other")]))
+            .unwrap());
+    }
+
+    /// A `switch` runs every `when` case against one context, so the nulls one
+    /// predicate synthesizes for an absent field must not change the next one's answer.
+    #[test]
+    fn a_synthesized_null_does_not_leak_into_the_next_predicate() {
+        let first = CompiledFilter::new("a.b == 1").unwrap();
+        let mut second = CompiledFilter::new("a == null or x == 1").unwrap();
+        second.fast_predicate = None;
+        let message = message(r#"{"x": 2}"#, &[]);
+
+        let alone = second
+            .matches_with_context(&message, &mut FilterContext::new())
+            .unwrap();
+
+        let mut shared = FilterContext::new();
+        assert!(!first.matches_with_context(&message, &mut shared).unwrap());
+        assert_eq!(
+            second.matches_with_context(&message, &mut shared).unwrap(),
+            alone,
+            "predicate order changed the answer"
+        );
     }
 
     #[test]

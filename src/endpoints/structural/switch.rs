@@ -181,17 +181,22 @@ impl MessagePublisher for SwitchPublisher {
             (Arc<dyn MessagePublisher>, Vec<CanonicalMessage>),
         > = HashMap::new();
         let mut dropped = 0usize;
+        // A message whose predicate cannot read it fails on its own: failing the whole
+        // batch would hand `retry`/`dlq` — or the drop report — every sibling message too.
+        let mut failed_routing = Vec::new();
 
         for message in messages {
-            if let Some(publisher) = self.get_publisher(&message)? {
-                let key = Arc::as_ptr(publisher) as *const () as usize;
-                grouped_messages
-                    .entry(key)
-                    .or_insert_with(|| (publisher.clone(), Vec::new()))
-                    .1
-                    .push(message);
-            } else {
-                dropped += 1;
+            match self.get_publisher(&message) {
+                Ok(Some(publisher)) => {
+                    let key = Arc::as_ptr(publisher) as *const () as usize;
+                    grouped_messages
+                        .entry(key)
+                        .or_insert_with(|| (publisher.clone(), Vec::new()))
+                        .1
+                        .push(message);
+                }
+                Ok(None) => dropped += 1,
+                Err(e) => failed_routing.push((message, e)),
             }
         }
         if dropped > 0 {
@@ -210,7 +215,7 @@ impl MessagePublisher for SwitchPublisher {
 
         // Aggregate results from all the batch sends.
         let mut all_responses = Vec::new();
-        let mut all_failed = Vec::new();
+        let mut all_failed = failed_routing;
 
         for result in results {
             match result {
@@ -566,6 +571,32 @@ mod tests {
             let result = switch.send(CanonicalMessage::from("not json")).await;
 
             assert!(matches!(result, Err(PublisherError::NonRetryable(_))));
+        }
+
+        /// One unreadable message must not take its whole batch down with it: the route
+        /// acks a failed batch wholesale when no `dlq` is configured.
+        #[tokio::test]
+        async fn an_unreadable_message_fails_alone_in_a_batch() {
+            let matched = Arc::new(RecordingPublisher::default());
+            let switch = switch_on(
+                vec![("amount > 100", matched.clone() as Arc<dyn MessagePublisher>)],
+                None,
+            );
+
+            let result = switch
+                .send_batch(vec![
+                    json(150),
+                    CanonicalMessage::from("not json"),
+                    json(200),
+                ])
+                .await
+                .unwrap();
+
+            match result {
+                SentBatch::Partial { failed, .. } => assert_eq!(failed.len(), 1),
+                SentBatch::Ack => panic!("the unreadable message should have been reported"),
+            }
+            assert_eq!(*matched.batches.lock().unwrap(), vec![2]);
         }
 
         /// Metadata routing needs no payload parse at all.

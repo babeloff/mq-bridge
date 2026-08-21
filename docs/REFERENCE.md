@@ -342,8 +342,8 @@ message has already paid for the whole route.
 
 - **Payload fields by bare name**, including nested paths — `amount`, `order.status`. The
   payload must be a JSON object; anything else produces a per-message error and fails the batch.
-  Indexed paths such as `items[0].qty` are unsupported and do not resolve; a predicate that
-  uses one therefore drops every message.
+  Indexed paths such as `items[0].qty` are unsupported: an expression that uses one is
+  rejected at startup rather than silently dropping every message.
 - **Metadata under the reserved `meta.` prefix** — `meta.http_status_code`,
   `meta.kind`. Metadata is **always text**, so a numeric comparison needs an explicit cast:
   `number(meta.http_status_code) >= 400`.
@@ -869,7 +869,7 @@ fields by bare name (`amount`, `order.status`), metadata under `meta.` and alway
 needs the `filter` feature; a `when` list in a build without it is a startup error, not a
 silent fallback. A payload the expression cannot read fails the send rather than dropping the
 message silently. As with `filter`, indexed payload paths such as `items[0].qty` are unsupported
-and do not resolve; a predicate that uses one drops every message.
+and are rejected at startup.
 
 In either mode, a message that matches nothing goes to `default`; without a `default` it is
 dropped with a warning. Value lookup is the cheaper mode and stays the right choice when the

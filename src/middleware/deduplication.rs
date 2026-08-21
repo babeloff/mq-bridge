@@ -628,13 +628,10 @@ impl MessageConsumer for DeduplicationConsumer {
 
             if filtered_messages.is_empty() {
                 let ordered = self.inner.commit_requires_order();
-                if let Err(e) = self
-                    .deferred
+                self.deferred
                     .ack_emptied(ordered, inner_commit, total_len)
                     .await
-                {
-                    warn!("Failed to commit skipped all-duplicate batch: {}", e);
-                }
+                    .map_err(ConsumerError::Connection)?;
                 continue;
             }
 
