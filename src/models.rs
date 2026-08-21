@@ -34,6 +34,17 @@ use std::{
 use crate::traits::Handler;
 use tracing::trace;
 
+#[cfg(feature = "filter")]
+fn deserialize_filter_expression<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let expression = String::deserialize(deserializer)?;
+    crate::middleware::filter::CompiledFilter::new(&expression)
+        .map_err(|error| serde::de::Error::custom(format!("invalid filter expression: {error}")))?;
+    Ok(expression)
+}
+
 /// The top-level configuration is a map of named routes.
 /// The key is the route name (e.g., "kafka_to_nats").
 ///
@@ -374,7 +385,13 @@ pub enum Middleware {
     Compression(CompressionMiddleware),
     /// Keeps only messages matching an expression, e.g. `filter: "amount > 100"`.
     /// Reads payload fields by name and metadata as `meta.<key>`. Input and output.
-    Filter(String),
+    Filter(
+        #[cfg_attr(
+            feature = "filter",
+            serde(deserialize_with = "deserialize_filter_expression")
+        )]
+        String,
+    ),
     Custom {
         name: String,
         config: serde_json::Value,
@@ -1847,6 +1864,10 @@ pub struct SwitchConfig {
 pub struct SwitchCase {
     /// Expression over payload fields and `meta.<key>`, e.g. `amount > 100`.
     #[serde(rename = "if")]
+    #[cfg_attr(
+        feature = "filter",
+        serde(deserialize_with = "deserialize_filter_expression")
+    )]
     pub condition: String,
     /// Where a matching message goes.
     pub to: Endpoint,

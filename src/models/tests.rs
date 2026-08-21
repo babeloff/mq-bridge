@@ -745,3 +745,39 @@ mod switch_config_tests {
         assert!(config.validate().is_err());
     }
 }
+
+#[cfg(feature = "filter")]
+mod filter_expression_deserialization_tests {
+    use crate::models::{Endpoint, Middleware, SwitchCase};
+
+    #[test]
+    fn middleware_rejects_invalid_expression_during_deserialization() {
+        let error = serde_yaml_ng::from_str::<Endpoint>(
+            "middlewares:\n  - filter: 'amount >'\nnull: null\n",
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("invalid filter expression"));
+    }
+
+    #[test]
+    fn switch_case_rejects_invalid_expression_during_deserialization() {
+        let error =
+            serde_yaml_ng::from_str::<SwitchCase>("if: 'items[0].qty > 1'\nto:\n  null: null\n")
+                .unwrap_err();
+
+        assert!(error.to_string().contains("indexed path"));
+    }
+
+    #[test]
+    fn valid_filter_expression_still_deserializes() {
+        let endpoint = serde_yaml_ng::from_str::<Endpoint>(
+            "middlewares:\n  - filter: 'amount > 100'\nnull: null\n",
+        )
+        .unwrap();
+
+        assert!(
+            matches!(&endpoint.middlewares[0], Middleware::Filter(expression) if expression == "amount > 100")
+        );
+    }
+}
