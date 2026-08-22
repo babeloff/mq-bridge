@@ -99,11 +99,16 @@ impl CustomEndpointFactory for PluginEndpointFactory {
             if status == MQB_OK {
                 Ok(AssertSend(out))
             } else {
-                Err(anyhow!(
+                // Classify rather than flattening to a string: a plugin that
+                // rejected its config reports MQB_ERR_INVALID_CONFIG, and the
+                // route only breaks out of its reconnect loop for the error
+                // classes it can downcast back out of this `anyhow`.
+                let cause = anyhow!(
                     "endpoint plugin `{}` could not open an input for route `{route}`: {}",
                     plugin.name(),
                     plugin.take_error(err)
-                ))
+                );
+                Err(anyhow::Error::new(consumer_error_from(status, cause)))
             }
         })
         .await
@@ -146,11 +151,13 @@ impl CustomEndpointFactory for PluginEndpointFactory {
             if status == MQB_OK {
                 Ok(AssertSend(out))
             } else {
-                Err(anyhow!(
+                // Classified for the same reason as the consumer side above.
+                let cause = anyhow!(
                     "endpoint plugin `{}` could not open an output for route `{route}`: {}",
                     plugin.name(),
                     plugin.take_error(err)
-                ))
+                );
+                Err(anyhow::Error::new(publisher_error_from(status, cause)))
             }
         })
         .await
@@ -513,7 +520,12 @@ fn publisher_error(
     err: MqbBuffer,
     action: &str,
 ) -> PublisherError {
-    let cause = plugin_cause(plugin, err, action);
+    publisher_error_from(status, plugin_cause(plugin, err, action))
+}
+
+/// The status-to-class half of [`publisher_error`], for callers that already
+/// turned the plugin's error buffer into a message.
+pub(super) fn publisher_error_from(status: MqbStatus, cause: anyhow::Error) -> PublisherError {
     match status {
         MQB_ERR_RETRYABLE => PublisherError::Retryable(cause),
         MQB_ERR_CONNECTION => PublisherError::Connection(cause),
@@ -544,5 +556,34 @@ mod tests {
             disposition_code(&MessageDisposition::Reply(CanonicalMessage::from("x"))),
             MQB_DISPOSITION_ACK
         );
+    }
+
+    // A plugin that rejected its config must not look like a transient fault:
+    // `create_consumer`/`create_publisher` classify with these, and the route
+    // only stops reconnecting for the permanent classes.
+    #[test]
+    fn a_rejected_plugin_config_is_permanent_not_retryable() {
+        assert!(matches!(
+            consumer_error_from(MQB_ERR_INVALID_CONFIG, anyhow!("bad field")),
+            ConsumerError::Permanent(_)
+        ));
+        assert!(matches!(
+            publisher_error_from(MQB_ERR_INVALID_CONFIG, anyhow!("bad field")),
+            PublisherError::NonRetryable(_)
+        ));
+    }
+
+    // The other half of the contract: a connection failure stays retryable, so
+    // a broker that is merely down still gets the reconnect loop.
+    #[test]
+    fn a_plugin_connection_failure_stays_retryable() {
+        assert!(matches!(
+            consumer_error_from(MQB_ERR_CONNECTION, anyhow!("broker down")),
+            ConsumerError::Connection(_)
+        ));
+        assert!(matches!(
+            publisher_error_from(MQB_ERR_CONNECTION, anyhow!("broker down")),
+            PublisherError::Connection(_)
+        ));
     }
 }

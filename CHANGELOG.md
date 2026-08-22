@@ -2,6 +2,123 @@
 
 All notable changes to `mq-bridge`. Newest first.
 
+## 0.4.7
+
+### Changed
+
+- **The startup failure message distinguishes its two causes.** A route that never became ready
+  reports `failed to start: did not become ready within {n}ms`; a route whose task ended before
+  signalling ready reports `failed to start: ended before it signalled ready (outcome: ...)`.
+  The second case returns immediately and never involved the timeout, so reporting it as one
+  sent the reader looking for a stall that never happened. Both now carry the cause the
+  reconnect loop recorded, which the old message dropped. Code matching on the old
+  `failed to start within {n}ms or encountered an error` text needs updating; the substring
+  `failed to start` is unchanged.
+
+### Fixed
+
+- **A route that ran to completion is no longer reported as one that failed to start.** The run
+  task signals ready before its consume loop, so a drain over a small source can reach its
+  terminal while that signal is still buffered — leaving the reconnect loop's `select!` with two
+  ready branches and free to take the terminal one, dropping the startup channel unread.
+  `Route::run()` then returned an error for a drain that had already written its output, and
+  `mqb copy --drain` exited non-zero on a successful copy. Both terminal arms now forward a
+  ready signal that was already emitted.
+
+- **A completed route reports the messages it dropped even after an earlier reconnect failure.**
+  The drop report was suppressed whenever `EndpointStatus::error` was already set, including by a
+  transient failure the route recovered from. Only a `Failed` route's cause now outranks it.
+
+- **A plugin endpoint that rejects its config no longer reconnects forever.** `create_consumer`
+  and `create_publisher` flattened the plugin's status into a bare message, and the reconnect
+  loop decides by downcasting to `ConsumerError`/`PublisherError` — so every failure to open
+  looked like a connection fault worth retrying. A plugin answering `MQB_ERR_INVALID_CONFIG`,
+  `MQB_ERR_UNSUPPORTED`, `MQB_ERR_PERMANENT` or `MQB_ERR_PANIC` now stops the route with that
+  cause; `MQB_ERR_CONNECTION` and `MQB_ERR_RETRYABLE` still get the reconnect loop.
+
+## 0.4.6
+
+### Added
+
+- **`filter` middleware.** Keeps only the messages matching an expression and drops the rest,
+  on the input or the output: `- filter: "amount > 100"`. Payload fields are read by bare name
+  (`amount`, `order.status`), metadata under `meta.` and always as text, so a numeric comparison
+  needs a cast (`number(meta.http_status_code) >= 400`); `&&`/`||` and `and`/`or` both work. A
+  metadata-only expression never parses the payload. **Prefer the input** — a filter there drops
+  the message before the rest of the route touches it and acks it at the source. Requires the
+  new `filter` feature (it pulls the `zen-expression` engine), which is part of `middleware` and
+  `full` but **not** of `portable`.
+
+- **Predicate mode for `switch`.** `when: [{ if, to }, ...]` routes on the same expression
+  language, first match wins, so overlapping thresholds are safe to write and a payload-derived
+  key no longer has to be promoted into metadata first. A `switch` uses exactly one of `when` or
+  `metadata_key`/`cases`; naming both or neither is a startup error, as is a `when` list in a
+  build without the `filter` feature. Value lookup stays the cheaper mode when the key is
+  already in metadata.
+
+- **`expression` on `transform`.** A Zen expression producing the output document, applied after
+  `mapping` and before `schema` — for values that have to be calculated rather than copied.
+  Needs the `zen` feature.
+
+- **A `fanout` can reply.** If one branch produces a response — a `response` or `static` leg, or
+  a `request` whose `forward_to` replies — that response goes back to the caller, so a
+  request/reply input can fan a message out and still answer. Only one branch may answer: if
+  several do, the first in list order wins, and the route warns once rather than on every
+  message. A branch that *fails* nacks the whole fan-out, so the caller gets a `500` rather than
+  an answer that hides a lost message; opt out per branch with a `request` whose `forward_to`
+  does not reply, or a `dlq` on a plain branch.
+
+- **`pass_through_status` on the `http` endpoint.** On a **publisher**, a non-2xx response
+  becomes response data instead of a publisher error, so a route can branch on
+  `http_status_code` with a `switch` rather than treating every 404 as a failed send. Transport
+  failures and unreadable responses are still errors. On a **consumer**, once every output sink
+  opts in, a transient sink failure answers the request with `502` instead of stopping and
+  reconnecting a non-streaming request/reply route. Composite outputs such as `fanout` need the
+  flag on every leaf sink — a mixed output keeps the normal stop-and-reconnect policy — and
+  streamable HTTP inputs keep their protocol-specific error frames.
+
+### Changed
+
+- **A middleware that empties a batch no longer acknowledges ahead of the route.** `filter` and
+  `deduplication` can filter a batch down to nothing, and acking that straight away jumps ahead
+  of batches the route is still writing on a source with cumulative acks — the ordered sequencer
+  only sees the commits `receive_batch` returns, so a crash in that window lost them. On those
+  sources the emptied batch's commit is now held and runs from inside the next retained batch's
+  commit, which the sequencer does order.
+
+- **An `object_store` sink on `name_by: auto` switches to `write_time` names when a row-dropping
+  middleware is on the route.** A source-range name covers one *contiguous* run of positions, so
+  a batch with holes punched in it would be written as one object per surviving run — a filter
+  keeping 80% of rows turns one upload into roughly a hundred. The route logs one line at
+  startup saying it made the switch. This covers `filter`, `deduplication`, `weak_join`,
+  `transform` with `on_error: reject`, and a `switch` in `when` mode with no `default`. Set
+  `name_by: source_position` explicitly to keep replay-safe names and accept the fragmentation.
+
+- **`filter` expressions and a `switch`'s `when` cases are compiled when the config is loaded.**
+  An invalid expression is now a startup error naming the expression, instead of a per-message
+  failure that only surfaces once traffic arrives.
+
+### Fixed
+
+- **`switch` forwards connect and disconnect hooks to its destinations**, `cases` and `default`
+  alike, and one failing teardown no longer skips the rest.
+
+- **A failed `request` whose `forward_to` answers the caller surfaces the error** instead of
+  echoing the original message back as a success. The route then nacks (HTTP `500`) and a
+  `retry` or `dlq` on the endpoint sees the failure as usual. Forwarding to a plain sink still
+  acks, so routing a status with a `switch` is unchanged.
+
+- **Concurrent MongoDB consumers no longer claim documents out from under each other.** Two
+  consumers polling within the same second write the same `locked_until`, which is all the claim
+  query had to work with, so one poll could read back documents another had just taken. Each
+  claim now carries a unique `claim_token`, and the read-back, unlock, ack and delete are all
+  scoped to it — an expired lease that was re-claimed elsewhere is no longer deleted from under
+  its new owner.
+
+## 0.4.5
+
+No library changes: CI workflow timeouts and a version bump.
+
 ## 0.4.4
 
 ### Breaking
