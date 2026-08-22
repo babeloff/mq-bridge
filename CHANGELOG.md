@@ -2,6 +2,24 @@
 
 All notable changes to `mq-bridge`. Newest first.
 
+## 0.4.8
+
+### Changed
+
+- **Filtering and structural forwarding retain bulk writes where possible.** An input `filter`
+  now reads additional full source batches after dropping rows until it refills the requested
+  batch size; a naturally short source batch remains a flush boundary so live routes do not
+  wait indefinitely. A `request` still performs its request/reply calls individually and
+  concurrently, unless its `to` endpoint requires ordered publishing; ordered requests run one
+  at a time. Results are restored to input order and responses plus error fallbacks are sent to
+  `forward_to` in one `send_batch` call. Batch-capable destinations such as MongoDB can
+  therefore continue using `insert_many` through both paths.
+
+- **Buffered concurrent routes warn that destination order is not guaranteed.** Buffering
+  preserves order within each batch, but with route `concurrency > 1` separate destination
+  writes may complete out of source order. Route validation now recommends `concurrency: 1`
+  when destination order matters.
+
 ## 0.4.7
 
 ### Changed

@@ -103,7 +103,114 @@ impl MessagePublisher for RequestForwardPublisher {
         if messages.is_empty() {
             return Ok(SentBatch::Ack);
         }
-        crate::traits::send_batch_helper(self, messages, |p, m| Box::pin(p.send(m))).await
+
+        use futures::StreamExt;
+
+        struct ForwardCandidate {
+            index: usize,
+            original: CanonicalMessage,
+            forwarded_id: u128,
+            request_error: Option<PublisherError>,
+        }
+
+        let request = &self.request;
+        let request_concurrency = if request.requires_ordered_publish() {
+            1
+        } else {
+            crate::traits::SEND_BATCH_CONCURRENCY
+        };
+        let mut requests = futures::stream::iter(messages.into_iter().enumerate().map(
+            |(index, original)| async move {
+                let result = request.send(original.clone()).await;
+                (index, original, result)
+            },
+        ))
+        .buffer_unordered(request_concurrency);
+
+        let mut candidates = Vec::new();
+        let mut forwarded = Vec::new();
+        while let Some((index, original, result)) = requests.next().await {
+            let (message, request_error) = match result {
+                Ok(Sent::Response(response)) => (response, None),
+                Ok(Sent::Ack) => {
+                    warn!(
+                        message_id = %format!("{:032x}", original.message_id),
+                        "request endpoint: inner returned Ack with no response, nothing forwarded"
+                    );
+                    continue;
+                }
+                Err(error) => {
+                    warn!(
+                        message_id = %format!("{:032x}", original.message_id),
+                        error = %error,
+                        "request endpoint: inner send failed, forwarding original message"
+                    );
+                    (original.clone(), Some(error))
+                }
+            };
+            candidates.push(ForwardCandidate {
+                index,
+                original,
+                forwarded_id: message.message_id,
+                request_error,
+            });
+            forwarded.push(message);
+        }
+
+        let mut ordered: Vec<_> = candidates.into_iter().zip(forwarded).collect();
+        ordered.sort_by_key(|(candidate, _)| candidate.index);
+        let (candidates, forwarded): (Vec<_>, Vec<_>) = ordered.into_iter().unzip();
+
+        if forwarded.is_empty() {
+            return Ok(SentBatch::Ack);
+        }
+
+        let result = self.forward.send_batch(forwarded).await?;
+        let SentBatch::Partial { responses, failed } = result else {
+            return Ok(SentBatch::Ack);
+        };
+
+        let mut response_by_id: std::collections::HashMap<_, _> = responses
+            .unwrap_or_default()
+            .into_iter()
+            .map(|response| (response.message_id, response))
+            .collect();
+        let mut failure_by_id: std::collections::HashMap<_, _> = failed
+            .into_iter()
+            .map(|(message, error)| (message.message_id, error))
+            .collect();
+        let mut outcomes = Vec::new();
+
+        for candidate in candidates {
+            if let Some(error) = failure_by_id.remove(&candidate.forwarded_id) {
+                outcomes.push((candidate.index, None, Some((candidate.original, error))));
+            } else if let Some(response) = response_by_id.remove(&candidate.forwarded_id) {
+                if let Some(error) = candidate.request_error {
+                    outcomes.push((candidate.index, None, Some((candidate.original, error))));
+                } else {
+                    outcomes.push((candidate.index, Some(response), None));
+                }
+            }
+        }
+
+        outcomes.sort_by_key(|(index, _, _)| *index);
+        let responses: Vec<_> = outcomes
+            .iter_mut()
+            .filter_map(|(_, response, _)| response.take())
+            .collect();
+        let failed: Vec<_> = outcomes
+            .into_iter()
+            .filter_map(|(_, _, failure)| failure)
+            .collect();
+
+        if responses.is_empty() && failed.is_empty() {
+            Ok(SentBatch::Ack)
+        } else {
+            Ok(SentBatch::Partial {
+                responses: (!responses.is_empty()).then_some(responses),
+                failed,
+            })
+        }
     }
 
     async fn status(&self) -> crate::traits::EndpointStatus {
@@ -216,6 +323,190 @@ mod tests {
 
         fn as_any(&self) -> &dyn Any {
             self
+        }
+    }
+
+    struct MixedRequest;
+
+    #[async_trait]
+    impl MessagePublisher for MixedRequest {
+        async fn send(&self, message: CanonicalMessage) -> Result<Sent, PublisherError> {
+            match message.get_payload_str().as_ref() {
+                "success" => {
+                    // Complete after the failure case so batch tests verify that
+                    // forwarding restores input order after concurrent requests.
+                    tokio::task::yield_now().await;
+                    let mut response = message;
+                    response.payload = "success-response".into();
+                    Ok(Sent::Response(response))
+                }
+                "failure" => Err(PublisherError::Retryable(anyhow::anyhow!("request failed"))),
+                "ack" => Ok(Sent::Ack),
+                other => panic!("unexpected request payload: {other}"),
+            }
+        }
+
+        async fn send_batch(
+            &self,
+            messages: Vec<CanonicalMessage>,
+        ) -> Result<SentBatch, PublisherError> {
+            crate::traits::send_batch_helper(self, messages, |p, message| Box::pin(p.send(message)))
+                .await
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    struct BatchRecordingSink {
+        batches: std::sync::Arc<StdMutex<Vec<Vec<CanonicalMessage>>>>,
+    }
+
+    struct OrderedRequest {
+        calls: std::sync::Arc<StdMutex<Vec<String>>>,
+        active: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        max_active: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl MessagePublisher for OrderedRequest {
+        async fn send(&self, message: CanonicalMessage) -> Result<Sent, PublisherError> {
+            use std::sync::atomic::Ordering;
+
+            self.calls
+                .lock()
+                .unwrap()
+                .push(message.get_payload_str().into_owned());
+            let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_active.fetch_max(active, Ordering::SeqCst);
+            tokio::task::yield_now().await;
+            self.active.fetch_sub(1, Ordering::SeqCst);
+            Ok(Sent::Response(message))
+        }
+
+        async fn send_batch(
+            &self,
+            messages: Vec<CanonicalMessage>,
+        ) -> Result<SentBatch, PublisherError> {
+            crate::traits::send_batch_helper(self, messages, |publisher, message| {
+                Box::pin(publisher.send(message))
+            })
+            .await
+        }
+
+        fn requires_ordered_publish(&self) -> bool {
+            true
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    #[async_trait]
+    impl MessagePublisher for BatchRecordingSink {
+        async fn send(&self, _message: CanonicalMessage) -> Result<Sent, PublisherError> {
+            panic!("forward_to must receive one batch, not individual sends")
+        }
+
+        async fn send_batch(
+            &self,
+            messages: Vec<CanonicalMessage>,
+        ) -> Result<SentBatch, PublisherError> {
+            self.batches.lock().unwrap().push(messages);
+            Ok(SentBatch::Ack)
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    #[tokio::test]
+    async fn batch_requests_are_collected_into_one_forward_batch() {
+        let batches = std::sync::Arc::new(StdMutex::new(Vec::new()));
+        let publisher = RequestForwardPublisher::new(
+            Arc::new(MixedRequest),
+            Arc::new(BatchRecordingSink {
+                batches: batches.clone(),
+            }),
+        );
+
+        let sent = publisher
+            .send_batch(vec![
+                CanonicalMessage::from("success"),
+                CanonicalMessage::from("failure"),
+                CanonicalMessage::from("ack"),
+            ])
+            .await
+            .unwrap();
+        assert!(matches!(sent, SentBatch::Ack));
+
+        let batches = batches.lock().unwrap();
+        assert_eq!(batches.len(), 1);
+        let payloads: Vec<_> = batches[0]
+            .iter()
+            .map(|message| message.get_payload_str().into_owned())
+            .collect();
+        assert_eq!(payloads, ["success-response", "failure"]);
+    }
+
+    #[tokio::test]
+    async fn ordered_request_publisher_is_sent_one_at_a_time_in_input_order() {
+        let calls = std::sync::Arc::new(StdMutex::new(Vec::new()));
+        let active = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let max_active = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let batches = std::sync::Arc::new(StdMutex::new(Vec::new()));
+        let publisher = RequestForwardPublisher::new(
+            Arc::new(OrderedRequest {
+                calls: calls.clone(),
+                active,
+                max_active: max_active.clone(),
+            }),
+            Arc::new(BatchRecordingSink { batches }),
+        );
+
+        publisher
+            .send_batch(vec!["first".into(), "second".into(), "third".into()])
+            .await
+            .unwrap();
+
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            ["first", "second", "third"]
+        );
+        assert_eq!(
+            max_active.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "ordered request publishers must never overlap sends"
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_fallback_response_surfaces_original_request_error() {
+        use crate::endpoints::structural::response::ResponsePublisher;
+
+        let success = CanonicalMessage::from("success");
+        let success_id = success.message_id;
+        let failure = CanonicalMessage::from("failure");
+        let failure_id = failure.message_id;
+        let publisher =
+            RequestForwardPublisher::new(Arc::new(MixedRequest), Arc::new(ResponsePublisher));
+
+        match publisher.send_batch(vec![success, failure]).await.unwrap() {
+            SentBatch::Partial {
+                responses: Some(responses),
+                failed,
+            } => {
+                assert_eq!(responses.len(), 1);
+                assert_eq!(responses[0].message_id, success_id);
+                assert_eq!(responses[0].get_payload_str(), "success-response");
+                assert_eq!(failed.len(), 1);
+                assert_eq!(failed[0].0.message_id, failure_id);
+                assert!(failed[0].1.to_string().contains("request failed"));
+            }
+            other => panic!("expected mixed batch outcome, got {other:?}"),
         }
     }
 

@@ -593,18 +593,43 @@ impl MessageConsumer for FilterConsumer {
     /// simply re-reads and re-drops those messages next run; nothing reaches the
     /// destination twice.
     async fn receive_batch(&mut self, max_messages: usize) -> Result<ReceivedBatch, ConsumerError> {
+        let target = max_messages.max(1);
+        let mut messages = Vec::with_capacity(target);
+        let mut commits: Vec<(usize, BatchCommitFunc)> = Vec::new();
+
         loop {
-            let batch = self.inner.receive_batch(max_messages).await?;
+            let requested = target - messages.len();
+            let batch = self.inner.receive_batch(requested).await?;
             if batch.messages.is_empty() {
-                run_all(self.deferred.take()).await.map_err(|error| {
-                    ConsumerError::Connection(
-                        error.context("failed to flush deferred filter acknowledgements on drain"),
-                    )
-                })?;
-                return Ok(batch);
+                let held = self.deferred.take();
+                if messages.is_empty() {
+                    run_all(held).await.map_err(|error| {
+                        ConsumerError::Connection(
+                            error.context(
+                                "failed to flush deferred filter acknowledgements on drain",
+                            ),
+                        )
+                    })?;
+                    return Ok(batch);
+                }
+
+                // Trailing filtered-out source batches must commit after the retained
+                // batches already collected in this call, never ahead of them.
+                let drain_commit = batch.commit;
+                commits.push((
+                    0,
+                    Box::new(move |_| {
+                        Box::pin(async move {
+                            run_all(held).await?;
+                            drain_commit(Vec::new()).await
+                        })
+                    }),
+                ));
+                break;
             }
 
-            let mut kept = Vec::with_capacity(batch.messages.len());
+            let source_count = batch.messages.len();
+            let mut kept = Vec::with_capacity(source_count);
             let mut keep_flags = Vec::with_capacity(batch.messages.len());
             for message in batch.messages {
                 let keep = self
@@ -651,11 +676,36 @@ impl MessageConsumer for FilterConsumer {
                     (batch.commit)(expanded).await
                 })
             });
-            return Ok(ReceivedBatch {
-                messages: kept,
-                commit,
-            });
+            messages.extend(kept);
+            commits.push((expected, commit));
+
+            // A short source batch is the transport's natural flush boundary. Do
+            // not turn filtering into an unbounded wait on a live source.
+            if messages.len() >= target || source_count < requested {
+                break;
+            }
         }
+
+        let commit: BatchCommitFunc = Box::new(move |dispositions| {
+            Box::pin(async move {
+                let expected: usize = commits.iter().map(|(count, _)| count).sum();
+                if dispositions.len() != expected {
+                    bail!(
+                        "filter commit received {} dispositions for {expected} retained messages",
+                        dispositions.len()
+                    );
+                }
+
+                let mut offset = 0;
+                for (count, commit) in commits {
+                    let end = offset + count;
+                    commit(dispositions[offset..end].to_vec()).await?;
+                    offset = end;
+                }
+                Ok(())
+            })
+        });
+        Ok(ReceivedBatch { messages, commit })
     }
 
     fn set_exit_on_empty(&mut self, exit_on_empty: bool) {
@@ -1161,6 +1211,59 @@ mod tests {
             committed.lock().unwrap().as_slice(),
             [2, 1],
             "the emptied batch is acked first, then the retained one"
+        );
+    }
+
+    #[tokio::test]
+    async fn filtered_full_source_batches_are_refilled_to_the_requested_size() {
+        let (source, committed) = OrderedSource::new(vec![
+            vec![amount(1), amount(200), amount(2), amount(300)],
+            vec![amount(400), amount(3), amount(500), amount(4)],
+        ]);
+        let mut consumer = FilterConsumer::new(Box::new(source), "amount > 100").unwrap();
+
+        let batch = consumer.receive_batch(4).await.unwrap();
+        assert_eq!(
+            batch
+                .messages
+                .iter()
+                .map(CanonicalMessage::get_payload_str)
+                .collect::<Vec<_>>(),
+            [
+                r#"{"amount":200}"#,
+                r#"{"amount":300}"#,
+                r#"{"amount":400}"#,
+                r#"{"amount":500}"#,
+            ]
+        );
+
+        (batch.commit)(vec![MessageDisposition::Ack; 4])
+            .await
+            .unwrap();
+        assert_eq!(
+            committed.lock().unwrap().as_slice(),
+            [4, 4],
+            "source batch commits stay in source order"
+        );
+    }
+
+    #[tokio::test]
+    async fn merged_filter_commit_validates_count_before_committing_any_source_batch() {
+        let (source, committed) = OrderedSource::new(vec![
+            vec![amount(200), amount(1), amount(300), amount(2)],
+            vec![amount(400), amount(3), amount(500), amount(4)],
+        ]);
+        let mut consumer = FilterConsumer::new(Box::new(source), "amount > 100").unwrap();
+
+        let batch = consumer.receive_batch(4).await.unwrap();
+        let error = (batch.commit)(vec![MessageDisposition::Ack; 3])
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("3 dispositions for 4 retained"));
+        assert!(
+            committed.lock().unwrap().is_empty(),
+            "an invalid merged commit must not partially commit its first source batch"
         );
     }
 
