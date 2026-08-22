@@ -2,24 +2,9 @@
 
 All notable changes to `mq-bridge`. Newest first.
 
-## ## 0.4.7
-
-### Added
-
-- **`pass_through_status` on the `http` endpoint.** On a **publisher**, a non-2xx response
-  becomes response data instead of a publisher error, so a route can branch on
-  `http_status_code` with a `switch` rather than treating every 404 as a failed send. Transport
-  failures and unreadable responses are still errors. On a **consumer**, once every output sink
-  opts in, a transient sink failure answers the request with `502` instead of stopping and
-  reconnecting a non-streaming request/reply route. Composite outputs such as `fanout` need the
-  flag on every leaf sink — a mixed output keeps the normal stop-and-reconnect policy — and
-  streamable HTTP inputs keep their protocol-specific error frames.
+## 0.4.7
 
 ### Changed
-
-- **`filter` expressions and a `switch`'s `when` cases are compiled when the config is loaded.**
-  An invalid expression is now a startup error naming the expression, instead of a per-message
-  failure that only surfaces once traffic arrives.
 
 - **The startup failure message distinguishes its two causes.** A route that never became ready
   reports `failed to start: did not become ready within {n}ms`; a route whose task ended before
@@ -40,12 +25,9 @@ All notable changes to `mq-bridge`. Newest first.
   `mqb copy --drain` exited non-zero on a successful copy. Both terminal arms now forward a
   ready signal that was already emitted.
 
-- **Concurrent MongoDB consumers no longer claim documents out from under each other.** Two
-  consumers polling within the same second write the same `locked_until`, which is all the claim
-  query had to work with, so one poll could read back documents another had just taken. Each
-  claim now carries a unique `claim_token`, and the read-back, unlock, ack and delete are all
-  scoped to it — an expired lease that was re-claimed elsewhere is no longer deleted from under
-  its new owner.
+- **A completed route reports the messages it dropped even after an earlier reconnect failure.**
+  The drop report was suppressed whenever `EndpointStatus::error` was already set, including by a
+  transient failure the route recovered from. Only a `Failed` route's cause now outranks it.
 
 ## 0.4.6
 
@@ -79,6 +61,15 @@ All notable changes to `mq-bridge`. Newest first.
   an answer that hides a lost message; opt out per branch with a `request` whose `forward_to`
   does not reply, or a `dlq` on a plain branch.
 
+- **`pass_through_status` on the `http` endpoint.** On a **publisher**, a non-2xx response
+  becomes response data instead of a publisher error, so a route can branch on
+  `http_status_code` with a `switch` rather than treating every 404 as a failed send. Transport
+  failures and unreadable responses are still errors. On a **consumer**, once every output sink
+  opts in, a transient sink failure answers the request with `502` instead of stopping and
+  reconnecting a non-streaming request/reply route. Composite outputs such as `fanout` need the
+  flag on every leaf sink — a mixed output keeps the normal stop-and-reconnect policy — and
+  streamable HTTP inputs keep their protocol-specific error frames.
+
 ### Changed
 
 - **A middleware that empties a batch no longer acknowledges ahead of the route.** `filter` and
@@ -96,6 +87,10 @@ All notable changes to `mq-bridge`. Newest first.
   `transform` with `on_error: reject`, and a `switch` in `when` mode with no `default`. Set
   `name_by: source_position` explicitly to keep replay-safe names and accept the fragmentation.
 
+- **`filter` expressions and a `switch`'s `when` cases are compiled when the config is loaded.**
+  An invalid expression is now a startup error naming the expression, instead of a per-message
+  failure that only surfaces once traffic arrives.
+
 ### Fixed
 
 - **`switch` forwards connect and disconnect hooks to its destinations**, `cases` and `default`
@@ -105,6 +100,13 @@ All notable changes to `mq-bridge`. Newest first.
   echoing the original message back as a success. The route then nacks (HTTP `500`) and a
   `retry` or `dlq` on the endpoint sees the failure as usual. Forwarding to a plain sink still
   acks, so routing a status with a `switch` is unchanged.
+
+- **Concurrent MongoDB consumers no longer claim documents out from under each other.** Two
+  consumers polling within the same second write the same `locked_until`, which is all the claim
+  query had to work with, so one poll could read back documents another had just taken. Each
+  claim now carries a unique `claim_token`, and the read-back, unlock, ack and delete are all
+  scoped to it — an expired lease that was re-claimed elsewhere is no longer deleted from under
+  its new owner.
 
 ## 0.4.5
 

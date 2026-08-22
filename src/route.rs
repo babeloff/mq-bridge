@@ -101,13 +101,14 @@ impl Drop for OutcomeGuard {
             RouteOutcome::Failed
         });
         // A route that discarded data did not run clean, whatever its outcome.
-        // Never overwrite a recorded failure cause: that one explains why the
-        // route stopped, which is the more urgent of the two.
+        // Only a `Failed` route's cause is kept over the drop report: it explains
+        // why the route stopped. On any other outcome a lingering `error` is a
+        // stale reconnect failure the route recovered from, so the drops win.
         {
             let drops = recover_read_lock(&self.drops, "route_drop_report");
             if drops.count > 0 {
                 let mut s = recover_write_lock(&self.status, "route_handle_status");
-                if s.error.is_none() {
+                if s.error.is_none() || !matches!(outcome, RouteOutcome::Failed) {
                     s.error = Some(format!(
                         "dropped {} message(s): sink rejected them permanently and no dlq middleware is configured: {}",
                         drops.count,
