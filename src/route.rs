@@ -370,6 +370,25 @@ const DRAIN_MAX_RECONNECT_ATTEMPTS: usize = 10;
 /// never reported healthy on the strength of the connect alone.
 const STABLE_RUN: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Forward a ready signal the run task already emitted but the reconnect loop
+/// never observed.
+///
+/// The inner task signals ready onto a `bounded(1)` channel *before* its consume
+/// loop, so the signal sits buffered. A drain over a small source can then reach
+/// its terminal within the same scheduling window, leaving `select!` with two
+/// ready branches and free to pick the terminal one at random. Without this, a
+/// route that ran to completion is reported to `run()` as one that never started.
+async fn forward_buffered_ready(
+    startup_notified: &mut bool,
+    iter_ready_rx: &async_channel::Receiver<()>,
+    ready_tx: &Sender<()>,
+) {
+    if !*startup_notified && iter_ready_rx.try_recv().is_ok() {
+        let _ = ready_tx.send(()).await;
+        *startup_notified = true;
+    }
+}
+
 async fn pause_after_empty_batch(delay_ms: u64) {
     if delay_ms > 0 {
         tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
@@ -1094,6 +1113,7 @@ impl Route {
                             let _ = internal_shutdown_tx.send(()).await;
                             // Wait for the inner task to finish gracefully.
                             let _ = run_task.await;
+                            forward_buffered_ready(&mut startup_notified, &iter_ready_rx, &ready_tx).await;
                             outcome_guard.set(RouteOutcome::Stopped);
                             break 'reconnect;
                         }
@@ -1126,6 +1146,7 @@ impl Route {
                             // Keep waiting for the run result / shutdown.
                         }
                         res = &mut run_task => {
+                            forward_buffered_ready(&mut startup_notified, &iter_ready_rx, &ready_tx).await;
                             match res {
                                 Ok(Ok(should_continue)) if !should_continue => {
                                     info!("Route '{}' completed gracefully. Shutting down.", name);
@@ -1226,32 +1247,49 @@ impl Route {
             }
         });
 
-        match tokio::time::timeout(startup_timeout, ready_rx.recv()).await {
-            Ok(Ok(_)) => Ok(RouteHandle {
+        let started = tokio::time::timeout(startup_timeout, ready_rx.recv()).await;
+        if let Ok(Ok(_)) = started {
+            return Ok(RouteHandle {
                 handle,
                 shutdown_tx,
                 status,
                 outcome,
-            }),
-            _ => {
-                handle.abort();
-                // The startup failure itself stays inside the reconnect loop, so
-                // surface the cause it recorded rather than a bare timeout.
-                // "connecting" is the initial marker, not a recorded failure.
-                let cause = recover_read_lock(&status, "route_handle_status")
-                    .error
-                    .clone()
-                    .filter(|e| e != "connecting")
-                    .map(|e| format!(": {e}"))
-                    .unwrap_or_default();
-                Err(anyhow::anyhow!(
-                    "Route '{}' failed to start within {}ms or encountered an error{}",
-                    name_str,
-                    startup_timeout.as_millis(),
-                    cause
-                ))
-            }
+            });
         }
+        handle.abort();
+        // The startup failure itself stays inside the reconnect loop, so
+        // surface the cause it recorded rather than a bare timeout.
+        // "connecting" is the initial marker, not a recorded failure.
+        let cause = recover_read_lock(&status, "route_handle_status")
+            .error
+            .clone()
+            .filter(|e| e != "connecting")
+            .map(|e| format!(": {e}"))
+            .unwrap_or_default();
+        Err(match started {
+            // Every `ready_tx` was dropped: the route task ended without ever
+            // signalling ready. That returns immediately, so calling it a timeout
+            // sends the reader after a stall that never happened.
+            Ok(Err(_)) => {
+                let terminal = *recover_read_lock(&outcome, "route_handle_outcome");
+                anyhow::anyhow!(
+                    "Route '{}' failed to start: ended before it signalled ready (outcome: {}){}",
+                    name_str,
+                    terminal.map_or("unknown", |o| match o {
+                        RouteOutcome::Completed => "completed",
+                        RouteOutcome::Stopped => "stopped",
+                        RouteOutcome::Failed => "failed",
+                    }),
+                    cause
+                )
+            }
+            _ => anyhow::anyhow!(
+                "Route '{}' failed to start: did not become ready within {}ms{}",
+                name_str,
+                startup_timeout.as_millis(),
+                cause
+            ),
+        })
     }
 
     /// The core logic of running the route, designed to be called within a reconnect loop.
@@ -3557,6 +3595,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_forward_buffered_ready_delivers_a_signal_the_loop_never_observed() {
+        // The terminal arms of the reconnect loop can win the `select!` race against a
+        // ready signal the run task already buffered. Forwarding it from there is what
+        // keeps a route that ran to completion from being reported as one that never
+        // started.
+        let (iter_ready_tx, iter_ready_rx) = bounded::<()>(1);
+        let (ready_tx, ready_rx) = bounded::<()>(1);
+        iter_ready_tx.send(()).await.unwrap();
+
+        let mut startup_notified = false;
+        forward_buffered_ready(&mut startup_notified, &iter_ready_rx, &ready_tx).await;
+        assert!(startup_notified);
+        assert!(
+            ready_rx.try_recv().is_ok(),
+            "buffered ready must reach `run()`"
+        );
+
+        // `run()` consumes the startup channel once, so a second send would sit unread.
+        iter_ready_tx.send(()).await.unwrap();
+        forward_buffered_ready(&mut startup_notified, &iter_ready_rx, &ready_tx).await;
+        assert!(
+            ready_rx.try_recv().is_err(),
+            "startup must not be notified twice"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_forward_buffered_ready_keeps_a_never_ready_route_a_failure() {
+        let (_iter_ready_tx, iter_ready_rx) = bounded::<()>(1);
+        let (ready_tx, ready_rx) = bounded::<()>(1);
+
+        let mut startup_notified = false;
+        forward_buffered_ready(&mut startup_notified, &iter_ready_rx, &ready_tx).await;
+        assert!(!startup_notified);
+        assert!(ready_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
     async fn test_start_fails_on_unavailable_endpoint() {
         // tokio::time::pause();
         let unique_id = fast_uuid_v7::gen_id().to_string();
@@ -3582,8 +3658,54 @@ mod tests {
         // The route should fail to start because the input endpoint fails to create.
         // The run() method waits for a ready signal which never comes.
         let result = route.run("test_start_fail").await;
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("failed to start"));
+        let err = result.expect_err("must fail").to_string();
+        // A stalled connect is a timeout, not a route that ended: the two now read
+        // differently, and the recorded cause rides along.
+        assert!(
+            err.contains("failed to start: did not become ready within 5000ms")
+                && err.contains("Endpoint unavailable"),
+            "got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_start_failure_distinguishes_an_ended_route_from_a_timeout() {
+        // A drain gives up after DRAIN_MAX_RECONNECT_ATTEMPTS, so the route task ends
+        // long before the startup timeout. `ready_rx` then fails immediately, and
+        // calling that a 5000ms timeout sends the reader after a stall that never
+        // happened.
+        let factory_name = format!("ended_before_ready_{}", fast_uuid_v7::gen_id());
+        register_endpoint_factory(
+            &factory_name,
+            Arc::new(MockEndpointFactory {
+                create_consumer_fail: true,
+                ..MockEndpointFactory::new()
+            }),
+        )
+        .unwrap();
+
+        let input = Endpoint {
+            endpoint_type: EndpointType::Custom {
+                name: factory_name,
+                config: serde_json::Value::Null,
+            },
+            middlewares: vec![],
+            handler: None,
+        };
+        let route = Route::new(input, Endpoint::new_memory("out", 10))
+            .with_exit_on_empty(true)
+            .with_reconnect_interval_ms(1);
+
+        let err = route
+            .run("test_ended_before_ready")
+            .await
+            .expect_err("must fail")
+            .to_string();
+        assert!(
+            err.contains("failed to start: ended before it signalled ready")
+                && err.contains("outcome: failed"),
+            "got: {err}"
+        );
     }
 
     #[tokio::test]
