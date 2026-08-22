@@ -29,6 +29,13 @@ All notable changes to `mq-bridge`. Newest first.
   The drop report was suppressed whenever `EndpointStatus::error` was already set, including by a
   transient failure the route recovered from. Only a `Failed` route's cause now outranks it.
 
+- **A plugin endpoint that rejects its config no longer reconnects forever.** `create_consumer`
+  and `create_publisher` flattened the plugin's status into a bare message, and the reconnect
+  loop decides by downcasting to `ConsumerError`/`PublisherError` — so every failure to open
+  looked like a connection fault worth retrying. A plugin answering `MQB_ERR_INVALID_CONFIG`,
+  `MQB_ERR_UNSUPPORTED`, `MQB_ERR_PERMANENT` or `MQB_ERR_PANIC` now stops the route with that
+  cause; `MQB_ERR_CONNECTION` and `MQB_ERR_RETRYABLE` still get the reconnect loop.
+
 ## 0.4.6
 
 ### Added
