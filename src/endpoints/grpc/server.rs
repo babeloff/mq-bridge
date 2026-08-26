@@ -30,10 +30,10 @@ use tracing::{error, info, trace, warn};
 /// the dispatch task can run ahead of the commits it is waiting on.
 const PUBLISH_BATCH_INFLIGHT: usize = 1024;
 /// Unacknowledged messages retained per subscriber, and subscribers retained per route.
-const MAX_PENDING_PER_CONSUMER: usize = 1024;
-const MAX_PENDING_CONSUMERS: usize = 64;
+pub(super) const MAX_PENDING_PER_CONSUMER: usize = 1024;
+pub(super) const MAX_PENDING_CONSUMERS: usize = 64;
 
-fn publish_response_for_disposition(
+pub(super) fn publish_response_for_disposition(
     id: String,
     disposition: MessageDisposition,
 ) -> proto::PublishResponse {
@@ -67,16 +67,16 @@ fn publish_response_for_disposition(
 // ── Embedded gRPC server (server_mode) ────────────────────────────────────────
 
 pub(super) struct ServerModeConsumer {
-    route_id: u64,
-    shared_server: Arc<SharedGrpcServer>,
-    bound_addr: std::net::SocketAddr,
+    pub(super) route_id: u64,
+    pub(super) shared_server: Arc<SharedGrpcServer>,
+    pub(super) bound_addr: std::net::SocketAddr,
     // One receive channel per shard; publishes are spread round-robin across the
     // shards so many concurrent producers don't all contend on one channel.
-    rxs: Vec<mpsc::Receiver<InboundDelivery>>,
+    pub(super) rxs: Vec<mpsc::Receiver<InboundDelivery>>,
     // Round-robin cursor for the next shard to drain first, so none starves.
-    drain_start: usize,
+    pub(super) drain_start: usize,
     /// Drain mode: only then does an idle first-message poll time out into an empty batch.
-    exit_on_empty: bool,
+    pub(super) exit_on_empty: bool,
 }
 
 pub(super) const REFLECTION_V1_PREFIX: &str = "/grpc.reflection.v1.ServerReflection/";
@@ -132,12 +132,12 @@ where
 
 /// Tonic service implementation that fans incoming messages into a subscriber
 /// broadcast stream and a reliable internal queue for the server-mode consumer.
-struct BridgeService {
-    router: Arc<SharedGrpcRouter>,
+pub(super) struct BridgeService {
+    pub(super) router: Arc<SharedGrpcRouter>,
     /// How long to wait for the consuming route to commit a published message before
     /// answering NACK. `None` (no `timeout_ms`) waits indefinitely, so a route that never
     /// commits blocks the publisher — set `timeout_ms` to bound it.
-    commit_timeout: Option<Duration>,
+    pub(super) commit_timeout: Option<Duration>,
 }
 
 /// Wait for the route's disposition, treating an expired `commit_timeout` or a dropped
@@ -161,29 +161,29 @@ async fn await_disposition(
     }
 }
 
-struct SharedGrpcRouter {
+pub(super) struct SharedGrpcRouter {
     // RwLock (not Mutex): `dispatch` only reads the table, so concurrent publishes
     // no longer serialize against each other on the lock.
-    routes: RwLock<HashMap<u64, SharedGrpcRoute>>,
+    pub(super) routes: RwLock<HashMap<u64, SharedGrpcRoute>>,
 }
 
 #[derive(Clone)]
-struct SharedGrpcRoute {
-    topic: String,
+pub(super) struct SharedGrpcRoute {
+    pub(super) topic: String,
     // Sharded senders; `cursor` round-robins publishes across them. `cursor` is
     // shared (Arc) so all clones of this route advance the same counter.
-    txs: Vec<mpsc::Sender<InboundDelivery>>,
-    cursor: Arc<AtomicUsize>,
-    broadcast_tx: broadcast::Sender<BridgeMessage>,
-    subscriber_pending: Arc<Mutex<SubscriberPending>>,
+    pub(super) txs: Vec<mpsc::Sender<InboundDelivery>>,
+    pub(super) cursor: Arc<AtomicUsize>,
+    pub(super) broadcast_tx: broadcast::Sender<BridgeMessage>,
+    pub(super) subscriber_pending: Arc<Mutex<SubscriberPending>>,
     /// `consumer_id`s with a live subscribe stream, so a duplicate is rejected rather than
     /// silently sharing the first one's retention set.
-    active_subscribers: Arc<Mutex<HashSet<String>>>,
+    pub(super) active_subscribers: Arc<Mutex<HashSet<String>>>,
 }
 
-struct InboundDelivery {
-    message: BridgeMessage,
-    completion: oneshot::Sender<MessageDisposition>,
+pub(super) struct InboundDelivery {
+    pub(super) message: BridgeMessage,
+    pub(super) completion: oneshot::Sender<MessageDisposition>,
 }
 
 /// A `publish_batch` message that has been dispatched and is waiting for its response.
@@ -202,13 +202,13 @@ enum Pending {
 /// bound. `unacked` is authoritative — `queue` keeps arrival order and may hold already
 /// acked entries until it is compacted, which keeps every operation O(1) amortized.
 #[derive(Default)]
-struct PendingMessages {
+pub(super) struct PendingMessages {
     queue: VecDeque<BridgeMessage>,
     unacked: HashSet<String>,
 }
 
 impl PendingMessages {
-    fn retain(&mut self, msg: &BridgeMessage) {
+    pub(super) fn retain(&mut self, msg: &BridgeMessage) {
         if !self.unacked.insert(msg.id.clone()) {
             return;
         }
@@ -227,16 +227,16 @@ impl PendingMessages {
         self.queue.push_back(msg.clone());
     }
 
-    fn is_unacked(&self, msg_id: &str) -> bool {
+    pub(super) fn is_unacked(&self, msg_id: &str) -> bool {
         self.unacked.contains(msg_id)
     }
 
     /// `true` if the id was still awaiting acknowledgement.
-    fn acknowledge(&mut self, msg_id: &str) -> bool {
+    pub(super) fn acknowledge(&mut self, msg_id: &str) -> bool {
         self.unacked.remove(msg_id)
     }
 
-    fn replay(&self) -> Vec<BridgeMessage> {
+    pub(super) fn replay(&self) -> Vec<BridgeMessage> {
         self.queue
             .iter()
             .filter(|msg| self.unacked.contains(&msg.id))
@@ -247,7 +247,7 @@ impl PendingMessages {
 
 /// Per-subscriber retention for one route, capped in both dimensions.
 #[derive(Default)]
-struct SubscriberPending {
+pub(super) struct SubscriberPending {
     by_consumer: HashMap<String, PendingMessages>,
     /// Insertion order of `by_consumer`, so the oldest subscriber can be evicted. A
     /// consumer that never reconnects (the default id is per-instance) would otherwise
@@ -256,7 +256,7 @@ struct SubscriberPending {
 }
 
 impl SubscriberPending {
-    fn entry(&mut self, consumer_id: &str) -> &mut PendingMessages {
+    pub(super) fn entry(&mut self, consumer_id: &str) -> &mut PendingMessages {
         if !self.by_consumer.contains_key(consumer_id) {
             if self.order.len() >= MAX_PENDING_CONSUMERS {
                 if let Some(evicted) = self.order.pop_front() {
@@ -276,7 +276,7 @@ impl SubscriberPending {
             .expect("entry was just inserted")
     }
 
-    fn get(&self, consumer_id: &str) -> Option<&PendingMessages> {
+    pub(super) fn get(&self, consumer_id: &str) -> Option<&PendingMessages> {
         self.by_consumer.get(consumer_id)
     }
 
@@ -329,10 +329,10 @@ impl Drop for SubscriptionClaim {
     }
 }
 
-struct SharedGrpcServer {
-    router: Arc<SharedGrpcRouter>,
-    handle: tokio::task::JoinHandle<()>,
-    bound_addr: std::net::SocketAddr,
+pub(super) struct SharedGrpcServer {
+    pub(super) router: Arc<SharedGrpcRouter>,
+    pub(super) handle: tokio::task::JoinHandle<()>,
+    pub(super) bound_addr: std::net::SocketAddr,
 }
 
 #[derive(Clone, Hash, PartialEq, Eq)]
@@ -350,7 +350,7 @@ struct GrpcServerKey {
 
 static GRPC_SERVER_REGISTRY: OnceLock<Mutex<HashMap<GrpcServerKey, Arc<SharedGrpcServer>>>> =
     OnceLock::new();
-static GRPC_ROUTE_ID: AtomicU64 = AtomicU64::new(1);
+pub(super) static GRPC_ROUTE_ID: AtomicU64 = AtomicU64::new(1);
 
 fn grpc_server_registry() -> &'static Mutex<HashMap<GrpcServerKey, Arc<SharedGrpcServer>>> {
     GRPC_SERVER_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
@@ -365,7 +365,7 @@ fn normalize_grpc_topic(topic: Option<&str>) -> String {
 }
 
 impl SharedGrpcRouter {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self {
             routes: RwLock::new(HashMap::new()),
         }
@@ -377,7 +377,7 @@ fn bridge_message_topic(msg: &BridgeMessage) -> String {
 }
 
 impl SharedGrpcRouter {
-    fn register_route(
+    pub(super) fn register_route(
         &self,
         route_id: u64,
         topic: String,
@@ -423,7 +423,13 @@ impl SharedGrpcRouter {
         routes.values().find(|route| route.topic == topic).cloned()
     }
 
-    async fn dispatch(&self, msg: BridgeMessage) -> Result<oneshot::Receiver<MessageDisposition>> {
+    pub(super) async fn dispatch(
+        &self,
+        mut msg: BridgeMessage,
+    ) -> Result<oneshot::Receiver<MessageDisposition>> {
+        if msg.id.is_empty() {
+            msg.id = fast_uuid_v7::gen_id().to_string();
+        }
         let topic = bridge_message_topic(&msg);
         let route = self
             .route_for_topic(&topic)

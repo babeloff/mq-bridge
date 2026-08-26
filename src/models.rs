@@ -276,6 +276,8 @@ pub struct StaticConfig {
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "lowercase")]
+// Endpoint configs are intentionally stored inline to preserve the public construction API.
+#[allow(clippy::large_enum_variant)]
 pub enum EndpointType {
     Aws(AwsConfig),
     Kafka(KafkaConfig),

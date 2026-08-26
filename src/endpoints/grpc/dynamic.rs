@@ -698,12 +698,25 @@ impl DynamicPublisher {
 
         match response {
             Ok(response) => {
-                let reply =
-                    decode_dynamic_output(&self.method, response.get_ref(), correlation_id)?;
-                Ok(SentBatch::Partial {
-                    responses: Some(vec![reply]),
-                    failed,
-                })
+                match decode_dynamic_output(&self.method, response.get_ref(), correlation_id) {
+                    Ok(reply) => Ok(SentBatch::Partial {
+                        responses: Some(vec![reply]),
+                        failed,
+                    }),
+                    Err(error) => {
+                        let message = error.to_string();
+                        failed.extend(streamed.into_iter().map(|sent| {
+                            (
+                                sent,
+                                PublisherError::NonRetryable(anyhow::anyhow!(message.clone())),
+                            )
+                        }));
+                        Ok(SentBatch::Partial {
+                            responses: Some(Vec::new()),
+                            failed,
+                        })
+                    }
+                }
             }
             // One reply covers the whole stream, so a failure fails every message in it.
             Err(status) => {

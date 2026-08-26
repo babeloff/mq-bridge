@@ -182,6 +182,11 @@ pub(super) async fn make_endpoint(
     config: &GrpcConfig,
     url: &str,
 ) -> Result<tonic::transport::Endpoint> {
+    if config.tls.accept_invalid_certs {
+        return Err(anyhow::anyhow!(
+            "gRPC clients do not support tls.accept_invalid_certs"
+        ));
+    }
     let mut endpoint = tonic::transport::Endpoint::from_shared(url.to_string())?;
 
     if config.tls.required {

@@ -46,6 +46,25 @@ fn extract_sensitive_string_map_entries(
     }
 }
 
+fn extract_binary_map_entries(
+    values: &mut HashMap<String, Vec<u8>>,
+    prefix: &str,
+    field_name: &str,
+    secrets: &mut HashMap<String, String>,
+) {
+    for (key, value) in std::mem::take(values) {
+        secrets.insert(
+            sanitize_secret_key(&format!(
+                "{}__{}__{}",
+                prefix,
+                field_name,
+                encode_secret_map_key(&key)
+            )),
+            serde_json::to_string(&value).expect("serializing bytes cannot fail"),
+        );
+    }
+}
+
 fn url_has_userinfo(url: &str) -> bool {
     let Some(authority_start) = url.find("://").map(|idx| idx + 3) else {
         return false;
@@ -462,6 +481,12 @@ impl SecretExtractor for GrpcConfig {
     fn extract_secrets(&mut self, prefix: &str, secrets: &mut HashMap<String, String>) {
         extract_sensitive_url(&mut self.url, prefix, "URL", secrets);
         extract_sensitive_string_map_entries(&mut self.metadata, prefix, "METADATA", secrets);
+        extract_binary_map_entries(
+            &mut self.binary_metadata,
+            prefix,
+            "BINARY_METADATA",
+            secrets,
+        );
         if let Some(value) = self.bearer_token.take() {
             secrets.insert(format!("{}__BEARER_TOKEN", prefix), value);
         }

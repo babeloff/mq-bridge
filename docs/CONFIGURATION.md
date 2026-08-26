@@ -349,11 +349,6 @@ The stable generated `mqbridge.Bridge` protocol remains the default. To call an
 arbitrary unary or server-streaming gRPC method, provide a compiled protobuf descriptor
 set plus the service, method, and JSON request:
 
-The deprecated `timeout_ms` and `server_streaming` configuration keys are still accepted:
-`timeout_ms` is a
-fallback for connection and request setup, while a dynamic stream's idle and overall deadlines
-require their dedicated keys.
-
 ```yaml
 input:
   grpc:
@@ -364,6 +359,10 @@ input:
     request:
       topic: audit
 ```
+
+The deprecated `timeout_ms` and `server_streaming` configuration keys are still accepted:
+`timeout_ms` is a fallback for connection and request setup, while a dynamic stream's idle and
+overall deadlines require their dedicated keys.
 
 Generate the descriptor with imports included:
 

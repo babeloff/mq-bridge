@@ -53,6 +53,7 @@ def main() -> None:
             metadata={"mq_bridge.topic": "compat"},
         )
     )
+    assert response.WhichOneof("result") == "ack"
     assert response.ack.status == bridge_pb2.Ack.ACK
     subscriber.join(timeout=5)
     assert not errors, errors

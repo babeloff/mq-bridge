@@ -90,10 +90,7 @@ impl GrpcPublisher {
                 .request_timeout_ms
                 .or(config.timeout_ms)
                 .map(Duration::from_millis),
-            overall_timeout: config
-                .overall_timeout_ms
-                .or(config.timeout_ms)
-                .map(Duration::from_millis),
+            overall_timeout: config.overall_timeout_ms.map(Duration::from_millis),
             topic: Some(
                 config
                     .topic

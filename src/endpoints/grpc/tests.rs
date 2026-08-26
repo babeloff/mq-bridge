@@ -1,5 +1,4 @@
 mod config {
-    use super::super::*;
     use crate::models::GrpcConfig;
 
     #[test]
@@ -19,13 +18,17 @@ mod config {
 mod consumer {
     use super::super::consumer::*;
     use super::super::publisher::GrpcPublisher;
-    use crate::endpoints::grpc::GrpcConsumer;
+    use super::super::{proto, BridgeMessage, CanonicalMessage};
     use crate::models::{Endpoint, EndpointType, GrpcConfig, Route};
+    use crate::traits::{MessageConsumer, MessageDisposition, MessagePublisher, SentBatch};
+    use proto::bridge_client::BridgeClient;
     use proto::bridge_server::{Bridge, BridgeServer};
-    use proto::PublishResponse;
+    use proto::{PublishResponse, SubscribeRequest};
+    use std::time::Duration;
     use tokio::sync::{broadcast, mpsc};
     use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
-    use tonic::{transport::Server, Request, Response, Status};
+    use tonic::transport::Server as TonicServer;
+    use tonic::{Request, Response, Status};
 
     struct MockBridge {
         tx: broadcast::Sender<BridgeMessage>,
@@ -208,21 +211,22 @@ mod consumer {
 
     #[tokio::test]
     async fn test_grpc_route_end_to_end() {
-        // Setup Mock Server on a unique port
-        let addr = "[::1]:50052".parse().unwrap();
+        let listener = tokio::net::TcpListener::bind("[::1]:0").await.unwrap();
+        let local = listener.local_addr().unwrap();
         let (tx, _) = broadcast::channel(32);
         let bridge = MockBridge { tx };
 
+        let incoming = TcpListenerStream::new(listener);
         let server_handle = tokio::spawn(async move {
-            Server::builder()
-                .serve(addr, BridgeServer::new(bridge))
+            TonicServer::builder()
+                .serve_with_incoming(BridgeServer::new(bridge), incoming)
                 .await
                 .unwrap();
         });
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         let config = GrpcConfig {
-            url: format!("http://{}", addr),
+            url: format!("http://{}", local),
             timeout_ms: None,
             topic: Some("e2e_test_topic".to_string()),
             ..Default::default()
@@ -292,13 +296,15 @@ mod consumer {
     }
     #[tokio::test]
     async fn acknowledge_and_batch_streaming_round_trip() {
-        let addr = "[::1]:50055".parse().unwrap();
+        let listener = tokio::net::TcpListener::bind("[::1]:0").await.unwrap();
+        let local = listener.local_addr().unwrap();
         let (tx, _) = broadcast::channel(16);
         let bridge = MockBridge { tx: tx.clone() };
 
+        let incoming = TcpListenerStream::new(listener);
         let server_handle = tokio::spawn(async move {
-            Server::builder()
-                .serve(addr, BridgeServer::new(bridge))
+            TonicServer::builder()
+                .serve_with_incoming(BridgeServer::new(bridge), incoming)
                 .await
                 .unwrap();
         });
@@ -306,7 +312,7 @@ mod consumer {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         let config = GrpcConfig {
-            url: format!("http://{}", addr),
+            url: format!("http://{}", local),
             timeout_ms: None,
             topic: Some("batch_test_topic".to_string()),
             ..Default::default()
@@ -365,8 +371,15 @@ mod dynamic {
     use super::super::dynamic::*;
     use super::super::publisher::GrpcPublisher;
     use super::super::server::{PrefixRouter, ServerModeConsumer, REFLECTION_V1_PREFIX};
+    use super::super::GrpcStatusError;
     use crate::models::GrpcConfig;
+    use crate::traits::{
+        ConsumerError, MessageConsumer, MessagePublisher, PublisherError, SentBatch,
+    };
+    use crate::CanonicalMessage;
     use std::collections::HashMap;
+    use std::time::Duration;
+    use tokio_stream::wrappers::TcpListenerStream;
     use tonic::transport::Server as TonicServer;
     use tonic::{Request, Response, Status};
 
@@ -898,9 +911,20 @@ mod server {
     use super::super::dynamic::reflected_descriptor_pool;
     use super::super::publisher::GrpcPublisher;
     use super::super::server::*;
+    use super::super::{proto, BridgeMessage};
     use crate::endpoints::grpc::GrpcConsumer;
     use crate::models::GrpcConfig;
+    use crate::traits::{MessageConsumer, MessageDisposition, MessagePublisher};
     use crate::CanonicalMessage;
+    use futures::StreamExt;
+    use proto::bridge_server::Bridge;
+    use proto::SubscribeRequest;
+    use std::collections::HashSet;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+    use tokio::sync::{broadcast, mpsc, oneshot};
+    use tonic::Request;
 
     /// `publish_batch` must dispatch without waiting for each message to commit. Awaiting
     /// receipts inline prevents later messages from reaching the consumer until the first

@@ -513,6 +513,45 @@ kafka_to_nats:
     }
 
     #[test]
+    fn grpc_binary_metadata_is_extracted_reversibly() {
+        let mut grpc = GrpcConfig::new("https://localhost:50051");
+        grpc.binary_metadata
+            .insert("authorization-bin".to_string(), vec![0, 127, 255]);
+        grpc.binary_metadata
+            .insert("x-trace-bin".to_string(), vec![1, 2, 3]);
+        grpc.bearer_token = Some("bearer-secret".to_string());
+        grpc.api_key = Some("api-secret".to_string());
+
+        let mut secrets = HashMap::new();
+        grpc.extract_secrets("MQB__ROUTE__OUTPUT__GRPC", &mut secrets);
+
+        assert!(grpc.binary_metadata.is_empty());
+        assert!(grpc.bearer_token.is_none());
+        assert!(grpc.api_key.is_none());
+        for (key, expected) in [
+            (
+                "MQB__ROUTE__OUTPUT__GRPC__BINARY_METADATA__617574686F72697A6174696F6E2D62696E",
+                vec![0, 127, 255],
+            ),
+            (
+                "MQB__ROUTE__OUTPUT__GRPC__BINARY_METADATA__782D74726163652D62696E",
+                vec![1, 2, 3],
+            ),
+        ] {
+            let restored: Vec<u8> = serde_json::from_str(secrets.get(key).unwrap()).unwrap();
+            assert_eq!(restored, expected);
+        }
+        assert_eq!(
+            secrets.get("MQB__ROUTE__OUTPUT__GRPC__BEARER_TOKEN"),
+            Some(&"bearer-secret".to_string())
+        );
+        assert_eq!(
+            secrets.get("MQB__ROUTE__OUTPUT__GRPC__API_KEY"),
+            Some(&"api-secret".to_string())
+        );
+    }
+
+    #[test]
     fn test_extract_sensitive_url_only_strips_authority_credentials() {
         let mut config = Config::new();
         let path_at_route = Route {

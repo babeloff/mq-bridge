@@ -87,15 +87,6 @@ names the unsupported shape and the supported alternatives.
 Descriptors can be supplied by `descriptor_set_path`, by `descriptor_set_bytes` through the Rust
 API, or discovered with reflection v1. This server-streaming source calls `Tail`:
 
-All deadlines default to disabled. The deprecated `timeout_ms` key is still accepted as a fallback
-for `connect_timeout_ms`, for `request_timeout_ms`, and for a Bridge publisher's overall batch
-timeout. It no longer imposes an idle or overall limit on a dynamic response stream; configure
-`idle_stream_timeout_ms` or `overall_timeout_ms` explicitly when those limits are wanted.
-
-`idle_stream_timeout_ms` is retryable: exceeding it drops the stream and the route reconnects.
-`overall_timeout_ms` caps the lifetime of the RPC and is terminal — exceeding it stops the route
-rather than restarting the call, which would reset the cap on every reconnect.
-
 ```yaml
 input:
   grpc:
@@ -113,6 +104,16 @@ input:
     metadata:
       x-tenant: accounting
 ```
+
+All deadlines default to disabled. The deprecated `timeout_ms` key is still accepted as a fallback
+for `connect_timeout_ms` and `request_timeout_ms`. It no longer imposes an idle or overall limit on
+a dynamic response stream; configure `idle_stream_timeout_ms` or `overall_timeout_ms` explicitly
+when those limits are wanted. A Bridge publisher's overall batch timeout also requires
+`overall_timeout_ms` explicitly.
+
+`idle_stream_timeout_ms` is retryable: exceeding it drops the stream and the route reconnects.
+`overall_timeout_ms` caps the lifetime of the RPC and is terminal — exceeding it stops the route
+rather than restarting the call, which would reset the cap on every reconnect.
 
 ## Dynamic client sink
 
@@ -157,6 +158,8 @@ in the batch is failed and a retry redelivers all of them. That is at-least-once
 batch-sized blast radius: size the route's `batch_size` accordingly, and prefer a unary method
 when the target offers one.
 
+## Unary source
+
 An arbitrary unary source uses the same shape; select its unary method and request:
 
 ```yaml
@@ -171,15 +174,25 @@ input:
     request_timeout_ms: 5000
 ```
 
-For an API key, set `api_key` and optionally `api_key_name` (default `x-api-key`). `metadata` holds
-ASCII values. `binary_metadata` is available to embedded Rust callers as raw byte values and its
-keys must use the `-bin` suffix. Authentication values are validated without being included in
-errors, endpoint status, logs, or connection-cache identities. All four are also sent on the
-reflection call, so a server that guards reflection sees the same credentials.
+## Metadata and credentials
 
-These four keys apply **only** to dynamic descriptor-driven calls. Setting any of them on a Bridge
-client, Bridge publisher, or server-mode endpoint is rejected at construction rather than silently
-connecting unauthenticated; authenticate the Bridge protocol with TLS client certificates.
+Dynamic descriptor-driven calls support four metadata and credential settings:
+
+- `metadata`: static ASCII metadata values.
+- `binary_metadata`: raw byte values for embedded Rust callers; keys must use the `-bin` suffix.
+- `bearer_token`: a bearer credential sent in the `authorization` metadata entry.
+- `api_key` and optional `api_key_name`: an API key and its metadata name (default `x-api-key`).
+
+Authentication values are validated without being included in errors, endpoint status, logs, or
+connection-cache identities. All four settings are also sent on the reflection call, so a server
+that guards reflection sees the same credentials.
+
+These four settings apply **only** to dynamic descriptor-driven calls. Setting any of them on a
+Bridge client, Bridge publisher, or server-mode endpoint is rejected at construction rather than
+silently connecting unauthenticated; authenticate the Bridge protocol with TLS client
+certificates.
+
+## Additional dynamic source details
 
 For a local descriptor, replace `reflection: true` with:
 
