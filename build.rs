@@ -28,10 +28,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // to see if the feature was requested for the package.
     #[cfg(feature = "grpc")]
     {
+        let out_dir = std::path::PathBuf::from(std::env::var("OUT_DIR")?);
         std::env::set_var("PROTOC", protoc_bin_vendored::protoc_bin_path().unwrap());
-        println!("cargo:rerun-if-changed=src/endpoints/grpc.proto");
+        println!("cargo:rerun-if-changed=src/endpoints/proto/mqbridge/bridge.proto");
         tonic_prost_build::configure()
-            .compile_protos(&["src/endpoints/grpc.proto"], &["src/endpoints"])?;
+            .file_descriptor_set_path(out_dir.join("mqbridge_descriptor.bin"))
+            .compile_protos(
+                &["src/endpoints/proto/mqbridge/bridge.proto"],
+                &["src/endpoints/proto"],
+            )?;
+        // Test-only fixture, excluded from the published crate. Guarding on its presence
+        // keeps downstream builds from compiling it and from failing when it is absent.
+        println!("cargo:rerun-if-changed=tests/fixtures/grpc_dynamic.proto");
+        if std::path::Path::new("tests/fixtures/grpc_dynamic.proto").exists() {
+            tonic_prost_build::configure()
+                .file_descriptor_set_path(out_dir.join("grpc_dynamic_test_descriptor.bin"))
+                .compile_protos(&["tests/fixtures/grpc_dynamic.proto"], &["tests/fixtures"])?;
+        }
     }
     Ok(())
 }

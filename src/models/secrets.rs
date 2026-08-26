@@ -461,6 +461,13 @@ impl SecretExtractor for PostgresCdcConfig {
 impl SecretExtractor for GrpcConfig {
     fn extract_secrets(&mut self, prefix: &str, secrets: &mut HashMap<String, String>) {
         extract_sensitive_url(&mut self.url, prefix, "URL", secrets);
+        extract_sensitive_string_map_entries(&mut self.metadata, prefix, "METADATA", secrets);
+        if let Some(value) = self.bearer_token.take() {
+            secrets.insert(format!("{}__BEARER_TOKEN", prefix), value);
+        }
+        if let Some(value) = self.api_key.take() {
+            secrets.insert(format!("{}__API_KEY", prefix), value);
+        }
         self.tls
             .extract_secrets(&format!("{}__{}", prefix, "TLS"), secrets);
     }

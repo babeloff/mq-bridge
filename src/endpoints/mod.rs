@@ -2061,9 +2061,7 @@ async fn create_base_publisher(
             )
         }
         #[cfg(feature = "grpc")]
-        EndpointType::Grpc(cfg) => {
-            Ok(Box::new(grpc::GrpcPublisher::new(cfg).await?) as Box<dyn MessagePublisher>)
-        }
+        EndpointType::Grpc(cfg) => grpc::create_grpc_publisher(cfg).await,
         #[cfg(feature = "sqlx")]
         EndpointType::Sqlx(cfg) => {
             Ok(Box::new(sqlx::SqlxPublisher::new(cfg).await?) as Box<dyn MessagePublisher>)

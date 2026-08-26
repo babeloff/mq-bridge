@@ -87,6 +87,15 @@ jobs:
       
       - name: Cache cargo build
         uses: Swatinem/rust-cache@v2
+
+      # setup-python provides a non-PEP-668 interpreter; the system python3 on
+      # ubuntu-latest is externally managed and rejects a plain pip install.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Python gRPC compatibility tools
+        run: python3 -m pip install grpcio-tools
       
       - name: Run unit tests
         run: cargo test --lib --features=full

@@ -14,6 +14,7 @@ use bytes::{Buf, BufMut};
 use futures::{StreamExt, TryStreamExt};
 use prost::Message;
 use prost_reflect::{DescriptorPool, DynamicMessage, MessageDescriptor};
+use sha2::{Digest, Sha256};
 use std::any::Any;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -26,10 +27,15 @@ use uuid::Uuid;
 pub mod proto {
     #![allow(clippy::all)]
     tonic::include_proto!("mqbridge");
+
+    /// Encoded descriptors for the stable `mqbridge` public API.
+    pub const FILE_DESCRIPTOR_SET: &[u8] =
+        tonic::include_file_descriptor_set!("mqbridge_descriptor");
 }
 
 use proto::bridge_client::BridgeClient;
 use proto::{BridgeMessage, SubscribeRequest};
+use tonic::metadata::{Ascii, Binary, MetadataKey, MetadataMap, MetadataValue};
 use tonic::Request;
 
 use tokio::sync::{broadcast, mpsc, oneshot};
@@ -37,6 +43,60 @@ use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
 use tonic::transport::Server as TonicServer;
 use tonic::transport::{Certificate, ClientTlsConfig, Identity, ServerTlsConfig};
 use tonic::{Response, Status};
+
+/// Structured failure returned by descriptor-driven gRPC calls.
+///
+/// `Display` and `Debug` intentionally omit trailing metadata values so credentials
+/// returned by a peer cannot leak through ordinary error logging. Callers that need
+/// protocol details can inspect [`Self::trailing_metadata`] explicitly.
+pub struct GrpcStatusError {
+    code: tonic::Code,
+    message: String,
+    trailing_metadata: MetadataMap,
+}
+
+impl GrpcStatusError {
+    pub fn code(&self) -> tonic::Code {
+        self.code
+    }
+
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+
+    pub fn trailing_metadata(&self) -> &MetadataMap {
+        &self.trailing_metadata
+    }
+}
+
+impl From<Status> for GrpcStatusError {
+    fn from(status: Status) -> Self {
+        Self {
+            code: status.code(),
+            message: status.message().to_owned(),
+            trailing_metadata: status.metadata().clone(),
+        }
+    }
+}
+
+impl std::fmt::Display for GrpcStatusError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "gRPC status {:?}: {}", self.code, self.message)
+    }
+}
+
+impl std::fmt::Debug for GrpcStatusError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GrpcStatusError")
+            .field("code", &self.code)
+            .field("message", &self.message)
+            .field("trailing_metadata_entries", &self.trailing_metadata.len())
+            .finish()
+    }
+}
+
+impl std::error::Error for GrpcStatusError {}
 
 const GRPC_BATCH_POLL_MS: u64 = 15; // Increased for better batching in performance tests, and to reduce "poll timed out" warnings
 /// Acks for one committed batch that may be in flight at once.
@@ -69,7 +129,10 @@ impl GrpcConsumer {
             let s = ServerModeConsumer::new(config, &url).await?;
             let addr = s.bound_addr();
             (GrpcConsumerInner::Server(s), Some(addr))
-        } else if config.descriptor_set_path.is_some() {
+        } else if config.descriptor_set_bytes.is_some()
+            || config.descriptor_set_path.is_some()
+            || config.reflection
+        {
             (
                 GrpcConsumerInner::Dynamic(Box::new(DynamicConsumer::new(config, &url).await?)),
                 None,
@@ -132,7 +195,13 @@ impl MessageConsumer for GrpcConsumer {
                 serde_json::json!({ "mode": "server", "bound_addr": self.bound_addr }),
             ),
             GrpcConsumerInner::Client(_) => (true, serde_json::json!({ "mode": "client" })),
-            GrpcConsumerInner::Dynamic(_) => (true, serde_json::json!({ "mode": "dynamic" })),
+            GrpcConsumerInner::Dynamic(_) => (
+                true,
+                serde_json::json!({
+                    "mode": "dynamic-client",
+                    "acknowledgement_guarantee": "none"
+                }),
+            ),
         };
         crate::traits::EndpointStatus {
             healthy,
@@ -212,9 +281,227 @@ async fn with_deadline<T>(
         Some(deadline) => tokio::time::timeout(deadline, call)
             .await
             .map_err(|_| anyhow::anyhow!("dynamic gRPC call timed out after {deadline:?}"))?
-            .map_err(Into::into),
-        None => call.await.map_err(Into::into),
+            .map_err(|status| anyhow::Error::new(GrpcStatusError::from(status))),
+        None => call
+            .await
+            .map_err(|status| anyhow::Error::new(GrpcStatusError::from(status))),
     }
+}
+
+/// Attaches the configured static metadata and credentials. Error text never
+/// includes a configured value, so an unusable credential cannot leak through logs.
+fn apply_call_metadata(config: &GrpcConfig, metadata: &mut MetadataMap) -> Result<()> {
+    for (name, value) in &config.metadata {
+        let key = MetadataKey::<Ascii>::from_bytes(name.as_bytes())
+            .map_err(|error| anyhow::anyhow!("invalid gRPC metadata key '{name}': {error}"))?;
+        let value = MetadataValue::<Ascii>::try_from(value.as_str()).map_err(|error| {
+            anyhow::anyhow!("invalid gRPC metadata value for '{name}': {error}")
+        })?;
+        metadata.insert(key, value);
+    }
+    for (name, value) in &config.binary_metadata {
+        let key = MetadataKey::<Binary>::from_bytes(name.as_bytes()).map_err(|error| {
+            anyhow::anyhow!("invalid binary gRPC metadata key '{name}': {error}")
+        })?;
+        metadata.insert_bin(key, MetadataValue::<Binary>::from_bytes(value));
+    }
+    if let Some(token) = &config.bearer_token {
+        let value = MetadataValue::<Ascii>::try_from(format!("Bearer {token}"))
+            .map_err(|_| anyhow::anyhow!("bearer_token is not a valid gRPC metadata value"))?;
+        metadata.insert("authorization", value);
+    }
+    if let Some(api_key) = &config.api_key {
+        let name = config.api_key_name.as_deref().unwrap_or("x-api-key");
+        let key = MetadataKey::<Ascii>::from_bytes(name.as_bytes())
+            .map_err(|error| anyhow::anyhow!("invalid api_key_name '{name}': {error}"))?;
+        let value = MetadataValue::<Ascii>::try_from(api_key.as_str())
+            .map_err(|_| anyhow::anyhow!("api_key is not a valid gRPC metadata value"))?;
+        metadata.insert(key, value);
+    }
+
+    Ok(())
+}
+
+/// Metadata and credentials are only attached to descriptor-driven calls. Accepting them
+/// silently elsewhere would connect unauthenticated, so those modes reject them instead.
+fn reject_unsupported_call_metadata(config: &GrpcConfig, mode: &str) -> Result<()> {
+    let mut set = Vec::new();
+    if !config.metadata.is_empty() {
+        set.push("metadata");
+    }
+    if !config.binary_metadata.is_empty() {
+        set.push("binary_metadata");
+    }
+    if config.bearer_token.is_some() {
+        set.push("bearer_token");
+    }
+    if config.api_key.is_some() {
+        set.push("api_key");
+    }
+    if set.is_empty() {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "gRPC {mode} mode does not send {}; these apply only to dynamic \
+         descriptor-driven calls. Use TLS client certificates for the Bridge protocol.",
+        set.join(", ")
+    )
+}
+
+fn dynamic_request(config: &GrpcConfig, payload: Vec<u8>) -> Result<Request<Vec<u8>>> {
+    let mut request = Request::new(payload);
+    apply_call_metadata(config, request.metadata_mut())?;
+    Ok(request)
+}
+
+/// Connects and resolves the configured service/method from a descriptor set, a
+/// descriptor file, or server reflection. Shared by the dynamic source and sink so both
+/// accept the same configuration and produce the same errors.
+async fn resolve_dynamic_method(
+    config: &GrpcConfig,
+    url: &str,
+) -> Result<(Channel, prost_reflect::MethodDescriptor)> {
+    let service_name = config
+        .service_name
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("dynamic gRPC requires service_name"))?;
+    let method_name = config
+        .method_name
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("dynamic gRPC requires method_name"))?;
+
+    let channel = make_endpoint(config, url).await?.connect().await?;
+    let request_deadline = config
+        .request_timeout_ms
+        .or(config.timeout_ms)
+        .map(Duration::from_millis);
+    let pool = if let Some(bytes) = &config.descriptor_set_bytes {
+        DescriptorPool::decode(bytes.as_slice())?
+    } else if let Some(path) = &config.descriptor_set_path {
+        let bytes = tokio::fs::read(path).await?;
+        DescriptorPool::decode(bytes.as_slice())?
+    } else if config.reflection {
+        reflected_descriptor_pool(config, channel.clone(), service_name, request_deadline).await?
+    } else {
+        anyhow::bail!(
+            "dynamic gRPC requires descriptor_set_bytes, descriptor_set_path, or reflection: true"
+        );
+    };
+
+    let service = pool.get_service_by_name(service_name).ok_or_else(|| {
+        anyhow::anyhow!(
+            "gRPC service '{}' not found in the discovered descriptors",
+            service_name
+        )
+    })?;
+    let method = service
+        .methods()
+        .find(|method| method.name() == method_name)
+        .ok_or_else(|| {
+            anyhow::anyhow!("gRPC method '{}.{}' not found", service_name, method_name)
+        })?;
+    Ok((channel, method))
+}
+
+/// Names an RPC's streaming shape for capability errors.
+fn method_shape(method: &prost_reflect::MethodDescriptor) -> &'static str {
+    match (method.is_client_streaming(), method.is_server_streaming()) {
+        (true, true) => "bidirectional-streaming",
+        (true, false) => "client-streaming",
+        (false, true) => "server-streaming",
+        (false, false) => "unary",
+    }
+}
+
+/// Encodes one canonical payload as the method's protobuf input message. A payload that
+/// does not match the descriptor is permanent: retrying re-encodes the same bytes.
+fn encode_dynamic_input(
+    method: &prost_reflect::MethodDescriptor,
+    payload: &[u8],
+) -> Result<Vec<u8>, PublisherError> {
+    let mut deserializer = serde_json::Deserializer::from_slice(payload);
+    let message =
+        DynamicMessage::deserialize(method.input(), &mut deserializer).map_err(|error| {
+            PublisherError::NonRetryable(anyhow::anyhow!(
+                "gRPC payload does not match '{}': {error}",
+                method.input().full_name()
+            ))
+        })?;
+    let mut bytes = Vec::with_capacity(message.encoded_len());
+    message.encode(&mut bytes).map_err(|error| {
+        PublisherError::NonRetryable(anyhow::anyhow!("gRPC payload encode failed: {error}"))
+    })?;
+    Ok(bytes)
+}
+
+/// Decodes a protobuf response into a canonical message carrying the originating id, so
+/// the route can correlate it as a reply.
+fn decode_dynamic_output(
+    method: &prost_reflect::MethodDescriptor,
+    bytes: &[u8],
+    correlation_id: Option<u128>,
+) -> Result<CanonicalMessage, PublisherError> {
+    let message = DynamicMessage::decode(method.output(), bytes).map_err(|error| {
+        PublisherError::NonRetryable(anyhow::anyhow!("gRPC response decode failed: {error}"))
+    })?;
+    let payload = serde_json::to_vec(&message).map_err(|error| {
+        PublisherError::NonRetryable(anyhow::anyhow!("gRPC response encode failed: {error}"))
+    })?;
+    Ok(CanonicalMessage::new(payload, correlation_id))
+}
+
+async fn reflected_descriptor_pool(
+    config: &GrpcConfig,
+    channel: Channel,
+    service_name: &str,
+    deadline: Option<Duration>,
+) -> Result<DescriptorPool> {
+    use tonic_reflection::pb::v1::server_reflection_client::ServerReflectionClient;
+    use tonic_reflection::pb::v1::server_reflection_request::MessageRequest;
+    use tonic_reflection::pb::v1::server_reflection_response::MessageResponse;
+    use tonic_reflection::pb::v1::ServerReflectionRequest;
+
+    let reflection_request = ServerReflectionRequest {
+        host: String::new(),
+        message_request: Some(MessageRequest::FileContainingSymbol(
+            service_name.to_owned(),
+        )),
+    };
+    // Reflection is an ordinary RPC, so a server that guards it needs the same
+    // credentials as the call the descriptors are being fetched for.
+    let mut request = Request::new(tokio_stream::iter([reflection_request]));
+    apply_call_metadata(config, request.metadata_mut())?;
+    let mut client = ServerReflectionClient::new(channel);
+    let call = client.server_reflection_info(request);
+    let mut responses = with_deadline(call, deadline).await?.into_inner();
+    let response = with_deadline(responses.message(), deadline)
+        .await?
+        .ok_or_else(|| {
+            anyhow::anyhow!("gRPC reflection returned no descriptor for '{service_name}'")
+        })?;
+    let descriptors = match response.message_response {
+        Some(MessageResponse::FileDescriptorResponse(response)) => response.file_descriptor_proto,
+        Some(MessageResponse::ErrorResponse(error)) => anyhow::bail!(
+            "gRPC reflection failed for '{service_name}' with code {}: {}",
+            error.error_code,
+            error.error_message
+        ),
+        _ => anyhow::bail!("gRPC reflection returned an unexpected response for '{service_name}'"),
+    };
+    let files = descriptors
+        .into_iter()
+        .map(|bytes| prost_types::FileDescriptorProto::decode(bytes.as_slice()))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let mut pool = DescriptorPool::new();
+    pool.add_file_descriptor_protos(files)?;
+    Ok(pool)
+}
+
+/// `overall_timeout_ms` caps the lifetime of the RPC, so it is permanent: a reconnect
+/// would restart the call and recompute the deadline, turning the cap into an endless
+/// restart loop. The idle timeout stays retryable, where reconnecting is the point.
+fn overall_deadline_exceeded() -> ConsumerError {
+    ConsumerError::Permanent(anyhow::anyhow!("dynamic gRPC overall deadline exceeded"))
 }
 
 enum DynamicResponse {
@@ -226,46 +513,38 @@ enum DynamicResponse {
 struct DynamicConsumer {
     response: DynamicResponse,
     output: MessageDescriptor,
+    service_name: String,
+    method_name: String,
+    response_index: u64,
+    idle_stream_timeout: Option<Duration>,
+    overall_deadline: Option<tokio::time::Instant>,
     exit_on_empty: bool,
 }
 
 impl DynamicConsumer {
     async fn new(config: &GrpcConfig, url: &str) -> Result<Self> {
-        let descriptor_path = config
-            .descriptor_set_path
-            .as_deref()
-            .ok_or_else(|| anyhow::anyhow!("dynamic gRPC requires descriptor_set_path"))?;
-        let service_name = config
-            .service_name
-            .as_deref()
-            .ok_or_else(|| anyhow::anyhow!("dynamic gRPC requires service_name"))?;
-        let method_name = config
-            .method_name
-            .as_deref()
-            .ok_or_else(|| anyhow::anyhow!("dynamic gRPC requires method_name"))?;
-        let descriptor_bytes = tokio::fs::read(descriptor_path).await?;
-        let pool = DescriptorPool::decode(descriptor_bytes.as_slice())?;
-        let service = pool.get_service_by_name(service_name).ok_or_else(|| {
-            anyhow::anyhow!(
-                "gRPC service '{}' not found in descriptor set",
-                service_name
-            )
-        })?;
-        let method = service
-            .methods()
-            .find(|method| method.name() == method_name)
-            .ok_or_else(|| {
-                anyhow::anyhow!("gRPC method '{}.{}' not found", service_name, method_name)
-            })?;
+        let (channel, method) = resolve_dynamic_method(config, url).await?;
+        let service_name = method.parent_service().full_name().to_owned();
+        let method_name = method.name().to_owned();
+        let request_deadline = config
+            .request_timeout_ms
+            .or(config.timeout_ms)
+            .map(Duration::from_millis);
         if method.is_client_streaming() {
-            anyhow::bail!("dynamic gRPC client-streaming methods are not supported");
-        }
-        if config.server_streaming != method.is_server_streaming() {
             anyhow::bail!(
-                "dynamic gRPC server_streaming={} does not match descriptor for '{}.{}'",
-                config.server_streaming,
+                "dynamic gRPC method '{}.{}' is {}; a gRPC *input* consumes responses, so it \
+                 supports unary and server-streaming methods only. A method that streams \
+                 requests is a sink: use it as the route's output instead",
                 service_name,
-                method_name
+                method_name,
+                method_shape(&method)
+            );
+        }
+        if config.server_streaming && !method.is_server_streaming() {
+            warn!(
+                service = service_name,
+                method = method_name,
+                "Ignoring deprecated server_streaming hint; the RPC shape is descriptor-derived"
             );
         }
 
@@ -279,37 +558,86 @@ impl DynamicConsumer {
         let mut request_bytes = Vec::with_capacity(request.encoded_len());
         request.encode(&mut request_bytes)?;
 
-        let channel = make_endpoint(config, url).await?.connect().await?;
         let mut client = tonic::client::Grpc::new(channel);
+        if let Some(max) = config.max_decoding_message_size {
+            client = client.max_decoding_message_size(max);
+        }
+        if let Some(max) = config.max_encoding_message_size {
+            client = client.max_encoding_message_size(max);
+        }
+        client
+            .ready()
+            .await
+            .map_err(|error| anyhow::anyhow!("dynamic gRPC service was not ready: {error}"))?;
         let path = tonic::codegen::http::uri::PathAndQuery::from_maybe_shared(format!(
             "/{service_name}/{method_name}"
         ))?;
-        // `make_endpoint` only bounds connection setup, so the call itself gets the same
-        // deadline — otherwise a server that accepts the connection and then never answers
-        // hangs route startup forever.
-        let deadline = config.timeout_ms.map(Duration::from_millis);
+        let overall_timeout = config.overall_timeout_ms.map(Duration::from_millis);
+        let overall_deadline = overall_timeout.map(|timeout| tokio::time::Instant::now() + timeout);
         let response = if method.is_server_streaming() {
-            let call = client.server_streaming(Request::new(request_bytes), path, RawProtobufCodec);
-            DynamicResponse::Streaming(Box::new(with_deadline(call, deadline).await?.into_inner()))
+            let call = client.server_streaming(
+                dynamic_request(config, request_bytes)?,
+                path,
+                RawProtobufCodec,
+            );
+            DynamicResponse::Streaming(Box::new(
+                with_deadline(call, request_deadline).await?.into_inner(),
+            ))
         } else {
-            let call = client.unary(Request::new(request_bytes), path, RawProtobufCodec);
-            DynamicResponse::Unary(Some(with_deadline(call, deadline).await?.into_inner()))
+            let call = client.unary(
+                dynamic_request(config, request_bytes)?,
+                path,
+                RawProtobufCodec,
+            );
+            DynamicResponse::Unary(Some(
+                with_deadline(call, request_deadline).await?.into_inner(),
+            ))
         };
         Ok(Self {
             response,
             output: method.output(),
+            service_name: service_name.to_owned(),
+            method_name: method_name.to_owned(),
+            response_index: 0,
+            idle_stream_timeout: config.idle_stream_timeout_ms.map(Duration::from_millis),
+            overall_deadline,
             exit_on_empty: false,
         })
     }
 
     /// A body that does not match the descriptor is a permanent error, not a connection
     /// one: reconnecting re-reads the same bytes and fails identically.
-    fn decode_message(&self, bytes: &[u8]) -> Result<CanonicalMessage, ConsumerError> {
+    fn decode_message(&mut self, bytes: &[u8]) -> Result<CanonicalMessage, ConsumerError> {
+        // Claim the position before decoding. Ids are advertised as deterministic, so the
+        // index has to follow stream position; a skipped response would otherwise shift
+        // every id after it.
+        let index = self.response_index;
+        self.response_index = self.response_index.saturating_add(1);
+
         let message = DynamicMessage::decode(self.output.clone(), bytes)
             .map_err(|error| ConsumerError::Permanent(error.into()))?;
         let payload =
             serde_json::to_vec(&message).map_err(|error| ConsumerError::Permanent(error.into()))?;
-        Ok(CanonicalMessage::new(payload, None))
+
+        let mut hasher = Sha256::new();
+        hasher.update(b"mqbridge.dynamic-response.v1\0");
+        hasher.update(self.service_name.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(self.method_name.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(index.to_be_bytes());
+        hasher.update(bytes);
+        let digest = hasher.finalize();
+        let mut id = [0_u8; 16];
+        id.copy_from_slice(&digest[..16]);
+
+        Ok(
+            CanonicalMessage::new(payload, Some(u128::from_be_bytes(id)))
+                .with_metadata_kv("grpc.service", self.service_name.clone())
+                .with_metadata_kv("grpc.method", self.method_name.clone())
+                .with_metadata_kv("grpc.response_index", index.to_string())
+                .with_metadata_kv("grpc.ack_guarantee", "none"),
+        )
     }
 }
 
@@ -325,6 +653,9 @@ impl MessageConsumer for DynamicConsumer {
     ) -> Result<crate::outcomes::ReceivedBatch, ConsumerError> {
         let max_messages = max_messages.max(1);
         let mut raw = Vec::with_capacity(max_messages);
+        let idle_timeout = self.idle_stream_timeout;
+        let overall_deadline = self.overall_deadline;
+        let exit_on_empty = self.exit_on_empty;
         match &mut self.response {
             DynamicResponse::Unary(message) => {
                 if let Some(message) = message.take() {
@@ -333,27 +664,58 @@ impl MessageConsumer for DynamicConsumer {
             }
             DynamicResponse::Streaming(stream) => {
                 while raw.len() < max_messages {
-                    let next = if raw.is_empty() {
-                        match crate::traits::drain_gated(self.exit_on_empty, stream.message()).await
-                        {
+                    let overall_remaining = overall_deadline.map(|deadline| {
+                        deadline.saturating_duration_since(tokio::time::Instant::now())
+                    });
+                    if overall_remaining == Some(Duration::ZERO) {
+                        return Err(overall_deadline_exceeded());
+                    }
+                    let next_result = if raw.is_empty() {
+                        let wait = crate::traits::drain_gated(exit_on_empty, stream.message());
+                        let timeout = match (idle_timeout, overall_remaining) {
+                            (Some(idle), Some(overall)) => Some(idle.min(overall)),
+                            (Some(idle), None) => Some(idle),
+                            (None, Some(overall)) => Some(overall),
+                            (None, None) => None,
+                        };
+                        let next = match timeout {
+                            Some(timeout) => {
+                                tokio::time::timeout(timeout, wait).await.map_err(|_| {
+                                    if overall_deadline.is_some_and(|deadline| {
+                                        tokio::time::Instant::now() >= deadline
+                                    }) {
+                                        overall_deadline_exceeded()
+                                    } else {
+                                        ConsumerError::Connection(anyhow::anyhow!(
+                                            "dynamic gRPC response stream idle timeout exceeded"
+                                        ))
+                                    }
+                                })?
+                            }
+                            None => wait.await,
+                        };
+                        match next {
                             Some(result) => result,
                             None => return Ok(crate::outcomes::ReceivedBatch::empty()),
                         }
                     } else {
-                        match tokio::time::timeout(
-                            Duration::from_millis(GRPC_BATCH_POLL_MS),
-                            stream.message(),
-                        )
-                        .await
-                        {
+                        let poll = Duration::from_millis(GRPC_BATCH_POLL_MS);
+                        let timeout =
+                            overall_remaining.map_or(poll, |remaining| poll.min(remaining));
+                        match tokio::time::timeout(timeout, stream.message()).await {
                             Ok(result) => result,
-                            Err(_) => break,
+                            Err(_) if timeout == poll => break,
+                            Err(_) => return Err(overall_deadline_exceeded()),
                         }
                     };
-                    match next {
+                    match next_result {
                         Ok(Some(message)) => raw.push(message),
                         Ok(None) => break,
-                        Err(error) => return Err(ConsumerError::Connection(error.into())),
+                        Err(status) => {
+                            return Err(ConsumerError::Connection(anyhow::Error::new(
+                                GrpcStatusError::from(status),
+                            )))
+                        }
                     }
                 }
             }
@@ -361,6 +723,7 @@ impl MessageConsumer for DynamicConsumer {
         if raw.is_empty() {
             return Err(ConsumerError::EndOfStream);
         }
+
         // Skip what will not decode rather than failing the batch: these bytes are already
         // off the stream and cannot be re-read, so discarding the whole batch for one bad
         // message would silently drop every healthy message alongside it.
@@ -380,6 +743,8 @@ impl MessageConsumer for DynamicConsumer {
         }
         Ok(crate::outcomes::ReceivedBatch {
             messages,
+            // Dynamic services define no acknowledgement operation. This only tells the
+            // route that the already-received response may be released locally.
             commit: Box::new(|_| Box::pin(async { Ok(()) })),
         })
     }
@@ -400,6 +765,7 @@ struct ClientModeConsumer {
 impl ClientModeConsumer {
     async fn new(config: &GrpcConfig, url: &str) -> Result<Self> {
         debug!(grpc_url = %url, "Creating gRPC client consumer (client mode)");
+        reject_unsupported_call_metadata(config, "Bridge client")?;
         let endpoint = make_endpoint(config, url).await?;
         let channel = endpoint.connect().await?;
         let mut client = configured_client(config, channel);
@@ -420,8 +786,12 @@ impl ClientModeConsumer {
             topic: topic.clone(),
             consumer_id: consumer_id.clone(),
         });
-        let stream = if let Some(ms) = config.timeout_ms {
-            tokio::time::timeout(Duration::from_millis(ms), client.subscribe(request))
+        let request_timeout = config
+            .request_timeout_ms
+            .or(config.timeout_ms)
+            .map(Duration::from_millis);
+        let stream = if let Some(timeout) = request_timeout {
+            tokio::time::timeout(timeout, client.subscribe(request))
                 .await
                 .map_err(|_| anyhow::anyhow!("gRPC subscribe timed out"))??
         } else {
@@ -627,6 +997,57 @@ struct ServerModeConsumer {
     drain_start: usize,
     /// Drain mode: only then does an idle first-message poll time out into an empty batch.
     exit_on_empty: bool,
+}
+
+const REFLECTION_V1_PREFIX: &str = "/grpc.reflection.v1.ServerReflection/";
+const REFLECTION_V1ALPHA_PREFIX: &str = "/grpc.reflection.v1alpha.ServerReflection/";
+
+/// Sends one gRPC path prefix to `matched` and everything else to `fallback`, so hosting
+/// reflection alongside the Bridge service does not pull in tonic's axum-backed router.
+///
+/// Every generated tonic service shares one response type and already returns a boxed
+/// future, so this dispatches by delegation alone — no wrapping, no extra allocation.
+/// Nest it to add further services.
+#[derive(Clone)]
+struct PrefixRouter<F, M> {
+    fallback: F,
+    prefix: &'static str,
+    matched: M,
+}
+
+impl<F, M, B> tonic::codegen::Service<tonic::codegen::http::Request<B>> for PrefixRouter<F, M>
+where
+    F: tonic::codegen::Service<tonic::codegen::http::Request<B>>,
+    M: tonic::codegen::Service<
+        tonic::codegen::http::Request<B>,
+        Response = F::Response,
+        Error = F::Error,
+        Future = F::Future,
+    >,
+{
+    type Response = F::Response;
+    type Error = F::Error;
+    type Future = F::Future;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        match self.fallback.poll_ready(cx) {
+            std::task::Poll::Ready(Ok(())) => self.matched.poll_ready(cx),
+            other => other,
+        }
+    }
+
+    fn call(&mut self, request: tonic::codegen::http::Request<B>) -> Self::Future {
+        // Unmatched paths go to the fallback, whose generated service answers anything it
+        // does not recognise with UNIMPLEMENTED.
+        if request.uri().path().starts_with(self.prefix) {
+            self.matched.call(request)
+        } else {
+            self.fallback.call(request)
+        }
+    }
 }
 
 /// Tonic service implementation that fans incoming messages into a subscriber
@@ -838,7 +1259,7 @@ struct SharedGrpcServer {
 struct GrpcServerKey {
     listen_addr: String,
     tls: crate::models::TlsConfig,
-    timeout_ms: Option<u64>,
+    request_timeout_ms: Option<u64>,
     initial_stream_window_size: Option<u32>,
     initial_connection_window_size: Option<u32>,
     concurrency_limit_per_connection: Option<usize>,
@@ -1184,10 +1605,11 @@ impl proto::bridge_server::Bridge for BridgeService {
 
 impl ServerModeConsumer {
     async fn new(config: &GrpcConfig, url: &str) -> Result<Self> {
+        reject_unsupported_call_metadata(config, "server")?;
         let key = GrpcServerKey {
             listen_addr: parse_addr(url)?.to_string(),
             tls: config.tls.clone(),
-            timeout_ms: config.timeout_ms,
+            request_timeout_ms: config.request_timeout_ms.or(config.timeout_ms),
             initial_stream_window_size: config.initial_stream_window_size,
             initial_connection_window_size: config.initial_connection_window_size,
             concurrency_limit_per_connection: config.concurrency_limit_per_connection,
@@ -1271,7 +1693,7 @@ async fn get_or_create_shared_grpc_server(
     if let Some(ms) = config.http2_keepalive_timeout_ms {
         builder = builder.http2_keepalive_timeout(Some(Duration::from_millis(ms)));
     }
-    if let Some(ms) = config.timeout_ms {
+    if let Some(ms) = config.request_timeout_ms.or(config.timeout_ms) {
         builder = builder.timeout(Duration::from_millis(ms));
     }
 
@@ -1299,7 +1721,10 @@ async fn get_or_create_shared_grpc_server(
 
     let mut service = proto::bridge_server::BridgeServer::new(BridgeService {
         router: router.clone(),
-        commit_timeout: config.timeout_ms.map(Duration::from_millis),
+        commit_timeout: config
+            .request_timeout_ms
+            .or(config.timeout_ms)
+            .map(Duration::from_millis),
     });
     if let Some(max) = config.max_decoding_message_size {
         service = service.max_decoding_message_size(max);
@@ -1314,9 +1739,23 @@ async fn get_or_create_shared_grpc_server(
     info!(server_addr = %local, "gRPC embedded server listener bound");
     let incoming = TcpListenerStream::new(listener);
 
+    // Both reflection versions: v1 for current tooling, v1alpha for older grpcurl/evans.
+    let configure_reflection = || {
+        tonic_reflection::server::Builder::configure()
+            .register_encoded_file_descriptor_set(proto::FILE_DESCRIPTOR_SET)
+    };
+    let services = PrefixRouter {
+        fallback: PrefixRouter {
+            fallback: service,
+            prefix: REFLECTION_V1_PREFIX,
+            matched: configure_reflection().build_v1()?,
+        },
+        prefix: REFLECTION_V1ALPHA_PREFIX,
+        matched: configure_reflection().build_v1alpha()?,
+    };
     let handle = tokio::spawn(async move {
         info!(server_addr = %local, "gRPC embedded server starting to serve");
-        if let Err(e) = builder.serve_with_incoming(service, incoming).await {
+        if let Err(e) = builder.serve_with_incoming(services, incoming).await {
             error!(server_addr = %local, "gRPC server error: {:?}", e);
         }
         info!(server_addr = %local, "gRPC embedded server stopped");
@@ -1469,6 +1908,311 @@ impl MessageConsumer for ServerModeConsumer {
     }
 }
 
+/// Builds the gRPC output for a route: a descriptor-driven call when a descriptor source
+/// is configured, otherwise the built-in Bridge publisher.
+pub async fn create_grpc_publisher(config: &GrpcConfig) -> Result<Box<dyn MessagePublisher>> {
+    if config.descriptor_set_bytes.is_some()
+        || config.descriptor_set_path.is_some()
+        || config.reflection
+    {
+        let url = config.tls.normalize_url(&config.url);
+        Ok(Box::new(DynamicPublisher::new(config, &url).await?))
+    } else {
+        Ok(Box::new(GrpcPublisher::new(config).await?))
+    }
+}
+
+// ── Dynamic publisher ─────────────────────────────────────────────────────────
+
+/// In-flight unary sends per batch. Matches `GRPC_ACK_CONCURRENCY`: both bound work that
+/// one HTTP/2 connection multiplexes.
+const GRPC_DYNAMIC_SEND_CONCURRENCY: usize = 64;
+
+/// Calls an arbitrary descriptor-defined method as a route's output.
+///
+/// Unary methods make one call per message. Client-streaming methods make one call per
+/// batch, which is also the acknowledgement granularity: the single reply covers every
+/// message in the batch, and a failure part-way through cannot say which ones the server
+/// already consumed, so a retry redelivers all of them.
+struct DynamicPublisher {
+    client: tonic::client::Grpc<Channel>,
+    method: prost_reflect::MethodDescriptor,
+    path: tonic::codegen::http::uri::PathAndQuery,
+    config: GrpcConfig,
+    service_name: String,
+    method_name: String,
+    request_timeout: Option<Duration>,
+    overall_timeout: Option<Duration>,
+}
+
+impl DynamicPublisher {
+    async fn new(config: &GrpcConfig, url: &str) -> Result<Self> {
+        let (channel, method) = resolve_dynamic_method(config, url).await?;
+        let service_name = method.parent_service().full_name().to_owned();
+        let method_name = method.name().to_owned();
+        if method.is_server_streaming() {
+            anyhow::bail!(
+                "dynamic gRPC method '{}.{}' is {}; a gRPC *output* publishes messages and \
+                 consumes one reply, so it supports unary and client-streaming methods only. \
+                 A method that streams responses is a source: use it as the route's input instead",
+                service_name,
+                method_name,
+                method_shape(&method)
+            );
+        }
+        // A bare `request:` in YAML deserializes to null; only a real value is a mistake here.
+        if config
+            .request
+            .as_ref()
+            .is_some_and(|value| !value.is_null())
+        {
+            anyhow::bail!(
+                "dynamic gRPC output does not use `request`: the published messages are the \
+                 requests. Remove `request`, or move this endpoint to the route's input"
+            );
+        }
+
+        let mut client = tonic::client::Grpc::new(channel);
+        if let Some(max) = config.max_decoding_message_size {
+            client = client.max_decoding_message_size(max);
+        }
+        if let Some(max) = config.max_encoding_message_size {
+            client = client.max_encoding_message_size(max);
+        }
+        let path = tonic::codegen::http::uri::PathAndQuery::from_maybe_shared(format!(
+            "/{service_name}/{method_name}"
+        ))?;
+
+        Ok(Self {
+            client,
+            method,
+            path,
+            config: config.clone(),
+            service_name,
+            method_name,
+            request_timeout: config
+                .request_timeout_ms
+                .or(config.timeout_ms)
+                .map(Duration::from_millis),
+            overall_timeout: config.overall_timeout_ms.map(Duration::from_millis),
+        })
+    }
+
+    async fn send_unary(
+        &self,
+        messages: Vec<CanonicalMessage>,
+    ) -> Result<SentBatch, PublisherError> {
+        let results = futures::stream::iter(messages.into_iter().map(|message| async move {
+            let bytes = match encode_dynamic_input(&self.method, &message.payload) {
+                Ok(bytes) => bytes,
+                Err(error) => return (message, Err(error)),
+            };
+            let request = match dynamic_request(&self.config, bytes) {
+                Ok(request) => request,
+                Err(error) => return (message, Err(PublisherError::NonRetryable(error))),
+            };
+            let mut client = self.client.clone();
+            if let Err(error) = client.ready().await {
+                return (
+                    message,
+                    Err(PublisherError::Retryable(anyhow::anyhow!(
+                        "dynamic gRPC service was not ready: {error}"
+                    ))),
+                );
+            }
+            let call = client.unary(request, self.path.clone(), RawProtobufCodec);
+            let response = match self.request_timeout {
+                Some(timeout) => match tokio::time::timeout(timeout, call).await {
+                    Ok(response) => response,
+                    Err(_) => {
+                        return (
+                            message,
+                            Err(PublisherError::Retryable(anyhow::anyhow!(
+                                "dynamic gRPC call timed out"
+                            ))),
+                        )
+                    }
+                },
+                None => call.await,
+            };
+            match response {
+                Ok(response) => {
+                    let reply = decode_dynamic_output(
+                        &self.method,
+                        response.get_ref(),
+                        Some(message.message_id),
+                    );
+                    match reply {
+                        Ok(reply) => (message, Ok(reply)),
+                        Err(error) => (message, Err(error)),
+                    }
+                }
+                Err(status) => (message, Err(status_to_publisher_error(status))),
+            }
+        }))
+        .buffered(GRPC_DYNAMIC_SEND_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await;
+
+        let mut responses = Vec::with_capacity(results.len());
+        let mut failed = Vec::new();
+        for (message, result) in results {
+            match result {
+                Ok(reply) => responses.push(reply),
+                Err(error) => failed.push((message, error)),
+            }
+        }
+        Ok(SentBatch::Partial {
+            responses: Some(responses),
+            failed,
+        })
+    }
+
+    async fn send_client_streaming(
+        &self,
+        messages: Vec<CanonicalMessage>,
+    ) -> Result<SentBatch, PublisherError> {
+        // Encode everything first: a payload that does not match the descriptor fails
+        // permanently, and finding that out mid-stream would leave a half-sent RPC.
+        let mut encoded = Vec::with_capacity(messages.len());
+        let mut failed = Vec::new();
+        let mut streamed = Vec::with_capacity(messages.len());
+        for message in messages {
+            match encode_dynamic_input(&self.method, &message.payload) {
+                Ok(bytes) => {
+                    encoded.push(bytes);
+                    streamed.push(message);
+                }
+                Err(error) => failed.push((message, error)),
+            }
+        }
+        if encoded.is_empty() {
+            return Ok(SentBatch::Partial {
+                responses: Some(Vec::new()),
+                failed,
+            });
+        }
+
+        let correlation_id = streamed.first().map(|message| message.message_id);
+        let request = dynamic_request(&self.config, Vec::new())
+            .map_err(PublisherError::NonRetryable)?
+            .map(|_| tokio_stream::iter(encoded));
+        let mut client = self.client.clone();
+        client.ready().await.map_err(|error| {
+            PublisherError::Retryable(anyhow::anyhow!(
+                "dynamic gRPC service was not ready: {error}"
+            ))
+        })?;
+        let call = client.client_streaming(request, self.path.clone(), RawProtobufCodec);
+        let response = match self.request_timeout {
+            Some(timeout) => tokio::time::timeout(timeout, call).await.map_err(|_| {
+                PublisherError::Retryable(anyhow::anyhow!("dynamic gRPC call timed out"))
+            })?,
+            None => call.await,
+        };
+
+        match response {
+            Ok(response) => {
+                let reply =
+                    decode_dynamic_output(&self.method, response.get_ref(), correlation_id)?;
+                Ok(SentBatch::Partial {
+                    responses: Some(vec![reply]),
+                    failed,
+                })
+            }
+            // One reply covers the whole stream, so a failure fails every message in it.
+            Err(status) => {
+                let error = status_to_publisher_error(status);
+                let message = error.to_string();
+                failed.extend(streamed.into_iter().map(|sent| {
+                    (
+                        sent,
+                        match error {
+                            PublisherError::NonRetryable(_) => {
+                                PublisherError::NonRetryable(anyhow::anyhow!(message.clone()))
+                            }
+                            _ => PublisherError::Retryable(anyhow::anyhow!(message.clone())),
+                        },
+                    )
+                }));
+                Ok(SentBatch::Partial {
+                    responses: Some(Vec::new()),
+                    failed,
+                })
+            }
+        }
+    }
+}
+
+/// gRPC codes that mean "this request will never succeed" become non-retryable so the
+/// route dead-letters instead of replaying a request the server already rejected.
+fn status_to_publisher_error(status: Status) -> PublisherError {
+    let permanent = matches!(
+        status.code(),
+        tonic::Code::InvalidArgument
+            | tonic::Code::NotFound
+            | tonic::Code::AlreadyExists
+            | tonic::Code::PermissionDenied
+            | tonic::Code::Unauthenticated
+            | tonic::Code::FailedPrecondition
+            | tonic::Code::OutOfRange
+            | tonic::Code::Unimplemented
+    );
+    let error = anyhow::Error::new(GrpcStatusError::from(status));
+    if permanent {
+        PublisherError::NonRetryable(error)
+    } else {
+        PublisherError::Retryable(error)
+    }
+}
+
+#[async_trait]
+impl MessagePublisher for DynamicPublisher {
+    async fn send_batch(
+        &self,
+        messages: Vec<CanonicalMessage>,
+    ) -> Result<SentBatch, PublisherError> {
+        if messages.is_empty() {
+            return Ok(SentBatch::Ack);
+        }
+        let send = async {
+            if self.method.is_client_streaming() {
+                self.send_client_streaming(messages).await
+            } else {
+                self.send_unary(messages).await
+            }
+        };
+        match self.overall_timeout {
+            Some(timeout) => tokio::time::timeout(timeout, send).await.map_err(|_| {
+                PublisherError::Retryable(anyhow::anyhow!("dynamic gRPC batch timed out"))
+            })?,
+            None => send.await,
+        }
+    }
+
+    async fn status(&self) -> crate::traits::EndpointStatus {
+        crate::traits::EndpointStatus {
+            healthy: true,
+            details: serde_json::json!({
+                "mode": "dynamic-client",
+                "service": self.service_name,
+                "method": self.method_name,
+                "shape": method_shape(&self.method),
+                "acknowledgement_guarantee": if self.method.is_client_streaming() {
+                    "batch"
+                } else {
+                    "per-message"
+                },
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
 // ── Publisher ─────────────────────────────────────────────────────────────────
 
 pub struct GrpcPublisher {
@@ -1476,12 +2220,14 @@ pub struct GrpcPublisher {
     // Retains the shared registry entry so concurrent publishers reuse this channel.
     _shared_channel: std::sync::Arc<Channel>,
     url: String,
-    timeout: Option<Duration>,
+    request_timeout: Option<Duration>,
+    overall_timeout: Option<Duration>,
     topic: Option<String>,
 }
 
 impl GrpcPublisher {
     pub async fn new(config: &GrpcConfig) -> Result<Self> {
+        reject_unsupported_call_metadata(config, "Bridge publisher")?;
         // Use a lazy channel so the publisher route can start before a server-mode
         // gRPC consumer has finished binding its embedded listener.
         let url = config.tls.normalize_url(&config.url);
@@ -1494,7 +2240,7 @@ impl GrpcPublisher {
             &config.tls.cert_file,
             &config.tls.key_file,
             config.tls.accept_invalid_certs,
-            config.timeout_ms,
+            config.connect_timeout_ms.or(config.timeout_ms),
             config.initial_stream_window_size,
             config.initial_connection_window_size,
             config.http2_keepalive_interval_ms,
@@ -1517,7 +2263,14 @@ impl GrpcPublisher {
             client,
             _shared_channel: shared_channel,
             url,
-            timeout: config.timeout_ms.map(Duration::from_millis),
+            request_timeout: config
+                .request_timeout_ms
+                .or(config.timeout_ms)
+                .map(Duration::from_millis),
+            overall_timeout: config
+                .overall_timeout_ms
+                .or(config.timeout_ms)
+                .map(Duration::from_millis),
             topic: Some(
                 config
                     .topic
@@ -1525,6 +2278,26 @@ impl GrpcPublisher {
                     .unwrap_or_else(|| "default".to_string()),
             ),
         })
+    }
+
+    /// Opens the response stream, bounding only call setup. `overall_timeout` bounds the
+    /// response-handling phase separately in `send_batch`.
+    async fn publish_batch_stream(
+        &self,
+        messages: Vec<BridgeMessage>,
+    ) -> Result<tonic::Streaming<proto::PublishResponse>, PublisherError> {
+        let mut client = self.client.clone();
+        let call = client.publish_batch(tokio_stream::iter(messages));
+        let response = match self.request_timeout {
+            Some(timeout) => tokio::time::timeout(timeout, call).await.map_err(|_| {
+                PublisherError::Retryable(anyhow::anyhow!("gRPC publish request timed out"))
+            })?,
+            None => call.await,
+        }
+        .map_err(|status| {
+            PublisherError::Retryable(anyhow::anyhow!("gRPC publish_batch error: {status:?}"))
+        })?;
+        Ok(response.into_inner())
     }
 }
 
@@ -1534,8 +2307,6 @@ impl MessagePublisher for GrpcPublisher {
         &self,
         messages: Vec<CanonicalMessage>,
     ) -> Result<SentBatch, PublisherError> {
-        let mut client = self.client.clone();
-
         // Preserve the original messages so we can map response ids back to originals.
         let original_messages = messages;
         let bridge_messages_vec: Vec<BridgeMessage> = original_messages
@@ -1553,19 +2324,8 @@ impl MessagePublisher for GrpcPublisher {
         }
         let total_messages = original_messages.len();
 
-        // Start the publish_batch call but don't await it yet; the future is
-        // driven inside the processing future so we can apply a timeout that
-        // bounds the entire response-handling phase.
-        let response_fut = client.publish_batch(tokio_stream::iter(bridge_messages_vec));
-
         let process_fut = async {
-            let response = response_fut.await.map_err(|e| {
-                PublisherError::Retryable(anyhow::anyhow!(format!(
-                    "gRPC publish_batch error: {:?}",
-                    e
-                )))
-            })?;
-            let mut stream = response.into_inner();
+            let mut stream = self.publish_batch_stream(bridge_messages_vec).await?;
             let mut responses = Vec::new();
             let mut failed: Vec<(CanonicalMessage, PublisherError)> = Vec::new();
             let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -1631,7 +2391,7 @@ impl MessagePublisher for GrpcPublisher {
         let (responses, failed): (
             Vec<crate::CanonicalMessage>,
             Vec<(crate::CanonicalMessage, PublisherError)>,
-        ) = if let Some(timeout) = self.timeout {
+        ) = if let Some(timeout) = self.overall_timeout {
             tokio::time::timeout(timeout, process_fut)
                 .await
                 .map_err(|_| {
@@ -1707,7 +2467,7 @@ async fn make_endpoint(config: &GrpcConfig, url: &str) -> Result<tonic::transpor
         endpoint = endpoint.tls_config(tls_config)?;
     }
 
-    if let Some(ms) = config.timeout_ms {
+    if let Some(ms) = config.connect_timeout_ms.or(config.timeout_ms) {
         endpoint = endpoint.connect_timeout(Duration::from_millis(ms));
     }
     if let Some(v) = config.initial_stream_window_size {
@@ -2021,7 +2781,7 @@ mod tests {
         server_handle.abort();
     }
     #[tokio::test]
-    async fn test_grpc_acknowledge_and_batch_streaming() {
+    async fn acknowledge_and_batch_streaming_round_trip() {
         let addr = "[::1]:50055".parse().unwrap();
         let (tx, _) = broadcast::channel(16);
         let bridge = MockBridge { tx: tx.clone() };
@@ -2042,7 +2802,9 @@ mod tests {
             ..Default::default()
         };
 
-        // Test sending a batch using GrpcPublisher
+        let mut consumer = ClientModeConsumer::new(&config, &config.url)
+            .await
+            .expect("Failed to create ClientModeConsumer");
         let publisher = GrpcPublisher::new(&config)
             .await
             .expect("Failed to create GrpcPublisher");
@@ -2052,11 +2814,20 @@ mod tests {
             CanonicalMessage::new("batch_2".into(), None),
         ];
 
+        // The mock answers with an Ack variant, which maps to SentBatch::Ack.
         let sent_result = publisher.send_batch(msgs).await;
-        // The mock server returns Ack variant with status 0, so it should map to SentBatch::Ack
         assert!(matches!(sent_result, Ok(SentBatch::Ack)));
 
-        // Test explicit acknowledge
+        let received = tokio::time::timeout(Duration::from_secs(1), consumer.receive_batch(2))
+            .await
+            .expect("subscription timed out")
+            .expect("subscription failed");
+        assert_eq!(received.messages.len(), 2);
+        (received.commit)(vec![MessageDisposition::Ack; 2])
+            .await
+            .expect("acknowledge failed");
+
+        // Explicit Acknowledge, outside the route commit path.
         let mut client = BridgeClient::new(
             tonic::transport::Endpoint::from_shared(config.url.clone())
                 .unwrap()
@@ -2343,5 +3114,698 @@ mod tests {
         assert!(subscribers
             .get(&format!("c{}", MAX_PENDING_CONSUMERS + 4))
             .is_some());
+    }
+
+    mod dynamic_fixture {
+        tonic::include_proto!("mqbridge.test.v1");
+        pub const FILE_DESCRIPTOR_SET: &[u8] =
+            tonic::include_file_descriptor_set!("grpc_dynamic_test_descriptor");
+    }
+
+    #[derive(Default)]
+    struct DynamicFixtureService;
+
+    #[tonic::async_trait]
+    impl dynamic_fixture::dynamic_fixture_server::DynamicFixture for DynamicFixtureService {
+        async fn unary(
+            &self,
+            request: Request<dynamic_fixture::DynamicRequest>,
+        ) -> Result<Response<dynamic_fixture::DynamicResponse>, Status> {
+            if request.get_ref().sequence == 98 {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            if request.get_ref().sequence == -1 {
+                let mut metadata = tonic::metadata::MetadataMap::new();
+                metadata.insert("error-detail", "secret-trailer".parse().unwrap());
+                return Err(Status::with_metadata(
+                    tonic::Code::InvalidArgument,
+                    "invalid fixture request",
+                    metadata,
+                ));
+            }
+            let auth = request
+                .metadata()
+                .get("authorization")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_owned();
+            Ok(Response::new(dynamic_fixture::DynamicResponse {
+                data: request.get_ref().data.clone(),
+                sequence: request.get_ref().sequence,
+                auth,
+            }))
+        }
+
+        type StreamStream = std::pin::Pin<
+            Box<
+                dyn futures::Stream<Item = Result<dynamic_fixture::DynamicResponse, Status>> + Send,
+            >,
+        >;
+
+        async fn stream(
+            &self,
+            request: Request<dynamic_fixture::DynamicRequest>,
+        ) -> Result<Response<Self::StreamStream>, Status> {
+            let input = request.into_inner();
+            if input.sequence == 99 {
+                let response = dynamic_fixture::DynamicResponse {
+                    data: input.data,
+                    sequence: input.sequence,
+                    auth: String::new(),
+                };
+                return Ok(Response::new(Box::pin(futures::stream::once(async move {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    Ok(response)
+                }))));
+            }
+            let responses = (0..2).map(move |offset| {
+                Ok(dynamic_fixture::DynamicResponse {
+                    data: input.data.clone(),
+                    sequence: input.sequence + offset,
+                    auth: String::new(),
+                })
+            });
+            Ok(Response::new(Box::pin(tokio_stream::iter(responses))))
+        }
+
+        /// Sums the sequences it received and echoes the count via `data`, so a test can
+        /// prove every streamed request arrived in one RPC.
+        async fn client_stream(
+            &self,
+            request: Request<tonic::Streaming<dynamic_fixture::DynamicRequest>>,
+        ) -> Result<Response<dynamic_fixture::DynamicResponse>, Status> {
+            let auth = request
+                .metadata()
+                .get("authorization")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_owned();
+            let mut stream = request.into_inner();
+            let mut total = 0_i64;
+            let mut count = 0_u8;
+            while let Some(message) = stream.message().await? {
+                if message.sequence == -1 {
+                    return Err(Status::invalid_argument("fixture rejects sequence -1"));
+                }
+                total += message.sequence;
+                count += 1;
+            }
+            Ok(Response::new(dynamic_fixture::DynamicResponse {
+                data: vec![count],
+                sequence: total,
+                auth,
+            }))
+        }
+
+        type BidiStream = std::pin::Pin<
+            Box<
+                dyn futures::Stream<Item = Result<dynamic_fixture::DynamicResponse, Status>> + Send,
+            >,
+        >;
+
+        async fn bidi(
+            &self,
+            _request: Request<tonic::Streaming<dynamic_fixture::DynamicRequest>>,
+        ) -> Result<Response<Self::BidiStream>, Status> {
+            Err(Status::unimplemented("fixture"))
+        }
+    }
+
+    async fn dynamic_fixture_server() -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let incoming = TcpListenerStream::new(listener);
+        let reflection = tonic_reflection::server::Builder::configure()
+            .register_encoded_file_descriptor_set(dynamic_fixture::FILE_DESCRIPTOR_SET)
+            .build_v1()
+            .unwrap();
+        let handle = tokio::spawn(async move {
+            TonicServer::builder()
+                .serve_with_incoming(
+                    PrefixRouter {
+                        fallback:
+                            dynamic_fixture::dynamic_fixture_server::DynamicFixtureServer::new(
+                                DynamicFixtureService,
+                            ),
+                        prefix: REFLECTION_V1_PREFIX,
+                        matched: reflection,
+                    },
+                    incoming,
+                )
+                .await
+                .unwrap();
+        });
+        (address, handle)
+    }
+
+    fn dynamic_config(address: std::net::SocketAddr, method: &str) -> GrpcConfig {
+        GrpcConfig::new(format!("http://{address}"))
+            .with_descriptor_set_bytes(dynamic_fixture::FILE_DESCRIPTOR_SET.to_vec())
+            .with_service_name("mqbridge.test.v1.DynamicFixture")
+            .with_method_name(method)
+            .with_request(serde_json::json!({
+                "data": "aGVsbG8=",
+                "sequence": "7"
+            }))
+    }
+
+    #[tokio::test]
+    async fn dynamic_unary_uses_canonical_json_metadata_and_stable_ids() {
+        let (address, handle) = dynamic_fixture_server().await;
+        let mut config = dynamic_config(address, "Unary")
+            .with_bearer_token("test-token")
+            .with_metadata(HashMap::from([("x-static".into(), "value".into())]));
+        config.server_streaming = true; // Deprecated hint must not override the descriptor.
+
+        let mut first = DynamicConsumer::new(&config, &config.url).await.unwrap();
+        let first_batch = first.receive_batch(1).await.unwrap();
+        let first_message = &first_batch.messages[0];
+        let json: serde_json::Value = serde_json::from_slice(&first_message.payload).unwrap();
+        assert_eq!(json["data"], "aGVsbG8=");
+        assert_eq!(json["sequence"], "7");
+        assert_eq!(json["auth"], "Bearer test-token");
+        assert_eq!(first_message.metadata["grpc.ack_guarantee"], "none");
+        assert_eq!(first_message.metadata["grpc.response_index"], "0");
+
+        let mut second = DynamicConsumer::new(&config, &config.url).await.unwrap();
+        let second_batch = second.receive_batch(1).await.unwrap();
+        assert_eq!(
+            first_message.message_id, second_batch.messages[0].message_id,
+            "the same RPC response must have a deterministic id"
+        );
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn dynamic_server_streaming_is_descriptor_derived() {
+        let (address, handle) = dynamic_fixture_server().await;
+        let config = dynamic_config(address, "Stream");
+        let mut consumer = DynamicConsumer::new(&config, &config.url).await.unwrap();
+        let batch = consumer.receive_batch(8).await.unwrap();
+        assert_eq!(batch.messages.len(), 2);
+        let first: serde_json::Value = serde_json::from_slice(&batch.messages[0].payload).unwrap();
+        let second: serde_json::Value = serde_json::from_slice(&batch.messages[1].payload).unwrap();
+        assert_eq!(first["sequence"], "7");
+        assert_eq!(second["sequence"], "8");
+        handle.abort();
+    }
+
+    /// A concrete free port, so each embedded server gets its own registry entry:
+    /// `GrpcServerKey` keys on the literal address, so two `127.0.0.1:0` consumers share
+    /// one server and the first of them to drop tears it down under the other.
+    async fn free_server_url() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        format!("http://127.0.0.1:{port}")
+    }
+
+    /// `PrefixRouter` replaces tonic's axum router, so every branch it dispatches has to
+    /// be exercised: the Bridge service, reflection v1, and reflection v1alpha.
+    #[tokio::test]
+    async fn prefix_router_dispatches_bridge_and_both_reflection_versions() {
+        use tonic_reflection::pb::v1alpha::server_reflection_client::ServerReflectionClient;
+        use tonic_reflection::pb::v1alpha::server_reflection_request::MessageRequest;
+        use tonic_reflection::pb::v1alpha::server_reflection_response::MessageResponse;
+        use tonic_reflection::pb::v1alpha::ServerReflectionRequest;
+
+        let mut consumer = GrpcConsumer::new(&GrpcConfig {
+            url: free_server_url().await,
+            topic: Some("router".into()),
+            server_mode: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let address = consumer.bound_addr.unwrap();
+        let url = format!("http://{address}");
+
+        // v1: the descriptor-discovery path a dynamic source uses.
+        let channel = tonic::transport::Endpoint::from_shared(url.clone())
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        let pool = reflected_descriptor_pool(
+            &GrpcConfig::new(url.clone()),
+            channel.clone(),
+            "mqbridge.Bridge",
+            Some(Duration::from_secs(5)),
+        )
+        .await
+        .expect("v1 reflection must route to the reflection service");
+        assert!(pool.get_service_by_name("mqbridge.Bridge").is_some());
+
+        // v1alpha: same descriptors over the older path older tooling still uses.
+        let mut v1alpha = ServerReflectionClient::new(channel);
+        let response = v1alpha
+            .server_reflection_info(tokio_stream::iter([ServerReflectionRequest {
+                host: String::new(),
+                message_request: Some(MessageRequest::FileContainingSymbol(
+                    "mqbridge.Bridge".to_owned(),
+                )),
+            }]))
+            .await
+            .expect("v1alpha reflection must route to the reflection service")
+            .into_inner()
+            .message()
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            response.message_response,
+            Some(MessageResponse::FileDescriptorResponse(_))
+        ));
+
+        // Fallback branch: a Bridge RPC must still reach the Bridge service.
+        let publisher = GrpcPublisher::new(&GrpcConfig {
+            url: url.clone(),
+            topic: Some("router".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let sent = tokio::spawn(async move {
+            publisher
+                .send_batch(vec![CanonicalMessage::new("routed".into(), None)])
+                .await
+        });
+        let batch = tokio::time::timeout(Duration::from_secs(5), consumer.receive_batch(1))
+            .await
+            .expect("Bridge publish did not reach the fallback branch")
+            .unwrap();
+        assert_eq!(batch.messages[0].payload.as_ref(), b"routed");
+        (batch.commit)(vec![MessageDisposition::Ack]).await.unwrap();
+        sent.await.unwrap().expect("Bridge publish failed");
+    }
+
+    #[tokio::test]
+    async fn dynamic_unary_output_calls_once_per_message_and_returns_replies() {
+        let (address, handle) = dynamic_fixture_server().await;
+        let config = dynamic_config(address, "Unary")
+            .with_bearer_token("sink-token")
+            .with_request(serde_json::Value::Null);
+        let publisher = DynamicPublisher::new(&config, &config.url).await.unwrap();
+
+        let sent = publisher
+            .send_batch(vec![
+                CanonicalMessage::new(br#"{"data":"aGk=","sequence":"1"}"#.to_vec(), Some(11)),
+                CanonicalMessage::new(br#"{"data":"aGk=","sequence":"2"}"#.to_vec(), Some(22)),
+            ])
+            .await
+            .unwrap();
+
+        let SentBatch::Partial { responses, failed } = sent else {
+            panic!("a unary sink replies per message");
+        };
+        assert!(failed.is_empty(), "{failed:?}");
+        let responses = responses.unwrap();
+        assert_eq!(responses.len(), 2);
+        // Replies carry the originating id so the route can correlate them.
+        let mut ids: Vec<_> = responses.iter().map(|reply| reply.message_id).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![11, 22]);
+        for reply in &responses {
+            let json: serde_json::Value = serde_json::from_slice(&reply.payload).unwrap();
+            assert_eq!(json["auth"], "Bearer sink-token");
+        }
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn dynamic_client_streaming_output_sends_one_batch_per_rpc() {
+        let (address, handle) = dynamic_fixture_server().await;
+        let config = dynamic_config(address, "ClientStream").with_request(serde_json::Value::Null);
+        let publisher = DynamicPublisher::new(&config, &config.url).await.unwrap();
+
+        let sent = publisher
+            .send_batch(vec![
+                CanonicalMessage::new(br#"{"data":"","sequence":"3"}"#.to_vec(), Some(7)),
+                CanonicalMessage::new(br#"{"data":"","sequence":"4"}"#.to_vec(), Some(8)),
+                CanonicalMessage::new(br#"{"data":"","sequence":"5"}"#.to_vec(), Some(9)),
+            ])
+            .await
+            .unwrap();
+
+        let SentBatch::Partial { responses, failed } = sent else {
+            panic!("a client-streaming sink replies once per batch");
+        };
+        assert!(failed.is_empty(), "{failed:?}");
+        let responses = responses.unwrap();
+        assert_eq!(responses.len(), 1, "one reply covers the whole batch");
+        let json: serde_json::Value = serde_json::from_slice(&responses[0].payload).unwrap();
+        // The fixture sums sequences and reports how many requests one RPC carried.
+        assert_eq!(json["sequence"], "12");
+        assert_eq!(json["data"], "Aw==", "one RPC carried all three requests");
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn dynamic_output_failures_are_classified_and_scoped() {
+        let (address, handle) = dynamic_fixture_server().await;
+
+        // A payload that does not match the descriptor fails permanently, on its own,
+        // without stopping the messages around it.
+        let unary = dynamic_config(address, "Unary").with_request(serde_json::Value::Null);
+        let publisher = DynamicPublisher::new(&unary, &unary.url).await.unwrap();
+        let sent = publisher
+            .send_batch(vec![
+                CanonicalMessage::new(br#"{"nope":1}"#.to_vec(), Some(1)),
+                CanonicalMessage::new(br#"{"data":"","sequence":"5"}"#.to_vec(), Some(2)),
+            ])
+            .await
+            .unwrap();
+        let SentBatch::Partial { responses, failed } = sent else {
+            panic!("expected per-message outcomes");
+        };
+        assert_eq!(responses.unwrap().len(), 1, "the good message still went");
+        assert_eq!(failed.len(), 1);
+        assert!(matches!(failed[0].1, PublisherError::NonRetryable(_)));
+
+        // INVALID_ARGUMENT is permanent, and on a client-streaming RPC the one reply
+        // covers the batch, so every streamed message fails with it.
+        let streaming =
+            dynamic_config(address, "ClientStream").with_request(serde_json::Value::Null);
+        let publisher = DynamicPublisher::new(&streaming, &streaming.url)
+            .await
+            .unwrap();
+        let sent = publisher
+            .send_batch(vec![
+                CanonicalMessage::new(br#"{"data":"","sequence":"1"}"#.to_vec(), Some(3)),
+                CanonicalMessage::new(br#"{"data":"","sequence":"-1"}"#.to_vec(), Some(4)),
+            ])
+            .await
+            .unwrap();
+        let SentBatch::Partial { failed, .. } = sent else {
+            panic!("expected a failed batch");
+        };
+        assert_eq!(failed.len(), 2, "batch granularity fails the whole stream");
+        assert!(failed
+            .iter()
+            .all(|(_, error)| matches!(error, PublisherError::NonRetryable(_))));
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn dynamic_output_rejects_source_shaped_methods_and_request() {
+        let (address, handle) = dynamic_fixture_server().await;
+
+        for method in ["Stream", "Bidi"] {
+            let config = dynamic_config(address, method).with_request(serde_json::Value::Null);
+            let error = DynamicPublisher::new(&config, &config.url)
+                .await
+                .err()
+                .unwrap();
+            assert!(
+                error.to_string().contains("use it as the route's input"),
+                "{error:#}"
+            );
+        }
+
+        // `request` belongs to a source; on a sink the messages are the requests.
+        let config = dynamic_config(address, "Unary");
+        let error = DynamicPublisher::new(&config, &config.url)
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            error.to_string().contains("does not use `request`"),
+            "{error:#}"
+        );
+
+        // The mirror image: a client-streaming method used as an input.
+        let config = dynamic_config(address, "ClientStream");
+        let error = DynamicConsumer::new(&config, &config.url)
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            error.to_string().contains("use it as the route's output"),
+            "{error:#}"
+        );
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn dynamic_reflection_and_capability_errors_are_explicit() {
+        let (address, handle) = dynamic_fixture_server().await;
+        let mut reflected = dynamic_config(address, "Unary");
+        reflected.descriptor_set_bytes = None;
+        reflected.reflection = true;
+        DynamicConsumer::new(&reflected, &reflected.url)
+            .await
+            .expect("reflection should discover the fixture");
+
+        for (method, shape) in [
+            ("ClientStream", "client-streaming"),
+            ("Bidi", "bidirectional-streaming"),
+        ] {
+            let config = dynamic_config(address, method);
+            let error = DynamicConsumer::new(&config, &config.url)
+                .await
+                .err()
+                .unwrap();
+            assert!(error.to_string().contains(shape), "{error:#}");
+            assert!(error
+                .to_string()
+                .contains("supports unary and server-streaming"));
+        }
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn dynamic_status_preserves_code_message_and_trailing_metadata() {
+        let (address, handle) = dynamic_fixture_server().await;
+        let mut config = dynamic_config(address, "Unary");
+        config.request = Some(serde_json::json!({"data": "", "sequence": "-1"}));
+        let error = DynamicConsumer::new(&config, &config.url)
+            .await
+            .err()
+            .unwrap();
+        let status = error
+            .downcast_ref::<GrpcStatusError>()
+            .expect("structured gRPC status");
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert_eq!(status.message(), "invalid fixture request");
+        assert_eq!(
+            status
+                .trailing_metadata()
+                .get("error-detail")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "secret-trailer"
+        );
+        assert!(!format!("{status:?}").contains("secret-trailer"));
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn dynamic_request_and_idle_stream_deadlines_are_separate() {
+        let (address, handle) = dynamic_fixture_server().await;
+
+        let mut request_timeout = dynamic_config(address, "Unary");
+        request_timeout.request = Some(serde_json::json!({"data": "", "sequence": "98"}));
+        request_timeout.request_timeout_ms = Some(10);
+        let error = DynamicConsumer::new(&request_timeout, &request_timeout.url)
+            .await
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("call timed out"), "{error:#}");
+
+        let mut idle_timeout = dynamic_config(address, "Stream");
+        idle_timeout.request = Some(serde_json::json!({"data": "", "sequence": "99"}));
+        idle_timeout.request_timeout_ms = Some(1_000);
+        idle_timeout.idle_stream_timeout_ms = Some(10);
+        let mut consumer = DynamicConsumer::new(&idle_timeout, &idle_timeout.url)
+            .await
+            .unwrap();
+        let error = consumer.receive_batch(1).await.err().unwrap();
+        assert!(error.to_string().contains("idle timeout"), "{error}");
+
+        let mut legacy_timeout = dynamic_config(address, "Stream");
+        legacy_timeout.request = Some(serde_json::json!({"data": "", "sequence": "99"}));
+        legacy_timeout.timeout_ms = Some(10);
+        legacy_timeout.request_timeout_ms = Some(1_000);
+        let mut consumer = DynamicConsumer::new(&legacy_timeout, &legacy_timeout.url)
+            .await
+            .unwrap();
+        let batch = consumer.receive_batch(1).await.unwrap();
+        assert_eq!(batch.messages.len(), 1);
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn dynamic_overall_deadline_stops_the_route_instead_of_reconnecting() {
+        let (address, handle) = dynamic_fixture_server().await;
+        let mut config = dynamic_config(address, "Stream");
+        config.request = Some(serde_json::json!({"data": "", "sequence": "99"}));
+        config.overall_timeout_ms = Some(10);
+
+        let mut consumer = DynamicConsumer::new(&config, &config.url).await.unwrap();
+        let error = consumer.receive_batch(1).await.err().unwrap();
+        // Connection would make the route reconnect, restarting the RPC and resetting the
+        // very cap that just fired.
+        assert!(
+            matches!(error, ConsumerError::Permanent(_)),
+            "overall deadline must be terminal, got {error:?}"
+        );
+        assert!(error.to_string().contains("overall deadline exceeded"));
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn bridge_modes_reject_dynamic_only_credentials() {
+        let base = GrpcConfig::new("http://127.0.0.1:1".to_string()).with_topic("orders");
+
+        for (label, config) in [
+            ("bearer_token", base.clone().with_bearer_token("token")),
+            ("api_key", base.clone().with_api_key("key")),
+            (
+                "metadata",
+                base.clone()
+                    .with_metadata(HashMap::from([("x-tenant".into(), "acme".into())])),
+            ),
+            (
+                "binary_metadata",
+                base.clone()
+                    .with_binary_metadata(HashMap::from([("x-trace-bin".into(), vec![1_u8])])),
+            ),
+        ] {
+            let publisher = GrpcPublisher::new(&config).await.err().unwrap();
+            assert!(publisher.to_string().contains(label), "{publisher:#}");
+
+            let consumer = ClientModeConsumer::new(&config, &config.url).await.err();
+            assert!(
+                consumer.is_some_and(|error| error.to_string().contains(label)),
+                "Bridge client must reject {label} rather than connect unauthenticated"
+            );
+
+            let mut server = config.clone();
+            server.server_mode = true;
+            server.url = "http://127.0.0.1:0".to_string();
+            let error = ServerModeConsumer::new(&server, &server.url).await.err();
+            assert!(error.is_some_and(|error| error.to_string().contains(label)));
+        }
+    }
+
+    #[test]
+    fn legacy_grpc_config_keys_still_deserialize() {
+        let config: GrpcConfig = serde_json::from_value(serde_json::json!({
+            "url": "http://127.0.0.1:50051",
+            "timeout_ms": 250,
+            "server_streaming": true
+        }))
+        .unwrap();
+
+        assert_eq!(config.timeout_ms, Some(250));
+        assert!(config.server_streaming);
+    }
+
+    #[tokio::test]
+    async fn dynamic_construction_rejects_invalid_descriptors_names_and_json() {
+        let (address, handle) = dynamic_fixture_server().await;
+
+        let mut invalid_descriptor = dynamic_config(address, "Unary");
+        invalid_descriptor.descriptor_set_bytes = Some(vec![0xff]);
+        assert!(
+            DynamicConsumer::new(&invalid_descriptor, &invalid_descriptor.url)
+                .await
+                .is_err()
+        );
+
+        let mut invalid_service = dynamic_config(address, "Unary");
+        invalid_service.service_name = Some("missing.Service".into());
+        let error = DynamicConsumer::new(&invalid_service, &invalid_service.url)
+            .await
+            .err()
+            .unwrap();
+        assert!(error
+            .to_string()
+            .contains("service 'missing.Service' not found"));
+
+        let invalid_method = dynamic_config(address, "Missing");
+        let error = DynamicConsumer::new(&invalid_method, &invalid_method.url)
+            .await
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("method"));
+        assert!(error.to_string().contains("Missing"));
+
+        let mut invalid_json = dynamic_config(address, "Unary");
+        invalid_json.request = Some(serde_json::json!({"sequence": {"not": "an integer"}}));
+        assert!(DynamicConsumer::new(&invalid_json, &invalid_json.url)
+            .await
+            .is_err());
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn generated_python_client_interoperates_with_bridge_server_mode() {
+        let python = std::process::Command::new("python3")
+            .args(["-c", "import grpc, grpc_tools.protoc"])
+            .status();
+        if !python.is_ok_and(|status| status.success()) {
+            eprintln!("skipping Python gRPC compatibility test: grpcio-tools is unavailable");
+            return;
+        }
+
+        let generated = tempfile::tempdir().unwrap();
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let generation = std::process::Command::new("python3")
+            .current_dir(root)
+            .args([
+                "-m",
+                "grpc_tools.protoc",
+                "-I",
+                "src/endpoints/proto",
+                "--python_out",
+                generated.path().to_str().unwrap(),
+                "--grpc_python_out",
+                generated.path().to_str().unwrap(),
+                "src/endpoints/proto/mqbridge/bridge.proto",
+            ])
+            .status()
+            .unwrap();
+        assert!(generation.success(), "Python client generation failed");
+
+        let mut consumer = GrpcConsumer::new(&GrpcConfig {
+            url: free_server_url().await,
+            topic: Some("compat".into()),
+            server_mode: true,
+            request_timeout_ms: Some(5_000),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let address = consumer.bound_addr.unwrap();
+
+        let mut child = std::process::Command::new("python3")
+            .current_dir(root)
+            .env("PYTHONPATH", generated.path())
+            .arg("tests/compat/python/bridge_client.py")
+            .arg(address.to_string())
+            .spawn()
+            .unwrap();
+
+        let batch = tokio::time::timeout(Duration::from_secs(5), consumer.receive_batch(1))
+            .await
+            .expect("Python client did not publish")
+            .expect("Bridge server did not receive Python publish");
+        assert_eq!(
+            batch.messages[0].payload.as_ref(),
+            b"python-generated-client"
+        );
+        (batch.commit)(vec![MessageDisposition::Ack])
+            .await
+            .expect("commit Python publish");
+
+        let wait = tokio::task::spawn_blocking(move || child.wait());
+        let status = tokio::time::timeout(Duration::from_secs(10), wait)
+            .await
+            .expect("Python compatibility client timed out")
+            .expect("Python compatibility wait task failed")
+            .unwrap();
+        assert!(status.success(), "Python compatibility client failed");
     }
 }

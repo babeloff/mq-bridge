@@ -10,6 +10,8 @@ license = "MIT"
 readme = "README.md"
 keywords = ["messaging", "kafka", "nats", "amqp", "cqrs"]
 categories = ["asynchronous", "network-programming"]
+# Test-only proto; build.rs skips it when absent so downstream builds skip the codegen.
+exclude = ["tests/fixtures/grpc_dynamic.proto"]
 
 [workspace]
 members = [
@@ -198,7 +200,9 @@ redis = { version = "1.4", default-features = false, features = ["tokio-comp", "
 # gRPC
 tonic = { version = "0.14", optional = true, default-features = false, features = ["codegen", "transport", "tls-webpki-roots"] }
 tonic-prost = { version = "0.14", optional = true }
+tonic-reflection = { version = "0.14", optional = true, default-features = false, features = ["server"] }
 prost = { version = "0.14", optional = true, default-features = false, features = ["std", "derive"] }
+prost-types = { version = "0.14", optional = true }
 prost-reflect = { version = "0.16", optional = true, features = ["serde"] }
 tokio-stream = { version = "0.1", optional = true, features = ["net"] }
 
@@ -312,7 +316,7 @@ zeromq = ["dep:zeromq"]
 zeromq-omq = ["dep:omq-tokio"]
 redis-streams = ["dep:redis"]
 # Note: The grpc feature requires protobuf-src which can significantly increase build times.
-grpc = ["tonic", "prost", "prost-reflect", "tokio-stream", "tonic-prost", "tonic-prost-build", "protoc-bin-vendored", "rustls"]
+grpc = ["tonic", "tonic-reflection", "prost", "prost-types", "prost-reflect", "tokio-stream", "tonic-prost", "tonic-prost-build", "protoc-bin-vendored", "rustls"]
 sqlx = ["dep:sqlx", "url"]
 clickhouse = ["dep:reqwest", "dep:flate2", "dep:lz4_flex", "dep:zstd", "url"]
 # Cloud object-store checkpoint backend (S3/GCS/Azure/R2). Talks cloud REST via reqwest.
