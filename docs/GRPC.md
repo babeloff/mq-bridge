@@ -6,7 +6,7 @@ been defined.
 
 ## Bridge protocol
 
-[`src/endpoints/proto/mqbridge/bridge.proto`](../src/endpoints/proto/mqbridge/bridge.proto) is the
+[`src/endpoints/grpc/proto/mqbridge/bridge.proto`](../src/endpoints/grpc/proto/mqbridge/bridge.proto) is the
 stable public API for external applications. Its package is `mqbridge`; generated Rust types remain
 available from `mq_bridge::endpoints::grpc::proto`. The source `.proto` and this documentation are
 included in the published crate.
@@ -27,19 +27,19 @@ by each language ecosystem):
 
 ```bash
 # Rust (build.rs)
-tonic_prost_build::compile_protos("src/endpoints/proto/mqbridge/bridge.proto")?;
+tonic_prost_build::compile_protos("src/endpoints/grpc/proto/mqbridge/bridge.proto")?;
 
 # Python
-python -m grpc_tools.protoc -I src/endpoints/proto --python_out=. --grpc_python_out=. src/endpoints/proto/mqbridge/bridge.proto
+python -m grpc_tools.protoc -I src/endpoints/grpc/proto --python_out=. --grpc_python_out=. src/endpoints/grpc/proto/mqbridge/bridge.proto
 
 # Go
-protoc -I src/endpoints/proto --go_out=. --go-grpc_out=. src/endpoints/proto/mqbridge/bridge.proto
+protoc -I src/endpoints/grpc/proto --go_out=. --go-grpc_out=. src/endpoints/grpc/proto/mqbridge/bridge.proto
 
 # TypeScript (example using grpc-tools + ts-proto)
-protoc -I src/endpoints/proto --plugin=protoc-gen-ts_proto --ts_proto_out=. src/endpoints/proto/mqbridge/bridge.proto
+protoc -I src/endpoints/grpc/proto --plugin=protoc-gen-ts_proto --ts_proto_out=. src/endpoints/grpc/proto/mqbridge/bridge.proto
 
 # Java (use protoc-gen-grpc-java from the grpc-java release)
-protoc -I src/endpoints/proto --java_out=. --grpc-java_out=. src/endpoints/proto/mqbridge/bridge.proto
+protoc -I src/endpoints/grpc/proto --java_out=. --grpc-java_out=. src/endpoints/grpc/proto/mqbridge/bridge.proto
 ```
 
 Generated SDKs may be published as separate language packages; consumers should not copy private

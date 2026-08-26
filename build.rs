@@ -30,12 +30,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let out_dir = std::path::PathBuf::from(std::env::var("OUT_DIR")?);
         std::env::set_var("PROTOC", protoc_bin_vendored::protoc_bin_path().unwrap());
-        println!("cargo:rerun-if-changed=src/endpoints/proto/mqbridge/bridge.proto");
+        println!("cargo:rerun-if-changed=src/endpoints/grpc/proto/mqbridge/bridge.proto");
         tonic_prost_build::configure()
             .file_descriptor_set_path(out_dir.join("mqbridge_descriptor.bin"))
             .compile_protos(
-                &["src/endpoints/proto/mqbridge/bridge.proto"],
-                &["src/endpoints/proto"],
+                &["src/endpoints/grpc/proto/mqbridge/bridge.proto"],
+                &["src/endpoints/grpc/proto"],
             )?;
         // Test-only fixture, excluded from the published crate. Guarding on its presence
         // keeps downstream builds from compiling it and from failing when it is absent.

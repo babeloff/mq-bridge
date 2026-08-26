@@ -33,7 +33,7 @@ All notable changes to `mq-bridge`. Newest first.
 
 - **[docs/GRPC.md](docs/GRPC.md).** The full gRPC guide, including why a generic
   descriptor-driven server is intentionally not implemented. The Bridge contract moved to
-  `src/endpoints/proto/mqbridge/bridge.proto`, unchanged on the wire, and CI now checks a
+  `src/endpoints/grpc/proto/mqbridge/bridge.proto`, unchanged on the wire, and CI now checks a
   generated Python client against server mode.
 
 ### Changed
