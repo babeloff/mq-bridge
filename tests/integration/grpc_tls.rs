@@ -56,7 +56,6 @@ async fn test_grpc_tls_roundtrip() {
             *cfg =
                 tls_helpers::grpc_server_config_with_tls(&cert_dir, format!("127.0.0.1:{}", port));
             cfg.topic = Some("tls_test".to_string());
-            cfg.tls.accept_invalid_certs = true;
         }
     }
     if let Some(in_route) = routes.get_mut("memory_to_grpc") {
@@ -66,7 +65,6 @@ async fn test_grpc_tls_roundtrip() {
                 format!("https://127.0.0.1:{}", port),
             );
             cfg.topic = Some("tls_test".to_string());
-            cfg.tls.accept_invalid_certs = true;
         }
     }
 
