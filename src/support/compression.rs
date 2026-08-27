@@ -11,27 +11,17 @@
 //! append model and the standard CLI tools (`zcat`, `lz4 -d`) working.
 
 use crate::models::Compression;
-use std::io::{BufRead, Read, Write as _};
+use crate::support::compression_pool::{gzip_default, lz4_pooled, zstd_pooled};
+use std::io::{BufRead, Read};
 
 /// Compresses one batch's serialized bytes into a single self-contained member.
 /// `Compression::None` is a caller bug — the uncompressed path never gets here.
 pub(crate) fn compress_member(algo: Compression, data: &[u8]) -> std::io::Result<Vec<u8>> {
     match algo {
         Compression::None => unreachable!("compress_member called with Compression::None"),
-        Compression::Gzip => {
-            let mut encoder =
-                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-            encoder.write_all(data)?;
-            encoder.finish()
-        }
-        Compression::Lz4 => {
-            let mut encoder = lz4_flex::frame::FrameEncoder::new(Vec::new());
-            encoder.write_all(data)?;
-            encoder
-                .finish()
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
-        }
-        Compression::Zstd => zstd::stream::encode_all(data, zstd::DEFAULT_COMPRESSION_LEVEL),
+        Compression::Gzip => gzip_default(data),
+        Compression::Lz4 => lz4_pooled(data),
+        Compression::Zstd => zstd_pooled(data, zstd::DEFAULT_COMPRESSION_LEVEL),
     }
 }
 
@@ -163,6 +153,64 @@ mod tests {
             joined.extend_from_slice(&b);
             let out = decompress_all(algo, &joined, None).unwrap();
             assert_eq!(out, b"first batch\nsecond batch\n", "algo {algo:?}");
+        }
+    }
+
+    #[test]
+    fn repeated_members_reuse_pooled_encoders() {
+        // Same thread, many members: the pooled gzip/zstd state is exercised on a reset,
+        // and incompressible input forces the gzip output buffer past its initial size.
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let random: Vec<u8> = (0..64 * 1024)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state as u8
+            })
+            .collect();
+
+        for algo in [Compression::Gzip, Compression::Lz4, Compression::Zstd] {
+            for _ in 0..3 {
+                for data in [b"".as_slice(), b"tiny", &vec![b'a'; 200_000], &random] {
+                    let member = compress_member(algo, data).unwrap();
+                    assert_eq!(
+                        decompress_all(algo, &member, None).unwrap(),
+                        data,
+                        "{algo:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pooled_gzip_matches_gzencoder_bytes() {
+        // Members already on disk (and `zcat`) must keep reading the same as before.
+        use std::io::Write;
+        for data in [b"tiny".as_slice(), &vec![b'x'; 100_000]] {
+            let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            e.write_all(data).unwrap();
+            let legacy = e.finish().unwrap();
+            let pooled = crate::support::compression_pool::gzip_default(data).unwrap();
+            assert_eq!(legacy, pooled, "byte-identical gzip member expected");
+        }
+    }
+
+    #[test]
+    fn pooled_lz4_matches_fresh_frame_encoder_bytes() {
+        // Sizes either side of the pool cut-off, each repeated so the reused encoder is
+        // compared too: frames already written must keep decoding the same way.
+        use std::io::Write;
+        for len in [0usize, 1, 4096, 64 * 1024, 64 * 1024 + 1, 300_000] {
+            let data: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+            let mut fresh = lz4_flex::frame::FrameEncoder::new(Vec::new());
+            fresh.write_all(&data).unwrap();
+            let expected = fresh.finish().unwrap();
+            for _ in 0..3 {
+                let pooled = compress_member(Compression::Lz4, &data).unwrap();
+                assert_eq!(pooled, expected, "len {len}");
+            }
         }
     }
 

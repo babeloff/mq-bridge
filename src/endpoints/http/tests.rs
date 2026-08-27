@@ -314,6 +314,43 @@ fn test_compress_decompress_round_trip_lz4_and_zstd() {
 }
 
 #[test]
+fn test_compress_decompress_round_trip_gzip_reuses_encoder() {
+    // Repeated so the thread-local encoder is exercised on a reset, not just a fresh build.
+    for _ in 0..3 {
+        for len in [1024usize, 4096, 200_000] {
+            let data = Bytes::from((0..len).map(|i| (i % 251) as u8).collect::<Vec<u8>>());
+            let (compressed, encoding) =
+                compress_if_needed(data.clone(), Compression::Gzip, 16).unwrap();
+            assert_eq!(encoding, Some("gzip"), "len {len}");
+            let restored = decompress_if_needed(compressed, Some("gzip")).unwrap();
+            assert_eq!(restored, data, "len {len}");
+        }
+    }
+}
+
+#[test]
+fn test_gzip_http_grows_output_past_initial_capacity() {
+    // Incompressible input: deflate emits more than the `len / 2 + 64` the output
+    // buffer starts with, so the member is only correct if the growth loop is.
+    let mut state = 0x2545_f491_4f6c_dd1du64;
+    let data: Vec<u8> = (0..64 * 1024)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state as u8
+        })
+        .collect();
+
+    for _ in 0..2 {
+        let gzipped = gzip_http(&data).unwrap();
+        assert!(gzipped.len() > data.len() / 2 + 64);
+        let restored = decompress_if_needed(Bytes::from(gzipped), Some("gzip")).unwrap();
+        assert_eq!(restored, data);
+    }
+}
+
+#[test]
 fn test_text_error_response_sets_text_content_type_when_accepted() {
     let response = text_error_response(StatusCode::BAD_REQUEST, "bad request", true, None);
 

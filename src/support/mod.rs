@@ -10,6 +10,8 @@
 pub mod base64_engine;
 #[cfg(feature = "compression")]
 pub(crate) mod compression;
+#[cfg(any(feature = "compression", feature = "http"))]
+pub(crate) mod compression_pool;
 pub mod connection_registry;
 #[cfg(feature = "encryption")]
 pub mod crypto;

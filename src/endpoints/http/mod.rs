@@ -9,6 +9,7 @@ use self::stream::{
 };
 use crate::canonical_message::tracing_support::LazyMessageIds;
 use crate::models::{Compression, HttpConfig, HttpServerProtocol, TlsConfig};
+use crate::support::compression_pool::{gzip_http, lz4_pooled, zstd_pooled};
 use crate::traits::{
     BoxFuture, ConsumerError, MessageConsumer, MessagePublisher, ReceivedBatch, Sent,
 };
@@ -2239,34 +2240,11 @@ fn compress_if_needed(
         return Ok((data, None));
     }
 
-    use std::io::Write;
-
-    // Pre-size output to avoid per-response reallocs.
     let (compressed, token): (Vec<u8>, &'static str) = match method {
         Compression::None => unreachable!(),
-        Compression::Gzip => {
-            let mut encoder = flate2::write::GzEncoder::new(
-                Vec::with_capacity(data.len() / 2 + 64),
-                flate2::Compression::fast(),
-            );
-            encoder.write_all(&data)?;
-            (encoder.finish()?, "gzip")
-        }
-        Compression::Lz4 => {
-            let mut encoder =
-                lz4_flex::frame::FrameEncoder::new(Vec::with_capacity(data.len() / 2 + 64));
-            encoder.write_all(&data)?;
-            (
-                encoder
-                    .finish()
-                    .map_err(|e| anyhow!("lz4 encode failed: {}", e))?,
-                "lz4",
-            )
-        }
-        Compression::Zstd => (
-            zstd::stream::encode_all(&data[..], zstd::DEFAULT_COMPRESSION_LEVEL)?,
-            "zstd",
-        ),
+        Compression::Gzip => (gzip_http(&data)?, "gzip"),
+        Compression::Lz4 => (lz4_pooled(&data).context("lz4 encode failed")?, "lz4"),
+        Compression::Zstd => (zstd_pooled(&data, zstd::DEFAULT_COMPRESSION_LEVEL)?, "zstd"),
     };
 
     // Only use compression if it actually saves space.
