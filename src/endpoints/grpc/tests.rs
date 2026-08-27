@@ -1006,9 +1006,14 @@ mod dynamic {
 
     #[test]
     fn credentials_require_a_tls_endpoint() {
+        let mut authorization_metadata = GrpcConfig::new("http://localhost:50051");
+        authorization_metadata
+            .metadata
+            .insert("Authorization".to_string(), "Bearer token".to_string());
         for config in [
             GrpcConfig::new("http://localhost:50051").with_bearer_token("token"),
             GrpcConfig::new("http://localhost:50051").with_api_key("key"),
+            authorization_metadata,
         ] {
             let error = apply_call_metadata(&config, &mut MetadataMap::new()).unwrap_err();
             assert!(error.to_string().contains("https://"), "{error:#}");

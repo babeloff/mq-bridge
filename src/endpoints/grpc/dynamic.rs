@@ -56,12 +56,21 @@ fn binary_metadata_key(name: &str) -> Result<MetadataKey<Binary>> {
 /// includes a configured value, so an unusable credential cannot leak through logs.
 pub(super) fn apply_call_metadata(config: &GrpcConfig, metadata: &mut MetadataMap) -> Result<()> {
     let normalized_url = config.tls.normalize_url(&config.url);
-    if (config.bearer_token.is_some() || config.api_key.is_some())
+    // Static `authorization` metadata is a credential too, so it is held to the same bar.
+    let sends_credentials = config.bearer_token.is_some()
+        || config.api_key.is_some()
+        || config
+            .metadata
+            .keys()
+            .any(|name| name.eq_ignore_ascii_case("authorization"));
+    if sends_credentials
         && !normalized_url
             .get(..8)
             .is_some_and(|scheme| scheme.eq_ignore_ascii_case("https://"))
     {
-        anyhow::bail!("gRPC bearer_token and api_key credentials require an https:// endpoint");
+        anyhow::bail!(
+            "gRPC bearer_token, api_key and authorization metadata require an https:// endpoint"
+        );
     }
 
     for (name, value) in &config.metadata {
