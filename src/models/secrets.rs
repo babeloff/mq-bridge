@@ -46,6 +46,25 @@ fn extract_sensitive_string_map_entries(
     }
 }
 
+fn extract_binary_map_entries(
+    values: &mut HashMap<String, Vec<u8>>,
+    prefix: &str,
+    field_name: &str,
+    secrets: &mut HashMap<String, String>,
+) {
+    for (key, value) in std::mem::take(values) {
+        secrets.insert(
+            sanitize_secret_key(&format!(
+                "{}__{}__{}",
+                prefix,
+                field_name,
+                encode_secret_map_key(&key)
+            )),
+            serde_json::to_string(&value).expect("serializing bytes cannot fail"),
+        );
+    }
+}
+
 fn url_has_userinfo(url: &str) -> bool {
     let Some(authority_start) = url.find("://").map(|idx| idx + 3) else {
         return false;
@@ -68,6 +87,26 @@ fn sanitize_secret_key(key: &str) -> String {
             }
         })
         .collect()
+}
+
+/// Reverses [`encode_secret_map_key`]. A map key that round-tripped through
+/// `extract_secrets` and back in from the environment arrives hex-encoded, so a
+/// consumer has to decode it before using it as the original name.
+#[cfg(feature = "grpc")]
+pub(crate) fn decode_secret_map_key(key: &str) -> Option<String> {
+    if key.is_empty() || key.len() % 2 != 0 {
+        return None;
+    }
+    let bytes: Option<Vec<u8>> = key
+        .as_bytes()
+        .chunks(2)
+        .map(|pair| {
+            let hi = (pair[0] as char).to_digit(16)?;
+            let lo = (pair[1] as char).to_digit(16)?;
+            Some((hi * 16 + lo) as u8)
+        })
+        .collect();
+    String::from_utf8(bytes?).ok()
 }
 
 fn encode_secret_map_key(key: &str) -> String {
@@ -461,6 +500,19 @@ impl SecretExtractor for PostgresCdcConfig {
 impl SecretExtractor for GrpcConfig {
     fn extract_secrets(&mut self, prefix: &str, secrets: &mut HashMap<String, String>) {
         extract_sensitive_url(&mut self.url, prefix, "URL", secrets);
+        extract_sensitive_string_map_entries(&mut self.metadata, prefix, "METADATA", secrets);
+        extract_binary_map_entries(
+            &mut self.binary_metadata,
+            prefix,
+            "BINARY_METADATA",
+            secrets,
+        );
+        if let Some(value) = self.bearer_token.take() {
+            secrets.insert(format!("{}__BEARER_TOKEN", prefix), value);
+        }
+        if let Some(value) = self.api_key.take() {
+            secrets.insert(format!("{}__API_KEY", prefix), value);
+        }
         self.tls
             .extract_secrets(&format!("{}__{}", prefix, "TLS"), secrets);
     }

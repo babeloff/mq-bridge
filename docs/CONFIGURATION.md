@@ -345,7 +345,7 @@ orders_out:
 
 ### Dynamic gRPC sources
 
-The existing generated `mqbridge.Bridge` protocol remains the default. To call an
+The stable generated `mqbridge.Bridge` protocol remains the default. To call an
 arbitrary unary or server-streaming gRPC method, provide a compiled protobuf descriptor
 set plus the service, method, and JSON request:
 
@@ -356,10 +356,13 @@ input:
     descriptor_set_path: proto/events.bin
     service_name: events.EventService
     method_name: Tail
-    server_streaming: true
     request:
       topic: audit
 ```
+
+The deprecated `timeout_ms` and `server_streaming` configuration keys are still accepted:
+`timeout_ms` is a fallback for connection and request setup, while a dynamic stream's idle and
+overall deadlines require their dedicated keys.
 
 Generate the descriptor with imports included:
 
@@ -368,10 +371,19 @@ protoc --descriptor_set_out=proto/events.bin --include_imports -I proto proto/ev
 ```
 
 Responses use protobuf's canonical JSON representation as the canonical message payload.
-Dynamic mode supports unary and server-streaming RPCs; client-streaming methods are
-rejected. A descriptor describes the wire format but does not define broker acknowledgement
+Dynamic mode derives unary versus server-streaming behavior from the descriptor; client-streaming
+and bidirectional-streaming methods are rejected with explicit capability errors. A descriptor
+describes the wire format but does not define broker acknowledgement
 semantics, so dynamic sources have no generic ACK operation. Use the built-in
 `mqbridge.Bridge` mode when route-level ACK/NACK and at-least-once delivery are required.
+
+The same descriptor keys on a route's `output` call a method instead of reading one: unary
+methods send one call per message, client-streaming methods stream a whole batch into one call,
+and `request` is rejected because the published messages are the requests.
+
+See the complete [gRPC integration guide](GRPC.md) for reflection, descriptor bytes, metadata and
+authentication, separate deadlines, canonical protobuf JSON, TLS/mTLS, external client generation,
+delivery guarantees, and the intentional generic-server boundary.
 
 ### Specialized Endpoints
 

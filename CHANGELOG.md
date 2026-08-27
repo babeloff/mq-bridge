@@ -2,6 +2,76 @@
 
 All notable changes to `mq-bridge`. Newest first.
 
+## 0.4.8
+
+### Added
+
+- **Dynamic gRPC sinks.** The descriptor keys now work on a route's `output` too: a unary method
+  makes one call per message and returns the reply as its response, a client-streaming method
+  streams a batch into one call. Server-streaming and bidirectional methods, and `request`, are
+  rejected there. Status codes that mean "never going to succeed" are non-retryable, so such a
+  message is dead-lettered instead of replayed.
+
+- **gRPC server reflection, on both sides.** `reflection: true` discovers descriptors from the
+  remote server instead of a descriptor file, and server mode hosts reflection v1 and v1alpha,
+  so `grpcurl` can introspect an embedded server.
+
+- **Metadata and credentials for dynamic gRPC calls.** `metadata`, `binary_metadata`,
+  `bearer_token`, and `api_key`/`api_key_name`, sent on the reflection call as well. They never
+  appear in errors or logs, and are startup errors on Bridge and server mode rather than a silent
+  unauthenticated connection — authenticate that with TLS client certificates.
+
+- **Separate gRPC deadlines.** `connect_timeout_ms`, `request_timeout_ms`,
+  `idle_stream_timeout_ms` (retryable: the route reconnects), and `overall_timeout_ms` (terminal:
+  reconnecting would reset the cap). All default to disabled.
+
+- **`descriptor_set_bytes`** passes a compiled gRPC `FileDescriptorSet` straight from embedded
+  Rust callers, with no temporary file.
+
+- **Provenance on dynamic gRPC responses.** A deterministic id per response, plus `grpc.service`,
+  `grpc.method`, `grpc.response_index`, and `grpc.ack_guarantee=none` metadata.
+
+- **[docs/GRPC.md](docs/GRPC.md).** The full gRPC guide, including why a generic
+  descriptor-driven server is intentionally not implemented. The Bridge contract moved to
+  `src/endpoints/grpc/proto/mqbridge/bridge.proto`, unchanged on the wire, and CI now checks a
+  generated Python client against server mode.
+
+### Changed
+
+- **Adding the dedicated gRPC deadline fields is a breaking Rust API change for exhaustive
+  `GrpcConfig` struct literals.** Downstream Rust callers must specify the new fields or use
+  `..Default::default()` / `GrpcConfig::new`. A downstream compile fixture now locks the complete
+  literal shape so future additions cannot make this break silently.
+
+- **gRPC `bearer_token` and `api_key` now require an `https://` endpoint.** A credential sent over
+  plaintext h2c is rejected rather than put on the wire in the clear. Deployments that terminated
+  TLS at a sidecar and spoke plaintext gRPC to it must point the endpoint at `https://`.
+
+- **The gRPC endpoint's `timeout_ms` and `server_streaming` are deprecated but still accepted.**
+  `timeout_ms` stays the fallback for connection and request setup; it no longer bounds a dynamic
+  stream, which needs the dedicated keys. RPC shape comes from the descriptor, so a disagreeing
+  `server_streaming` warns instead of failing startup.
+
+- **gRPC descriptor keys on an `output` select the dynamic publisher.** They were previously
+  ignored there and the Bridge publisher was used.
+
+- **gRPC failures preserve code, message, and trailing metadata** in a `GrpcStatusError`. Its
+  `Display`/`Debug` omit trailer values so a peer's credentials cannot leak into logs.
+
+- **Filtering and structural forwarding retain bulk writes where possible.** An input `filter`
+  now reads additional full source batches after dropping rows until it refills the requested
+  batch size; a naturally short source batch remains a flush boundary so live routes do not
+  wait indefinitely. A `request` still performs its request/reply calls individually and
+  concurrently, unless its `to` endpoint requires ordered publishing; ordered requests run one
+  at a time. Results are restored to input order and responses plus error fallbacks are sent to
+  `forward_to` in one `send_batch` call. Batch-capable destinations such as MongoDB can
+  therefore continue using `insert_many` through both paths.
+
+- **Buffered concurrent routes warn that destination order is not guaranteed.** Buffering
+  preserves order within each batch, but with route `concurrency > 1` separate destination
+  writes may complete out of source order. Route validation now recommends `concurrency: 1`
+  when destination order matters.
+
 ## 0.4.7
 
 ### Changed

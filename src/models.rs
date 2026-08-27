@@ -20,6 +20,8 @@ use defaults::*;
 use serde_support::*;
 
 pub use defaults::DEFAULT_KAFKA_PARTITIONS;
+#[cfg(feature = "grpc")]
+pub(crate) use secrets::decode_secret_map_key;
 pub use secrets::{extract_config_secrets, SecretExtractor};
 
 use serde::{
@@ -276,6 +278,8 @@ pub struct StaticConfig {
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "lowercase")]
+// Endpoint configs are intentionally stored inline to preserve the public construction API.
+#[allow(clippy::large_enum_variant)]
 pub enum EndpointType {
     Aws(AwsConfig),
     Kafka(KafkaConfig),
@@ -1565,10 +1569,21 @@ pub struct GrpcConfig {
     /// fresh id per consumer; set it to be redelivered unacknowledged messages on reconnect.
     #[serde(default)]
     pub consumer_id: Option<String>,
-    /// Timeout in milliseconds.
-    /// - Client mode: used as the connection timeout and per-request deadline.
-    /// - Server mode: applied as the per-request deadline on the embedded server.
+    /// Deprecated compatibility timeout in milliseconds. Used as the fallback for
+    /// connection and initial-request deadlines. Prefer the dedicated settings.
     pub timeout_ms: Option<u64>,
+    /// Maximum time to establish a client connection.
+    #[serde(default)]
+    pub connect_timeout_ms: Option<u64>,
+    /// Maximum time to establish an RPC and receive its initial response.
+    #[serde(default)]
+    pub request_timeout_ms: Option<u64>,
+    /// Maximum time a dynamic response stream may remain idle between messages.
+    #[serde(default)]
+    pub idle_stream_timeout_ms: Option<u64>,
+    /// Maximum lifetime of a dynamic RPC; exceeding it stops the route instead of reconnecting.
+    #[serde(default)]
+    pub overall_timeout_ms: Option<u64>,
     /// TLS configuration.
     #[serde(default)]
     pub tls: TlsConfig,
@@ -1600,6 +1615,13 @@ pub struct GrpcConfig {
     /// Compiled protobuf FileDescriptorSet for dynamic client mode.
     #[serde(default)]
     pub descriptor_set_path: Option<String>,
+    /// Compiled protobuf FileDescriptorSet bytes for embedded callers. Takes precedence
+    /// over `descriptor_set_path` and avoids writing a temporary descriptor file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub descriptor_set_bytes: Option<Vec<u8>>,
+    /// Discover descriptors from the remote gRPC server reflection v1 service.
+    #[serde(default)]
+    pub reflection: bool,
     /// Fully-qualified protobuf service name for dynamic client mode.
     #[serde(default)]
     pub service_name: Option<String>,
@@ -1609,9 +1631,27 @@ pub struct GrpcConfig {
     /// JSON request mapped to the dynamic protobuf input message.
     #[serde(default)]
     pub request: Option<serde_json::Value>,
-    /// Use a server-streaming dynamic RPC. False selects unary.
+    /// Deprecated compatibility hint. Dynamic RPC shape is always derived from the descriptor.
     #[serde(default)]
     pub server_streaming: bool,
+    /// Static ASCII metadata attached to dynamic RPCs. Values for keys that look
+    /// sensitive are extracted by mq-bridge's normal secret handling.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub metadata: HashMap<String, String>,
+    /// Static binary metadata for dynamic calls. Keys must end in `-bin`; values are raw bytes.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub binary_metadata: HashMap<String, Vec<u8>>,
+    /// Bearer token sent as `authorization` on dynamic calls; rejected in Bridge/server mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "schema", schemars(extend("format"="password")))]
+    pub bearer_token: Option<String>,
+    /// API key sent as `api_key_name` (default `x-api-key`) on dynamic calls only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "schema", schemars(extend("format"="password")))]
+    pub api_key: Option<String>,
+    /// Metadata key used for `api_key`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key_name: Option<String>,
     /// (Publisher only) Share one gRPC channel per connection (default: true); false forces a dedicated channel.
     #[serde(default)]
     #[cfg_attr(feature = "schema", schemars(default = "default_shared_schema"))]

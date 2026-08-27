@@ -10,6 +10,8 @@ license = "MIT"
 readme = "README.md"
 keywords = ["messaging", "kafka", "nats", "amqp", "cqrs"]
 categories = ["asynchronous", "network-programming"]
+# Test-only proto; build.rs skips it when absent so downstream builds skip the codegen.
+exclude = ["tests/fixtures/grpc_dynamic.proto"]
 
 [workspace]
 members = [
@@ -18,11 +20,12 @@ members = [
     "node/mq-bridge-node",
     "tests/fixtures/plugin-fixture",
     "tests/fixtures/plugin-fixture-bad-abi",
+    "tests/fixtures/grpc-config-compat",
 ]
 resolver = "2"
 
 [workspace.package]
-version = "0.4.7"
+version = "0.4.8"
 
 [workspace.dependencies]
 anyhow = "1.0"
@@ -168,10 +171,13 @@ zen-expression = { version = "0.55.1", optional = true, default-features = false
 rust_decimal = { version = "1", optional = true }
 tokio-websockets = { version = "0.13", optional = true, default-features = false, features = ["client", "server", "sha1_smol", "fastrand"] }
 
-# AWS
-aws-config = { version = "1.10", optional = true, default-features = false, features = ["behavior-version-latest", "rt-tokio", "rustls"] }
-aws-sdk-sqs = { version = "1.105", optional = true, default-features = false, features = ["rt-tokio", "rustls"] }
-aws-sdk-sns = { version = "1.107", optional = true, default-features = false, features = ["rt-tokio", "rustls"] }
+# AWS.
+# `default-https-client`, not `rustls`: the SDK's `rustls` feature selects the
+# legacy hyper 0.14 / rustls 0.21 client, compiling a second HTTP+TLS stack
+# alongside the hyper 1.x one the crate already builds.
+aws-config = { version = "1.10", optional = true, default-features = false, features = ["behavior-version-latest", "rt-tokio", "default-https-client"] }
+aws-sdk-sqs = { version = "1.105", optional = true, default-features = false, features = ["rt-tokio", "default-https-client"] }
+aws-sdk-sns = { version = "1.107", optional = true, default-features = false, features = ["rt-tokio", "default-https-client"] }
 
 # SQLx
 sqlx = { version = "0.9", features = ["runtime-tokio", "tls-rustls", "postgres", "mysql", "sqlite", "any"], optional = true }
@@ -179,7 +185,7 @@ sqlx = { version = "0.9", features = ["runtime-tokio", "tls-rustls", "postgres",
 # ClickHouse — talks the ClickHouse HTTP interface directly (JSONEachRow in/out).
 # reqwest is used rather than the typed `clickhouse` crate because that crate is
 # RowBinary/`Row`-derive only and cannot round-trip arbitrary dynamic JSON payloads.
-reqwest = { version = "0.13", default-features = false, features = ["rustls", "http2", "charset", "query", "gzip"], optional = true }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "http2", "query", "gzip"], optional = true }
 
 # ZeroMQ
 zeromq = { version = "0.6", optional = true }
@@ -198,7 +204,9 @@ redis = { version = "1.4", default-features = false, features = ["tokio-comp", "
 # gRPC
 tonic = { version = "0.14", optional = true, default-features = false, features = ["codegen", "transport", "tls-webpki-roots"] }
 tonic-prost = { version = "0.14", optional = true }
+tonic-reflection = { version = "0.14", optional = true, default-features = false, features = ["server"] }
 prost = { version = "0.14", optional = true, default-features = false, features = ["std", "derive"] }
+prost-types = { version = "0.14", optional = true }
 prost-reflect = { version = "0.16", optional = true, features = ["serde"] }
 tokio-stream = { version = "0.1", optional = true, features = ["net"] }
 
@@ -312,7 +320,7 @@ zeromq = ["dep:zeromq"]
 zeromq-omq = ["dep:omq-tokio"]
 redis-streams = ["dep:redis"]
 # Note: The grpc feature requires protobuf-src which can significantly increase build times.
-grpc = ["tonic", "prost", "prost-reflect", "tokio-stream", "tonic-prost", "tonic-prost-build", "protoc-bin-vendored", "rustls"]
+grpc = ["tonic", "tonic-reflection", "prost", "prost-types", "prost-reflect", "tokio-stream", "tonic-prost", "tonic-prost-build", "protoc-bin-vendored", "rustls"]
 sqlx = ["dep:sqlx", "url"]
 clickhouse = ["dep:reqwest", "dep:flate2", "dep:lz4_flex", "dep:zstd", "url"]
 # Cloud object-store checkpoint backend (S3/GCS/Azure/R2). Talks cloud REST via reqwest.
@@ -336,7 +344,7 @@ criterion = { version = "0.8", features = ["async", "async_tokio"] }
 # Used by the router_bench microbench to model the proposed lock-free route table.
 arc-swap = "1"
 mq-bridge = { path = ".", features = ["test-utils", "rustls-ring"] }
-reqwest = { version = "0.13", features = ["stream"] }
+reqwest = { version = "0.13", default-features = false, features = ["stream"] }
 
 # TLS test helpers
 rcgen = "0.14"

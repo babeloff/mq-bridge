@@ -342,6 +342,45 @@ fn check_fault_middleware_allowed(
     Ok(())
 }
 
+fn endpoint_tree_has_buffer(endpoint: &Endpoint, visited_refs: &mut HashSet<String>) -> bool {
+    if endpoint
+        .middlewares
+        .iter()
+        .any(|middleware| matches!(middleware, Middleware::Buffer(_)))
+    {
+        return true;
+    }
+
+    if endpoint.middlewares.iter().any(|middleware| {
+        matches!(middleware, Middleware::Dlq(config) if endpoint_tree_has_buffer(&config.endpoint, visited_refs))
+    }) {
+        return true;
+    }
+
+    match &endpoint.endpoint_type {
+        EndpointType::Ref(name) => {
+            visited_refs.insert(name.clone())
+                && get_endpoint(name)
+                    .is_some_and(|referenced| endpoint_tree_has_buffer(&referenced, visited_refs))
+        }
+        EndpointType::Fanout(endpoints) => endpoints
+            .iter()
+            .any(|endpoint| endpoint_tree_has_buffer(endpoint, visited_refs)),
+        EndpointType::Switch(config) => config
+            .cases
+            .values()
+            .chain(config.when.iter().map(|case| &case.to))
+            .chain(config.default.iter().map(Box::as_ref))
+            .any(|endpoint| endpoint_tree_has_buffer(endpoint, visited_refs)),
+        EndpointType::Reader(inner) => endpoint_tree_has_buffer(inner, visited_refs),
+        EndpointType::Request(config) => {
+            endpoint_tree_has_buffer(&config.to, visited_refs)
+                || endpoint_tree_has_buffer(&config.forward_to, visited_refs)
+        }
+        _ => false,
+    }
+}
+
 /// How many messages a runner may process before it must cooperatively yield.
 ///
 /// The route loops drive `async-channel` recv/send, which complete synchronously
@@ -984,6 +1023,17 @@ impl Route {
             &self.output,
             allowed_endpoints,
         )?);
+        if self.options.concurrency > 1
+            && (endpoint_tree_has_buffer(&self.input, &mut HashSet::new())
+                || endpoint_tree_has_buffer(&self.output, &mut HashSet::new()))
+        {
+            warnings.push(format!(
+                "Route '{name}' uses buffer middleware with concurrency {}. Buffering preserves \
+                 order within each batch, but concurrent destination writes may complete out of \
+                 source order. Use concurrency: 1 when destination order must be preserved.",
+                self.options.concurrency
+            ));
+        }
         Ok(warnings)
     }
 
@@ -2452,6 +2502,45 @@ mod tests {
 
         let err = route.check("zero_options", None).unwrap_err().to_string();
         assert!(err.contains("concurrency must be at least 1"));
+    }
+
+    #[test]
+    fn test_route_check_warns_when_buffered_writes_are_concurrent() {
+        let suffix = fast_uuid_v7::gen_id_str();
+        let buffered_name = format!("buffer_warning_leaf_{suffix}");
+        register_endpoint(
+            &buffered_name,
+            Endpoint::new_memory("buffer_warning_out", 10).add_middleware(Middleware::Buffer(
+                crate::models::BufferMiddleware {
+                    max_messages: 100,
+                    max_delay_ms: 10,
+                },
+            )),
+        );
+        let output = Endpoint::new(EndpointType::Fanout(vec![Endpoint::new(
+            EndpointType::Ref(buffered_name),
+        )]));
+        let route =
+            Route::new(Endpoint::new_memory("buffer_warning_in", 10), output).with_concurrency(4);
+
+        let warnings = route.check("buffer_warning", None).unwrap();
+        assert!(warnings.iter().any(|warning| {
+            warning.contains("concurrent destination writes") && warning.contains("concurrency: 1")
+        }));
+    }
+
+    #[test]
+    fn buffer_detection_stops_at_reference_cycles() {
+        let suffix = fast_uuid_v7::gen_id_str();
+        let first = format!("buffer_cycle_first_{suffix}");
+        let second = format!("buffer_cycle_second_{suffix}");
+        register_endpoint(&first, Endpoint::new(EndpointType::Ref(second.clone())));
+        register_endpoint(&second, Endpoint::new(EndpointType::Ref(first.clone())));
+
+        assert!(!endpoint_tree_has_buffer(
+            &Endpoint::new(EndpointType::Ref(first)),
+            &mut HashSet::new(),
+        ));
     }
 
     #[test]

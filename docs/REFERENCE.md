@@ -338,6 +338,11 @@ The value is a bare expression string:
 rest of the pipeline touches it, and acknowledges it at the source; on the output the
 message has already paid for the whole route.
 
+When filtering splits a full input batch, the consumer reads additional full source batches
+until it refills the requested batch size. A naturally short source batch remains a flush
+boundary, so live routes do not wait indefinitely merely to fill a batch. This lets sinks such
+as MongoDB continue using bulk writes after filtering without adding input buffer middleware.
+
 **What an expression can read:**
 
 - **Payload fields by bare name**, including nested paths — `amount`, `order.status`. The
@@ -483,6 +488,10 @@ Accumulates single sends and forwards them as one batch. Input and output.
 
 Flushes when either bound is hit. Useful in front of an endpoint whose per-call overhead
 dominates. Adds up to `max_delay_ms` of latency.
+
+With route `concurrency` greater than 1, buffering preserves order inside each batch but
+does not guarantee source order across concurrent destination writes. Use `concurrency: 1`
+when destination order matters; route validation emits a warning for this combination.
 
 ### `limiter`
 
@@ -898,6 +907,12 @@ output:
 `request_reply: true`. On error or timeout the **original** message is forwarded instead of a
 response, so nothing is lost — distinguish the two downstream with a [`switch`](#switch) on a
 status key such as `http_status_code`.
+
+For batch input, requests still run individually because each needs its own reply. They run
+concurrently unless `to` requires ordered publishing, in which case they are issued one at a
+time in source order. Their responses and error fallbacks are restored to input order and
+passed to `forward_to` in one `send_batch` call. Batch-capable sinks such as MongoDB can
+therefore use their native bulk write for the forwarding leg.
 
 Whatever `forward_to` returns is passed back up. A plain sink acks, `forward_to: {}` (the
 `null` endpoint, also spelled `null`) discards, and `forward_to: { response: {} }` replies to

@@ -42,6 +42,11 @@ jobs:
       - name: Run clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
 
+      # Not a workspace default member, so nothing else builds it. It pins the
+      # exhaustive `GrpcConfig` literal a downstream crate would write.
+      - name: Check downstream config-compat fixture
+        run: cargo check -p grpc-config-compat
+
   # Every feature subset still gets its own `cargo check`, but sequentially in one
   # job: the matrix cost 8 runner slots at the moment integration-build's dependents
   # were starving, and none of this is on the critical path.
@@ -87,6 +92,15 @@ jobs:
       
       - name: Cache cargo build
         uses: Swatinem/rust-cache@v2
+
+      # setup-python provides a non-PEP-668 interpreter; the system python3 on
+      # ubuntu-latest is externally managed and rejects a plain pip install.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Python gRPC compatibility tools
+        run: python3 -m pip install grpcio-tools
       
       - name: Run unit tests
         run: cargo test --lib --features=full

@@ -1,0 +1,21 @@
+syntax = "proto3";
+
+package mqbridge.test.v1;
+
+service DynamicFixture {
+    rpc Unary (DynamicRequest) returns (DynamicResponse);
+    rpc Stream (DynamicRequest) returns (stream DynamicResponse);
+    rpc ClientStream (stream DynamicRequest) returns (DynamicResponse);
+    rpc Bidi (stream DynamicRequest) returns (stream DynamicResponse);
+}
+
+message DynamicRequest {
+    bytes data = 1;
+    int64 sequence = 2;
+}
+
+message DynamicResponse {
+    bytes data = 1;
+    int64 sequence = 2;
+    string auth = 3;
+}

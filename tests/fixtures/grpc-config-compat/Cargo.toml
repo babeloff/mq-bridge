@@ -1,0 +1,8 @@
+[package]
+name = "grpc-config-compat"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+mq-bridge = { path = "../../..", default-features = false }

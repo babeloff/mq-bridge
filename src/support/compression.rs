@@ -11,27 +11,19 @@
 //! append model and the standard CLI tools (`zcat`, `lz4 -d`) working.
 
 use crate::models::Compression;
-use std::io::{BufRead, Read, Write as _};
+use crate::support::compression_pool::{
+    gzip_default, lz4_pooled, zstd_pooled, zstd_pooled_decompress,
+};
+use std::io::{BufRead, Read};
 
 /// Compresses one batch's serialized bytes into a single self-contained member.
 /// `Compression::None` is a caller bug — the uncompressed path never gets here.
 pub(crate) fn compress_member(algo: Compression, data: &[u8]) -> std::io::Result<Vec<u8>> {
     match algo {
         Compression::None => unreachable!("compress_member called with Compression::None"),
-        Compression::Gzip => {
-            let mut encoder =
-                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-            encoder.write_all(data)?;
-            encoder.finish()
-        }
-        Compression::Lz4 => {
-            let mut encoder = lz4_flex::frame::FrameEncoder::new(Vec::new());
-            encoder.write_all(data)?;
-            encoder
-                .finish()
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
-        }
-        Compression::Zstd => zstd::stream::encode_all(data, zstd::DEFAULT_COMPRESSION_LEVEL),
+        Compression::Gzip => gzip_default(data),
+        Compression::Lz4 => lz4_pooled(data),
+        Compression::Zstd => zstd_pooled(data, zstd::DEFAULT_COMPRESSION_LEVEL),
     }
 }
 
@@ -78,34 +70,44 @@ pub(crate) fn decompress_all(
     data: &[u8],
     max_bytes: Option<u64>,
 ) -> std::io::Result<Vec<u8>> {
-    // Decode straight over the borrowed slice — no owning copy. (`decompress_reader`
-    // returns a `'static` box and would force a `data.to_vec()`; matching here keeps
-    // the whole compressed object from being cloned on every read.)
-    let cursor = std::io::Cursor::new(data);
-    let mut decoder: Box<dyn Read + '_> = match algo {
-        Compression::None => Box::new(cursor),
-        Compression::Gzip => Box::new(flate2::read::MultiGzDecoder::new(cursor)),
-        Compression::Lz4 => Box::new(MultiLz4FrameDecoder::new(cursor)),
-        Compression::Zstd => Box::new(zstd::stream::read::Decoder::with_buffer(cursor)?),
-    };
-    let mut out = Vec::new();
-    match max_bytes {
-        // Read one byte past the limit; a decompressed payload longer than that is
-        // rejected rather than allocated whole.
-        Some(limit) => {
-            decoder
-                .by_ref()
-                .take(limit.saturating_add(1))
-                .read_to_end(&mut out)?;
-            if out.len() as u64 > limit {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("decompressed data exceeds the decode limit of {limit} bytes"),
-                ));
+    let out = if algo == Compression::Zstd {
+        // Pooled: reuses this thread's decode context instead of building one per call.
+        zstd_pooled_decompress(data, max_bytes)?
+    } else {
+        // Decode straight over the borrowed slice — no owning copy. (`decompress_reader`
+        // returns a `'static` box and would force a `data.to_vec()`; matching here keeps
+        // the whole compressed object from being cloned on every read.)
+        let cursor = std::io::Cursor::new(data);
+        let mut decoder: Box<dyn Read + '_> = match algo {
+            Compression::None => Box::new(cursor),
+            Compression::Gzip => Box::new(flate2::read::MultiGzDecoder::new(cursor)),
+            Compression::Lz4 => Box::new(MultiLz4FrameDecoder::new(cursor)),
+            Compression::Zstd => unreachable!("zstd takes the pooled path"),
+        };
+        let mut out = Vec::new();
+        match max_bytes {
+            // Read one byte past the limit; a decompressed payload longer than that is
+            // rejected rather than allocated whole.
+            Some(limit) => {
+                decoder
+                    .by_ref()
+                    .take(limit.saturating_add(1))
+                    .read_to_end(&mut out)?;
+            }
+            None => {
+                decoder.read_to_end(&mut out)?;
             }
         }
-        None => {
-            decoder.read_to_end(&mut out)?;
+        out
+    };
+    // Both paths stop one byte past the limit, so an over-long payload is rejected
+    // rather than decoded whole.
+    if let Some(limit) = max_bytes {
+        if out.len() as u64 > limit {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("decompressed data exceeds the decode limit of {limit} bytes"),
+            ));
         }
     }
     Ok(out)
@@ -167,6 +169,64 @@ mod tests {
     }
 
     #[test]
+    fn repeated_members_reuse_pooled_encoders() {
+        // Same thread, many members: the pooled gzip/zstd state is exercised on a reset,
+        // and incompressible input forces the gzip output buffer past its initial size.
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let random: Vec<u8> = (0..64 * 1024)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state as u8
+            })
+            .collect();
+
+        for algo in [Compression::Gzip, Compression::Lz4, Compression::Zstd] {
+            for _ in 0..3 {
+                for data in [b"".as_slice(), b"tiny", &vec![b'a'; 200_000], &random] {
+                    let member = compress_member(algo, data).unwrap();
+                    assert_eq!(
+                        decompress_all(algo, &member, None).unwrap(),
+                        data,
+                        "{algo:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pooled_gzip_matches_gzencoder_bytes() {
+        // Members already on disk (and `zcat`) must keep reading the same as before.
+        use std::io::Write;
+        for data in [b"tiny".as_slice(), &vec![b'x'; 100_000]] {
+            let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            e.write_all(data).unwrap();
+            let legacy = e.finish().unwrap();
+            let pooled = crate::support::compression_pool::gzip_default(data).unwrap();
+            assert_eq!(legacy, pooled, "byte-identical gzip member expected");
+        }
+    }
+
+    #[test]
+    fn pooled_lz4_matches_fresh_frame_encoder_bytes() {
+        // Sizes either side of the pool cut-off, each repeated so the reused encoder is
+        // compared too: frames already written must keep decoding the same way.
+        use std::io::Write;
+        for len in [0usize, 1, 4096, 64 * 1024, 64 * 1024 + 1, 300_000] {
+            let data: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+            let mut fresh = lz4_flex::frame::FrameEncoder::new(Vec::new());
+            fresh.write_all(&data).unwrap();
+            let expected = fresh.finish().unwrap();
+            for _ in 0..3 {
+                let pooled = compress_member(Compression::Lz4, &data).unwrap();
+                assert_eq!(pooled, expected, "len {len}");
+            }
+        }
+    }
+
+    #[test]
     fn decompress_all_enforces_limit() {
         for algo in [Compression::Gzip, Compression::Lz4, Compression::Zstd] {
             let big = vec![b'a'; 10 * 1024];
@@ -174,6 +234,76 @@ mod tests {
             assert!(member.len() < big.len());
             assert!(decompress_all(algo, &member, Some(1024)).is_err());
             assert_eq!(decompress_all(algo, &member, Some(64 * 1024)).unwrap(), big);
+        }
+    }
+
+    #[test]
+    fn zstd_concatenated_large_members_round_trip() {
+        // Frames well past the initial output capacity: every boundary has to reset the
+        // pooled context and keep decoding into the same growing buffer.
+        let batch: Vec<u8> = (0..200_000).map(|i| (i % 251) as u8).collect();
+        let mut joined = Vec::new();
+        for _ in 0..3 {
+            joined.extend_from_slice(&compress_member(Compression::Zstd, &batch).unwrap());
+        }
+        let out = decompress_all(Compression::Zstd, &joined, None).unwrap();
+        assert_eq!(out.len(), batch.len() * 3);
+        assert_eq!(&out[..batch.len()], &batch[..]);
+        assert_eq!(&out[batch.len() * 2..], &batch[..]);
+    }
+
+    #[test]
+    fn zstd_truncated_member_errors_without_poisoning_the_pool() {
+        let member = compress_member(Compression::Zstd, b"a full batch\n").unwrap();
+        let cut = &member[..member.len() - 1];
+        assert!(decompress_all(Compression::Zstd, cut, None).is_err());
+        // The next call reuses the context left mid-frame, so it must still be correct.
+        assert_eq!(
+            decompress_all(Compression::Zstd, &member, None).unwrap(),
+            b"a full batch\n"
+        );
+    }
+
+    #[test]
+    fn zstd_limit_stop_does_not_poison_the_pool() {
+        let big = vec![b'a'; 64 * 1024];
+        let member = compress_member(Compression::Zstd, &big).unwrap();
+        assert!(decompress_all(Compression::Zstd, &member, Some(1024)).is_err());
+        assert_eq!(
+            decompress_all(Compression::Zstd, &member, None).unwrap(),
+            big
+        );
+    }
+
+    #[test]
+    fn zstd_hard_error_does_not_poison_the_pool() {
+        // A malformed frame leaves the pooled context in an error state; the reinit at
+        // the head of the next call has to clear it, or every later decode on this
+        // thread is wrong.
+        let good = compress_member(Compression::Zstd, b"a full batch\n").unwrap();
+        let mut with_tail = good.clone();
+        with_tail.extend_from_slice(b"garbage tail that is not a frame");
+        for bad in [b"not a zstd frame at all".as_slice(), &with_tail] {
+            assert!(decompress_all(Compression::Zstd, bad, None).is_err());
+            assert_eq!(
+                decompress_all(Compression::Zstd, &good, None).unwrap(),
+                b"a full batch\n"
+            );
+        }
+    }
+
+    #[test]
+    fn zstd_limit_decodes_at_most_one_byte_past_it() {
+        // The guard is only worth having if it stops decoding where it says it does:
+        // `Vec::reserve` hands back more capacity than asked for, and the decoder will
+        // fill whatever it is given.
+        let big = vec![b'a'; 300_000];
+        let member = compress_member(Compression::Zstd, &big).unwrap();
+        for limit in [0u64, 1, 1000, 5000, 100_000] {
+            let out =
+                crate::support::compression_pool::zstd_pooled_decompress(&member, Some(limit))
+                    .unwrap();
+            assert_eq!(out.len() as u64, limit + 1, "limit {limit}");
         }
     }
 }

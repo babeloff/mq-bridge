@@ -159,17 +159,28 @@ class FileConfig(TypedDict, total=False):
 
 
 class GrpcConfig(TypedDict, total=False):
+    api_key: Optional[str]
+    api_key_name: Optional[str]
+    bearer_token: Optional[str]
+    binary_metadata: Dict[str, List[int]]
     concurrency_limit_per_connection: Optional[int]
+    connect_timeout_ms: Optional[int]
     consumer_id: Optional[str]
+    descriptor_set_bytes: Optional[List[int]]
     descriptor_set_path: Optional[str]
     http2_keepalive_interval_ms: Optional[int]
     http2_keepalive_timeout_ms: Optional[int]
+    idle_stream_timeout_ms: Optional[int]
     initial_connection_window_size: Optional[int]
     initial_stream_window_size: Optional[int]
     max_decoding_message_size: Optional[int]
     max_encoding_message_size: Optional[int]
+    metadata: Dict[str, str]
     method_name: Optional[str]
+    overall_timeout_ms: Optional[int]
+    reflection: bool
     request: Any
+    request_timeout_ms: Optional[int]
     server_mode: bool
     server_streaming: bool
     service_name: Optional[str]
