@@ -3,7 +3,7 @@
 //  Licensed under MIT License, see License file for more details
 //  git clone https://github.com/marcomq/mq-bridge
 //
-//! Thread-local gzip/zstd/lz4 encoder pools shared by the HTTP endpoint and the batch codecs.
+//! Thread-local gzip/zstd/lz4 codec pools shared by the HTTP endpoint and the batch codecs.
 //!
 //! Building an encoder costs far more than compressing a small payload: deflate state is
 //! ~350 KiB in ~9 allocations (the 32 KiB window, two 64 KiB hash chains, the 64 KiB
@@ -158,5 +158,79 @@ pub(crate) fn lz4_pooled(data: &[u8]) -> std::io::Result<Vec<u8>> {
             *slot = None;
         }
         framed
+    })
+}
+
+/// Decompresses concatenated zstd frames with this thread's reused context, stopping
+/// once `limit` is passed. `zstd::stream::read::Decoder` builds a fresh context and its
+/// own output buffer per call. The result may run one byte past `limit`, which is how
+/// the caller tells a payload that merely reached the limit from one that exceeds it.
+#[cfg(feature = "compression")]
+pub(crate) fn zstd_pooled_decompress(data: &[u8], limit: Option<u64>) -> std::io::Result<Vec<u8>> {
+    use zstd::stream::raw::{Decoder, InBuffer, Operation, OutBuffer};
+
+    if data.is_empty() {
+        return Ok(Vec::new());
+    }
+    let cap = limit.map_or(usize::MAX, |limit| {
+        usize::try_from(limit.saturating_add(1)).unwrap_or(usize::MAX)
+    });
+
+    thread_local! {
+        static POOL: RefCell<Option<Decoder<'static>>> = const { RefCell::new(None) };
+    }
+    POOL.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let decoder = match slot.as_mut() {
+            Some(decoder) => decoder,
+            None => slot.insert(Decoder::new()?),
+        };
+        // The previous call may have stopped mid-frame, on its limit or on an error.
+        decoder.reinit()?;
+
+        let mut out = Vec::with_capacity(
+            data.len()
+                .saturating_mul(4)
+                .clamp(4096, 256 * 1024)
+                .min(cap),
+        );
+        let mut consumed = 0;
+        loop {
+            if out.len() == out.capacity() {
+                let target = out.capacity().saturating_mul(2).min(cap);
+                out.reserve(target - out.len());
+            }
+            let filled = out.len();
+            // `run` decodes into the spare capacity and extends the length as it fills.
+            let (hint, read) = {
+                let mut input = InBuffer::around(&data[consumed..]);
+                let mut output = OutBuffer::around_pos(&mut out, filled);
+                let hint = decoder.run(&mut input, &mut output)?;
+                (hint, input.pos())
+            };
+            consumed += read;
+
+            if hint == 0 {
+                // Frame complete; a following member decodes with a fresh session.
+                if consumed == data.len() {
+                    return Ok(out);
+                }
+                decoder.reinit()?;
+            } else if read == 0 && out.len() == filled {
+                // Nothing read and nothing drained while the frame is still open: the
+                // input is cut short. Returning here is also what rules out a spin.
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "incomplete frame",
+                ));
+            }
+            // Checked last so the loop never re-enters with a full buffer it cannot grow.
+            // `reserve` rounds capacity up and the decoder fills whatever it is handed,
+            // so trim back to the one byte past `limit` the caller expects.
+            if out.len() >= cap {
+                out.truncate(cap);
+                return Ok(out);
+            }
+        }
     })
 }
