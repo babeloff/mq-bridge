@@ -183,8 +183,9 @@ Dynamic descriptor-driven calls support four metadata and credential settings:
 - `bearer_token`: a bearer credential sent in the `authorization` metadata entry.
 - `api_key` and optional `api_key_name`: an API key and its metadata name (default `x-api-key`).
 
-Authentication values are validated without being included in errors, endpoint status, logs, or
-connection-cache identities. All four settings are also sent on the reflection call, so a server
+`bearer_token` and `api_key` require an `https://` URL; a credential offered over plaintext h2c is
+rejected rather than sent in the clear. Authentication values are validated without being included
+in errors, endpoint status, logs, or connection-cache identities. All four settings are also sent on the reflection call, so a server
 that guards reflection sees the same credentials.
 
 These four settings apply **only** to dynamic descriptor-driven calls. Setting any of them on a

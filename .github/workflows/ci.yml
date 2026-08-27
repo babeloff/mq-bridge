@@ -42,6 +42,11 @@ jobs:
       - name: Run clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
 
+      # Not a workspace default member, so nothing else builds it. It pins the
+      # exhaustive `GrpcConfig` literal a downstream crate would write.
+      - name: Check downstream config-compat fixture
+        run: cargo check -p grpc-config-compat
+
   # Every feature subset still gets its own `cargo check`, but sequentially in one
   # job: the matrix cost 8 runner slots at the moment integration-build's dependents
   # were starving, and none of this is on the critical path.

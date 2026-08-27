@@ -43,6 +43,10 @@ All notable changes to `mq-bridge`. Newest first.
   `..Default::default()` / `GrpcConfig::new`. A downstream compile fixture now locks the complete
   literal shape so future additions cannot make this break silently.
 
+- **gRPC `bearer_token` and `api_key` now require an `https://` endpoint.** A credential sent over
+  plaintext h2c is rejected rather than put on the wire in the clear. Deployments that terminated
+  TLS at a sidecar and spoke plaintext gRPC to it must point the endpoint at `https://`.
+
 - **The gRPC endpoint's `timeout_ms` and `server_streaming` are deprecated but still accepted.**
   `timeout_ms` stays the fallback for connection and request setup; it no longer bounds a dynamic
   stream, which needs the dedicated keys. RPC shape comes from the descriptor, so a disagreeing
