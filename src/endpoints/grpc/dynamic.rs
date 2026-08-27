@@ -55,6 +55,15 @@ fn binary_metadata_key(name: &str) -> Result<MetadataKey<Binary>> {
 /// Attaches the configured static metadata and credentials. Error text never
 /// includes a configured value, so an unusable credential cannot leak through logs.
 pub(super) fn apply_call_metadata(config: &GrpcConfig, metadata: &mut MetadataMap) -> Result<()> {
+    let normalized_url = config.tls.normalize_url(&config.url);
+    if (config.bearer_token.is_some() || config.api_key.is_some())
+        && !normalized_url
+            .get(..8)
+            .is_some_and(|scheme| scheme.eq_ignore_ascii_case("https://"))
+    {
+        anyhow::bail!("gRPC bearer_token and api_key credentials require an https:// endpoint");
+    }
+
     for (name, value) in &config.metadata {
         let key = MetadataKey::<Ascii>::from_bytes(name.as_bytes())
             .map_err(|error| anyhow::anyhow!("invalid gRPC metadata key '{name}': {error}"))?;

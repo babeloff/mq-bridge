@@ -19,7 +19,8 @@ def main() -> None:
     def subscribe_and_ack() -> None:
         try:
             stream = stub.Subscribe(
-                bridge_pb2.SubscribeRequest(topic="compat", consumer_id="python-compat")
+                bridge_pb2.SubscribeRequest(topic="compat", consumer_id="python-compat"),
+                timeout=10,
             )
             # Response headers arrive only once the server handler has returned, which is
             # after it registered the subscription. Publishing before that would race.
@@ -32,7 +33,8 @@ def main() -> None:
                     id=message.id,
                     status=bridge_pb2.Ack.ACK,
                     metadata={"mq_bridge.consumer_id": "python-compat"},
-                )
+                ),
+                timeout=10,
             )
             assert ack.success, ack.error
             stream.cancel()
@@ -51,7 +53,8 @@ def main() -> None:
             payload=b"python-generated-client",
             id="018f0b4d-2f36-7c20-8000-000000000001",
             metadata={"mq_bridge.topic": "compat"},
-        )
+        ),
+        timeout=10,
     )
     assert response.WhichOneof("result") == "ack"
     assert response.ack.status == bridge_pb2.Ack.ACK

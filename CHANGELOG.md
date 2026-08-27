@@ -38,6 +38,11 @@ All notable changes to `mq-bridge`. Newest first.
 
 ### Changed
 
+- **Adding the dedicated gRPC deadline fields is a breaking Rust API change for exhaustive
+  `GrpcConfig` struct literals.** Downstream Rust callers must specify the new fields or use
+  `..Default::default()` / `GrpcConfig::new`. A downstream compile fixture now locks the complete
+  literal shape so future additions cannot make this break silently.
+
 - **The gRPC endpoint's `timeout_ms` and `server_streaming` are deprecated but still accepted.**
   `timeout_ms` stays the fallback for connection and request setup; it no longer bounds a dynamic
   stream, which needs the dedicated keys. RPC shape comes from the descriptor, so a disagreeing

@@ -277,10 +277,14 @@ mod consumer {
 
         // Verify: Receive the batch from the second route's destination
         let mut received_messages = Vec::new();
-        while received_messages.len() < messages_to_send.len() {
-            let batch = mem_dest_consumer.receive_batch(5).await.unwrap();
-            received_messages.extend(batch.messages);
-        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while received_messages.len() < messages_to_send.len() {
+                let batch = mem_dest_consumer.receive_batch(5).await.unwrap();
+                received_messages.extend(batch.messages);
+            }
+        })
+        .await
+        .expect("gRPC route did not deliver the expected messages");
 
         assert_eq!(received_messages.len(), messages_to_send.len());
         assert_eq!(
@@ -372,7 +376,7 @@ mod dynamic {
     use super::super::publisher::GrpcPublisher;
     use super::super::server::{PrefixRouter, ServerModeConsumer, REFLECTION_V1_PREFIX};
     use super::super::GrpcStatusError;
-    use crate::models::{GrpcConfig, SecretExtractor};
+    use crate::models::{GrpcConfig, SecretExtractor, TlsConfig};
     use crate::traits::{
         ConsumerError, MessageConsumer, MessagePublisher, PublisherError, SentBatch,
     };
@@ -381,7 +385,7 @@ mod dynamic {
     use std::time::Duration;
     use tokio_stream::wrappers::TcpListenerStream;
     use tonic::metadata::MetadataMap;
-    use tonic::transport::Server as TonicServer;
+    use tonic::transport::{Identity, Server as TonicServer, ServerTlsConfig};
     use tonic::{Request, Response, Status};
 
     mod dynamic_fixture {
@@ -499,7 +503,15 @@ mod dynamic {
         }
     }
 
-    async fn dynamic_fixture_server() -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+    async fn dynamic_fixture_server_with_tls(
+        tls: bool,
+    ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        if tls {
+            #[cfg(feature = "rustls-aws-lc")]
+            let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+            #[cfg(not(feature = "rustls-aws-lc"))]
+            let _ = rustls::crypto::ring::default_provider().install_default();
+        }
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let incoming = TcpListenerStream::new(listener);
@@ -507,8 +519,24 @@ mod dynamic {
             .register_encoded_file_descriptor_set(dynamic_fixture::FILE_DESCRIPTOR_SET)
             .build_v1()
             .unwrap();
+        let mut builder = TonicServer::builder();
+        if tls {
+            let identity = Identity::from_pem(
+                include_bytes!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/tests/integration/docker-compose/grpc-certs/server.crt"
+                )),
+                include_bytes!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/tests/integration/docker-compose/grpc-certs/server.key"
+                )),
+            );
+            builder = builder
+                .tls_config(ServerTlsConfig::new().identity(identity))
+                .unwrap();
+        }
         let handle = tokio::spawn(async move {
-            TonicServer::builder()
+            builder
                 .serve_with_incoming(
                     PrefixRouter {
                         fallback:
@@ -526,6 +554,14 @@ mod dynamic {
         (address, handle)
     }
 
+    async fn dynamic_fixture_server() -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        dynamic_fixture_server_with_tls(false).await
+    }
+
+    async fn dynamic_tls_fixture_server() -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        dynamic_fixture_server_with_tls(true).await
+    }
+
     fn dynamic_config(address: std::net::SocketAddr, method: &str) -> GrpcConfig {
         GrpcConfig::new(format!("http://{address}"))
             .with_descriptor_set_bytes(dynamic_fixture::FILE_DESCRIPTOR_SET.to_vec())
@@ -537,10 +573,20 @@ mod dynamic {
             }))
     }
 
+    fn dynamic_tls_config(address: std::net::SocketAddr, method: &str) -> GrpcConfig {
+        let mut config = dynamic_config(address, method);
+        config.url = format!("https://{address}");
+        config.tls = TlsConfig::new().with_ca_file(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/integration/docker-compose/grpc-certs/ca.pem"
+        ));
+        config
+    }
+
     #[tokio::test]
     async fn dynamic_unary_uses_canonical_json_metadata_and_stable_ids() {
-        let (address, handle) = dynamic_fixture_server().await;
-        let mut config = dynamic_config(address, "Unary")
+        let (address, handle) = dynamic_tls_fixture_server().await;
+        let mut config = dynamic_tls_config(address, "Unary")
             .with_bearer_token("test-token")
             .with_metadata(HashMap::from([("x-static".into(), "value".into())]));
         config.server_streaming = true; // Deprecated hint must not override the descriptor.
@@ -580,8 +626,8 @@ mod dynamic {
 
     #[tokio::test]
     async fn dynamic_unary_output_calls_once_per_message_and_returns_replies() {
-        let (address, handle) = dynamic_fixture_server().await;
-        let config = dynamic_config(address, "Unary")
+        let (address, handle) = dynamic_tls_fixture_server().await;
+        let config = dynamic_tls_config(address, "Unary")
             .with_bearer_token("sink-token")
             .with_request(serde_json::Value::Null);
         let publisher = DynamicPublisher::new(&config, &config.url).await.unwrap();
@@ -948,6 +994,17 @@ mod dynamic {
             .unwrap();
         assert!(error.to_string().contains("x-trace"), "{error:#}");
     }
+
+    #[test]
+    fn credentials_require_a_tls_endpoint() {
+        for config in [
+            GrpcConfig::new("http://localhost:50051").with_bearer_token("token"),
+            GrpcConfig::new("http://localhost:50051").with_api_key("key"),
+        ] {
+            let error = apply_call_metadata(&config, &mut MetadataMap::new()).unwrap_err();
+            assert!(error.to_string().contains("https://"), "{error:#}");
+        }
+    }
 }
 
 mod server {
@@ -1245,6 +1302,30 @@ mod server {
         format!("http://127.0.0.1:{port}")
     }
 
+    async fn server_consumer_on_free_port(mut config: GrpcConfig) -> GrpcConsumer {
+        let mut last_error = None;
+        for _ in 0..10 {
+            config.url = free_server_url().await;
+            match GrpcConsumer::new(&config).await {
+                Ok(consumer) => return consumer,
+                Err(error)
+                    if error.chain().any(|cause| {
+                        cause
+                            .downcast_ref::<std::io::Error>()
+                            .is_some_and(|error| error.kind() == std::io::ErrorKind::AddrInUse)
+                    }) =>
+                {
+                    last_error = Some(error);
+                }
+                Err(error) => panic!("failed to start gRPC test server: {error:#}"),
+            }
+        }
+        panic!(
+            "failed to bind a reserved gRPC test port after 10 attempts: {:#}",
+            last_error.unwrap()
+        );
+    }
+
     /// `PrefixRouter` replaces tonic's axum router, so every branch it dispatches has to
     /// be exercised: the Bridge service, reflection v1, and reflection v1alpha.
     #[tokio::test]
@@ -1254,14 +1335,12 @@ mod server {
         use tonic_reflection::pb::v1alpha::server_reflection_response::MessageResponse;
         use tonic_reflection::pb::v1alpha::ServerReflectionRequest;
 
-        let mut consumer = GrpcConsumer::new(&GrpcConfig {
-            url: free_server_url().await,
+        let mut consumer = server_consumer_on_free_port(GrpcConfig {
             topic: Some("router".into()),
             server_mode: true,
             ..Default::default()
         })
-        .await
-        .unwrap();
+        .await;
         let address = consumer.bound_addr.unwrap();
         let url = format!("http://{address}");
 
@@ -1353,24 +1432,35 @@ mod server {
             .unwrap();
         assert!(generation.success(), "Python client generation failed");
 
-        let mut consumer = GrpcConsumer::new(&GrpcConfig {
-            url: free_server_url().await,
+        let mut consumer = server_consumer_on_free_port(GrpcConfig {
             topic: Some("compat".into()),
             server_mode: true,
             request_timeout_ms: Some(5_000),
             ..Default::default()
         })
-        .await
-        .unwrap();
+        .await;
         let address = consumer.bound_addr.unwrap();
 
-        let mut child = std::process::Command::new("python3")
-            .current_dir(root)
-            .env("PYTHONPATH", generated.path())
-            .arg("tests/compat/python/bridge_client.py")
-            .arg(address.to_string())
-            .spawn()
-            .unwrap();
+        struct ChildGuard(std::process::Child);
+
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                if !matches!(self.0.try_wait(), Ok(Some(_))) {
+                    let _ = self.0.kill();
+                    let _ = self.0.wait();
+                }
+            }
+        }
+
+        let mut child = ChildGuard(
+            std::process::Command::new("python3")
+                .current_dir(root)
+                .env("PYTHONPATH", generated.path())
+                .arg("tests/compat/python/bridge_client.py")
+                .arg(address.to_string())
+                .spawn()
+                .unwrap(),
+        );
 
         let batch = tokio::time::timeout(Duration::from_secs(5), consumer.receive_batch(1))
             .await
@@ -1384,12 +1474,16 @@ mod server {
             .await
             .expect("commit Python publish");
 
-        let wait = tokio::task::spawn_blocking(move || child.wait());
-        let status = tokio::time::timeout(Duration::from_secs(10), wait)
-            .await
-            .expect("Python compatibility client timed out")
-            .expect("Python compatibility wait task failed")
-            .unwrap();
+        let status = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Some(status) = child.0.try_wait().unwrap() {
+                    break status;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("Python compatibility client timed out");
         assert!(status.success(), "Python compatibility client failed");
     }
 }
