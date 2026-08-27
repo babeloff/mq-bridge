@@ -22,7 +22,7 @@ use crate::models::{CipherKind, EncryptionConfig};
 use aes_gcm::Aes256Gcm;
 use anyhow::{anyhow, Context};
 use base64::Engine as _;
-use chacha20poly1305::aead::{Aead, KeyInit, Payload};
+use chacha20poly1305::aead::{Aead, AeadInOut, KeyInit, Payload};
 use chacha20poly1305::XChaCha20Poly1305;
 use std::collections::HashMap;
 
@@ -30,12 +30,78 @@ use super::crypto_envelope::{
     AES_GCM_NONCE_LEN, CIPHER_AES_GCM, CIPHER_XCHACHA, ENVELOPE_VERSION, XCHACHA_NONCE_LEN,
 };
 
+/// Authentication tag length; 16 bytes for both ciphers.
+const TAG_LEN: usize = 16;
+
+/// The AEAD instance for one key, built once. AES-256's key schedule and GHASH
+/// table cost more to set up than sealing a small payload, so they are not
+/// rebuilt per message. XChaCha needs no key schedule but shares the shape.
+enum Cipher {
+    Xchacha(XChaCha20Poly1305),
+    /// Boxed: the AES round keys and GHASH table are ~1 KiB, XChaCha's key is 32 bytes.
+    Aes(Box<Aes256Gcm>),
+}
+
+impl Cipher {
+    fn new(kind: CipherKind, key: &[u8; 32]) -> Self {
+        match kind {
+            CipherKind::Xchacha20poly1305 => Cipher::Xchacha(XChaCha20Poly1305::new(key.into())),
+            CipherKind::Aes256gcm => Cipher::Aes(Box::new(Aes256Gcm::new(key.into()))),
+        }
+    }
+
+    /// Encrypts `out[body..]` in place and appends the tag, so the ciphertext is
+    /// written straight into the envelope rather than allocated and copied in.
+    fn seal_in_place(
+        &self,
+        nonce: &[u8],
+        aad: &[u8],
+        out: &mut Vec<u8>,
+        body: usize,
+    ) -> anyhow::Result<()> {
+        let failed = || anyhow!("AEAD encryption failed");
+        let tag = match self {
+            Cipher::Xchacha(cipher) => {
+                let nonce: &[u8; XCHACHA_NONCE_LEN] = nonce.try_into().map_err(|_| failed())?;
+                cipher.encrypt_inout_detached(nonce.into(), aad, (&mut out[body..]).into())
+            }
+            Cipher::Aes(cipher) => {
+                let nonce: &[u8; AES_GCM_NONCE_LEN] = nonce.try_into().map_err(|_| failed())?;
+                cipher.encrypt_inout_detached(nonce.into(), aad, (&mut out[body..]).into())
+            }
+        }
+        .map_err(|_| failed())?;
+        out.extend_from_slice(&tag);
+        Ok(())
+    }
+
+    fn open(&self, nonce: &[u8], aad: &[u8], ciphertext: &[u8]) -> anyhow::Result<Vec<u8>> {
+        let failed = || anyhow!("AEAD decryption failed (tampered data or wrong key)");
+        let payload = Payload {
+            msg: ciphertext,
+            aad,
+        };
+        match self {
+            Cipher::Xchacha(cipher) => {
+                let nonce: &[u8; XCHACHA_NONCE_LEN] = nonce.try_into().map_err(|_| failed())?;
+                cipher.decrypt(nonce.into(), payload)
+            }
+            Cipher::Aes(cipher) => {
+                let nonce: &[u8; AES_GCM_NONCE_LEN] = nonce.try_into().map_err(|_| failed())?;
+                cipher.decrypt(nonce.into(), payload)
+            }
+        }
+        .map_err(|_| failed())
+    }
+}
+
 /// A ready-to-use AEAD engine built from an [`EncryptionConfig`]: the active
 /// seal key plus any extra decrypt-only keys (rotation).
 pub struct Crypto {
     cipher: CipherKind,
     key_id: String,
     key: [u8; 32],
+    active: Cipher,
     decrypt_keys: HashMap<String, [u8; 32]>,
 }
 
@@ -78,6 +144,7 @@ impl Crypto {
         Ok(Self {
             cipher: config.cipher,
             key_id: config.key_id.clone(),
+            active: Cipher::new(config.cipher, &key),
             key,
             decrypt_keys,
         })
@@ -91,29 +158,17 @@ impl Crypto {
         };
         let nonce_bytes: [u8; XCHACHA_NONCE_LEN] = rand::random();
         let nonce = &nonce_bytes[..nonce_len];
-        let payload = Payload {
-            msg: plaintext,
-            aad,
-        };
-        let ciphertext = match self.cipher {
-            CipherKind::Xchacha20poly1305 => {
-                XChaCha20Poly1305::new((&self.key).into()).encrypt((&nonce_bytes).into(), payload)
-            }
-            CipherKind::Aes256gcm => {
-                let nonce: &[u8; AES_GCM_NONCE_LEN] =
-                    nonce.try_into().expect("nonce length fixed above");
-                Aes256Gcm::new((&self.key).into()).encrypt(nonce.into(), payload)
-            }
-        }
-        .map_err(|_| anyhow!("AEAD encryption failed"))?;
 
-        let mut out = Vec::with_capacity(3 + self.key_id.len() + nonce_len + ciphertext.len());
+        let mut out =
+            Vec::with_capacity(3 + self.key_id.len() + nonce_len + plaintext.len() + TAG_LEN);
         out.push(ENVELOPE_VERSION);
         out.push(cipher_byte);
         out.push(self.key_id.len() as u8);
         out.extend_from_slice(self.key_id.as_bytes());
         out.extend_from_slice(nonce);
-        out.extend_from_slice(&ciphertext);
+        let body = out.len();
+        out.extend_from_slice(plaintext);
+        self.active.seal_in_place(nonce, aad, &mut out, body)?;
         Ok(out)
     }
 
@@ -132,9 +187,9 @@ impl Crypto {
         }
         let (key_id, rest) = rest.split_at(key_id_len as usize);
         let key_id = std::str::from_utf8(key_id).map_err(|_| err())?;
-        let nonce_len = match cipher_byte {
-            CIPHER_XCHACHA => XCHACHA_NONCE_LEN,
-            CIPHER_AES_GCM => AES_GCM_NONCE_LEN,
+        let (kind, nonce_len) = match cipher_byte {
+            CIPHER_XCHACHA => (CipherKind::Xchacha20poly1305, XCHACHA_NONCE_LEN),
+            CIPHER_AES_GCM => (CipherKind::Aes256gcm, AES_GCM_NONCE_LEN),
             other => return Err(anyhow!("unknown encryption cipher id {other}")),
         };
         if rest.len() < nonce_len {
@@ -142,30 +197,23 @@ impl Crypto {
         }
         let (nonce, ciphertext) = rest.split_at(nonce_len);
 
-        let key = if key_id == self.key_id {
-            &self.key
+        // Anything sealed by this config opens with the pre-built cipher; only a
+        // rotation key or a foreign cipher needs one built here.
+        let rotated;
+        let cipher = if kind == self.cipher && key_id == self.key_id {
+            &self.active
         } else {
-            self.decrypt_keys
-                .get(key_id)
-                .ok_or_else(|| anyhow!("no decryption key for key_id '{key_id}'"))?
+            let key = if key_id == self.key_id {
+                &self.key
+            } else {
+                self.decrypt_keys
+                    .get(key_id)
+                    .ok_or_else(|| anyhow!("no decryption key for key_id '{key_id}'"))?
+            };
+            rotated = Cipher::new(kind, key);
+            &rotated
         };
-        let payload = Payload {
-            msg: ciphertext,
-            aad,
-        };
-        match cipher_byte {
-            CIPHER_XCHACHA => {
-                let nonce: &[u8; XCHACHA_NONCE_LEN] =
-                    nonce.try_into().expect("nonce length checked above");
-                XChaCha20Poly1305::new(key.into()).decrypt(nonce.into(), payload)
-            }
-            _ => {
-                let nonce: &[u8; AES_GCM_NONCE_LEN] =
-                    nonce.try_into().expect("nonce length checked above");
-                Aes256Gcm::new(key.into()).decrypt(nonce.into(), payload)
-            }
-        }
-        .map_err(|_| anyhow!("AEAD decryption failed (tampered data or wrong key)"))
+        cipher.open(nonce, aad, ciphertext)
     }
 }
 
@@ -188,6 +236,30 @@ mod tests {
             let crypto = Crypto::new(&config(cipher)).unwrap();
             let envelope = crypto.seal(b"secret payload", b"aad").unwrap();
             assert_ne!(&envelope, b"secret payload");
+            assert_eq!(crypto.open(&envelope, b"aad").unwrap(), b"secret payload");
+        }
+    }
+
+    /// Wire-format pin: envelopes sealed by the previous implementation (cipher built
+    /// per call, ciphertext allocated and copied in) must still open unchanged.
+    #[test]
+    fn opens_envelopes_from_the_previous_seal() {
+        const VECTORS: [(CipherKind, &str); 2] = [
+            (
+                CipherKind::Xchacha20poly1305,
+                "0100026b31090909090909090909090909090909090909090909090909cd1781f819de5912956b645309178325d684b4b084007ae1f95d5e8bbdfa",
+            ),
+            (
+                CipherKind::Aes256gcm,
+                "0101026b3109090909090909090909090954e0e7e6db84e111c11ba757878ea2b887e0ce8ffe2dd4d315dcc7c6ae6d",
+            ),
+        ];
+        for (cipher, hex) in VECTORS {
+            let envelope: Vec<u8> = (0..hex.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+                .collect();
+            let crypto = Crypto::new(&config(cipher)).unwrap();
             assert_eq!(crypto.open(&envelope, b"aad").unwrap(), b"secret payload");
         }
     }
