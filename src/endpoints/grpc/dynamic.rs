@@ -41,9 +41,20 @@ async fn with_deadline<T>(
     }
 }
 
+/// Binary metadata names survive `extract_secrets` hex-encoded, so a name that is not a
+/// usable `-bin` key on its own is retried decoded before it is rejected.
+fn binary_metadata_key(name: &str) -> Result<MetadataKey<Binary>> {
+    if let Ok(key) = MetadataKey::<Binary>::from_bytes(name.as_bytes()) {
+        return Ok(key);
+    }
+    let decoded = crate::models::decode_secret_map_key(name)
+        .and_then(|decoded| MetadataKey::<Binary>::from_bytes(decoded.as_bytes()).ok());
+    decoded.ok_or_else(|| anyhow::anyhow!("invalid binary gRPC metadata key '{name}'"))
+}
+
 /// Attaches the configured static metadata and credentials. Error text never
 /// includes a configured value, so an unusable credential cannot leak through logs.
-fn apply_call_metadata(config: &GrpcConfig, metadata: &mut MetadataMap) -> Result<()> {
+pub(super) fn apply_call_metadata(config: &GrpcConfig, metadata: &mut MetadataMap) -> Result<()> {
     for (name, value) in &config.metadata {
         let key = MetadataKey::<Ascii>::from_bytes(name.as_bytes())
             .map_err(|error| anyhow::anyhow!("invalid gRPC metadata key '{name}': {error}"))?;
@@ -53,10 +64,10 @@ fn apply_call_metadata(config: &GrpcConfig, metadata: &mut MetadataMap) -> Resul
         metadata.insert(key, value);
     }
     for (name, value) in &config.binary_metadata {
-        let key = MetadataKey::<Binary>::from_bytes(name.as_bytes()).map_err(|error| {
-            anyhow::anyhow!("invalid binary gRPC metadata key '{name}': {error}")
-        })?;
-        metadata.insert_bin(key, MetadataValue::<Binary>::from_bytes(value));
+        metadata.insert_bin(
+            binary_metadata_key(name)?,
+            MetadataValue::<Binary>::from_bytes(value),
+        );
     }
     if let Some(token) = &config.bearer_token {
         let value = MetadataValue::<Ascii>::try_from(format!("Bearer {token}"))

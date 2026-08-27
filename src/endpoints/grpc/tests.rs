@@ -372,7 +372,7 @@ mod dynamic {
     use super::super::publisher::GrpcPublisher;
     use super::super::server::{PrefixRouter, ServerModeConsumer, REFLECTION_V1_PREFIX};
     use super::super::GrpcStatusError;
-    use crate::models::GrpcConfig;
+    use crate::models::{GrpcConfig, SecretExtractor};
     use crate::traits::{
         ConsumerError, MessageConsumer, MessagePublisher, PublisherError, SentBatch,
     };
@@ -380,6 +380,7 @@ mod dynamic {
     use std::collections::HashMap;
     use std::time::Duration;
     use tokio_stream::wrappers::TcpListenerStream;
+    use tonic::metadata::MetadataMap;
     use tonic::transport::Server as TonicServer;
     use tonic::{Request, Response, Status};
 
@@ -904,6 +905,48 @@ mod dynamic {
             .is_err());
 
         handle.abort();
+    }
+
+    /// `extract_secrets` hex-encodes map keys so they survive as environment variable
+    /// names, and the config crate rebuilds the map from those names. The call site has
+    /// to undo that, or the header goes out under the encoded name.
+    #[test]
+    fn binary_metadata_keys_survive_the_secret_env_round_trip() {
+        let mut config = GrpcConfig::new("https://localhost:50051");
+        config
+            .binary_metadata
+            .insert("x-trace-bin".to_string(), vec![1, 2, 3]);
+
+        let mut secrets = HashMap::new();
+        config.extract_secrets("MQB__ROUTE__OUTPUT__GRPC", &mut secrets);
+        assert!(config.binary_metadata.is_empty());
+        assert_eq!(secrets.len(), 1);
+
+        // The reload lowercases the env name and keeps only its trailing segment as key.
+        let (env_key, env_value) = secrets.iter().next().unwrap();
+        config.binary_metadata.insert(
+            env_key.rsplit("__").next().unwrap().to_ascii_lowercase(),
+            serde_json::from_str(env_value).unwrap(),
+        );
+
+        let mut metadata = MetadataMap::new();
+        apply_call_metadata(&config, &mut metadata).unwrap();
+        assert_eq!(
+            metadata.get_bin("x-trace-bin").unwrap().to_bytes().unwrap(),
+            bytes::Bytes::from_static(&[1, 2, 3])
+        );
+    }
+
+    #[test]
+    fn binary_metadata_rejects_a_key_that_is_neither_usable_nor_encoded() {
+        let mut config = GrpcConfig::new("https://localhost:50051");
+        config
+            .binary_metadata
+            .insert("x-trace".to_string(), vec![1]);
+        let error = apply_call_metadata(&config, &mut MetadataMap::new())
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("x-trace"), "{error:#}");
     }
 }
 

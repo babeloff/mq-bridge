@@ -56,6 +56,7 @@ def main() -> None:
     assert response.WhichOneof("result") == "ack"
     assert response.ack.status == bridge_pb2.Ack.ACK
     subscriber.join(timeout=5)
+    assert not subscriber.is_alive(), "Subscriber thread did not finish"
     assert not errors, errors
     assert received and received[0].payload == b"python-generated-client"
 

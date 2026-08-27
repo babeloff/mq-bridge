@@ -20,6 +20,8 @@ use defaults::*;
 use serde_support::*;
 
 pub use defaults::DEFAULT_KAFKA_PARTITIONS;
+#[cfg(feature = "grpc")]
+pub(crate) use secrets::decode_secret_map_key;
 pub use secrets::{extract_config_secrets, SecretExtractor};
 
 use serde::{

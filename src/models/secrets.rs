@@ -89,6 +89,26 @@ fn sanitize_secret_key(key: &str) -> String {
         .collect()
 }
 
+/// Reverses [`encode_secret_map_key`]. A map key that round-tripped through
+/// `extract_secrets` and back in from the environment arrives hex-encoded, so a
+/// consumer has to decode it before using it as the original name.
+#[cfg(feature = "grpc")]
+pub(crate) fn decode_secret_map_key(key: &str) -> Option<String> {
+    if key.is_empty() || key.len() % 2 != 0 {
+        return None;
+    }
+    let bytes: Option<Vec<u8>> = key
+        .as_bytes()
+        .chunks(2)
+        .map(|pair| {
+            let hi = (pair[0] as char).to_digit(16)?;
+            let lo = (pair[1] as char).to_digit(16)?;
+            Some((hi * 16 + lo) as u8)
+        })
+        .collect();
+    String::from_utf8(bytes?).ok()
+}
+
 fn encode_secret_map_key(key: &str) -> String {
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
     let mut encoded = String::with_capacity(key.len() * 2);
