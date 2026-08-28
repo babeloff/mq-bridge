@@ -72,6 +72,16 @@ jobs:
           manifest-path: apps/mq-bridge-app/Cargo.toml
           command: check bans licenses sources
 
+      # Informational, same policy as the engine's supply-chain job in ci.yml:
+      # the app resolves its own Cargo.lock, so deny.toml's advisory ignores are
+      # only actually exercised if this runs.
+      - name: Advisories (informational)
+        continue-on-error: true
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          manifest-path: apps/mq-bridge-app/Cargo.toml
+          command: check advisories
+
   ui:
     name: App UI
     runs-on: ubuntu-latest

@@ -25,12 +25,21 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
+        with:
+          # A workflow_dispatch run defaults to the branch it was started from;
+          # a release must be built from the tag it claims to be.
+          ref: ${{ inputs.tag_name || github.ref }}
 
       - name: Resolve tag and version
         id: meta
         shell: bash
+        env:
+          # Passed through the environment rather than interpolated into the
+          # script body, so a dispatch input cannot inject shell.
+          INPUT_TAG: ${{ inputs.tag_name }}
+          REF_NAME: ${{ github.ref_name }}
         run: |
-          RELEASE_TAG="${{ inputs.tag_name || github.ref_name }}"
+          RELEASE_TAG="${INPUT_TAG:-$REF_NAME}"
           # Extract version from Cargo.toml, handling potential indentation
           CARGO_VERSION="$(sed -n 's/^[[:space:]]*version = "\([^"]*\)".*/\1/p' Cargo.toml | tr -d '\r' | head -n1)"
           # Fallback to the release tag (without 'v' prefix) if Cargo.toml version extraction fails
@@ -57,6 +66,10 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
+        with:
+          # A workflow_dispatch run defaults to the branch it was started from;
+          # a release must be built from the tag it claims to be.
+          ref: ${{ inputs.tag_name || github.ref }}
 
       - name: Install Rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@v1
@@ -88,6 +101,10 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
+        with:
+          # A workflow_dispatch run defaults to the branch it was started from;
+          # a release must be built from the tag it claims to be.
+          ref: ${{ inputs.tag_name || github.ref }}
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -145,6 +162,10 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
+        with:
+          # A workflow_dispatch run defaults to the branch it was started from;
+          # a release must be built from the tag it claims to be.
+          ref: ${{ inputs.tag_name || github.ref }}
 
       - name: Create Release
         id: create_release
@@ -186,6 +207,10 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
+        with:
+          # A workflow_dispatch run defaults to the branch it was started from;
+          # a release must be built from the tag it claims to be.
+          ref: ${{ inputs.tag_name || github.ref }}
 
       - name: Install Rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@v1
@@ -258,6 +283,10 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
+        with:
+          # A workflow_dispatch run defaults to the branch it was started from;
+          # a release must be built from the tag it claims to be.
+          ref: ${{ inputs.tag_name || github.ref }}
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
@@ -296,6 +325,10 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
+        with:
+          # A workflow_dispatch run defaults to the branch it was started from;
+          # a release must be built from the tag it claims to be.
+          ref: ${{ inputs.tag_name || github.ref }}
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v4
@@ -337,6 +370,10 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
+        with:
+          # A workflow_dispatch run defaults to the branch it was started from;
+          # a release must be built from the tag it claims to be.
+          ref: ${{ inputs.tag_name || github.ref }}
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
@@ -381,13 +418,20 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # `latest` keeps pointing at the last stable release: an rc/alpha/beta tag
+      # publishes only its own version tag.
       - name: Create and push multi-arch manifest
+        env:
+          VERSION: ${{ needs.metadata.outputs.cargo_version }}
+          IS_PRERELEASE: ${{ needs.metadata.outputs.is_prerelease }}
         run: |
-          docker buildx imagetools create \
-            --tag ghcr.io/${{ env.IMAGE_NAME }}:${{ needs.metadata.outputs.cargo_version }} \
-            --tag ghcr.io/${{ env.IMAGE_NAME }}:latest \
-            ghcr.io/${{ env.IMAGE_NAME }}:${{ needs.metadata.outputs.cargo_version }}-amd64 \
-            ghcr.io/${{ env.IMAGE_NAME }}:${{ needs.metadata.outputs.cargo_version }}-arm64
+          tags=(--tag "ghcr.io/${IMAGE_NAME}:${VERSION}")
+          if [ "$IS_PRERELEASE" != "true" ]; then
+            tags+=(--tag "ghcr.io/${IMAGE_NAME}:latest")
+          fi
+          docker buildx imagetools create "${tags[@]}" \
+            "ghcr.io/${IMAGE_NAME}:${VERSION}-amd64" \
+            "ghcr.io/${IMAGE_NAME}:${VERSION}-arm64"
 
   publish-amd64-ibm-mq-tag:
     name: Push amd64 IBM MQ aliases
@@ -405,11 +449,16 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Create and push IBM MQ image aliases
+        env:
+          VERSION: ${{ needs.metadata.outputs.cargo_version }}
+          IS_PRERELEASE: ${{ needs.metadata.outputs.is_prerelease }}
         run: |
-          docker buildx imagetools create \
-            --tag ghcr.io/${{ env.IMAGE_NAME }}:ibm-mq \
-            --tag ghcr.io/${{ env.IMAGE_NAME }}:latest-ibm-mq \
-            ghcr.io/${{ env.IMAGE_NAME }}:${{ needs.metadata.outputs.cargo_version }}-amd64-ibm-mq
+          tags=(--tag "ghcr.io/${IMAGE_NAME}:ibm-mq")
+          if [ "$IS_PRERELEASE" != "true" ]; then
+            tags+=(--tag "ghcr.io/${IMAGE_NAME}:latest-ibm-mq")
+          fi
+          docker buildx imagetools create "${tags[@]}" \
+            "ghcr.io/${IMAGE_NAME}:${VERSION}-amd64-ibm-mq"
 
   build-tauri-release:
     name: Build Tauri bundle for ${{ matrix.name }}
@@ -436,6 +485,10 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
+        with:
+          # A workflow_dispatch run defaults to the branch it was started from;
+          # a release must be built from the tag it claims to be.
+          ref: ${{ inputs.tag_name || github.ref }}
 
       - name: Setup Node.js
         uses: actions/setup-node@v7
@@ -512,6 +565,10 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
+        with:
+          # A workflow_dispatch run defaults to the branch it was started from;
+          # a release must be built from the tag it claims to be.
+          ref: ${{ inputs.tag_name || github.ref }}
 
       - name: Undraft the release
         env:
@@ -533,6 +590,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
+          ref: ${{ inputs.tag_name || github.ref }}
           # Publishing uses CARGO_REGISTRY_TOKEN, not the GitHub token, so avoid
           # persisting git credentials for this job.
           persist-credentials: false
@@ -607,6 +665,9 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v7
         with:
+          # A workflow_dispatch run defaults to the branch it was started from;
+          # a release must be built from the tag it claims to be.
+          ref: ${{ inputs.tag_name || github.ref }}
           # The tap is cloned and pushed over SSH (GIT_SSH_COMMAND + deploy key),
           # so the checkout token has no reason to persist in .git/config.
           persist-credentials: false
@@ -639,7 +700,13 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add Formula/mq-bridge-app.rb Casks/mq-bridge.rb
-          git commit -m "mq-bridge ${VERSION}" || exit 0
+          # An empty staging area is the only legitimate no-op here; any other
+          # commit failure must fail the job instead of skipping the push.
+          if git diff --cached --quiet; then
+            echo "tap already up to date for ${VERSION}"
+            exit 0
+          fi
+          git commit -m "mq-bridge ${VERSION}"
           git push
 
   publish-mcp-registry:
@@ -656,6 +723,10 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
+        with:
+          # A workflow_dispatch run defaults to the branch it was started from;
+          # a release must be built from the tag it claims to be.
+          ref: ${{ inputs.tag_name || github.ref }}
 
       - name: Pin server.json to the release version
         env:
@@ -714,6 +785,10 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
+        with:
+          # A workflow_dispatch run defaults to the branch it was started from;
+          # a release must be built from the tag it claims to be.
+          ref: ${{ inputs.tag_name || github.ref }}
 
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v4

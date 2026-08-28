@@ -19,7 +19,7 @@ const CONFIG_MASTER_KEY_MEMORY_KID: &str = "process-memory";
 #[cfg(test)]
 static TEST_CONFIG_MASTER_KEY_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> =
     std::sync::OnceLock::new();
-static CONFIG_MASTER_KEY_MEMORY: OnceLock<RwLock<Option<String>>> = OnceLock::new();
+static CONFIG_MASTER_KEY_MEMORY: OnceLock<RwLock<Option<Zeroizing<String>>>> = OnceLock::new();
 
 #[derive(Debug, serde::Deserialize, serde::Serialize, Clone, Default)]
 struct EncryptedEnvelope {
@@ -69,7 +69,7 @@ pub fn config_file_format_from_path(path: &str) -> FileFormat {
     }
 }
 
-fn config_master_key_memory() -> &'static RwLock<Option<String>> {
+fn config_master_key_memory() -> &'static RwLock<Option<Zeroizing<String>>> {
     CONFIG_MASTER_KEY_MEMORY.get_or_init(|| RwLock::new(None))
 }
 
@@ -77,7 +77,8 @@ pub fn set_process_config_master_key_hex(value: String) {
     let mut guard = config_master_key_memory()
         .write()
         .unwrap_or_else(|error| error.into_inner());
-    *guard = Some(value);
+    // Zeroizing so the replaced key is wiped rather than left in the allocator.
+    *guard = Some(Zeroizing::new(value));
 }
 
 pub fn clear_process_config_master_key() {
@@ -95,12 +96,12 @@ fn read_config_master_key() -> Result<(Zeroizing<Vec<u8>>, &'static str), anyhow
     let (raw, kid) = if let Some(value) = in_memory {
         (value, CONFIG_MASTER_KEY_MEMORY_KID)
     } else {
-        let value = std::env::var(CONFIG_MASTER_KEY_ENV).map_err(|_| {
+        let value = Zeroizing::new(std::env::var(CONFIG_MASTER_KEY_ENV).map_err(|_| {
             anyhow::anyhow!(
                 "Sensitive config requires {} to be set to a 32-byte hex key",
                 CONFIG_MASTER_KEY_ENV
             )
-        })?;
+        })?);
         (value, CONFIG_MASTER_KEY_ENV)
     };
     let bytes = hex::decode(raw.trim()).map_err(|_| {
@@ -203,10 +204,9 @@ pub fn maybe_decrypt_config_source(
         return Ok(None);
     };
 
-    if !uses_encrypted_config_mode_label(&file.config_security.mode) {
-        return Ok(None);
-    }
-
+    // Keyed off the payload, not the mode label: a hand-edited or downgraded
+    // `config_security.mode` must not make an encrypted file parse as an
+    // (almost empty) plain config instead of failing loudly.
     let Some(encrypted) = file.encrypted_config.as_ref() else {
         return Ok(None);
     };

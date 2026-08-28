@@ -1659,6 +1659,15 @@ impl UiApp {
         mut new_config: AppConfig,
     ) -> std::result::Result<(), UpdateConfigError> {
         tracing::info!("Received new configuration via Web UI. Reloading...");
+        // While recovery is pending the running config is an empty fallback, not
+        // the file on disk. Saving it would overwrite the unreadable encrypted
+        // config that /config-recovery/reset still has to back up.
+        if self.config_recovery().is_some() {
+            return Err(UpdateConfigError::Validation(
+                "The stored configuration could not be decrypted and is still on disk. Reset it via /config-recovery/reset before saving a new configuration"
+                    .to_string(),
+            ));
+        }
         let requested_plugin_paths = crate::plugins::canonical_plugin_paths(
             &new_config.plugins,
             &new_config.env_vars,

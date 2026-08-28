@@ -10,7 +10,6 @@ const proxiedPaths = [
   "/config",
   "/config-recovery",
   "/storage-security",
-  "/desktop-secrets",
   "/consumer-status",
   "/consumer-start",
   "/consumer-stop",

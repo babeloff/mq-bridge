@@ -289,6 +289,68 @@ pub trait SecretStore: Send + Sync {
     fn store(&self, secrets: &HashMap<String, String>) -> Result<()>;
 }
 
+/// Renders a secret as a double-quoted `.env` value so it survives a dotenvy
+/// reload. Newlines, `#`, leading/trailing spaces and `$` substitution all
+/// corrupt or truncate a bare value.
+fn quote_env_value(value: &str) -> String {
+    let mut quoted = String::with_capacity(value.len() + 2);
+    quoted.push('"');
+    for ch in value.chars() {
+        match ch {
+            '\\' => quoted.push_str("\\\\"),
+            '"' => quoted.push_str("\\\""),
+            '$' => quoted.push_str("\\$"),
+            '\n' => quoted.push_str("\\n"),
+            _ => quoted.push(ch),
+        }
+    }
+    quoted.push('"');
+    quoted
+}
+
+/// Writes `contents` to `path` atomically and, on Unix, owner-only: the file is
+/// built beside the target and renamed over it, so a crash mid-write cannot
+/// leave a truncated config or secret file behind.
+fn write_private_file(path: &Path, contents: &[u8]) -> Result<()> {
+    use std::io::Write;
+
+    let directory = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty());
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("{} has no file name", path.display()))?;
+    let mut temp_name = std::ffi::OsString::from(".");
+    temp_name.push(file_name);
+    temp_name.push(format!(".{}.tmp", Uuid::new_v4()));
+    let temp_path = match directory {
+        Some(parent) => parent.join(temp_name),
+        None => PathBuf::from(temp_name),
+    };
+
+    let write_temp = || -> std::io::Result<()> {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        let mut file = options.open(&temp_path)?;
+        file.write_all(contents)?;
+        file.sync_all()
+    };
+
+    if let Err(error) = write_temp() {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(error.into());
+    }
+    // Windows rejects a rename onto an existing file.
+    #[cfg(windows)]
+    let _ = std::fs::remove_file(path);
+    std::fs::rename(&temp_path, path).inspect_err(|_| {
+        let _ = std::fs::remove_file(&temp_path);
+    })?;
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 pub struct EnvFileSecretStore {
     path: PathBuf,
@@ -325,7 +387,7 @@ impl SecretStore for EnvFileSecretStore {
             if let Some((key, _)) = line.split_once('=') {
                 let key = key.trim();
                 if let Some(new_value) = secrets.get(key) {
-                    new_lines.push(format!("{}={}", key, new_value));
+                    new_lines.push(format!("{}={}", key, quote_env_value(new_value)));
                     processed_keys.insert(key.to_string());
                 } else {
                     new_lines.push(line.to_string());
@@ -337,7 +399,7 @@ impl SecretStore for EnvFileSecretStore {
 
         for (key, value) in secrets {
             if !processed_keys.contains(key) {
-                new_lines.push(format!("{}={}", key, value));
+                new_lines.push(format!("{}={}", key, quote_env_value(value)));
             }
         }
 
@@ -345,7 +407,7 @@ impl SecretStore for EnvFileSecretStore {
         if !final_content.ends_with('\n') {
             final_content.push('\n');
         }
-        std::fs::write(&self.path, final_content)?;
+        write_private_file(&self.path, final_content.as_bytes())?;
         Ok(())
     }
 }
@@ -885,7 +947,7 @@ impl AppConfig {
                 _ => serde_yaml_ng::to_string(&config_value)?,
             }
         };
-        std::fs::write(path, output)?;
+        write_private_file(Path::new(path), output.as_bytes())?;
         Ok(())
     }
 
@@ -1842,5 +1904,53 @@ consumers: []
         unsafe {
             std::env::remove_var(crate::encrypted_config::CONFIG_MASTER_KEY_ENV);
         }
+    }
+
+    #[test]
+    fn env_secret_store_round_trips_awkward_values() {
+        let path = std::env::temp_dir().join(format!("mqb-env-{}.env", Uuid::new_v4()));
+        let store = EnvFileSecretStore::new(&path);
+
+        let mut secrets = HashMap::new();
+        secrets.insert("MQB_PLAIN".to_string(), "simple".to_string());
+        secrets.insert("MQB_HASH".to_string(), "pa#ss word".to_string());
+        secrets.insert(
+            "MQB_DOLLAR".to_string(),
+            "$HOME/${NOT_EXPANDED}".to_string(),
+        );
+        secrets.insert("MQB_QUOTES".to_string(), "a\"b\\c".to_string());
+        secrets.insert(
+            "MQB_NEWLINE".to_string(),
+            "-----BEGIN-----\nkey\n".to_string(),
+        );
+        store.store(&secrets).unwrap();
+
+        let loaded: HashMap<String, String> = dotenvy::from_path_iter(&path)
+            .unwrap()
+            .map(|entry| entry.unwrap())
+            .collect();
+        for (key, value) in &secrets {
+            assert_eq!(loaded.get(key), Some(value), "{key} did not round-trip");
+        }
+
+        // Rewriting an existing key must not corrupt the others.
+        let mut update = HashMap::new();
+        update.insert("MQB_HASH".to_string(), "new # value".to_string());
+        store.store(&update).unwrap();
+        let reloaded: HashMap<String, String> = dotenvy::from_path_iter(&path)
+            .unwrap()
+            .map(|entry| entry.unwrap())
+            .collect();
+        assert_eq!(reloaded.get("MQB_HASH"), Some(&"new # value".to_string()));
+        assert_eq!(reloaded.get("MQB_NEWLINE"), secrets.get("MQB_NEWLINE"),);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "secret file must be owner-only");
+        }
+
+        let _ = std::fs::remove_file(&path);
     }
 }

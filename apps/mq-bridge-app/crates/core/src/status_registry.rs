@@ -528,7 +528,7 @@ impl StatusLease {
         }
         // Taken before the removal and dropped after it, so a publish that is
         // already inside its blocking section finishes first and no later one
-        // can start. The wait is one small fsync at most.
+        // can start. The wait is one small write plus a rename.
         let mut released = self
             .released
             .lock()
@@ -544,7 +544,9 @@ impl Drop for StatusLease {
     }
 }
 
-/// `publish` fsyncs, so it never runs on an async worker thread.
+/// `publish` does blocking file I/O (write + rename, no fsync -- a lease is
+/// transient and is republished on a timer), so it never runs on an async
+/// worker thread.
 async fn publish_off_thread(
     registry: &LocalStatusRegistry,
     status: &InstanceStatus,

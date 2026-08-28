@@ -137,25 +137,16 @@ pub fn configure_resume(
             config.group_id.get_or_insert_with(|| state_id.clone());
             Ok(ResumeCapability::Native)
         }
-        EndpointType::MongoDb(config) => {
-            let mode = config.consume.unwrap_or({
-                if config.change_stream {
-                    MongoConsume::CaptureNew
-                } else {
-                    MongoConsume::CaptureAll
-                }
-            });
-            match mode {
-                MongoConsume::CaptureNew | MongoConsume::CaptureAll => {
-                    config.cursor_id.get_or_insert_with(|| state_id.clone());
-                    Ok(ResumeCapability::CursorBased)
-                }
-                MongoConsume::Snapshot => bail!(
-                    "source `mongodb` does not support resumable copy in snapshot mode; use capture_all or capture_new"
-                ),
-                MongoConsume::Consumer => unsupported("mongodb consumer mode"),
+        EndpointType::MongoDb(config) => match config.resolved_consume() {
+            MongoConsume::CaptureNew | MongoConsume::CaptureAll => {
+                config.cursor_id.get_or_insert_with(|| state_id.clone());
+                Ok(ResumeCapability::CursorBased)
             }
-        }
+            MongoConsume::Snapshot => bail!(
+                "source `mongodb` does not support resumable copy in snapshot mode; use capture_all or capture_new"
+            ),
+            MongoConsume::Consumer => unsupported("mongodb consumer mode"),
+        },
         EndpointType::PostgresCdc(config) => {
             if config.temporary_slot {
                 bail!(

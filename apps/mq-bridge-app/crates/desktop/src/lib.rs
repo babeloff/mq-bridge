@@ -154,11 +154,9 @@ fn load_or_create_desktop_message_key(config_path: &Path, service: &str) -> anyh
 }
 
 fn probe_desktop_key_store_available(config_path: &Path, service: &str) -> bool {
-    let account = format!(
-        "{}:{}",
-        desktop_key_account("key-store-probe", config_path),
-        uuid::Uuid::new_v4()
-    );
+    // Stable, so repeated probes overwrite one entry instead of leaving a new
+    // orphan behind every time the delete below fails.
+    let account = desktop_key_account("key-store-probe", config_path);
     let entry = match keyring::Entry::new(service, &account) {
         Ok(entry) => entry,
         Err(error) => {

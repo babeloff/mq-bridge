@@ -262,7 +262,16 @@ pub fn status(local: bool) -> Result<()> {
             println!("{}: no {} scope", client.label(), scope_label(local));
             continue;
         };
-        let registered = read_config(&path)?
+        // Report a broken config for one client and keep going: it must not hide
+        // the status of every client listed after it.
+        let config = match read_config(&path) {
+            Ok(config) => config,
+            Err(error) => {
+                println!("{}: cannot read config -- {error:#}", client.label());
+                continue;
+            }
+        };
+        let registered = config
             .pointer(&format!("/mcpServers/{SERVER_NAME}"))
             .cloned();
         match registered {
@@ -313,8 +322,16 @@ fn write_config(path: &Path, config: &Value) -> Result<()> {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
-    let text = serde_json::to_string_pretty(config)?;
-    std::fs::write(path, text + "\n").with_context(|| format!("failed to write {}", path.display()))
+    let text = serde_json::to_string_pretty(config)? + "\n";
+    // Written beside the target and renamed over it: this is somebody else's
+    // editor config, and a half-written file would break their client.
+    let temp = path.with_extension(format!("mqb-{}.tmp", std::process::id()));
+    std::fs::write(&temp, text).with_context(|| format!("failed to write {}", temp.display()))?;
+    std::fs::rename(&temp, path)
+        .inspect_err(|_| {
+            let _ = std::fs::remove_file(&temp);
+        })
+        .with_context(|| format!("failed to write {}", path.display()))
 }
 
 /// Sets our entry under `mcpServers`, leaving every other key untouched.

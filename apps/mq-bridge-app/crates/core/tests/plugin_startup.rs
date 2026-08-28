@@ -90,7 +90,17 @@ async fn native_plugins_are_loaded_only_from_trusted_startup_config() {
         library.to_string_lossy().into_owned(),
     ];
     let error = trusted.update_config(trusted_config).await.unwrap_err();
-    assert!(!error.to_string().contains("startup-only"));
+    // The duplicate entries canonicalize to the already-trusted set, so this
+    // must fail on the unwritable config path, not on the startup-only gate.
+    let message = error.to_string();
+    assert!(
+        !message.contains("startup-only"),
+        "unexpected error: {message}"
+    );
+    assert!(
+        message.contains("Failed to save configuration"),
+        "expected a config-save failure, got: {message}"
+    );
     assert_eq!(
         mq_bridge::plugin::loaded_endpoint_plugins().len(),
         registrations_before.len()

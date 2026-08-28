@@ -392,6 +392,9 @@ pub(crate) struct RunningRoute {
     handle: RouteHandle,
     input: String,
     output: String,
+    /// How many messages this route was asked to keep. Zero means no capture
+    /// buffer was ever created for it, so none must be opened on its behalf.
+    capture_last: usize,
 }
 
 /// Shared map of routes started via this server, keyed by route name.
@@ -837,6 +840,7 @@ impl BridgeMcp {
                 handle,
                 input: input_label,
                 output: output_label,
+                capture_last,
             },
         );
 
@@ -987,15 +991,22 @@ impl BridgeMcp {
         &self,
         Parameters(args): Parameters<RouteNameArg>,
     ) -> Result<CallToolResult, McpError> {
-        if !self.routes.lock().await.contains_key(&args.name) {
-            return Err(invalid(format!("no route named '{}'", args.name)));
-        }
+        let captures = match self.routes.lock().await.get(&args.name) {
+            Some(route) => route.capture_last > 0,
+            None => return Err(invalid(format!("no route named '{}'", args.name))),
+        };
 
-        let messages: Vec<serde_json::Value> = MessageCapture::open(&capture_topic(&args.name))
-            .drain()
-            .into_iter()
-            .map(captured_message_json)
-            .collect();
+        // `MessageCapture::open` creates the buffer if it is missing, so a route
+        // started without `capture_last` must not go through it at all.
+        let messages: Vec<serde_json::Value> = if captures {
+            MessageCapture::open(&capture_topic(&args.name))
+                .drain()
+                .into_iter()
+                .map(captured_message_json)
+                .collect()
+        } else {
+            Vec::new()
+        };
 
         Ok(ok_json(serde_json::json!({
             "route": args.name,
@@ -1027,9 +1038,13 @@ impl BridgeMcp {
                 // topic and outlive the route, so anything still buffered would
                 // otherwise resurface as the first `route_messages` result of the
                 // next route that reuses this name.
-                let dropped = MessageCapture::open(&capture_topic(&args.name))
-                    .drain()
-                    .len();
+                let dropped = if route.capture_last > 0 {
+                    MessageCapture::open(&capture_topic(&args.name))
+                        .drain()
+                        .len()
+                } else {
+                    0
+                };
                 Ok(ok_json(serde_json::json!({
                     "stopped": args.name,
                     "messages": messages,
