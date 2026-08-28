@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html class="wa-theme-default wa-palette-default wa-brand-blue">
+<head>
+    <title>mq bridge</title>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link rel="icon" type="image/x-icon" href="/favicon.ico">
+
+    <link rel="stylesheet" href="/style.css" />
+    <script>
+        (() => {
+            const key = "theme";
+            const systemDark = window.matchMedia("(prefers-color-scheme: dark)");
+
+            const getPreference = () => localStorage.getItem(key) || "auto";
+
+            const applyColorScheme = () => {
+                const preference = getPreference();
+                const isDark =
+                    preference === "dark" ||
+                    (preference === "auto" && systemDark.matches);
+
+                document.documentElement.classList.toggle("wa-dark", isDark);
+                document.documentElement.dataset.theme = isDark ? "dark" : "light";
+                document.documentElement.dataset.themePreference = preference;
+            };
+
+            window.setThemePreference = (preference) => {
+                localStorage.setItem(key, preference);
+                applyColorScheme();
+            };
+
+            window.getThemePreference = getPreference;
+
+            applyColorScheme();
+
+            systemDark.addEventListener("change", () => {
+                if (getPreference() === "auto") {
+                    applyColorScheme();
+                }
+            });
+        })();
+    </script>
+  <script type="module" crossorigin src="/index.js"></script>
+  <link rel="stylesheet" crossorigin href="/assets/index.css">
+</head>
+<body>
+    <div id="app"></div>
+    <template id="legacy-test-shape">
+      <wa-button id="route-toggle"></wa-button>
+      <span id="pub-proto-label">Type</span>
+    </template>
+</body>
+</html>

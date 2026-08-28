@@ -1,0 +1,98 @@
+/*
+ * mq-bridge book theme — colors lifted from the desktop/UI palette
+ * (crates/core/static/style.css). Overrides mdbook's built-in "light"/"navy"
+ * theme variables so the book matches the app instead of the brown "rust" theme.
+ * Fonts and layout are left to mdbook.
+ */
+
+/* Light — mirrors :root in the UI */
+.light {
+    --bg: #f5f7fb;
+    --fg: #162033;
+
+    --sidebar-bg: #eef3fb;
+    --sidebar-fg: #162033;
+    --sidebar-non-existant: #7c8aa3;
+    --sidebar-active: #388bfd;
+    --sidebar-spacer: #ccd8ea;
+
+    --scrollbar: #ccd8ea;
+
+    --icons: #4e5f7b;
+    --icons-hover: #162033;
+
+    --links: #0b5cab;
+
+    --inline-code-color: #7a2e00;
+
+    --theme-popup-bg: #ffffff;
+    --theme-popup-border: #ccd8ea;
+    --theme-hover: #e4ecf8;
+
+    --quote-bg: #eef3fb;
+    --quote-border: #ccd8ea;
+
+    --table-border-color: #ccd8ea;
+    --table-header-bg: #e4ecf8;
+    --table-alternate-bg: #eef3fb;
+
+    --searchbar-border-color: #ccd8ea;
+    --searchbar-bg: #f6f9ff;
+    --searchbar-fg: #162033;
+    --searchbar-shadow-color: #ccd8ea;
+    --searchresults-header-fg: #4e5f7b;
+    --searchresults-border-color: #ccd8ea;
+    --searchresults-li-bg: #e4ecf8;
+    --search-mark-bg: #ffe495;
+}
+
+/* Dark — mirrors :root.wa-dark in the UI */
+.navy {
+    --bg: #0f1117;
+    --fg: #e6edf3;
+
+    --sidebar-bg: #161b22;
+    --sidebar-fg: #e6edf3;
+    --sidebar-non-existant: #7d8590;
+    --sidebar-active: #78aefc;
+    --sidebar-spacer: #2a3444;
+
+    --scrollbar: #2a3444;
+
+    --icons: #7d8590;
+    --icons-hover: #e6edf3;
+
+    --links: #78aefc;
+
+    --inline-code-color: #ffd38a;
+
+    --theme-popup-bg: #161b22;
+    --theme-popup-border: #2a3444;
+    --theme-hover: #222d3a;
+
+    --quote-bg: #1c2333;
+    --quote-border: #2a3444;
+
+    --table-border-color: #2a3444;
+    --table-header-bg: #1c2333;
+    --table-alternate-bg: #161b22;
+
+    --searchbar-border-color: #2a3444;
+    --searchbar-bg: #1c2333;
+    --searchbar-fg: #e6edf3;
+    --searchbar-shadow-color: #0f1117;
+    --searchresults-header-fg: #7d8590;
+    --searchresults-border-color: #2a3444;
+    --searchresults-li-bg: #1c2333;
+    --search-mark-bg: #6d28d9;
+}
+
+/* Menu bar tinted with the app accent instead of theme brown */
+.light .menu-bar,
+.light .menu-bar:hover {
+    background-color: #f5f7fb;
+}
+.navy .menu-bar,
+.navy .menu-bar:hover {
+    background-color: #0f1117;
+}

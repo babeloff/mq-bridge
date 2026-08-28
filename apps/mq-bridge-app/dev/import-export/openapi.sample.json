@@ -1,0 +1,28 @@
+{
+  "openapi": "3.0.0",
+  "info": {
+    "title": "MQB OpenAPI sample",
+    "version": "1.0.0"
+  },
+  "servers": [
+    {
+      "url": "http://openapi.example"
+    }
+  ],
+  "paths": {
+    "/orders": {
+      "post": {
+        "summary": "Create order",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "example": {
+                "id": 1
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

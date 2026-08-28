@@ -1,0 +1,51 @@
+# MQTT
+
+Publishes to or subscribes from an MQTT broker (v5 by default, v3 supported).
+
+## URL format
+
+```text
+mqtt://[user:pass@]host[:port]?topic=<topic>
+```
+
+`mqtt://` is rewritten to `tcp://` (and `mqtts://` to `ssl://`) before being
+handed to the MQTT client — the scheme only selects the endpoint kind on the
+CLI. MQTT topic wildcards (`+`, `#`) are supported on the source side.
+
+## Examples
+
+**Subscribe to a wildcard topic and forward to Kafka, continuous:**
+
+```bash
+mqb copy \
+  --from mqtt://broker.local:1883?topic=sensors/+/temperature \
+  --to kafka://kafka.local:9092?topic=sensor-readings
+```
+
+**Publish a file's lines to a topic, one-shot:**
+
+```bash
+mqb copy --drain \
+  --from file:///data/events.jsonl?format=json \
+  --to mqtts://user:pass@broker.local:8883?topic=events
+```
+
+**Fixed client ID and QoS 2 for exactly-once delivery semantics:**
+
+```bash
+mqb copy \
+  --from 'mqtt://broker.local:1883?topic=alerts&client_id=mqb-alerts-01&qos=2' \
+  --to null:
+```
+
+## Key options
+
+| Option | Purpose |
+|---|---|
+| `topic` | MQTT topic (wildcards on the source side). |
+| `client_id` | Fixed client ID; auto-generated if omitted. |
+| `qos` | Quality of Service (0, 1, or 2). Defaults to 1. |
+| `protocol` | `V3` or `V5`. Defaults to `V5`. |
+| `delayed_ack` | Consumer-only: ack after processing instead of on receipt (default). |
+
+Full field list: [reference/mqtt.md](../reference/mqtt.md).

@@ -1,0 +1,38 @@
+log_level: info
+ui_addr: 127.0.0.1:39091
+metrics_addr: ""
+default_tab: publishers
+
+routes:
+  ingest_http:
+    enabled: false
+    input:
+      middlewares:
+        - metrics: {}
+      http:
+        url: 127.0.0.1:39081
+    output:
+      memory:
+        topic: route-output
+
+consumers:
+  - name: memory_consumer
+    comment: Demo consumer comment
+    endpoint:
+      middlewares:
+        - metrics: {}
+      memory:
+        topic: consumer-events
+    response:
+      headers:
+        x-initial: test
+      payload: ok
+
+publishers:
+  - name: http_publisher
+    comment: Demo publisher comment
+    endpoint:
+      middlewares:
+        - metrics: {}
+      http:
+        url: http://localhost:8080/api/orders

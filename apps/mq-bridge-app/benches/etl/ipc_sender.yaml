@@ -1,0 +1,30 @@
+# Memory-IPC throughput benchmark, sender side.
+# Run via ./run_ipc_throughput.sh, not by hand — see ipc_receiver.yaml for why.
+#
+# Runs as a separate OS process; a `static` load generator produces the same
+# ~250-byte JSON row on every poll, forwarded as the publisher output to the
+# same Unix domain socket the receiver process is listening on. Start the
+# receiver process first (it owns the socket, server role); this process
+# connects as the client.
+log_level: debug
+metrics_addr: 127.0.0.1:9098
+ui_addr: 127.0.0.1:9099
+consumers:
+  - name: ipc_send
+    endpoint:
+      static:
+        body: '{"id":1,"first_name":"Jamie","country":"DE","amount":42.5,"created_at":"2026-07-11T00:00:00Z","active":true,"attributes":{"k":"v"}}'
+        raw: true
+    output:
+      mode: publisher
+      publisher: ipc_out
+    message_capture:
+      enabled: false
+    concurrency: 1
+    batch_size: 1024
+publishers:
+  - name: ipc_out
+    endpoint:
+      memory:
+        topic: "unix:///tmp/mqbipc/s.sock"
+        capacity: 4096

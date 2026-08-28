@@ -1,0 +1,28 @@
+{
+  "info": {
+    "name": "mqb sample postman",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "item": [
+    {
+      "name": "Create order",
+      "request": {
+        "method": "POST",
+        "url": {
+          "raw": "https://api.test/orders"
+        },
+        "header": [
+          {
+            "key": "Authorization",
+            "value": "Bearer t",
+            "disabled": false
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\"order\":1}"
+        }
+      }
+    }
+  ]
+}

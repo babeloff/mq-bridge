@@ -1,0 +1,32 @@
+# Exposes an HTTP endpoint and respond static content
+# Used for performance tests
+
+log_level: info,mq_bridge=info # for debugging, use  info,mq_bridge=info  or info,mq_bridge=trace
+logger: plain # plain | json
+metrics_addr: 0.0.0.0:9090 # prometheus compatible metrics
+ui_addr: 0.0.0.0:9091  # you should delete the UI on production
+routes:
+  file_to_http:
+    input:
+      file:
+        path: input.log
+        mode: consume
+        delete: true
+        format: raw
+    output:
+      middlewares:
+        - retry:
+            max_attempts: 10
+            initial_interval_ms: 100
+            max_interval_ms: 2000
+        - dlq:
+            endpoint:
+              file:
+                path: error.log
+      http: # Use environment variable substitution with a default value
+        url: ${HOST_ADDR:-localhost:3000}
+        tls:
+          required: false
+    concurrency: 1
+    batch_size: 1024
+    commit_concurrency_limit: 4096

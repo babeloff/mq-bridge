@@ -1,0 +1,68 @@
+---
+# Kafka + Arroyo for the stream-passthrough scenario (scenario 9).
+#
+# Two listeners, and both are load-bearing for a fair comparison: mq-bridge-app
+# runs on the host and reaches the broker through the published port as
+# `localhost:9092`; Arroyo runs in a container and reaches the same broker as
+# `kafka:29092` on the compose network. A single-listener broker advertising
+# `localhost:9092` is reachable from the host only — an in-container consumer
+# bootstraps fine and then fails on the advertised address, silently, as a
+# connection it never completes.
+services:
+  kafka:
+    image: confluentinc/cp-kafka:7.9.5
+    container_name: kafka-etl-bench-mq-bridge
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: 'broker,controller'
+      KAFKA_CONTROLLER_QUORUM_VOTERS: '1@kafka:9093'
+      KAFKA_CONTROLLER_LISTENER_NAMES: 'CONTROLLER'
+      CLUSTER_ID: 'Lz6m2BfHR4WZbg1VxH9c2A'
+
+      KAFKA_LISTENERS: 'HOST://:9092,INTERNAL://:29092,CONTROLLER://:9093'
+      KAFKA_ADVERTISED_LISTENERS: 'HOST://localhost:9092,INTERNAL://kafka:29092'
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: 'HOST:PLAINTEXT,INTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT'
+      KAFKA_INTER_BROKER_LISTENER_NAME: 'INTERNAL'
+
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'true'
+      KAFKA_NUM_PARTITIONS: '4'
+      KAFKA_LOG_RETENTION_MS: -1
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-topics --bootstrap-server localhost:9092 --list"]
+      interval: 5s
+      timeout: 20s
+      retries: 12
+
+  # Single-node Arroyo (controller + scheduler + worker in one process).
+  # Output and checkpoints go to named volumes rather than bind mounts: a macOS
+  # bind mount crosses the Docker Desktop VM boundary on every write, which would
+  # measure osxfs instead of the sink.
+  arroyo:
+    image: ghcr.io/arroyosystems/arroyo:0.15.0
+    container_name: arroyo-etl-bench
+    depends_on:
+      kafka:
+        condition: service_healthy
+    ports:
+      - "5115:5115"
+    command: ["cluster"]
+    environment:
+      ARROYO__DATABASE__TYPE: sqlite
+      ARROYO__DATABASE__SQLITE__PATH: /arroyo-artifacts/arroyo.sqlite
+      ARROYO__CHECKPOINT_URL: /arroyo-ckpt
+      ARROYO__COMPILER__ARTIFACT_URL: /arroyo-artifacts
+    volumes:
+      - arroyo-out:/arroyo-out
+      - arroyo-ckpt:/arroyo-ckpt
+      - arroyo-artifacts:/arroyo-artifacts
+
+volumes:
+  arroyo-out:
+  arroyo-ckpt:
+  arroyo-artifacts:

@@ -1,0 +1,16 @@
+{
+  "$comment": "Type schema for data/bench.csv, used by the CSV->JSONL benchmark to bring mq-bridge's output in line with Sling's. mq-bridge's CSV reader emits every field as a string; Sling infers `id` as an integer, leaves the other scalars as strings, and parses the embedded JSON in `attributes` into a nested object. Declaring the types here makes the transform middleware reproduce all of that: `coerce` widens the `id` string to an integer, and `contentMediaType` on `attributes` decodes the embedded document. Both tools therefore do the same per-row work, and it is priced into the benchmark timing.",
+  "type": "object",
+  "properties": {
+    "id": { "type": "integer" },
+    "first_name": { "type": "string" },
+    "country": { "type": "string" },
+    "amount": { "type": "string" },
+    "created_at": { "type": "string" },
+    "active": { "type": "string" },
+    "attributes": {
+      "type": "string",
+      "contentMediaType": "application/json"
+    }
+  }
+}

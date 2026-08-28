@@ -1,0 +1,27 @@
+# Memory-IPC throughput benchmark, receiver side.
+# Run via ./run_ipc_throughput.sh, not by hand — it starts this + the sender
+# in the right order and fails loudly on any reconnect/error churn instead of
+# silently reporting a bogus low rate.
+#
+# Runs as a separate OS process; listens on a Unix domain socket (real cross-process
+# IPC, not just an in-process channel) and discards everything it receives.
+# Deliberately no `metrics` middleware: it sits on the per-message hot path and
+# both slows throughput down and was itself the source of a false "near-zero
+# throughput" reading in an earlier version of this benchmark (a bug in the
+# metrics middleware, not a real transport stall). Instead, `log_level: debug`
+# makes the transport's own `count=`/`bytes=` log line (already emitted by
+# ipc_unix.rs per batch, no metrics crate involved) the count source — the
+# script sums those instead of scraping /metrics.
+log_level: debug
+ui_addr: 127.0.0.1:9097
+consumers:
+  - name: ipc_recv
+    endpoint:
+      memory:
+        topic: "unix:///tmp/mqbipc/s.sock"
+        capacity: 4096
+    message_capture:
+      enabled: false
+    concurrency: 1
+    batch_size: 1024
+publishers: []
