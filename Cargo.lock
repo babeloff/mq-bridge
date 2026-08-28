@@ -2477,6 +2477,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "hipstr"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "07a5072958d04f9147e517881d929d3f4706612712f8f4cfcd247f2b716d5262"
+dependencies = [
+ "loom",
+ "serde",
+]
+
+[[package]]
 name = "hkdf"
 version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7467,9 +7477,9 @@ dependencies = [
 
 [[package]]
 name = "zen-expression"
-version = "0.55.1"
+version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5856c9af91eda7a513982c0073bd64fb38f6a5d00a72f7eb83416c2df32acc9f"
+checksum = "54ebfe9b20edcb22c243efd3486e6e4ad09683da9cd9f83d198d79a2f63c618c"
 dependencies = [
  "ahash 0.8.12",
  "anyhow",
@@ -7487,6 +7497,7 @@ dependencies = [
  "rust_decimal_macros",
  "serde",
  "serde_json",
+ "smallvec",
  "strsim",
  "strum",
  "strum_macros",
@@ -7497,9 +7508,9 @@ dependencies = [
 
 [[package]]
 name = "zen-macros"
-version = "0.55.1"
+version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8f54511739f4c1cb5690912ebb1cddacd8623d4619361d569eb53d29055192bc"
+checksum = "d316b73632e248999b1dada562b3c2392df3559ddbc710a79dd287c82a596097"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -7509,16 +7520,18 @@ dependencies = [
 
 [[package]]
 name = "zen-types"
-version = "0.55.1"
+version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "af8fffa0884c139e3d4e4831ac97b7c4b087c89e2aaf77c19eb985238b0ce967"
+checksum = "8853dc6a80505b7096dae2a171b8a6a22ccb34a251dcec5d54ded2ce1c892883"
 dependencies = [
  "ahash 0.8.12",
+ "hipstr",
  "nohash-hasher",
  "rust_decimal",
  "rust_decimal_macros",
  "serde",
  "serde_json",
+ "smallvec",
  "thiserror 1.0.69",
 ]
 
