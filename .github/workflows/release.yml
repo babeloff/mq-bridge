@@ -138,16 +138,18 @@ jobs:
       # Each crate can only be dry-run as far as its dependencies are already on
       # crates.io, and this runs before anything is published:
       #   mq-bridge        - every dep is published, so the tarball builds.
-      #   app-core         - depends on the unpublished mq-bridge at this version,
-      #                      so packaging is checked but verification is not.
-      #   mq-bridge-app    - same for app-core, which cannot even be resolved, so
-      #                      only the manifest and file list are checked.
-      # The real ordering guarantee is in publish-crates-io, which publishes in
-      # dependency order and waits for the index between crates.
+      #   app-core         - depends on the unpublished mq-bridge at this version.
+      #   mq-bridge-app    - the same, through app-core.
+      # `cargo package` always re-resolves the packaged Cargo.lock against the real
+      # index with [patch.crates-io] dropped, and --no-verify skips the build but
+      # not that resolve, so both app crates can only be checked as far as --list:
+      # manifest validity and file list. The real ordering guarantee is in
+      # publish-crates-io, which publishes in dependency order and waits for the
+      # index between crates.
       - name: Package publishable crates
         run: |
           cargo package -p mq-bridge
-          cargo package --manifest-path apps/mq-bridge-app/Cargo.toml -p mq-bridge-app-core --no-verify
+          cargo package --manifest-path apps/mq-bridge-app/Cargo.toml --list -p mq-bridge-app-core > /dev/null
           cargo package --manifest-path apps/mq-bridge-app/Cargo.toml --list -p mq-bridge-app > /dev/null
 
   # Created as a draft: assets are staged onto it by the build jobs, and it is
