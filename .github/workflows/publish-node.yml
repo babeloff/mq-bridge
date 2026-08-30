@@ -16,6 +16,11 @@ name: Publish Node Package
 # publishing runs via OIDC (id-token) with provenance — no token. We deliberately
 # do NOT read NPM_TOKEN: a present-but-expired secret would be sent to the registry
 # and 401 instead of falling back to OIDC, so the credential is left out entirely.
+#
+# npm validates the trusted publisher against the *calling* workflow, not the one
+# running `npm publish`, so all six packages must be registered against
+# `release.yml`. A mismatch is silent: the OIDC exchange yields no token and the
+# publish 404s. `id-token: write` is required on the caller job too.
 
 # Invoked by release.yml after the GitHub release goes public, rather than
 # listening on `release: published` — see the note in publish-python.yml.

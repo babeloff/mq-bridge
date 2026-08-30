@@ -664,8 +664,9 @@ jobs:
       id-token: write
     uses: ./.github/workflows/publish-python.yml
 
-  # PyPI does not accept reusable workflows as trusted-publisher identities, so
-  # the final OIDC-authenticated upload stays in the top-level release workflow.
+  # The upload stays here, not in publish-python.yml: attestations are signed
+  # with the top-level workflow's identity, so only a job in release.yml can
+  # match the `release.yml` trusted publisher registered on PyPI.
   publish-python:
     name: Publish Python Packages / Publish to PyPI
     needs: build-python-packages
