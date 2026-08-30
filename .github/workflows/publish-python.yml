@@ -11,6 +11,16 @@ on:
         required: false
         default: "pypi"
         type: string
+      # Only a direct run uploads from here. `workflow_dispatch` does not declare
+      # this input, so it reads as null there and the publish job runs; callers
+      # get the default and skip it. Do not gate on `github.event_name` — in a
+      # reusable workflow that is the *caller's* event, so a manually dispatched
+      # release.yml would look like a direct run.
+      skip_publish:
+        description: "Build only; the caller performs the upload"
+        required: false
+        default: true
+        type: boolean
   workflow_dispatch:
     inputs:
       target:
@@ -243,9 +253,10 @@ jobs:
 
   publish:
     name: Publish to ${{ inputs.target == 'pypi' && 'PyPI' || 'TestPyPI' }}
-    # PyPI cannot use a reusable workflow as a trusted publisher. Keep this job
-    # only for direct manual runs; release.yml has its own orchestrated publisher.
-    if: github.event_name == 'workflow_dispatch'
+    # Direct runs only. Publishing from here under release.yml authenticates
+    # (PyPI matches the reusable workflow) but the attestation is signed with the
+    # *caller's* identity, which PyPI then rejects. release.yml uploads instead.
+    if: ${{ !inputs.skip_publish }}
     runs-on: ubuntu-latest
     needs: [build-wheels, build-sdists]
     permissions:
