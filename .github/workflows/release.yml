@@ -122,10 +122,12 @@ jobs:
       - name: Assert a single mq-bridge instance
         run: |
           set -euo pipefail
-          cargo metadata --manifest-path apps/mq-bridge-app/Cargo.toml --format-version 1 > metadata.json
+          # Written outside the checkout: a stray file in the working tree makes
+          # the `cargo package` step below fail on a dirty repository.
+          cargo metadata --manifest-path apps/mq-bridge-app/Cargo.toml --format-version 1 > "$RUNNER_TEMP/metadata.json"
           python3 - <<'EOF'
-          import json, sys
-          meta = json.load(open("metadata.json"))
+          import json, os, sys
+          meta = json.load(open(os.environ["RUNNER_TEMP"] + "/metadata.json"))
           versions = sorted({p["version"] for p in meta["packages"] if p["name"] == "mq-bridge"})
           print("mq-bridge versions in the graph:", versions)
           if len(versions) > 1:
