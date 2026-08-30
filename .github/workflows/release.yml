@@ -19,6 +19,14 @@ on:
         required: false
         default: false
         type: boolean
+      # The node addons take ~35 min to rebuild and the publish step then skips
+      # every already-published version, so a PyPI-only recovery should not pay
+      # for them.
+      skip_npm:
+        description: 'Also skip the npm publish (use when only PyPI needs re-publishing)'
+        required: false
+        default: false
+        type: boolean
 
 env:
   IMAGE_NAME: marcomq/mq-bridge-app
@@ -664,7 +672,7 @@ jobs:
     needs: publish-release
     # `publish_only` skips publish-release, and a skipped dependency skips the
     # dependent unless the condition tolerates it.
-    if: ${{ !cancelled() && (inputs.publish_only || needs.publish-release.result == 'success') }}
+    if: ${{ !cancelled() && !inputs.skip_npm && (inputs.publish_only || needs.publish-release.result == 'success') }}
     permissions:
       contents: read
       id-token: write
@@ -688,10 +696,16 @@ jobs:
   # match the `release.yml` trusted publisher registered on PyPI.
   publish-python:
     name: Publish Python Packages / Publish to PyPI
-    needs: build-python-packages
-    # A skip propagates down the whole chain, not one hop: build-python-packages
-    # opting past a skipped publish-release does not clear it for its dependents.
-    if: ${{ !cancelled() && needs.build-python-packages.result == 'success' }}
+    needs: [build-python-packages, publish-release]
+    # Deliberately `!= 'failure'` rather than `== 'success'`. Two things can make
+    # a dependency non-success here and only one is a real problem: a skip
+    # propagates down the whole chain, and a reusable-workflow caller whose child
+    # job was skipped may not report plain success either. Gate on publish-release
+    # for the ordering guarantee instead, and let a genuine wheel failure skip us.
+    if: >-
+      ${{ !cancelled()
+          && needs.build-python-packages.result != 'failure'
+          && (inputs.publish_only || needs.publish-release.result == 'success') }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
