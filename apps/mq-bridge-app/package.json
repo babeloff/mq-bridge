@@ -30,8 +30,8 @@
     "test": "npm run check && npm run test:unit && npm run test:ui",
     "generate:ui-types": "node dev/scripts/generate-ui-types.mjs",
     "check:ui-types": "node dev/scripts/generate-ui-types.mjs --check",
-    "sync:version": "node dev/scripts/sync-version.mjs",
-    "check:version": "node dev/scripts/sync-version.mjs --check",
+    "sync:version": "node ../../scripts/sync-version.mjs",
+    "check:version": "node ../../scripts/sync-version.mjs --check",
     "update:ui-vendor": "npm update @awesome.me/webawesome split.js"
   },
   "devDependencies": {
