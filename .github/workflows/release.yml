@@ -658,6 +658,10 @@ jobs:
     needs: publish-release
     permissions:
       contents: read
+      # GitHub validates the maximum permissions of every job in a reusable
+      # workflow before evaluating job-level conditions. publish-python.yml's
+      # manual-only publisher requests OIDC, even though it is skipped here.
+      id-token: write
     uses: ./.github/workflows/publish-python.yml
 
   # PyPI does not accept reusable workflows as trusted-publisher identities, so
