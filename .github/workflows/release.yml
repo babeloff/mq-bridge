@@ -79,8 +79,14 @@ jobs:
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config zlib1g-dev cmake libcurl4-openssl-dev protobuf-compiler
 
+      # Not --all-targets: it selects the benches as well, and `cargo test` runs
+      # a criterion bench in test mode, so performance_bench would start its
+      # Docker services and measure throughput here. Benches are only
+      # compile-checked.
       - name: Test mq-bridge
-        run: cargo test -p mq-bridge --all-targets --features full
+        run: |
+          cargo test -p mq-bridge --lib --bins --tests --features full
+          cargo check -p mq-bridge --benches --features full
 
       - name: Test mq-bridge-app
         run: cargo test --manifest-path apps/mq-bridge-app/Cargo.toml -p mq-bridge-app --all-targets
