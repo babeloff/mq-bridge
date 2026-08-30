@@ -629,7 +629,7 @@ jobs:
           publish() {
             for attempt in 1 2 3 4 5; do
               cargo publish -p "$1" ${2:+--manifest-path "$2"} 2>&1 | tee "publish-$1.log" && return
-              if grep -q "already uploaded" "publish-$1.log"; then
+              if grep -Eq "already uploaded|already exists on crates.io index" "publish-$1.log"; then
                 echo "$1 is already on crates.io, continuing"
                 return
               fi
@@ -653,16 +653,56 @@ jobs:
     uses: ./.github/workflows/publish-node.yml
     secrets: inherit
 
-  publish-python:
-    name: Publish Python Packages
+  build-python-packages:
+    name: Build Python Packages
     needs: publish-release
     permissions:
       contents: read
-      id-token: write
     uses: ./.github/workflows/publish-python.yml
-    with:
-      target: pypi
-    secrets: inherit
+
+  # PyPI does not accept reusable workflows as trusted-publisher identities, so
+  # the final OIDC-authenticated upload stays in the top-level release workflow.
+  publish-python:
+    name: Publish Python Packages / Publish to PyPI
+    needs: build-python-packages
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    environment:
+      name: pypi
+    steps:
+      - name: Download wheels
+        uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-*
+          path: dist
+          merge-multiple: true
+
+      - name: Download source distributions
+        uses: actions/download-artifact@v4
+        with:
+          pattern: sdist-*
+          path: dist
+          merge-multiple: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: List distribution files
+        run: ls -lh dist/
+
+      - name: Check package metadata
+        run: |
+          pip install twine
+          twine check dist/*
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/
 
   update-homebrew-tap:
     name: Update Homebrew tap
