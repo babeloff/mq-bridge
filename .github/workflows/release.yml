@@ -689,6 +689,9 @@ jobs:
   publish-python:
     name: Publish Python Packages / Publish to PyPI
     needs: build-python-packages
+    # A skip propagates down the whole chain, not one hop: build-python-packages
+    # opting past a skipped publish-release does not clear it for its dependents.
+    if: ${{ !cancelled() && needs.build-python-packages.result == 'success' }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
