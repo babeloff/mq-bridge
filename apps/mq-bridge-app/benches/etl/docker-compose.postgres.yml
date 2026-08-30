@@ -1,0 +1,28 @@
+# Mirrors the mq-bridge library's tests/integration/docker-compose/postgres_cdc.yml
+# so the ETL/CDC benchmark runs on the *same* backend the CDC integration tests use:
+# postgres:16-alpine with logical replication enabled (wal_level=logical).
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: postgres-etl-bench-mq-bridge
+    command:
+      - "postgres"
+      - "-c"
+      - "wal_level=logical"
+      - "-c"
+      - "max_wal_senders=4"
+      - "-c"
+      - "max_replication_slots=4"
+      - "-c"
+      - "wal_sender_timeout=0"
+    ports:
+      - "5432:5432"
+    environment:
+      - POSTGRES_USER=testuser
+      - POSTGRES_PASSWORD=testpass
+      - POSTGRES_DB=testdb
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U testuser -d testdb"]
+      interval: 5s
+      timeout: 5s
+      retries: 5

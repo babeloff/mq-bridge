@@ -1,0 +1,22 @@
+{
+  "type": "mqb-export",
+  "version": 1,
+  "exportedAt": "2026-04-30T00:00:00.000Z",
+  "config": {
+    "name": "sample-config",
+    "publishers": [
+      {
+        "name": "incoming",
+        "endpoint": {
+          "http": {
+            "url": "https://example.org/orders"
+          }
+        }
+      }
+    ],
+    "consumers": [],
+    "routes": {}
+  },
+  "presets": {},
+  "envVars": {}
+}

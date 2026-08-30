@@ -1,0 +1,27 @@
+# Exposes an HTTP endpoint and respond static content
+# Used for performance tests
+
+# General settings
+log_level: "info"
+
+routes:
+  http_sender:
+    input:
+      static: "Hello World!" # The HTTP response body
+    output:
+      middlewares:
+        - retry:
+            max_attempts: 10
+            initial_interval_ms: 100
+            max_interval_ms: 2000
+        - dlq:
+            endpoint:
+              file:
+                path: error.out
+      http:
+        url: "${HOST_ADDR:-localhost:3000}" # Listen for webhooks on port 3000
+    concurrency: 32
+    batch_size: 128
+    commit_concurrency_limit: 4096
+
+        

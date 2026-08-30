@@ -1,0 +1,17 @@
+# Exposes an HTTP endpoint and respond static content
+# Used for performance tests
+
+# General settings
+log_level: "info,mq_bridge=trace"
+
+routes:
+  http_server:
+    input:
+      http:
+        url: "0.0.0.0:8080" # Listen for webhooks on port 8080
+    output:
+      static: "Hello World!" # The HTTP response body
+    concurrency: 10
+    batch_size: 200
+    commit_concurrency_limit: 4096
+        

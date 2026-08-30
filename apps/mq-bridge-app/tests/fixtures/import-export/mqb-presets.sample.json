@@ -1,0 +1,19 @@
+{
+  "type": "mqb-presets",
+  "version": 1,
+  "exportedAt": "2026-04-30T00:00:00.000Z",
+  "presets": {
+    "orders_http": [
+      {
+        "name": "preset_1",
+        "method": "POST",
+        "url": "https://api.local/orders",
+        "payload": "{\"order\":1}",
+        "headers": []
+      }
+    ]
+  },
+  "envVars": {
+    "baseUrl": "https://api.local"
+  }
+}

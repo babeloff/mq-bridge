@@ -1,0 +1,15 @@
+# Reads messages from a RabbitMQ queue and appends them to a log file.
+# Note: When using with Docker, ensure you mount a volume to the path specified.
+# e.g., -v ./data:/data
+
+log_level: "info"
+
+routes:
+  amqp_to_file:
+    input:
+      amqp:
+        url: "amqp://guest:guest@rabbitmq:5672/%2f"
+        queue: "my-queue"
+    output:
+      file:
+        path: "/data/messages.log"

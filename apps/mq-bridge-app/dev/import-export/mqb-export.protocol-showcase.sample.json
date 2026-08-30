@@ -1,0 +1,270 @@
+{
+  "type": "mqb-export",
+  "version": 1,
+  "exportedAt": "2026-04-30T00:00:00.000Z",
+  "config": {
+    "log_level": "info",
+    "default_tab": "publishers",
+    "publishers": [
+      {
+        "name": "pub_http_orders_api",
+        "comment": "HTTP publisher to upstream orders API",
+        "endpoint": {
+          "http": {
+            "url": "https://api.example.com/orders",
+            "method": "POST",
+            "custom_headers": {
+              "x-tenant": "demo",
+              "content-type": "application/json"
+            }
+          }
+        }
+      },
+      {
+        "name": "pub_nats_orders",
+        "comment": "NATS publisher",
+        "endpoint": {
+          "nats": {
+            "url": "nats://localhost:4222",
+            "subject": "orders.created",
+            "stream": "ORDERS"
+          }
+        }
+      },
+      {
+        "name": "pub_rabbitmq_orders",
+        "comment": "AMQP publisher",
+        "endpoint": {
+          "amqp": {
+            "url": "amqp://guest:guest@localhost:5672/%2f",
+            "exchange": "orders.exchange",
+            "queue": "orders.out"
+          }
+        }
+      },
+      {
+        "name": "pub_kafka_orders",
+        "comment": "Kafka publisher",
+        "endpoint": {
+          "kafka": {
+            "url": "localhost:9092",
+            "topic": "orders.events"
+          }
+        }
+      },
+      {
+        "name": "pub_zeromq_orders",
+        "comment": "ZeroMQ publisher",
+        "endpoint": {
+          "zeromq": {
+            "url": "tcp://127.0.0.1:5556",
+            "socket_type": "push",
+            "bind": false
+          }
+        }
+      },
+      {
+        "name": "pub_mqtt_orders",
+        "comment": "MQTT publisher",
+        "endpoint": {
+          "mqtt": {
+            "url": "tcp://localhost:1883",
+            "topic": "orders/events"
+          }
+        }
+      },
+      {
+        "name": "pub_grpc_orders",
+        "comment": "gRPC publisher",
+        "endpoint": {
+          "grpc": {
+            "url": "http://localhost:50051",
+            "topic": "orders.events"
+          }
+        }
+      },
+      {
+        "name": "pub_memory_orders",
+        "comment": "In-memory publisher for local tests",
+        "endpoint": {
+          "memory": {
+            "topic": "orders.memory"
+          }
+        }
+      }
+    ],
+    "consumers": [
+      {
+        "name": "cons_http_ingest",
+        "comment": "HTTP ingest endpoint with custom response",
+        "endpoint": {
+          "middlewares": [
+            {
+              "metrics": {}
+            }
+          ],
+          "http": {
+            "url": "0.0.0.0:39095",
+            "workers": 4
+          }
+        },
+        "response": {
+          "headers": {
+            "content-type": "application/json",
+            "x-source": "mq-bridge-demo"
+          },
+          "payload": "{\"status\":\"accepted\"}"
+        }
+      },
+      {
+        "name": "cons_nats_orders",
+        "comment": "NATS consumer",
+        "endpoint": {
+          "middlewares": [
+            {
+              "metrics": {}
+            }
+          ],
+          "nats": {
+            "url": "nats://localhost:4222",
+            "subject": "orders.created",
+            "stream": "ORDERS"
+          }
+        }
+      },
+      {
+        "name": "cons_rabbitmq_orders",
+        "comment": "AMQP consumer",
+        "endpoint": {
+          "middlewares": [
+            {
+              "metrics": {}
+            }
+          ],
+          "amqp": {
+            "url": "amqp://guest:guest@localhost:5672/%2f",
+            "queue": "orders.in"
+          }
+        }
+      },
+      {
+        "name": "cons_kafka_orders",
+        "comment": "Kafka consumer",
+        "endpoint": {
+          "middlewares": [
+            {
+              "metrics": {}
+            }
+          ],
+          "kafka": {
+            "url": "localhost:9092",
+            "topic": "orders.events",
+            "group_id": "mqb-demo-consumers"
+          }
+        }
+      },
+      {
+        "name": "cons_zeromq_orders",
+        "comment": "ZeroMQ SUB consumer",
+        "endpoint": {
+          "middlewares": [
+            {
+              "metrics": {}
+            }
+          ],
+          "zeromq": {
+            "url": "tcp://127.0.0.1:5557",
+            "socket_type": "sub",
+            "topic": "orders",
+            "bind": false
+          }
+        }
+      },
+      {
+        "name": "cons_mqtt_orders",
+        "comment": "MQTT consumer",
+        "endpoint": {
+          "middlewares": [
+            {
+              "metrics": {}
+            }
+          ],
+          "mqtt": {
+            "url": "tcp://localhost:1883",
+            "topic": "orders/events"
+          }
+        }
+      },
+      {
+        "name": "cons_grpc_orders",
+        "comment": "gRPC consumer",
+        "endpoint": {
+          "middlewares": [
+            {
+              "metrics": {}
+            }
+          ],
+          "grpc": {
+            "url": "http://localhost:50051",
+            "topic": "orders.events"
+          }
+        }
+      },
+      {
+        "name": "cons_memory_orders",
+        "comment": "Memory consumer for easy local screenshots",
+        "endpoint": {
+          "middlewares": [
+            {
+              "metrics": {}
+            }
+          ],
+          "memory": {
+            "topic": "orders.memory"
+          }
+        }
+      }
+    ],
+    "routes": {}
+  },
+  "presets": {
+    "pub_http_orders_api": [
+      {
+        "name": "create_order",
+        "method": "POST",
+        "url": "${baseUrl}/orders",
+        "payload": "{\"orderId\": \"A-1001\", \"status\": \"created\"}",
+        "headers": [
+          {
+            "key": "authorization",
+            "value": "Bearer ${apiToken}",
+            "enabled": true
+          },
+          {
+            "key": "content-type",
+            "value": "application/json",
+            "enabled": true
+          }
+        ]
+      },
+      {
+        "name": "update_order",
+        "method": "PUT",
+        "url": "${baseUrl}/orders/A-1001",
+        "payload": "{\"status\": \"shipped\"}",
+        "headers": [
+          {
+            "key": "authorization",
+            "value": "Bearer ${apiToken}",
+            "enabled": true
+          }
+        ]
+      }
+    ]
+  },
+  "envVars": {
+    "baseUrl": "https://api.example.com",
+    "apiToken": "demo-token"
+  }
+}
+

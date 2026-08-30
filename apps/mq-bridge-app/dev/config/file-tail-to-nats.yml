@@ -1,0 +1,14 @@
+# Tails a log file and forwards new lines to a NATS subject.
+# Useful for log aggregation.
+
+log_level: "info"
+
+routes:
+  file_to_nats:
+    input:
+      file:
+        path: "input.log"
+    output:
+      nats:
+        url: "nats:4222"
+        subject: "app-logs"

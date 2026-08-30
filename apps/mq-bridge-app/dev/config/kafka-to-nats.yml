@@ -1,0 +1,14 @@
+# A simple route from a Kafka topic to a NATS subject.
+
+log_level: "info"
+
+routes:
+  kafka_to_nats:
+    input:
+      kafka:
+        url: "kafka:9092"
+        topic: "events-in"
+    output:
+      nats:
+        url: "nats:4222"
+        subject: "events-out"

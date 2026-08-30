@@ -1,0 +1,14 @@
+# Exposes an HTTP endpoint and forwards incoming requests to a Kafka topic.
+
+# General settings
+log_level: "info"
+
+routes:
+  webhook_to_kafka:
+    input:
+      http:
+        url: "0.0.0.0:8080" # Listen for webhooks on port 8080
+    output:
+      kafka:
+        url: "kafka:9092"
+        topic: "webhook-events"

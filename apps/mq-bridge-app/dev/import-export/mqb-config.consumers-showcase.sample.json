@@ -1,0 +1,139 @@
+{
+  "type": "mqb-config",
+  "version": 1,
+  "exportedAt": "2026-04-30T00:00:00.000Z",
+  "config": {
+    "consumers": [
+      {
+        "name": "consumer_http_orders",
+        "comment": "HTTP consumer with custom response",
+        "endpoint": {
+          "middlewares": [
+            {
+              "metrics": {}
+            }
+          ],
+          "http": {
+            "url": "0.0.0.0:39101"
+          }
+        },
+        "response": {
+          "headers": {
+            "content-type": "application/json",
+            "x-demo": "true"
+          },
+          "payload": "{\"accepted\": true}"
+        }
+      },
+      {
+        "name": "consumer_kafka_orders",
+        "comment": "Kafka consumer",
+        "endpoint": {
+          "middlewares": [
+            {
+              "metrics": {}
+            }
+          ],
+          "kafka": {
+            "url": "localhost:9092",
+            "topic": "orders.events",
+            "group_id": "mqb-consumer-showcase"
+          }
+        }
+      },
+      {
+        "name": "consumer_nats_orders",
+        "comment": "NATS consumer",
+        "endpoint": {
+          "middlewares": [
+            {
+              "metrics": {}
+            }
+          ],
+          "nats": {
+            "url": "nats://localhost:4222",
+            "subject": "orders.created",
+            "stream": "ORDERS"
+          }
+        }
+      },
+      {
+        "name": "consumer_amqp_orders",
+        "comment": "AMQP consumer",
+        "endpoint": {
+          "middlewares": [
+            {
+              "metrics": {}
+            }
+          ],
+          "amqp": {
+            "url": "amqp://guest:guest@localhost:5672/%2f",
+            "queue": "orders.in"
+          }
+        }
+      },
+      {
+        "name": "consumer_mqtt_orders",
+        "comment": "MQTT consumer",
+        "endpoint": {
+          "middlewares": [
+            {
+              "metrics": {}
+            }
+          ],
+          "mqtt": {
+            "url": "tcp://localhost:1883",
+            "topic": "orders/events"
+          }
+        }
+      },
+      {
+        "name": "consumer_zeromq_orders",
+        "comment": "ZeroMQ subscriber",
+        "endpoint": {
+          "middlewares": [
+            {
+              "metrics": {}
+            }
+          ],
+          "zeromq": {
+            "url": "tcp://127.0.0.1:5559",
+            "socket_type": "sub",
+            "topic": "orders",
+            "bind": false
+          }
+        }
+      },
+      {
+        "name": "consumer_grpc_orders",
+        "comment": "gRPC consumer",
+        "endpoint": {
+          "middlewares": [
+            {
+              "metrics": {}
+            }
+          ],
+          "grpc": {
+            "url": "http://localhost:50051",
+            "topic": "orders.events"
+          }
+        }
+      },
+      {
+        "name": "consumer_memory_orders",
+        "comment": "Memory consumer for local testing",
+        "endpoint": {
+          "middlewares": [
+            {
+              "metrics": {}
+            }
+          ],
+          "memory": {
+            "topic": "orders.memory"
+          }
+        }
+      }
+    ]
+  }
+}
+

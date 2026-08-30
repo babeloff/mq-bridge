@@ -1,0 +1,38 @@
+# A lightweight broker setup using the file system as a persistent queue.
+# Messages are received via HTTP, stored in a file, and then processed (e.g., sent to a webhook).
+# Ensure the /data directory is mounted/writable.
+# There is no High Availability or 
+
+log_level: "info"
+metrics_addr: 0.0.0.0:9090
+
+routes:
+  # Combined broker route handling both ingest and read operations on the same port.
+  http_broker:
+    input:
+      middlewares:
+        - metrics: {}
+      http:
+        url: "0.0.0.0:8080"
+    output:
+      switch:
+        metadata_key: "http_path"
+        default:
+          static: "NOT FOUND"
+        cases:
+          "/status":
+            static: OK
+          "/pull":
+            reader:
+              file:
+                path: queue.log
+                mode: consume
+                delete: true
+          "/push":
+            file:
+              path: queue.log
+            middlewares:
+              - dlq:
+                  endpoint:
+                    file:
+                      path: error.log

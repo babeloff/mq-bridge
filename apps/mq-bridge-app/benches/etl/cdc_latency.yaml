@@ -1,0 +1,35 @@
+# Scenario 2 — CDC event-to-sink latency, zero-code config path.
+#
+# A single consumer route: postgres_cdc (logical replication) -> discard (null).
+# The `metrics` middleware on the input endpoint makes the engine record
+# `queue_message_processing_duration_seconds{route="collector_cdc_lat",endpoint="input"}`
+# per event, exposed as Prometheus summary quantiles on metrics_addr. Those
+# quantiles are the latency proxy (in-engine per-event processing/decode time on
+# the consumer side — see METHODOLOGY.md for exactly what this does and does not
+# measure vs. Debezium end-to-end).
+#
+# Apply it (starts the route) with:  POST /config  to the UI address — the runner
+# (run_cdc_latency.sh) does this. concurrency/batch_size are the swept knobs.
+log_level: info
+metrics_addr: 127.0.0.1:9090
+ui_addr: 127.0.0.1:9091
+consumers:
+  - name: cdc_lat
+    endpoint:
+      middlewares:
+        - metrics: {}
+      postgres_cdc:
+        url: postgres://testuser:testpass@localhost:5432/testdb
+        publication: mqb_pub
+        slot_name: mqb_slot
+        create_slot: true
+        # Permanent slot: a temporary slot is dropped when its creating connection
+        # closes, which races the streaming connection ("slot does not exist").
+        # The runner drops the slot before each run so it starts clean.
+        temporary_slot: false
+        status_interval_ms: 1000
+    message_capture:
+      enabled: false
+    concurrency: 1
+    batch_size: 1
+publishers: []

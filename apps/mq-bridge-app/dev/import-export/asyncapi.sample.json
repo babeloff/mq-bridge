@@ -1,0 +1,25 @@
+{
+  "asyncapi": "2.6.0",
+  "info": {
+    "title": "MQB AsyncAPI sample",
+    "version": "1.0.0"
+  },
+  "servers": {
+    "production": {
+      "url": "mqtt://broker.local:1883",
+      "protocol": "mqtt"
+    }
+  },
+  "channels": {
+    "orders/created": {
+      "publish": {
+        "summary": "Publish order created",
+        "message": {
+          "example": {
+            "id": 42
+          }
+        }
+      }
+    }
+  }
+}

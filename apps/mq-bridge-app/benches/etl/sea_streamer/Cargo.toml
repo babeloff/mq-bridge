@@ -1,0 +1,32 @@
+[package]
+name = "sea-streamer-etl-bench"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[features]
+mimalloc = ["dep:mimalloc"]
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4.5", features = ["derive"] }
+mimalloc = { version = "0.1", default-features = false, optional = true }
+sea-streamer-file = { version = "=0.5.2", features = ["executables"] }
+sea-streamer-kafka = "=0.5.0"
+sea-streamer-socket = { version = "=0.5.2", features = [
+    "executables",
+    "backend-file",
+    "backend-kafka",
+] }
+sea-streamer-types = "=0.5.2"
+tokio = { version = "1.10", features = ["full"] }
+
+[[bin]]
+name = "sea-streamer-relay"
+path = "src/bin/relay.rs"
+
+[[bin]]
+name = "sea-streamer-count"
+path = "src/bin/count.rs"

@@ -100,6 +100,14 @@ impl Drop for OutcomeGuard {
             s.error = Some("route task panicked or was aborted".to_string());
             RouteOutcome::Failed
         });
+        // A drained source can finish before the reconnect loop processes its
+        // buffered ready signal or before a recovered pass reaches `STABLE_RUN`.
+        // Either way, a clean terminal outcome makes any connection error stale.
+        if matches!(outcome, RouteOutcome::Completed) {
+            let mut s = recover_write_lock(&self.status, "route_handle_status");
+            s.healthy = true;
+            s.error = None;
+        }
         // A route that discarded data did not run clean, whatever its outcome.
         // Only a `Failed` route's cause is kept over the drop report: it explains
         // why the route stopped. On any other outcome a lingering `error` is a
@@ -2337,6 +2345,36 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
+
+    #[test]
+    fn completed_route_clears_stale_connection_status() {
+        for error in ["connecting", "temporary disconnect"] {
+            let outcome = Arc::new(RwLock::new(None));
+            let status = Arc::new(RwLock::new(EndpointStatus {
+                healthy: false,
+                error: Some(error.to_string()),
+                ..Default::default()
+            }));
+
+            {
+                let mut guard = OutcomeGuard {
+                    outcome: Arc::clone(&outcome),
+                    status: Arc::clone(&status),
+                    drops: Arc::new(RwLock::new(DropReport::default())),
+                    resolved: None,
+                };
+                guard.set(RouteOutcome::Completed);
+            }
+
+            let status = recover_read_lock(&status, "test_route_handle_status");
+            assert!(status.healthy);
+            assert_eq!(status.error, None);
+            assert_eq!(
+                *recover_read_lock(&outcome, "test_route_handle_outcome"),
+                Some(RouteOutcome::Completed)
+            );
+        }
+    }
 
     #[test]
     fn infers_idempotent_sink_mechanisms() {

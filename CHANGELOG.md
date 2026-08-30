@@ -2,6 +2,14 @@
 
 All notable changes to `mq-bridge`. Newest first.
 
+## 0.4.9
+
+### Fixed
+
+- **Completed drain routes no longer retain stale connection failures.** A finite source that
+  finishes before its ready signal or recovery timer is processed now reports a healthy,
+  successful terminal status. Errors for messages dropped without a DLQ remain visible.
+
 ## 0.4.8
 
 ### Added
