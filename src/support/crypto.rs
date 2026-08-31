@@ -313,3 +313,81 @@ mod tests {
         assert!(Crypto::new(&cfg).is_err());
     }
 }
+
+/// AEAD properties. Round-tripping is the obvious one; the tamper and wrong-AAD cases are the
+/// reason this is AEAD rather than a plain cipher, and neither is covered by an example test.
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    fn ciphers() -> impl Strategy<Value = CipherKind> {
+        prop_oneof![
+            Just(CipherKind::Xchacha20poly1305),
+            Just(CipherKind::Aes256gcm),
+        ]
+    }
+
+    fn crypto(cipher: CipherKind) -> Crypto {
+        Crypto::new(&EncryptionConfig {
+            cipher,
+            key_id: "k1".to_string(),
+            key: base64::engine::general_purpose::STANDARD.encode([7u8; 32]),
+            decrypt_keys: HashMap::new(),
+        })
+        .unwrap()
+    }
+
+    proptest! {
+        #[test]
+        fn a_sealed_payload_opens_back_to_itself(
+            cipher in ciphers(),
+            plaintext in prop::collection::vec(any::<u8>(), 0..2048),
+            aad in prop::collection::vec(any::<u8>(), 0..64),
+        ) {
+            let c = crypto(cipher);
+            let envelope = c.seal(&plaintext, &aad).unwrap();
+            prop_assert_eq!(c.open(&envelope, &aad).unwrap(), plaintext);
+        }
+
+        /// A fresh nonce per seal means two seals of the same input never collide.
+        #[test]
+        fn sealing_twice_never_produces_the_same_envelope(
+            cipher in ciphers(),
+            plaintext in prop::collection::vec(any::<u8>(), 1..256),
+        ) {
+            let c = crypto(cipher);
+            prop_assert_ne!(
+                c.seal(&plaintext, b"").unwrap(),
+                c.seal(&plaintext, b"").unwrap()
+            );
+        }
+
+        #[test]
+        fn flipping_any_byte_of_the_envelope_fails_to_open(
+            cipher in ciphers(),
+            plaintext in prop::collection::vec(any::<u8>(), 1..256),
+            index in any::<prop::sample::Index>(),
+            xor in 1u8..=255,
+        ) {
+            let c = crypto(cipher);
+            let mut envelope = c.seal(&plaintext, b"").unwrap();
+            let at = index.index(envelope.len());
+            envelope[at] ^= xor;
+            prop_assert!(c.open(&envelope, b"").is_err());
+        }
+
+        #[test]
+        fn opening_with_different_aad_fails(
+            cipher in ciphers(),
+            plaintext in prop::collection::vec(any::<u8>(), 1..256),
+            sealed_aad in prop::collection::vec(any::<u8>(), 0..32),
+            opened_aad in prop::collection::vec(any::<u8>(), 0..32),
+        ) {
+            prop_assume!(sealed_aad != opened_aad);
+            let c = crypto(cipher);
+            let envelope = c.seal(&plaintext, &sealed_aad).unwrap();
+            prop_assert!(c.open(&envelope, &opened_aad).is_err());
+        }
+    }
+}

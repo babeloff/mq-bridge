@@ -307,3 +307,54 @@ mod tests {
         }
     }
 }
+
+/// Round-trip properties for the member codec. The sinks append one member per batch and the
+/// readers stream the result back, so "any payload survives" and "members concatenate" are the
+/// two invariants the file and object_store formats rest on.
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    fn algorithms() -> impl Strategy<Value = Compression> {
+        prop_oneof![
+            Just(Compression::Gzip),
+            Just(Compression::Lz4),
+            Just(Compression::Zstd),
+        ]
+    }
+
+    proptest! {
+        #[test]
+        fn a_member_round_trips(
+            algo in algorithms(),
+            data in prop::collection::vec(any::<u8>(), 0..4096),
+        ) {
+            let packed = compress_member(algo, &data).unwrap();
+            prop_assert_eq!(decompress_all(algo, &packed, None).unwrap(), data);
+        }
+
+        #[test]
+        fn concatenated_members_decode_as_one_stream(
+            algo in algorithms(),
+            first in prop::collection::vec(any::<u8>(), 0..1024),
+            second in prop::collection::vec(any::<u8>(), 0..1024),
+        ) {
+            let mut packed = compress_member(algo, &first).unwrap();
+            packed.extend_from_slice(&compress_member(algo, &second).unwrap());
+            let joined: Vec<u8> = first.iter().chain(second.iter()).copied().collect();
+            prop_assert_eq!(decompress_all(algo, &packed, None).unwrap(), joined);
+        }
+
+        /// The bomb guard rejects rather than allocating whatever the member expands to.
+        #[test]
+        fn the_size_limit_rejects_oversized_output(
+            algo in algorithms(),
+            data in prop::collection::vec(any::<u8>(), 64..2048),
+        ) {
+            let packed = compress_member(algo, &data).unwrap();
+            let limit = (data.len() - 1) as u64;
+            prop_assert!(decompress_all(algo, &packed, Some(limit)).is_err());
+        }
+    }
+}

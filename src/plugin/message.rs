@@ -20,19 +20,22 @@ pub(crate) unsafe fn from_abi(ptr: *const MqbMessage, len: usize) -> Vec<Canonic
     if ptr.is_null() || len == 0 {
         return Vec::new();
     }
-    std::slice::from_raw_parts(ptr, len)
+    unsafe { std::slice::from_raw_parts(ptr, len) }
         .iter()
         .map(|message| {
             let id = u128::from_be_bytes(message.message_id);
-            let mut canonical =
-                CanonicalMessage::new(message.payload.as_bytes().to_vec(), (id != 0).then_some(id));
+            let mut canonical = CanonicalMessage::new(
+                unsafe { message.payload.as_bytes() }.to_vec(),
+                (id != 0).then_some(id),
+            );
             if !message.metadata.is_null() && message.metadata_len > 0 {
-                let entries = std::slice::from_raw_parts(message.metadata, message.metadata_len);
+                let entries =
+                    unsafe { std::slice::from_raw_parts(message.metadata, message.metadata_len) };
                 canonical.metadata = HashMap::with_capacity(entries.len());
                 for entry in entries {
                     canonical.metadata.insert(
-                        String::from_utf8_lossy(entry.key.as_bytes()).into_owned(),
-                        String::from_utf8_lossy(entry.value.as_bytes()).into_owned(),
+                        String::from_utf8_lossy(unsafe { entry.key.as_bytes() }).into_owned(),
+                        String::from_utf8_lossy(unsafe { entry.value.as_bytes() }).into_owned(),
                     );
                 }
             }

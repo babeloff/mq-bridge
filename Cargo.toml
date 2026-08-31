@@ -34,6 +34,11 @@ resolver = "2"
 # Lints that are off by default in rustc/clippy and mark code that was never meant to
 # ship. Kept at `warn` so a local `cargo check` surfaces them; CI already runs clippy
 # with `-D warnings`, which promotes them to hard errors there.
+[workspace.lints.rust]
+# Allow-by-default in edition 2021, warn-by-default from edition 2024. Turning it on now keeps
+# each unsafe operation in the plugin FFI layer marked at its own call site.
+unsafe_op_in_unsafe_fn = "warn"
+
 [workspace.lints.clippy]
 todo = "warn"
 dbg_macro = "warn"
@@ -355,6 +360,8 @@ chrono = "0.4"
 metrics-util = "0.20"
 # pgoutput decoder unit tests decode hex-encoded wire fixtures.
 hex = "0.4"
+# Round-trip properties for the pure codecs (compression, crypto, zeromq frames, templates).
+proptest = "1"
 criterion = { version = "0.8", features = ["async", "async_tokio"] }
 # Used by the router_bench microbench to model the proposed lock-free route table.
 arc-swap = "1"
