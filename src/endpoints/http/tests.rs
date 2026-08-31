@@ -6,14 +6,10 @@
 use super::*;
 use crate::endpoints::{create_consumer_from_route, create_publisher_from_route};
 use crate::models::{Config, Endpoint, EndpointType, StreamBufferConfig};
+use crate::test_utils::get_free_port;
 use hyper::header::{ACCEPT, ACCEPT_ENCODING, CONTENT_TYPE};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-fn get_free_port() -> u16 {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.local_addr().unwrap().port()
-}
 
 async fn wait_for_server_ready(addr: &str, timeout: Duration) -> bool {
     let start = Instant::now();

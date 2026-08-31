@@ -4,6 +4,7 @@ use futures::{SinkExt, StreamExt};
 use mq_bridge::endpoints::websocket::WebSocketConsumer;
 use mq_bridge::endpoints::websocket::WebSocketPublisher;
 use mq_bridge::models::{Endpoint, EndpointType, WebSocketConfig, WebSocketExecutionMode};
+use mq_bridge::test_utils::get_free_port;
 use mq_bridge::traits::{MessageConsumer, MessageDisposition, MessagePublisher};
 use mq_bridge::{CanonicalMessage, Handled, HandlerError, Route};
 use tokio_websockets::{ClientBuilder, Message};
@@ -14,11 +15,6 @@ async fn echo(msg: CanonicalMessage) -> Result<Handled, HandlerError> {
 
 async fn ack(_msg: CanonicalMessage) -> Result<Handled, HandlerError> {
     Ok(Handled::Ack)
-}
-
-fn get_free_port() -> u16 {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.local_addr().unwrap().port()
 }
 
 async fn connect(
