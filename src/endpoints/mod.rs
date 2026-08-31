@@ -3120,14 +3120,18 @@ mod tests {
 
         #[test]
         fn an_input_only_rejection_names_the_route_that_carries_it() {
-            let err = check_consumer("orders_in", &switch_over(vec![("paid", null())], None), None)
-                .unwrap_err()
-                .to_string();
+            let err = check_consumer(
+                "orders_in",
+                &switch_over(vec![("paid", null())], None),
+                None,
+            )
+            .unwrap_err()
+            .to_string();
             assert!(err.contains("orders_in"), "{err}");
         }
 
-        /// The policy list governs transports. Structural types stay reachable whatever it says,
-        /// so a policy of `["memory"]` must not lock a route out of `null` or `fanout`.
+        /// The policy list governs transports. Core types stay reachable whatever it says, so a
+        /// policy of `["memory"]` must not lock a route out of `null`, `fanout` or `file`.
         #[test]
         fn the_policy_list_never_blocks_a_core_endpoint_type() {
             let allowed: &[&str] = &["memory"];
@@ -3137,7 +3141,21 @@ mod tests {
                 Endpoint::new(EndpointType::Fanout(vec![null()])),
             ] {
                 assert!(check_publisher("test", &endpoint, Some(allowed)).is_ok());
-                assert!(check_consumer("test", &endpoint, Some(allowed)).is_ok());
+            }
+
+            let file = Endpoint::new(EndpointType::File(crate::models::FileConfig::new(
+                "/tmp/policy_probe.jsonl",
+            )));
+            assert!(check_consumer("test", &file, Some(allowed)).is_ok());
+        }
+
+        /// `null` and `fanout` are sinks. They are refused as inputs on role grounds, not policy,
+        /// so the absence of any policy at all must not let them through.
+        #[test]
+        fn output_only_types_are_refused_as_inputs_whatever_the_policy() {
+            for endpoint in [null(), Endpoint::new(EndpointType::Fanout(vec![null()]))] {
+                assert!(check_consumer("test", &endpoint, None).is_err());
+                assert!(check_publisher("test", &endpoint, None).is_ok());
             }
         }
 

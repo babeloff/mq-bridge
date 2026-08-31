@@ -445,6 +445,19 @@ async fn pause_after_empty_batch(delay_ms: u64) {
     }
 }
 
+/// Drained commit and worker tasks yield a `JoinError` only when the task panicked, which the
+/// task's own error handling never sees. A panicked commit means a batch was never acked, so
+/// these must not be dropped silently.
+fn report_join_result<T>(res: std::result::Result<T, tokio::task::JoinError>, what: &str) {
+    if let Err(e) = res {
+        if e.is_cancelled() {
+            debug!("{} was cancelled before completing", what);
+        } else {
+            error!("{} panicked: {}", what, e);
+        }
+    }
+}
+
 fn report_route_error(err_tx: &Sender<anyhow::Error>, err: anyhow::Error, context: &str) {
     match err_tx.try_send(err) {
         Ok(_) => trace!("Reported error to main task"),
@@ -623,7 +636,9 @@ async fn send_batch_and_commit(
             let permit = acquire_commit_permit(commit_semaphore).await;
             let err_tx = err_tx.clone();
             // Reap finished commits so completed results don't accumulate until shutdown.
-            while commit_tasks.try_join_next().is_some() {}
+            while let Some(res) = commit_tasks.try_join_next() {
+                report_join_result(res, "Commit task");
+            }
             commit_tasks.spawn(async move {
                 let _permit = permit;
                 if let Err(e) = commit(dispositions).await {
@@ -727,7 +742,9 @@ async fn send_batch_and_commit(
             );
             let permit = acquire_commit_permit(commit_semaphore).await;
             // Reap finished commits so completed results don't accumulate until shutdown.
-            while commit_tasks.try_join_next().is_some() {}
+            while let Some(res) = commit_tasks.try_join_next() {
+                report_join_result(res, "Commit task");
+            }
             commit_tasks.spawn(async move {
                 let _permit = permit;
                 if let Err(e) = commit(dispositions).await {
@@ -1546,8 +1563,9 @@ impl Route {
                     }
                 }
                 res = commit_tasks.join_next() => {
-                    if res.is_none() {
-                        break;
+                    match res {
+                        Some(res) => report_join_result(res, "Commit task"),
+                        None => break,
                     }
                 }
             }
@@ -1703,7 +1721,9 @@ impl Route {
                     }
                 }
                 // Wait for all in-flight commits to complete
-                while commit_tasks.join_next().await.is_some() {}
+                while let Some(res) = commit_tasks.join_next().await {
+                    report_join_result(res, "Commit task");
+                }
             });
         }
 
@@ -1837,7 +1857,9 @@ impl Route {
         // are not aborted mid-sequence.
         drop(work_tx);
         // Wait for all worker tasks to complete.
-        while join_set.join_next().await.is_some() {}
+        while let Some(res) = join_set.join_next().await {
+            report_join_result(res, "Worker task");
+        }
 
         // Close sequencer (if any) now that all in-flight commits have drained.
         commit_router.shutdown().await;
