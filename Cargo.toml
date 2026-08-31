@@ -171,7 +171,7 @@ aes-gcm = { version = "0.11", optional = true }
 
 # Expression VM for the `filter` feature. `regex-lite` keeps the regex engine
 # pure Rust; the default features pull a heavier one.
-zen-expression = { version = "0.55.1", optional = true, default-features = false, features = ["regex-lite"] }
+zen-expression = { version = "2.0", optional = true, default-features = false, features = ["regex-lite"] }
 rust_decimal = { version = "1", optional = true }
 tokio-websockets = { version = "0.13", optional = true, default-features = false, features = ["client", "server", "sha1_smol", "fastrand"] }
 

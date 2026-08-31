@@ -472,7 +472,11 @@ impl MessagePublisher for MongoDbPublisher {
             }
         }
 
-        match self.collection.insert_many(docs).await {
+        // Unordered: an ordered insert stops at the first error, so one duplicate
+        // `_id` would leave the rest of the batch uninserted and indistinguishable
+        // from a failure. Documents carry their own `seq`, so insertion order
+        // holds nothing the stored data depends on.
+        match self.collection.insert_many(docs).ordered(false).await {
             Ok(_) => {
                 if failed_messages.is_empty() {
                     Ok(SentBatch::Ack)
@@ -510,30 +514,20 @@ impl MessagePublisher for MongoDbPublisher {
                         });
                     }
 
-                    let mut stop_processing = false;
-
+                    // Every document was attempted, so an index with no write
+                    // error was inserted and each error stands on its own.
                     for (i, msg) in valid_messages.into_iter().enumerate() {
-                        if stop_processing {
-                            failed_messages.push((
-                                msg,
-                                PublisherError::Retryable(anyhow::anyhow!(
-                                    "Message not inserted (skipped due to previous error)"
-                                )),
-                            ));
-                            continue;
-                        }
-
                         if let Some(w) = errors_by_index.get(&i) {
-                            if w.code == 11000 {
-                                // Duplicate key error. Treat as success (idempotent), but it stops execution in ordered mode.
-                                stop_processing = true;
-                            } else {
-                                let error = PublisherError::Retryable(anyhow::anyhow!(
-                                    "MongoDB write error: {:?}",
-                                    w
+                            // Duplicate `_id`: the document is already stored, which
+                            // is what `id_field` uses to make a re-run idempotent.
+                            if w.code != 11000 {
+                                failed_messages.push((
+                                    msg,
+                                    PublisherError::Retryable(anyhow::anyhow!(
+                                        "MongoDB write error: {:?}",
+                                        w
+                                    )),
                                 ));
-                                failed_messages.push((msg, error));
-                                stop_processing = true;
                             }
                         }
                     }
