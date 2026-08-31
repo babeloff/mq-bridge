@@ -101,3 +101,6 @@ grpc = ["mq-bridge/grpc"]
 sqlx = ["mq-bridge/sqlx"]
 rustls-ring = ["dep:rustls", "rustls/ring", "mq-bridge/rustls-ring"]
 rustls-aws-lc = ["dep:rustls", "rustls/aws_lc_rs", "rustls/prefer-post-quantum", "mq-bridge/rustls-aws-lc"]
+
+[lints]
+workspace = true

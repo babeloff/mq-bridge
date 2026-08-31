@@ -1,3 +1,8 @@
+// A standalone profiling binary, not library code: bailing out of a bad run with a
+// non-zero status is the point. `clippy::exit` is denied workspace-wide because the
+// library is embedded in host processes (Python/Node bindings) that it must never kill.
+#![allow(clippy::exit)]
+
 #[cfg(feature = "http")]
 use mq_bridge::endpoints::create_publisher_from_route;
 #[cfg(feature = "http")]

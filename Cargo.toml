@@ -15,6 +15,9 @@ categories = ["asynchronous", "network-programming"]
 # the app's member crates, so the UI, book and benches would ship in the tarball.
 exclude = ["tests/fixtures/grpc_dynamic.proto", "apps/"]
 
+[lints]
+workspace = true
+
 [workspace]
 members = [
     "bindings-common",
@@ -27,6 +30,14 @@ members = [
 # apps/mq-bridge-app is its own workspace with its own Cargo.lock; see its manifest.
 exclude = ["apps"]
 resolver = "2"
+
+# Lints that are off by default in rustc/clippy and mark code that was never meant to
+# ship. Kept at `warn` so a local `cargo check` surfaces them; CI already runs clippy
+# with `-D warnings`, which promotes them to hard errors there.
+[workspace.lints.clippy]
+todo = "warn"
+dbg_macro = "warn"
+exit = "warn"
 
 [workspace.package]
 version = "0.4.9"
