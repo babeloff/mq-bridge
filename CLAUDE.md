@@ -46,6 +46,7 @@ src/
 │   ├── amqp.rs          # AMQP (RabbitMQ) consumer/publisher
 │   ├── aws.rs           # AWS SQS/SNS
 │   ├── clickhouse.rs    # ClickHouse sink + cursor source
+│   ├── dir_spool/       # Crash-safe directory FIFO queue (payload file + JSON sidecar)
 │   ├── file/            # File-based endpoints
 │   ├── grpc.rs          # gRPC consumer/publisher
 │   ├── http/            # HTTP consumer/publisher (+ streaming)

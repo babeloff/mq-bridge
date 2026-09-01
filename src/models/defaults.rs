@@ -166,6 +166,32 @@ pub(crate) fn default_true() -> bool {
     true
 }
 
+pub(crate) fn default_spool_naming_pattern() -> String {
+    "{seq:09}".to_string()
+}
+
+pub(crate) fn default_spool_payload_extension() -> String {
+    "bin".to_string()
+}
+
+pub(crate) fn default_spool_metadata_extension() -> String {
+    "json".to_string()
+}
+
+pub(crate) fn default_spool_done_file() -> String {
+    "DONE".to_string()
+}
+
+pub(crate) fn default_spool_poll_interval_ms() -> u64 {
+    100
+}
+
+impl Default for DirSpoolConfig {
+    fn default() -> Self {
+        Self::new(String::new())
+    }
+}
+
 pub(crate) fn default_atomic_usize_arc() -> Arc<AtomicUsize> {
     Arc::new(AtomicUsize::new(0))
 }

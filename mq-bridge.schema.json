@@ -557,6 +557,72 @@
         "path"
       ]
     },
+    "DirSpoolConfig": {
+      "description": "Configuration for a `dir_spool` endpoint: a crash-safe FIFO queue backed by a directory.\n\nAs a **sink** each message becomes a pair of files under `path` — a payload file holding\nthe raw `CanonicalMessage.payload` bytes, and an optional JSON sidecar holding its\nmetadata. Both are written to a `.tmp` name, fsynced, and renamed into place, so a reader\nnever observes a partial write. As a **source** the directory is listed in lexical order,\neach finalized pair is emitted as one message, and (with `drain_on_read`) the pair is\ndeleted once the message is acknowledged.\n\nThe names are what makes the queue ordered, so `naming_pattern` must keep the sequence\nnumber zero-padded and leading. The publisher resumes the sequence from the highest\nnumber already present in the directory, so a restart appends rather than overwrites.",
+      "type": "object",
+      "properties": {
+        "atomic": {
+          "description": "(Sink only) Write to a `.tmp` name and rename into place, so a reader never sees a\npartial chunk. Defaults to true; turning it off trades that guarantee for one less\nrename per chunk.",
+          "type": "boolean",
+          "default": true
+        },
+        "done_file": {
+          "description": "Name of the producer-completion sentinel file. Defaults to `DONE`.",
+          "type": "string",
+          "default": "DONE"
+        },
+        "drain_on_read": {
+          "description": "(Source only) Delete each chunk's files once its message is acknowledged. Defaults to\ntrue — this is what makes the directory a queue rather than a growing archive. With\nit off, chunks are left in place and each is emitted at most once per consumer run.",
+          "type": "boolean",
+          "default": true
+        },
+        "emit_done": {
+          "description": "(Sink only) Create `done_file` when the publisher is closed, marking the stream\nfinished for a `stop_on_done` consumer. Defaults to false.",
+          "type": "boolean",
+          "default": false
+        },
+        "metadata_extension": {
+          "description": "Extension of the JSON metadata sidecar, with or without the leading dot. Defaults to\n`json`. Set to an empty string to write and expect payload files only.",
+          "type": "string",
+          "default": "json"
+        },
+        "naming_pattern": {
+          "description": "(Sink only) Name template for each chunk, without extension. Supports `{seq}`,\n`{seq:06}` / `{seq:06d}` (zero-padded), `{timestamp}` (unix millis) and\n`{message_id}`. Defaults to `{seq:09}`. Lexical order must match sequence order,\nso keep a zero-padded `{seq}` first.",
+          "type": "string",
+          "default": "{seq:09}"
+        },
+        "path": {
+          "description": "Directory holding the spool. Created if missing.",
+          "type": "string"
+        },
+        "payload_extension": {
+          "description": "Extension of the payload file, with or without the leading dot. Defaults to `bin`.",
+          "type": "string",
+          "default": "bin"
+        },
+        "poll_interval_ms": {
+          "description": "(Source only) Idle poll interval in milliseconds when the directory holds no new\nchunks. Defaults to 100.",
+          "type": "integer",
+          "format": "uint64",
+          "default": 100,
+          "minimum": 0
+        },
+        "source_metadata": {
+          "description": "(Source only) Include `mqb.src.spool_*` source positions in each message's metadata.\nDefaults to false.",
+          "type": "boolean",
+          "default": false
+        },
+        "stop_on_done": {
+          "description": "(Source only) End the stream once the directory holds no unread chunks and\n`done_file` is present. Defaults to false, which tails the directory indefinitely.",
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "path"
+      ]
+    },
     "EncryptionConfig": {
       "description": "AEAD encryption settings, shared by the `encryption` middleware (per-message\npayload encryption) and the at-rest `encryption` field of the file and\nobject_store endpoints. Requires the `encryption` feature.",
       "type": "object",
@@ -646,6 +712,17 @@
           },
           "required": [
             "file"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "dir_spool": {
+              "$ref": "#/$defs/DirSpoolConfig"
+            }
+          },
+          "required": [
+            "dir_spool"
           ]
         },
         {
@@ -1136,6 +1213,42 @@
     "GrpcConfig": {
       "type": "object",
       "properties": {
+        "api_key": {
+          "description": "API key sent as `api_key_name` (default `x-api-key`) on dynamic calls only.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "password"
+        },
+        "api_key_name": {
+          "description": "Metadata key used for `api_key`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "bearer_token": {
+          "description": "Bearer token sent as `authorization` on dynamic calls; rejected in Bridge/server mode.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "password"
+        },
+        "binary_metadata": {
+          "description": "Static binary metadata for dynamic calls. Keys must end in `-bin`; values are raw bytes.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "format": "uint8",
+              "maximum": 255,
+              "minimum": 0
+            }
+          }
+        },
         "concurrency_limit_per_connection": {
           "description": "Maximum number of concurrent requests handled per connection. **Server-mode only.**",
           "type": [
@@ -1146,6 +1259,16 @@
           "default": null,
           "minimum": 0
         },
+        "connect_timeout_ms": {
+          "description": "Maximum time to establish a client connection.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "default": null,
+          "minimum": 0
+        },
         "consumer_id": {
           "description": "Stable subscription identity used for ACK tracking and redelivery. Defaults to a\nfresh id per consumer; set it to be redelivered unacknowledged messages on reconnect.",
           "type": [
@@ -1153,6 +1276,19 @@
             "null"
           ],
           "default": null
+        },
+        "descriptor_set_bytes": {
+          "description": "Compiled protobuf FileDescriptorSet bytes for embedded callers. Takes precedence\nover `descriptor_set_path` and avoids writing a temporary descriptor file.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "integer",
+            "format": "uint8",
+            "maximum": 255,
+            "minimum": 0
+          }
         },
         "descriptor_set_path": {
           "description": "Compiled protobuf FileDescriptorSet for dynamic client mode.",
@@ -1174,6 +1310,16 @@
         },
         "http2_keepalive_timeout_ms": {
           "description": "Timeout for a keepalive ping acknowledgement in milliseconds. Applies in both modes.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "default": null,
+          "minimum": 0
+        },
+        "idle_stream_timeout_ms": {
+          "description": "Maximum time a dynamic response stream may remain idle between messages.",
           "type": [
             "integer",
             "null"
@@ -1222,6 +1368,13 @@
           "default": null,
           "minimum": 0
         },
+        "metadata": {
+          "description": "Static ASCII metadata attached to dynamic RPCs. Values for keys that look\nsensitive are extracted by mq-bridge's normal secret handling.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
         "method_name": {
           "description": "RPC method name for dynamic client mode.",
           "type": [
@@ -1230,9 +1383,34 @@
           ],
           "default": null
         },
+        "overall_timeout_ms": {
+          "description": "Maximum lifetime of a dynamic RPC; exceeding it stops the route instead of reconnecting.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "default": null,
+          "minimum": 0
+        },
+        "reflection": {
+          "description": "Discover descriptors from the remote gRPC server reflection v1 service.",
+          "type": "boolean",
+          "default": false
+        },
         "request": {
           "description": "JSON request mapped to the dynamic protobuf input message.",
           "default": null
+        },
+        "request_timeout_ms": {
+          "description": "Maximum time to establish an RPC and receive its initial response.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "default": null,
+          "minimum": 0
         },
         "server_mode": {
           "description": "If `true`, start an embedded tonic gRPC server that accepts incoming `Publish` /\n`PublishBatch` RPCs. If `false` (the default), connect to a remote server as a client.",
@@ -1240,7 +1418,7 @@
           "default": false
         },
         "server_streaming": {
-          "description": "Use a server-streaming dynamic RPC. False selects unary.",
+          "description": "Deprecated compatibility hint. Dynamic RPC shape is always derived from the descriptor.",
           "type": "boolean",
           "default": false
         },
@@ -1261,7 +1439,7 @@
           "default": true
         },
         "timeout_ms": {
-          "description": "Timeout in milliseconds.\n- Client mode: used as the connection timeout and per-request deadline.\n- Server mode: applied as the per-request deadline on the embedded server.",
+          "description": "Deprecated compatibility timeout in milliseconds. Used as the fallback for\nconnection and initial-request deadlines. Prefer the dedicated settings.",
           "type": [
             "integer",
             "null"

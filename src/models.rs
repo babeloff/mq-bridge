@@ -285,6 +285,8 @@ pub enum EndpointType {
     Kafka(KafkaConfig),
     Nats(NatsConfig),
     File(FileConfig),
+    #[serde(rename = "dir_spool", alias = "spool", alias = "dirspool")]
+    DirSpool(DirSpoolConfig),
     #[serde(rename = "object_store", alias = "objectstore", alias = "s3")]
     ObjectStore(ObjectStoreConfig),
     #[cfg_attr(feature = "schema", schemars(extend("format" = "structural_endpoint")))]
@@ -997,6 +999,70 @@ pub enum FileConsumerMode {
         #[serde(default)]
         read_from_tail: bool,
     },
+}
+
+// --- Directory Spool Specific Configuration ---
+
+/// Configuration for a `dir_spool` endpoint: a crash-safe FIFO queue backed by a directory.
+///
+/// As a **sink** each message becomes a pair of files under `path` — a payload file holding
+/// the raw `CanonicalMessage.payload` bytes, and an optional JSON sidecar holding its
+/// metadata. Both are written to a `.tmp` name, fsynced, and renamed into place, so a reader
+/// never observes a partial write. As a **source** the directory is listed in lexical order,
+/// each finalized pair is emitted as one message, and (with `drain_on_read`) the pair is
+/// deleted once the message is acknowledged.
+///
+/// The names are what makes the queue ordered, so `naming_pattern` must keep the sequence
+/// number zero-padded and leading. The publisher resumes the sequence from the highest
+/// number already present in the directory, so a restart appends rather than overwrites.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct DirSpoolConfig {
+    /// Directory holding the spool. Created if missing.
+    pub path: String,
+    /// (Sink only) Name template for each chunk, without extension. Supports `{seq}`,
+    /// `{seq:06}` / `{seq:06d}` (zero-padded), `{timestamp}` (unix millis) and
+    /// `{message_id}`. Defaults to `{seq:09}`. Lexical order must match sequence order,
+    /// so keep a zero-padded `{seq}` first.
+    #[serde(default = "default_spool_naming_pattern")]
+    pub naming_pattern: String,
+    /// Extension of the payload file, with or without the leading dot. Defaults to `bin`.
+    #[serde(default = "default_spool_payload_extension")]
+    pub payload_extension: String,
+    /// Extension of the JSON metadata sidecar, with or without the leading dot. Defaults to
+    /// `json`. Set to an empty string to write and expect payload files only.
+    #[serde(default = "default_spool_metadata_extension")]
+    pub metadata_extension: String,
+    /// (Sink only) Write to a `.tmp` name and rename into place, so a reader never sees a
+    /// partial chunk. Defaults to true; turning it off trades that guarantee for one less
+    /// rename per chunk.
+    #[serde(default = "default_true")]
+    pub atomic: bool,
+    /// Name of the producer-completion sentinel file. Defaults to `DONE`.
+    #[serde(default = "default_spool_done_file")]
+    pub done_file: String,
+    /// (Sink only) Create `done_file` when the publisher is closed, marking the stream
+    /// finished for a `stop_on_done` consumer. Defaults to false.
+    #[serde(default)]
+    pub emit_done: bool,
+    /// (Source only) Delete each chunk's files once its message is acknowledged. Defaults to
+    /// true — this is what makes the directory a queue rather than a growing archive. With
+    /// it off, chunks are left in place and each is emitted at most once per consumer run.
+    #[serde(default = "default_true")]
+    pub drain_on_read: bool,
+    /// (Source only) End the stream once the directory holds no unread chunks and
+    /// `done_file` is present. Defaults to false, which tails the directory indefinitely.
+    #[serde(default)]
+    pub stop_on_done: bool,
+    /// (Source only) Idle poll interval in milliseconds when the directory holds no new
+    /// chunks. Defaults to 100.
+    #[serde(default = "default_spool_poll_interval_ms")]
+    pub poll_interval_ms: u64,
+    /// (Source only) Include `mqb.src.spool_*` source positions in each message's metadata.
+    /// Defaults to false.
+    #[serde(default)]
+    pub source_metadata: bool,
 }
 
 // --- Object Store (S3/GCS/Azure) Specific Configuration ---

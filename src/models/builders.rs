@@ -76,6 +76,7 @@ impl EndpointType {
             EndpointType::Kafka(_) => "kafka",
             EndpointType::Nats(_) => "nats",
             EndpointType::File(_) => "file",
+            EndpointType::DirSpool(_) => "dir_spool",
             EndpointType::ObjectStore(_) => "object_store",
             EndpointType::Static(_) => "static",
             EndpointType::Ref(_) => "ref",
@@ -108,6 +109,7 @@ impl EndpointType {
         matches!(
             self,
             EndpointType::File(_)
+                | EndpointType::DirSpool(_)
                 | EndpointType::Static(_)
                 | EndpointType::Ref(_)
                 | EndpointType::Memory(_)
@@ -290,6 +292,38 @@ impl FileConfig {
     /// Returns the effective consumer mode, defaulting to `Consume` if not set.
     pub fn effective_mode(&self) -> FileConsumerMode {
         self.mode.clone().unwrap_or_default()
+    }
+}
+
+impl DirSpoolConfig {
+    /// Creates a directory-spool configuration over `path`, with every other field at the
+    /// default the deserializer would have applied.
+    pub fn new(path: impl Into<String>) -> Self {
+        Self {
+            path: path.into(),
+            naming_pattern: default_spool_naming_pattern(),
+            payload_extension: default_spool_payload_extension(),
+            metadata_extension: default_spool_metadata_extension(),
+            atomic: true,
+            done_file: default_spool_done_file(),
+            emit_done: false,
+            drain_on_read: true,
+            stop_on_done: false,
+            poll_interval_ms: default_spool_poll_interval_ms(),
+            source_metadata: false,
+        }
+    }
+
+    /// The payload extension without its leading dot, e.g. `bin`.
+    pub fn payload_suffix(&self) -> &str {
+        self.payload_extension.trim_start_matches('.')
+    }
+
+    /// The metadata sidecar extension without its leading dot, or `None` when sidecars are
+    /// disabled (an empty `metadata_extension`).
+    pub fn metadata_suffix(&self) -> Option<&str> {
+        let suffix = self.metadata_extension.trim_start_matches('.');
+        (!suffix.is_empty()).then_some(suffix)
     }
 }
 

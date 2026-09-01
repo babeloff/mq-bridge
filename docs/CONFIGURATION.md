@@ -419,6 +419,81 @@ output:
         path: "/var/data/unroutable_orders.log"
 ```
 
+#### Directory spool (`dir_spool`)
+
+The `dir_spool` endpoint is a crash-safe FIFO queue whose backing store is a directory. Each
+message becomes a *chunk*: a payload file holding the raw `CanonicalMessage` payload bytes,
+plus an optional JSON sidecar holding its metadata. Chunks are written to a `.tmp` name,
+fsynced, and renamed into place, so a reader listing the directory never sees a partial
+write; on the reading side a chunk is deleted once its message is acknowledged.
+
+Use it to decouple a fast producer from a slower consumer across a process or language
+boundary — a Rust edge engine feeding a Python data-science script, say — with no broker to
+run and no shared memory to size. The producer can finish and exit while the consumer is
+still draining, and a crash on either side leaves a directory you can inspect with `ls`.
+
+Prefer the [`file`](#configuration-reference) endpoint instead when the data is a stream of
+delimited records appended to one file. `dir_spool` is for a queue of arbitrarily large
+opaque blobs, where the delimiter framing and the single append point both get in the way.
+
+| Field | Side | Default | Meaning |
+|---|---|---|---|
+| `path` | both | — | Spool directory. Created if missing. |
+| `naming_pattern` | sink | `{seq:09}` | Chunk name without extension. Supports `{seq}`, `{seq:06}` / `{seq:06d}`, `{timestamp}` (unix millis) and `{message_id}`. |
+| `payload_extension` | both | `bin` | Extension of the payload file, with or without the leading dot. |
+| `metadata_extension` | both | `json` | Extension of the metadata sidecar. Empty string writes and expects payload files only. |
+| `atomic` | sink | `true` | Write to `.tmp` and rename on completion. |
+| `done_file` | both | `DONE` | Name of the producer-completion sentinel. |
+| `emit_done` | sink | `false` | Create `done_file` when the publisher closes. |
+| `drain_on_read` | source | `true` | Delete each chunk once its message is acknowledged. |
+| `stop_on_done` | source | `false` | End the stream once the queue is empty *and* `done_file` exists. |
+| `poll_interval_ms` | source | `100` | Idle poll interval when the directory holds no new chunks. |
+| `source_metadata` | source | `false` | Stamp `mqb.src.spool_path` and `mqb.src.spool_chunk`. |
+
+Lexical order is queue order, so keep a zero-padded `{seq}` first in `naming_pattern`.
+A publisher opening an existing spool resumes numbering past the highest chunk already
+there, so a restart appends rather than overwriting the head of the queue.
+
+The sentinel and the queue are checked together: `stop_on_done` ends the stream only once
+the directory holds no unread chunks *and* `done_file` is present, so a producer that
+finished long ago still has its backlog drained first.
+
+**Example**: video frames plus telemetry, written by one process and drained by another.
+
+```yaml
+# Producer: raw H.264 chunks with a telemetry sidecar, sentinel on close.
+frame_capture:
+  input:
+    memory:
+      topic: "frames"
+  output:
+    dir_spool:
+      path: "/tmp/video_telemetry_spool"
+      naming_pattern: "{seq:06d}_{timestamp}"
+      payload_extension: ".h264"
+      metadata_extension: ".json"
+      emit_done: true
+
+# Consumer: drain in sequence order, delete as we go, exit when the producer is done.
+frame_ingest:
+  input:
+    dir_spool:
+      path: "/tmp/video_telemetry_spool"
+      payload_extension: ".h264"
+      drain_on_read: true
+      stop_on_done: true
+  output:
+    mongodb:
+      url: "mongodb://localhost:27017"
+      database: "telemetry"
+      collection: "frames"
+```
+
+A message nacked by the route is left on disk and redelivered on the next poll. A chunk
+whose payload file exists without a sidecar is still delivered, with empty metadata — which
+is what lets a foreign producer write into the spool with nothing but `write()` and
+`rename()`.
+
 ### IDE Support (Schema Validation) 
 mq-bridge includes a JSON schema for configuration validation and auto-completion. 
 1. Ensure you have a YAML plugin installed (e.g., YAML for VS Code). 

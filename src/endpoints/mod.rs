@@ -9,6 +9,7 @@ pub mod amqp;
 pub mod aws;
 #[cfg(feature = "clickhouse")]
 pub mod clickhouse;
+pub mod dir_spool;
 pub mod file;
 #[cfg(feature = "grpc")]
 pub mod grpc;
@@ -529,6 +530,21 @@ fn check_consumer_recursive(
             Ok(warnings)
         }
         EndpointType::File(_) => Ok(warnings),
+        EndpointType::DirSpool(cfg) => {
+            if cfg.emit_done {
+                warnings.push(
+                    "Endpoint 'dir_spool' is used as a consumer, but 'emit_done' is a publisher-only option and will be ignored."
+                    .to_string()
+                );
+            }
+            if cfg.stop_on_done && cfg.done_file.is_empty() {
+                return Err(anyhow!(
+                    "[route:{}] dir_spool consumer sets 'stop_on_done' but 'done_file' is empty, so the stream could never end",
+                    route_name
+                ));
+            }
+            Ok(warnings)
+        }
         #[cfg(feature = "object-store")]
         EndpointType::ObjectStore(cfg) => {
             if cfg.extension.is_some() {
@@ -744,6 +760,10 @@ fn source_metadata_requested(endpoint_type: &EndpointType) -> bool {
         EndpointType::PostgresCdc(config) => config.source_metadata,
         EndpointType::MongoDb(config) => config.source_metadata,
         EndpointType::File(config) => config.source_metadata,
+        // Provenance only, not a replay position — so `dir_spool` is deliberately absent
+        // from `supports_source_metadata` above. A chunk name orders the queue but says
+        // nothing an idempotent sink could re-derive after the chunk has been drained.
+        EndpointType::DirSpool(config) => config.source_metadata,
         EndpointType::Sqlx(config) => config.source_metadata,
         _ => false,
     }
@@ -1297,6 +1317,9 @@ async fn create_base_consumer(
         EndpointType::File(cfg) => Ok(boxed(
             file::FileConsumer::new_with_source_metadata(cfg, _source_metadata).await?,
         )),
+        EndpointType::DirSpool(cfg) => Ok(boxed(
+            dir_spool::DirSpoolConsumer::new_with_source_metadata(cfg, _source_metadata).await?,
+        )),
         #[cfg(feature = "object-store")]
         EndpointType::ObjectStore(cfg) => {
             Ok(boxed(object_store::ObjectStoreConsumer::new(cfg).await?))
@@ -1751,6 +1774,20 @@ fn check_publisher_recursive(
             Ok(warnings)
         }
         EndpointType::File(_) => Ok(warnings),
+        EndpointType::DirSpool(cfg) => {
+            for (set, option) in [
+                (!cfg.drain_on_read, "drain_on_read"),
+                (cfg.stop_on_done, "stop_on_done"),
+                (cfg.source_metadata, "source_metadata"),
+            ] {
+                if set {
+                    warnings.push(format!(
+                        "Endpoint 'dir_spool' is used as a publisher, but '{option}' is a consumer-only option and will be ignored."
+                    ));
+                }
+            }
+            Ok(warnings)
+        }
         #[cfg(feature = "object-store")]
         EndpointType::ObjectStore(cfg) => {
             if cfg.checkpoint_store.is_some() {
@@ -2110,6 +2147,10 @@ async fn create_base_publisher(
             file::FilePublisher::new_with_name_by(cfg, cfg.resolved_name_by(source_has_position))
                 .await?,
         ) as Box<dyn MessagePublisher>),
+        EndpointType::DirSpool(cfg) => {
+            Ok(Box::new(dir_spool::DirSpoolPublisher::new(cfg).await?)
+                as Box<dyn MessagePublisher>)
+        }
         #[cfg(feature = "object-store")]
         EndpointType::ObjectStore(cfg) => Ok(Box::new(
             object_store::ObjectStorePublisher::new_with_name_by(
