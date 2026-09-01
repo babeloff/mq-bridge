@@ -744,11 +744,33 @@ fn undefined_uri_variables_fail_before_connecting() {
     assert_failure_contains(&result, "undefined variable", "MQ_TEST_NOT_SET");
 }
 
+/// CSV types every field as text, but `> 100` says the comparison is numeric, so
+/// the filter reads it as a number instead of demanding `number(amount)`.
 #[test]
-fn copy_filter_on_a_text_typed_source_names_the_numeric_cast() {
+fn copy_filter_on_a_text_typed_source_needs_no_numeric_cast() {
     let dir = TestDir::new();
     let source_path = dir.path().join("text-typed.csv");
-    std::fs::write(&source_path, b"id,amount\n1,125\n").expect("seed CSV source");
+    std::fs::write(&source_path, b"id,amount\n1,125\n2,50\n").expect("seed CSV source");
+    let sink_path = dir.path().join("kept.jsonl");
+
+    let result = copy_with_options(
+        &format!("file://{}?format=csv", source_path.display()),
+        &format!("file://{}", sink_path.display()),
+        &["--filter", "amount > 100"],
+    );
+
+    assert!(result.status.success(), "{:?}", result);
+    let kept = std::fs::read_to_string(&sink_path).expect("read the filtered sink");
+    assert!(kept.contains("125"), "the matching row is kept: {kept}");
+    assert!(!kept.contains("\"50\""), "the other row is dropped: {kept}");
+}
+
+/// Text no cast can read is still the under-specified case the hint is for.
+#[test]
+fn copy_filter_on_unreadable_text_names_the_numeric_cast() {
+    let dir = TestDir::new();
+    let source_path = dir.path().join("unreadable.csv");
+    std::fs::write(&source_path, b"id,amount\n1,n/a\n").expect("seed CSV source");
 
     let result = copy_with_options(
         &format!("file://{}?format=csv", source_path.display()),
@@ -2514,7 +2536,7 @@ fn a_filter_reads_nested_payload_paths_and_combines_terms() {
     );
 }
 
-/// Metadata is always text, so a numeric comparison against it needs a cast —
+/// An explicit `number()` still reads metadata the same way the inferred cast does,
 /// and `meta.` shadows a payload field of the same name, which is what makes
 /// the two namespaces unambiguous.
 #[test]

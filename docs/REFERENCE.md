@@ -350,14 +350,18 @@ as MongoDB continue using bulk writes after filtering without adding input buffe
   Indexed paths such as `items[0].qty` are unsupported: an expression that uses one is
   rejected at startup rather than silently dropping every message.
 - **Metadata under the reserved `meta.` prefix** — `meta.http_status_code`,
-  `meta.kind`. Metadata is **always text**, so a numeric comparison needs an explicit cast:
-  `number(meta.http_status_code) >= 400`.
+  `meta.kind`. Metadata is **always text**, and so are all CSV fields and a SQL source's
+  `numeric` and timestamp columns. Comparing one against a **numeric literal** reads it as a
+  number, so `meta.http_status_code >= 400` needs no cast. The literal is what decides:
+  `zip == "01234"` stays a string comparison, and `number()` is still required where no
+  literal names the intent (`meta.a > meta.b`, `amount > 100 * 2`) or where the text is not a
+  number at all.
 
 If an expression names no payload field at all, the payload is never parsed — a
 metadata-only filter costs no JSON decode.
 
 ```yaml middleware
-- filter: "order.status == \"open\" and number(meta.retry_count) < 3"
+- filter: "order.status == \"open\" and meta.retry_count < 3"
 ```
 
 `&&` and `||` are rewritten to `and` / `or` for you, so both spellings work.
@@ -873,8 +877,8 @@ output:
 ```
 
 `if` takes the same expression language as the [`filter`](#filter) middleware — payload
-fields by bare name (`amount`, `order.status`), metadata under `meta.` and always as text
-(`number(meta.http_status_code) >= 400`), `and`/`or` or `&&`/`||`. Predicate mode therefore
+fields by bare name (`amount`, `order.status`), metadata under `meta.` as text that a numeric
+literal reads as a number (`meta.http_status_code >= 400`), `and`/`or` or `&&`/`||`. Predicate mode therefore
 needs the `filter` feature; a `when` list in a build without it is a startup error, not a
 silent fallback. A payload the expression cannot read fails the send rather than dropping the
 message silently. As with `filter`, indexed payload paths such as `items[0].qty` are unsupported

@@ -4,6 +4,17 @@ All notable changes to `mq-bridge`. Newest first.
 
 ## 0.4.9
 
+### Changed
+
+- **Filter and `switch` expressions infer the numeric cast.** Comparing a text-typed field
+  against a numeric literal now reads it as a number, so `meta.retry_count > 3` and
+  `amount >= 50` work on metadata, CSV, and a SQL source's `numeric`/timestamp columns without
+  `number()`. The literal is what decides, so `zip == "01234"` still compares as text. `number()`
+  is unchanged and stays required where no literal names the intent (`meta.a > meta.b`,
+  `amount > 100 * 2`); text that is not a number still fails with the hint that names the field.
+  A side effect is that `meta.retries == 3` now matches at all — it previously compared a string
+  against a number on the fast path and could never be true.
+
 ### Fixed
 
 - **Completed drain routes no longer retain stale connection failures.** A finite source that
