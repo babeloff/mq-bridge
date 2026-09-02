@@ -445,6 +445,19 @@ async fn pause_after_empty_batch(delay_ms: u64) {
     }
 }
 
+/// Drained commit and worker tasks yield a `JoinError` only when the task panicked, which the
+/// task's own error handling never sees. A panicked commit means a batch was never acked, so
+/// these must not be dropped silently.
+fn report_join_result<T>(res: std::result::Result<T, tokio::task::JoinError>, what: &str) {
+    if let Err(e) = res {
+        if e.is_cancelled() {
+            debug!("{} was cancelled before completing", what);
+        } else {
+            error!("{} panicked: {}", what, e);
+        }
+    }
+}
+
 fn report_route_error(err_tx: &Sender<anyhow::Error>, err: anyhow::Error, context: &str) {
     match err_tx.try_send(err) {
         Ok(_) => trace!("Reported error to main task"),
@@ -623,7 +636,9 @@ async fn send_batch_and_commit(
             let permit = acquire_commit_permit(commit_semaphore).await;
             let err_tx = err_tx.clone();
             // Reap finished commits so completed results don't accumulate until shutdown.
-            while commit_tasks.try_join_next().is_some() {}
+            while let Some(res) = commit_tasks.try_join_next() {
+                report_join_result(res, "Commit task");
+            }
             commit_tasks.spawn(async move {
                 let _permit = permit;
                 if let Err(e) = commit(dispositions).await {
@@ -727,7 +742,9 @@ async fn send_batch_and_commit(
             );
             let permit = acquire_commit_permit(commit_semaphore).await;
             // Reap finished commits so completed results don't accumulate until shutdown.
-            while commit_tasks.try_join_next().is_some() {}
+            while let Some(res) = commit_tasks.try_join_next() {
+                report_join_result(res, "Commit task");
+            }
             commit_tasks.spawn(async move {
                 let _permit = permit;
                 if let Err(e) = commit(dispositions).await {
@@ -1546,8 +1563,9 @@ impl Route {
                     }
                 }
                 res = commit_tasks.join_next() => {
-                    if res.is_none() {
-                        break;
+                    match res {
+                        Some(res) => report_join_result(res, "Commit task"),
+                        None => break,
                     }
                 }
             }
@@ -1703,7 +1721,9 @@ impl Route {
                     }
                 }
                 // Wait for all in-flight commits to complete
-                while commit_tasks.join_next().await.is_some() {}
+                while let Some(res) = commit_tasks.join_next().await {
+                    report_join_result(res, "Commit task");
+                }
             });
         }
 
@@ -1715,9 +1735,10 @@ impl Route {
         let mut since_yield = 0usize;
         // Holds an error that caused the loop to break, to be returned after graceful shutdown.
         let mut loop_error: Option<anyhow::Error> = None;
-        // Set when the loop breaks because the source drained with exit_on_empty,
-        // so we report a graceful stop rather than a shutdown-driven exit.
-        let mut exited_on_empty = false;
+        // Set when the loop breaks on a graceful terminal -- an empty batch under
+        // exit_on_empty, or a source reporting end of stream -- so we report a
+        // completion rather than a shutdown-driven exit.
+        let mut drained = false;
         loop {
             select! {
                 biased; // Prioritize checking for errors
@@ -1753,7 +1774,7 @@ impl Route {
                             if batch.messages.is_empty() {
                                 if self.options.exit_on_empty {
                                     info!("Consumer for route '{}' drained (empty batch, exit_on_empty). Shutting down.", name);
-                                    exited_on_empty = true;
+                                    drained = true;
                                     break; // Graceful drain-then-exit
                                 }
                                 pause_after_empty_batch(self.options.empty_batch_delay_ms).await;
@@ -1763,6 +1784,10 @@ impl Route {
                         }
                         Err(ConsumerError::EndOfStream) => {
                             info!("Consumer for route '{}' reached end of stream. Shutting down.", name);
+                            // Without this the tail below reads "no shutdown was
+                            // requested" as "reconnect", and the outer loop reruns
+                            // the whole source again, forever.
+                            drained = true;
                             break; // Graceful exit
                         }
                         Err(ConsumerError::Connection(e)) => {
@@ -1832,7 +1857,9 @@ impl Route {
         // are not aborted mid-sequence.
         drop(work_tx);
         // Wait for all worker tasks to complete.
-        while join_set.join_next().await.is_some() {}
+        while let Some(res) = join_set.join_next().await {
+            report_join_result(res, "Worker task");
+        }
 
         // Close sequencer (if any) now that all in-flight commits have drained.
         commit_router.shutdown().await;
@@ -1848,12 +1875,13 @@ impl Route {
         }
 
         // A drain-then-exit is a graceful completion, not a shutdown-driven exit.
-        if exited_on_empty {
+        if drained {
             return Ok(false);
         }
 
-        // Return true if shutdown was requested (channel is empty means it was closed/consumed),
-        // false if we reached end-of-stream naturally.
+        // Every graceful terminal is handled above, so what is left is a shutdown
+        // signal (channel empty means it was closed/consumed) or a dropped
+        // connection the outer loop should reconnect.
         Ok(shutdown_rx.is_empty())
     }
 
@@ -4167,6 +4195,81 @@ mod tests {
         );
 
         Route::stop("test_dead_output_drain").await;
+    }
+
+    // Regression: with `concurrency > 1`, a source that reports `EndOfStream` used to
+    // fall through to `Ok(shutdown_rx.is_empty())` at the end of `run_concurrently`.
+    // No shutdown had been requested, so that read as "reconnect" and the outer loop
+    // reran the source from the top, forever — `copy --drain` from a MongoDB snapshot
+    // never exited and rewrote its whole sink on every pass. The sequential runner
+    // always got this right, so the bug only showed above concurrency 1.
+    #[tokio::test]
+    async fn test_end_of_stream_completes_a_concurrent_route_instead_of_reconnecting() {
+        let unique_id = fast_uuid_v7::gen_id().to_string();
+        let factory_name = format!("eos_concurrent_{}", unique_id);
+
+        // One batch, then end of stream — a finite source, like a snapshot read.
+        let batches = Arc::new(AtomicUsize::new(0));
+        let consumer_batches = batches.clone();
+        let mut factory = MockEndpointFactory::new();
+        factory.consumer_behavior = Arc::new(Mutex::new(move || {
+            struct FiniteConsumer {
+                batches: Arc<AtomicUsize>,
+            }
+            #[async_trait::async_trait]
+            impl MessageConsumer for FiniteConsumer {
+                async fn receive_batch(
+                    &mut self,
+                    _: usize,
+                ) -> Result<ReceivedBatch, ConsumerError> {
+                    if self.batches.fetch_add(1, Ordering::SeqCst) > 0 {
+                        return Err(ConsumerError::EndOfStream);
+                    }
+                    Ok(ReceivedBatch {
+                        messages: vec![crate::CanonicalMessage::from("only")],
+                        commit: Box::new(|_| Box::pin(async { Ok(()) })),
+                    })
+                }
+                fn as_any(&self) -> &dyn Any {
+                    self
+                }
+            }
+            Ok(Box::new(FiniteConsumer {
+                batches: consumer_batches.clone(),
+            }) as Box<dyn MessageConsumer>)
+        }));
+        register_endpoint_factory(&factory_name, Arc::new(factory)).unwrap();
+
+        let input = Endpoint {
+            endpoint_type: EndpointType::Custom {
+                name: factory_name,
+                config: serde_json::Value::Null,
+            },
+            middlewares: vec![],
+            handler: None,
+        };
+        let route = Route::new(input, Endpoint::new(EndpointType::Null))
+            .with_concurrency(4)
+            .with_reconnect_interval_ms(10);
+
+        let handle = route.run("test_eos_concurrent").await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while handle.outcome().is_none() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("a drained source must end the route, not restart it");
+
+        assert_eq!(handle.outcome(), Some(RouteOutcome::Completed));
+        // Two reads: the batch and the end-of-stream. A restart would read again.
+        assert_eq!(
+            batches.load(Ordering::SeqCst),
+            2,
+            "the route reconnected and reread the source after end of stream"
+        );
+
+        Route::stop("test_eos_concurrent").await;
     }
 
     // N5 as originally reported: the dead leg sits inside a `fanout` next to a working

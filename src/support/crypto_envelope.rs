@@ -7,6 +7,10 @@
 //! so at-rest detection still works without the `encryption` feature.
 
 pub(crate) const ENVELOPE_VERSION: u8 = 1;
+/// As v1, but the AAD is the cleartext header followed by the caller's AAD. Only
+/// produced when the caller authenticates something; at-rest sealing never does.
+#[cfg(feature = "encryption")]
+pub(crate) const ENVELOPE_VERSION_AAD_BOUND: u8 = 2;
 pub(crate) const CIPHER_XCHACHA: u8 = 0;
 pub(crate) const CIPHER_AES_GCM: u8 = 1;
 #[cfg(feature = "encryption")]

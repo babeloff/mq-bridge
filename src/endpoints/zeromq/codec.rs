@@ -129,3 +129,67 @@ pub(crate) fn decode_frames(
     }
     Ok(messages)
 }
+
+/// Framing properties shared by both ZeroMQ backends. `raw_framed` is the default format, so
+/// what survives the frame boundary — payload bytes and headers — is the contract producers see.
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+    use std::collections::HashMap;
+
+    fn metadata() -> impl Strategy<Value = HashMap<String, String>> {
+        // `mqb.src.*` is stripped by design on both sides, so keep generated keys clear of it.
+        prop::collection::hash_map("[a-z]{1,8}", "[ -~]{0,32}", 0..6)
+    }
+
+    proptest! {
+        #[test]
+        fn raw_framed_round_trips_payload_and_metadata(
+            payload in prop::collection::vec(any::<u8>(), 0..512),
+            meta in metadata(),
+        ) {
+            let mut msg = CanonicalMessage::new(payload.clone(), None);
+            msg.metadata = meta.clone();
+            let frames = encode_frames(&mut msg, &ZeroMqFormat::RawFramed).unwrap();
+            prop_assert_eq!(frames.len(), 2);
+
+            let decoded = decode_frames(frames, false, &ZeroMqFormat::RawFramed).unwrap();
+            prop_assert_eq!(decoded.len(), 1);
+            prop_assert_eq!(decoded[0].payload.as_ref(), payload.as_slice());
+            prop_assert_eq!(&decoded[0].metadata, &meta);
+        }
+
+        /// `raw` carries bytes only; headers are dropped by design.
+        #[test]
+        fn raw_round_trips_the_payload_verbatim(
+            payload in prop::collection::vec(any::<u8>(), 1..512),
+            meta in metadata(),
+        ) {
+            let mut msg = CanonicalMessage::new(payload.clone(), None);
+            msg.metadata = meta;
+            let frames = encode_frames(&mut msg, &ZeroMqFormat::Raw).unwrap();
+            prop_assert_eq!(frames.len(), 1);
+
+            let decoded = decode_frames(frames, false, &ZeroMqFormat::Raw).unwrap();
+            prop_assert_eq!(decoded.len(), 1);
+            prop_assert_eq!(decoded[0].payload.as_ref(), payload.as_slice());
+            prop_assert!(decoded[0].metadata.is_empty());
+        }
+
+        /// Arbitrary inbound frames come from other people's producers: decoding must return a
+        /// result either way, never panic.
+        #[test]
+        fn decoding_arbitrary_frames_never_panics(
+            frames in prop::collection::vec(
+                prop::collection::vec(any::<u8>(), 0..64).prop_map(Bytes::from),
+                0..4,
+            ),
+            is_sub in any::<bool>(),
+        ) {
+            for format in [ZeroMqFormat::Raw, ZeroMqFormat::RawFramed, ZeroMqFormat::Json] {
+                let _ = decode_frames(frames.clone(), is_sub, &format);
+            }
+        }
+    }
+}

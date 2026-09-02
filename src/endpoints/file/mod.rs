@@ -567,7 +567,7 @@ impl FilePublisher {
             crypto: config
                 .encryption
                 .as_ref()
-                .map(Crypto::new)
+                .map(Crypto::new_at_rest)
                 .transpose()?
                 .map(Arc::new),
             csv_header: Arc::new(Mutex::new(None)),
@@ -2261,7 +2261,7 @@ impl FileConsumer {
         let crypto = config
             .encryption
             .as_ref()
-            .map(Crypto::new)
+            .map(Crypto::new_at_rest)
             .transpose()?
             .map(Arc::new);
         let make_reader = move |file: std::fs::File| -> Box<dyn std::io::Read> {
@@ -2748,6 +2748,20 @@ pub(crate) fn parse_message(
                     None
                 }
                 Some(cols) => {
+                    // Extra fields have no column to land in, so they are dropped.
+                    // Say so once: the row still copies under a clean success.
+                    if fields.len() > cols.len() {
+                        static WARNED: AtomicBool = AtomicBool::new(false);
+                        const MSG: &str = "CSV row has more fields than the header has \
+                                           columns; the extras are dropped. Further \
+                                           occurrences are logged at debug level.";
+                        let (columns, fields) = (cols.len(), fields.len());
+                        if !WARNED.swap(true, Ordering::Relaxed) {
+                            warn!(columns, fields, "{MSG}");
+                        } else {
+                            tracing::debug!(columns, fields, "{MSG}");
+                        }
+                    }
                     // Build the JSON object bytes directly instead of constructing a
                     // serde_json::Map and re-serializing it. Avoids per-row header
                     // clones, map allocation/ordering, and a serde serialization pass.

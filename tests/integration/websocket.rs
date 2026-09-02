@@ -2,7 +2,8 @@
 
 use mq_bridge::models::{Endpoint, EndpointType, WebSocketConfig};
 use mq_bridge::test_utils::{
-    run_performance_pipeline_test, run_pipeline_test, setup_logging, PERF_TEST_MESSAGE_COUNT,
+    get_free_port, run_performance_pipeline_test, run_pipeline_test, setup_logging,
+    PERF_TEST_MESSAGE_COUNT,
 };
 
 const CONFIG_YAML: &str = r#"
@@ -27,11 +28,6 @@ routes:
     output:
       memory: { topic: "test-out-websocket", capacity: {out_capacity} }
 "#;
-
-fn get_free_port() -> u16 {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.local_addr().unwrap().port()
-}
 
 fn websocket_config_yaml(port: u16, message_count: usize) -> String {
     CONFIG_YAML

@@ -650,7 +650,7 @@ later result in severe bugs.
 
 For that reason I reviewed each commit manually to prevent hard-to-fix architectural issuess and cleaned up, and refactored the generated output.
 
-**I do trust the current code as much as if it would be completely written by myself.**
+**I do trust the current code as much as if it would be written by myself.**
 
 Due to the large feature set, there may still be unfixed issues. The current focus is testing and documentation.
 

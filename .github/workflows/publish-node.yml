@@ -6,169 +6,36 @@ name: Publish Node Package
 # platform packages as optionalDependencies, so each consumer downloads only its
 # own ~20MB binary; the napi loader (native.js) requires the matching one.
 #
-# Linux is built inside a Debian 11 (glibc 2.31) container so the binaries run on
-# RHEL 9 (glibc 2.34), Debian 11/12 and Ubuntu 20.04+ — covering the priority
-# server targets. macOS/Windows build natively.
+# The addons themselves are built by build-node.yml, which must have run earlier
+# in the SAME workflow run - this workflow only downloads its artifacts. That is
+# what lets release.yml overlap the ~35min of builds with the docker/bundle work
+# and still hold the upload until the release is public. There is deliberately no
+# `workflow_dispatch` here: a standalone run would find no artifacts. Use
+# release.yml's `publish_only` input to re-publish.
 #
 # Auth: OIDC trusted publishing. The one-time bootstrap (which used an NPM_TOKEN
 # secret to create the 5 platform packages, since npm has no pending-publisher
 # concept) is done; all six packages exist with trusted publishing configured, so
-# publishing runs via OIDC (id-token) with provenance — no token. We deliberately
+# publishing runs via OIDC (id-token) with provenance - no token. We deliberately
 # do NOT read NPM_TOKEN: a present-but-expired secret would be sent to the registry
 # and 401 instead of falling back to OIDC, so the credential is left out entirely.
 #
 # npm validates the trusted publisher against the *calling* workflow, not the one
 # running `npm publish`, so all six packages must be registered against
 # `release.yml`. A mismatch is silent: the OIDC exchange yields no token and the
-# publish 404s. `id-token: write` is required on the caller job too.
+# publish 404s. release.yml's `preflight` job runs exactly that exchange at the
+# start of a run, so a mismatch fails in seconds instead of 90 minutes.
 
-# Invoked by release.yml after the GitHub release goes public, rather than
-# listening on `release: published` — see the note in publish-python.yml.
 on:
   workflow_call:
-  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build-linux:
-    name: Build ${{ matrix.target }}
-    runs-on: ${{ matrix.runner }}
-    permissions:
-      contents: read
-    container:
-      # Debian 11 bullseye => glibc 2.31 baseline (runs on RHEL 9 / Debian 11+ /
-      # Ubuntu 20.04+). Pulled natively per arch on the matching runner.
-      image: node:20-bullseye
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - runner: ubuntu-22.04
-            target: x86_64-unknown-linux-gnu
-          - runner: ubuntu-22.04-arm
-            target: aarch64-unknown-linux-gnu
-    steps:
-      - uses: actions/checkout@v7
-
-      # rdkafka builds librdkafka from source (cc/make) and aws-lc-sys needs
-      # cmake; the slim node image lacks these.
-      - name: Install build toolchain
-        run: |
-          apt-get update -qq
-          apt-get install -y --no-install-recommends build-essential cmake perl pkg-config
-
-      - name: Install Rust toolchain
-        run: |
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-
-      # Regenerate package.json/lock from the Cargo workspace version (source of
-      # truth) BEFORE npm ci, so a drifted committed lock can't fail the build.
-      - name: Sync version from Cargo workspace
-        working-directory: node/mq-bridge-node
-        run: npm run sync-version
-
-      - name: Install Node dependencies
-        working-directory: node/mq-bridge-node
-        run: npm ci
-
-      - name: Build native addon (full)
-        working-directory: node/mq-bridge-node
-        env:
-          CARGO_NET_RETRY: "5"
-          CARGO_NET_GIT_FETCH_WITH_CLI: "true"
-          # curl's HTTP/2 multiplexing flakes on Windows runners ("[55] Failed
-          # sending data to the peer"); force HTTP/1.1 so fetches are reliable.
-          CARGO_HTTP_MULTIPLEXING: "false"
-        run: >-
-          npx napi build --platform --release --strip
-          --target ${{ matrix.target }}
-          --js native.js --dts native.d.ts
-
-      - name: Upload addon
-        uses: actions/upload-artifact@v4
-        with:
-          name: bindings-${{ matrix.target }}
-          path: node/mq-bridge-node/*.node
-          if-no-files-found: error
-
-      # The root package ships the generated loader; upload it once.
-      - name: Upload loader
-        if: matrix.target == 'x86_64-unknown-linux-gnu'
-        uses: actions/upload-artifact@v4
-        with:
-          name: loader
-          path: |
-            node/mq-bridge-node/native.js
-            node/mq-bridge-node/native.d.ts
-          if-no-files-found: error
-
-  build-native:
-    name: Build ${{ matrix.target }}
-    runs-on: ${{ matrix.runner }}
-    permissions:
-      contents: read
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - runner: macos-15-intel
-            target: x86_64-apple-darwin
-          - runner: macos-latest
-            target: aarch64-apple-darwin
-          - runner: windows-latest
-            target: x86_64-pc-windows-msvc
-    steps:
-      - uses: actions/checkout@v7
-
-      - name: Set up Node
-        uses: actions/setup-node@v7
-        with:
-          node-version: "20"
-          cache: npm
-          cache-dependency-path: node/mq-bridge-node/package-lock.json
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
-        with:
-          targets: ${{ matrix.target }}
-
-      # Regenerate package.json/lock from the Cargo workspace version (source of
-      # truth) BEFORE npm ci, so a drifted committed lock can't fail the build.
-      - name: Sync version from Cargo workspace
-        working-directory: node/mq-bridge-node
-        run: npm run sync-version
-
-      - name: Install Node dependencies
-        working-directory: node/mq-bridge-node
-        run: npm ci
-
-      - name: Build native addon (full)
-        working-directory: node/mq-bridge-node
-        env:
-          CARGO_NET_RETRY: "5"
-          CARGO_NET_GIT_FETCH_WITH_CLI: "true"
-          # curl's HTTP/2 multiplexing flakes on Windows runners ("[55] Failed
-          # sending data to the peer"); force HTTP/1.1 so fetches are reliable.
-          CARGO_HTTP_MULTIPLEXING: "false"
-        run: >-
-          npx napi build --platform --release --strip
-          --target ${{ matrix.target }}
-          --js native.js --dts native.d.ts
-
-      - name: Upload addon
-        uses: actions/upload-artifact@v4
-        with:
-          name: bindings-${{ matrix.target }}
-          path: node/mq-bridge-node/*.node
-          if-no-files-found: error
-
   publish:
     name: Publish to npm
     runs-on: ubuntu-latest
-    needs: [build-linux, build-native]
     permissions:
       contents: read
       id-token: write # OIDC trusted publishing + provenance
@@ -198,13 +65,13 @@ jobs:
         run: npm ci
 
       - name: Download loader into package root
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: loader
           path: node/mq-bridge-node
 
       - name: Download platform addons
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: bindings-*
           path: node/mq-bridge-node/artifacts

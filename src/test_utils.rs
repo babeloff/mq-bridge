@@ -36,6 +36,13 @@ const MAX_PARALLEL_COMMITS: usize = 4096;
 const PERF_SEND_MAX_RETRIES: usize = 5;
 pub const PERF_CLEANUP_READ_TIMEOUT: Duration = Duration::from_secs(1);
 
+/// Binds port 0 so the OS picks a free port, then releases it for the caller to bind. The gap
+/// between release and rebind is racy under parallel tests; nothing here reserves the port.
+pub fn get_free_port() -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.local_addr().unwrap().port()
+}
+
 fn format_error_chain(error: &(dyn std::error::Error + 'static)) -> String {
     let mut message = error.to_string();
     let mut source = error.source();

@@ -99,6 +99,7 @@
 ///     topic: "llm-responses".to_string(),
 ///     correlation_id: None,
 ///     capacity: Some(100),
+///     idle_ttl_secs: None,
 /// }));
 ///
 /// let http_publisher = Endpoint::new(EndpointType::Http(HttpConfig {
@@ -127,9 +128,13 @@ use once_cell::sync::Lazy;
 use std::any::Any;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tracing::{trace, warn};
 
 const DEFAULT_CAPACITY: usize = 100;
+
+/// Seconds before a partition nobody ever attached a consumer to is discarded.
+const DEFAULT_IDLE_TTL_SECS: u64 = 3600;
 
 /// How long a publish waits on a full partition before giving up.
 ///
@@ -150,28 +155,84 @@ impl StreamPartition {
     }
 }
 
-type StreamTopic = HashMap<String, StreamPartition>;
+/// A partition plus when it was last created or published to. The timestamp only
+/// matters while no consumer is attached; see [`sweep_idle_partitions`].
+struct PartitionEntry {
+    partition: StreamPartition,
+    last_activity: std::time::Instant,
+}
 
-static STREAM_BUFFERS: Lazy<Mutex<HashMap<String, Arc<Mutex<StreamTopic>>>>> =
+type StreamTopic = HashMap<String, PartitionEntry>;
+
+/// A topic's partitions and the one sweep policy they share. The endpoint that
+/// creates the topic fixes it, so a publisher's default cannot overrule the
+/// `idle_ttl_secs: 0` a consumer on the same topic asked for.
+struct TopicState {
+    partitions: StreamTopic,
+    idle_ttl: Duration,
+}
+
+static STREAM_BUFFERS: Lazy<Mutex<HashMap<String, Arc<Mutex<TopicState>>>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
-fn get_or_create_topic(topic: &str) -> Arc<Mutex<StreamTopic>> {
+fn get_or_create_topic(topic: &str, idle_ttl: Duration) -> Arc<Mutex<TopicState>> {
     let mut buffers = STREAM_BUFFERS
         .lock()
         .expect("stream buffer registry poisoned");
     buffers
         .entry(topic.to_string())
-        .or_insert_with(|| Arc::new(Mutex::new(HashMap::new())))
+        .or_insert_with(|| {
+            Arc::new(Mutex::new(TopicState {
+                partitions: HashMap::new(),
+                idle_ttl,
+            }))
+        })
         .clone()
 }
 
-fn get_or_create_partition(topic: &str, correlation_id: &str, capacity: usize) -> StreamPartition {
-    let topic = get_or_create_topic(topic);
-    let mut partitions = topic.lock().expect("stream buffer topic poisoned");
-    partitions
+/// Drops partitions that no consumer ever attached to and that nothing has published to
+/// for `ttl`.
+///
+/// The publish path creates a partition on demand, but only a consumer's `Drop` removes
+/// one, so a correlation id whose reader never arrives would otherwise hold its buffered
+/// batches until the process exits. An attached consumer holds its own `Receiver` clone,
+/// which keeps `receiver_count` above the registry's own — so a live reader is never swept,
+/// however idle it is.
+fn sweep_idle_partitions(partitions: &mut StreamTopic, ttl: Duration) {
+    if ttl.is_zero() {
+        return;
+    }
+    let now = std::time::Instant::now();
+    partitions.retain(|correlation_id, entry| {
+        let abandoned = entry.partition.sender.receiver_count() <= 1
+            && now.duration_since(entry.last_activity) > ttl;
+        if abandoned {
+            trace!(correlation_id, "Dropping idle stream_buffer partition");
+            entry.partition.sender.close();
+        }
+        !abandoned
+    });
+}
+
+fn get_or_create_partition(
+    topic: &str,
+    correlation_id: &str,
+    capacity: usize,
+    idle_ttl: Duration,
+) -> StreamPartition {
+    let topic = get_or_create_topic(topic, idle_ttl);
+    let mut state = topic.lock().expect("stream buffer topic poisoned");
+    let ttl = state.idle_ttl;
+    sweep_idle_partitions(&mut state.partitions, ttl);
+    let entry = state
+        .partitions
         .entry(correlation_id.to_string())
-        .or_insert_with(|| StreamPartition::new(capacity))
-        .clone()
+        .or_insert_with(|| PartitionEntry {
+            partition: StreamPartition::new(capacity),
+            last_activity: std::time::Instant::now(),
+        });
+    entry.last_activity = std::time::Instant::now();
+    entry.partition.clone()
 }
 
 fn remove_partition_if_current(
@@ -186,16 +247,17 @@ fn remove_partition_if_current(
     let Some(topic_arc) = buffers.get(topic).cloned() else {
         return;
     };
-    let mut partitions = topic_arc.lock().expect("stream buffer topic poisoned");
-    let should_remove = partitions
+    let mut state = topic_arc.lock().expect("stream buffer topic poisoned");
+    let should_remove = state
+        .partitions
         .get(correlation_id)
-        .is_some_and(|partition| partition.sender.same_channel(sender));
+        .is_some_and(|entry| entry.partition.sender.same_channel(sender));
     if should_remove {
-        partitions.remove(correlation_id);
+        state.partitions.remove(correlation_id);
         sender.close();
         // Drop the topic once its last partition is gone so finished topics don't linger.
-        let now_empty = partitions.is_empty();
-        drop(partitions);
+        let now_empty = state.partitions.is_empty();
+        drop(state);
         if now_empty {
             buffers.remove(topic);
         }
@@ -212,6 +274,7 @@ fn remove_partition_if_current(
 pub struct StreamBufferPublisher {
     topic: String,
     capacity: usize,
+    idle_ttl: Duration,
 }
 
 impl StreamBufferPublisher {
@@ -219,6 +282,7 @@ impl StreamBufferPublisher {
         Ok(Self {
             topic: config.topic.clone(),
             capacity: config.capacity.unwrap_or(DEFAULT_CAPACITY),
+            idle_ttl: Duration::from_secs(config.idle_ttl_secs.unwrap_or(DEFAULT_IDLE_TTL_SECS)),
         })
     }
 }
@@ -235,7 +299,8 @@ impl MessagePublisher for StreamBufferPublisher {
                     "stream_buffer publisher requires message metadata 'correlation_id'"
                 ))
             })?;
-        let partition = get_or_create_partition(&self.topic, &correlation_id, self.capacity);
+        let partition =
+            get_or_create_partition(&self.topic, &correlation_id, self.capacity, self.idle_ttl);
         if partition.sender.is_closed() {
             return Err(PublisherError::Retryable(anyhow!(
                 "stream_buffer partition is closed"
@@ -279,7 +344,8 @@ impl MessagePublisher for StreamBufferPublisher {
                 "stream_buffer publisher batch requires a single shared correlation_id"
             )));
         }
-        let partition = get_or_create_partition(&self.topic, &correlation_id, self.capacity);
+        let partition =
+            get_or_create_partition(&self.topic, &correlation_id, self.capacity, self.idle_ttl);
         if partition.sender.is_closed() {
             return Err(PublisherError::Retryable(anyhow!(
                 "stream_buffer partition is closed"
@@ -339,6 +405,7 @@ impl StreamBufferConsumer {
             &config.topic,
             &correlation_id,
             config.capacity.unwrap_or(DEFAULT_CAPACITY),
+            Duration::from_secs(config.idle_ttl_secs.unwrap_or(DEFAULT_IDLE_TTL_SECS)),
         );
         Ok(Self {
             topic: config.topic.clone(),
@@ -547,11 +614,51 @@ mod tests {
     use super::*;
     use crate::traits::MessageConsumer;
 
+    fn idle_entry(capacity: usize) -> PartitionEntry {
+        PartitionEntry {
+            partition: StreamPartition::new(capacity),
+            last_activity: std::time::Instant::now(),
+        }
+    }
+
+    /// A partition the publish path created for a correlation id whose reader never
+    /// arrived would otherwise be held until the process exits.
+    #[test]
+    fn idle_partitions_without_a_consumer_are_swept() {
+        let mut partitions: StreamTopic = HashMap::new();
+        partitions.insert("abandoned".to_string(), idle_entry(4));
+        std::thread::sleep(Duration::from_millis(2));
+
+        sweep_idle_partitions(&mut partitions, Duration::from_millis(1));
+        assert!(partitions.is_empty());
+    }
+
+    /// An attached reader holds its own `Receiver` clone, so it is never swept however
+    /// long it sits idle.
+    #[test]
+    fn an_attached_consumer_keeps_its_partition() {
+        let mut partitions: StreamTopic = HashMap::new();
+        let entry = idle_entry(4);
+        let _attached = entry.partition.receiver.clone();
+        partitions.insert("live".to_string(), entry);
+        std::thread::sleep(Duration::from_millis(2));
+
+        sweep_idle_partitions(&mut partitions, Duration::from_millis(1));
+        assert_eq!(partitions.len(), 1);
+
+        // Disabled by config.
+        partitions.insert("abandoned".to_string(), idle_entry(4));
+        std::thread::sleep(Duration::from_millis(2));
+        sweep_idle_partitions(&mut partitions, Duration::ZERO);
+        assert_eq!(partitions.len(), 2);
+    }
+
     fn config(topic: &str, correlation_id: Option<&str>) -> StreamBufferConfig {
         StreamBufferConfig {
             topic: topic.to_string(),
             correlation_id: correlation_id.map(str::to_string),
             capacity: Some(10),
+            idle_ttl_secs: None,
         }
     }
 

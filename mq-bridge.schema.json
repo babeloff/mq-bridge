@@ -214,7 +214,7 @@
           "const": "xchacha20poly1305"
         },
         {
-          "description": "AES-256-GCM: 96-bit random nonce; prefer the default for very high volumes.",
+          "description": "AES-256-GCM: 96-bit counter nonce, for interoperability with other systems.",
           "type": "string",
           "const": "aes256gcm"
         }
@@ -449,6 +449,13 @@
           },
           "default": {}
         },
+        "max_cookies": {
+          "description": "Maximum cookies kept per session; the least recently set are dropped. Defaults to 256.",
+          "type": "integer",
+          "format": "uint",
+          "default": 256,
+          "minimum": 0
+        },
         "set_cookie_metadata_key": {
           "description": "Metadata key used to read HTTP Set-Cookie responses. Defaults to `set-cookie`.",
           "type": "string",
@@ -561,6 +568,13 @@
       "description": "AEAD encryption settings, shared by the `encryption` middleware (per-message\npayload encryption) and the at-rest `encryption` field of the file and\nobject_store endpoints. Requires the `encryption` feature.",
       "type": "object",
       "properties": {
+        "authenticate_metadata": {
+          "description": "Metadata keys bound into the AEAD tag; changing one then fails decryption. Middleware only.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
         "cipher": {
           "description": "AEAD cipher. Defaults to `xchacha20poly1305`.",
           "$ref": "#/$defs/CipherKind",
@@ -1136,6 +1150,42 @@
     "GrpcConfig": {
       "type": "object",
       "properties": {
+        "api_key": {
+          "description": "API key sent as `api_key_name` (default `x-api-key`) on dynamic calls only.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "password"
+        },
+        "api_key_name": {
+          "description": "Metadata key used for `api_key`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "bearer_token": {
+          "description": "Bearer token sent as `authorization` on dynamic calls; rejected in Bridge/server mode.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "password"
+        },
+        "binary_metadata": {
+          "description": "Static binary metadata for dynamic calls. Keys must end in `-bin`; values are raw bytes.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "format": "uint8",
+              "maximum": 255,
+              "minimum": 0
+            }
+          }
+        },
         "concurrency_limit_per_connection": {
           "description": "Maximum number of concurrent requests handled per connection. **Server-mode only.**",
           "type": [
@@ -1146,6 +1196,16 @@
           "default": null,
           "minimum": 0
         },
+        "connect_timeout_ms": {
+          "description": "Maximum time to establish a client connection.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "default": null,
+          "minimum": 0
+        },
         "consumer_id": {
           "description": "Stable subscription identity used for ACK tracking and redelivery. Defaults to a\nfresh id per consumer; set it to be redelivered unacknowledged messages on reconnect.",
           "type": [
@@ -1153,6 +1213,19 @@
             "null"
           ],
           "default": null
+        },
+        "descriptor_set_bytes": {
+          "description": "Compiled protobuf FileDescriptorSet bytes for embedded callers. Takes precedence\nover `descriptor_set_path` and avoids writing a temporary descriptor file.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "integer",
+            "format": "uint8",
+            "maximum": 255,
+            "minimum": 0
+          }
         },
         "descriptor_set_path": {
           "description": "Compiled protobuf FileDescriptorSet for dynamic client mode.",
@@ -1174,6 +1247,16 @@
         },
         "http2_keepalive_timeout_ms": {
           "description": "Timeout for a keepalive ping acknowledgement in milliseconds. Applies in both modes.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "default": null,
+          "minimum": 0
+        },
+        "idle_stream_timeout_ms": {
+          "description": "Maximum time a dynamic response stream may remain idle between messages.",
           "type": [
             "integer",
             "null"
@@ -1222,6 +1305,13 @@
           "default": null,
           "minimum": 0
         },
+        "metadata": {
+          "description": "Static ASCII metadata attached to dynamic RPCs. Values for keys that look\nsensitive are extracted by mq-bridge's normal secret handling.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
         "method_name": {
           "description": "RPC method name for dynamic client mode.",
           "type": [
@@ -1230,9 +1320,34 @@
           ],
           "default": null
         },
+        "overall_timeout_ms": {
+          "description": "Maximum lifetime of a dynamic RPC; exceeding it stops the route instead of reconnecting.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "default": null,
+          "minimum": 0
+        },
+        "reflection": {
+          "description": "Discover descriptors from the remote gRPC server reflection v1 service.",
+          "type": "boolean",
+          "default": false
+        },
         "request": {
           "description": "JSON request mapped to the dynamic protobuf input message.",
           "default": null
+        },
+        "request_timeout_ms": {
+          "description": "Maximum time to establish an RPC and receive its initial response.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "default": null,
+          "minimum": 0
         },
         "server_mode": {
           "description": "If `true`, start an embedded tonic gRPC server that accepts incoming `Publish` /\n`PublishBatch` RPCs. If `false` (the default), connect to a remote server as a client.",
@@ -1240,7 +1355,7 @@
           "default": false
         },
         "server_streaming": {
-          "description": "Use a server-streaming dynamic RPC. False selects unary.",
+          "description": "Deprecated compatibility hint. Dynamic RPC shape is always derived from the descriptor.",
           "type": "boolean",
           "default": false
         },
@@ -1261,7 +1376,7 @@
           "default": true
         },
         "timeout_ms": {
-          "description": "Timeout in milliseconds.\n- Client mode: used as the connection timeout and per-request deadline.\n- Server mode: applied as the per-request deadline on the embedded server.",
+          "description": "Deprecated compatibility timeout in milliseconds. Used as the fallback for\nconnection and initial-request deadlines. Prefer the dedicated settings.",
           "type": [
             "integer",
             "null"
@@ -3378,6 +3493,15 @@
             "string",
             "null"
           ]
+        },
+        "idle_ttl_secs": {
+          "description": "Seconds before a partition with no attached consumer is discarded. 0 disables. Defaults to 3600.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
         },
         "topic": {
           "description": "Shared buffer topic used by both the publisher and correlated consumers.",

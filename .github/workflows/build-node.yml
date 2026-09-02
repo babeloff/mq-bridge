@@ -1,0 +1,154 @@
+name: Build Node Addons
+
+# Builds the napi-rs addon for every published platform and uploads them as
+# run artifacts (`bindings-<target>` plus a single `loader`). publish-node.yml
+# consumes those artifacts and does the actual npm publish.
+#
+# Split from publish-node.yml so release.yml can start these builds as soon as
+# the test gate is green, in parallel with the docker and bundle builds, while
+# the upload still waits for the GitHub release to go public.
+#
+# Linux is built inside a Debian 11 (glibc 2.31) container so the binaries run on
+# RHEL 9 (glibc 2.34), Debian 11/12 and Ubuntu 20.04+ - covering the priority
+# server targets. macOS/Windows build natively.
+
+on:
+  workflow_call:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-linux:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    container:
+      # Debian 11 bullseye => glibc 2.31 baseline (runs on RHEL 9 / Debian 11+ /
+      # Ubuntu 20.04+). Pulled natively per arch on the matching runner.
+      image: node:20-bullseye
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v7
+
+      # rdkafka builds librdkafka from source (cc/make) and aws-lc-sys needs
+      # cmake; the slim node image lacks these.
+      - name: Install build toolchain
+        run: |
+          apt-get update -qq
+          apt-get install -y --no-install-recommends build-essential cmake perl pkg-config
+
+      - name: Install Rust toolchain
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      # Regenerate package.json/lock from the Cargo workspace version (source of
+      # truth) BEFORE npm ci, so a drifted committed lock can't fail the build.
+      - name: Sync version from Cargo workspace
+        working-directory: node/mq-bridge-node
+        run: npm run sync-version
+
+      - name: Install Node dependencies
+        working-directory: node/mq-bridge-node
+        run: npm ci
+
+      - name: Build native addon (full)
+        working-directory: node/mq-bridge-node
+        env:
+          CARGO_NET_RETRY: "5"
+          CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+          # curl's HTTP/2 multiplexing flakes on Windows runners ("[55] Failed
+          # sending data to the peer"); force HTTP/1.1 so fetches are reliable.
+          CARGO_HTTP_MULTIPLEXING: "false"
+        run: >-
+          npx napi build --platform --release --strip
+          --target ${{ matrix.target }}
+          --js native.js --dts native.d.ts
+
+      - name: Upload addon
+        uses: actions/upload-artifact@v7
+        with:
+          name: bindings-${{ matrix.target }}
+          path: node/mq-bridge-node/*.node
+          if-no-files-found: error
+
+      # The root package ships the generated loader; upload it once.
+      - name: Upload loader
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        uses: actions/upload-artifact@v7
+        with:
+          name: loader
+          path: |
+            node/mq-bridge-node/native.js
+            node/mq-bridge-node/native.d.ts
+          if-no-files-found: error
+
+  build-native:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+          - runner: macos-latest
+            target: aarch64-apple-darwin
+          - runner: windows-latest
+            target: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: node/mq-bridge-node/package-lock.json
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # Regenerate package.json/lock from the Cargo workspace version (source of
+      # truth) BEFORE npm ci, so a drifted committed lock can't fail the build.
+      - name: Sync version from Cargo workspace
+        working-directory: node/mq-bridge-node
+        run: npm run sync-version
+
+      - name: Install Node dependencies
+        working-directory: node/mq-bridge-node
+        run: npm ci
+
+      - name: Build native addon (full)
+        working-directory: node/mq-bridge-node
+        env:
+          CARGO_NET_RETRY: "5"
+          CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+          # curl's HTTP/2 multiplexing flakes on Windows runners ("[55] Failed
+          # sending data to the peer"); force HTTP/1.1 so fetches are reliable.
+          CARGO_HTTP_MULTIPLEXING: "false"
+        run: >-
+          npx napi build --platform --release --strip
+          --target ${{ matrix.target }}
+          --js native.js --dts native.d.ts
+
+      - name: Upload addon
+        uses: actions/upload-artifact@v7
+        with:
+          name: bindings-${{ matrix.target }}
+          path: node/mq-bridge-node/*.node
+          if-no-files-found: error

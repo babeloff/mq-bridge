@@ -1,10 +1,9 @@
-const { test, expect } = require("@playwright/test");
+const fs = require("node:fs");
+const path = require("node:path");
+const { test, expect } = require("./fixtures");
+const { DATA_ADDR, makeConfig } = require("./helpers");
 
-const VISUAL_CONFIG = {
-  log_level: "info",
-  ui_addr: "127.0.0.1:39091",
-  metrics_addr: "",
-  default_tab: "publishers",
+const VISUAL_CONFIG = makeConfig({
   routes: {},
   consumers: [
     {
@@ -12,7 +11,7 @@ const VISUAL_CONFIG = {
       comment: "Screenshot consumer",
       endpoint: {
         middlewares: [{ metrics: {} }],
-        http: { url: "127.0.0.1:39081", path: "/visual-regression", method: "POST" },
+        http: { url: DATA_ADDR, path: "/visual-regression", method: "POST" },
       },
       response: {
         headers: { "content-type": "application/json" },
@@ -30,7 +29,7 @@ const VISUAL_CONFIG = {
       comment: "HTTP list endpoint",
       endpoint: {
         middlewares: [{ metrics: {} }],
-        http: { url: "http://127.0.0.1:39081", path: "/api/orders", method: "GET" },
+        http: { url: `http://${DATA_ADDR}`, path: "/api/orders", method: "GET" },
       },
       payload: "{\"limit\":25}",
     },
@@ -39,7 +38,7 @@ const VISUAL_CONFIG = {
       comment: "HTTP create endpoint",
       endpoint: {
         middlewares: [{ metrics: {} }],
-        http: { url: "http://127.0.0.1:39081", path: "/api/orders", method: "POST" },
+        http: { url: `http://${DATA_ADDR}`, path: "/api/orders", method: "POST" },
       },
       payload: "{\"sku\":\"VISUAL-1\",\"quantity\":2}",
     },
@@ -48,7 +47,7 @@ const VISUAL_CONFIG = {
       comment: "HTTP detail endpoint",
       endpoint: {
         middlewares: [{ metrics: {} }],
-        http: { url: "http://127.0.0.1:39081", path: "/api/orders/{id}", method: "GET" },
+        http: { url: `http://${DATA_ADDR}`, path: "/api/orders/{id}", method: "GET" },
       },
       payload: "{}",
     },
@@ -57,7 +56,7 @@ const VISUAL_CONFIG = {
       comment: "HTTP publisher used by the consumer screenshot",
       endpoint: {
         middlewares: [{ metrics: {} }],
-        http: { url: "http://127.0.0.1:39081", path: "/visual-regression", method: "POST" },
+        http: { url: `http://${DATA_ADDR}`, path: "/visual-regression", method: "POST" },
       },
       payload: "{\"event\":\"visual-regression\",\"status\":\"ready\"}",
     },
@@ -77,7 +76,7 @@ const VISUAL_CONFIG = {
   env_vars: {
     API_HOST: "127.0.0.1",
   },
-};
+});
 
 const screenshotOptions = {
   fullPage: true,
@@ -85,7 +84,28 @@ const screenshotOptions = {
   maxDiffPixelRatio: 0.001,
 };
 
-test.skip(!!process.env.CI, "Screenshot baselines are local-only; CI runs the behavioral UI suite.");
+/**
+ * Screenshots are only comparable against a baseline rendered by the same font
+ * stack, so each platform needs its own. Rather than skip on CI outright — which
+ * is how a layout regression reaches main between two local runs — skip only
+ * while this platform has no baseline yet, so committing one turns the suite on
+ * with no code change.
+ *
+ * To produce the Linux baselines CI needs, run the "App" workflow manually with
+ * `update_visual_baselines: true`; it renders them on the same runner image CI
+ * compares against and uploads them as an artifact to review and commit.
+ */
+const BASELINE_DIR = path.join(__dirname, "ui-visual.spec.js-snapshots");
+const hasBaseline = fs.existsSync(BASELINE_DIR)
+  && fs.readdirSync(BASELINE_DIR).some((file) => file.endsWith(`-${process.platform}.png`));
+
+test.skip(
+  !hasBaseline,
+  `No screenshot baselines for platform "${process.platform}". ` +
+    "Generate them by running the App workflow with update_visual_baselines=true " +
+    "(Linux/CI) or `npm run test:ui:update-screenshots` (this machine), " +
+    "review the diff, and commit them.",
+);
 
 async function stabilizeForScreenshot(page) {
   await page.addStyleTag({

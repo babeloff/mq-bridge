@@ -133,37 +133,30 @@ impl WeakJoinConsumer {
     fn check_timeouts(&self, state: &mut JoinState, ready_messages: &mut Vec<CanonicalMessage>) {
         let now = Instant::now();
         let timeout = Duration::from_millis(self.config.timeout_ms);
-        let mut timed_out_keys = Vec::new();
 
-        for (key, (start_time, _)) in state.pending.iter() {
-            if now.duration_since(*start_time) >= timeout {
-                timed_out_keys.push(key.clone());
+        // One pass, no key clones: expired groups are emitted (unless discarding) as
+        // they are removed.
+        state.pending.retain(|key, (start_time, msgs)| {
+            if now.duration_since(*start_time) < timeout {
+                return true;
             }
-        }
-
-        for key in timed_out_keys {
-            if let Some((_, msgs)) = state.pending.remove(&key) {
-                if self.config.on_timeout == WeakJoinTimeout::Discard {
-                    continue; // drop the incomplete group without emitting
-                }
-                ready_messages.push(self.emit_join(&key, &msgs));
+            if self.config.on_timeout != WeakJoinTimeout::Discard {
+                ready_messages.push(self.emit_join(key, msgs));
             }
-        }
+            false
+        });
     }
 
     /// Drains every remaining pending group, used when the upstream is exhausted (drain
     /// mode) so no buffered group is stranded when the empty batch propagates up. Honours
     /// `on_timeout`: incomplete groups are emitted unless configured to discard.
     fn flush_all_pending(&self, state: &mut JoinState, ready_messages: &mut Vec<CanonicalMessage>) {
-        let keys: Vec<String> = state.pending.keys().cloned().collect();
-        for key in keys {
-            if let Some((_, msgs)) = state.pending.remove(&key) {
-                if self.config.on_timeout == WeakJoinTimeout::Discard {
-                    continue;
-                }
-                ready_messages.push(self.emit_join(&key, &msgs));
+        if self.config.on_timeout != WeakJoinTimeout::Discard {
+            for (key, (_, msgs)) in state.pending.iter() {
+                ready_messages.push(self.emit_join(key, msgs));
             }
         }
+        state.pending.clear();
     }
 }
 

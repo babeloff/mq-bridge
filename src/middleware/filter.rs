@@ -3,8 +3,10 @@
 //!
 //! An expression reads the payload's top-level JSON fields as bare names
 //! (`amount > 100`) and the message metadata under the reserved `meta` prefix
-//! (`meta.http_status_code == '200'`). Metadata values are always strings, so a
-//! numeric comparison needs `number(meta.retries) > 3`.
+//! (`meta.http_status_code == '200'`). Metadata and text-typed columns arrive as
+//! strings, but comparing one against a numeric literal reads it as a number, so
+//! `meta.retries > 3` needs no cast. `number()` stays accepted, and is still
+//! required where no literal names the intent.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -37,6 +39,8 @@ pub(crate) struct CompiledFilter {
     payload_paths: Vec<Vec<String>>,
     /// Metadata keys the expression reads via the `meta` prefix.
     metadata_keys: Vec<String>,
+    /// Dotted paths the expression compares against a numeric literal.
+    numeric_paths: Vec<String>,
     uses_all_metadata: bool,
     warned_unusable_field: AtomicBool,
 }
@@ -71,6 +75,9 @@ impl FastPredicate {
             (FastLiteral::String(expected), Some(Value::String(actual))) => {
                 expected.as_ref() == actual
             }
+            (FastLiteral::Number(expected), Some(Value::String(actual))) => {
+                parse_number(actual).is_some_and(|actual| actual == *expected)
+            }
             _ => false,
         };
         equal ^ self.negate
@@ -88,6 +95,9 @@ impl FastPredicate {
         let equal = match (&self.expected, actual) {
             (FastLiteral::Null, None) => true,
             (FastLiteral::String(expected), Some(actual)) => expected.as_ref() == actual,
+            (FastLiteral::Number(expected), Some(actual)) => {
+                parse_number(actual).is_some_and(|actual| actual == *expected)
+            }
             _ => false,
         };
         equal ^ self.negate
@@ -168,6 +178,7 @@ impl CompiledFilter {
         let fast_predicate = compile_fast_predicate(&expression);
         let (payload_paths, metadata_keys, uses_all_metadata, has_unsupported_path) =
             referenced_paths(&expression);
+        let numeric_paths = numerically_compared_paths(&expression);
         // An indexed path never resolves, so tolerating it per message would drop every
         // message while the route reported itself healthy. Refuse to start instead.
         if has_unsupported_path {
@@ -181,6 +192,7 @@ impl CompiledFilter {
             fast_predicate,
             payload_paths,
             metadata_keys,
+            numeric_paths,
             uses_all_metadata,
             warned_unusable_field: AtomicBool::new(false),
         })
@@ -268,7 +280,10 @@ impl CompiledFilter {
             return Ok(predicate.evaluate(document));
         }
 
-        let evaluated = match self.expression.evaluate(Variable::from(document)) {
+        let variable = Variable::from(document);
+        self.coerce_numeric_fields(&variable);
+
+        let evaluated = match self.expression.evaluate(variable) {
             Ok(evaluated) => evaluated,
             Err(_) if has_unusable_field => return Ok(false),
             Err(error) => {
@@ -283,12 +298,45 @@ impl CompiledFilter {
                         .iter()
                         .map(|key| format!("{METADATA_PREFIX}.{key}")),
                 );
+                text_fields.retain(|field| !self.reads_as_number(document, field));
                 return Err(text_typed_field_error(&error.to_string(), &text_fields));
             }
         };
         match evaluated {
             Variable::Bool(value) => Ok(value),
             _ => bail!("filter expression did not evaluate to a boolean"),
+        }
+    }
+
+    /// Whether [`Self::coerce_numeric_fields`] already made this field a number,
+    /// which means it is not what the failed evaluation tripped over.
+    fn reads_as_number(&self, document: &Value, field: &str) -> bool {
+        self.numeric_paths.iter().any(|path| path == field)
+            && resolve(
+                document,
+                &field.split('.').map(String::from).collect::<Vec<_>>(),
+            )
+            .and_then(Value::as_str)
+            .is_some_and(|text| parse_number(text).is_some())
+    }
+
+    /// Reads a text field the expression compares against a number as a number.
+    ///
+    /// Sources that type everything as text (CSV, metadata, SQL `numeric`) would
+    /// otherwise need `number()` on every field. Text that is not a number is left
+    /// alone, so it still reaches [`text_typed_field_error`].
+    ///
+    /// This rewrites the per-evaluation [`Variable`], never the document the
+    /// caller's [`FilterContext`] shares between a `switch`'s cases.
+    fn coerce_numeric_fields(&self, root: &Variable) {
+        for path in &self.numeric_paths {
+            let Some(value) = root.dot(path) else {
+                continue;
+            };
+            let Some(text) = value.as_str() else { continue };
+            if let Some(number) = parse_number(text) {
+                root.dot_insert(path, Variable::Number(number));
+            }
         }
     }
 
@@ -346,6 +394,45 @@ fn parse_fast_literal(opcode: &Opcode) -> Option<FastLiteral> {
         Opcode::PushString(value) => Some(FastLiteral::String(value.clone())),
         _ => None,
     }
+}
+
+/// Dotted paths the expression compares against a numeric literal.
+///
+/// The literal is what proves the intent: `amount > 100` means the field is a
+/// number even where the source delivered it as text, while `amount == '100'`
+/// asks for a string and `meta.a > meta.b` may well be comparing dates. Anything
+/// but a bare field against a bare number is left for `number()`.
+fn numerically_compared_paths(expression: &Expression<Standard>) -> Vec<String> {
+    let opcodes = expression.bytecode();
+    let mut paths: Vec<String> = Vec::new();
+
+    for window in opcodes.as_ref().windows(3) {
+        if !matches!(window[2], Opcode::Compare(_) | Opcode::Equal) {
+            continue;
+        }
+        let fetch = match (&window[0], &window[1]) {
+            (Opcode::PushNumber(_), operand) | (operand, Opcode::PushNumber(_)) => operand,
+            _ => continue,
+        };
+        let Some(path) = parse_fast_fetch(fetch).filter(|path| !path.is_empty()) else {
+            continue;
+        };
+        let dotted = path.join(".");
+        if !paths.contains(&dotted) {
+            paths.push(dotted);
+        }
+    }
+
+    paths
+}
+
+/// Parses exactly what the engine's own `number()` accepts, so the implicit and
+/// the explicit cast cannot disagree.
+fn parse_number(text: &str) -> Option<rust_decimal::Decimal> {
+    let text = text.trim();
+    rust_decimal::Decimal::from_str_exact(text)
+        .or_else(|_| rust_decimal::Decimal::from_scientific(text))
+        .ok()
 }
 
 /// Walks a dotted path, yielding the value only if it is a usable scalar.
@@ -461,10 +548,13 @@ fn referenced_paths(
 
 /// Turns the engine's opcode-level type error into one naming the field and the fix.
 ///
-/// A text-typed column makes `amount > 100` compare a string against a number,
-/// which the expression VM reports only as `Opcode Compare: Unsupported type`.
-/// That names neither the column nor `number()`, so the route looks broken rather
-/// than under-specified.
+/// A text-typed column compares a string against a number, which the expression VM
+/// reports only as `Opcode Compare: Unsupported type`. That names neither the column
+/// nor `number()`, so the route looks broken rather than under-specified.
+///
+/// A bare numeric literal is read as an implicit cast, so what reaches here is text
+/// no cast can rescue (`"n/a" > 100`) or a comparison with no literal to take the
+/// intent from (`meta.a > meta.b`, `amount > 100 * 2`).
 ///
 /// Which fields arrive as text depends on the source, so the hint names both
 /// shapes rather than asserting one: CSV and most key-value stores type
@@ -887,19 +977,121 @@ mod tests {
             .unwrap());
     }
 
-    /// Metadata is always `String`, so a numeric comparison needs `number()` —
-    /// and the bare form must produce the error that says so.
+    /// Metadata is always `String`, but the literal in `> 3` says the comparison
+    /// is numeric, so the cast is inferred rather than demanded.
     #[test]
-    fn a_numeric_metadata_comparison_needs_an_explicit_cast() {
+    fn a_numeric_metadata_comparison_needs_no_explicit_cast() {
         let bare = CompiledFilter::new("meta.retries > 3").unwrap();
-        let error = bare
-            .matches(&message("{}", &[("retries", "5")]))
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("number(meta.retries)"), "got: {error}");
+        assert!(bare.matches(&message("{}", &[("retries", "5")])).unwrap());
+        assert!(!bare.matches(&message("{}", &[("retries", "2")])).unwrap());
 
         let cast = CompiledFilter::new("number(meta.retries) > 3").unwrap();
         assert!(cast.matches(&message("{}", &[("retries", "5")])).unwrap());
+    }
+
+    /// CSV and SQL `numeric` columns arrive as text the same way metadata does.
+    #[test]
+    fn a_text_typed_payload_field_compares_numerically() {
+        let filter = CompiledFilter::new("amount > 100").unwrap();
+        assert!(filter
+            .matches(&message(r#"{"amount": "125"}"#, &[]))
+            .unwrap());
+        assert!(!filter
+            .matches(&message(r#"{"amount": "50"}"#, &[]))
+            .unwrap());
+        assert!(filter
+            .matches(&message(r#"{"amount": " 125.5 "}"#, &[]))
+            .unwrap());
+    }
+
+    /// The implicit cast must be exact where `number()` is, not a float round-trip.
+    #[test]
+    fn the_implicit_cast_keeps_decimal_precision() {
+        let filter = CompiledFilter::new("amount > 1.5").unwrap();
+        assert!(!filter
+            .matches(&message(r#"{"amount": "1.50"}"#, &[]))
+            .unwrap());
+        assert!(filter
+            .matches(&message(r#"{"amount": "1.51"}"#, &[]))
+            .unwrap());
+    }
+
+    /// A string literal asks for a string. Coercing here would break leading zeros.
+    #[test]
+    fn a_string_comparison_is_never_coerced() {
+        let filter = CompiledFilter::new("zip == '01234'").unwrap();
+        assert!(filter
+            .matches(&message(r#"{"zip": "01234"}"#, &[]))
+            .unwrap());
+        assert!(!filter.matches(&message(r#"{"zip": "1234"}"#, &[])).unwrap());
+    }
+
+    /// The fast path skips the VM entirely, so it needs the same rule; before this
+    /// it could not match a text field against a number at all.
+    #[test]
+    fn fast_equality_compares_text_against_a_numeric_literal() {
+        let meta = CompiledFilter::new("meta.retries == 3").unwrap();
+        assert!(meta.fast_predicate.is_some());
+        assert!(meta.matches(&message("{}", &[("retries", "3")])).unwrap());
+        assert!(!meta.matches(&message("{}", &[("retries", "4")])).unwrap());
+
+        let payload = CompiledFilter::new("amount == 125").unwrap();
+        assert!(payload.fast_predicate.is_some());
+        assert!(payload
+            .matches(&message(r#"{"amount": "125"}"#, &[]))
+            .unwrap());
+        assert!(!payload
+            .matches(&message(r#"{"amount": "126"}"#, &[]))
+            .unwrap());
+    }
+
+    /// Text no cast can read still names the field and the cast, and a comparison
+    /// with no literal to take its intent from still needs `number()`.
+    #[test]
+    fn unreadable_text_still_names_the_numeric_cast() {
+        let filter = CompiledFilter::new("amount > 100").unwrap();
+        let error = filter
+            .matches(&message(r#"{"amount": "n/a"}"#, &[]))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("number(amount)"), "got: {error}");
+
+        let pair = CompiledFilter::new("meta.a > meta.b").unwrap();
+        let error = pair
+            .matches(&message("{}", &[("a", "5"), ("b", "3")]))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("number(meta.a)"), "got: {error}");
+    }
+
+    /// A field the implicit cast read fine is not what the evaluation tripped over,
+    /// so the diagnostic must not name it alongside the one that failed.
+    #[test]
+    fn the_diagnostic_names_only_the_field_that_failed() {
+        let filter = CompiledFilter::new("amount > 100 and other > 1").unwrap();
+        let error = filter
+            .matches(&message(r#"{"amount": "125", "other": "n/a"}"#, &[]))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("`other`"), "got: {error}");
+        assert!(!error.contains("`amount`"), "got: {error}");
+    }
+
+    /// A `switch` runs every `when` case against one context, so a numeric case must
+    /// not leave the field a number for a later case that compares it as text.
+    #[test]
+    fn coercion_does_not_leak_into_the_next_predicate() {
+        let numeric = CompiledFilter::new("amount > 100").unwrap();
+        let mut textual = CompiledFilter::new("amount == '125'").unwrap();
+        textual.fast_predicate = None;
+        let message = message(r#"{"amount": "125"}"#, &[]);
+
+        let mut shared = FilterContext::new();
+        assert!(numeric.matches_with_context(&message, &mut shared).unwrap());
+        assert!(
+            textual.matches_with_context(&message, &mut shared).unwrap(),
+            "predicate order changed the answer"
+        );
     }
 
     /// The app's original implementation rejected these outright, because it

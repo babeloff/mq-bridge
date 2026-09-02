@@ -223,13 +223,13 @@ fn into_handle<T>(value: T) -> *mut c_void {
 /// # Safety
 /// `handle` must be a live handle previously produced by [`into_handle`] for `T`.
 unsafe fn borrow<'a, T>(handle: *mut c_void) -> Option<&'a T> {
-    (!handle.is_null()).then(|| &*handle.cast::<T>())
+    (!handle.is_null()).then(|| unsafe { &*handle.cast::<T>() })
 }
 
 /// # Safety
 /// `handle` must be a live handle for `T`, and must not be used afterwards.
 unsafe fn reclaim<T>(handle: *mut c_void) -> Option<Box<T>> {
-    (!handle.is_null()).then(|| Box::from_raw(handle.cast::<T>()))
+    (!handle.is_null()).then(|| unsafe { Box::from_raw(handle.cast::<T>()) })
 }
 
 fn buffer_from(message: impl AsRef<str>) -> MqbBuffer {
@@ -249,10 +249,10 @@ unsafe fn set_error(out: *mut MqbBuffer, message: impl AsRef<str>) {
     if out.is_null() {
         return;
     }
-    if !(*out).is_empty() {
-        buffer_free(*out);
+    if !unsafe { (*out).is_empty() } {
+        unsafe { buffer_free(*out) };
     }
-    *out = buffer_from(message);
+    unsafe { *out = buffer_from(message) };
 }
 
 /// Runs an ABI call body, turning any panic into [`MQB_ERR_PANIC`] so unwinding
@@ -292,7 +292,7 @@ fn panic_text(payload: &(dyn std::any::Any + Send)) -> String {
 /// # Safety
 /// `slice` must satisfy the ABI's borrow rules for the current call.
 unsafe fn read_str(slice: MqbSlice, field: &str) -> Result<String, String> {
-    std::str::from_utf8(slice.as_bytes())
+    std::str::from_utf8(unsafe { slice.as_bytes() })
         .map(str::to_owned)
         .map_err(|_| format!("`{field}` passed to the plugin is not valid UTF-8"))
 }
@@ -303,14 +303,14 @@ unsafe fn read_config(slice: MqbSlice) -> Result<serde_json::Value, String> {
     if slice.len == 0 {
         return Ok(serde_json::Value::Object(Default::default()));
     }
-    serde_json::from_slice(slice.as_bytes())
+    serde_json::from_slice(unsafe { slice.as_bytes() })
         .map_err(|err| format!("endpoint configuration is not valid JSON: {err}"))
 }
 
 /// Reports a runtime-level failure (a panic, or a runtime that went away) with
 /// the status matching its cause.
 unsafe fn task_failed(err: *mut MqbBuffer, failure: TaskFailure) -> MqbStatus {
-    set_error(err, failure.to_string());
+    unsafe { set_error(err, failure.to_string()) };
     failure.status()
 }
 
@@ -343,7 +343,7 @@ where
         let runtime = match build_runtime() {
             Ok(runtime) => runtime,
             Err(error) => {
-                set_error(err, format!("{error:#}"));
+                unsafe { set_error(err, format!("{error:#}")) };
                 return MQB_ERR_PERMANENT;
             }
         };
@@ -351,19 +351,19 @@ where
             factory: Arc::new(F::default()),
             runtime,
         };
-        *out = MqbFactoryHandle(into_handle(state));
+        unsafe { *out = MqbFactoryHandle(into_handle(state)) };
         MQB_OK
     })
 }
 
 unsafe extern "C" fn factory_free(factory: MqbFactoryHandle) {
-    guarded_unit(|| drop(reclaim::<FactoryState>(factory.0)));
+    guarded_unit(|| drop(unsafe { reclaim::<FactoryState>(factory.0) }));
 }
 
 unsafe extern "C" fn buffer_free(buffer: MqbBuffer) {
     guarded_unit(|| {
         if !buffer.ptr.is_null() {
-            drop(Vec::from_raw_parts(buffer.ptr, buffer.len, buffer.cap));
+            drop(unsafe { Vec::from_raw_parts(buffer.ptr, buffer.len, buffer.cap) });
         }
     });
 }
@@ -378,17 +378,18 @@ unsafe extern "C" fn consumer_create(
     err: *mut MqbBuffer,
 ) -> MqbStatus {
     guarded(err, || {
-        let Some(state) = borrow::<FactoryState>(factory.0) else {
-            set_error(err, "consumer_create called with a null factory handle");
+        let Some(state) = (unsafe { borrow::<FactoryState>(factory.0) }) else {
+            unsafe { set_error(err, "consumer_create called with a null factory handle") };
             return MQB_ERR_PERMANENT;
         };
-        let (route, config) = match (read_str(route_name, "route_name"), read_config(config_json)) {
-            (Ok(route), Ok(config)) => (route, config),
-            (Err(message), _) | (_, Err(message)) => {
-                set_error(err, message);
-                return MQB_ERR_INVALID_CONFIG;
-            }
-        };
+        let (route, config) =
+            match unsafe { (read_str(route_name, "route_name"), read_config(config_json)) } {
+                (Ok(route), Ok(config)) => (route, config),
+                (Err(message), _) | (_, Err(message)) => {
+                    unsafe { set_error(err, message) };
+                    return MQB_ERR_INVALID_CONFIG;
+                }
+            };
 
         let factory = Arc::clone(&state.factory);
         let runtime = Arc::clone(&state.runtime);
@@ -410,19 +411,21 @@ unsafe extern "C" fn consumer_create(
         let (consumer, commit_requires_order) = match created {
             Ok(Ok(created)) => created,
             Ok(Err((status, error))) => {
-                set_error(err, format!("{error:#}"));
+                unsafe { set_error(err, format!("{error:#}")) };
                 return status;
             }
-            Err(failure) => return task_failed(err, failure),
+            Err(failure) => return unsafe { task_failed(err, failure) },
         };
 
         let (shutdown, _) = tokio::sync::watch::channel(false);
-        *out = MqbConsumerHandle(into_handle(ConsumerState {
-            consumer: Arc::new(Mutex::new(consumer)),
-            runtime,
-            shutdown,
-            commit_requires_order,
-        }));
+        unsafe {
+            *out = MqbConsumerHandle(into_handle(ConsumerState {
+                consumer: Arc::new(Mutex::new(consumer)),
+                runtime,
+                shutdown,
+                commit_requires_order,
+            }))
+        };
         MQB_OK
     })
 }
@@ -436,8 +439,8 @@ unsafe extern "C" fn consumer_receive_batch(
     err: *mut MqbBuffer,
 ) -> MqbStatus {
     guarded(err, || {
-        let Some(state) = borrow::<ConsumerState>(consumer.0) else {
-            set_error(err, "consumer_receive_batch called with a null handle");
+        let Some(state) = (unsafe { borrow::<ConsumerState>(consumer.0) }) else {
+            unsafe { set_error(err, "consumer_receive_batch called with a null handle") };
             return MQB_ERR_PERMANENT;
         };
         let shared = Arc::clone(&state.consumer);
@@ -452,11 +455,11 @@ unsafe extern "C" fn consumer_receive_batch(
             Ok(Some(Ok(batch))) => batch,
             Ok(Some(Err(error))) => {
                 let status = consumer_status(&error);
-                set_error(err, format!("{error:#}"));
+                unsafe { set_error(err, format!("{error:#}")) };
                 return status;
             }
             Ok(None) => return MQB_END_OF_STREAM,
-            Err(failure) => return task_failed(err, failure),
+            Err(failure) => return unsafe { task_failed(err, failure) },
         };
 
         let state = Box::new(BatchState {
@@ -464,21 +467,24 @@ unsafe extern "C" fn consumer_receive_batch(
             commit: Some(batch.commit),
             runtime: Arc::clone(&state.runtime),
         });
-        *out_messages = state.messages.as_ptr();
-        *out_len = state.messages.len();
-        *out_batch = MqbBatchHandle(Box::into_raw(state).cast());
+        unsafe {
+            *out_messages = state.messages.as_ptr();
+            *out_len = state.messages.len();
+            *out_batch = MqbBatchHandle(Box::into_raw(state).cast());
+        }
         MQB_OK
     })
 }
 
 unsafe extern "C" fn consumer_commit_requires_order(consumer: MqbConsumerHandle) -> u8 {
     // Defaults to the safe answer (ordered) if the handle is unusable.
-    borrow::<ConsumerState>(consumer.0).map_or(1, |state| u8::from(state.commit_requires_order))
+    unsafe { borrow::<ConsumerState>(consumer.0) }
+        .map_or(1, |state| u8::from(state.commit_requires_order))
 }
 
 unsafe extern "C" fn consumer_set_exit_on_empty(consumer: MqbConsumerHandle, exit_on_empty: u8) {
     guarded_unit(|| {
-        let Some(state) = borrow::<ConsumerState>(consumer.0) else {
+        let Some(state) = (unsafe { borrow::<ConsumerState>(consumer.0) }) else {
             return;
         };
         let shared = Arc::clone(&state.consumer);
@@ -490,7 +496,7 @@ unsafe extern "C" fn consumer_set_exit_on_empty(consumer: MqbConsumerHandle, exi
 
 unsafe extern "C" fn consumer_close(consumer: MqbConsumerHandle, err: *mut MqbBuffer) -> MqbStatus {
     guarded(err, || {
-        let Some(state) = borrow::<ConsumerState>(consumer.0) else {
+        let Some(state) = (unsafe { borrow::<ConsumerState>(consumer.0) }) else {
             return MQB_OK;
         };
         let _ = state.shutdown.send(true);
@@ -502,16 +508,16 @@ unsafe extern "C" fn consumer_close(consumer: MqbConsumerHandle, err: *mut MqbBu
         match closed {
             Ok(Ok(())) => MQB_OK,
             Ok(Err(error)) => {
-                set_error(err, format!("{error:#}"));
+                unsafe { set_error(err, format!("{error:#}")) };
                 MQB_ERR_RETRYABLE
             }
-            Err(failure) => task_failed(err, failure),
+            Err(failure) => unsafe { task_failed(err, failure) },
         }
     })
 }
 
 unsafe extern "C" fn consumer_free(consumer: MqbConsumerHandle) {
-    guarded_unit(|| drop(reclaim::<ConsumerState>(consumer.0)));
+    guarded_unit(|| drop(unsafe { reclaim::<ConsumerState>(consumer.0) }));
 }
 
 // --------------------------------------------------------------------- batch
@@ -523,32 +529,36 @@ unsafe extern "C" fn batch_commit(
     err: *mut MqbBuffer,
 ) -> MqbStatus {
     guarded(err, || {
-        let Some(mut state) = reclaim::<BatchState>(batch.0) else {
-            set_error(err, "batch_commit called with a null handle");
+        let Some(mut state) = (unsafe { reclaim::<BatchState>(batch.0) }) else {
+            unsafe { set_error(err, "batch_commit called with a null handle") };
             return MQB_ERR_PERMANENT;
         };
         let Some(commit) = state.commit.take() else {
-            set_error(err, "batch_commit called twice for the same batch");
+            unsafe { set_error(err, "batch_commit called twice for the same batch") };
             return MQB_ERR_PERMANENT;
         };
         // Same check the middleware side makes: a mismatched count would
         // silently ack or drop messages instead of failing loudly.
         let expected = state.messages.len();
         if len != expected {
-            set_error(
-                err,
-                format!("batch_commit got {len} dispositions for a batch of {expected} messages"),
-            );
+            unsafe {
+                set_error(
+                    err,
+                    format!(
+                        "batch_commit got {len} dispositions for a batch of {expected} messages"
+                    ),
+                )
+            };
             return MQB_ERR_PERMANENT;
         }
         if dispositions.is_null() && len != 0 {
-            set_error(err, "batch_commit got a null disposition array");
+            unsafe { set_error(err, "batch_commit got a null disposition array") };
             return MQB_ERR_PERMANENT;
         }
         let codes: &[u8] = if len == 0 {
             &[]
         } else {
-            std::slice::from_raw_parts(dispositions, len)
+            unsafe { std::slice::from_raw_parts(dispositions, len) }
         };
         let dispositions: Vec<MessageDisposition> = codes
             .iter()
@@ -564,10 +574,10 @@ unsafe extern "C" fn batch_commit(
         match block_on(&state.runtime, commit(dispositions)) {
             Ok(Ok(())) => MQB_OK,
             Ok(Err(error)) => {
-                set_error(err, format!("{error:#}"));
+                unsafe { set_error(err, format!("{error:#}")) };
                 MQB_ERR_RETRYABLE
             }
-            Err(failure) => task_failed(err, failure),
+            Err(failure) => unsafe { task_failed(err, failure) },
         }
     })
 }
@@ -575,7 +585,7 @@ unsafe extern "C" fn batch_commit(
 unsafe extern "C" fn batch_free(batch: MqbBatchHandle) {
     // Dropping the commit closure without calling it acknowledges nothing,
     // which is what an uncommitted batch must do.
-    guarded_unit(|| drop(reclaim::<BatchState>(batch.0)));
+    guarded_unit(|| drop(unsafe { reclaim::<BatchState>(batch.0) }));
 }
 
 // ----------------------------------------------------------------- publisher
@@ -588,17 +598,18 @@ unsafe extern "C" fn publisher_create(
     err: *mut MqbBuffer,
 ) -> MqbStatus {
     guarded(err, || {
-        let Some(state) = borrow::<FactoryState>(factory.0) else {
-            set_error(err, "publisher_create called with a null factory handle");
+        let Some(state) = (unsafe { borrow::<FactoryState>(factory.0) }) else {
+            unsafe { set_error(err, "publisher_create called with a null factory handle") };
             return MQB_ERR_PERMANENT;
         };
-        let (route, config) = match (read_str(route_name, "route_name"), read_config(config_json)) {
-            (Ok(route), Ok(config)) => (route, config),
-            (Err(message), _) | (_, Err(message)) => {
-                set_error(err, message);
-                return MQB_ERR_INVALID_CONFIG;
-            }
-        };
+        let (route, config) =
+            match unsafe { (read_str(route_name, "route_name"), read_config(config_json)) } {
+                (Ok(route), Ok(config)) => (route, config),
+                (Err(message), _) | (_, Err(message)) => {
+                    unsafe { set_error(err, message) };
+                    return MQB_ERR_INVALID_CONFIG;
+                }
+            };
 
         let factory = Arc::clone(&state.factory);
         let runtime = Arc::clone(&state.runtime);
@@ -615,16 +626,18 @@ unsafe extern "C" fn publisher_create(
         let publisher = match created {
             Ok(Ok(publisher)) => publisher,
             Ok(Err((status, error))) => {
-                set_error(err, format!("{error:#}"));
+                unsafe { set_error(err, format!("{error:#}")) };
                 return status;
             }
-            Err(failure) => return task_failed(err, failure),
+            Err(failure) => return unsafe { task_failed(err, failure) },
         };
 
-        *out = MqbPublisherHandle(into_handle(PublisherState {
-            publisher: Arc::from(publisher),
-            runtime,
-        }));
+        unsafe {
+            *out = MqbPublisherHandle(into_handle(PublisherState {
+                publisher: Arc::from(publisher),
+                runtime,
+            }))
+        };
         MQB_OK
     })
 }
@@ -636,11 +649,11 @@ unsafe extern "C" fn publisher_send_batch(
     err: *mut MqbBuffer,
 ) -> MqbStatus {
     guarded(err, || {
-        let Some(state) = borrow::<PublisherState>(publisher.0) else {
-            set_error(err, "publisher_send_batch called with a null handle");
+        let Some(state) = (unsafe { borrow::<PublisherState>(publisher.0) }) else {
+            unsafe { set_error(err, "publisher_send_batch called with a null handle") };
             return MQB_ERR_PERMANENT;
         };
-        let messages: Vec<CanonicalMessage> = from_abi(messages, len);
+        let messages: Vec<CanonicalMessage> = unsafe { from_abi(messages, len) };
         let shared = Arc::clone(&state.publisher);
         let sent = block_on(
             &state.runtime,
@@ -654,16 +667,16 @@ unsafe extern "C" fn publisher_send_batch(
                 None => MQB_OK,
                 Some((_, error)) => {
                     let status = processing_status(&error);
-                    set_error(err, format!("{error:#}"));
+                    unsafe { set_error(err, format!("{error:#}")) };
                     status
                 }
             },
             Ok(Err(error)) => {
                 let status = processing_status(&error);
-                set_error(err, format!("{error:#}"));
+                unsafe { set_error(err, format!("{error:#}")) };
                 status
             }
-            Err(failure) => task_failed(err, failure),
+            Err(failure) => unsafe { task_failed(err, failure) },
         }
     })
 }
@@ -673,17 +686,17 @@ unsafe extern "C" fn publisher_flush(
     err: *mut MqbBuffer,
 ) -> MqbStatus {
     guarded(err, || {
-        let Some(state) = borrow::<PublisherState>(publisher.0) else {
+        let Some(state) = (unsafe { borrow::<PublisherState>(publisher.0) }) else {
             return MQB_OK;
         };
         let shared = Arc::clone(&state.publisher);
         match block_on(&state.runtime, async move { shared.flush().await }) {
             Ok(Ok(())) => MQB_OK,
             Ok(Err(error)) => {
-                set_error(err, format!("{error:#}"));
+                unsafe { set_error(err, format!("{error:#}")) };
                 MQB_ERR_RETRYABLE
             }
-            Err(failure) => task_failed(err, failure),
+            Err(failure) => unsafe { task_failed(err, failure) },
         }
     })
 }
@@ -693,7 +706,7 @@ unsafe extern "C" fn publisher_close(
     err: *mut MqbBuffer,
 ) -> MqbStatus {
     guarded(err, || {
-        let Some(state) = borrow::<PublisherState>(publisher.0) else {
+        let Some(state) = (unsafe { borrow::<PublisherState>(publisher.0) }) else {
             return MQB_OK;
         };
         let shared = Arc::clone(&state.publisher);
@@ -707,16 +720,16 @@ unsafe extern "C" fn publisher_close(
         match closed {
             Ok(Ok(())) => MQB_OK,
             Ok(Err(error)) => {
-                set_error(err, format!("{error:#}"));
+                unsafe { set_error(err, format!("{error:#}")) };
                 MQB_ERR_RETRYABLE
             }
-            Err(failure) => task_failed(err, failure),
+            Err(failure) => unsafe { task_failed(err, failure) },
         }
     })
 }
 
 unsafe extern "C" fn publisher_free(publisher: MqbPublisherHandle) {
-    guarded_unit(|| drop(reclaim::<PublisherState>(publisher.0)));
+    guarded_unit(|| drop(unsafe { reclaim::<PublisherState>(publisher.0) }));
 }
 
 // ---------------------------------------------------------------- middleware
@@ -803,17 +816,18 @@ where
     M: MiddlewareFactory,
 {
     guarded(err, || {
-        let Some(state) = borrow::<FactoryState>(factory.0) else {
-            set_error(err, "middleware_create called with a null factory handle");
+        let Some(state) = (unsafe { borrow::<FactoryState>(factory.0) }) else {
+            unsafe { set_error(err, "middleware_create called with a null factory handle") };
             return MQB_ERR_PERMANENT;
         };
-        let (route, config) = match (read_str(route_name, "route_name"), read_config(config_json)) {
-            (Ok(route), Ok(config)) => (route, config),
-            (Err(message), _) | (_, Err(message)) => {
-                set_error(err, message);
-                return MQB_ERR_INVALID_CONFIG;
-            }
-        };
+        let (route, config) =
+            match unsafe { (read_str(route_name, "route_name"), read_config(config_json)) } {
+                (Ok(route), Ok(config)) => (route, config),
+                (Err(message), _) | (_, Err(message)) => {
+                    unsafe { set_error(err, message) };
+                    return MQB_ERR_INVALID_CONFIG;
+                }
+            };
 
         let runtime = Arc::clone(&state.runtime);
         let created = block_on(&runtime, async move {
@@ -822,17 +836,19 @@ where
         let filter = match created {
             Ok(Ok(filter)) => filter,
             Ok(Err(error)) => {
-                set_error(err, format!("{error:#}"));
+                unsafe { set_error(err, format!("{error:#}")) };
                 return MQB_ERR_INVALID_CONFIG;
             }
-            Err(failure) => return task_failed(err, failure),
+            Err(failure) => return unsafe { task_failed(err, failure) },
         };
 
-        *out = MqbMiddlewareHandle(into_handle(MiddlewareState {
-            filter: Arc::from(filter),
-            side,
-            runtime,
-        }));
+        unsafe {
+            *out = MqbMiddlewareHandle(into_handle(MiddlewareState {
+                filter: Arc::from(filter),
+                side,
+                runtime,
+            }))
+        };
         MQB_OK
     })
 }
@@ -847,11 +863,11 @@ unsafe extern "C" fn middleware_apply(
     err: *mut MqbBuffer,
 ) -> MqbStatus {
     guarded(err, || {
-        let Some(state) = borrow::<MiddlewareState>(middleware.0) else {
-            set_error(err, "middleware_apply called with a null handle");
+        let Some(state) = (unsafe { borrow::<MiddlewareState>(middleware.0) }) else {
+            unsafe { set_error(err, "middleware_apply called with a null handle") };
             return MQB_ERR_PERMANENT;
         };
-        let messages = from_abi(messages, len);
+        let messages = unsafe { from_abi(messages, len) };
         let filter = Arc::clone(&state.filter);
         let receive = state.side == MQB_MIDDLEWARE_RECEIVE;
         let filtered = block_on(&state.runtime, async move {
@@ -864,22 +880,24 @@ unsafe extern "C" fn middleware_apply(
         let filtered = match filtered {
             Ok(Ok(filtered)) => filtered,
             Ok(Err(error)) => {
-                set_error(err, format!("{error:#}"));
+                unsafe { set_error(err, format!("{error:#}")) };
                 return MQB_ERR_RETRYABLE;
             }
-            Err(failure) => return task_failed(err, failure),
+            Err(failure) => return unsafe { task_failed(err, failure) },
         };
         // Enforced here so a mistake surfaces as a clear error rather than as a
         // mismatched array the host would read out of bounds.
         if filtered.len() != len {
-            set_error(
-                err,
-                format!(
-                    "middleware returned {} entries for a batch of {len}; it must return exactly \
-                     one entry per message, in order",
-                    filtered.len()
-                ),
-            );
+            unsafe {
+                set_error(
+                    err,
+                    format!(
+                        "middleware returned {} entries for a batch of {len}; it must return \
+                         exactly one entry per message, in order",
+                        filtered.len()
+                    ),
+                )
+            };
             return MQB_ERR_PERMANENT;
         }
 
@@ -897,19 +915,21 @@ unsafe extern "C" fn middleware_apply(
             messages: AbiMessages::new(messages),
             kept,
         });
-        *out_messages = state.messages.as_ptr();
-        *out_kept = state.kept.as_ptr();
-        *out_result = MqbFilterHandle(Box::into_raw(state).cast());
+        unsafe {
+            *out_messages = state.messages.as_ptr();
+            *out_kept = state.kept.as_ptr();
+            *out_result = MqbFilterHandle(Box::into_raw(state).cast());
+        }
         MQB_OK
     })
 }
 
 unsafe extern "C" fn middleware_result_free(result: MqbFilterHandle) {
-    guarded_unit(|| drop(reclaim::<FilterResultState>(result.0)));
+    guarded_unit(|| drop(unsafe { reclaim::<FilterResultState>(result.0) }));
 }
 
 unsafe extern "C" fn middleware_free(middleware: MqbMiddlewareHandle) {
-    guarded_unit(|| drop(reclaim::<MiddlewareState>(middleware.0)));
+    guarded_unit(|| drop(unsafe { reclaim::<MiddlewareState>(middleware.0) }));
 }
 
 /// A function table wrapped so it can live in a `static`.

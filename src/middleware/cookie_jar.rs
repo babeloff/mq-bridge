@@ -11,8 +11,33 @@ use std::sync::{Arc, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 #[derive(Debug, Default, Clone)]
 struct SessionState {
-    cookies: HashMap<String, String>,
+    /// `name -> (set sequence, value)`. Cookie names are chosen by the server, so a
+    /// rotating name would grow the jar without bound; the sequence drives eviction
+    /// once `max_cookies` is exceeded.
+    cookies: HashMap<String, (u64, String)>,
     values: HashMap<String, String>,
+    next_seq: u64,
+}
+
+impl SessionState {
+    fn set_cookie(&mut self, name: String, value: String, max_cookies: usize) {
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        self.cookies.insert(name, (seq, value));
+        while self.cookies.len() > max_cookies.max(1) {
+            let oldest = self
+                .cookies
+                .iter()
+                .min_by_key(|(_, (seq, _))| *seq)
+                .map(|(name, _)| name.clone());
+            match oldest {
+                Some(name) => {
+                    self.cookies.remove(&name);
+                }
+                None => break,
+            }
+        }
+    }
 }
 
 type SessionStore = Arc<RwLock<SessionState>>;
@@ -69,23 +94,48 @@ fn parse_cookie_header(header: &str) -> Vec<(String, String)> {
         .collect()
 }
 
-fn parse_set_cookie_header(header: &str) -> Option<(String, String)> {
+/// What a `Set-Cookie` header asks the jar to do.
+enum SetCookie {
+    Store(String, String),
+    /// `Max-Age` at or below zero, the standard way to delete a cookie.
+    Expire(String),
+}
+
+/// `Expires` is deliberately not honoured: parsing HTTP dates would need a date
+/// dependency, and `max_cookies` already bounds the jar. `Max-Age` is unambiguous.
+fn parse_set_cookie_header(header: &str) -> Option<SetCookie> {
     let first = header.lines().next().unwrap_or(header).trim();
-    let first_pair = first.split(';').next()?.trim();
-    let (name, value) = first_pair.split_once('=')?;
+    let mut parts = first.split(';');
+    let (name, value) = parts.next()?.trim().split_once('=')?;
     let name = name.trim();
     if name.is_empty() {
         return None;
     }
-    Some((name.to_string(), value.trim().to_string()))
+
+    let expired = parts.any(|attr| {
+        let Some((key, val)) = attr.trim().split_once('=') else {
+            return false;
+        };
+        key.trim().eq_ignore_ascii_case("max-age")
+            && val.trim().parse::<i64>().is_ok_and(|age| age <= 0)
+    });
+
+    Some(if expired {
+        SetCookie::Expire(name.to_string())
+    } else {
+        SetCookie::Store(name.to_string(), value.trim().to_string())
+    })
 }
 
-fn render_cookie_header(cookies: &HashMap<String, String>) -> Option<String> {
+fn render_cookie_header(cookies: &HashMap<String, (u64, String)>) -> Option<String> {
     if cookies.is_empty() {
         return None;
     }
 
-    let mut pairs: Vec<_> = cookies.iter().map(|(k, v)| format!("{k}={v}")).collect();
+    let mut pairs: Vec<_> = cookies
+        .iter()
+        .map(|(k, (_, v))| format!("{k}={v}"))
+        .collect();
     pairs.sort();
     Some(pairs.join("; "))
 }
@@ -100,7 +150,7 @@ fn export_session_metadata(
     };
 
     let snapshot = recover_read_lock(store, "cookie_jar_session").clone();
-    for (key, value) in snapshot.cookies {
+    for (key, (_, value)) in snapshot.cookies {
         metadata.insert(format!("{prefix}cookie.{key}"), value);
     }
     for (key, value) in snapshot.values {
@@ -114,18 +164,23 @@ fn capture_session_inputs(
     cookie_metadata_key: &str,
     set_cookie_metadata_key: &str,
     capture_metadata_keys: &[String],
+    max_cookies: usize,
 ) {
     let mut state = recover_write_lock(store, "cookie_jar_session");
 
     if let Some(cookie_header) = metadata.get(cookie_metadata_key) {
         for (name, value) in parse_cookie_header(cookie_header) {
-            state.cookies.insert(name, value);
+            state.set_cookie(name, value, max_cookies);
         }
     }
 
     if let Some(set_cookie_header) = metadata.get(set_cookie_metadata_key) {
-        if let Some((name, value)) = parse_set_cookie_header(set_cookie_header) {
-            state.cookies.insert(name, value);
+        match parse_set_cookie_header(set_cookie_header) {
+            Some(SetCookie::Store(name, value)) => state.set_cookie(name, value, max_cookies),
+            Some(SetCookie::Expire(name)) => {
+                state.cookies.remove(&name);
+            }
+            None => {}
         }
     }
 
@@ -162,12 +217,12 @@ fn inject_session_metadata(
             .and_then(|prefix| session_key.strip_prefix(prefix))
             .unwrap_or(session_key);
         let value = match unprefixed.split_once('.') {
-            Some(("cookie", name)) => snapshot.cookies.get(name),
+            Some(("cookie", name)) => snapshot.cookies.get(name).map(|(_, v)| v),
             Some(("value", name)) => snapshot.values.get(name),
             _ => None,
         }
         .or_else(|| snapshot.values.get(session_key))
-        .or_else(|| snapshot.cookies.get(session_key));
+        .or_else(|| snapshot.cookies.get(session_key).map(|(_, v)| v));
 
         if let Some(value) = value {
             metadata.insert(metadata_key.clone(), value.clone());
@@ -197,6 +252,7 @@ impl CookieJarConsumer {
             &self.config.cookie_metadata_key,
             &self.config.set_cookie_metadata_key,
             &self.config.capture_metadata_keys,
+            self.config.max_cookies,
         );
         export_session_metadata(
             &mut message.metadata,
@@ -264,6 +320,7 @@ impl CookieJarPublisher {
             &self.config.cookie_metadata_key,
             &self.config.set_cookie_metadata_key,
             &self.config.capture_metadata_keys,
+            self.config.max_cookies,
         );
         inject_session_metadata(
             &mut message.metadata,
@@ -286,6 +343,7 @@ impl CookieJarPublisher {
             &self.config.cookie_metadata_key,
             &self.config.set_cookie_metadata_key,
             &self.config.capture_metadata_keys,
+            self.config.max_cookies,
         );
         export_session_metadata(
             &mut message.metadata,
@@ -406,6 +464,38 @@ mod tests {
 
         fn as_any(&self) -> &dyn Any {
             self
+        }
+    }
+
+    #[test]
+    fn max_age_zero_expires_a_cookie() {
+        let mut state = SessionState::default();
+        state.set_cookie("sid".to_string(), "abc".to_string(), 256);
+
+        match parse_set_cookie_header("sid=abc; Path=/; Max-Age=0").unwrap() {
+            SetCookie::Expire(name) => {
+                state.cookies.remove(&name);
+            }
+            SetCookie::Store(..) => panic!("Max-Age=0 must expire the cookie"),
+        }
+        assert!(state.cookies.is_empty());
+
+        assert!(matches!(
+            parse_set_cookie_header("sid=abc; Max-Age=3600"),
+            Some(SetCookie::Store(..))
+        ));
+    }
+
+    /// Cookie names come from the server, so a rotating name must not grow the jar.
+    #[test]
+    fn the_jar_is_capped_and_evicts_the_oldest() {
+        let mut state = SessionState::default();
+        for i in 0..10 {
+            state.set_cookie(format!("rotating-{i}"), "v".to_string(), 3);
+        }
+        assert_eq!(state.cookies.len(), 3);
+        for i in 7..10 {
+            assert!(state.cookies.contains_key(&format!("rotating-{i}")));
         }
     }
 

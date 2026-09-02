@@ -890,3 +890,40 @@ mod tests {
         assert_eq!(out, "id= n=0");
     }
 }
+
+/// Template properties. `compile` runs on operator-supplied config, so the invariants that matter
+/// are that literal bodies survive untouched and that no input reaches a panic instead of an error.
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        /// A body with no `$` has no tokens, so it must render back byte-identical.
+        #[test]
+        fn a_literal_body_renders_back_unchanged(body in "[^$]{0,128}") {
+            let template = CompiledTemplate::compile(&body, None).unwrap();
+            prop_assert!(!template.is_dynamic());
+            prop_assert_eq!(template.render(None), body.into_bytes());
+        }
+
+        /// `$${…}` is the escape for a body that wants a literal `${…}`.
+        #[test]
+        fn the_escape_sequence_yields_a_literal_token(inner in "[a-z]{1,8}") {
+            let body = ["$${", &inner, "}"].concat();
+            let template = CompiledTemplate::compile(&body, None).unwrap();
+            prop_assert!(!template.is_dynamic());
+            prop_assert_eq!(template.render(None), ["${", &inner, "}"].concat().into_bytes());
+        }
+
+        /// Malformed tokens must come back as `Err` at startup, never as a panic.
+        #[test]
+        fn compiling_arbitrary_input_never_panics(body in ".{0,128}") {
+            for content_type in [None, Some("application/json"), Some("text/plain")] {
+                if let Ok(template) = CompiledTemplate::compile(&body, content_type) {
+                    let _ = template.render(None);
+                }
+            }
+        }
+    }
+}

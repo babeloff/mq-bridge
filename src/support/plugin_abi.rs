@@ -162,7 +162,7 @@ impl MqbSlice {
         if self.len == 0 {
             return &[];
         }
-        core::slice::from_raw_parts(self.ptr, self.len)
+        unsafe { core::slice::from_raw_parts(self.ptr, self.len) }
     }
 }
 
@@ -195,7 +195,7 @@ impl MqbBuffer {
         if self.is_empty() {
             return &[];
         }
-        core::slice::from_raw_parts(self.ptr, self.len)
+        unsafe { core::slice::from_raw_parts(self.ptr, self.len) }
     }
 }
 

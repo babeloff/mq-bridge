@@ -7,7 +7,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const os = require("node:os");
 
-const { test, expect } = require("@playwright/test");
+const { test, expect } = require("./fixtures");
 const { resetConfig, readConfig, gotoView } = require("./helpers");
 
 const ACTIONS = {

@@ -72,3 +72,6 @@ grpc = ["mq-bridge/grpc"]
 sqlx = ["mq-bridge/sqlx"]
 rustls-ring = ["mq-bridge/rustls-ring"]
 rustls-aws-lc = ["mq-bridge/rustls-aws-lc"]
+
+[lints]
+workspace = true
