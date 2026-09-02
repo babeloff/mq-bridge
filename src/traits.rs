@@ -31,7 +31,7 @@ pub enum MessageDisposition {
 
 /// How a route pass ended, for an endpoint whose close is a signal to someone else.
 ///
-/// Passed to [`MessagePublisher::on_disconnect_with_outcome`]. Every teardown path runs
+/// Read with [`disconnect_outcome`] from inside a disconnect hook. Every teardown path runs
 /// the disconnect hooks — a clean finish, a shutdown and a failure alike — so an endpoint
 /// that has to tell the three apart cannot do it by being closed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

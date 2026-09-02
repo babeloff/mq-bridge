@@ -537,7 +537,11 @@ the rule.
 `drain_on_read: false` is the one exception to the cardinality rule: such a reader deletes
 nothing, so several of them over one spool each see every chunk once and none of them takes
 a lock — though each will warn if a draining consumer holds the directory, because that one
-deletes chunks out from under it.
+deletes chunks out from under it. It remembers what it has read by name, in memory, for as
+long as the run lasts: a chunk may appear with a name below one already delivered, so a
+position alone could not tell the two apart. Budget for that on a spool of millions of
+chunks that is never drained, and restart the reader to reset it — a fresh run re-reads
+the directory from the beginning.
 
 ##### Throughput and durability
 The endpoint's dominant cost is fsync, not mq-bridge. The default `fsync: chunk` is **two

@@ -981,6 +981,10 @@ pub struct DirSpoolConsumer {
     /// `drain_on_read` is off, so nothing is ever deleted — those already delivered
     /// successfully. Shared with the commit closures, which run on the route's tasks and
     /// are what releases a chunk again after a nack.
+    ///
+    /// In that second case the set grows with the spool, which is the price of the
+    /// contract: a chunk can arrive with a name below one already read, so "delivered at
+    /// most once per run" cannot be held as a position, only as names.
     claimed: Arc<StdMutex<HashSet<String>>>,
     /// Chunk names left over from the last directory scan, in queue order. Batches are
     /// served from the front of this and the directory is only walked again once it runs
@@ -1071,15 +1075,11 @@ impl DirSpoolConsumer {
     /// cheap on a spool far too large to list — the reason sharding exists.
     async fn refill_ready(&mut self, limit: usize) -> anyhow::Result<()> {
         let capacity = limit.max(READY_CACHE_CAPACITY);
-        // Snapshot rather than lock per entry: the guard must not be held across the
-        // `next_entry` await, which is what keeps this future `Send`. The set only holds
-        // chunks in flight (or, with `drain_on_read` off, already-read ones), and a refill
-        // happens once per cache-full of messages, so the clone is not on the hot path.
-        let claimed = self
-            .claimed
-            .lock()
-            .expect("dir_spool claim set poisoned")
-            .clone();
+        // Locked per candidate rather than snapshotted: with `drain_on_read` off the set
+        // holds every chunk read so far, and copying that per refill would double the
+        // reader's peak memory. An uncontended lock is nothing beside the `next_entry`
+        // await and the name allocation it already costs per entry.
+        let claimed = Arc::clone(&self.claimed);
         let depth = self.sharding.map_or(0, |sharding| sharding.depth);
         let mut collected: Vec<String> = Vec::new();
         // Explicit stack rather than recursion, which an async fn cannot do without boxing.
@@ -1127,7 +1127,7 @@ impl DirSpoolConsumer {
         path: &Path,
         prefix: &str,
         capacity: usize,
-        claimed: &HashSet<String>,
+        claimed: &StdMutex<HashSet<String>>,
     ) -> anyhow::Result<(Vec<String>, Vec<String>)> {
         let mut entries = match fs::read_dir(path).await {
             Ok(entries) => entries,
@@ -1161,7 +1161,13 @@ impl DirSpoolConsumer {
                 continue;
             };
             let base = join_base(prefix, stem);
-            if claimed.contains(&base) {
+            // Scoped so no guard is live across the next `next_entry` await, which is what
+            // keeps this future `Send`.
+            if claimed
+                .lock()
+                .expect("dir_spool claim set poisoned")
+                .contains(&base)
+            {
                 continue;
             }
             if smallest.len() < capacity {

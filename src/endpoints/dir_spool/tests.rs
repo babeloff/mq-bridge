@@ -731,6 +731,32 @@ async fn reads_a_bare_payload_file_written_without_a_sidecar() {
     assert!(received[0].metadata.is_empty());
 }
 
+/// A perusal reader sees *every* chunk once, not every chunk above a watermark. Names
+/// only arrive in order when one producer writes them; a second producer with the claim
+/// off, or a foreign one, can drop a lexically lower name after the reader has moved past
+/// it. Skipping it would lose a message, so what has been read is remembered by name.
+#[tokio::test]
+async fn a_non_draining_reader_still_delivers_a_late_arrival_below_what_it_has_read() {
+    let dir = tempdir().unwrap();
+    let mut cfg = config(dir.path());
+    cfg.drain_on_read = false;
+
+    std::fs::write(dir.path().join("000005.bin"), b"five").unwrap();
+    std::fs::write(dir.path().join("000006.bin"), b"six").unwrap();
+    let mut consumer = DirSpoolConsumer::new(&cfg).await.unwrap();
+    let first = drain(&mut consumer, 10).await;
+    assert_eq!(first.len(), 2);
+
+    // Behind the reader's position, and still owed to it.
+    std::fs::write(dir.path().join("000001.bin"), b"one").unwrap();
+    let late = drain(&mut consumer, 10).await;
+    assert_eq!(late.len(), 1, "the late chunk must not be skipped");
+    assert_eq!(&late[0].payload[..], b"one");
+
+    // And nothing already read comes back a second time.
+    assert!(drain(&mut consumer, 10).await.is_empty());
+}
+
 #[tokio::test]
 async fn stamps_source_metadata_when_asked() {
     let dir = tempdir().unwrap();
