@@ -443,20 +443,59 @@ opaque blobs, where the delimiter framing and the single append point both get i
 | `payload_extension` | both | `bin` | Extension of the payload file, with or without the leading dot. |
 | `metadata_extension` | both | `json` | Extension of the metadata sidecar. Empty string writes and expects payload files only. |
 | `atomic` | sink | `true` | Write to `.tmp` and rename on completion. |
-| `done_file` | both | `DONE` | Name of the producer-completion sentinel. |
-| `emit_done` | sink | `false` | Create `done_file` when the publisher closes. |
 | `drain_on_read` | source | `true` | Delete each chunk once its message is acknowledged. |
-| `stop_on_done` | source | `false` | End the stream once the queue is empty *and* `done_file` exists. |
+| `stop_on_done` | source | `false` | End the stream once the queue is empty *and* no producer holds the `PRODUCER` lock. |
 | `poll_interval_ms` | source | `100` | Idle poll interval when the directory holds no new chunks. |
 | `source_metadata` | source | `false` | Stamp `mqb.src.spool_path` and `mqb.src.spool_chunk`. |
+| `claim` | both | `exclusive` | Lock this side of the spool: `exclusive` refuses to start when another instance holds the same role, `warn` logs and runs anyway, `off` takes no lock at all. |
 
 Lexical order is queue order, so keep a zero-padded `{seq}` first in `naming_pattern`.
 A publisher opening an existing spool resumes numbering past the highest chunk already
 there, so a restart appends rather than overwriting the head of the queue.
 
-The sentinel and the queue are checked together: `stop_on_done` ends the stream only once
-the directory holds no unread chunks *and* `done_file` is present, so a producer that
-finished long ago still has its backlog drained first.
+**Cardinality, and how a producer says it is finished.** One spool directory takes **one
+producer and one consumer**, each of which may be internally concurrent — `concurrency > 1`
+on either side is fine, since the sequence counter and the in-flight set are shared within
+an instance. A *second* instance in the same role corrupts the queue rather than sharing
+it: two producers seed from the same highest sequence number and overwrite each other's
+chunks, and two draining consumers each deliver every chunk they win the race to read.
+
+So each side takes a pid lock on one extension-less file in the spool — `PRODUCER` or
+`CONSUMER` — created when the endpoint opens and removed when it closes, and `claim:
+exclusive` (the default) refuses to start when its role is already held, naming the holder.
+The two roles never conflict with each other, so a producer and a consumer sharing a
+directory — the point of the endpoint — needs no configuration.
+
+The `PRODUCER` lock is also the end-of-stream signal: `stop_on_done` ends the stream once
+the queue is empty *and* no live producer holds the lock, so a producer that finished long
+ago still has its backlog drained first. Because the signal is a lock rather than a
+sentinel file, it cannot be left behind — there is no stale "finished" marker for the next
+run to trip over, and a producer that starts again is visible again immediately.
+
+Two consequences worth planning for:
+
+- **Start order matters under `stop_on_done`.** A consumer started in the window *before*
+  its producer takes the lock sees an empty spool that nobody is writing to, and ends the
+  stream at once. Start the consumer after the producer (or after it has finished — the
+  backlog is still drained), or leave `stop_on_done` off and stop the consumer another way.
+- **A producer that crashes looks like one that finished.** Its lock names a process that
+  is no longer running, so it is broken, and a `stop_on_done` consumer drains what reached
+  the disk and then ends the stream rather than tailing a spool nobody is filling. That is
+  the opposite trade from a sentinel file, which would have left the consumer waiting
+  forever for a `DONE` that was never coming.
+- **A lock is broken automatically only when its owner is provably gone.** The check is by
+  process id, so it works for a crash on the machine that wrote the lock. A spool shared
+  between hosts or containers cannot be judged that way: clear such a lock by deleting the
+  file, and be aware that a pid check across a pid-namespace boundary can also break a lock
+  whose owner is alive but invisible.
+
+Genuinely shared spools are still possible with `claim: warn` or `claim: off`, but several
+producers then need `{message_id}` in `naming_pattern` to keep names from colliding, and
+`claim: off` on a producer makes it invisible to a `stop_on_done` consumer. `drain_on_read:
+false` is the one exception to the cardinality rule: such a reader deletes nothing, so
+several of them over one spool each see every chunk once and none of them takes a lock —
+though each will warn if a draining consumer holds the directory, because that one deletes
+chunks out from under it.
 
 A directory scan keeps up to 65,536 chunk names for the batches that follow, so draining a
 backlog costs one scan per that many messages rather than one per batch. Two consequences
@@ -467,7 +506,8 @@ batch that empties a listing can be shorter than the route's `batch_size`.
 **Example**: video frames plus telemetry, written by one process and drained by another.
 
 ```yaml
-# Producer: raw H.264 chunks with a telemetry sidecar, sentinel on close.
+# Producer: raw H.264 chunks with a telemetry sidecar. Holds the PRODUCER lock while it
+# runs, and releasing it on close is what ends the consumer's stream below.
 frame_capture:
   input:
     memory:
@@ -478,7 +518,6 @@ frame_capture:
       naming_pattern: "{seq:06d}_{timestamp}"
       payload_extension: ".h264"
       metadata_extension: ".json"
-      emit_done: true
 
 # Consumer: drain in sequence order, delete as we go, exit when the producer is done.
 frame_ingest:

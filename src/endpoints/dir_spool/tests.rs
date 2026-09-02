@@ -1,5 +1,5 @@
 use super::*;
-use crate::models::DirSpoolConfig;
+use crate::models::{DirSpoolConfig, SpoolClaim};
 use crate::traits::{MessageConsumer, MessagePublisher};
 use tempfile::tempdir;
 
@@ -13,11 +13,28 @@ fn message(payload: &str, kind: &str) -> CanonicalMessage {
     msg
 }
 
-/// Drains the consumer until it reports an empty batch, acking everything it hands out.
+/// Every file in `dir`, sorted, so an assertion can name exactly what a spool holds.
+fn entries(dir: &std::path::Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+/// Drains the consumer until the queue runs out, acking everything it hands out. Under
+/// `stop_on_done` the queue running out is reported as `EndOfStream` rather than as an
+/// empty batch, and both end the drain; the signal is repeatable, so a caller can still
+/// assert on it afterwards.
 async fn drain(consumer: &mut DirSpoolConsumer, max: usize) -> Vec<CanonicalMessage> {
     let mut collected = Vec::new();
     loop {
-        let batch = consumer.receive_batch(max).await.unwrap();
+        let batch = match consumer.receive_batch(max).await {
+            Ok(batch) => batch,
+            Err(ConsumerError::EndOfStream) => return collected,
+            Err(error) => panic!("unexpected consumer error: {error:?}"),
+        };
         if batch.messages.is_empty() {
             return collected;
         }
@@ -54,7 +71,6 @@ dir_spool:
   payload_extension: ".h264"
   metadata_extension: ".json"
   atomic: true
-  emit_done: true
 "#,
     )
     .expect("the documented publisher config must parse");
@@ -66,12 +82,12 @@ dir_spool:
     // A leading dot is accepted and stripped, so `.h264` and `h264` mean the same thing.
     assert_eq!(cfg.payload_suffix(), "h264");
     assert_eq!(cfg.metadata_suffix(), Some("json"));
-    assert!(cfg.emit_done);
     // Consumer-side fields keep their defaults on a publisher block.
     assert!(cfg.drain_on_read);
     assert!(!cfg.stop_on_done);
-    assert_eq!(cfg.done_file, "DONE");
     assert_eq!(cfg.poll_interval_ms, 100);
+    // Both sides claim their role exclusively unless told otherwise.
+    assert_eq!(cfg.claim, SpoolClaim::Exclusive);
 
     let endpoint: Endpoint = serde_yaml_ng::from_str(
         r#"
@@ -143,8 +159,9 @@ async fn roundtrips_payload_and_metadata_through_the_spool() {
     assert_eq!(&received[0].payload[..], b"frame-one");
     assert_eq!(&received[1].payload[..], b"frame-two");
     assert_eq!(received[0].metadata.get("kind").unwrap(), "video");
-    // `drain_on_read` defaults to true, so an acked chunk leaves nothing behind.
-    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    // `drain_on_read` defaults to true, so an acked chunk leaves no chunk behind. The two
+    // live endpoints' claim files are all that is left, and neither is a chunk.
+    assert_eq!(entries(dir.path()), vec!["CONSUMER", "PRODUCER"]);
 }
 
 #[tokio::test]
@@ -335,10 +352,9 @@ async fn never_hands_out_a_partially_written_chunk() {
 }
 
 #[tokio::test]
-async fn ends_the_stream_once_the_queue_is_empty_and_done_is_present() {
+async fn ends_the_stream_once_the_queue_is_empty_and_the_producer_has_let_go() {
     let dir = tempdir().unwrap();
     let mut cfg = config(dir.path());
-    cfg.emit_done = true;
     cfg.stop_on_done = true;
 
     let publisher = DirSpoolPublisher::new(&cfg).await.unwrap();
@@ -346,16 +362,46 @@ async fn ends_the_stream_once_the_queue_is_empty_and_done_is_present() {
         .send_batch(vec![message("last", "x")])
         .await
         .unwrap();
-    // The route calls this hook when the publisher goes away.
-    publisher.on_disconnect_hook().unwrap().await.unwrap();
-    assert!(dir.path().join("DONE").exists());
 
     let mut consumer = DirSpoolConsumer::new(&cfg).await.unwrap();
-    // The backlog is drained first: the sentinel does not cut the queue short.
+    // While the producer holds its lock the stream stays open even with the queue empty.
     let batch = consumer.receive_batch(10).await.unwrap();
     assert_eq!(batch.messages.len(), 1);
     (batch.commit)(vec![MessageDisposition::Ack]).await.unwrap();
+    let waiting = consumer.receive_batch(10).await;
+    assert!(
+        matches!(&waiting, Ok(batch) if batch.messages.is_empty()),
+        "a live producer must keep the stream open, got {waiting:?}"
+    );
 
+    // The route calls this hook when the publisher goes away; it releases the lock, which
+    // is what declares the stream finished.
+    publisher.on_disconnect_hook().unwrap().await.unwrap();
+    assert!(!dir.path().join("PRODUCER").exists());
+    match consumer.receive_batch(10).await {
+        Err(ConsumerError::EndOfStream) => {}
+        other => panic!("expected EndOfStream once the producer let go, got {other:?}"),
+    }
+}
+
+/// The backlog comes first: a producer that finished long ago does not cut the queue short.
+#[tokio::test]
+async fn drains_the_backlog_before_ending_the_stream() {
+    let dir = tempdir().unwrap();
+    let mut cfg = config(dir.path());
+    cfg.stop_on_done = true;
+
+    let publisher = DirSpoolPublisher::new(&cfg).await.unwrap();
+    publisher
+        .send_batch(vec![message("one", "x"), message("two", "x")])
+        .await
+        .unwrap();
+    drop(publisher);
+    assert!(!dir.path().join("PRODUCER").exists());
+
+    let mut consumer = DirSpoolConsumer::new(&cfg).await.unwrap();
+    let received = drain(&mut consumer, 1).await;
+    assert_eq!(received.len(), 2);
     match consumer.receive_batch(10).await {
         Err(ConsumerError::EndOfStream) => {}
         other => panic!("expected EndOfStream once the queue drained, got {other:?}"),
@@ -367,10 +413,10 @@ async fn keeps_tailing_when_stop_on_done_is_off() {
     let dir = tempdir().unwrap();
     let mut cfg = config(dir.path());
     cfg.poll_interval_ms = 1;
-    std::fs::write(dir.path().join("DONE"), b"").unwrap();
 
     let mut consumer = DirSpoolConsumer::new(&cfg).await.unwrap();
-    // An empty batch, not an end of stream: the default is a directory tail.
+    // No producer holds the spool and the queue is empty, but `stop_on_done` is off: an
+    // empty batch, not an end of stream, because the default is a directory tail.
     let batch = consumer.receive_batch(10).await.unwrap();
     assert!(batch.messages.is_empty());
 }
@@ -494,6 +540,191 @@ async fn rejects_a_payload_and_sidecar_sharing_one_extension() {
     assert!(error.contains("must differ"), "unexpected error: {error}");
 }
 
+// --- Claims ---
+
+#[tokio::test]
+async fn a_second_producer_is_refused_while_the_first_holds_the_claim() {
+    let dir = tempdir().unwrap();
+    let cfg = config(dir.path());
+
+    let first = DirSpoolPublisher::new(&cfg).await.unwrap();
+    assert!(dir.path().join("PRODUCER").exists());
+
+    // Two producers seeded from the same sequence number would overwrite each other's
+    // chunks, so this has to fail loudly rather than corrupt the queue.
+    let error = DirSpoolPublisher::new(&cfg)
+        .await
+        .expect_err("a second producer must be refused")
+        .to_string();
+    assert!(
+        error.contains("already held by a producer") && error.contains("PRODUCER"),
+        "the error must name the holder and the file to delete, got: {error}"
+    );
+    // The refusal must not have disturbed the live claim.
+    drop(first);
+    assert!(!dir.path().join("PRODUCER").exists());
+    DirSpoolPublisher::new(&cfg)
+        .await
+        .expect("the claim is released when the holder is dropped");
+}
+
+#[tokio::test]
+async fn a_shared_spool_is_still_possible_with_claim_off_or_warn() {
+    let dir = tempdir().unwrap();
+    let mut cfg = config(dir.path());
+    cfg.claim = SpoolClaim::Off;
+
+    let _first = DirSpoolPublisher::new(&cfg).await.unwrap();
+    // Nothing claimed, nothing checked.
+    assert!(!dir.path().join("PRODUCER").exists());
+    let _second = DirSpoolPublisher::new(&cfg)
+        .await
+        .expect("'off' takes no claim and enforces none");
+
+    let mut warned = config(dir.path());
+    warned.claim = SpoolClaim::Warn;
+    let _third = DirSpoolPublisher::new(&warned)
+        .await
+        .expect("'warn' takes the free claim");
+    let _fourth = DirSpoolPublisher::new(&warned)
+        .await
+        .expect("'warn' logs the conflict and runs anyway");
+}
+
+/// A crash must not wedge the next start: the lock it left behind names a process that is
+/// no longer running, which `pidlock` checks before refusing.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_lock_left_by_a_dead_process_is_taken_over() {
+    let dir = tempdir().unwrap();
+    let cfg = config(dir.path());
+
+    // A pid that is definitely gone, because we waited for it.
+    let mut child = std::process::Command::new("/bin/true").spawn().unwrap();
+    let dead_pid = child.id();
+    child.wait().unwrap();
+    std::fs::write(dir.path().join("PRODUCER"), dead_pid.to_string()).unwrap();
+
+    let publisher = DirSpoolPublisher::new(&cfg)
+        .await
+        .expect("a lock whose owner is gone must be taken over");
+    // Retaken, not merely ignored: the file now names this process.
+    let held = std::fs::read_to_string(dir.path().join("PRODUCER")).unwrap();
+    assert_eq!(held.trim(), std::process::id().to_string());
+    drop(publisher);
+}
+
+/// The other direction: a lock naming a process that *is* running is respected, whoever
+/// wrote it.
+#[tokio::test]
+async fn a_lock_naming_a_live_process_is_respected() {
+    let dir = tempdir().unwrap();
+    let cfg = config(dir.path());
+    // Our own pid stands in for "some live process wrote this".
+    std::fs::write(dir.path().join("PRODUCER"), std::process::id().to_string()).unwrap();
+
+    let error = DirSpoolPublisher::new(&cfg)
+        .await
+        .expect_err("a live lock must be respected, not broken")
+        .to_string();
+    assert!(
+        error.contains(&format!("pid {}", std::process::id())),
+        "the error must name the holder, got: {error}"
+    );
+}
+
+/// A lock file that holds no readable pid names nobody, so there is no one to defer to and
+/// nothing to alarm about: `pidlock` clears it and the endpoint starts.
+#[tokio::test]
+async fn a_corrupt_lock_file_is_cleared() {
+    let dir = tempdir().unwrap();
+    let cfg = config(dir.path());
+    std::fs::write(dir.path().join("PRODUCER"), b"not a pid").unwrap();
+
+    let publisher = DirSpoolPublisher::new(&cfg)
+        .await
+        .expect("a lock file with no readable pid must be cleared");
+    let held = std::fs::read_to_string(dir.path().join("PRODUCER")).unwrap();
+    assert_eq!(held.trim(), std::process::id().to_string());
+    drop(publisher);
+}
+
+#[tokio::test]
+async fn a_draining_consumer_excludes_another_but_readers_share_the_spool() {
+    let dir = tempdir().unwrap();
+    let cfg = config(dir.path());
+
+    let drainer = DirSpoolConsumer::new(&cfg).await.unwrap();
+    assert!(dir.path().join("CONSUMER").exists());
+    let error = DirSpoolConsumer::new(&cfg)
+        .await
+        .expect_err("a second draining consumer must be refused")
+        .to_string();
+    assert!(
+        error.contains("already held by a consumer"),
+        "unexpected error: {error}"
+    );
+
+    // A non-draining reader deletes nothing, so it may read alongside the drainer — it
+    // just gets warned that chunks will vanish from under it.
+    let mut archive = config(dir.path());
+    archive.drain_on_read = false;
+    let _reader = DirSpoolConsumer::new(&archive)
+        .await
+        .expect("a non-draining reader must not be blocked by a drainer");
+    drop(drainer);
+
+    // And several non-draining readers share the spool with no claim between them.
+    let _second_reader = DirSpoolConsumer::new(&archive)
+        .await
+        .expect("non-draining readers are a supported fan-out");
+    assert!(!dir.path().join("CONSUMER").exists());
+}
+
+/// The hazard the old `DONE` sentinel had — a stale "producer finished" marker from an
+/// earlier run — cannot arise now: the signal is a lock the producer holds, so a producer
+/// that starts again is visible again, with nothing to clean up first.
+#[tokio::test]
+async fn a_restarted_producer_reopens_the_stream() {
+    let dir = tempdir().unwrap();
+    let mut cfg = config(dir.path());
+    cfg.stop_on_done = true;
+    cfg.poll_interval_ms = 1;
+
+    // First run: produce, drain, and let go.
+    let first = DirSpoolPublisher::new(&cfg).await.unwrap();
+    first
+        .send_batch(vec![message("run-one", "x")])
+        .await
+        .unwrap();
+    drop(first);
+    let mut consumer = DirSpoolConsumer::new(&cfg).await.unwrap();
+    assert_eq!(drain(&mut consumer, 10).await.len(), 1);
+    // Nothing live holds the spool, so the stream is over.
+    assert!(matches!(
+        consumer.receive_batch(10).await,
+        Err(ConsumerError::EndOfStream)
+    ));
+    drop(consumer);
+
+    // Second run: the new producer takes the lock again, and a fresh consumer waits on it
+    // rather than seeing a leftover "finished" marker.
+    let second = DirSpoolPublisher::new(&cfg).await.unwrap();
+    assert!(dir.path().join("PRODUCER").exists());
+    let mut consumer = DirSpoolConsumer::new(&cfg).await.unwrap();
+    let waiting = consumer.receive_batch(10).await;
+    assert!(
+        matches!(&waiting, Ok(batch) if batch.messages.is_empty()),
+        "a restarted producer must reopen the stream, got {waiting:?}"
+    );
+    second
+        .send_batch(vec![message("run-two", "x")])
+        .await
+        .unwrap();
+    let received = drain(&mut consumer, 10).await;
+    assert_eq!(&received[0].payload[..], b"run-two");
+}
+
 /// The whole point of the endpoint: a producer that runs to completion and exits, and a
 /// consumer that starts afterwards and still gets every chunk, in order.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -506,8 +737,7 @@ async fn a_route_drains_a_spool_its_producer_has_already_finished_writing() {
     let sink = dir.path().join("out.jsonl");
 
     // Producer: fill the spool and mark it finished, then go away entirely.
-    let mut producer_cfg = DirSpoolConfig::new(spool.to_str().unwrap());
-    producer_cfg.emit_done = true;
+    let producer_cfg = DirSpoolConfig::new(spool.to_str().unwrap());
     let producer = DirSpoolPublisher::new(&producer_cfg).await.unwrap();
     for index in 0..20 {
         producer
@@ -536,19 +766,20 @@ async fn a_route_drains_a_spool_its_producer_has_already_finished_writing() {
         route.run_until_err("spool_drain", None, None),
     )
     .await
-    .expect("the route should end once DONE is reached and the queue is empty")
+    .expect("the route should end once the producer has let go and the queue is empty")
     .expect("the route should complete without errors");
 
     let written = tokio::fs::read_to_string(&sink).await.unwrap();
     let lines: Vec<&str> = written.lines().collect();
     let expected: Vec<String> = (0..20).map(|index| index.to_string()).collect();
     assert_eq!(lines, expected, "the spool must drain in queue order");
-    // Every chunk was acked, so the queue is empty; only the sentinel is left.
-    let leftovers: Vec<String> = std::fs::read_dir(&spool)
-        .unwrap()
-        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
-        .collect();
-    assert_eq!(leftovers, vec!["DONE".to_string()]);
+    // Every chunk was acked and both ends have closed, so the spool is empty — including
+    // the two locks, which the producer and the route's consumer each released.
+    assert!(
+        entries(&spool).is_empty(),
+        "the drained spool should be empty, holds {:?}",
+        entries(&spool)
+    );
 }
 
 #[tokio::test]

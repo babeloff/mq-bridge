@@ -305,12 +305,11 @@ impl DirSpoolConfig {
             payload_extension: default_spool_payload_extension(),
             metadata_extension: default_spool_metadata_extension(),
             atomic: true,
-            done_file: default_spool_done_file(),
-            emit_done: false,
             drain_on_read: true,
             stop_on_done: false,
             poll_interval_ms: default_spool_poll_interval_ms(),
             source_metadata: false,
+            claim: crate::models::SpoolClaim::default(),
         }
     }
 

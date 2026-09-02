@@ -55,8 +55,8 @@ pub use crate::endpoints::structural::{
 };
 use crate::middleware::apply_middlewares_to_consumer;
 use crate::models::{
-    Endpoint, EndpointType, MemoryConfig, Middleware, NameBy, ResponseConfig, StreamBufferConfig,
-    TransformErrorPolicy,
+    Endpoint, EndpointType, MemoryConfig, Middleware, NameBy, ResponseConfig, SpoolClaim,
+    StreamBufferConfig, TransformErrorPolicy,
 };
 use crate::route::{get_endpoint, get_endpoint_factory};
 use crate::traits::{BoxFuture, MessageConsumer, MessagePublisher};
@@ -531,17 +531,11 @@ fn check_consumer_recursive(
         }
         EndpointType::File(_) => Ok(warnings),
         EndpointType::DirSpool(cfg) => {
-            if cfg.emit_done {
+            if cfg.stop_on_done && matches!(cfg.claim, SpoolClaim::Off) {
                 warnings.push(
-                    "Endpoint 'dir_spool' is used as a consumer, but 'emit_done' is a publisher-only option and will be ignored."
+                    "Endpoint 'dir_spool' sets 'stop_on_done' with 'claim: off', so it cannot see the PRODUCER lock and will end the stream as soon as the queue is empty."
                     .to_string()
                 );
-            }
-            if cfg.stop_on_done && cfg.done_file.is_empty() {
-                return Err(anyhow!(
-                    "[route:{}] dir_spool consumer sets 'stop_on_done' but 'done_file' is empty, so the stream could never end",
-                    route_name
-                ));
             }
             Ok(warnings)
         }
@@ -1785,6 +1779,12 @@ fn check_publisher_recursive(
                         "Endpoint 'dir_spool' is used as a publisher, but '{option}' is a consumer-only option and will be ignored."
                     ));
                 }
+            }
+            if matches!(cfg.claim, SpoolClaim::Off) {
+                warnings.push(
+                    "Endpoint 'dir_spool' is used as a publisher with 'claim: off', so it takes no PRODUCER lock and a 'stop_on_done' consumer cannot tell it is still running."
+                    .to_string()
+                );
             }
             Ok(warnings)
         }

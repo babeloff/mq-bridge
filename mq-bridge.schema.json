@@ -566,20 +566,15 @@
           "type": "boolean",
           "default": true
         },
-        "done_file": {
-          "description": "Name of the producer-completion sentinel file. Defaults to `DONE`.",
-          "type": "string",
-          "default": "DONE"
+        "claim": {
+          "description": "How this endpoint claims its side of the spool against a second instance in the\nsame role. Defaults to `exclusive`. See [`SpoolClaim`].",
+          "$ref": "#/$defs/SpoolClaim",
+          "default": "exclusive"
         },
         "drain_on_read": {
           "description": "(Source only) Delete each chunk's files once its message is acknowledged. Defaults to\ntrue — this is what makes the directory a queue rather than a growing archive. With\nit off, chunks are left in place and each is emitted at most once per consumer run.",
           "type": "boolean",
           "default": true
-        },
-        "emit_done": {
-          "description": "(Sink only) Create `done_file` when the publisher is closed, marking the stream\nfinished for a `stop_on_done` consumer. Defaults to false.",
-          "type": "boolean",
-          "default": false
         },
         "metadata_extension": {
           "description": "Extension of the JSON metadata sidecar, with or without the leading dot. Defaults to\n`json`. Set to an empty string to write and expect payload files only.",
@@ -613,7 +608,7 @@
           "default": false
         },
         "stop_on_done": {
-          "description": "(Source only) End the stream once the directory holds no unread chunks and\n`done_file` is present. Defaults to false, which tails the directory indefinitely.",
+          "description": "(Source only) End the stream once the directory holds no unread chunks *and* no\nproducer holds the spool. Defaults to false, which tails the directory\nindefinitely.\n\nA producer announces itself by taking the `PRODUCER` lock when it opens the spool\nand releases it when it closes, so \"the producer is done\" is the absence of that\nlock — which, unlike a sentinel file, cannot be left behind by a crash. The\ncorollary is a start-order requirement: a consumer started in the window *before*\nits producer takes the lock sees an empty spool with nobody writing to it, and ends\nthe stream immediately. Start the consumer after the producer, or leave this off\nand stop the consumer some other way.",
           "type": "boolean",
           "default": false
         }
@@ -3299,6 +3294,26 @@
       "additionalProperties": false,
       "required": [
         "path"
+      ]
+    },
+    "SpoolClaim": {
+      "description": "What a `dir_spool` endpoint does when a second instance opens the same directory in the\nsame role — a second producer writing it, or a second draining consumer emptying it.\n\nNeither is supported by the endpoint's design: two producers seeded from the same\nhighest sequence number overwrite each other's chunks, and two draining consumers each\ndeliver every chunk they win the race to read. So each role takes a pid lock on one\nextension-less file — `PRODUCER` or `CONSUMER` — created when the endpoint opens and\nremoved when it closes. A producer and a consumer sharing a directory do not conflict:\nthat is the whole point of the endpoint.\n\nThe `PRODUCER` lock doubles as the end-of-stream signal for `stop_on_done`, so turning\nthis `off` on a publisher also makes it invisible to such a consumer.\n\nA lock whose owner is no longer running is broken and retaken, so a crash does not\nwedge a restart. That check is by process id, which is only meaningful on the machine\nand in the pid namespace that wrote it: a spool shared between hosts or containers can\nhave a live holder's lock broken by a second starter that cannot see its process.",
+      "oneOf": [
+        {
+          "description": "Refuse to start when the role is already claimed, naming the holder (default).",
+          "type": "string",
+          "const": "exclusive"
+        },
+        {
+          "description": "Log a warning and run anyway. For a spool deliberately shared by several\nproducers, which needs `{message_id}` in `naming_pattern` to keep names unique.",
+          "type": "string",
+          "const": "warn"
+        },
+        {
+          "description": "Take no claim and check for none.",
+          "type": "string",
+          "const": "off"
+        }
       ]
     },
     "SqlxConfig": {

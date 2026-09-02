@@ -13,6 +13,13 @@
 //! with no broker and no shared memory: the producer can finish and exit while the consumer
 //! is still draining, and a crash on either side leaves the directory readable.
 //!
+//! One directory takes one producer and one consumer, each of which may be internally
+//! concurrent. Each side announces itself by taking a pid lock on one extension-less file —
+//! `PRODUCER` or `CONSUMER` — held for as long as the endpoint lives, which both keeps a
+//! second instance in the same role out and tells a `stop_on_done` consumer whether anyone
+//! is still writing. A lock whose owner is gone is broken by the next start, so a crash
+//! leaves a directory that is readable *and* reusable.
+//!
 //! The `file` endpoint is the sibling for a *stream* of delimited records in one file; this
 //! one is for a *queue* of arbitrarily large opaque blobs, where the delimiter framing and
 //! the single-writer append point would both get in the way.
@@ -176,6 +183,195 @@ async fn sync_directory(dir: &Path) {
     }
 }
 
+// --- Locks ---
+
+/// Which end of the spool a lock belongs to.
+///
+/// The two ends never conflict with each other — a producer and a consumer sharing a
+/// directory is what the endpoint is *for* — so each gets its own file and only collides
+/// with another instance in the same role.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SpoolRole {
+    Producer,
+    Consumer,
+}
+
+impl SpoolRole {
+    /// File the lock lands on, holding the owning process id. Extension-less, so the chunk
+    /// listing — which requires `payload_extension` — can never mistake it for a message.
+    const fn lock_file(self) -> &'static str {
+        match self {
+            Self::Producer => "PRODUCER",
+            Self::Consumer => "CONSUMER",
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Producer => "producer",
+            Self::Consumer => "consumer",
+        }
+    }
+}
+
+/// A `Pidlock` over `dir`'s file for `role`, not yet acquired. Also the handle used to ask
+/// who *else* holds it.
+fn role_lock(dir: &Path, role: SpoolRole) -> anyhow::Result<pidlock::Pidlock> {
+    let path = dir.join(role.lock_file());
+    pidlock::Pidlock::new_validated(&path)
+        .with_context(|| format!("Unusable dir_spool lock path {}", path.display()))
+}
+
+/// Who holds a role's lock, as far as this process can tell.
+#[derive(Debug)]
+enum LockHolder {
+    /// Nothing live holds it: no file, or a file whose owner is gone (which reading it
+    /// also cleaned up).
+    Free,
+    /// Held by a process that is still running.
+    Pid(i32),
+    /// Held by something, but the lock could not be read. Reported as held, the cautious
+    /// direction: an unreadable lock must not be mistaken for a finished producer.
+    Unknown,
+}
+
+impl LockHolder {
+    fn is_held(&self) -> bool {
+        !matches!(self, Self::Free)
+    }
+
+    fn describe(&self) -> String {
+        match self {
+            Self::Free => "nothing".to_string(),
+            Self::Pid(pid) => format!("pid {pid}"),
+            Self::Unknown => "an unreadable lock file".to_string(),
+        }
+    }
+}
+
+/// Reads who holds `role`'s lock on `dir`.
+///
+/// A lock left behind by a process that is gone reads as [`LockHolder::Free`] *and* is
+/// deleted, which is what lets a crash heal instead of wedging the next start.
+fn lock_holder(dir: &Path, role: SpoolRole) -> LockHolder {
+    let lock = match role_lock(dir, role) {
+        Ok(lock) => lock,
+        Err(error) => {
+            warn!(dir = %dir.display(), %error, "dir_spool could not open the {} lock", role.label());
+            return LockHolder::Unknown;
+        }
+    };
+    match lock.get_owner() {
+        Ok(Some(pid)) => LockHolder::Pid(pid),
+        Ok(None) => LockHolder::Free,
+        Err(error) => {
+            warn!(
+                dir = %dir.display(),
+                %error,
+                "dir_spool could not read the {} lock; treating it as held",
+                role.label()
+            );
+            LockHolder::Unknown
+        }
+    }
+}
+
+/// Whether a producer currently holds `dir`.
+///
+/// A producer takes the `PRODUCER` lock when it opens the spool and releases it when it
+/// closes, so "no live producer" *is* the end-of-stream signal. Being a lock rather than a
+/// sentinel file, it cannot be left behind by a crash, and a producer that starts again is
+/// visible again with nothing to clean up first. The corollary is that a producer which
+/// *crashes* looks like one that finished: its lock is broken here, and a `stop_on_done`
+/// consumer drains what is on disk and ends rather than tailing a spool nobody is filling.
+///
+/// Only reached on the idle path, and only under `stop_on_done`, so a tailing consumer —
+/// the default — pays nothing for it.
+fn producer_is_live(dir: &Path) -> bool {
+    lock_holder(dir, SpoolRole::Producer).is_held()
+}
+
+/// Warns a non-draining reader that a draining consumer owns the spool.
+///
+/// Two readers that only read are fine together; a drainer alongside them deletes chunks
+/// on ack, so this reader will silently miss whatever the drainer got to first. Not an
+/// error — which of the two is the mistake is the operator's call — but never silent.
+fn warn_if_drained(dir: &Path, mode: crate::models::SpoolClaim) {
+    if matches!(mode, crate::models::SpoolClaim::Off) {
+        return;
+    }
+    let holder = lock_holder(dir, SpoolRole::Consumer);
+    if holder.is_held() {
+        warn!(
+            dir = %dir.display(),
+            holder = %holder.describe(),
+            "dir_spool is being drained by another consumer, so this 'drain_on_read: false' reader will miss chunks it deletes"
+        );
+    }
+}
+
+/// Takes `role`'s lock on `dir`, or reports the conflict.
+///
+/// The file is created with `O_EXCL` holding this process's id, so of two processes
+/// starting at once only one can believe it won, and a lock whose owner is no longer
+/// running is broken and retaken. A live conflict is what `claim` decides about:
+/// `Exclusive` turns it into a startup failure, `Warn` into a log line. Returns `None`
+/// when no lock is held — `claim: off`, or `Warn` deferring to the live holder.
+///
+/// Blocking, and called straight from the endpoint constructors rather than through
+/// `spawn_blocking`: `pidlock` is a blocking API, and this is one `create_new` plus one
+/// small write, once per endpoint.
+fn acquire_lock(
+    dir: &Path,
+    role: SpoolRole,
+    mode: crate::models::SpoolClaim,
+) -> anyhow::Result<Option<pidlock::Pidlock>> {
+    use crate::models::SpoolClaim;
+
+    if matches!(mode, SpoolClaim::Off) {
+        return Ok(None);
+    }
+    let mut lock = role_lock(dir, role)?;
+    match lock.acquire() {
+        Ok(()) => {
+            debug!(
+                path = %dir.join(role.lock_file()).display(),
+                "dir_spool {} lock taken",
+                role.label()
+            );
+            Ok(Some(lock))
+        }
+        Err(pidlock::PidlockError::LockExists) => {
+            let holder = lock_holder(dir, role).describe();
+            if matches!(mode, SpoolClaim::Warn) {
+                warn!(
+                    dir = %dir.display(),
+                    "dir_spool is already held by a {} ({holder}); running anyway because 'claim' is 'warn'",
+                    role.label()
+                );
+                return Ok(None);
+            }
+            Err(anyhow::anyhow!(
+                "dir_spool directory {} is already held by a {} ({holder}). \
+                 Two {}s on one spool corrupt it, so this endpoint will not start. \
+                 Point them at separate directories, or set 'claim' to 'warn' or 'off' if \
+                 the spool really is shared. A lock left by a crash is broken automatically \
+                 once its process is gone; one held by a process this machine cannot see — a \
+                 spool shared across hosts or containers — has to be cleared by deleting {}.",
+                dir.display(),
+                role.label(),
+                role.label(),
+                dir.join(role.lock_file()).display()
+            ))
+        }
+        Err(error) => Err(anyhow::Error::new(error).context(format!(
+            "Failed to take the dir_spool {} lock in {}",
+            role.label(),
+            dir.display()
+        ))),
+    }
+}
+
 // --- Publisher ---
 
 /// Writes each message to the spool directory as one payload file plus an optional JSON
@@ -187,11 +383,15 @@ pub struct DirSpoolPublisher {
     payload_suffix: String,
     metadata_suffix: Option<String>,
     atomic: bool,
-    done_file: String,
-    emit_done: bool,
     /// Next sequence number. Seeded past the highest number already in the directory so a
     /// restart appends to the queue instead of overwriting its head.
     seq: Arc<AtomicU64>,
+    /// The `PRODUCER` lock. Held for as long as this publisher lives, and its *release* is
+    /// what tells a `stop_on_done` consumer the stream is finished — so it is dropped at
+    /// the defined moment the route disconnects the publisher, not whenever the publisher
+    /// happens to be freed. `None` under `claim: off`, or `claim: warn` over a spool
+    /// another producer holds.
+    lock: StdMutex<Option<pidlock::Pidlock>>,
 }
 
 impl DirSpoolPublisher {
@@ -214,6 +414,9 @@ impl DirSpoolPublisher {
                 "dir_spool 'payload_extension' and 'metadata_extension' must differ (both are '{payload_suffix}')"
             ));
         }
+        // Locked before the directory is read, so a second producer cannot be what
+        // reseeds this one's sequence.
+        let lock = acquire_lock(&dir, SpoolRole::Producer, config.claim)?;
         let next_seq = highest_sequence(&dir, &payload_suffix)
             .await?
             .map_or(0, |high| high + 1);
@@ -223,9 +426,8 @@ impl DirSpoolPublisher {
             payload_suffix,
             metadata_suffix: config.metadata_suffix().map(str::to_string),
             atomic: config.atomic,
-            done_file: config.done_file.clone(),
-            emit_done: config.emit_done,
             seq: Arc::new(AtomicU64::new(next_seq)),
+            lock: StdMutex::new(lock),
         })
     }
 
@@ -249,27 +451,20 @@ impl DirSpoolPublisher {
         Ok(base)
     }
 
-    /// Creates the producer-completion sentinel. Idempotent: an existing sentinel is left
-    /// alone rather than rewritten, so a second producer closing does not disturb it.
-    async fn write_done(&self) -> anyhow::Result<()> {
-        let path = self.dir.join(&self.done_file);
-        match OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&path)
-            .await
-        {
-            Ok(file) => {
-                let _ = file.sync_all().await;
-                sync_directory(&self.dir).await;
-                debug!(path = %path.display(), "dir_spool done sentinel written");
-                Ok(())
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
-            Err(error) => Err(anyhow::Error::new(error).context(format!(
-                "Failed to write dir_spool sentinel {}",
-                path.display()
-            ))),
+    /// Releases the `PRODUCER` lock, declaring this producer finished.
+    ///
+    /// Idempotent, and best effort: dropping the lock deletes the file, and a file that
+    /// cannot be deleted is reported rather than raised, since by this point the messages
+    /// are already written. The cost of a lock left behind is bounded — the next start
+    /// finds its owner gone and breaks it.
+    fn release_lock(&self) {
+        let released = self
+            .lock
+            .lock()
+            .expect("dir_spool producer lock poisoned")
+            .take();
+        if released.is_some() {
+            debug!(dir = %self.dir.display(), "dir_spool producer lock released: this producer is finished");
         }
     }
 }
@@ -316,10 +511,14 @@ impl MessagePublisher for DirSpoolPublisher {
     }
 
     fn on_disconnect_hook(&self) -> Option<BoxFuture<'_, anyhow::Result<()>>> {
-        // The sentinel means "this producer is finished", so it belongs at the one moment
-        // the route can tell us that: the publisher going away.
-        self.emit_done
-            .then(|| Box::pin(self.write_done()) as BoxFuture<'_, anyhow::Result<()>>)
+        // Releasing the lock is how this producer says "finished", so it belongs at the one
+        // moment the route can tell us that: the publisher going away. Every chunk is
+        // already fsynced by `send_batch`, so nothing a consumer can now see is unwritten.
+        Some(Box::pin(async move {
+            self.release_lock();
+            sync_directory(&self.dir).await;
+            Ok(())
+        }))
     }
 
     // The spool is a queue, and the sequence number a chunk gets is assigned inside
@@ -343,7 +542,6 @@ pub struct DirSpoolConsumer {
     path: String,
     payload_suffix: String,
     metadata_suffix: Option<String>,
-    done_file: String,
     drain_on_read: bool,
     stop_on_done: bool,
     poll_interval: Duration,
@@ -363,6 +561,9 @@ pub struct DirSpoolConsumer {
     /// Directory scans performed. Only read by the tests, which assert that draining a
     /// backlog does not scan per batch; a counter bump is cheaper than a test hook.
     scans: u64,
+    /// The `CONSUMER` lock, released when this consumer is dropped. Only a *draining*
+    /// consumer takes one — see [`DirSpoolConsumer::new_with_source_metadata`].
+    _lock: Option<pidlock::Pidlock>,
     exit_on_empty: bool,
 }
 
@@ -373,6 +574,11 @@ impl DirSpoolConsumer {
 
     /// `source_metadata` is the effective flag: the route turns it on for an idempotent
     /// output even when the input config leaves it unset.
+    ///
+    /// Only a *draining* consumer claims the directory. `drain_on_read: false` reads
+    /// without deleting, so several such readers over one spool each see every chunk once
+    /// — a supported fan-out, not a conflict. Such a reader does look for a draining
+    /// consumer's claim, because that one deletes chunks out from under it.
     pub async fn new_with_source_metadata(
         config: &DirSpoolConfig,
         source_metadata: bool,
@@ -384,12 +590,17 @@ impl DirSpoolConsumer {
                 "dir_spool 'payload_extension' must not be empty"
             ));
         }
+        let lock = if config.drain_on_read {
+            acquire_lock(&dir, SpoolRole::Consumer, config.claim)?
+        } else {
+            warn_if_drained(&dir, config.claim);
+            None
+        };
         Ok(Self {
             dir,
             path: config.path.clone(),
             payload_suffix,
             metadata_suffix: config.metadata_suffix().map(str::to_string),
-            done_file: config.done_file.clone(),
             drain_on_read: config.drain_on_read,
             stop_on_done: config.stop_on_done,
             poll_interval: Duration::from_millis(config.poll_interval_ms),
@@ -398,6 +609,7 @@ impl DirSpoolConsumer {
             ready: VecDeque::new(),
             requeued: Arc::new(StdMutex::new(Vec::new())),
             scans: 0,
+            _lock: lock,
             exit_on_empty: false,
         })
     }
@@ -572,19 +784,18 @@ impl DirSpoolConsumer {
         (messages, delivered)
     }
 
-    /// Whether the producer has declared the stream finished.
-    async fn done_present(&self) -> bool {
-        fs::try_exists(self.dir.join(&self.done_file))
-            .await
-            .unwrap_or(false)
+    /// Whether the producer has declared the stream finished, which it does by releasing
+    /// the `PRODUCER` lock — so "finished" is the *absence* of a live producer.
+    fn producer_finished(&self) -> bool {
+        !producer_is_live(&self.dir)
     }
 
     /// What to hand back when the directory holds nothing to read.
     async fn idle(&self) -> Result<ReceivedBatch, ConsumerError> {
-        // The sentinel only ends the stream once the queue behind it is empty, which is
-        // the whole point of the two-part condition: a producer that finished long ago
-        // still has its backlog drained first.
-        if self.stop_on_done && self.done_present().await {
+        // The producer being gone only ends the stream once the queue behind it is empty,
+        // which is the whole point of the two-part condition: a producer that finished long
+        // ago still has its backlog drained first.
+        if self.stop_on_done && self.producer_finished() {
             return Err(ConsumerError::EndOfStream);
         }
         // Under `--drain` an empty batch is the exit signal, so surface it immediately

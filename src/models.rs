@@ -1039,20 +1039,22 @@ pub struct DirSpoolConfig {
     /// rename per chunk.
     #[serde(default = "default_true")]
     pub atomic: bool,
-    /// Name of the producer-completion sentinel file. Defaults to `DONE`.
-    #[serde(default = "default_spool_done_file")]
-    pub done_file: String,
-    /// (Sink only) Create `done_file` when the publisher is closed, marking the stream
-    /// finished for a `stop_on_done` consumer. Defaults to false.
-    #[serde(default)]
-    pub emit_done: bool,
     /// (Source only) Delete each chunk's files once its message is acknowledged. Defaults to
     /// true — this is what makes the directory a queue rather than a growing archive. With
     /// it off, chunks are left in place and each is emitted at most once per consumer run.
     #[serde(default = "default_true")]
     pub drain_on_read: bool,
-    /// (Source only) End the stream once the directory holds no unread chunks and
-    /// `done_file` is present. Defaults to false, which tails the directory indefinitely.
+    /// (Source only) End the stream once the directory holds no unread chunks *and* no
+    /// producer holds the spool. Defaults to false, which tails the directory
+    /// indefinitely.
+    ///
+    /// A producer announces itself by taking the `PRODUCER` lock when it opens the spool
+    /// and releases it when it closes, so "the producer is done" is the absence of that
+    /// lock — which, unlike a sentinel file, cannot be left behind by a crash. The
+    /// corollary is a start-order requirement: a consumer started in the window *before*
+    /// its producer takes the lock sees an empty spool with nobody writing to it, and ends
+    /// the stream immediately. Start the consumer after the producer, or leave this off
+    /// and stop the consumer some other way.
     #[serde(default)]
     pub stop_on_done: bool,
     /// (Source only) Idle poll interval in milliseconds when the directory holds no new
@@ -1063,6 +1065,41 @@ pub struct DirSpoolConfig {
     /// Defaults to false.
     #[serde(default)]
     pub source_metadata: bool,
+    /// How this endpoint claims its side of the spool against a second instance in the
+    /// same role. Defaults to `exclusive`. See [`SpoolClaim`].
+    #[serde(default)]
+    pub claim: SpoolClaim,
+}
+
+/// What a `dir_spool` endpoint does when a second instance opens the same directory in the
+/// same role — a second producer writing it, or a second draining consumer emptying it.
+///
+/// Neither is supported by the endpoint's design: two producers seeded from the same
+/// highest sequence number overwrite each other's chunks, and two draining consumers each
+/// deliver every chunk they win the race to read. So each role takes a pid lock on one
+/// extension-less file — `PRODUCER` or `CONSUMER` — created when the endpoint opens and
+/// removed when it closes. A producer and a consumer sharing a directory do not conflict:
+/// that is the whole point of the endpoint.
+///
+/// The `PRODUCER` lock doubles as the end-of-stream signal for `stop_on_done`, so turning
+/// this `off` on a publisher also makes it invisible to such a consumer.
+///
+/// A lock whose owner is no longer running is broken and retaken, so a crash does not
+/// wedge a restart. That check is by process id, which is only meaningful on the machine
+/// and in the pid namespace that wrote it: a spool shared between hosts or containers can
+/// have a live holder's lock broken by a second starter that cannot see its process.
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum SpoolClaim {
+    /// Refuse to start when the role is already claimed, naming the holder (default).
+    #[default]
+    Exclusive,
+    /// Log a warning and run anyway. For a spool deliberately shared by several
+    /// producers, which needs `{message_id}` in `naming_pattern` to keep names unique.
+    Warn,
+    /// Take no claim and check for none.
+    Off,
 }
 
 // --- Object Store (S3/GCS/Azure) Specific Configuration ---
