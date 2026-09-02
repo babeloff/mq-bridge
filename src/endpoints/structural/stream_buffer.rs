@@ -266,9 +266,7 @@ impl StreamBufferPublisher {
         Ok(Self {
             topic: config.topic.clone(),
             capacity: config.capacity.unwrap_or(DEFAULT_CAPACITY),
-            idle_ttl: Duration::from_secs(
-                config.idle_ttl_secs.unwrap_or(DEFAULT_IDLE_TTL_SECS),
-            ),
+            idle_ttl: Duration::from_secs(config.idle_ttl_secs.unwrap_or(DEFAULT_IDLE_TTL_SECS)),
         })
     }
 }
