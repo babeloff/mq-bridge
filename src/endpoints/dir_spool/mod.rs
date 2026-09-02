@@ -921,8 +921,14 @@ impl DirSpoolConsumer {
     }
 
     /// Reads every chunk in `ready`, returning the messages and the base names they came
-    /// from. A chunk that vanished between the listing and the read was taken by a
-    /// competing consumer; the rest of the batch is still good.
+    /// from.
+    ///
+    /// A chunk that vanished between the listing and the read is skipped and the rest of the
+    /// batch delivered. That is recovery, not a claim protocol: nothing on disk marks a
+    /// chunk as taken, so under `claim: warn`/`off` two draining consumers can both read one
+    /// before either deletes it, and both will deliver it. The consumer lock is what keeps
+    /// that from happening; this path covers an operator or a foreign tool clearing chunks
+    /// out from under a listing.
     async fn read_ready(&self, ready: Vec<String>) -> (Vec<CanonicalMessage>, Vec<String>) {
         let mut messages = Vec::with_capacity(ready.len());
         let mut delivered = Vec::with_capacity(ready.len());

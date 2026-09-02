@@ -303,8 +303,9 @@ async fn redelivers_a_nacked_chunk_ahead_of_a_cached_backlog() {
     assert_eq!(payloads, expected);
 }
 
-/// A cached listing goes stale when another consumer drains the same directory; the batch
-/// that finds nothing must rescan rather than report the queue empty.
+/// A cached listing goes stale when something else empties the directory — an operator, a
+/// foreign tool, or a second drainer under `claim: warn`/`off`. The batch that finds nothing
+/// must rescan rather than report the queue empty.
 #[tokio::test]
 async fn rescans_when_the_cached_listing_has_been_drained_by_someone_else() {
     let dir = tempdir().unwrap();
@@ -321,7 +322,7 @@ async fn rescans_when_the_cached_listing_has_been_drained_by_someone_else() {
     // Fill the cache with both names, hand out neither.
     consumer.list_ready(0).await.unwrap();
     assert_eq!(consumer.ready.len(), 2);
-    // A competing consumer takes the chunk the cache is about to hand out, and a third
+    // Something else takes the chunk the cache is about to hand out, and a third
     // chunk arrives that the stale cache has never seen.
     std::fs::remove_file(dir.path().join("000000000.bin")).unwrap();
     std::fs::remove_file(dir.path().join("000000000.json")).unwrap();
@@ -1002,9 +1003,12 @@ async fn a_restarted_producer_clears_the_sentinel_and_reopens_the_stream() {
         Err(ConsumerError::EndOfStream)
     ));
     drop(consumer);
+    // The marker is sitting there, which is exactly what would end run two prematurely.
+    assert!(dir.path().join("DONE").exists());
 
-    // Second run: the new producer clears the sentinel, and a fresh consumer waits for
-    // this run's data instead of ending on the last run's marker.
+    // Second run: the new producer clears the sentinel as it opens, so a consumer that
+    // outpaces it — an empty queue part-way through the run — waits instead of ending on
+    // the last run's marker.
     let second = DirSpoolPublisher::new(&cfg).await.unwrap();
     assert!(!dir.path().join("DONE").exists());
     assert!(dir.path().join("PRODUCER").exists());
@@ -1015,11 +1019,29 @@ async fn a_restarted_producer_clears_the_sentinel_and_reopens_the_stream() {
         "a restarted producer must reopen the stream, got {waiting:?}"
     );
     second
-        .send_batch(vec![message("run-two", "x")])
+        .send_batch(vec![message("run-two-first", "x")])
+        .await
+        .unwrap();
+    assert_eq!(drain(&mut consumer, 10).await.len(), 1);
+    // Caught up again, mid-run: still not the end.
+    let waiting = consumer.receive_batch(10).await;
+    assert!(
+        matches!(&waiting, Ok(batch) if batch.messages.is_empty()),
+        "an empty queue part-way through a run must not end the stream, got {waiting:?}"
+    );
+    second
+        .send_batch(vec![message("run-two-last", "x")])
         .await
         .unwrap();
     let received = drain(&mut consumer, 10).await;
-    assert_eq!(&received[0].payload[..], b"run-two");
+    assert_eq!(&received[0].payload[..], b"run-two-last");
+
+    // And run two ends on run two's own marker.
+    close_producer(&second, DisconnectOutcome::Completed).await;
+    assert!(matches!(
+        consumer.receive_batch(10).await,
+        Err(ConsumerError::EndOfStream)
+    ));
 }
 
 /// The whole point of the endpoint: a producer that runs to completion and exits, and a

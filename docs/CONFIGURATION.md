@@ -514,12 +514,20 @@ Two things to know about the locks themselves:
   lock. All of these are rejected at startup (and by route validation), compared
   case-insensitively so that `DONE` and `done` count as one file on Windows and macOS.
 
-Genuinely shared spools are still possible with `claim: warn` or `claim: off`, but several
-*simultaneous* producers then need `{message_id}` in `naming_pattern` to keep names from
-colliding. `drain_on_read: false` is the one exception to the cardinality rule: such a
-reader deletes nothing, so several of them over one spool each see every chunk once and none
-of them takes a lock — though each will warn if a draining consumer holds the directory,
-because that one deletes chunks out from under it.
+Genuinely shared spools are still possible with `claim: warn` or `claim: off`, at a price on
+each side. Several *simultaneous* producers need `{message_id}` in `naming_pattern` to keep
+names from colliding. Several *draining* consumers get **duplicate delivery**: a chunk is
+claimed only in the reading process's memory, and deleted only once its message is
+acknowledged, so two drainers can both read one before either deletes it and both will
+deliver it. There is no on-disk claim — no rename-to-claim handshake — so competing
+consumers do not partition a spool between themselves. The lock is what makes that
+arrangement hard to enter by accident; if you switch it off, one drainer per spool is still
+the rule.
+
+`drain_on_read: false` is the one exception to the cardinality rule: such a reader deletes
+nothing, so several of them over one spool each see every chunk once and none of them takes
+a lock — though each will warn if a draining consumer holds the directory, because that one
+deletes chunks out from under it.
 
 A directory scan keeps up to 65,536 chunk names for the batches that follow, so draining a
 backlog costs one scan per that many messages rather than one per batch. Two consequences
