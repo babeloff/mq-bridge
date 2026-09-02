@@ -33,7 +33,7 @@ import {
   updatePublisherPayload,
   updatePublisherRequestField,
 } from "../../ui/src/lib/publishers-view";
-import { publishersPanelState } from "../../ui/src/lib/stores";
+import { publishersPanelState, type PublishersPanelState } from "../../ui/src/lib/stores";
 import { installBaseWindowStubs, mountPublishersDom, restoreBaseWindowStubs } from "./test-helpers";
 
 /** Deterministic 32-bit PRNG: a failing seed replays exactly. */
@@ -164,7 +164,7 @@ const ACTIONS = [
  * user would notice breaking: a selection that points nowhere, a list and a
  * detail pane that disagree, a panel that claims publishers it does not have.
  */
-function checkInvariants(state: ReturnType<typeof get<typeof publishersPanelState>>) {
+function checkInvariants(state: PublishersPanelState) {
   const { items, selectedIndex, hasPublishers, metadataRows, activeSubtab } = state;
 
   expect(hasPublishers).toBe(items.length > 0);

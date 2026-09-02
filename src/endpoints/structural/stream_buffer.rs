@@ -164,16 +164,29 @@ struct PartitionEntry {
 
 type StreamTopic = HashMap<String, PartitionEntry>;
 
-static STREAM_BUFFERS: Lazy<Mutex<HashMap<String, Arc<Mutex<StreamTopic>>>>> =
+/// A topic's partitions and the one sweep policy they share. The endpoint that
+/// creates the topic fixes it, so a publisher's default cannot overrule the
+/// `idle_ttl_secs: 0` a consumer on the same topic asked for.
+struct TopicState {
+    partitions: StreamTopic,
+    idle_ttl: Duration,
+}
+
+static STREAM_BUFFERS: Lazy<Mutex<HashMap<String, Arc<Mutex<TopicState>>>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
-fn get_or_create_topic(topic: &str) -> Arc<Mutex<StreamTopic>> {
+fn get_or_create_topic(topic: &str, idle_ttl: Duration) -> Arc<Mutex<TopicState>> {
     let mut buffers = STREAM_BUFFERS
         .lock()
         .expect("stream buffer registry poisoned");
     buffers
         .entry(topic.to_string())
-        .or_insert_with(|| Arc::new(Mutex::new(HashMap::new())))
+        .or_insert_with(|| {
+            Arc::new(Mutex::new(TopicState {
+                partitions: HashMap::new(),
+                idle_ttl,
+            }))
+        })
         .clone()
 }
 
@@ -207,10 +220,12 @@ fn get_or_create_partition(
     capacity: usize,
     idle_ttl: Duration,
 ) -> StreamPartition {
-    let topic = get_or_create_topic(topic);
-    let mut partitions = topic.lock().expect("stream buffer topic poisoned");
-    sweep_idle_partitions(&mut partitions, idle_ttl);
-    let entry = partitions
+    let topic = get_or_create_topic(topic, idle_ttl);
+    let mut state = topic.lock().expect("stream buffer topic poisoned");
+    let ttl = state.idle_ttl;
+    sweep_idle_partitions(&mut state.partitions, ttl);
+    let entry = state
+        .partitions
         .entry(correlation_id.to_string())
         .or_insert_with(|| PartitionEntry {
             partition: StreamPartition::new(capacity),
@@ -232,16 +247,17 @@ fn remove_partition_if_current(
     let Some(topic_arc) = buffers.get(topic).cloned() else {
         return;
     };
-    let mut partitions = topic_arc.lock().expect("stream buffer topic poisoned");
-    let should_remove = partitions
+    let mut state = topic_arc.lock().expect("stream buffer topic poisoned");
+    let should_remove = state
+        .partitions
         .get(correlation_id)
         .is_some_and(|entry| entry.partition.sender.same_channel(sender));
     if should_remove {
-        partitions.remove(correlation_id);
+        state.partitions.remove(correlation_id);
         sender.close();
         // Drop the topic once its last partition is gone so finished topics don't linger.
-        let now_empty = partitions.is_empty();
-        drop(partitions);
+        let now_empty = state.partitions.is_empty();
+        drop(state);
         if now_empty {
             buffers.remove(topic);
         }

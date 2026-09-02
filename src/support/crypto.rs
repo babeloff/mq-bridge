@@ -13,12 +13,13 @@
 //! [version:u8=1][cipher:u8][key_id_len:u8][key_id][nonce][ciphertext‖tag]
 //! ```
 //!
-//! Nonces are `random prefix ‖ per-instance counter`, not fully random: a
-//! random 96-bit nonce would cap AES-256-GCM at the ~2^32 messages of NIST SP
-//! 800-38D, which a busy route reaches in under an hour. The counter makes
-//! nonces unique for the life of a `Crypto`, so only two concurrent instances
-//! drawing the same prefix could collide. The nonce is written into the
-//! envelope verbatim, so this is not a wire-format change.
+//! Nonces are `random prefix ‖ counter`, not fully random: a random 96-bit
+//! nonce would cap AES-256-GCM at the ~2^32 messages of NIST SP 800-38D, which
+//! a busy route reaches in under an hour. The counter makes nonces unique for
+//! the life of a `Crypto`; it starts at a random offset rather than zero, so
+//! two instances (or restarts) drawing the same prefix -- 4 bytes under
+//! AES-GCM -- must also overlap in counter range to collide. The nonce is
+//! written into the envelope verbatim, so this is not a wire-format change.
 //!
 //! A non-empty `aad` is additionally prefixed with the cleartext envelope header,
 //! so the cipher id, key id and nonce are covered by the tag too. Those envelopes
@@ -167,7 +168,7 @@ impl Crypto {
             key,
             decrypt_keys,
             nonce_prefix: rand::random(),
-            nonce_counter: AtomicU64::new(0),
+            nonce_counter: AtomicU64::new(rand::random()),
             authenticate_metadata: config.authenticate_metadata.clone(),
         })
     }

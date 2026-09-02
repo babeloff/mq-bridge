@@ -194,14 +194,20 @@ jobs:
           printf '%s\n' "$DEPLOY_KEY" > ~/.ssh/tap_key
           chmod 600 ~/.ssh/tap_key
           ssh-keyscan github.com >> ~/.ssh/known_hosts 2>/dev/null
-          # GitHub always closes the shell session with exit 1; the greeting is
-          # what says whether the key is accepted and what it may do.
-          greeting="$(ssh -i ~/.ssh/tap_key -o IdentitiesOnly=yes -o BatchMode=yes \
-            -T git@github.com 2>&1 || true)"
-          echo "$greeting"
-          case "$greeting" in
-            *"successfully authenticated"*|*"marcomq/homebrew-tap"*) echo "tap deploy key OK" ;;
-            *) echo "::error::The Homebrew tap deploy key was rejected by github.com"; exit 1 ;;
+          # A greeting only proves the key is *a* valid key: a read-only or
+          # foreign deploy key greets just as warmly. Ask the tap for the
+          # service a push opens instead; stdin is closed, so nothing is written.
+          probe="$(ssh -i ~/.ssh/tap_key -o IdentitiesOnly=yes -o BatchMode=yes \
+            git@github.com "git-receive-pack 'marcomq/homebrew-tap.git'" </dev/null 2>&1 \
+            | tr -d '\0' || true)"
+          # The ref advertisement is binary; match a capability, don't print it.
+          case "$probe" in
+            *report-status*) echo "tap deploy key can write to marcomq/homebrew-tap" ;;
+            *)
+              echo "$probe"
+              echo "::error::The Homebrew tap deploy key cannot write to marcomq/homebrew-tap (missing, revoked, or read-only)"
+              exit 1
+              ;;
           esac
 
   preflight-pypi:
@@ -760,7 +766,7 @@ jobs:
       # saving, so an entry stays around 1GB per platform -- watch the repo's 10GB
       # cache budget, which the docker buildx scopes also draw on.
       - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: apps/mq-bridge-app
           key: tauri-${{ matrix.name }}

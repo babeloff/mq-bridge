@@ -11,8 +11,8 @@
 #   ./run_docker_tests.sh kafka nats   # only these
 set -uo pipefail
 
-cd "$(dirname "$0")"
-REPO=$(cd ../../../../../.. && pwd)
+cd "$(dirname "$0")" || { echo "cannot enter $(dirname "$0")" >&2; exit 1; }
+REPO=$(cd ../../../../../.. && pwd) || { echo "cannot resolve the repo root from $PWD" >&2; exit 1; }
 COMPOSE_DIR="$REPO/tests/integration/docker-compose"
 
 ALL=(postgres mysql mariadb kafka nats mongodb redis amqp mqtt)
@@ -38,7 +38,18 @@ BACKENDS=("$@")
 (cd "$REPO/apps/mq-bridge-app" && cargo test -p mq-bridge-app --test cli_copy_docker_test --no-run) || exit 1
 
 log=$(mktemp)
-trap 'rm -f "$log"' EXIT
+# Only a stack this run started is ours to stop, so Ctrl-C mid-backend takes
+# down the one that is up and nothing else.
+started_file=
+cleanup() {
+  rm -f "$log"
+  if [ -n "$started_file" ]; then
+    docker compose -f "$started_file" down -v >/dev/null 2>&1
+    started_file=
+  fi
+}
+trap cleanup EXIT
+trap 'cleanup; exit 130' INT TERM
 failed=()
 for backend in "${BACKENDS[@]}"; do
   started=$SECONDS
@@ -56,6 +67,7 @@ for backend in "${BACKENDS[@]}"; do
       docker compose -f "$file" down -v >/dev/null 2>&1
       continue
     fi
+    started_file="$file"
   fi
   up=$((SECONDS - started))
 
@@ -79,7 +91,10 @@ for backend in "${BACKENDS[@]}"; do
   printf '==> %s: %s test(s), %ds startup (reused: %s), %ds total\n' \
     "$backend" "${ran:-0}" "$up" "$reused" "$((SECONDS - started))"
 
-  [ "$reused" = no ] && docker compose -f "$file" down -v >/dev/null 2>&1
+  if [ "$reused" = no ]; then
+    docker compose -f "$file" down -v >/dev/null 2>&1
+    started_file=
+  fi
 done
 
 if [ ${#failed[@]} -ne 0 ]; then

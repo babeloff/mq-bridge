@@ -385,7 +385,7 @@ test.describe("dead button sweep", () => {
         }
       }
 
-      testInfo.attach("skipped-buttons", {
+      await testInfo.attach("skipped-buttons", {
         body: skipped.map((entry) => `${entry.view.name}: "${entry.button.label}" (${entry.reason})`).join("\n"),
         contentType: "text/plain",
       });
@@ -430,7 +430,7 @@ test.describe("dead button sweep", () => {
       (entry) => !entry.reached && !DRAG_HANDLE.test(entry.label),
     );
 
-    testInfo.attach("button-coverage", {
+    await testInfo.attach("button-coverage", {
       body: [...seen.entries()]
         .map(([key, entry]) => `${entry.reached ? "reached" : "NEVER  "} ${key} ${[...entry.views].join(", ")}`)
         .join("\n"),

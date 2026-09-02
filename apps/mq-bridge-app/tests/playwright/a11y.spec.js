@@ -72,7 +72,7 @@ for (const view of VIEWS) {
     const advisory = violations.filter((violation) => !BLOCKING_IMPACTS.includes(violation.impact));
 
     if (advisory.length > 0) {
-      testInfo.attach(`a11y-advisory-${view.name}`, {
+      await testInfo.attach(`a11y-advisory-${view.name}`, {
         body: summarize(advisory),
         contentType: "text/plain",
       });
@@ -85,7 +85,7 @@ for (const view of VIEWS) {
       `new accessibility violations in ${view.name}:\n  ${summarize(introduced)}`,
     ).toEqual([]);
 
-    testInfo.attach(`a11y-known-${view.name}`, {
+    await testInfo.attach(`a11y-known-${view.name}`, {
       body: summarize(blocking.filter((violation) => known.includes(violation.id))),
       contentType: "text/plain",
     });

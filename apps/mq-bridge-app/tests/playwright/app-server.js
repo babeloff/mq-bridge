@@ -51,7 +51,8 @@ async function waitForHealth(url, child, stderr) {
   const deadline = Date.now() + HEALTH_TIMEOUT_MS;
   for (;;) {
     try {
-      if ((await fetch(url)).ok) return;
+      // Bounded per-probe: a stalled response must not eat the whole budget.
+      if ((await fetch(url, { signal: AbortSignal.timeout(2000) })).ok) return;
     } catch {
       // Not listening yet.
     }

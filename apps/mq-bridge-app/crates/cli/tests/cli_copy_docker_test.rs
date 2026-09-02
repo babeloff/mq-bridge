@@ -721,8 +721,8 @@ fn mqtt_delivers_to_a_subscriber_that_was_already_running() {
     );
 }
 
-/// Kills the spawned copy on drop, so a failed assertion or a `wait_until`
-/// timeout cannot leave a background reader running.
+/// Kills the spawned copy on drop, so a failed assertion or a deadline loop
+/// running out cannot leave a background reader running.
 #[cfg(all(unix, any(feature = "full", feature = "mqtt")))]
 struct BackgroundCopy(std::process::Child);
 

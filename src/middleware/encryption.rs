@@ -20,6 +20,7 @@ use crate::traits::{
 use crate::CanonicalMessage;
 use async_trait::async_trait;
 use std::any::Any;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 pub struct EncryptionPublisher {
@@ -71,7 +72,7 @@ impl MessagePublisher for EncryptionPublisher {
         // Keep the plaintext payloads: messages surfaced as failed must go back
         // upstream (retry/dlq) in their original form, or an outer retry would
         // double-seal them. A Vec of refcount-bumped `Bytes` costs one allocation
-        // for the batch; failure sets are small, so the lookup scans linearly.
+        // for the batch.
         let mut originals: Vec<(u128, bytes::Bytes)> = Vec::with_capacity(messages.len());
         for message in &mut messages {
             originals.push((message.message_id, message.payload.clone()));
@@ -83,10 +84,11 @@ impl MessagePublisher for EncryptionPublisher {
                 responses,
                 mut failed,
             } => {
+                // Indexed only here: a whole batch can fail, and scanning the
+                // originals per message made that quadratic.
+                let by_id: HashMap<u128, bytes::Bytes> = originals.into_iter().collect();
                 for (msg, _) in &mut failed {
-                    if let Some((_, original)) =
-                        originals.iter().find(|(id, _)| *id == msg.message_id)
-                    {
+                    if let Some(original) = by_id.get(&msg.message_id) {
                         msg.payload = original.clone();
                     }
                 }
