@@ -341,7 +341,7 @@ pub enum CipherKind {
     /// XChaCha20-Poly1305 (default): 192-bit random nonce, safe at high message rates.
     #[default]
     Xchacha20poly1305,
-    /// AES-256-GCM: 96-bit random nonce; prefer the default for very high volumes.
+    /// AES-256-GCM: 96-bit counter nonce, for interoperability with other systems.
     Aes256gcm,
 }
 
@@ -365,6 +365,9 @@ pub struct EncryptionConfig {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[cfg_attr(feature = "schema", schemars(extend("format" = "password")))]
     pub decrypt_keys: HashMap<String, String>,
+    /// Metadata keys bound into the AEAD tag; changing one then fails decryption. Middleware only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub authenticate_metadata: Vec<String>,
 }
 
 /// An enumeration of all supported middleware types.
@@ -548,6 +551,9 @@ pub struct CookieJarMiddleware {
     /// `access_token` into outgoing metadata key `authorization` when not already present.
     #[serde(default)]
     pub inject_metadata: HashMap<String, String>,
+    /// Maximum cookies kept per session; the least recently set are dropped. Defaults to 256.
+    #[serde(default = "default_max_cookies")]
+    pub max_cookies: usize,
 }
 
 /// Weak Join middleware configuration.
@@ -1394,6 +1400,9 @@ pub struct StreamBufferConfig {
     /// Capacity of each correlation partition. Defaults to 100.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capacity: Option<usize>,
+    /// Seconds before a partition with no attached consumer is discarded. 0 disables. Defaults to 3600.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_ttl_secs: Option<u64>,
 }
 
 // --- AMQP Specific Configuration ---

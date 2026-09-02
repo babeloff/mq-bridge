@@ -1,20 +1,44 @@
 const { expect } = require("@playwright/test");
 
 /**
- * Shared fixture for specs that need a populated workspace. Mirrors the inline
- * fixture in ui.spec.js; that file predates this module and still owns its copy.
+ * The address the *config* claims, which is no longer the address the app is
+ * actually on: each worker's server binds a port of its own (app-server.js).
+ * It survives because the settings view renders it and a screenshot baseline
+ * pins it — treat it as display data, not as somewhere to connect.
  */
-const BASE_CONFIG = {
-  log_level: "info",
-  ui_addr: "127.0.0.1:39091",
-  metrics_addr: "",
-  default_tab: "publishers",
+const DISPLAY_UI_ADDR = "127.0.0.1:39091";
+
+/**
+ * The port used by HTTP endpoints in test configs. Only the delivery test in
+ * ui.spec.js actually binds it; everywhere else it is text on screen.
+ */
+const DATA_ADDR = "127.0.0.1:39081";
+
+/**
+ * The shell every spec's config needs, so a spec declares only the publishers,
+ * consumers and routes its own assertions care about.
+ */
+function makeConfig(overrides = {}) {
+  return {
+    log_level: "info",
+    ui_addr: DISPLAY_UI_ADDR,
+    metrics_addr: "",
+    default_tab: "publishers",
+    routes: {},
+    consumers: [],
+    publishers: [],
+    ...overrides,
+  };
+}
+
+/** A populated workspace: one disabled route, one consumer, two publishers. */
+const BASE_CONFIG = makeConfig({
   routes: {
     ingest_http: {
       enabled: false,
       input: {
         middlewares: [{ metrics: {} }],
-        http: { url: "127.0.0.1:39081" },
+        http: { url: DATA_ADDR },
       },
       output: { memory: { topic: "route-output" } },
     },
@@ -51,7 +75,7 @@ const BASE_CONFIG = {
       },
     },
   ],
-};
+});
 
 async function resetConfig(page, config = BASE_CONFIG) {
   const response = await page.request.post("/config", { data: config });
@@ -70,8 +94,22 @@ async function readConfig(page) {
  */
 async function gotoView(page, hash) {
   await page.goto(`/${hash}`);
+  await waitForShell(page);
+}
+
+/** The shell is up once the tab strip and a panel are on screen. */
+async function waitForShell(page) {
   await expect(page.locator("#mainTabs")).toBeVisible();
   await expect(page.locator(".tab-content-panel.active")).toBeVisible();
 }
 
-module.exports = { BASE_CONFIG, resetConfig, readConfig, gotoView };
+module.exports = {
+  BASE_CONFIG,
+  DATA_ADDR,
+  DISPLAY_UI_ADDR,
+  makeConfig,
+  resetConfig,
+  readConfig,
+  gotoView,
+  waitForShell,
+};

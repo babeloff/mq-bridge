@@ -7,6 +7,9 @@
 //! message payload into an AEAD envelope, the consumer side opens it.
 //! Metadata and routing keys stay in the clear. Request-reply response
 //! payloads pass through untouched.
+//!
+//! Metadata keys listed in `authenticate_metadata` are not encrypted but are
+//! bound into the AEAD tag, so altering one in transit fails decryption.
 
 use crate::models::EncryptionConfig;
 use crate::support::crypto::Crypto;
@@ -17,6 +20,7 @@ use crate::traits::{
 use crate::CanonicalMessage;
 use async_trait::async_trait;
 use std::any::Any;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 pub struct EncryptionPublisher {
@@ -36,9 +40,10 @@ impl EncryptionPublisher {
     }
 
     fn seal_message(&self, message: &mut CanonicalMessage) -> Result<(), PublisherError> {
+        let aad = self.crypto.metadata_aad(&message.metadata);
         let sealed = self
             .crypto
-            .seal(&message.payload, b"")
+            .seal(&message.payload, &aad)
             .map_err(PublisherError::NonRetryable)?;
         message.payload = sealed.into();
         Ok(())
@@ -66,12 +71,11 @@ impl MessagePublisher for EncryptionPublisher {
     ) -> Result<SentBatch, PublisherError> {
         // Keep the plaintext payloads: messages surfaced as failed must go back
         // upstream (retry/dlq) in their original form, or an outer retry would
-        // double-seal them.
-        let originals: std::collections::HashMap<u128, bytes::Bytes> = messages
-            .iter()
-            .map(|m| (m.message_id, m.payload.clone()))
-            .collect();
+        // double-seal them. A Vec of refcount-bumped `Bytes` costs one allocation
+        // for the batch.
+        let mut originals: Vec<(u128, bytes::Bytes)> = Vec::with_capacity(messages.len());
         for message in &mut messages {
+            originals.push((message.message_id, message.payload.clone()));
             self.seal_message(message)?;
         }
         match self.inner.send_batch(messages).await? {
@@ -80,8 +84,11 @@ impl MessagePublisher for EncryptionPublisher {
                 responses,
                 mut failed,
             } => {
+                // Indexed only here: a whole batch can fail, and scanning the
+                // originals per message made that quadratic.
+                let by_id: HashMap<u128, bytes::Bytes> = originals.into_iter().collect();
                 for (msg, _) in &mut failed {
-                    if let Some(original) = originals.get(&msg.message_id) {
+                    if let Some(original) = by_id.get(&msg.message_id) {
                         msg.payload = original.clone();
                     }
                 }
@@ -116,9 +123,10 @@ impl EncryptionConsumer {
         // A decrypt/authentication failure is permanent: the ciphertext will never
         // open, so it must be surfaced as non-retryable rather than triggering an
         // endless reconnect-and-re-read of the same poison message.
+        let aad = self.crypto.metadata_aad(&message.metadata);
         let opened = self
             .crypto
-            .open(&message.payload, b"")
+            .open(&message.payload, &aad)
             .map_err(ConsumerError::Permanent)?;
         message.payload = opened.into();
         Ok(())
@@ -358,6 +366,53 @@ mod tests {
         assert!(matches!(
             recorded[0].as_slice(),
             [MessageDisposition::Ack, MessageDisposition::Nack]
+        ));
+    }
+
+    /// Metadata is transport-visible, so a listed key is bound into the tag: changing
+    /// it in transit must fail exactly like a tampered payload.
+    #[tokio::test]
+    async fn tampered_authenticated_metadata_is_rejected() {
+        let mut cfg = config();
+        cfg.authenticate_metadata = vec!["tenant".to_string()];
+
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let publisher =
+            EncryptionPublisher::new(Box::new(RecordingPublisher { sent: sent.clone() }), &cfg)
+                .unwrap();
+        let mut msg = CanonicalMessage::from("payload");
+        msg.metadata
+            .insert("tenant".to_string(), "acme".to_string());
+        msg.metadata.insert("trace".to_string(), "t1".to_string());
+        publisher.send_batch(vec![msg]).await.unwrap();
+
+        let wire = sent.lock().unwrap().clone();
+
+        // An unlisted key stays free to change.
+        let mut untouched = wire.clone();
+        untouched[0]
+            .metadata
+            .insert("trace".to_string(), "t2".to_string());
+        let mut consumer =
+            EncryptionConsumer::new(Box::new(MockConsumer::new(untouched)), &cfg).unwrap();
+        let batch = consumer.receive_batch(10).await.unwrap();
+        assert_eq!(batch.messages[0].payload.as_ref(), b"payload");
+
+        // The listed one does not: the message is dropped and acked, not redelivered.
+        let mut swapped = wire;
+        swapped[0]
+            .metadata
+            .insert("tenant".to_string(), "evil".to_string());
+        let inner = MockConsumer::new(swapped);
+        let committed = inner.committed.clone();
+        let mut consumer = EncryptionConsumer::new(Box::new(inner), &cfg).unwrap();
+        assert!(matches!(
+            consumer.receive_batch(10).await,
+            Err(ConsumerError::EndOfStream)
+        ));
+        assert!(matches!(
+            committed.lock().unwrap()[0].as_slice(),
+            [MessageDisposition::Ack]
         ));
     }
 

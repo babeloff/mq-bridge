@@ -125,6 +125,10 @@ COPY . .
 # RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked     if [ "$TARGETARCH" = "arm64" ]; then         RDKAFKA_SRC=$(find /usr/local/cargo/registry -path "*/rdkafka-sys-*/librdkafka" -type d 2>/dev/null | head -1) &&         echo "rdkafka src: $RDKAFKA_SRC" &&         if [ -n "$RDKAFKA_SRC" ]; then             mkdir -p /tmp/rdkafka-cmake-test && cd /tmp/rdkafka-cmake-test &&             cmake "$RDKAFKA_SRC"                 -DCMAKE_TOOLCHAIN_FILE=/aarch64-toolchain.cmake                 -DRDKAFKA_BUILD_STATIC=1 -DRDKAFKA_BUILD_TESTS=0                 -DRDKAFKA_BUILD_EXAMPLES=0 -DWITH_ZLIB=1                 -DWITH_CURL=0 -DWITH_SSL=0 -DWITH_SASL=0                 -DWITH_ZSTD=0 -DENABLE_LZ4_EXT=0 &&             echo "=== cmake configure OK ===" ||             (echo "=== CMakeError.log ===" &&              cat /tmp/rdkafka-cmake-test/CMakeFiles/CMakeError.log 2>/dev/null &&              exit 1);         else             echo "rdkafka-sys not yet in cargo registry cache, skipping cmake test";         fi;     fi
 
 # Build the application.
+#
+# --jobs 3 (not the runner's 4) leaves a core for I/O and keeps peak RSS in
+# reach of a 16GB GHA runner. CMAKE_BUILD_PARALLEL_LEVEL stays at 1 --
+# librdkafka's cmake build is the memory hog, cargo's own codegen is not.
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/src/mq-bridge/target,id=target-${TARGETARCH}-${CACHE_BUST},sharing=locked \
     if [ "$TARGETARCH" = "amd64" ]; then \
@@ -140,7 +144,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     fi && \
     CARGO_PROFILE_RELEASE_LTO=thin \
     CMAKE_BUILD_PARALLEL_LEVEL=1 \
-    cargo build -vv --manifest-path apps/mq-bridge-app/Cargo.toml --target "$RUST_TARGET" --profile release-with-lto $CARGO_FEATURES --jobs 1 -p mq-bridge-app && \
+    cargo build --manifest-path apps/mq-bridge-app/Cargo.toml --target "$RUST_TARGET" --profile release-with-lto $CARGO_FEATURES --jobs 3 -p mq-bridge-app && \
     cp target/$RUST_TARGET/release-with-lto/mq-bridge-app mq-bridge-app && \
     cp target/$RUST_TARGET/release-with-lto/mqb mqb
 

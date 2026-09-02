@@ -13,6 +13,11 @@ on:
   # than a second copy of it that can drift.
   workflow_call:
   workflow_dispatch:
+    inputs:
+      update_visual_baselines:
+        description: "Re-render the Linux screenshot baselines and upload them as an artifact"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -121,9 +126,12 @@ jobs:
         working-directory: apps/mq-bridge-app
         run: npm run test:unit
 
-      - name: Install Playwright browser
+      - name: Install Playwright browsers
         working-directory: apps/mq-bridge-app
-        run: npx playwright install --with-deps chromium
+        # firefox and webkit run only the cross-browser specs (see
+        # playwright.config.js), which is where engine-specific form-control
+        # behaviour has bitten before.
+        run: npx playwright install --with-deps chromium firefox webkit
 
       - name: Build app binary for UI tests
         working-directory: apps/mq-bridge-app
@@ -133,9 +141,25 @@ jobs:
         working-directory: apps/mq-bridge-app
         run: npm run test:ui
 
+      # The screenshot suite skips itself while this platform has no committed
+      # baseline. Run this workflow manually with update_visual_baselines=true to
+      # render them here, then review and commit the artifact.
+      - name: Re-render visual baselines
+        if: inputs.update_visual_baselines
+        working-directory: apps/mq-bridge-app
+        run: npm run build:ui && npx playwright test ui-visual.spec.js --update-snapshots=all || true
+
+      - name: Upload visual baselines
+        if: inputs.update_visual_baselines
+        uses: actions/upload-artifact@v7
+        with:
+          name: visual-baselines-linux
+          path: apps/mq-bridge-app/tests/playwright/ui-visual.spec.js-snapshots/
+          if-no-files-found: warn
+
       - name: Upload Playwright test artifacts
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: playwright-test-results
           path: |
@@ -174,3 +198,60 @@ jobs:
       - name: Run integration suite
         working-directory: apps/mq-bridge-app
         run: cargo test -p mq-bridge-app --test ${{ matrix.target }}
+
+  # One backend per runner, so the servers never compete for memory or for the
+  # fixed host ports the test URIs use. `run_docker_tests.sh` does the same loop
+  # locally, one at a time.
+  docker:
+    name: App docker (${{ matrix.backend }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        backend:
+          [postgres, mysql, mariadb, kafka, nats, mongodb, redis, amqp, mqtt]
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          # One cache for every app job: rust, ui and both integration
+          # shards compile the same crates at the same features.
+          shared-key: app
+          # rust-cache resolves its workspace at the repo root, so by default it
+          # purges every crate whose manifest lives under it -- mq-bridge itself
+          # included. Without this each app job recompiles the engine from
+          # scratch; only registry deps would survive.
+          cache-workspace-crates: true
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev libssl-dev pkg-config zlib1g-dev protobuf-compiler
+
+      # The engine's own integration stacks, so there is one definition per
+      # service rather than a second copy that can drift.
+      - name: Start ${{ matrix.backend }}
+        run: docker compose -f tests/integration/docker-compose/${{ matrix.backend }}.yml up -d --wait --wait-timeout 300
+
+      # The backend name filters the test names as well as MQB_TEST_BACKEND:
+      # `backend!` skips by returning, so without the name filter every excluded
+      # test still reports `ok` and a broken service would look green.
+      - name: Run ${{ matrix.backend }} tests
+        working-directory: apps/mq-bridge-app
+        # `shell: bash` for pipefail: the default shell would take `tee`'s exit
+        # status and report a failing test run as a pass.
+        shell: bash
+        env:
+          MQB_TEST_BACKEND: ${{ matrix.backend }}
+        run: |
+          cargo test -p mq-bridge-app --test cli_copy_docker_test \
+            -- --ignored --test-threads=1 ${{ matrix.backend }} 2>&1 | tee result.log
+          grep -qE 'test result: ok\. [1-9]' result.log \
+            || { echo "no ${{ matrix.backend }} tests ran"; exit 1; }
+
+      - name: Service logs
+        if: failure()
+        run: docker compose -f tests/integration/docker-compose/${{ matrix.backend }}.yml logs --tail 200

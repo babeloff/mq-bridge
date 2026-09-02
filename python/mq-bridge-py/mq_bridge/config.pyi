@@ -76,6 +76,7 @@ class CookieJarMiddleware(TypedDict, total=False):
     cookie_metadata_key: str
     export_metadata_prefix: Optional[str]
     inject_metadata: Dict[str, str]
+    max_cookies: int
     set_cookie_metadata_key: str
     shared_scope: Optional[str]
 
@@ -107,6 +108,7 @@ class DetailedMappingRule(TypedDict, total=False):
 
 class EncryptionConfig(TypedDict, total=False):
     """AEAD encryption settings, shared by the `encryption` middleware (per-message"""
+    authenticate_metadata: List[str]
     cipher: CipherKind
     decrypt_keys: Dict[str, str]
     key: Required[str]
@@ -504,6 +506,7 @@ class StreamBufferConfig(TypedDict, total=False):
     """Configuration for the correlated in-process stream response buffer."""
     capacity: Optional[int]
     correlation_id: Optional[str]
+    idle_ttl_secs: Optional[int]
     topic: Required[str]
 
 

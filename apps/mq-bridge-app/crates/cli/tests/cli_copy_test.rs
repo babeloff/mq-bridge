@@ -3,7 +3,8 @@ use std::io::{ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
 fn cli() -> Command {
@@ -743,11 +744,33 @@ fn undefined_uri_variables_fail_before_connecting() {
     assert_failure_contains(&result, "undefined variable", "MQ_TEST_NOT_SET");
 }
 
+/// CSV types every field as text, but `> 100` says the comparison is numeric, so
+/// the filter reads it as a number instead of demanding `number(amount)`.
 #[test]
-fn copy_filter_on_a_text_typed_source_names_the_numeric_cast() {
+fn copy_filter_on_a_text_typed_source_needs_no_numeric_cast() {
     let dir = TestDir::new();
     let source_path = dir.path().join("text-typed.csv");
-    std::fs::write(&source_path, b"id,amount\n1,125\n").expect("seed CSV source");
+    std::fs::write(&source_path, b"id,amount\n1,125\n2,50\n").expect("seed CSV source");
+    let sink_path = dir.path().join("kept.jsonl");
+
+    let result = copy_with_options(
+        &format!("file://{}?format=csv", source_path.display()),
+        &format!("file://{}", sink_path.display()),
+        &["--filter", "amount > 100"],
+    );
+
+    assert!(result.status.success(), "{:?}", result);
+    let kept = std::fs::read_to_string(&sink_path).expect("read the filtered sink");
+    assert!(kept.contains("125"), "the matching row is kept: {kept}");
+    assert!(!kept.contains("\"50\""), "the other row is dropped: {kept}");
+}
+
+/// Text no cast can read is still the under-specified case the hint is for.
+#[test]
+fn copy_filter_on_unreadable_text_names_the_numeric_cast() {
+    let dir = TestDir::new();
+    let source_path = dir.path().join("unreadable.csv");
+    std::fs::write(&source_path, b"id,amount\n1,n/a\n").expect("seed CSV source");
 
     let result = copy_with_options(
         &format!("file://{}?format=csv", source_path.display()),
@@ -2513,7 +2536,7 @@ fn a_filter_reads_nested_payload_paths_and_combines_terms() {
     );
 }
 
-/// Metadata is always text, so a numeric comparison against it needs a cast —
+/// An explicit `number()` still reads metadata the same way the inferred cast does,
 /// and `meta.` shadows a payload field of the same name, which is what makes
 /// the two namespaces unambiguous.
 #[test]
@@ -3173,4 +3196,254 @@ fn filter_and_transform_rejections_report_the_same_summary() {
         summary_of(&filtered),
         "a row dropped by a transform and one dropped by a filter must count alike"
     );
+}
+
+// ---------------------------------------------------------------------------
+// What a failing sink does to a copy. The matrix above only proves `retry` and
+// `dlq` are constructed: its sink always succeeds, so a `retry` that never
+// retried and a `dlq` that caught nothing would pass it.
+// ---------------------------------------------------------------------------
+
+/// An HTTP sink answering each request with the next status in `statuses` (the
+/// last repeating), counting them. Serves until dropped, unlike the fixture
+/// above: a retry needs a second request.
+struct HttpFixture {
+    address: std::net::SocketAddr,
+    requests: Arc<AtomicUsize>,
+    stop: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl HttpFixture {
+    fn serving(statuses: &'static [u16]) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind HTTP fixture");
+        let address = listener.local_addr().expect("fixture address");
+        listener
+            .set_nonblocking(true)
+            .expect("set fixture non-blocking");
+        let requests = Arc::new(AtomicUsize::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (seen, stopped) = (requests.clone(), stop.clone());
+
+        let thread = std::thread::spawn(move || {
+            while !stopped.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        stream
+                            .set_nonblocking(false)
+                            .expect("restore blocking stream");
+                        stream
+                            .set_read_timeout(Some(Duration::from_secs(10)))
+                            .expect("set fixture timeout");
+                        let index = seen.fetch_add(1, Ordering::SeqCst);
+                        read_http_request(&mut stream);
+                        let status = statuses[index.min(statuses.len() - 1)];
+                        let _ = stream.write_all(
+                            format!(
+                                "HTTP/1.1 {status} Fixture\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            )
+                            .as_bytes(),
+                        );
+                    }
+                    Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5))
+                    }
+                    Err(error) => panic!("accept CLI request: {error}"),
+                }
+            }
+        });
+
+        Self {
+            address,
+            requests,
+            stop,
+            thread: Some(thread),
+        }
+    }
+
+    fn requests(&self) -> usize {
+        self.requests.load(Ordering::SeqCst)
+    }
+}
+
+impl Drop for HttpFixture {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// Reads headers and declared body, so the response is not written into a
+/// half-sent request.
+fn read_http_request(stream: &mut TcpStream) {
+    let mut request = Vec::new();
+    let mut buffer = [0_u8; 4096];
+    loop {
+        let read = stream.read(&mut buffer).expect("read CLI request");
+        if read == 0 {
+            return; // Client hung up; nothing left to answer.
+        }
+        request.extend_from_slice(&buffer[..read]);
+        let Some(header_end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") else {
+            continue;
+        };
+        let content_length = String::from_utf8_lossy(&request[..header_end])
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().expect("content length"))
+            })
+            .unwrap_or_default();
+        if request.len() >= header_end + 4 + content_length {
+            return;
+        }
+    }
+}
+
+/// Without `retry` the route falls back to reconnecting, which re-reads the
+/// source and re-delivers what it already delivered.
+#[test]
+fn a_retry_middleware_carries_a_copy_past_a_transient_sink_failure() {
+    let dir = TestDir::new();
+    let fixture = HttpFixture::serving(&[500, 200]);
+    let source = raw_uri(seed_rows(&dir, "retry-source.jsonl", &numbered_rows(1)));
+
+    let output = copy_with_options(
+        &source,
+        &format!(
+            "http://{}/ingest|retry?max_attempts=5&initial_interval_ms=10&max_interval_ms=20",
+            fixture.address
+        ),
+        &["--batch-size", "1", "--concurrency", "1"],
+    );
+
+    assert_success(&output, "retried copy");
+    assert!(
+        logged(&output).contains("Retrying"),
+        "the run must say it retried: {}",
+        logged(&output)
+    );
+    // A third would mean the route reconnected instead of retrying in place.
+    assert_eq!(fixture.requests(), 2, "requests the sink actually received");
+}
+
+/// A permanent rejection must land the rows in the dlq endpoint and still
+/// report success -- not fail the copy, and not lose them.
+#[test]
+fn a_dlq_captures_the_rows_a_sink_permanently_rejects() {
+    let dir = TestDir::new();
+    let fixture = HttpFixture::serving(&[400]);
+    let rows = numbered_rows(4);
+    let source = raw_uri(seed_rows(&dir, "dlq-source.jsonl", &rows));
+    let dead_letters = dir.path().join("dead-letters.jsonl");
+
+    let output = copy_with_options(
+        &source,
+        &format!(
+            "http://{}/ingest|dlq?endpoint={}",
+            fixture.address,
+            nested(&raw_uri(&dead_letters))
+        ),
+        &["--batch-size", "1", "--concurrency", "1"],
+    );
+
+    assert_success(&output, "dead-lettered copy");
+    assert_rows_eq(
+        &sorted(&read_rows(&dead_letters)),
+        &sorted(&rows),
+        "every rejected row must reach the dlq endpoint",
+    );
+    assert_eq!(fixture.requests(), rows.len(), "one attempt per row");
+}
+
+/// Extra fields cannot be kept -- there is no column for them -- but losing
+/// them silently under a clean "copied N rows" is how the loss goes unnoticed.
+#[test]
+fn a_csv_row_wider_than_its_header_reports_the_fields_it_dropped() {
+    let dir = TestDir::new();
+    let path = dir.path().join("wide.csv");
+    std::fs::write(&path, "id,name\n1,ok\n2,extra,dropped\n").expect("seed wide CSV");
+    let copied = dir.path().join("wide-out.jsonl");
+
+    let output = copy(
+        &format!("file://{}?format=csv", path.display()),
+        &raw_uri(&copied),
+    );
+
+    assert_success(&output, "wide CSV copy");
+    assert_rows_eq(
+        &read_rows(&copied),
+        &[
+            r#"{"id":"1","name":"ok"}"#.to_string(),
+            r#"{"id":"2","name":"extra"}"#.to_string(),
+        ],
+        "a wide row keeps the columns the header names",
+    );
+    assert!(
+        logged(&output).contains("more fields than the header has columns; the extras are dropped"),
+        "the dropped fields must be reported: {}",
+        logged(&output)
+    );
+}
+
+/// A transform behind two codecs: a stage applied at the wrong point in the
+/// chain writes a plausible file that will not read back.
+#[test]
+fn a_three_stage_middleware_chain_round_trips_through_every_stage() {
+    const KEY: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+    // {"type":"object","properties":{"id":{"type":"integer"}}}
+    const SCHEMA: &str = concat!(
+        "%7B%22type%22%3A%22object%22%2C%22properties%22%3A",
+        "%7B%22id%22%3A%7B%22type%22%3A%22integer%22%7D%7D%7D"
+    );
+
+    let dir = TestDir::new();
+    let rows: Vec<String> = (0..8).map(|i| format!(r#"{{"id":"{i}"}}"#)).collect();
+    let source = raw_uri(seed_rows(&dir, "chain-source.jsonl", &rows));
+    let stored = dir.path().join("chain.messages");
+    let restored = dir.path().join("chain-restored.jsonl");
+    let stored_base = format!("file://{}?format=normal", stored.display());
+
+    // A chain runs right to left, so this types the rows, then compresses, then
+    // encrypts. Reading mirrors it -- and drops the transform, which is not a codec.
+    let write = copy(
+        &source,
+        &format!(
+            "{stored_base}|encryption?key={KEY}|compression?algorithm=zstd|transform?schema={SCHEMA}"
+        ),
+    );
+    assert_success(&write, "three-stage write");
+
+    let read = copy(
+        &format!("{stored_base}|compression?algorithm=zstd|encryption?key={KEY}"),
+        &raw_uri(&restored),
+    );
+    assert_success(&read, "three-stage read");
+
+    let typed: Vec<String> = (0..8).map(|i| format!(r#"{{"id":{i}}}"#)).collect();
+    assert_rows_eq(
+        &sorted(&read_rows(&restored)),
+        &sorted(&typed),
+        "chained rows",
+    );
+}
+
+/// A copy that splits on buffer boundaries instead of record boundaries
+/// corrupts rows without failing.
+#[test]
+fn a_payload_far_larger_than_the_read_buffer_survives_the_round_trip() {
+    let dir = TestDir::new();
+    let rows: Vec<String> = (0..8)
+        .map(|index| format!(r#"{{"id":{index},"blob":"{}"}}"#, "x".repeat(256 * 1024)))
+        .collect();
+    let source = raw_uri(seed_rows(&dir, "large-source.jsonl", &rows));
+    let copied = dir.path().join("large-out.jsonl");
+
+    let output = copy(&source, &raw_uri(&copied));
+
+    assert_success(&output, "large payload copy");
+    assert_rows_eq(&sorted(&read_rows(&copied)), &sorted(&rows), "large rows");
 }

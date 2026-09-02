@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { beforeEach, describe, expect, test, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
 const runtimeStatusStoreSet = vi.fn();
 const activeMainTabSet = vi.fn();
@@ -109,6 +109,11 @@ vi.mock("../../ui/src/lib/routing", () => ({
 }));
 
 describe("bootstrap runtime status sync", () => {
+  // In afterEach, not at the end of a test: a failing assertion skipped it.
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
   beforeEach(async () => {
     vi.resetModules();
     runtimeStatusStoreSet.mockReset();
@@ -211,7 +216,6 @@ describe("bootstrap runtime status sync", () => {
       messagesEncrypted: true,
       messagesPersistent: false,
     });
-    vi.unstubAllGlobals();
   });
 
   test("publishes the fresh polled status even when legacy global is stale", () => {
@@ -282,6 +286,5 @@ describe("bootstrap runtime status sync", () => {
       "The unreadable config was backed up to:\n/tmp/config.yml.recovery-20260507-174500.bak",
       "Encrypted Config Reset",
     );
-    vi.unstubAllGlobals();
   });
 });

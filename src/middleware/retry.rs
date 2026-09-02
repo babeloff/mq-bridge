@@ -111,7 +111,14 @@ impl MessagePublisher for RetryPublisher {
 
         loop {
             attempt += 1;
-            let mut outgoing = current_messages.clone();
+            // `send_batch` consumes the batch and `Err` does not hand it back, so a copy is
+            // kept to re-send from. Nothing is re-sent after the final attempt, so that one
+            // moves instead of deep-copying every metadata map.
+            let mut outgoing = if attempt >= self.config.max_attempts {
+                std::mem::take(&mut current_messages)
+            } else {
+                current_messages.clone()
+            };
             for msg in &mut outgoing {
                 tag_attempt(msg, attempt);
             }

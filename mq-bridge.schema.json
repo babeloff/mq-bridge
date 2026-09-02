@@ -214,7 +214,7 @@
           "const": "xchacha20poly1305"
         },
         {
-          "description": "AES-256-GCM: 96-bit random nonce; prefer the default for very high volumes.",
+          "description": "AES-256-GCM: 96-bit counter nonce, for interoperability with other systems.",
           "type": "string",
           "const": "aes256gcm"
         }
@@ -449,6 +449,13 @@
           },
           "default": {}
         },
+        "max_cookies": {
+          "description": "Maximum cookies kept per session; the least recently set are dropped. Defaults to 256.",
+          "type": "integer",
+          "format": "uint",
+          "default": 256,
+          "minimum": 0
+        },
         "set_cookie_metadata_key": {
           "description": "Metadata key used to read HTTP Set-Cookie responses. Defaults to `set-cookie`.",
           "type": "string",
@@ -661,6 +668,13 @@
       "description": "AEAD encryption settings, shared by the `encryption` middleware (per-message\npayload encryption) and the at-rest `encryption` field of the file and\nobject_store endpoints. Requires the `encryption` feature.",
       "type": "object",
       "properties": {
+        "authenticate_metadata": {
+          "description": "Metadata keys bound into the AEAD tag; changing one then fails decryption. Middleware only.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
         "cipher": {
           "description": "AEAD cipher. Defaults to `xchacha20poly1305`.",
           "$ref": "#/$defs/CipherKind",
@@ -3645,6 +3659,15 @@
             "string",
             "null"
           ]
+        },
+        "idle_ttl_secs": {
+          "description": "Seconds before a partition with no attached consumer is discarded. 0 disables. Defaults to 3600.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
         },
         "topic": {
           "description": "Shared buffer topic used by both the publisher and correlated consumers.",

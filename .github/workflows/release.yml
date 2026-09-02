@@ -27,10 +27,23 @@ on:
         required: false
         default: false
         type: boolean
+      # The preflight jobs assert things no build can assert for us, but they
+      # lean on registry endpoints that are not all formally specified. If one
+      # ever misfires, this gets a release out without waiting for a fix.
+      skip_preflight:
+        description: 'Skip the registry preflight checks'
+        required: false
+        default: false
+        type: boolean
 
 env:
   IMAGE_NAME: marcomq/mq-bridge-app
   IBM_MQ_SHA256: faadc63c7a0d7ae24a85cdb0ed5f0669a61c5f70123bbd3cea3c540c77eea855
+  # Keyed on this, not the release version: a per-version scope meant every
+  # release started from a cold Rust build. Bump it by hand to force a rebuild.
+  # Caveat: GHA caches are ref-scoped, so a tag-push run reads main's cache but
+  # writes its own -- dispatch-from-main runs get the full benefit.
+  DOCKER_CACHE_VERSION: "1"
 
 jobs:
   metadata:
@@ -76,6 +89,219 @@ jobs:
           echo "release_tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
           echo "cargo_version=$CARGO_VERSION" >> "$GITHUB_OUTPUT"
           echo "is_prerelease=$IS_PRERELEASE" >> "$GITHUB_OUTPUT"
+
+  # Every registry this workflow publishes to authenticates by OIDC, and none of
+  # them can be checked without actually asking for a token. Asking up front
+  # costs ~20s and converts the failure this pipeline is worst at -- 90 minutes
+  # of builds, then a rejection on identity -- into an immediate one. These run
+  # on `publish_only` too: that is the recovery path, so it is exactly when the
+  # identity is most likely to be the thing that is broken.
+  #
+  # One job per environment, because a job has only one and the token's claims
+  # must match what each registry registered:
+  #   npm       - no environment (publish-node.yml's publish job has none)
+  #   PyPI      - environment: pypi
+  #   crates.io - environment: release
+  preflight-npm:
+    name: Preflight / npm
+    needs: metadata
+    if: ${{ !inputs.skip_preflight && !inputs.skip_npm }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag_name || github.ref }}
+
+      # Replays what `npm publish` does internally (npm/lib/utils/oidc.js): mint
+      # a GitHub id_token for the npm audience, then trade it for a publish token
+      # per package. npm matches the trusted publisher on the *calling* workflow,
+      # which is release.yml both here and at publish time, so this is the same
+      # exchange the real upload will make. A package with no publisher, or one
+      # registered against the wrong workflow, refuses the exchange here instead
+      # of silently yielding no token and 404-ing on the PUT 90 minutes later.
+      - name: npm trusted publishing
+        env:
+          VERSION: ${{ needs.metadata.outputs.cargo_version }}
+        run: |
+          set -euo pipefail
+          id_token="$(curl -sSf -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=npm:registry.npmjs.org" \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)["value"])')"
+
+          # Derived from the package manifest, not a second hardcoded list, so a
+          # newly added platform target cannot slip past this check.
+          mapfile -t packages < <(python3 -c '
+          import json
+          d = json.load(open("node/mq-bridge-node/package.json"))
+          print(d["name"])
+          for name in d.get("optionalDependencies", {}):
+              print(name)
+          ')
+          echo "checking ${#packages[@]} npm packages"
+
+          failed=()
+          for pkg in "${packages[@]}"; do
+            code="$(curl -sS -o /dev/null -w '%{http_code}' -X POST \
+              -H "Authorization: Bearer $id_token" \
+              "https://registry.npmjs.org/-/npm/v1/oidc/token/exchange/package/$pkg")"
+            if [ "$code" = "200" ]; then
+              echo "  ok       $pkg"
+            else
+              echo "  REFUSED  $pkg (HTTP $code)"
+              failed+=("$pkg")
+            fi
+            # Informational only: `publish_only` re-runs deliberately, and the
+            # publish script skips versions that are already live.
+            if curl -sSf -o /dev/null "https://registry.npmjs.org/$pkg/$VERSION" 2>/dev/null; then
+              echo "  note     $pkg@$VERSION is already published; it will be skipped"
+            fi
+          done
+
+          if [ ${#failed[@]} -gt 0 ]; then
+            echo "::error::npm refused an OIDC publish token for: ${failed[*]}"
+            echo "::error::Each package needs a trusted publisher on npmjs.com naming this repo and release.yml (not publish-node.yml). A brand-new platform package has to be bootstrapped once with a token before a publisher can be attached."
+            exit 1
+          fi
+
+  # Not a registry, and deliberately not a step of preflight-npm: the tap has
+  # nothing to do with npm, and hanging it off `skip_npm` meant a release
+  # dispatched with skip_npm still ran update-homebrew-tap with an unverified
+  # key. Gated like the tap job itself, which `publish_only` skips.
+  preflight-homebrew:
+    name: Preflight / Homebrew tap
+    needs: metadata
+    if: ${{ !inputs.skip_preflight && !inputs.publish_only }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      # A deploy key that was rotated or removed only shows up at the very end of
+      # the run otherwise, after the release is already public.
+      - name: Homebrew tap deploy key
+        env:
+          DEPLOY_KEY: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${DEPLOY_KEY:-}" ]; then
+            echo "::error::HOMEBREW_TAP_DEPLOY_KEY is not set"
+            exit 1
+          fi
+          mkdir -p ~/.ssh
+          printf '%s\n' "$DEPLOY_KEY" > ~/.ssh/tap_key
+          chmod 600 ~/.ssh/tap_key
+          ssh-keyscan github.com >> ~/.ssh/known_hosts 2>/dev/null
+          # A greeting only proves the key is *a* valid key: a read-only or
+          # foreign deploy key greets just as warmly. Ask the tap for the
+          # service a push opens instead; stdin is closed, so nothing is written.
+          probe="$(ssh -i ~/.ssh/tap_key -o IdentitiesOnly=yes -o BatchMode=yes \
+            git@github.com "git-receive-pack 'marcomq/homebrew-tap.git'" </dev/null 2>&1 \
+            | tr -d '\0' || true)"
+          # The ref advertisement is binary; match a capability, don't print it.
+          case "$probe" in
+            *report-status*) echo "tap deploy key can write to marcomq/homebrew-tap" ;;
+            *)
+              echo "$probe"
+              echo "::error::The Homebrew tap deploy key cannot write to marcomq/homebrew-tap (missing, revoked, or read-only)"
+              exit 1
+              ;;
+          esac
+
+  preflight-pypi:
+    name: Preflight / PyPI
+    needs: metadata
+    if: ${{ !inputs.skip_preflight }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    # Must match the upload job's environment: PyPI matches the environment
+    # claim, so a token minted outside it is not the token that will be used.
+    environment:
+      name: pypi
+    steps:
+      # PyPI's documented dry run for trusted publishing: mint an id_token for
+      # PyPI's audience and exchange it. A non-200 is the same rejection the
+      # upload would have hit at the end of the run. A 200 proves this workflow
+      # is a registered publisher for at least one project -- PyPI mints a token
+      # scoped to whatever it matches -- so it catches a wrong or missing
+      # registration, not a second project that was never registered.
+      - name: PyPI trusted publishing
+        run: |
+          set -euo pipefail
+          audience="$(curl -sSf https://pypi.org/_/oidc/audience \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)["audience"])')"
+          id_token="$(curl -sSf -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${audience}" \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)["value"])')"
+          # The success body carries a real publish token, so only the status is
+          # inspected on success and only `.message` is echoed on failure.
+          code="$(curl -sS -o "$RUNNER_TEMP/pypi.json" -w '%{http_code}' \
+            -X POST https://pypi.org/_/oidc/mint-token \
+            --json "$(python3 -c 'import json,sys; print(json.dumps({"token": sys.argv[1]}))' "$id_token")")"
+          if [ "$code" = "200" ]; then
+            echo "PyPI trusted publisher OK"
+            exit 0
+          fi
+          echo "::error::PyPI refused this workflow's OIDC identity (HTTP $code)"
+          python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d.get("message", d))' \
+            "$RUNNER_TEMP/pypi.json" >&2 || true
+          echo "::error::Every mq-bridge-py* project needs a trusted publisher naming this repo, release.yml and the pypi environment. Note that PyPI matches the reusable workflow but verifies attestations against the caller, which is why the upload lives in release.yml."
+          exit 1
+
+  preflight-crates-io:
+    name: Preflight / crates.io
+    needs: metadata
+    if: ${{ !inputs.skip_preflight && !inputs.publish_only }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    environment: release
+    steps:
+      # The same OIDC exchange the publish job makes. It proves this workflow is
+      # a registered Trusted Publisher on crates.io; it does not enumerate the
+      # three crates, so it catches a revoked or misnamed registration rather
+      # than one crate that was never set up.
+      - name: crates.io trusted publishing
+        uses: rust-lang/crates-io-auth-action@v1
+
+  # A single gate the expensive jobs can hang off. The legs are individually
+  # skippable (skip_npm, publish_only, skip_preflight), and a skipped `needs`
+  # would skip every dependent, so this collapses them into one always-running
+  # job that is green when nothing was actually refused.
+  preflight:
+    name: Preflight
+    needs: [preflight-npm, preflight-pypi, preflight-crates-io, preflight-homebrew]
+    # `!cancelled()`, not `always()`: a cancelled run would otherwise stack a red
+    # "a preflight check failed" on top of the cancellation it is just observing.
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Collect preflight results
+        env:
+          NPM: ${{ needs.preflight-npm.result }}
+          PYPI: ${{ needs.preflight-pypi.result }}
+          CRATES: ${{ needs.preflight-crates-io.result }}
+          HOMEBREW: ${{ needs.preflight-homebrew.result }}
+        run: |
+          set -euo pipefail
+          status=0
+          for leg in "npm:$NPM" "pypi:$PYPI" "crates-io:$CRATES" "homebrew:$HOMEBREW"; do
+            echo "${leg%%:*}: ${leg#*:}"
+            case "${leg#*:}" in
+              success|skipped) ;;
+              *) status=1 ;;
+            esac
+          done
+          if [ "$status" -ne 0 ]; then
+            echo "::error::A registry preflight check failed. Nothing has been built or published yet -- fix the trusted publisher registration and re-run. To release anyway, dispatch with skip_preflight."
+            exit 1
+          fi
+
 
   test:
     name: Cargo Test
@@ -186,7 +412,7 @@ jobs:
   # A failed CLI or bundle build must not leave an empty release behind.
   release:
     name: Create Draft Release
-    needs: [metadata, test, app-checks, package-dry-run]
+    needs: [metadata, preflight, test, app-checks, package-dry-run]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -202,7 +428,7 @@ jobs:
 
       - name: Create Release
         id: create_release
-        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           tag_name: ${{ needs.metadata.outputs.release_tag }}
           name: Release ${{ needs.metadata.outputs.release_tag }}
@@ -301,14 +527,14 @@ jobs:
           fi
 
       - name: Upload Release Asset
-        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           tag_name: ${{ needs.metadata.outputs.release_tag }}
           files: ${{ env.ASSET_PATH }}
 
   build-linux-amd64:
     name: Build docker linux/amd64
-    needs: [metadata, test, app-checks, package-dry-run]
+    needs: [metadata, preflight, test, app-checks, package-dry-run]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -343,14 +569,14 @@ jobs:
             ghcr.io/${{ env.IMAGE_NAME }}:amd64
             ghcr.io/${{ env.IMAGE_NAME }}:${{ needs.metadata.outputs.cargo_version }}-amd64
           build-args: |
-            CACHE_BUST=${{ needs.metadata.outputs.cargo_version }}
+            CACHE_BUST=${{ env.DOCKER_CACHE_VERSION }}
             ENABLE_IBM_MQ=false
-          cache-from: type=gha,scope=build-amd64-v${{ needs.metadata.outputs.cargo_version }}
-          cache-to: type=gha,mode=max,scope=build-amd64-v${{ needs.metadata.outputs.cargo_version }}
+          cache-from: type=gha,scope=build-amd64-v${{ env.DOCKER_CACHE_VERSION }}
+          cache-to: type=gha,mode=max,scope=build-amd64-v${{ env.DOCKER_CACHE_VERSION }}
 
   build-linux-arm64:
     name: Build docker linux/arm64
-    needs: [metadata, test, app-checks, package-dry-run]
+    needs: [metadata, preflight, test, app-checks, package-dry-run]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -388,14 +614,14 @@ jobs:
             ghcr.io/${{ env.IMAGE_NAME }}:arm64
             ghcr.io/${{ env.IMAGE_NAME }}:${{ needs.metadata.outputs.cargo_version }}-arm64
           build-args: |
-            CACHE_BUST=${{ needs.metadata.outputs.cargo_version }}
+            CACHE_BUST=${{ env.DOCKER_CACHE_VERSION }}
             ENABLE_IBM_MQ=false
-          cache-from: type=gha,scope=build-arm64-v${{ needs.metadata.outputs.cargo_version }}
-          cache-to: type=gha,mode=max,scope=build-arm64-v${{ needs.metadata.outputs.cargo_version }}
+          cache-from: type=gha,scope=build-arm64-v${{ env.DOCKER_CACHE_VERSION }}
+          cache-to: type=gha,mode=max,scope=build-arm64-v${{ env.DOCKER_CACHE_VERSION }}
 
   build-linux-amd64-ibm-mq:
     name: Build docker linux/amd64 + IBM MQ
-    needs: [metadata, test, app-checks, package-dry-run]
+    needs: [metadata, preflight, test, app-checks, package-dry-run]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -430,11 +656,11 @@ jobs:
             ghcr.io/${{ env.IMAGE_NAME }}:amd64-ibm-mq
             ghcr.io/${{ env.IMAGE_NAME }}:${{ needs.metadata.outputs.cargo_version }}-amd64-ibm-mq
           build-args: |
-            CACHE_BUST=${{ needs.metadata.outputs.cargo_version }}
+            CACHE_BUST=${{ env.DOCKER_CACHE_VERSION }}
             ENABLE_IBM_MQ=true
             IBM_MQ_SHA256=${{ env.IBM_MQ_SHA256 }}
-          cache-from: type=gha,scope=build-amd64-ibm-mq-v${{ needs.metadata.outputs.cargo_version }}
-          cache-to: type=gha,mode=max,scope=build-amd64-ibm-mq-v${{ needs.metadata.outputs.cargo_version }}
+          cache-from: type=gha,scope=build-amd64-ibm-mq-v${{ env.DOCKER_CACHE_VERSION }}
+          cache-to: type=gha,mode=max,scope=build-amd64-ibm-mq-v${{ env.DOCKER_CACHE_VERSION }}
 
   publish-manifest:
     name: Push multi-arch manifest
@@ -534,6 +760,16 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.rust_targets }}
+
+      # dtolnay/rust-toolchain caches nothing, so these bundles rebuilt the whole
+      # dependency graph every release. rust-cache prunes workspace crates before
+      # saving, so an entry stays around 1GB per platform -- watch the repo's 10GB
+      # cache budget, which the docker buildx scopes also draw on.
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: apps/mq-bridge-app
+          key: tauri-${{ matrix.name }}
 
       - name: Install Linux dependencies
         if: matrix.platform == 'ubuntu-22.04'
@@ -667,22 +903,49 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
 
-  publish-node:
-    name: Publish Node Packages
-    needs: publish-release
-    # `publish_only` skips publish-release, and a skipped dependency skips the
-    # dependent unless the condition tolerates it.
-    if: ${{ !cancelled() && !inputs.skip_npm && (inputs.publish_only || needs.publish-release.result == 'success') }}
+  # The addon and wheel builds hang off the test gate, not off publish-release.
+  # Nothing in them touches a registry, so there was never a reason to wait ~45min
+  # for the docker images and desktop bundles first -- that serialisation was the
+  # single biggest item on the critical path. The uploads below still wait for
+  # publish-release, so the contract that nothing goes public until every build
+  # has passed is unchanged; the cost is that a run which fails late has already
+  # paid for these builds.
+  build-node-packages:
+    name: Build Node Packages
+    needs: [metadata, preflight, test, app-checks, package-dry-run]
+    # `publish_only` skips the test gate, and a skipped dependency skips the
+    # dependent unless the condition tolerates it. The addons still have to be
+    # rebuilt on that path: publish-node.yml only consumes artifacts from its
+    # own run.
+    #
+    # `preflight` is checked explicitly. Tolerating a skipped `needs` opts this
+    # job out of the default "skip when a dependency failed" rule for ALL of
+    # them, so without this a refused preflight still paid for the full matrix --
+    # and on `publish_only`, where the test gate is short-circuited, still
+    # published.
+    if: >-
+      ${{ !cancelled() && !inputs.skip_npm
+          && needs.preflight.result == 'success'
+          && (inputs.publish_only
+              || (needs.test.result == 'success'
+                  && needs.app-checks.result == 'success'
+                  && needs.package-dry-run.result == 'success')) }}
     permissions:
       contents: read
-      id-token: write
-    uses: ./.github/workflows/publish-node.yml
-    secrets: inherit
+    uses: ./.github/workflows/build-node.yml
 
   build-python-packages:
     name: Build Python Packages
-    needs: publish-release
-    if: ${{ !cancelled() && (inputs.publish_only || needs.publish-release.result == 'success') }}
+    needs: [metadata, preflight, test, app-checks, package-dry-run]
+    # See build-node-packages: `preflight` has to be named explicitly, because
+    # tolerating a skipped `needs` waives the default failure-skip for every one.
+    if: >-
+      ${{ !cancelled()
+          && needs.preflight.result == 'success'
+          && (inputs.publish_only
+              || (needs.test.result == 'success'
+                  && needs.app-checks.result == 'success'
+                  && needs.package-dry-run.result == 'success')) }}
     permissions:
       contents: read
       # GitHub validates the maximum permissions of every job in a reusable
@@ -690,20 +953,43 @@ jobs:
       # manual-only publisher requests OIDC, even though it is skipped here.
       id-token: write
     uses: ./.github/workflows/publish-python.yml
+    with:
+      # Already the workflow_call default; stated anyway because getting it wrong
+      # uploads with the caller's attestation identity, which PyPI rejects, and
+      # that is exactly the failure that cost a full release run before.
+      skip_publish: true
+
+  publish-node:
+    name: Publish Node Packages
+    needs: [build-node-packages, publish-release]
+    if: >-
+      ${{ !cancelled() && !inputs.skip_npm
+          && needs.build-node-packages.result == 'success'
+          && (inputs.publish_only || needs.publish-release.result == 'success') }}
+    permissions:
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/publish-node.yml
+    secrets: inherit
 
   # The upload stays here, not in publish-python.yml: attestations are signed
   # with the top-level workflow's identity, so only a job in release.yml can
   # match the `release.yml` trusted publisher registered on PyPI.
   publish-python:
     name: Publish Python Packages / Publish to PyPI
-    needs: [build-python-packages, publish-release]
+    needs: [preflight, build-python-packages, publish-release]
     # Deliberately `!= 'failure'` rather than `== 'success'`. Two things can make
     # a dependency non-success here and only one is a real problem: a skip
     # propagates down the whole chain, and a reusable-workflow caller whose child
     # job was skipped may not report plain success either. Gate on publish-release
     # for the ordering guarantee instead, and let a genuine wheel failure skip us.
+    #
+    # That tolerance is why `preflight` needs its own `== 'success'`: a preflight
+    # refusal skips build-python-packages, which `!= 'failure'` would wave through
+    # to an upload with the identity preflight just said was wrong.
     if: >-
       ${{ !cancelled()
+          && needs.preflight.result == 'success'
           && needs.build-python-packages.result != 'failure'
           && (inputs.publish_only || needs.publish-release.result == 'success') }}
     runs-on: ubuntu-latest
@@ -714,21 +1000,21 @@ jobs:
       name: pypi
     steps:
       - name: Download wheels
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: wheels-*
           path: dist
           merge-multiple: true
 
       - name: Download source distributions
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: sdist-*
           path: dist
           merge-multiple: true
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.11"
 
@@ -908,7 +1194,7 @@ jobs:
           tar -czf mq-bridge-cli-aarch64-unknown-linux-gnu.tar.gz -C staging .
 
       - name: Upload Release Asset
-        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           tag_name: ${{ needs.metadata.outputs.release_tag }}
           files: mq-bridge-cli-aarch64-unknown-linux-gnu.tar.gz

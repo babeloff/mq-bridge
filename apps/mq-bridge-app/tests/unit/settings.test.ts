@@ -111,6 +111,43 @@ describe("settings", () => {
     expect((schema.properties.config_security as any).properties.mode.description).not.toContain("Sensitive");
   });
 
+  test("describes an unsupported current mode as unavailable", () => {
+    const schema = buildSettingsSchema(
+      {
+        properties: {
+          config_security: {
+            type: "object",
+            properties: {
+              mode: {
+                type: "string",
+                enum: ["unencrypted", "balanced", "env_temporary_messages", "temporary_messages", "sensitive", "durable"],
+              },
+            },
+          },
+        },
+      },
+      {
+        target: "cli",
+        encrypted: false,
+        persistent: true,
+        keySource: "env",
+        keyStoreAvailable: false,
+        encryptedConfigAvailable: false,
+        persistentMessagesAvailable: false,
+        configEncrypted: false,
+        messagesEncrypted: false,
+        messagesPersistent: true,
+      },
+      {
+        config_security: { mode: "durable" },
+      },
+    );
+
+    expect((schema.properties.config_security as any).properties.mode.description).toContain(
+      "durable (Current, unsupported here): Unavailable.",
+    );
+  });
+
   test("normalizes legacy security settings into config_security", () => {
     const settings = extractSettingsConfig({
       default_tab: "publishers",

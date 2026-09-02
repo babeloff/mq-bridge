@@ -8,6 +8,11 @@ on:
       - "apps/mq-bridge-app/dev/docs/**"
       - "apps/mq-bridge-app/crates/cli/examples/gen_url_docs.rs"
       - ".github/workflows/docs.yml"
+  # The benchmark workflow pushes new data to the gh-pages branch; republish the
+  # site so the vendored dashboard below picks it up.
+  workflow_run:
+    workflows: ["Benchmark"]
+    types: [completed]
   workflow_dispatch:
 
 permissions:
@@ -37,6 +42,26 @@ jobs:
 
       - name: Build book
         run: mdbook build apps/mq-bridge-app/dev/docs
+
+      # The benchmark dashboard lives on the gh-pages branch. Copy it into the
+      # book so this workflow is the only thing that publishes to Pages.
+      - name: Checkout benchmark data
+        uses: actions/checkout@v7
+        continue-on-error: true
+        with:
+          ref: gh-pages
+          path: .benchmark-data
+          persist-credentials: false
+
+      - name: Vendor benchmark dashboard
+        run: |
+          src=.benchmark-data/dev/bench
+          if [ -d "$src" ]; then
+            mkdir -p apps/mq-bridge-app/dev/docs/book/dev
+            cp -R "$src" apps/mq-bridge-app/dev/docs/book/dev/bench
+          else
+            echo "::warning::no benchmark data on gh-pages; /dev/bench/ will be missing"
+          fi
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v5

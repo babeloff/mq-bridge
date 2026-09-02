@@ -1,16 +1,13 @@
-const { test, expect } = require("@playwright/test");
+const { test, expect } = require("./fixtures");
+const { DATA_ADDR, makeConfig, resetConfig } = require("./helpers");
 
-const BASE_CONFIG = {
-  log_level: "info",
-  ui_addr: "127.0.0.1:39091",
-  metrics_addr: "",
-  default_tab: "publishers",
+const BASE_CONFIG = makeConfig({
   routes: {
     ingest_http: {
       enabled: false,
       input: {
         middlewares: [{ metrics: {} }],
-        http: { url: "127.0.0.1:39081" },
+        http: { url: DATA_ADDR },
       },
       output: { memory: { topic: "route-output" } },
     },
@@ -67,14 +64,7 @@ const BASE_CONFIG = {
       },
     },
   ],
-};
-
-async function resetConfig(page, config = BASE_CONFIG) {
-  const response = await page.request.post("/config", {
-    data: config,
-  });
-  expect(response.ok()).toBeTruthy();
-}
+});
 
 async function openPublisherDefinition(page, index = 0) {
   await page.goto(`/#publishers:${index}`);
@@ -130,17 +120,9 @@ async function expectFormLabelAbsent(page, text) {
   ).toHaveCount(0);
 }
 
+// Uncaught exceptions are caught for every spec by the shared base in fixtures.js.
 test.beforeEach(async ({ page }) => {
-  await resetConfig(page);
-  const pageErrors = [];
-  page.on("pageerror", (error) => {
-    pageErrors.push(error);
-  });
-  page.__pageErrors = pageErrors;
-});
-
-test.afterEach(async ({ page }) => {
-  expect(page.__pageErrors || []).toEqual([]);
+  await resetConfig(page, BASE_CONFIG);
 });
 
 test("publisher advanced fields can be expanded and middlewares can be added", async ({ page }) => {
@@ -273,7 +255,7 @@ test("http publisher delivers a message to the http consumer within 2 seconds wi
         comment: "HTTP consumer for UI delivery test",
         endpoint: {
           middlewares: [{ metrics: {} }],
-          http: { url: "127.0.0.1:39081", path: "/ui-test", method: "POST" },
+          http: { url: DATA_ADDR, path: "/ui-test", method: "POST" },
         },
         response: null,
       },
@@ -284,7 +266,7 @@ test("http publisher delivers a message to the http consumer within 2 seconds wi
         comment: "HTTP publisher for UI delivery test",
         endpoint: {
           middlewares: [{ metrics: {} }],
-          http: { url: "http://127.0.0.1:39081/ui-test", method: "POST" },
+          http: { url: `http://${DATA_ADDR}/ui-test`, method: "POST" },
         },
       },
     ],

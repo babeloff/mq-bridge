@@ -126,8 +126,13 @@ impl Default for EncryptionConfig {
             key_id: default_encryption_key_id(),
             key: String::new(),
             decrypt_keys: HashMap::new(),
+            authenticate_metadata: Vec::new(),
         }
     }
+}
+
+pub(crate) fn default_max_cookies() -> usize {
+    256
 }
 
 impl Default for CookieJarMiddleware {
@@ -139,6 +144,7 @@ impl Default for CookieJarMiddleware {
             capture_metadata_keys: Vec::new(),
             export_metadata_prefix: None,
             inject_metadata: HashMap::new(),
+            max_cookies: default_max_cookies(),
         }
     }
 }

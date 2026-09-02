@@ -350,14 +350,18 @@ as MongoDB continue using bulk writes after filtering without adding input buffe
   Indexed paths such as `items[0].qty` are unsupported: an expression that uses one is
   rejected at startup rather than silently dropping every message.
 - **Metadata under the reserved `meta.` prefix** — `meta.http_status_code`,
-  `meta.kind`. Metadata is **always text**, so a numeric comparison needs an explicit cast:
-  `number(meta.http_status_code) >= 400`.
+  `meta.kind`. Metadata is **always text**, and so are all CSV fields and a SQL source's
+  `numeric` and timestamp columns. Comparing one against a **numeric literal** reads it as a
+  number, so `meta.http_status_code >= 400` needs no cast. The literal is what decides:
+  `zip == "01234"` stays a string comparison, and `number()` is still required where no
+  literal names the intent (`meta.a > meta.b`, `amount > 100 * 2`) or where the text is not a
+  number at all.
 
 If an expression names no payload field at all, the payload is never parsed — a
 metadata-only filter costs no JSON decode.
 
 ```yaml middleware
-- filter: "order.status == \"open\" and number(meta.retry_count) < 3"
+- filter: "order.status == \"open\" and meta.retry_count < 3"
 ```
 
 `&&` and `||` are rewritten to `and` / `or` for you, so both spellings work.
@@ -534,6 +538,7 @@ Persists HTTP cookies and arbitrary session values across messages. Input and ou
 | `capture_metadata_keys` | list of strings | `[]` |
 | `export_metadata_prefix` | string | – |
 | `inject_metadata` | map string→string | `{}` |
+| `max_cookies` | integer — cap per session store | `256` |
 
 ```yaml middleware
 - cookie_jar:
@@ -545,6 +550,10 @@ Persists HTTP cookies and arbitrary session values across messages. Input and ou
 Reads `set-cookie` from responses and injects `cookie` into later requests. With
 `shared_scope`, instances using the same name share one store across endpoints and routes in
 the process — that is how a login route and a data route reuse one session.
+
+Cookie names are chosen by the server, so the jar is bounded: `Max-Age=0` (or negative)
+deletes a cookie, and once `max_cookies` is exceeded the least recently set entries are
+dropped. `Expires` is **not** parsed — use `Max-Age`, which every modern server also sends.
 
 ### `encryption`
 
@@ -558,6 +567,7 @@ output. Requires the `encryption` feature.
 | `key_id` | string | `default` |
 | `key` | string — base64-encoded 32-byte key; `${env:VAR}` reads it from the environment | required |
 | `decrypt_keys` | map key_id → key | `{}` |
+| `authenticate_metadata` | list of metadata keys bound into the AEAD tag (middleware only) | `[]` |
 
 ```yaml middleware
 - encryption: { key: "${env:MQB_ENC_KEY}" }
@@ -566,12 +576,30 @@ output. Requires the `encryption` feature.
 The envelope records the cipher and `key_id`, so key rotation works by sealing with a new
 `key_id`/`key` while listing the old key under `decrypt_keys` on the consuming side. Each
 payload is authenticated independently: any bit-level tampering, a torn frame, or a
-missing/wrong key is a hard consumer error, not a silent drop. The AEAD binds only the
-payload (empty associated data): metadata and routing keys are *not* authenticated against
-the ciphertext, since they are not guaranteed to survive transport round-trips (many
-endpoints regenerate the `message_id` or drop `kind`). A sealed payload can therefore be
-replayed under different metadata; use the `deduplication` middleware or a sink uniqueness
-constraint if that matters. Note that this authenticates
+missing/wrong key is a hard consumer error, not a silent drop.
+
+By default the AEAD binds only the payload (empty associated data): metadata and routing
+keys are *not* authenticated against the ciphertext, since they are not guaranteed to
+survive transport round-trips (many endpoints regenerate the `message_id` or drop `kind`).
+A sealed payload can therefore be replayed under different metadata.
+
+`authenticate_metadata` closes that gap for keys you know survive your transport. Listed
+keys stay in the clear but are bound into the tag, so altering, removing or adding one in
+transit fails decryption exactly like a tampered payload — no extra field or second key is
+needed, since the AEAD tag already is the checksum:
+
+```yaml middleware
+- encryption:
+    key: "${env:MQB_ENC_KEY}"
+    authenticate_metadata: [tenant, mqb.id]
+```
+
+Both sides must configure the *same* list; a mismatch surfaces as a decrypt failure. Keys
+are bound in the order listed, and an absent key is distinguished from an empty one. These
+envelopes are tagged version 2, so adding the field is a one-way switch for data already at
+rest or in flight — drain the route first. The field applies to this middleware only; the
+`file` / `object_store` at-rest `encryption` fields reject it, since there is no per-message
+metadata at that layer. Note that this authenticates
 each payload, not the file as a whole — like any append-structured file, an at-rest file
 that loses whole trailing frames (truncation at a frame boundary) reads back as a shorter
 stream with no error, so rely on the consumer's checkpoint/cursor for completeness rather
@@ -873,8 +901,8 @@ output:
 ```
 
 `if` takes the same expression language as the [`filter`](#filter) middleware — payload
-fields by bare name (`amount`, `order.status`), metadata under `meta.` and always as text
-(`number(meta.http_status_code) >= 400`), `and`/`or` or `&&`/`||`. Predicate mode therefore
+fields by bare name (`amount`, `order.status`), metadata under `meta.` as text that a numeric
+literal reads as a number (`meta.http_status_code >= 400`), `and`/`or` or `&&`/`||`. Predicate mode therefore
 needs the `filter` feature; a `when` list in a build without it is a startup error, not a
 silent fallback. A payload the expression cannot read fails the send rather than dropping the
 message silently. As with `filter`, indexed payload paths such as `items[0].qty` are unsupported
@@ -1027,6 +1055,7 @@ bodies between routes.
 | `topic` | string | required; shared by publisher and consumers |
 | `correlation_id` | string | **required on consumers, must be unset on publishers** |
 | `capacity` | integer | default `100`, per partition |
+| `idle_ttl_secs` | integer | default `3600`; `0` disables |
 
 ```yaml endpoint
 output:
@@ -1038,6 +1067,11 @@ input:
 
 A consumer without `correlation_id` is a startup error; a publisher *with* one logs a warning
 and ignores it. Primarily wired up via `HttpConfig::stream_response_to`.
+
+The publisher creates a partition on demand, but only a consumer's shutdown removes one, so
+a correlation id whose reader never arrives would hold its buffered batches until the
+process exits. `idle_ttl_secs` discards such a partition once nothing has published to it
+for that long. A partition with a consumer attached is never discarded, however idle.
 
 ### `null`
 

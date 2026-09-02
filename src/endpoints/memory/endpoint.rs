@@ -99,12 +99,14 @@ impl MemoryChannel {
     }
 }
 
+type WaiterMap = HashMap<String, oneshot::Sender<CanonicalMessage>>;
+
 /// A shareable, thread-safe, in-memory channel for responses.
 #[derive(Debug, Clone)]
 pub struct MemoryResponseChannel {
     pub sender: Sender<CanonicalMessage>,
     pub receiver: Receiver<CanonicalMessage>,
-    waiters: Arc<tokio::sync::Mutex<HashMap<String, oneshot::Sender<CanonicalMessage>>>>,
+    waiters: Arc<Mutex<WaiterMap>>,
 }
 
 impl MemoryResponseChannel {
@@ -113,7 +115,7 @@ impl MemoryResponseChannel {
         Self {
             sender,
             receiver,
-            waiters: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            waiters: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -141,7 +143,7 @@ impl MemoryResponseChannel {
         correlation_id: &str,
         sender: oneshot::Sender<CanonicalMessage>,
     ) -> anyhow::Result<()> {
-        let mut waiters = self.waiters.lock().await;
+        let mut waiters = self.waiters.lock().unwrap();
         if waiters.contains_key(correlation_id) {
             return Err(anyhow!(
                 "Correlation ID {} already registered",
@@ -156,7 +158,41 @@ impl MemoryResponseChannel {
         &self,
         correlation_id: &str,
     ) -> Option<oneshot::Sender<CanonicalMessage>> {
-        self.waiters.lock().await.remove(correlation_id)
+        self.waiters.lock().unwrap().remove(correlation_id)
+    }
+}
+
+/// Removes a registered waiter unless disarmed, so a `send()` future dropped by a
+/// shutdown or an outer timeout cannot leave the correlation id wedged --
+/// `register_waiter` rejects duplicates.
+struct WaiterGuard {
+    waiters: Arc<Mutex<WaiterMap>>,
+    correlation_id: String,
+    armed: bool,
+}
+
+impl WaiterGuard {
+    fn new(channel: &MemoryResponseChannel, correlation_id: String) -> Self {
+        Self {
+            waiters: channel.waiters.clone(),
+            correlation_id,
+            armed: true,
+        }
+    }
+
+    /// The response arrived and the responder already took the waiter.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for WaiterGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            if let Ok(mut waiters) = self.waiters.lock() {
+                waiters.remove(&self.correlation_id);
+            }
+        }
     }
 }
 
@@ -389,11 +425,12 @@ impl MessagePublisher for MemoryPublisher {
                         .register_waiter(&cid, tx)
                         .await
                         .map_err(PublisherError::NonRetryable)?;
+                    // Covers every exit below, including this future being dropped.
+                    let mut waiter = WaiterGuard::new(&response_channel, cid.clone());
 
                     // Send the message
                     // We use the internal sender directly to avoid recursion or cloning issues
                     if let Err(e) = sender.send(vec![message]).await {
-                        response_channel.remove_waiter(&cid).await;
                         return Err(anyhow!("Failed to send to memory channel: {}", e).into());
                     }
 
@@ -401,7 +438,6 @@ impl MessagePublisher for MemoryPublisher {
                     let response = match tokio::time::timeout(self.request_timeout, rx).await {
                         Ok(Ok(resp)) => resp,
                         Ok(Err(e)) => {
-                            response_channel.remove_waiter(&cid).await;
                             return Err(anyhow!(
                                 "Failed to receive response for correlation_id {}: {}",
                                 cid,
@@ -410,13 +446,13 @@ impl MessagePublisher for MemoryPublisher {
                             .into());
                         }
                         Err(_) => {
-                            response_channel.remove_waiter(&cid).await;
                             return Err(PublisherError::Retryable(anyhow!(
                                 "Request timed out waiting for response for correlation_id {}",
                                 cid
                             )));
                         }
                     };
+                    waiter.disarm();
 
                     Ok(Sent::Response(response))
                 } else {
@@ -1454,6 +1490,53 @@ mod tests {
                 .await
                 .is_none(),
             "timed out request should clean up the registered waiter"
+        );
+    }
+
+    /// A `send()` future dropped mid-flight (route shutdown, an outer timeout) must not
+    /// leave the waiter behind: `register_waiter` rejects duplicates, so a caller-supplied
+    /// correlation id would stay wedged for the process lifetime.
+    #[tokio::test]
+    async fn test_memory_request_reply_cancelled_send_cleans_waiter() {
+        let topic = format!("mem_rr_cancel_{}", fast_uuid_v7::gen_id_str());
+        let correlation_id = fast_uuid_v7::gen_id_string();
+        let publisher = MemoryPublisher::new(&MemoryConfig {
+            topic: topic.clone(),
+            capacity: Some(10),
+            request_reply: true,
+            request_timeout_ms: Some(60_000),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let mut message = CanonicalMessage::from("request that gets cancelled");
+        message
+            .metadata
+            .insert("correlation_id".to_string(), correlation_id.clone());
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_millis(25),
+            publisher.send(message),
+        )
+        .await;
+        assert!(outcome.is_err(), "send should still be awaiting a response");
+
+        let response_channel = get_or_create_response_channel(&topic);
+        assert!(
+            response_channel
+                .remove_waiter(&correlation_id)
+                .await
+                .is_none(),
+            "cancelled request should clean up the registered waiter"
+        );
+
+        let (tx, _rx) = oneshot::channel();
+        assert!(
+            response_channel
+                .register_waiter(&correlation_id, tx)
+                .await
+                .is_ok(),
+            "correlation id must be reusable after cancellation"
         );
     }
 

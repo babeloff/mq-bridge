@@ -101,7 +101,7 @@ jobs:
 
       # setup-python provides a non-PEP-668 interpreter; the system python3 on
       # ubuntu-latest is externally managed and rejects a plain pip install.
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
 
@@ -152,7 +152,7 @@ jobs:
             --archive-file nextest-archive.tar.zst
 
       - name: Upload nextest archive
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: integration-nextest-archive
           path: nextest-archive.tar.zst
@@ -197,7 +197,7 @@ jobs:
           tool: nextest
 
       - name: Download nextest archive
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: integration-nextest-archive
 
@@ -244,7 +244,7 @@ jobs:
           tool: nextest
 
       - name: Download nextest archive
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: integration-nextest-archive
 

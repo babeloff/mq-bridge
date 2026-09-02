@@ -10,12 +10,48 @@ use crate::traits::{
 use crate::CanonicalMessage;
 use async_trait::async_trait;
 use std::any::Any;
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+/// Metric handles resolved once per wrapped endpoint.
+///
+/// The `counter!`/`histogram!` macros allocate both label `String`s and re-resolve the
+/// registry on every call, which is per *message* on this path. Handles are the
+/// crate's intended way to avoid that.
+///
+/// This resolves against the global recorder at construction, i.e. when the route is
+/// built, so the host application must install its recorder before starting routes —
+/// otherwise these stay no-ops.
+struct Handles {
+    processed: metrics::Counter,
+    duration: metrics::Histogram,
+}
+
+impl Handles {
+    fn new(route_name: &str, endpoint_direction: &str) -> Self {
+        Self {
+            processed: metrics::counter!(
+                "queue_messages_processed_total",
+                "route" => route_name.to_string(),
+                "endpoint" => endpoint_direction.to_string()
+            ),
+            duration: metrics::histogram!(
+                "queue_message_processing_duration_seconds",
+                "route" => route_name.to_string(),
+                "endpoint" => endpoint_direction.to_string()
+            ),
+        }
+    }
+
+    /// Records `count` messages taking `elapsed` in total; the histogram gets the average.
+    fn record(&self, count: u64, elapsed: Duration) {
+        self.processed.increment(count);
+        self.duration.record(elapsed.as_secs_f64() / count as f64);
+    }
+}
 
 pub struct MetricsPublisher {
     inner: Box<dyn MessagePublisher>,
-    route_name: String,
-    endpoint_direction: String,
+    handles: Handles,
 }
 
 impl MetricsPublisher {
@@ -27,8 +63,7 @@ impl MetricsPublisher {
     ) -> Self {
         Self {
             inner,
-            route_name: route_name.to_string(),
-            endpoint_direction: endpoint_direction.to_string(),
+            handles: Handles::new(route_name, endpoint_direction),
         }
     }
 }
@@ -48,8 +83,7 @@ impl MessagePublisher for MetricsPublisher {
         let result = self.inner.send(message).await?;
         let duration = start.elapsed();
 
-        metrics::counter!("queue_messages_processed_total", "route" => self.route_name.clone(), "endpoint" => self.endpoint_direction.clone()).increment(1);
-        metrics::histogram!("queue_message_processing_duration_seconds", "route" => self.route_name.clone(), "endpoint" => self.endpoint_direction.clone()).record(duration.as_secs_f64());
+        self.handles.record(1, duration);
 
         Ok(result)
     }
@@ -66,17 +100,13 @@ impl MessagePublisher for MetricsPublisher {
             SentBatch::Partial { failed, .. } => {
                 let successful_count = total_count - failed.len();
                 if successful_count > 0 {
-                    let avg_duration = duration.as_secs_f64() / successful_count as f64;
-                    metrics::counter!("queue_messages_processed_total", "route" => self.route_name.clone(), "endpoint" => self.endpoint_direction.clone()).increment(successful_count as u64);
-                    metrics::histogram!("queue_message_processing_duration_seconds", "route" => self.route_name.clone(), "endpoint" => self.endpoint_direction.clone()).record(avg_duration);
+                    self.handles.record(successful_count as u64, duration);
                 }
                 // We can add a new metric for failures here if desired
             }
             SentBatch::Ack => {
                 if total_count > 0 {
-                    let avg_duration = duration.as_secs_f64() / total_count as f64;
-                    metrics::counter!("queue_messages_processed_total", "route" => self.route_name.clone(), "endpoint" => self.endpoint_direction.clone()).increment(total_count as u64);
-                    metrics::histogram!("queue_message_processing_duration_seconds", "route" => self.route_name.clone(), "endpoint" => self.endpoint_direction.clone()).record(avg_duration);
+                    self.handles.record(total_count as u64, duration);
                 }
             }
         }
@@ -94,8 +124,7 @@ impl MessagePublisher for MetricsPublisher {
 
 pub struct MetricsConsumer {
     inner: Box<dyn MessageConsumer>,
-    route_name: String,
-    endpoint_direction: String,
+    handles: Handles,
 }
 
 impl MetricsConsumer {
@@ -107,8 +136,7 @@ impl MetricsConsumer {
     ) -> Self {
         Self {
             inner,
-            route_name: route_name.to_string(),
-            endpoint_direction: endpoint_direction.to_string(),
+            handles: Handles::new(route_name, endpoint_direction),
         }
     }
 }
@@ -135,8 +163,7 @@ impl MessageConsumer for MetricsConsumer {
         let result = self.inner.receive().await?;
         let duration = start.elapsed();
 
-        metrics::counter!("queue_messages_processed_total", "route" => self.route_name.clone(), "endpoint" => self.endpoint_direction.clone()).increment(1);
-        metrics::histogram!("queue_message_processing_duration_seconds", "route" => self.route_name.clone(), "endpoint" => self.endpoint_direction.clone()).record(duration.as_secs_f64());
+        self.handles.record(1, duration);
 
         Ok(result)
     }
@@ -147,9 +174,7 @@ impl MessageConsumer for MetricsConsumer {
         let duration = start.elapsed();
 
         if !batch.messages.is_empty() {
-            let avg_duration = duration.as_secs_f64() / batch.messages.len() as f64;
-            metrics::counter!("queue_messages_processed_total", "route" => self.route_name.clone(), "endpoint" => self.endpoint_direction.clone()).increment(batch.messages.len() as u64);
-            metrics::histogram!("queue_message_processing_duration_seconds", "route" => self.route_name.clone(), "endpoint" => self.endpoint_direction.clone()).record(avg_duration);
+            self.handles.record(batch.messages.len() as u64, duration);
         }
 
         Ok(batch)

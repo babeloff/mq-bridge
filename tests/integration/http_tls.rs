@@ -2,7 +2,7 @@
 
 use crate::integration::tls_helpers;
 use mq_bridge::models::Route;
-use mq_bridge::test_utils::setup_logging;
+use mq_bridge::test_utils::{get_free_port, setup_logging};
 use mq_bridge::test_utils::{PERF_TEST_MESSAGE_COUNT, PERF_TEST_SINGLE_MESSAGE_COUNT};
 use serde_yaml_ng;
 use std::collections::HashMap;
@@ -32,11 +32,6 @@ routes:
     output:
       memory: { topic: "test-out-http-tls", capacity: {out_capacity} }
 "#;
-
-fn get_free_port() -> u16 {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.local_addr().unwrap().port()
-}
 
 async fn wait_for_server_ready(addr: &str, timeout: Duration) -> bool {
     let start = Instant::now();

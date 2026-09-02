@@ -150,8 +150,10 @@ mqb copy \
 ```
 
 An expression reads payload fields by bare name, including nested paths (`order.status`), and
-message metadata under the reserved `meta.` prefix (`meta.kind`). Metadata is always text, so a
-numeric comparison there needs a cast: `number(meta.retry_count) < 3`.
+message metadata under the reserved `meta.` prefix (`meta.kind`). Metadata is always text, as are
+CSV fields and a SQL source's `numeric` and timestamp columns, but comparing one against a numeric
+literal reads it as a number: `meta.retry_count < 3` and `amount >= 50` both work untouched. A
+string literal still compares as text (`zip == "01234"`), and `number()` remains available.
 
 A true result continues to the destination. A false result is an intentional successful drop
 and advances the source acknowledgement/checkpoint. Invalid expressions and payloads that are

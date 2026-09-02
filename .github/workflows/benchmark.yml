@@ -44,7 +44,7 @@ jobs:
           cp "$BIN_PATH" ./performance_bench_bin
 
       - name: Upload bench binary
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: performance-bench-bin
           path: performance_bench_bin
@@ -65,7 +65,7 @@ jobs:
           persist-credentials: false
 
       - name: Download bench binary
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: performance-bench-bin
 
@@ -87,7 +87,7 @@ jobs:
           ./scripts/ci/format_bench_output.sh raw_output_streams.txt output_streams.txt
 
       - name: Upload shard output
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: bench-output-streams
           path: |
@@ -107,7 +107,7 @@ jobs:
           persist-credentials: false
 
       - name: Download bench binary
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: performance-bench-bin
 
@@ -129,7 +129,7 @@ jobs:
           ./scripts/ci/format_bench_output.sh raw_output_database.txt output_database.txt
 
       - name: Upload shard output
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: bench-output-database
           path: |
@@ -149,7 +149,7 @@ jobs:
           persist-credentials: false
 
       - name: Download bench binary
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: performance-bench-bin
 
@@ -165,7 +165,7 @@ jobs:
           ./scripts/ci/format_bench_output.sh raw_output_dockerless.txt output_dockerless.txt
 
       - name: Upload shard output
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: bench-output-dockerless
           path: |
@@ -191,7 +191,7 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Download shard outputs
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: bench-output-*
           merge-multiple: true

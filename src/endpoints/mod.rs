@@ -93,6 +93,7 @@ impl Endpoint {
             topic: topic.to_string(),
             correlation_id: correlation_id.map(str::to_string),
             capacity: Some(capacity),
+            idle_ttl_secs: None,
         }))
     }
     pub fn has_retry_middleware(&self) -> bool {
@@ -3036,6 +3037,208 @@ mod tests {
             )
             .unwrap()
             .is_none());
+        }
+    }
+
+    /// `check_consumer` and `check_publisher` are the gate every route config passes before
+    /// anything connects. These cover the shared walk — refs, recursion, structural nesting
+    /// and policy — rather than the per-transport arms, which sit behind feature flags.
+    mod validation {
+        use super::*;
+        use crate::models::{RequestForwardConfig, SwitchConfig};
+        use crate::route::register_endpoint;
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        /// The ref registry is process-global and shared with every other test in the binary.
+        fn unique(prefix: &str) -> String {
+            format!("{prefix}_{}", fast_uuid_v7::gen_id_str())
+        }
+
+        struct NoopHandler;
+
+        #[async_trait::async_trait]
+        impl crate::traits::Handler for NoopHandler {
+            async fn handle(
+                &self,
+                _msg: CanonicalMessage,
+            ) -> Result<crate::outcomes::Handled, crate::HandlerError> {
+                Ok(crate::outcomes::Handled::Ack)
+            }
+        }
+
+        fn with_handler(mut endpoint: Endpoint) -> Endpoint {
+            endpoint.handler = Some(Arc::new(NoopHandler));
+            endpoint
+        }
+
+        fn null() -> Endpoint {
+            Endpoint::new(EndpointType::Null)
+        }
+
+        fn dangling_ref() -> Endpoint {
+            Endpoint::new(EndpointType::Ref(unique("never_registered")))
+        }
+
+        fn switch_over(cases: Vec<(&str, Endpoint)>, default: Option<Endpoint>) -> Endpoint {
+            Endpoint::new(EndpointType::Switch(SwitchConfig {
+                metadata_key: "kind".to_string(),
+                cases: cases
+                    .into_iter()
+                    .map(|(key, endpoint)| (key.to_string(), endpoint))
+                    .collect::<HashMap<_, _>>(),
+                when: Vec::new(),
+                default: default.map(Box::new),
+            }))
+        }
+
+        #[test]
+        fn a_handler_on_an_input_endpoint_warns_that_it_is_ignored() {
+            let warnings =
+                check_consumer("test", &with_handler(Endpoint::new_memory("in", 1)), None).unwrap();
+            assert_eq!(warnings.len(), 1);
+            assert!(warnings[0].contains("only supported on output endpoints"));
+        }
+
+        #[test]
+        fn a_ref_carries_up_the_warnings_of_what_it_points_at() {
+            let name = unique("ref_target");
+            register_endpoint(&name, with_handler(Endpoint::new_memory("in", 1)));
+
+            let warnings =
+                check_consumer("test", &Endpoint::new(EndpointType::Ref(name)), None).unwrap();
+            assert_eq!(
+                warnings.len(),
+                1,
+                "the referenced endpoint's warning must survive the hop"
+            );
+        }
+
+        #[test]
+        fn an_unregistered_ref_is_rejected_on_both_sides() {
+            let missing = dangling_ref();
+            for err in [
+                check_consumer("test", &missing, None).unwrap_err(),
+                check_publisher("test", &missing, None).unwrap_err(),
+            ] {
+                let err = err.to_string();
+                assert!(err.contains("not found"), "{err}");
+            }
+        }
+
+        /// A `ref` cycle is one typo away in any config file, so the depth guard is what stands
+        /// between that typo and a blown stack.
+        #[test]
+        fn a_ref_cycle_stops_at_the_depth_limit_instead_of_overflowing() {
+            let first = unique("cycle_first");
+            let second = unique("cycle_second");
+            register_endpoint(&first, Endpoint::new(EndpointType::Ref(second.clone())));
+            register_endpoint(&second, Endpoint::new(EndpointType::Ref(first.clone())));
+
+            let entry = Endpoint::new(EndpointType::Ref(first));
+            for err in [
+                check_consumer("test", &entry, None).unwrap_err(),
+                check_publisher("test", &entry, None).unwrap_err(),
+            ] {
+                let err = err.to_string();
+                assert!(err.contains("depth"), "{err}");
+            }
+        }
+
+        /// A structural endpoint is a tree, so validation has to reach the leaves. Each of these
+        /// buries the same unresolvable ref one level down a different arm.
+        #[test]
+        fn validation_reaches_leaves_through_fanout_switch_and_request() {
+            let fanout = Endpoint::new(EndpointType::Fanout(vec![null(), dangling_ref()]));
+            let switch_case = switch_over(vec![("paid", dangling_ref())], None);
+            let switch_default = switch_over(vec![("paid", null())], Some(dangling_ref()));
+            let request = Endpoint::new(EndpointType::Request(RequestForwardConfig {
+                to: Box::new(null()),
+                forward_to: Box::new(dangling_ref()),
+            }));
+
+            for endpoint in [fanout, switch_case, switch_default, request] {
+                assert!(
+                    check_publisher("test", &endpoint, None).is_err(),
+                    "a broken leaf must not pass validation"
+                );
+            }
+        }
+
+        /// `reader` is the one publisher arm that flips role: what it wraps is validated as an
+        /// input, so an input-only rejection has to still apply inside it.
+        #[test]
+        fn a_reader_validates_its_inner_endpoint_as_a_consumer() {
+            let reader = Endpoint::new(EndpointType::Reader(Box::new(switch_over(
+                vec![("paid", null())],
+                None,
+            ))));
+            let err = check_publisher("test", &reader, None)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("only supported as an output"), "{err}");
+        }
+
+        #[test]
+        fn an_input_only_rejection_names_the_route_that_carries_it() {
+            let err = check_consumer(
+                "orders_in",
+                &switch_over(vec![("paid", null())], None),
+                None,
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains("orders_in"), "{err}");
+        }
+
+        /// The policy list governs transports. Core types stay reachable whatever it says, so a
+        /// policy of `["memory"]` must not lock a route out of `null`, `fanout` or `file`.
+        #[test]
+        fn the_policy_list_never_blocks_a_core_endpoint_type() {
+            let allowed: &[&str] = &["memory"];
+            for endpoint in [
+                null(),
+                Endpoint::new_memory("plain", 1),
+                Endpoint::new(EndpointType::Fanout(vec![null()])),
+            ] {
+                assert!(check_publisher("test", &endpoint, Some(allowed)).is_ok());
+            }
+
+            let file = Endpoint::new(EndpointType::File(crate::models::FileConfig::new(
+                "/tmp/policy_probe.jsonl",
+            )));
+            assert!(check_consumer("test", &file, Some(allowed)).is_ok());
+        }
+
+        /// `null` and `fanout` are sinks. They are refused as inputs on role grounds, not policy,
+        /// so the absence of any policy at all must not let them through.
+        #[test]
+        fn output_only_types_are_refused_as_inputs_whatever_the_policy() {
+            for endpoint in [null(), Endpoint::new(EndpointType::Fanout(vec![null()]))] {
+                assert!(check_consumer("test", &endpoint, None).is_err());
+                assert!(check_publisher("test", &endpoint, None).is_ok());
+            }
+        }
+
+        /// Policy is enforced per node, not just at the root — otherwise a `fanout` would be a
+        /// hole straight through it.
+        #[cfg(feature = "http")]
+        #[test]
+        fn the_policy_list_rejects_a_disallowed_type_however_deeply_it_is_nested() {
+            let http = Endpoint::new(EndpointType::Http(crate::models::HttpConfig::new(
+                "http://localhost:8080",
+            )));
+            let allowed: &[&str] = &["memory"];
+
+            let err = check_publisher("test", &http, Some(allowed))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("not allowed by policy"), "{err}");
+
+            let nested = Endpoint::new(EndpointType::Fanout(vec![null(), http.clone()]));
+            assert!(check_publisher("test", &nested, Some(allowed)).is_err());
+
+            assert!(check_publisher("test", &http, Some(&["memory", "http"])).is_ok());
         }
     }
 }

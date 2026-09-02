@@ -379,29 +379,28 @@ impl EventStore {
     }
 
     async fn run_gc(&self) {
-        let subs = self.subscribers.read().unwrap();
-        if subs.is_empty() {
-            return;
-        }
-
         let now = SystemTime::now();
         let timeout = self.retention_policy.subscriber_timeout;
 
-        // Calculate min_ack only from active subscribers
-        let active_acks: Vec<u64> = subs
-            .values()
-            .filter(|s| {
-                let last_seen = s.last_seen.lock().unwrap();
-                if let Ok(age) = now.duration_since(*last_seen) {
-                    age < timeout
-                } else {
-                    false
-                }
-            })
-            .map(|s| s.last_ack_offset.load(Ordering::SeqCst))
-            .collect();
-
-        drop(subs);
+        // Drop timed-out subscribers instead of only skipping them: ephemeral
+        // subscribers use a fresh id per instance, so the map grows with churn.
+        // A live consumer refreshes `last_seen` on every receive_batch; one that
+        // is evicted and comes back re-registers at ack offset 0, which only
+        // makes GC more conservative.
+        let active_acks: Vec<u64> = {
+            let mut subs = self.subscribers.write().unwrap();
+            if subs.is_empty() {
+                return;
+            }
+            subs.retain(|_, s| {
+                s.last_seen
+                    .lock()
+                    .is_ok_and(|seen| now.duration_since(*seen).is_ok_and(|age| age < timeout))
+            });
+            subs.values()
+                .map(|s| s.last_ack_offset.load(Ordering::SeqCst))
+                .collect()
+        };
 
         // If no active subscribers, we default to 0 (don't remove based on ack)
         let min_ack = if active_acks.is_empty() {
@@ -767,6 +766,31 @@ mod tests {
             }
             _ => panic!("Expected Gap error, got {:?}", res),
         }
+    }
+
+    /// Timed-out subscribers must leave the map, not just be skipped for the ack math.
+    #[tokio::test]
+    async fn test_gc_evicts_timed_out_subscribers() {
+        let policy = RetentionPolicy {
+            max_count: None,
+            gc_interval: Duration::from_millis(10),
+            subscriber_timeout: Duration::from_millis(50),
+            max_age: None,
+        };
+        let store = Arc::new(EventStore::new(policy));
+
+        for i in 0..1000 {
+            store.register_subscriber(format!("ephemeral-{i}")).await;
+        }
+        assert_eq!(store.subscribers.read().unwrap().len(), 1000);
+
+        sleep(Duration::from_millis(60)).await;
+        store.register_subscriber("live".into()).await;
+        store.run_gc().await;
+
+        let subs = store.subscribers.read().unwrap();
+        assert_eq!(subs.len(), 1);
+        assert!(subs.contains_key("live"));
     }
 
     #[tokio::test]

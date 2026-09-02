@@ -1,4 +1,5 @@
-const { test, expect } = require("@playwright/test");
+const { test, expect } = require("./fixtures");
+const { makeConfig, resetConfig } = require("./helpers");
 
 // Peer rows come from other mq-bridge processes on the same machine. Driving
 // them through a real second process would make these tests depend on process
@@ -6,11 +7,7 @@ const { test, expect } = require("@playwright/test");
 // endpoint is stubbed instead — what is under test is the UI contract:
 // grouping, read-only rendering, escaping, and disappearance.
 
-const BASE_CONFIG = {
-  log_level: "info",
-  ui_addr: "127.0.0.1:39091",
-  metrics_addr: "",
-  default_tab: "publishers",
+const BASE_CONFIG = makeConfig({
   routes: {},
   consumers: [
     {
@@ -24,7 +21,7 @@ const BASE_CONFIG = {
       endpoint: { memory: { topic: "local-out" } },
     },
   ],
-};
+});
 
 const summary = (overrides = {}) => ({
   running: true,
@@ -130,13 +127,8 @@ async function stubPeerStatus(page, initialInstances) {
   return state;
 }
 
-async function resetConfig(page) {
-  const response = await page.request.post("/config", { data: BASE_CONFIG });
-  expect(response.ok()).toBeTruthy();
-}
-
 test.beforeEach(async ({ page }) => {
-  await resetConfig(page);
+  await resetConfig(page, BASE_CONFIG);
 });
 
 test("peer consumers and route inputs are grouped under their instance", async ({ page }) => {
@@ -253,14 +245,20 @@ test("a peer whose lease expires disappears from the sidebar", async ({ page }) 
   await expect(page.locator("#cons-list .peer-group-label")).toHaveCount(0);
 });
 
-test("a non-local client is shown no peer section at all", async ({ page }) => {
-  const state = await stubPeerStatus(page, [SELF, MCP_PEER]);
-  state.status = 403;
-  await page.goto("/#consumers");
+test.describe("non-local client", () => {
+  // This case drives the peer endpoint into the 403 it is meant to return, so
+  // the resulting console error is the behaviour under test, not a defect.
+  test.use({ allowedPageProblems: /403 \(Forbidden\)/ });
 
-  await expect(page.locator("#cons-list .sidebar-item")).not.toHaveCount(0);
-  await expect(page.locator("#cons-list .sidebar-item--peer")).toHaveCount(0);
-  await expect(page.locator("#cons-list .peer-group-label")).toHaveCount(0);
+  test("a non-local client is shown no peer section at all", async ({ page }) => {
+    const state = await stubPeerStatus(page, [SELF, MCP_PEER]);
+    state.status = 403;
+    await page.goto("/#consumers");
+
+    await expect(page.locator("#cons-list .sidebar-item")).not.toHaveCount(0);
+    await expect(page.locator("#cons-list .sidebar-item--peer")).toHaveCount(0);
+    await expect(page.locator("#cons-list .peer-group-label")).toHaveCount(0);
+  });
 });
 
 test("the sidebar filter applies to peer rows", async ({ page }) => {

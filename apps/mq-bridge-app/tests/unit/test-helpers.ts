@@ -85,3 +85,60 @@ export function restoreBaseWindowStubs() {
 
   previousWindowStubValues = null;
 }
+
+/**
+ * The publishers panel's DOM contract, for tests that drive `publishers-view`
+ * without mounting the Svelte component.
+ */
+export function mountPublishersDom() {
+  document.body.innerHTML = `
+    <div id="tab-publishers" class="active">
+      <div id="publishers-container">
+        <input id="pub-filter" />
+        <button id="pub-add"></button>
+        <button id="pub-copy"></button>
+        <button id="pub-clone"></button>
+        <button id="pub-save"></button>
+        <button id="pub-delete"></button>
+        <button id="pub-send"></button>
+        <button id="pub-beautify"></button>
+        <button id="add-meta"></button>
+        <div id="pub-list"></div>
+        <div id="pub-empty-alert"></div>
+        <div id="pub-main-ui"></div>
+        <input id="pub-proto" />
+        <div id="pub-method-wrap"></div>
+        <select id="pub-method"></select>
+        <div id="pub-extra-1-wrap"></div>
+        <div id="pub-extra-2-wrap"></div>
+        <div id="pub-url-wrap"></div>
+        <span id="pub-extra-1-label"></span>
+        <span id="pub-extra-2-label"></span>
+        <span id="pub-url-label"></span>
+        <input id="pub-extra-1" />
+        <input id="pub-extra-2" />
+        <input id="pub-url" />
+        <div id="pub-sub-tabs">
+          <button class="content-tab" id="ctab-payload" data-target="pub-payload-pane"></button>
+          <button class="content-tab" id="ctab-config" data-target="pub-config-pane"></button>
+          <button class="content-tab" data-target="pub-meta-pane"></button>
+          <button class="content-tab" data-target="pub-history-pane"></button>
+        </div>
+        <div id="pub-top-content-wrapper">
+          <div class="pane-top" id="pub-payload-pane"></div>
+          <div class="pane-top" id="pub-meta-pane"></div>
+          <div class="pane-top" id="pub-history-pane"></div>
+          <div class="pane-top" id="pub-config-pane"></div>
+        </div>
+        <textarea id="pub-payload"></textarea>
+        <table id="metadata-container"><tbody></tbody></table>
+        <div id="pub-response-container"></div>
+        <div id="pub-response-status"></div>
+        <div id="pub-response"></div>
+        <button id="pub-resp-copy"></button>
+        <div id="pub-response-tab"></div>
+        <div id="pub-config-form"></div>
+      </div>
+    </div>
+  `;
+}
