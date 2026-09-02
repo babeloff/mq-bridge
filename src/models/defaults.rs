@@ -178,6 +178,18 @@ pub(crate) fn default_spool_metadata_extension() -> String {
     "json".to_string()
 }
 
+pub(crate) fn default_spool_done_file() -> String {
+    "DONE".to_string()
+}
+
+pub(crate) fn default_spool_producer_file() -> String {
+    "PRODUCER".to_string()
+}
+
+pub(crate) fn default_spool_consumer_file() -> String {
+    "CONSUMER".to_string()
+}
+
 pub(crate) fn default_spool_poll_interval_ms() -> u64 {
     100
 }

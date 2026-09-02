@@ -1039,22 +1039,43 @@ pub struct DirSpoolConfig {
     /// rename per chunk.
     #[serde(default = "default_true")]
     pub atomic: bool,
+    /// Name of the producer-completion sentinel file. Defaults to `DONE`.
+    ///
+    /// Production can span several producers — they run one at a time, which
+    /// `producer_file` enforces — so "a producer closed" is not "production finished".
+    /// This file is what says the latter, and only the last producer should write it.
+    #[serde(default = "default_spool_done_file")]
+    pub done_file: String,
+    /// (Sink only) Create `done_file` when the publisher is closed, marking production
+    /// finished for a `stop_on_done` consumer. Defaults to false.
+    ///
+    /// Set it on the *last* producer only. A publisher opening the spool deletes an
+    /// existing sentinel, since it is producing again.
+    #[serde(default)]
+    pub emit_done: bool,
+    /// Name of the file holding the producer lock, which keeps a second producer out.
+    /// Defaults to `PRODUCER`.
+    ///
+    /// Every instance sharing the directory must agree on this name — that is what makes
+    /// them exclude each other — and it must not collide with the other control files or
+    /// with a chunk name. See [`SpoolClaim`].
+    #[serde(default = "default_spool_producer_file")]
+    pub producer_file: String,
+    /// Name of the file holding the consumer lock, which keeps a second *draining*
+    /// consumer out. Defaults to `CONSUMER`. Same rules as `producer_file`.
+    #[serde(default = "default_spool_consumer_file")]
+    pub consumer_file: String,
     /// (Source only) Delete each chunk's files once its message is acknowledged. Defaults to
     /// true — this is what makes the directory a queue rather than a growing archive. With
     /// it off, chunks are left in place and each is emitted at most once per consumer run.
     #[serde(default = "default_true")]
     pub drain_on_read: bool,
-    /// (Source only) End the stream once the directory holds no unread chunks *and* no
-    /// producer holds the spool. Defaults to false, which tails the directory
-    /// indefinitely.
+    /// (Source only) End the stream once the directory holds no unread chunks *and*
+    /// `done_file` is present. Defaults to false, which tails the directory indefinitely.
     ///
-    /// A producer announces itself by taking the `PRODUCER` lock when it opens the spool
-    /// and releases it when it closes, so "the producer is done" is the absence of that
-    /// lock — which, unlike a sentinel file, cannot be left behind by a crash. The
-    /// corollary is a start-order requirement: a consumer started in the window *before*
-    /// its producer takes the lock sees an empty spool with nobody writing to it, and ends
-    /// the stream immediately. Start the consumer after the producer, or leave this off
-    /// and stop the consumer some other way.
+    /// Both halves matter: a producer that finished long ago still has its backlog drained
+    /// first, and a spool that is merely empty keeps the stream open, because another
+    /// producer may still be coming.
     #[serde(default)]
     pub stop_on_done: bool,
     /// (Source only) Idle poll interval in milliseconds when the directory holds no new
@@ -1076,13 +1097,13 @@ pub struct DirSpoolConfig {
 ///
 /// Neither is supported by the endpoint's design: two producers seeded from the same
 /// highest sequence number overwrite each other's chunks, and two draining consumers each
-/// deliver every chunk they win the race to read. So each role takes a pid lock on one
-/// extension-less file — `PRODUCER` or `CONSUMER` — created when the endpoint opens and
-/// removed when it closes. A producer and a consumer sharing a directory do not conflict:
+/// deliver every chunk they win the race to read. So each role takes a pid lock on its own
+/// file — `producer_file` or `consumer_file` — created when the endpoint opens and removed
+/// when it closes. A producer and a consumer sharing a directory do not conflict:
 /// that is the whole point of the endpoint.
 ///
-/// The `PRODUCER` lock doubles as the end-of-stream signal for `stop_on_done`, so turning
-/// this `off` on a publisher also makes it invisible to such a consumer.
+/// The locks say "someone is running", not "production is finished" — several producers
+/// may fill one spool in turn, and `done_file` is what marks the end of that.
 ///
 /// A lock whose owner is no longer running is broken and retaken, so a crash does not
 /// wedge a restart. That check is by process id, which is only meaningful on the machine

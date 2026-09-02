@@ -55,8 +55,8 @@ pub use crate::endpoints::structural::{
 };
 use crate::middleware::apply_middlewares_to_consumer;
 use crate::models::{
-    Endpoint, EndpointType, MemoryConfig, Middleware, NameBy, ResponseConfig, SpoolClaim,
-    StreamBufferConfig, TransformErrorPolicy,
+    Endpoint, EndpointType, MemoryConfig, Middleware, NameBy, ResponseConfig, StreamBufferConfig,
+    TransformErrorPolicy,
 };
 use crate::route::{get_endpoint, get_endpoint_factory};
 use crate::traits::{BoxFuture, MessageConsumer, MessagePublisher};
@@ -531,9 +531,11 @@ fn check_consumer_recursive(
         }
         EndpointType::File(_) => Ok(warnings),
         EndpointType::DirSpool(cfg) => {
-            if cfg.stop_on_done && matches!(cfg.claim, SpoolClaim::Off) {
+            dir_spool::validate_control_files(cfg)
+                .map_err(|error| anyhow!("[route:{route_name}] {error}"))?;
+            if cfg.emit_done {
                 warnings.push(
-                    "Endpoint 'dir_spool' sets 'stop_on_done' with 'claim: off', so it cannot see the PRODUCER lock and will end the stream as soon as the queue is empty."
+                    "Endpoint 'dir_spool' is used as a consumer, but 'emit_done' is a publisher-only option and will be ignored."
                     .to_string()
                 );
             }
@@ -1780,12 +1782,8 @@ fn check_publisher_recursive(
                     ));
                 }
             }
-            if matches!(cfg.claim, SpoolClaim::Off) {
-                warnings.push(
-                    "Endpoint 'dir_spool' is used as a publisher with 'claim: off', so it takes no PRODUCER lock and a 'stop_on_done' consumer cannot tell it is still running."
-                    .to_string()
-                );
-            }
+            dir_spool::validate_control_files(cfg)
+                .map_err(|error| anyhow!("[route:{route_name}] {error}"))?;
             Ok(warnings)
         }
         #[cfg(feature = "object-store")]
