@@ -591,6 +591,11 @@
           "$ref": "#/$defs/SpoolDone",
           "default": "never"
         },
+        "fsync": {
+          "description": "How hard to work at making a chunk survive a power loss. Defaults to `chunk`, which\nis two fsyncs per message with a sidecar. See [`SpoolFsync`].",
+          "$ref": "#/$defs/SpoolFsync",
+          "default": "chunk"
+        },
         "metadata_extension": {
           "description": "Extension of the JSON metadata sidecar, with or without the leading dot. Defaults to\n`json`. Set to an empty string to write and expect payload files only.",
           "type": "string",
@@ -3367,6 +3372,21 @@
           "description": "Write it whenever the producer closes, however the route ended — a clean finish, a\nshutdown, or a failure.\n\nThis says \"nothing more is coming from here\", not \"everything worked\". Use it for a\nconsumer that must not wait forever on a producer that may have died, at the price\nof it treating a truncated stream as complete.",
           "type": "string",
           "const": "end"
+        }
+      ]
+    },
+    "SpoolFsync": {
+      "description": "How hard a `dir_spool` endpoint works to make its writes survive a power loss.\n\nThis is the endpoint's dominant cost. `chunk`, the default, is two fsyncs per message —\nthe payload and its sidecar — plus one directory fsync per batch, and on a spinning disk\nor a conservative SSD that sets the throughput ceiling long before anything in\nmq-bridge does. Dropping the sidecar (`metadata_extension: \"\"`) halves it; `off` removes\nit.\n\nIndependent of `atomic`, which decides whether a reader can see a half-written chunk,\nnot whether a crash can lose one. The once-per-run fsyncs — the lock, the sentinel — are\nnot affected by either.",
+      "oneOf": [
+        {
+          "description": "fsync every chunk file before it is renamed into place, and the directory once per\nbatch (default). An acknowledged batch has reached the disk.",
+          "type": "string",
+          "const": "chunk"
+        },
+        {
+          "description": "Do not fsync chunks at all, and let the operating system flush when it chooses.\n\nA crash or a power loss can then lose recent chunks *or* leave one present but\ntruncated, which a consumer would deliver as a short message — so this trades the\nendpoint's crash-safety claim, not merely its tail. Reasonable when the spool is a\nbuffer between two processes on one machine and a reboot means starting over anyway.",
+          "type": "string",
+          "const": "off"
         }
       ]
     },

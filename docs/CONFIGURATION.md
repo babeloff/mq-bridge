@@ -445,6 +445,7 @@ opaque blobs, where the delimiter framing and the single append point both get i
 | `payload_extension` | both | `bin` | Extension of the payload file, with or without the leading dot. |
 | `metadata_extension` | both | `json` | Extension of the metadata sidecar. Empty string writes and expects payload files only. |
 | `atomic` | sink | `true` | Write to `.tmp` and rename on completion. |
+| `fsync` | both | `chunk` | Durability: `chunk` fsyncs every chunk file and the directory once per batch, `off` fsyncs nothing and lets the OS flush. |
 | `done_file` | both | `DONE` | Sentinel that marks production finished. |
 | `emit_done` | sink | `never` | When to create `done_file`: `success` (the route reached the end of its input and every chunk was written), `end` (whenever the producer closes, however the pass ended), `never`. Set it on the *last* producer only. |
 | `producer_file` | both | `PRODUCER` | File holding the producer lock, which keeps a second producer out. |
@@ -455,9 +456,16 @@ opaque blobs, where the delimiter framing and the single append point both get i
 | `source_metadata` | source | `false` | Stamp `mqb.src.spool_path` and `mqb.src.spool_chunk`. |
 | `claim` | both | `exclusive` | Lock this side of the spool: `exclusive` refuses to start when another instance holds the same role, `warn` logs and runs anyway, `off` takes no lock at all. |
 
-Lexical order is queue order, so keep a zero-padded `{seq}` first in `naming_pattern`.
-A publisher opening an existing spool resumes numbering past the highest chunk already
-there, so a restart appends rather than overwriting the head of the queue.
+Lexical order is queue order, so `naming_pattern` **must start with the sequence** — a sink
+whose pattern begins with anything else is rejected. The front of a chunk name is
+load-bearing twice over: the listing is ordered by it, and a publisher opening an existing
+spool reads its next sequence number back out of it, resuming past the highest chunk already
+there rather than overwriting the head of the queue. `{timestamp}_{seq}` would resume from a
+13-digit timestamp, and a literal prefix would resume from zero and overwrite. Padding is
+not enforced, but an unpadded `{seq}` warns: chunk 10 sorts before chunk 2.
+
+`payload_extension` and `metadata_extension` must also differ, on both sides — a consumer
+whose two extensions match would read every sidecar as a payload.
 
 ##### Cardinality, and how production ends
 One spool directory takes **one producer and one consumer at a time**, each of which may be
@@ -531,6 +539,29 @@ nothing, so several of them over one spool each see every chunk once and none of
 a lock — though each will warn if a draining consumer holds the directory, because that one
 deletes chunks out from under it.
 
+##### Throughput and durability
+The endpoint's dominant cost is fsync, not mq-bridge. The default `fsync: chunk` is **two
+fsyncs per message** when a sidecar is written — the payload and its sidecar — plus one
+directory fsync per batch. Measured on one machine (btrfs on NVMe, 64 KiB payloads, one
+message per `send_batch`), single sink, no route:
+
+| | `fsync: chunk` | `fsync: off` |
+|---|---|---|
+| with sidecar | ~210 msg/s | ~2100 msg/s |
+| `metadata_extension: ""` | ~360 msg/s | ~3900 msg/s |
+
+On tmpfs the same run gives ~3500 and ~9200 msg/s respectively, which is the number to use
+if the spool lives in `/dev/shm` — and a caution against sizing from a tmpfs measurement for
+a spool that will land on a disk. Treat these as an order of magnitude, not a specification:
+a spinning disk is far slower and a battery-backed controller far faster.
+
+Two ways to buy headroom before reaching for `fsync: off`: drop the sidecar when the payload
+is self-describing (`metadata_extension: ""`, which nearly doubles the rate and halves the
+file count), and batch — the per-batch directory fsync is amortized over the batch, so
+`batch_size: 32` pays it once rather than 32 times. `fsync: off` trades the endpoint's
+crash-safety claim, not just its tail: a power loss can leave a chunk present but truncated,
+which a consumer would deliver as a short message.
+
 ##### Sharding
 A flat spool is one directory per stream, and most filesystems degrade long before mq-bridge
 does — 30fps with sidecars is over 200,000 files an hour. `shard_depth` spreads chunks over
@@ -564,12 +595,15 @@ are visible from outside: chunks that arrive while a listing is still being serv
 picked up only once it is exhausted (within `poll_interval_ms` on an idle spool), and the
 batch that empties a listing can be shorter than the route's `batch_size`.
 
-**Example**: video frames plus telemetry, written by one process and drained by another.
+**Example**: video frames written by one process and drained by another.
 
 ```yaml
-# Producer: raw H.264 chunks with a telemetry sidecar. Holds the PRODUCER lock while it
-# runs; on a clean finish it writes DONE, which is what ends the consumer's stream below.
-# Use `emit_done: end` instead if the consumer must not wait on a producer that may die.
+# Producer: raw H.264 chunks, no sidecar — an Annex B chunk is self-describing, and a
+# sidecar per frame would double the file count and the fsyncs for nothing. Keep the
+# default `metadata_extension: "json"` on a spool whose metadata has to travel.
+# Holds the PRODUCER lock while it runs; on a clean finish it writes DONE, which is what
+# ends the consumer's stream below. Use `emit_done: end` instead if the consumer must not
+# wait on a producer that may die.
 frame_capture:
   input:
     memory:
@@ -583,7 +617,7 @@ frame_capture:
       shard_depth: 2
       shard_width: 3
       payload_extension: ".h264"
-      metadata_extension: ".json"
+      metadata_extension: ""
       emit_done: success
 
 # Consumer: drain in sequence order, delete as we go, exit when the producer is done.
@@ -594,6 +628,7 @@ frame_ingest:
       shard_depth: 2
       shard_width: 3
       payload_extension: ".h264"
+      metadata_extension: ""
       drain_on_read: true
       stop_on_done: true
   output:

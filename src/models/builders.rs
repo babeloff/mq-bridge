@@ -307,6 +307,7 @@ impl DirSpoolConfig {
             payload_extension: default_spool_payload_extension(),
             metadata_extension: default_spool_metadata_extension(),
             atomic: true,
+            fsync: SpoolFsync::default(),
             done_file: default_spool_done_file(),
             emit_done: SpoolDone::default(),
             producer_file: default_spool_producer_file(),

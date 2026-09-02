@@ -1061,6 +1061,10 @@ pub struct DirSpoolConfig {
     /// rename per chunk.
     #[serde(default = "default_true")]
     pub atomic: bool,
+    /// How hard to work at making a chunk survive a power loss. Defaults to `chunk`, which
+    /// is two fsyncs per message with a sidecar. See [`SpoolFsync`].
+    #[serde(default)]
+    pub fsync: SpoolFsync,
     /// Name of the producer-completion sentinel file. Defaults to `DONE`.
     ///
     /// Production can span several producers — they run one at a time, which
@@ -1112,6 +1116,34 @@ pub struct DirSpoolConfig {
     /// same role. Defaults to `exclusive`. See [`SpoolClaim`].
     #[serde(default)]
     pub claim: SpoolClaim,
+}
+
+/// How hard a `dir_spool` endpoint works to make its writes survive a power loss.
+///
+/// This is the endpoint's dominant cost. `chunk`, the default, is two fsyncs per message —
+/// the payload and its sidecar — plus one directory fsync per batch, and on a spinning disk
+/// or a conservative SSD that sets the throughput ceiling long before anything in
+/// mq-bridge does. Dropping the sidecar (`metadata_extension: ""`) halves it; `off` removes
+/// it.
+///
+/// Independent of `atomic`, which decides whether a reader can see a half-written chunk,
+/// not whether a crash can lose one. The once-per-run fsyncs — the lock, the sentinel — are
+/// not affected by either.
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum SpoolFsync {
+    /// fsync every chunk file before it is renamed into place, and the directory once per
+    /// batch (default). An acknowledged batch has reached the disk.
+    #[default]
+    Chunk,
+    /// Do not fsync chunks at all, and let the operating system flush when it chooses.
+    ///
+    /// A crash or a power loss can then lose recent chunks *or* leave one present but
+    /// truncated, which a consumer would deliver as a short message — so this trades the
+    /// endpoint's crash-safety claim, not merely its tail. Reasonable when the spool is a
+    /// buffer between two processes on one machine and a reboot means starting over anyway.
+    Off,
 }
 
 /// When a `dir_spool` publisher writes its `done_file`, marking production finished.

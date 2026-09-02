@@ -25,7 +25,7 @@
 //! one is for a *queue* of arbitrarily large opaque blobs, where the delimiter framing and
 //! the single-writer append point would both get in the way.
 
-use crate::models::DirSpoolConfig;
+use crate::models::{DirSpoolConfig, SpoolFsync};
 use crate::traits::{
     BoxFuture, ConsumerError, DisconnectOutcome, MessageConsumer, MessageDisposition,
     MessagePublisher, PublisherError, ReceivedBatch, SentBatch,
@@ -234,18 +234,30 @@ fn validate_sharding(config: &DirSpoolConfig) -> anyhow::Result<()> {
 /// The padded width of a `{seq:0N}` placeholder at the very start of `pattern`, or `None`
 /// when the pattern does not start with one.
 fn leading_seq_width(pattern: &str) -> Option<usize> {
+    leading_seq(pattern).flatten()
+}
+
+/// How `pattern` opens: `Some(Some(width))` for a zero-padded `{seq:0N}`, `Some(None)` for a
+/// bare `{seq}`, and `None` when it does not start with the sequence at all.
+fn leading_seq(pattern: &str) -> Option<Option<usize>> {
     let token = pattern.strip_prefix('{')?;
     let close = token.find('}')?;
-    let (name, spec) = token[..close].split_once(':')?;
+    let (name, spec) = match token[..close].split_once(':') {
+        Some((name, spec)) => (name, Some(spec)),
+        None => (&token[..close], None),
+    };
     if name != "seq" {
         return None;
     }
+    let Some(spec) = spec else {
+        return Some(None);
+    };
     let width: usize = spec
         .trim_end_matches('d')
         .trim_start_matches('0')
         .parse()
         .ok()?;
-    (width > 0).then_some(width)
+    Some((width > 0).then_some(width))
 }
 
 /// Strips `.<suffix>` from `name`, returning the chunk's base name.
@@ -264,10 +276,16 @@ async fn ensure_directory(path: &str) -> anyhow::Result<PathBuf> {
     Ok(dir)
 }
 
-/// Writes `body` to `path`, fsyncing it so the bytes survive a crash that follows the
-/// rename. When `atomic`, the write lands on a `.tmp` sibling that is renamed into place
-/// only once complete, so a reader listing the directory never observes a partial chunk.
-async fn write_chunk_file(path: &Path, body: &[u8], atomic: bool) -> anyhow::Result<()> {
+/// Writes `body` to `path`, fsyncing it — unless `fsync` is off — so the bytes survive a
+/// crash that follows the rename. When `atomic`, the write lands on a `.tmp` sibling that is
+/// renamed into place only once complete, so a reader listing the directory never observes a
+/// partial chunk.
+async fn write_chunk_file(
+    path: &Path,
+    body: &[u8],
+    atomic: bool,
+    fsync: SpoolFsync,
+) -> anyhow::Result<()> {
     let target = if atomic {
         let mut staging = path.as_os_str().to_os_string();
         staging.push(STAGING_SUFFIX);
@@ -285,9 +303,11 @@ async fn write_chunk_file(path: &Path, body: &[u8], atomic: bool) -> anyhow::Res
     file.write_all(body)
         .await
         .with_context(|| format!("Failed to write dir_spool chunk {}", target.display()))?;
-    file.sync_all()
-        .await
-        .with_context(|| format!("Failed to sync dir_spool chunk {}", target.display()))?;
+    if matches!(fsync, SpoolFsync::Chunk) {
+        file.sync_all()
+            .await
+            .with_context(|| format!("Failed to sync dir_spool chunk {}", target.display()))?;
+    }
     drop(file);
     if atomic {
         fs::rename(&target, path)
@@ -342,6 +362,66 @@ impl SpoolRole {
             Self::Consumer => &config.consumer_file,
         }
     }
+}
+
+/// Everything about a spool's layout that both ends have to agree on, and that neither can
+/// work without: the extensions that tell a payload from a sidecar, the control files, and
+/// the shard shape.
+pub(crate) fn validate_spool_layout(config: &DirSpoolConfig) -> anyhow::Result<()> {
+    validate_extensions(config)?;
+    validate_control_files(config)?;
+    validate_sharding(config)
+}
+
+/// Checks that a payload file can be told from a sidecar.
+///
+/// Both ends need this, not just the writing one: a consumer whose two extensions match
+/// would read every sidecar as a payload and deliver the metadata as a message body.
+fn validate_extensions(config: &DirSpoolConfig) -> anyhow::Result<()> {
+    let payload_suffix = config.payload_suffix();
+    if payload_suffix.is_empty() {
+        return Err(anyhow::anyhow!(
+            "dir_spool 'payload_extension' must not be empty"
+        ));
+    }
+    if config.metadata_suffix() == Some(payload_suffix) {
+        return Err(anyhow::anyhow!(
+            "dir_spool 'payload_extension' and 'metadata_extension' must differ (both are \
+             '{payload_suffix}'), or a sidecar would be read as a payload"
+        ));
+    }
+    Ok(())
+}
+
+/// Checks that a sink's `naming_pattern` can carry both the queue's order and its position.
+///
+/// The front of a chunk name is load-bearing twice over: the listing is ordered by it, and a
+/// publisher reopening a spool reads its next sequence number back out of it. A pattern that
+/// starts with anything else breaks both, and silently — `{timestamp}_{seq}` resumes from a
+/// 13-digit timestamp, and a literal prefix resumes from zero and overwrites the head of the
+/// queue — so it is rejected rather than documented.
+pub(crate) fn validate_naming_pattern(config: &DirSpoolConfig) -> anyhow::Result<()> {
+    if leading_seq(&config.naming_pattern).is_none() {
+        return Err(anyhow::anyhow!(
+            "dir_spool 'naming_pattern' must start with the sequence, like '{{seq:09}}'; \
+             '{}' does not, so lexical order would not be queue order and a publisher \
+             reopening the spool would resume from whatever digits happen to come first",
+            config.naming_pattern
+        ));
+    }
+    Ok(())
+}
+
+/// The warning a sink's `naming_pattern` deserves but is not refused for.
+pub(crate) fn naming_pattern_warning(config: &DirSpoolConfig) -> Option<String> {
+    matches!(leading_seq(&config.naming_pattern), Some(None)).then(|| {
+        format!(
+            "Endpoint 'dir_spool' has an unpadded sequence in 'naming_pattern' ('{}'): chunk \
+             10 sorts before chunk 2, so the queue will be delivered out of order. Use a \
+             zero-padded width, like '{{seq:09}}'.",
+            config.naming_pattern
+        )
+    })
 }
 
 /// The control files a spool holds besides its chunks: the two locks and the completion
@@ -579,6 +659,7 @@ pub struct DirSpoolPublisher {
     payload_suffix: String,
     metadata_suffix: Option<String>,
     atomic: bool,
+    fsync: SpoolFsync,
     done_file: String,
     emit_done: crate::models::SpoolDone,
     /// Whether any chunk this publisher accepted failed to reach the disk, which makes the
@@ -602,20 +683,13 @@ impl DirSpoolPublisher {
                 config.naming_pattern
             ));
         }
+        validate_spool_layout(config)?;
+        validate_naming_pattern(config)?;
+        if let Some(warning) = naming_pattern_warning(config) {
+            warn!("{warning}");
+        }
         let dir = ensure_directory(&config.path).await?;
         let payload_suffix = config.payload_suffix().to_string();
-        if payload_suffix.is_empty() {
-            return Err(anyhow::anyhow!(
-                "dir_spool 'payload_extension' must not be empty"
-            ));
-        }
-        if config.metadata_suffix() == Some(payload_suffix.as_str()) {
-            return Err(anyhow::anyhow!(
-                "dir_spool 'payload_extension' and 'metadata_extension' must differ (both are '{payload_suffix}')"
-            ));
-        }
-        validate_control_files(config)?;
-        validate_sharding(config)?;
         // Locked before the directory is touched, so a second producer cannot be what
         // clears the sentinel below or reseeds this one's sequence.
         let lock = acquire_lock(&dir, SpoolRole::Producer, config)?;
@@ -630,6 +704,7 @@ impl DirSpoolPublisher {
             payload_suffix,
             metadata_suffix: config.metadata_suffix().map(str::to_string),
             atomic: config.atomic,
+            fsync: config.fsync,
             done_file: config.done_file.clone(),
             emit_done: config.emit_done,
             write_failed: AtomicBool::new(false),
@@ -699,10 +774,10 @@ impl DirSpoolPublisher {
     ) -> anyhow::Result<()> {
         if let Some((suffix, body)) = sidecar {
             let path = self.dir.join(format!("{base}.{suffix}"));
-            write_chunk_file(&path, body, self.atomic).await?;
+            write_chunk_file(&path, body, self.atomic, self.fsync).await?;
         }
         let payload_path = self.dir.join(format!("{base}.{}", self.payload_suffix));
-        write_chunk_file(&payload_path, &message.payload, self.atomic).await
+        write_chunk_file(&payload_path, &message.payload, self.atomic, self.fsync).await
     }
 
     /// Creates the production-completion sentinel. Idempotent: an existing sentinel is
@@ -837,7 +912,9 @@ impl MessagePublisher for DirSpoolPublisher {
         }
         // One directory fsync for the whole batch: the per-chunk renames are already
         // ordered, and this only decides how much of the tail survives a power loss.
-        sync_directory(&self.dir).await;
+        if matches!(self.fsync, SpoolFsync::Chunk) {
+            sync_directory(&self.dir).await;
+        }
         if failed.is_empty() {
             Ok(SentBatch::Ack)
         } else {
@@ -886,6 +963,7 @@ pub struct DirSpoolConsumer {
     sharding: Option<Sharding>,
     payload_suffix: String,
     metadata_suffix: Option<String>,
+    fsync: SpoolFsync,
     done_file: String,
     drain_on_read: bool,
     stop_on_done: bool,
@@ -928,15 +1006,9 @@ impl DirSpoolConsumer {
         config: &DirSpoolConfig,
         source_metadata: bool,
     ) -> anyhow::Result<Self> {
+        validate_spool_layout(config)?;
         let dir = ensure_directory(&config.path).await?;
         let payload_suffix = config.payload_suffix().to_string();
-        if payload_suffix.is_empty() {
-            return Err(anyhow::anyhow!(
-                "dir_spool 'payload_extension' must not be empty"
-            ));
-        }
-        validate_control_files(config)?;
-        validate_sharding(config)?;
         let lock = if config.drain_on_read {
             acquire_lock(&dir, SpoolRole::Consumer, config)?
         } else {
@@ -947,6 +1019,7 @@ impl DirSpoolConsumer {
             dir,
             path: config.path.clone(),
             sharding: Sharding::from_config(config),
+            fsync: config.fsync,
             done_file: config.done_file.clone(),
             payload_suffix,
             metadata_suffix: config.metadata_suffix().map(str::to_string),
@@ -1345,6 +1418,7 @@ impl MessageConsumer for DirSpoolConsumer {
         let payload_suffix = self.payload_suffix.clone();
         let metadata_suffix = self.metadata_suffix.clone();
         let drain_on_read = self.drain_on_read;
+        let fsync = self.fsync;
         let claimed = Arc::clone(&self.claimed);
         let requeued = Arc::clone(&self.requeued);
         let commit: crate::traits::BatchCommitFunc = Box::new(move |dispositions| {
@@ -1386,7 +1460,9 @@ impl MessageConsumer for DirSpoolConsumer {
                         .expect("dir_spool requeue poisoned")
                         .extend(redeliver);
                 }
-                sync_directory(&dir).await;
+                if matches!(fsync, SpoolFsync::Chunk) {
+                    sync_directory(&dir).await;
+                }
                 Ok(())
             })
         });

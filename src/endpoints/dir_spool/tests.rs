@@ -1,5 +1,5 @@
 use super::*;
-use crate::models::{DirSpoolConfig, SpoolClaim, SpoolDone};
+use crate::models::{DirSpoolConfig, SpoolClaim, SpoolDone, SpoolFsync};
 use crate::traits::{DisconnectOutcome, MessageConsumer, MessagePublisher};
 use tempfile::tempdir;
 
@@ -105,7 +105,7 @@ dir_spool:
   shard_depth: 2
   shard_width: 3
   payload_extension: ".h264"
-  metadata_extension: ".json"
+  metadata_extension: ""
   atomic: true
   emit_done: success
 "#,
@@ -120,7 +120,8 @@ dir_spool:
     assert_eq!(cfg.shard_width, 3);
     // A leading dot is accepted and stripped, so `.h264` and `h264` mean the same thing.
     assert_eq!(cfg.payload_suffix(), "h264");
-    assert_eq!(cfg.metadata_suffix(), Some("json"));
+    // The video example writes no sidecar: a frame chunk is self-describing.
+    assert_eq!(cfg.metadata_suffix(), None);
     assert_eq!(cfg.emit_done, SpoolDone::Success);
     // Consumer-side fields keep their defaults on a publisher block.
     assert!(cfg.drain_on_read);
@@ -150,6 +151,9 @@ dir_spool:
     // A flat spool unless asked otherwise, and the default padding is wide enough to shard.
     assert_eq!(cfg.shard_depth, 0);
     assert_eq!(cfg.shard_width, 3);
+    // The general default keeps metadata, and pays for it with a second file per message.
+    assert_eq!(cfg.metadata_suffix(), Some("json"));
+    assert_eq!(cfg.fsync, SpoolFsync::Chunk);
 }
 
 /// `spool` is the short spelling the feature request used; both must reach the same type.
@@ -740,15 +744,98 @@ async fn honours_custom_extensions_and_a_disabled_sidecar() {
     assert!(received[0].metadata.is_empty());
 }
 
+/// A consumer whose two extensions match would read every sidecar as a payload and deliver
+/// the metadata as a message body, so it refuses the same configuration the publisher does.
 #[tokio::test]
-async fn rejects_a_payload_and_sidecar_sharing_one_extension() {
+async fn both_ends_reject_a_payload_and_sidecar_sharing_one_extension() {
     let dir = tempdir().unwrap();
     let mut cfg = config(dir.path());
     cfg.payload_extension = "json".to_string();
     cfg.metadata_extension = ".json".to_string();
 
-    let error = DirSpoolPublisher::new(&cfg).await.unwrap_err().to_string();
-    assert!(error.contains("must differ"), "unexpected error: {error}");
+    for error in [
+        DirSpoolPublisher::new(&cfg).await.unwrap_err().to_string(),
+        DirSpoolConsumer::new(&cfg).await.unwrap_err().to_string(),
+    ] {
+        assert!(error.contains("must differ"), "unexpected error: {error}");
+    }
+}
+
+/// The front of a chunk name is the queue's order *and* its resume point, so a sink whose
+/// pattern starts with anything else is refused rather than left to corrupt a second run.
+#[tokio::test]
+async fn rejects_a_naming_pattern_that_does_not_start_with_the_sequence() {
+    let dir = tempdir().unwrap();
+
+    for pattern in ["{timestamp}_{seq:09}", "chunk-{seq:09}", "{message_id}"] {
+        let mut cfg = config(dir.path());
+        cfg.naming_pattern = pattern.to_string();
+        let error = DirSpoolPublisher::new(&cfg)
+            .await
+            .expect_err("a pattern that does not lead with the sequence must be refused")
+            .to_string();
+        assert!(
+            error.contains("must start with the sequence"),
+            "unexpected error for {pattern:?}: {error}"
+        );
+        // A consumer does not render names, so the same spool is still readable.
+        assert!(DirSpoolConsumer::new(&cfg).await.is_ok());
+    }
+}
+
+/// `{timestamp}_{seq}` was the specific trap: `leading_sequence` reads the timestamp as the
+/// sequence, and a second run would resume from 1.7 trillion.
+#[test]
+fn leading_sequence_would_read_a_timestamp_prefix_as_the_sequence() {
+    assert_eq!(
+        leading_sequence("1700000000000_000000001"),
+        Some(1_700_000_000_000)
+    );
+    // Which is why the pattern is rejected rather than documented.
+    let mut cfg = DirSpoolConfig::new("/tmp/s");
+    cfg.naming_pattern = "{timestamp}_{seq:09}".to_string();
+    assert!(validate_naming_pattern(&cfg).is_err());
+}
+
+/// An unpadded sequence still works for fewer than ten chunks, so it warns rather than
+/// failing — but it does warn, because chunk 10 sorts before chunk 2.
+#[test]
+fn warns_about_an_unpadded_sequence() {
+    let mut cfg = DirSpoolConfig::new("/tmp/s");
+    cfg.naming_pattern = "{seq}".to_string();
+    assert!(validate_naming_pattern(&cfg).is_ok());
+    let warning = naming_pattern_warning(&cfg).expect("an unpadded sequence must warn");
+    assert!(
+        warning.contains("chunk 10 sorts before chunk 2"),
+        "{warning}"
+    );
+
+    cfg.naming_pattern = "{seq:09}".to_string();
+    assert!(naming_pattern_warning(&cfg).is_none());
+    cfg.naming_pattern = "{seq:06d}_{timestamp}".to_string();
+    assert!(naming_pattern_warning(&cfg).is_none());
+}
+
+/// `fsync: off` changes what a crash costs, not what a spool contains.
+#[tokio::test]
+async fn round_trips_with_fsync_off() {
+    let dir = tempdir().unwrap();
+    let mut cfg = config(dir.path());
+    cfg.fsync = SpoolFsync::Off;
+
+    let publisher = DirSpoolPublisher::new(&cfg).await.unwrap();
+    publisher
+        .send_batch(vec![message("unsynced", "x"), message("also", "x")])
+        .await
+        .unwrap();
+
+    let mut consumer = DirSpoolConsumer::new(&cfg).await.unwrap();
+    let received = drain(&mut consumer, 10).await;
+    assert_eq!(received.len(), 2);
+    assert_eq!(&received[0].payload[..], b"unsynced");
+    assert_eq!(received[0].metadata.get("kind").unwrap(), "x");
+    // Acked chunks are still deleted; only the fsyncs are gone.
+    assert_eq!(entries(dir.path()), vec!["CONSUMER", "PRODUCER"]);
 }
 
 // --- Sharding ---

@@ -531,7 +531,7 @@ fn check_consumer_recursive(
         }
         EndpointType::File(_) => Ok(warnings),
         EndpointType::DirSpool(cfg) => {
-            dir_spool::validate_control_files(cfg)
+            dir_spool::validate_spool_layout(cfg)
                 .map_err(|error| anyhow!("[route:{route_name}] {error}"))?;
             if !matches!(cfg.emit_done, SpoolDone::Never) {
                 warnings.push(
@@ -1798,8 +1798,13 @@ fn check_publisher_recursive(
                     ));
                 }
             }
-            dir_spool::validate_control_files(cfg)
+            dir_spool::validate_spool_layout(cfg)
                 .map_err(|error| anyhow!("[route:{route_name}] {error}"))?;
+            // Sink-only: the front of a chunk name has to be the sequence, or the queue
+            // loses both its order and its resume point.
+            dir_spool::validate_naming_pattern(cfg)
+                .map_err(|error| anyhow!("[route:{route_name}] {error}"))?;
+            warnings.extend(dir_spool::naming_pattern_warning(cfg));
             Ok(warnings)
         }
         #[cfg(feature = "object-store")]
