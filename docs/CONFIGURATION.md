@@ -643,6 +643,41 @@ whose payload file exists without a sidecar is still delivered, with empty metad
 is what lets a foreign producer write into the spool with nothing but `write()` and
 `rename()`.
 
+##### Further reading
+`dir_spool` is a deliberately old idea. Spooling — buffering plus a queue, so that a fast
+producer hands work off and carries on while a slow consumer drains it at its own pace — has
+been the standard answer to this problem since the 1960s, and the print spooler is its
+canonical form. These are worth reading before designing anything on top of a spool
+directory:
+
+- [Spooling](https://en.wikipedia.org/wiki/Spooling) (Wikipedia) — the concept and its
+  vocabulary, the name (said to come from "Simultaneous Peripheral Operations On-Line",
+  possibly a backronym), and a bibliography that goes back to the primary sources: Lundin &
+  Stoneman's *The Spooler User Guide* (1977), Donovan's *Systems Programming* (1972), and the
+  spooling chapters of Peterson & Silberschatz and Tanenbaum.
+- [Printing and spooling](https://www.cise.ufl.edu/~jnw/SysAdminfa04/Lectures/34.html)
+  (University of Florida CISE, system administration lecture, 2004) — Unix print spooling
+  from the operator's side: BSD copying job data into the spool directory under a job id
+  versus System V writing a request file that points at the original, the `lpd`/`lpsched`
+  daemons, and the operational concerns that outlive the software — who owns the spool
+  directory and with what permissions, and which hosts may submit into it.
+- [Spooling: print spoolers in practice](https://www.onenoughtone.com/learn/spooling/2) — a
+  modern worked example, tracing a job through CUPS end to end: the `cupsd` scheduler, the
+  queue under `/var/spool/cups/`, filter chains, and device backends.
+
+Three things `dir_spool` takes from that tradition. The directory *is* the queue, so the
+producer's obligation ends when the file lands and a crash on either side leaves a state you
+can read with `ls`. Data is copied into the spool rather than referenced in place — the BSD
+choice rather than the System V one — which is what lets the producer finish and exit while
+the consumer is still draining. And the control information is a separate file from the data,
+which is what the payload/sidecar split is, and why the two extensions must differ.
+
+One thing it does differently: a classic spooler has a single privileged daemon serializing
+access to the queue, and `dir_spool` has no daemon at all. That is why exclusion is done with
+the `producer_file` and `consumer_file` pid locks instead, and why the cardinality rules above
+have to be stated rather than enforced by a process boundary. The filter chains a print
+spooler applies on the way out are, in mq-bridge, the route's middleware and handlers.
+
 ### IDE Support (Schema Validation) 
 mq-bridge includes a JSON schema for configuration validation and auto-completion. 
 1. Ensure you have a YAML plugin installed (e.g., YAML for VS Code). 

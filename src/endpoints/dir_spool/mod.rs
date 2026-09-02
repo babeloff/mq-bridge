@@ -24,6 +24,16 @@
 //! The `file` endpoint is the sibling for a *stream* of delimited records in one file; this
 //! one is for a *queue* of arbitrarily large opaque blobs, where the delimiter framing and
 //! the single-writer append point would both get in the way.
+//!
+//! None of this is new. Spooling — buffering plus a queue, so a fast producer hands work off
+//! and a slow consumer drains it at its own pace — is the 1960s answer to this problem, and
+//! the print spooler is its canonical form. `dir_spool` follows it in making the directory
+//! the queue, in copying data into the spool rather than referencing it in place (the BSD
+//! choice rather than the System V one, and what lets the producer exit while the consumer
+//! drains), and in keeping control information in a file of its own — the payload/sidecar
+//! split. It differs in having no privileged daemon to serialize access, which is why
+//! exclusion is a pair of pid locks instead. See `docs/CONFIGURATION.md` (Directory spool →
+//! Further reading) for the sources.
 
 use crate::models::{DirSpoolConfig, SpoolFsync};
 use crate::traits::{
