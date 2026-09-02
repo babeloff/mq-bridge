@@ -285,6 +285,8 @@ pub enum EndpointType {
     Kafka(KafkaConfig),
     Nats(NatsConfig),
     File(FileConfig),
+    #[serde(rename = "dir_spool", alias = "spool", alias = "dirspool")]
+    DirSpool(DirSpoolConfig),
     #[serde(rename = "object_store", alias = "objectstore", alias = "s3")]
     ObjectStore(ObjectStoreConfig),
     #[cfg_attr(feature = "schema", schemars(extend("format" = "structural_endpoint")))]
@@ -1003,6 +1005,211 @@ pub enum FileConsumerMode {
         #[serde(default)]
         read_from_tail: bool,
     },
+}
+
+// --- Directory Spool Specific Configuration ---
+
+/// Configuration for a `dir_spool` endpoint: a crash-safe FIFO queue backed by a directory.
+///
+/// As a **sink** each message becomes a pair of files under `path` — a payload file holding
+/// the raw `CanonicalMessage.payload` bytes, and an optional JSON sidecar holding its
+/// metadata. Both are written to a `.tmp` name, fsynced, and renamed into place, so a reader
+/// never observes a partial write. As a **source** the directory is listed in lexical order,
+/// each finalized pair is emitted as one message, and (with `drain_on_read`) the pair is
+/// deleted once the message is acknowledged.
+///
+/// The names are what makes the queue ordered, so `naming_pattern` must keep the sequence
+/// number zero-padded and leading. The publisher resumes the sequence from the highest
+/// number already present in the directory, so a restart appends rather than overwrites.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct DirSpoolConfig {
+    /// Directory holding the spool. Created if missing.
+    pub path: String,
+    /// (Sink only) Name template for each chunk, without extension. Supports `{seq}`,
+    /// `{seq:06}` / `{seq:06d}` (zero-padded), `{timestamp}` (unix millis) and
+    /// `{message_id}`. Defaults to `{seq:09}`. Lexical order must match sequence order,
+    /// so keep a zero-padded `{seq}` first.
+    #[serde(default = "default_spool_naming_pattern")]
+    pub naming_pattern: String,
+    /// How many levels of shard subdirectory to spread chunks over. Defaults to 0, which
+    /// writes every chunk straight into `path`.
+    ///
+    /// A flat spool is one directory per stream, and most filesystems degrade long before
+    /// mq-bridge does: 30fps with sidecars is over 200,000 files an hour. Sharding takes the
+    /// leading digits of the sequence number as directory names, so `{seq:09}` with a depth
+    /// of 2 and a width of 3 writes chunk 1 as `000/000/001.bin` and gives every directory
+    /// at most 1000 entries.
+    ///
+    /// Both ends must agree: a consumer only descends as far as its own `shard_depth`. It
+    /// warns when a scan finds subdirectories it is not configured to enter, since the
+    /// alternative is a spool that reads as permanently empty.
+    #[serde(default)]
+    pub shard_depth: usize,
+    /// How many characters of the sequence number each shard level consumes. Defaults to 3,
+    /// giving 1000 entries per level. Ignored when `shard_depth` is 0.
+    ///
+    /// With sharding on, `naming_pattern` must start with a zero-padded `{seq:0N}` wider
+    /// than `shard_depth * shard_width`, so that every chunk shards identically and one
+    /// character is left for the file itself.
+    #[serde(default = "default_spool_shard_width")]
+    pub shard_width: usize,
+    /// Extension of the payload file, with or without the leading dot. Defaults to `bin`.
+    #[serde(default = "default_spool_payload_extension")]
+    pub payload_extension: String,
+    /// Extension of the JSON metadata sidecar, with or without the leading dot. Defaults to
+    /// `json`. Set to an empty string to write and expect payload files only.
+    #[serde(default = "default_spool_metadata_extension")]
+    pub metadata_extension: String,
+    /// (Sink only) Write to a `.tmp` name and rename into place, so a reader never sees a
+    /// partial chunk. Defaults to true; turning it off trades that guarantee for one less
+    /// rename per chunk.
+    #[serde(default = "default_true")]
+    pub atomic: bool,
+    /// How hard to work at making a chunk survive a power loss. Defaults to `chunk`, which
+    /// is two fsyncs per message with a sidecar. See [`SpoolFsync`].
+    #[serde(default)]
+    pub fsync: SpoolFsync,
+    /// Name of the producer-completion sentinel file. Defaults to `DONE`.
+    ///
+    /// Production can span several producers — they run one at a time, which
+    /// `producer_file` enforces — so "a producer closed" is not "production finished".
+    /// This file is what says the latter, and only the last producer should write it.
+    #[serde(default = "default_spool_done_file")]
+    pub done_file: String,
+    /// (Sink only) When to create `done_file`, marking production finished for a
+    /// `stop_on_done` consumer. Defaults to `never`. See [`SpoolDone`].
+    ///
+    /// Set it on the *last* producer only. A publisher opening the spool deletes an
+    /// existing sentinel, since it is producing again.
+    #[serde(default)]
+    pub emit_done: SpoolDone,
+    /// Name of the file holding the producer lock, which keeps a second producer out.
+    /// Defaults to `PRODUCER`.
+    ///
+    /// Every instance sharing the directory must agree on this name — that is what makes
+    /// them exclude each other — and it must not collide with the other control files or
+    /// with a chunk name. See [`SpoolClaim`].
+    #[serde(default = "default_spool_producer_file")]
+    pub producer_file: String,
+    /// Name of the file holding the consumer lock, which keeps a second *draining*
+    /// consumer out. Defaults to `CONSUMER`. Same rules as `producer_file`.
+    #[serde(default = "default_spool_consumer_file")]
+    pub consumer_file: String,
+    /// (Source only) Delete each chunk's files once its message is acknowledged. Defaults to
+    /// true — this is what makes the directory a queue rather than a growing archive. With
+    /// it off, chunks are left in place and each is emitted at most once per consumer run.
+    #[serde(default = "default_true")]
+    pub drain_on_read: bool,
+    /// (Source only) End the stream once the directory holds no unread chunks *and*
+    /// `done_file` is present. Defaults to false, which tails the directory indefinitely.
+    ///
+    /// Both halves matter: a producer that finished long ago still has its backlog drained
+    /// first, and a spool that is merely empty keeps the stream open, because another
+    /// producer may still be coming.
+    #[serde(default)]
+    pub stop_on_done: bool,
+    /// (Source only) Idle poll interval in milliseconds when the directory holds no new
+    /// chunks. Defaults to 100.
+    #[serde(default = "default_spool_poll_interval_ms")]
+    pub poll_interval_ms: u64,
+    /// (Source only) Include `mqb.src.spool_*` source positions in each message's metadata.
+    /// Defaults to false.
+    #[serde(default)]
+    pub source_metadata: bool,
+    /// How this endpoint claims its side of the spool against a second instance in the
+    /// same role. Defaults to `exclusive`. See [`SpoolClaim`].
+    #[serde(default)]
+    pub claim: SpoolClaim,
+}
+
+/// How hard a `dir_spool` endpoint works to make its writes survive a power loss.
+///
+/// This is the endpoint's dominant cost. `chunk`, the default, is two fsyncs per message —
+/// the payload and its sidecar — plus one directory fsync per batch, and on a spinning disk
+/// or a conservative SSD that sets the throughput ceiling long before anything in
+/// mq-bridge does. Dropping the sidecar (`metadata_extension: ""`) halves it; `off` removes
+/// it.
+///
+/// Independent of `atomic`, which decides whether a reader can see a half-written chunk,
+/// not whether a crash can lose one. The once-per-run fsyncs — the lock, the sentinel — are
+/// not affected by either.
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum SpoolFsync {
+    /// fsync every chunk file before it is renamed into place, and the directory once per
+    /// batch (default). An acknowledged batch has reached the disk.
+    #[default]
+    Chunk,
+    /// Do not fsync chunks at all, and let the operating system flush when it chooses.
+    ///
+    /// A crash or a power loss can then lose recent chunks *or* leave one present but
+    /// truncated, which a consumer would deliver as a short message — so this trades the
+    /// endpoint's crash-safety claim, not merely its tail. Reasonable when the spool is a
+    /// buffer between two processes on one machine and a reboot means starting over anyway.
+    Off,
+}
+
+/// When a `dir_spool` publisher writes its `done_file`, marking production finished.
+///
+/// The distinction is *how* the route ended, which the publisher learns from
+/// [`DisconnectOutcome`](crate::traits::DisconnectOutcome): every teardown path closes the
+/// publisher, so being closed says nothing on its own.
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum SpoolDone {
+    /// Never write it (default). Something else decides when production is finished.
+    #[default]
+    Never,
+    /// Write it only when the route reached the natural end of its input and every chunk
+    /// this producer accepted was written.
+    ///
+    /// A route that is shut down, that fails, or that reconnects does *not* write it —
+    /// production did not finish, so a `stop_on_done` consumer keeps waiting. Note that a
+    /// continuously running producer never reaches a natural end, so `success` on one only
+    /// ever means "not yet": use `end` there.
+    Success,
+    /// Write it whenever the producer closes, however the route ended — a clean finish, a
+    /// shutdown, or a failure.
+    ///
+    /// This says "nothing more is coming from here", not "everything worked". Use it for a
+    /// consumer that must not wait forever on a producer that may have died, at the price
+    /// of it treating a truncated stream as complete.
+    End,
+}
+
+/// What a `dir_spool` endpoint does when a second instance opens the same directory in the
+/// same role — a second producer writing it, or a second draining consumer emptying it.
+///
+/// Neither is supported by the endpoint's design: two producers seeded from the same
+/// highest sequence number overwrite each other's chunks, and two draining consumers each
+/// deliver every chunk they win the race to read. So each role takes a pid lock on its own
+/// file — `producer_file` or `consumer_file` — created when the endpoint opens and removed
+/// when it closes. A producer and a consumer sharing a directory do not conflict:
+/// that is the whole point of the endpoint.
+///
+/// The locks say "someone is running", not "production is finished" — several producers
+/// may fill one spool in turn, and `done_file` is what marks the end of that.
+///
+/// A lock whose owner is no longer running is broken and retaken, so a crash does not
+/// wedge a restart. That check is by process id, which is only meaningful on the machine
+/// and in the pid namespace that wrote it: a spool shared between hosts or containers can
+/// have a live holder's lock broken by a second starter that cannot see its process.
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum SpoolClaim {
+    /// Refuse to start when the role is already claimed, naming the holder (default).
+    #[default]
+    Exclusive,
+    /// Log a warning and run anyway. For a spool deliberately shared by several
+    /// producers, which needs `{message_id}` in `naming_pattern` to keep names unique.
+    Warn,
+    /// Take no claim and check for none.
+    Off,
 }
 
 // --- Object Store (S3/GCS/Azure) Specific Configuration ---
