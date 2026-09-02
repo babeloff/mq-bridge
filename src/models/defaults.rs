@@ -178,6 +178,10 @@ pub(crate) fn default_spool_metadata_extension() -> String {
     "json".to_string()
 }
 
+pub(crate) fn default_spool_shard_width() -> usize {
+    3
+}
+
 pub(crate) fn default_spool_done_file() -> String {
     "DONE".to_string()
 }

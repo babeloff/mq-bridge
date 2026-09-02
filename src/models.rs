@@ -1027,6 +1027,28 @@ pub struct DirSpoolConfig {
     /// so keep a zero-padded `{seq}` first.
     #[serde(default = "default_spool_naming_pattern")]
     pub naming_pattern: String,
+    /// How many levels of shard subdirectory to spread chunks over. Defaults to 0, which
+    /// writes every chunk straight into `path`.
+    ///
+    /// A flat spool is one directory per stream, and most filesystems degrade long before
+    /// mq-bridge does: 30fps with sidecars is over 200,000 files an hour. Sharding takes the
+    /// leading digits of the sequence number as directory names, so `{seq:09}` with a depth
+    /// of 2 and a width of 3 writes chunk 1 as `000/000/001.bin` and gives every directory
+    /// at most 1000 entries.
+    ///
+    /// Both ends must agree: a consumer only descends as far as its own `shard_depth`. It
+    /// warns when a scan finds subdirectories it is not configured to enter, since the
+    /// alternative is a spool that reads as permanently empty.
+    #[serde(default)]
+    pub shard_depth: usize,
+    /// How many characters of the sequence number each shard level consumes. Defaults to 3,
+    /// giving 1000 entries per level. Ignored when `shard_depth` is 0.
+    ///
+    /// With sharding on, `naming_pattern` must start with a zero-padded `{seq:0N}` wider
+    /// than `shard_depth * shard_width`, so that every chunk shards identically and one
+    /// character is left for the file itself.
+    #[serde(default = "default_spool_shard_width")]
+    pub shard_width: usize,
     /// Extension of the payload file, with or without the leading dot. Defaults to `bin`.
     #[serde(default = "default_spool_payload_extension")]
     pub payload_extension: String,

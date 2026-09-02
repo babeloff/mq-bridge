@@ -32,6 +32,31 @@ async fn close_producer(publisher: &DirSpoolPublisher, outcome: DisconnectOutcom
         .unwrap();
 }
 
+/// Every file under `dir`, as sorted relative paths, so an assertion can name the shape of
+/// a sharded spool.
+fn tree_entries(dir: &std::path::Path) -> Vec<String> {
+    fn walk(root: &std::path::Path, at: &std::path::Path, out: &mut Vec<String>) {
+        for entry in std::fs::read_dir(at).unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            if path.is_dir() {
+                walk(root, &path, out);
+            } else {
+                out.push(
+                    path.strip_prefix(root)
+                        .unwrap()
+                        .to_string_lossy()
+                        .replace('\\', "/"),
+                );
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(dir, dir, &mut out);
+    out.sort();
+    out
+}
+
 /// Drains the consumer until the queue runs out, acking everything it hands out. Under
 /// `stop_on_done` the queue running out is reported as `EndOfStream` rather than as an
 /// empty batch, and both end the drain; the signal is repeatable, so a caller can still
@@ -76,7 +101,9 @@ fn parses_the_documented_yaml_shape() {
         r#"
 dir_spool:
   path: "/tmp/video_telemetry_spool"
-  naming_pattern: "{seq:06d}_{timestamp}"
+  naming_pattern: "{seq:09}_{timestamp}"
+  shard_depth: 2
+  shard_width: 3
   payload_extension: ".h264"
   metadata_extension: ".json"
   atomic: true
@@ -88,7 +115,9 @@ dir_spool:
         panic!("expected a dir_spool endpoint");
     };
     assert_eq!(cfg.path, "/tmp/video_telemetry_spool");
-    assert_eq!(cfg.naming_pattern, "{seq:06d}_{timestamp}");
+    assert_eq!(cfg.naming_pattern, "{seq:09}_{timestamp}");
+    assert_eq!(cfg.shard_depth, 2);
+    assert_eq!(cfg.shard_width, 3);
     // A leading dot is accepted and stripped, so `.h264` and `h264` mean the same thing.
     assert_eq!(cfg.payload_suffix(), "h264");
     assert_eq!(cfg.metadata_suffix(), Some("json"));
@@ -118,6 +147,9 @@ dir_spool:
     };
     assert!(cfg.stop_on_done);
     assert_eq!(cfg.naming_pattern, "{seq:09}");
+    // A flat spool unless asked otherwise, and the default padding is wide enough to shard.
+    assert_eq!(cfg.shard_depth, 0);
+    assert_eq!(cfg.shard_width, 3);
 }
 
 /// `spool` is the short spelling the feature request used; both must reach the same type.
@@ -719,6 +751,293 @@ async fn rejects_a_payload_and_sidecar_sharing_one_extension() {
     assert!(error.contains("must differ"), "unexpected error: {error}");
 }
 
+// --- Sharding ---
+
+#[test]
+fn shard_paths_split_the_leading_sequence_digits() {
+    let sharding = Sharding { depth: 2, width: 3 };
+    assert_eq!(sharding.path_for("000000001"), "000/000/001");
+    assert_eq!(sharding.path_for("000001234"), "000/001/234");
+    assert_eq!(sharding.path_for("001000000"), "001/000/000");
+    // A suffix after the sequence rides along on the file name.
+    assert_eq!(
+        sharding.path_for("000000001_1700000000000"),
+        "000/000/001_1700000000000"
+    );
+    // Too short to shard: returned whole, so no caller can build a path out of the spool.
+    assert_eq!(sharding.path_for("00001"), "00001");
+}
+
+/// The point of the feature: 30fps with sidecars is over 200,000 files an hour, and one
+/// directory does not hold that well. Sharding spreads them without changing queue order.
+#[tokio::test]
+async fn shards_chunks_into_subdirectories_and_reads_them_back_in_order() {
+    let dir = tempdir().unwrap();
+    let mut cfg = config(dir.path());
+    cfg.shard_depth = 2;
+    cfg.shard_width = 3;
+
+    let publisher = DirSpoolPublisher::new(&cfg).await.unwrap();
+    publisher
+        .send_batch(vec![message("first", "x"), message("second", "x")])
+        .await
+        .unwrap();
+
+    assert_eq!(
+        tree_entries(dir.path())
+            .into_iter()
+            .filter(|name| name.ends_with(".bin"))
+            .collect::<Vec<_>>(),
+        vec!["000/000/000.bin", "000/000/001.bin"],
+        "chunk 1 must land at 000/000/001, and its sidecar beside it"
+    );
+    assert!(dir.path().join("000/000/001.json").exists());
+
+    let mut consumer = DirSpoolConsumer::new(&cfg).await.unwrap();
+    let received = drain(&mut consumer, 10).await;
+    let payloads: Vec<String> = received
+        .iter()
+        .map(|m| String::from_utf8(m.payload.to_vec()).unwrap())
+        .collect();
+    assert_eq!(payloads, vec!["first", "second"]);
+}
+
+/// Queue order has to survive a shard boundary, which is where a per-directory listing
+/// would silently start delivering out of order.
+#[tokio::test]
+async fn keeps_queue_order_across_shard_boundaries() {
+    let dir = tempdir().unwrap();
+    let mut cfg = config(dir.path());
+    // Three digits over two single-character levels, so the boundary falls at chunk 10.
+    cfg.naming_pattern = "{seq:03}".to_string();
+    cfg.shard_depth = 2;
+    cfg.shard_width = 1;
+    cfg.source_metadata = true;
+
+    let publisher = DirSpoolPublisher::new(&cfg).await.unwrap();
+    for index in 0..23 {
+        publisher
+            .send_batch(vec![message(&format!("chunk-{index}"), "seq")])
+            .await
+            .unwrap();
+    }
+    // Spread over three leaf shards, none of which holds more than ten chunks.
+    assert!(dir.path().join("0/0/9.bin").exists());
+    assert!(dir.path().join("0/1/0.bin").exists());
+    assert!(dir.path().join("0/2/2.bin").exists());
+
+    let mut consumer = DirSpoolConsumer::new(&cfg).await.unwrap();
+    // A batch size below the shard size forces the walk to resume mid-tree.
+    let received = drain(&mut consumer, 4).await;
+    let payloads: Vec<String> = received
+        .iter()
+        .map(|m| String::from_utf8(m.payload.to_vec()).unwrap())
+        .collect();
+    let expected: Vec<String> = (0..23).map(|index| format!("chunk-{index}")).collect();
+    assert_eq!(payloads, expected);
+    assert_eq!(
+        received[10].metadata.get(SRC_CHUNK_KEY).unwrap(),
+        "0/1/0",
+        "the chunk's recorded identity is its path relative to the spool"
+    );
+    // Draining prunes the shards it empties, so the spool does not accumulate directories.
+    assert!(
+        tree_entries(dir.path())
+            .iter()
+            .all(|name| !name.ends_with(".bin")),
+        "holds {:?}",
+        tree_entries(dir.path())
+    );
+    assert!(!dir.path().join("0/0").exists(), "an emptied shard must go");
+    assert!(!dir.path().join("0").exists());
+}
+
+/// A restarted producer has to find the highest chunk in the tree, not just the root.
+#[tokio::test]
+async fn resumes_the_sequence_across_shards_after_a_restart() {
+    let dir = tempdir().unwrap();
+    let mut cfg = config(dir.path());
+    cfg.naming_pattern = "{seq:03}".to_string();
+    cfg.shard_depth = 2;
+    cfg.shard_width = 1;
+
+    let first = DirSpoolPublisher::new(&cfg).await.unwrap();
+    for index in 0..12 {
+        first
+            .send_batch(vec![message(&format!("a-{index}"), "x")])
+            .await
+            .unwrap();
+    }
+    drop(first);
+
+    let second = DirSpoolPublisher::new(&cfg).await.unwrap();
+    second.send_batch(vec![message("b", "x")]).await.unwrap();
+    // Chunk 12 follows chunk 11 rather than overwriting the head of the queue.
+    assert!(dir.path().join("0/1/2.bin").exists());
+    drop(second);
+
+    let mut consumer = DirSpoolConsumer::new(&cfg).await.unwrap();
+    let received = drain(&mut consumer, 100).await;
+    assert_eq!(received.len(), 13);
+    assert_eq!(&received[12].payload[..], b"b");
+}
+
+/// A producer writing into a shard the consumer prunes at the same moment must not lose the
+/// message: the directory is simply re-created.
+#[tokio::test]
+async fn a_pruned_shard_is_recreated_by_the_next_write() {
+    let dir = tempdir().unwrap();
+    let mut cfg = config(dir.path());
+    cfg.naming_pattern = "{seq:03}".to_string();
+    cfg.shard_depth = 2;
+    cfg.shard_width = 1;
+
+    let publisher = DirSpoolPublisher::new(&cfg).await.unwrap();
+    publisher
+        .send_batch(vec![message("one", "x")])
+        .await
+        .unwrap();
+    let mut consumer = DirSpoolConsumer::new(&cfg).await.unwrap();
+    assert_eq!(drain(&mut consumer, 10).await.len(), 1);
+    assert!(!dir.path().join("0/0").exists(), "the shard was pruned");
+
+    // Same publisher, same shard, now missing.
+    publisher
+        .send_batch(vec![message("two", "x")])
+        .await
+        .unwrap();
+    assert!(dir.path().join("0/0/1.bin").exists());
+    let received = drain(&mut consumer, 10).await;
+    assert_eq!(&received[0].payload[..], b"two");
+}
+
+/// A consumer that does not know the spool is sharded would otherwise read it as
+/// permanently empty, so it says so.
+#[tokio::test]
+async fn a_consumer_without_the_shard_depth_finds_nothing_and_warns() {
+    let dir = tempdir().unwrap();
+    let mut producer_cfg = config(dir.path());
+    producer_cfg.shard_depth = 2;
+    let publisher = DirSpoolPublisher::new(&producer_cfg).await.unwrap();
+    publisher
+        .send_batch(vec![message("hidden", "x")])
+        .await
+        .unwrap();
+
+    // The default depth is 0: the chunk is real but out of reach, which is a
+    // misconfiguration the log names (see `refill_ready`).
+    let mut consumer = DirSpoolConsumer::new(&config(dir.path())).await.unwrap();
+    let batch = consumer.receive_batch(10).await.unwrap();
+    assert!(batch.messages.is_empty());
+}
+
+/// The route path with sharding on: a chunk's identity now contains a separator, and it
+/// travels through the batch commit and the source metadata.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_route_drains_a_sharded_spool() {
+    use crate::models::{Endpoint, EndpointType, FileConfig, FileFormat};
+    use crate::route::Route;
+
+    let dir = tempdir().unwrap();
+    let spool = dir.path().join("spool");
+    let sink = dir.path().join("out.jsonl");
+
+    let mut producer_cfg = DirSpoolConfig::new(spool.to_str().unwrap());
+    producer_cfg.naming_pattern = "{seq:03}".to_string();
+    producer_cfg.shard_depth = 2;
+    producer_cfg.shard_width = 1;
+    producer_cfg.emit_done = SpoolDone::Success;
+    let producer = DirSpoolPublisher::new(&producer_cfg).await.unwrap();
+    for index in 0..15 {
+        producer
+            .send_batch(vec![message(&format!("{index}"), "frame")])
+            .await
+            .unwrap();
+    }
+    close_producer(&producer, DisconnectOutcome::Completed).await;
+    drop(producer);
+
+    let mut consumer_cfg = DirSpoolConfig::new(spool.to_str().unwrap());
+    consumer_cfg.naming_pattern = "{seq:03}".to_string();
+    consumer_cfg.shard_depth = 2;
+    consumer_cfg.shard_width = 1;
+    consumer_cfg.stop_on_done = true;
+    let route = Route::new(
+        Endpoint::new(EndpointType::DirSpool(consumer_cfg)),
+        Endpoint::new(EndpointType::File(FileConfig {
+            path: sink.to_str().unwrap().to_string(),
+            format: FileFormat::Raw,
+            ..Default::default()
+        })),
+    )
+    .with_concurrency(4)
+    .with_batch_size(2);
+
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        route.run_until_err("sharded_spool_drain", None, None),
+    )
+    .await
+    .expect("the route should end once DONE is reached and the queue is empty")
+    .expect("the route should complete without errors");
+
+    let written = tokio::fs::read_to_string(&sink).await.unwrap();
+    let lines: Vec<&str> = written.lines().collect();
+    let expected: Vec<String> = (0..15).map(|index| index.to_string()).collect();
+    assert_eq!(lines, expected, "a sharded spool must drain in queue order");
+    // Chunks gone, shards pruned, only the sentinel left.
+    assert_eq!(tree_entries(&spool), vec!["DONE".to_string()]);
+}
+
+/// Sharding cuts the directory names out of the front of every rendered name, so a pattern
+/// that does not start with a wide enough fixed-width sequence cannot be sharded.
+#[tokio::test]
+async fn rejects_sharding_a_pattern_it_cannot_split() {
+    let dir = tempdir().unwrap();
+
+    let cases: Vec<(DirSpoolConfig, &str)> = vec![
+        {
+            // Variable width: chunk 999 and chunk 1000 would shard to different depths.
+            let mut cfg = config(dir.path());
+            cfg.naming_pattern = "{seq}".to_string();
+            cfg.shard_depth = 1;
+            (cfg, "must start with a zero-padded sequence")
+        },
+        {
+            let mut cfg = config(dir.path());
+            cfg.naming_pattern = "{timestamp}_{seq:09}".to_string();
+            cfg.shard_depth = 1;
+            (cfg, "must start with a zero-padded sequence")
+        },
+        {
+            // Nine digits, but three levels of three take all of them.
+            let mut cfg = config(dir.path());
+            cfg.shard_depth = 3;
+            cfg.shard_width = 3;
+            (cfg, "at least one has to be left for the file name")
+        },
+        {
+            let mut cfg = config(dir.path());
+            cfg.shard_depth = 2;
+            cfg.shard_width = 0;
+            (cfg, "'shard_width' must be at least 1")
+        },
+    ];
+
+    for (cfg, expected) in cases {
+        for error in [
+            DirSpoolPublisher::new(&cfg).await.unwrap_err().to_string(),
+            DirSpoolConsumer::new(&cfg).await.unwrap_err().to_string(),
+        ] {
+            assert!(
+                error.contains(expected),
+                "expected an error mentioning {expected:?}, got: {error}"
+            );
+        }
+    }
+    assert!(tree_entries(dir.path()).is_empty());
+}
+
 // --- Claims ---
 
 #[tokio::test]
@@ -945,6 +1264,14 @@ async fn rejects_control_file_names_that_would_collide() {
             let mut cfg = config(dir.path());
             cfg.consumer_file = String::new();
             (cfg, "must not be empty")
+        },
+        {
+            // One name cannot be both a shard directory and the sentinel.
+            let mut cfg = config(dir.path());
+            cfg.shard_depth = 2;
+            cfg.shard_width = 3;
+            cfg.done_file = "000".to_string();
+            (cfg, "shape of a shard directory")
         },
     ];
 

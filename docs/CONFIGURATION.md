@@ -440,6 +440,8 @@ opaque blobs, where the delimiter framing and the single append point both get i
 |---|---|---|---|
 | `path` | both | — | Spool directory. Created if missing. |
 | `naming_pattern` | sink | `{seq:09}` | Chunk name without extension. Supports `{seq}`, `{seq:06}` / `{seq:06d}`, `{timestamp}` (unix millis) and `{message_id}`. |
+| `shard_depth` | both | `0` | Levels of shard subdirectory to spread chunks over. 0 writes every chunk straight into `path`. |
+| `shard_width` | both | `3` | Characters of the sequence number each shard level consumes. Ignored when `shard_depth` is 0. |
 | `payload_extension` | both | `bin` | Extension of the payload file, with or without the leading dot. |
 | `metadata_extension` | both | `json` | Extension of the metadata sidecar. Empty string writes and expects payload files only. |
 | `atomic` | sink | `true` | Write to `.tmp` and rename on completion. |
@@ -529,6 +531,33 @@ nothing, so several of them over one spool each see every chunk once and none of
 a lock — though each will warn if a draining consumer holds the directory, because that one
 deletes chunks out from under it.
 
+##### Sharding
+A flat spool is one directory per stream, and most filesystems degrade long before mq-bridge
+does — 30fps with sidecars is over 200,000 files an hour. `shard_depth` spreads chunks over
+subdirectories named from the leading digits of the sequence number, so with the default
+`{seq:09}`, `shard_depth: 2` and `shard_width: 3`, chunk 1 is written as `000/000/001.bin`
+(its sidecar beside it) and no directory ever holds more than 1000 entries.
+
+Queue order is unaffected: lexical order over the whole relative path is still sequence
+order, and a chunk's recorded identity (`mqb.src.spool_chunk`) becomes that path. Sharding
+also makes a large backlog cheaper to read, not just to store — the consumer walks shards in
+order and stops as soon as its listing is full, so it reads the leading shards rather than
+the whole tree, and a drained shard directory is pruned as it empties.
+
+Three things to get right:
+
+- **`naming_pattern` must start with a zero-padded `{seq:0N}`** wider than
+  `shard_depth * shard_width`. The directory names are cut from the front of every rendered
+  name, so that front has to be a fixed width — otherwise chunk 999 and chunk 1000 would
+  shard to different depths and lexical order would stop being queue order. A pattern that
+  cannot be split is rejected at startup, as is one with no room left for the file name.
+- **Both ends must agree on `shard_depth`.** A consumer only descends as far as its own
+  setting, so one left at `0` against a sharded spool reads it as permanently empty (and
+  under `stop_on_done`, ends the stream immediately). It warns when a scan finds
+  subdirectories it is not configured to enter, which is what that mistake looks like.
+- **A control file cannot be shaped like a shard.** `done_file: "000"` with
+  `shard_width: 3` is rejected, since one name cannot be both the sentinel and a directory.
+
 A directory scan keeps up to 65,536 chunk names for the batches that follow, so draining a
 backlog costs one scan per that many messages rather than one per batch. Two consequences
 are visible from outside: chunks that arrive while a listing is still being served are
@@ -548,7 +577,11 @@ frame_capture:
   output:
     dir_spool:
       path: "/tmp/video_telemetry_spool"
-      naming_pattern: "{seq:06d}_{timestamp}"
+      naming_pattern: "{seq:09}_{timestamp}"
+      # 30fps fills a flat directory fast: two levels of three digits keep every
+      # directory under 1000 entries. The consumer needs the same shard_depth.
+      shard_depth: 2
+      shard_width: 3
       payload_extension: ".h264"
       metadata_extension: ".json"
       emit_done: success
@@ -558,6 +591,8 @@ frame_ingest:
   input:
     dir_spool:
       path: "/tmp/video_telemetry_spool"
+      shard_depth: 2
+      shard_width: 3
       payload_extension: ".h264"
       drain_on_read: true
       stop_on_done: true

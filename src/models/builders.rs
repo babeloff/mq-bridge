@@ -302,6 +302,8 @@ impl DirSpoolConfig {
         Self {
             path: path.into(),
             naming_pattern: default_spool_naming_pattern(),
+            shard_depth: 0,
+            shard_width: default_spool_shard_width(),
             payload_extension: default_spool_payload_extension(),
             metadata_extension: default_spool_metadata_extension(),
             atomic: true,

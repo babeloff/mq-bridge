@@ -622,6 +622,20 @@
           "type": "string",
           "default": "PRODUCER"
         },
+        "shard_depth": {
+          "description": "How many levels of shard subdirectory to spread chunks over. Defaults to 0, which\nwrites every chunk straight into `path`.\n\nA flat spool is one directory per stream, and most filesystems degrade long before\nmq-bridge does: 30fps with sidecars is over 200,000 files an hour. Sharding takes the\nleading digits of the sequence number as directory names, so `{seq:09}` with a depth\nof 2 and a width of 3 writes chunk 1 as `000/000/001.bin` and gives every directory\nat most 1000 entries.\n\nBoth ends must agree: a consumer only descends as far as its own `shard_depth`. It\nwarns when a scan finds subdirectories it is not configured to enter, since the\nalternative is a spool that reads as permanently empty.",
+          "type": "integer",
+          "format": "uint",
+          "default": 0,
+          "minimum": 0
+        },
+        "shard_width": {
+          "description": "How many characters of the sequence number each shard level consumes. Defaults to 3,\ngiving 1000 entries per level. Ignored when `shard_depth` is 0.\n\nWith sharding on, `naming_pattern` must start with a zero-padded `{seq:0N}` wider\nthan `shard_depth * shard_width`, so that every chunk shards identically and one\ncharacter is left for the file itself.",
+          "type": "integer",
+          "format": "uint",
+          "default": 3,
+          "minimum": 0
+        },
         "source_metadata": {
           "description": "(Source only) Include `mqb.src.spool_*` source positions in each message's metadata.\nDefaults to false.",
           "type": "boolean",

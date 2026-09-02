@@ -122,9 +122,130 @@ fn render_placeholder(token: &str, seq: u64, message_id: u128) -> Option<String>
 
 /// The leading run of digits in `name`, which is the chunk's sequence number under any
 /// pattern that keeps `{seq}` first. Used to resume numbering after a restart.
+///
+/// Takes the chunk's whole relative path, with the shard separators stripped: sharding moves
+/// the leading digits of the sequence into directory names, so `000/001/234` is chunk 1234
+/// and its file name alone would read as 234.
 fn leading_sequence(name: &str) -> Option<u64> {
-    let digits: String = name.chars().take_while(char::is_ascii_digit).collect();
+    let digits: String = name
+        .chars()
+        .filter(|c| *c != '/')
+        .take_while(char::is_ascii_digit)
+        .collect();
     (!digits.is_empty()).then(|| digits.parse().ok()).flatten()
+}
+
+/// A chunk's identity: its path relative to the spool root, which is the file's base name
+/// in a flat spool and `shard/.../name` in a sharded one.
+fn join_base(prefix: &str, stem: &str) -> String {
+    if prefix.is_empty() {
+        stem.to_string()
+    } else {
+        format!("{prefix}/{stem}")
+    }
+}
+
+// --- Sharding ---
+
+/// How chunks are spread over subdirectories, so that no one directory holds a stream's
+/// worth of files.
+///
+/// The leading characters of the rendered name — which the pattern guarantees are sequence
+/// digits — become directory names, and the rest names the file: depth 2 width 3 turns
+/// `000000001` into `000/000/001`. Lexical order over the whole relative path is unchanged,
+/// so it is still queue order, and every directory holds at most `10^width` entries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Sharding {
+    depth: usize,
+    width: usize,
+}
+
+impl Sharding {
+    /// The configured sharding, or `None` when chunks go straight into the spool.
+    fn from_config(config: &DirSpoolConfig) -> Option<Self> {
+        (config.shard_depth > 0 && config.shard_width > 0).then_some(Self {
+            depth: config.shard_depth,
+            width: config.shard_width,
+        })
+    }
+
+    /// How many leading characters of a name the directories consume.
+    const fn prefix_len(self) -> usize {
+        self.depth * self.width
+    }
+
+    /// Splits `name` into its shard path, e.g. `000000001` -> `000/000/001`.
+    ///
+    /// A name too short to shard is returned unchanged. The pattern check in
+    /// [`validate_sharding`] is what keeps that from happening for real chunks; here it only
+    /// means a caller cannot produce a path outside the spool.
+    fn path_for(self, name: &str) -> String {
+        if name.len() <= self.prefix_len() {
+            return name.to_string();
+        }
+        let mut out = String::with_capacity(name.len() + self.depth);
+        for level in 0..self.depth {
+            out.push_str(&name[level * self.width..(level + 1) * self.width]);
+            out.push('/');
+        }
+        out.push_str(&name[self.prefix_len()..]);
+        out
+    }
+}
+
+/// Checks that `naming_pattern` can be sharded as configured.
+///
+/// Sharding cuts the directory names out of the front of every rendered name, so that front
+/// has to be the same width for every chunk — otherwise chunk 999 and chunk 1000 would land
+/// at different depths and lexical order would stop being queue order. A zero-padded `{seq}`
+/// at the start of the pattern is what guarantees it, and it has to be wide enough to leave
+/// at least one character for the file itself.
+fn validate_sharding(config: &DirSpoolConfig) -> anyhow::Result<()> {
+    let Some(sharding) = Sharding::from_config(config) else {
+        // `shard_width: 0` with a depth set is a mistake worth naming rather than ignoring.
+        if config.shard_depth > 0 {
+            return Err(anyhow::anyhow!(
+                "dir_spool 'shard_width' must be at least 1 when 'shard_depth' is set"
+            ));
+        }
+        return Ok(());
+    };
+    let seq_width = leading_seq_width(&config.naming_pattern).ok_or_else(|| {
+        anyhow::anyhow!(
+            "dir_spool 'naming_pattern' must start with a zero-padded sequence, like \
+             '{{seq:09}}', to be sharded; '{}' does not, so its chunks would not all shard \
+             to the same depth",
+            config.naming_pattern
+        )
+    })?;
+    if seq_width <= sharding.prefix_len() {
+        return Err(anyhow::anyhow!(
+            "dir_spool 'naming_pattern' pads the sequence to {seq_width} digits, but \
+             'shard_depth' {} x 'shard_width' {} takes {} of them and at least one has to be \
+             left for the file name. Widen the padding or shard less deeply.",
+            sharding.depth,
+            sharding.width,
+            sharding.prefix_len()
+        ));
+    }
+    Ok(())
+}
+
+/// The padded width of a `{seq:0N}` placeholder at the very start of `pattern`, or `None`
+/// when the pattern does not start with one.
+fn leading_seq_width(pattern: &str) -> Option<usize> {
+    let token = pattern.strip_prefix('{')?;
+    let close = token.find('}')?;
+    let (name, spec) = token[..close].split_once(':')?;
+    if name != "seq" {
+        return None;
+    }
+    let width: usize = spec
+        .trim_end_matches('d')
+        .trim_start_matches('0')
+        .parse()
+        .ok()?;
+    (width > 0).then_some(width)
 }
 
 /// Strips `.<suffix>` from `name`, returning the chunk's base name.
@@ -174,6 +295,14 @@ async fn write_chunk_file(path: &Path, body: &[u8], atomic: bool) -> anyhow::Res
             .with_context(|| format!("Failed to finalize dir_spool chunk {}", path.display()))?;
     }
     Ok(())
+}
+
+/// Whether `error` is the missing shard directory a concurrent prune leaves behind.
+fn shard_dir_vanished(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .filter_map(|cause| cause.downcast_ref::<std::io::Error>())
+        .any(|io| io.kind() == std::io::ErrorKind::NotFound)
 }
 
 /// fsyncs the directory so a rename is durable. Best effort: Windows cannot open a
@@ -263,6 +392,17 @@ pub(crate) fn validate_control_files(config: &DirSpoolConfig) -> anyhow::Result<
                 "dir_spool '{field}' is '{name}', which ends in '{STAGING_SUFFIX}' and so \
                  looks like a chunk that is still being written"
             ));
+        }
+        // A shard directory is `shard_width` digits, and one name cannot be both a file and
+        // a directory: the sentinel would make the shard uncreatable, mid-production.
+        if let Some(sharding) = Sharding::from_config(config) {
+            if name.len() == sharding.width && name.chars().all(|c| c.is_ascii_digit()) {
+                return Err(anyhow::anyhow!(
+                    "dir_spool '{field}' is '{name}', which is exactly the shape of a shard \
+                     directory ({} digits) and would collide with one",
+                    sharding.width
+                ));
+            }
         }
     }
     // Case-insensitively, because on Windows and macOS `DONE` and `done` are one file.
@@ -435,6 +575,7 @@ fn acquire_lock(
 pub struct DirSpoolPublisher {
     dir: PathBuf,
     naming_pattern: String,
+    sharding: Option<Sharding>,
     payload_suffix: String,
     metadata_suffix: Option<String>,
     atomic: bool,
@@ -474,16 +615,18 @@ impl DirSpoolPublisher {
             ));
         }
         validate_control_files(config)?;
+        validate_sharding(config)?;
         // Locked before the directory is touched, so a second producer cannot be what
         // clears the sentinel below or reseeds this one's sequence.
         let lock = acquire_lock(&dir, SpoolRole::Producer, config)?;
         clear_done(&dir, &config.done_file).await;
-        let next_seq = highest_sequence(&dir, &payload_suffix)
+        let next_seq = highest_sequence(&dir, &payload_suffix, Sharding::from_config(config))
             .await?
             .map_or(0, |high| high + 1);
         Ok(Self {
             dir,
             naming_pattern: config.naming_pattern.clone(),
+            sharding: Sharding::from_config(config),
             payload_suffix,
             metadata_suffix: config.metadata_suffix().map(str::to_string),
             atomic: config.atomic,
@@ -499,20 +642,67 @@ impl DirSpoolPublisher {
     /// consumer that keys off the payload file always finds the metadata already there.
     async fn write_chunk(&self, message: &CanonicalMessage) -> anyhow::Result<String> {
         let seq = self.seq.fetch_add(1, Ordering::Relaxed);
-        let base = render_name(&self.naming_pattern, seq, message.message_id);
-        if let Some(suffix) = &self.metadata_suffix {
-            let sidecar = serde_json::to_vec(&SidecarView {
-                message_id: crate::canonical_message::format_message_id(message.message_id),
-                metadata: &message.metadata,
-            })
-            .context("Failed to encode dir_spool metadata sidecar")?;
-            let path = self.dir.join(format!("{base}.{suffix}"));
-            write_chunk_file(&path, &sidecar, self.atomic).await?;
+        let name = render_name(&self.naming_pattern, seq, message.message_id);
+        let base = match self.sharding {
+            Some(sharding) => sharding.path_for(&name),
+            None => name,
+        };
+        let sidecar = match &self.metadata_suffix {
+            Some(suffix) => Some((
+                suffix.clone(),
+                serde_json::to_vec(&SidecarView {
+                    message_id: crate::canonical_message::format_message_id(message.message_id),
+                    metadata: &message.metadata,
+                })
+                .context("Failed to encode dir_spool metadata sidecar")?,
+            )),
+            None => None,
+        };
+        // Two attempts: the consumer prunes a shard directory as it empties, so one can go
+        // away between this producer creating it and writing into it. Retrying re-creates it.
+        for attempt in 0..2 {
+            self.ensure_shard_dir(&base).await?;
+            match self
+                .write_chunk_files(&base, sidecar.as_ref(), message)
+                .await
+            {
+                Ok(()) => break,
+                Err(error) if attempt == 0 && shard_dir_vanished(&error) => {
+                    debug!(chunk = %base, "dir_spool shard directory vanished mid-write; recreating");
+                }
+                Err(error) => return Err(error),
+            }
         }
-        let payload_path = self.dir.join(format!("{base}.{}", self.payload_suffix));
-        write_chunk_file(&payload_path, &message.payload, self.atomic).await?;
         trace!(chunk = %base, bytes = message.payload.len(), "dir_spool chunk written");
         Ok(base)
+    }
+
+    /// Creates the shard directory `base` lands in, when it is not the spool root itself.
+    async fn ensure_shard_dir(&self, base: &str) -> anyhow::Result<()> {
+        let Some((shard, _)) = base.rsplit_once('/') else {
+            return Ok(());
+        };
+        let path = self.dir.join(shard);
+        fs::create_dir_all(&path)
+            .await
+            .with_context(|| format!("Failed to create dir_spool shard {}", path.display()))
+    }
+
+    /// Writes the sidecar and then the payload. The sidecar is renamed into place *before*
+    /// the payload, so a consumer that keys off the payload file always finds the metadata
+    /// already there.
+    async fn write_chunk_files(
+        &self,
+        base: &str,
+        sidecar: Option<&(String, Vec<u8>)>,
+        message: &CanonicalMessage,
+    ) -> anyhow::Result<()> {
+        if let Some((suffix, body)) = sidecar {
+            let path = self.dir.join(format!("{base}.{suffix}"));
+            write_chunk_file(&path, body, self.atomic).await?;
+        }
+        let payload_path = self.dir.join(format!("{base}.{}", self.payload_suffix));
+        write_chunk_file(&payload_path, &message.payload, self.atomic).await
     }
 
     /// Creates the production-completion sentinel. Idempotent: an existing sentinel is
@@ -693,6 +883,7 @@ impl MessagePublisher for DirSpoolPublisher {
 pub struct DirSpoolConsumer {
     dir: PathBuf,
     path: String,
+    sharding: Option<Sharding>,
     payload_suffix: String,
     metadata_suffix: Option<String>,
     done_file: String,
@@ -745,6 +936,7 @@ impl DirSpoolConsumer {
             ));
         }
         validate_control_files(config)?;
+        validate_sharding(config)?;
         let lock = if config.drain_on_read {
             acquire_lock(&dir, SpoolRole::Consumer, config)?
         } else {
@@ -754,6 +946,7 @@ impl DirSpoolConsumer {
         Ok(Self {
             dir,
             path: config.path.clone(),
+            sharding: Sharding::from_config(config),
             done_file: config.done_file.clone(),
             payload_suffix,
             metadata_suffix: config.metadata_suffix().map(str::to_string),
@@ -784,12 +977,17 @@ impl DirSpoolConsumer {
         Ok(self.ready.drain(..take).collect())
     }
 
-    /// Walks the directory and rebuilds the cached listing.
+    /// Walks the spool and rebuilds the cached listing.
     ///
-    /// Only the lexically smallest `capacity` names are kept, in a max-heap that evicts as
-    /// it goes, so the cost is one pass and bounded memory even for a directory holding
-    /// millions of chunks — the old code collected and sorted every name to then discard
-    /// all but a batch's worth.
+    /// Within one directory only the lexically smallest names are kept, in a max-heap that
+    /// evicts as it goes, so a directory holding millions of chunks costs one pass and
+    /// bounded memory rather than a sort of every name to then discard all but a batch's
+    /// worth.
+    ///
+    /// With sharding on, the shard directories are visited in order and only until the
+    /// cache is full: every name under `000/` sorts before every name under `001/`, so the
+    /// leading shards are the only ones that have to be read. That is what keeps a refill
+    /// cheap on a spool far too large to list — the reason sharding exists.
     async fn refill_ready(&mut self, limit: usize) -> anyhow::Result<()> {
         let capacity = limit.max(READY_CACHE_CAPACITY);
         // Snapshot rather than lock per entry: the guard must not be held across the
@@ -801,35 +999,100 @@ impl DirSpoolConsumer {
             .lock()
             .expect("dir_spool claim set poisoned")
             .clone();
-        let mut entries = fs::read_dir(&self.dir)
-            .await
-            .with_context(|| format!("Failed to list dir_spool directory: {}", self.path))?;
+        let depth = self.sharding.map_or(0, |sharding| sharding.depth);
+        let mut collected: Vec<String> = Vec::new();
+        // Explicit stack rather than recursion, which an async fn cannot do without boxing.
+        // Children are pushed in reverse so the smallest is popped first.
+        let mut pending = vec![(self.dir.clone(), String::new(), depth)];
+        let mut skipped_dirs = 0usize;
+        while let Some((path, prefix, depth_left)) = pending.pop() {
+            if collected.len() >= capacity {
+                break;
+            }
+            let (chunks, shards) = self
+                .scan_one_directory(&path, &prefix, capacity - collected.len(), &claimed)
+                .await?;
+            // This level's chunks first, then its subdirectories. A properly sharded spool
+            // holds chunks only at the leaves, so the two never interleave in practice.
+            collected.extend(chunks);
+            if depth_left == 0 {
+                skipped_dirs += shards.len();
+                continue;
+            }
+            for shard in shards.into_iter().rev() {
+                let child = path.join(&shard);
+                let child_prefix = join_base(&prefix, &shard);
+                pending.push((child, child_prefix, depth_left - 1));
+            }
+        }
+        // A consumer pointed at a sharded spool without being told the depth would otherwise
+        // report an empty queue forever — and under `stop_on_done`, end the stream at once.
+        if collected.is_empty() && skipped_dirs > 0 {
+            warn!(
+                path = %self.path,
+                subdirectories = skipped_dirs,
+                shard_depth = depth,
+                "dir_spool found no chunks but did find subdirectories it is not configured to enter; is 'shard_depth' set to match the producer?"
+            );
+        }
+        self.ready = collected.into();
+        Ok(())
+    }
+
+    /// Reads one directory, returning its unclaimed chunk paths in queue order (at most
+    /// `capacity` of them) and the names of its subdirectories, also in order.
+    async fn scan_one_directory(
+        &mut self,
+        path: &Path,
+        prefix: &str,
+        capacity: usize,
+        claimed: &HashSet<String>,
+    ) -> anyhow::Result<(Vec<String>, Vec<String>)> {
+        let mut entries = match fs::read_dir(path).await {
+            Ok(entries) => entries,
+            // A shard the consumer emptied and pruned, or one a producer has not created
+            // yet: not an error, just nothing to read.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok((Vec::new(), Vec::new()))
+            }
+            Err(error) => {
+                return Err(anyhow::Error::new(error).context(format!(
+                    "Failed to list dir_spool directory: {}",
+                    path.display()
+                )))
+            }
+        };
         self.scans += 1;
         let mut smallest: BinaryHeap<String> = BinaryHeap::new();
+        let mut shards: Vec<String> = Vec::new();
         while let Some(entry) = entries
             .next_entry()
             .await
-            .with_context(|| format!("Failed to walk dir_spool directory: {}", self.path))?
+            .with_context(|| format!("Failed to walk dir_spool directory: {}", path.display()))?
         {
             let name = entry.file_name().to_string_lossy().into_owned();
             // `.tmp` files are mid-write, and every other extension (the sidecar, the
-            // sentinel) is not itself a chunk.
-            let Some(base) = chunk_base(&name, &self.payload_suffix) else {
+            // sentinel, a lock) is not itself a chunk.
+            let Some(stem) = chunk_base(&name, &self.payload_suffix) else {
+                if entry.file_type().await.is_ok_and(|kind| kind.is_dir()) {
+                    shards.push(name);
+                }
                 continue;
             };
-            if claimed.contains(base) {
+            let base = join_base(prefix, stem);
+            if claimed.contains(&base) {
                 continue;
             }
             if smallest.len() < capacity {
-                smallest.push(base.to_string());
-            } else if smallest.peek().is_some_and(|worst| base < worst.as_str()) {
+                smallest.push(base);
+            } else if smallest.peek().is_some_and(|worst| &base < worst) {
                 smallest.pop();
-                smallest.push(base.to_string());
+                smallest.push(base);
             }
         }
+        shards.sort_unstable();
         // Lexical order is queue order — that is the contract `naming_pattern` documents.
-        self.ready = smallest.into_sorted_vec().into();
-        Ok(())
+        Ok((smallest.into_sorted_vec(), shards))
     }
 
     /// Folds the chunks a nack released back into the cached listing, so a redelivery does
@@ -991,7 +1254,30 @@ async fn remove_chunk(
     if let Some(suffix) = metadata_suffix {
         remove_file(&dir.join(format!("{base}.{suffix}"))).await;
     }
+    prune_shard_dirs(dir, base).await;
     true
+}
+
+/// Removes the shard directories `base` lived in, innermost first, for as long as they are
+/// empty.
+///
+/// Silent and best effort: `remove_dir` fails with `ENOTEMPTY` for every shard that still
+/// holds chunks, which is the common case and not worth a log line, and a producer that is
+/// about to write into the shard we just removed re-creates it. Never touches the spool root
+/// itself — that is the operator's directory, not ours.
+async fn prune_shard_dirs(dir: &Path, base: &str) {
+    let Some((shard, _)) = base.rsplit_once('/') else {
+        return;
+    };
+    let mut levels: Vec<&str> = shard.split('/').collect();
+    while !levels.is_empty() {
+        let path = dir.join(levels.join("/"));
+        if fs::remove_dir(&path).await.is_err() {
+            return;
+        }
+        trace!(path = %path.display(), "dir_spool pruned an empty shard directory");
+        levels.pop();
+    }
 }
 
 /// Deletes `path`, treating an already-absent file as success. Returns whether it is gone.
@@ -1115,21 +1401,62 @@ impl MessageConsumer for DirSpoolConsumer {
 
 /// The highest sequence number among the finalized chunks in `dir`, or `None` when it holds
 /// no chunk this publisher would have written.
-async fn highest_sequence(dir: &Path, payload_suffix: &str) -> anyhow::Result<Option<u64>> {
-    let mut entries = fs::read_dir(dir)
-        .await
-        .with_context(|| format!("Failed to list dir_spool directory: {}", dir.display()))?;
-    let mut highest = None;
-    while let Some(entry) = entries.next_entry().await? {
-        let name = entry.file_name().to_string_lossy().into_owned();
-        let Some(base) = chunk_base(&name, payload_suffix) else {
-            continue;
+///
+/// Walks the shard tree greatest-first and stops at the first chunk it finds: lexical order
+/// is sequence order, so the last chunk under the last shard is the highest one, and there is
+/// no reason to read the rest of a spool that may hold millions of files. A shard that turns
+/// out to be empty — pruned, or left behind by a producer that failed — is backtracked out
+/// of, which is why this is a search and not a single descent.
+async fn highest_sequence(
+    dir: &Path,
+    payload_suffix: &str,
+    sharding: Option<Sharding>,
+) -> anyhow::Result<Option<u64>> {
+    let mut pending = vec![(
+        dir.to_path_buf(),
+        String::new(),
+        sharding.map_or(0, |sharding| sharding.depth),
+    )];
+    while let Some((path, prefix, depth_left)) = pending.pop() {
+        let mut entries = match fs::read_dir(&path).await {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(anyhow::Error::new(error).context(format!(
+                    "Failed to list dir_spool directory: {}",
+                    path.display()
+                )))
+            }
         };
-        if let Some(seq) = leading_sequence(base) {
-            highest = Some(highest.map_or(seq, |current: u64| current.max(seq)));
+        let mut highest: Option<u64> = None;
+        let mut shards: Vec<String> = Vec::new();
+        while let Some(entry) = entries.next_entry().await? {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let Some(stem) = chunk_base(&name, payload_suffix) else {
+                if entry.file_type().await.is_ok_and(|kind| kind.is_dir()) {
+                    shards.push(name);
+                }
+                continue;
+            };
+            if let Some(seq) = leading_sequence(&join_base(&prefix, stem)) {
+                highest = Some(highest.map_or(seq, |current: u64| current.max(seq)));
+            }
+        }
+        if highest.is_some() {
+            return Ok(highest);
+        }
+        if depth_left == 0 {
+            continue;
+        }
+        // Smallest pushed first, so the greatest shard is the one popped next.
+        shards.sort_unstable();
+        for shard in shards {
+            let child = path.join(&shard);
+            let child_prefix = join_base(&prefix, &shard);
+            pending.push((child, child_prefix, depth_left - 1));
         }
     }
-    Ok(highest)
+    Ok(None)
 }
 
 #[cfg(test)]
