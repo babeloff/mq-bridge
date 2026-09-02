@@ -1314,8 +1314,8 @@ fn custom_endpoint_from_uri(
 fn base_endpoint_from_uri(uri: &str) -> anyhow::Result<mq_bridge::models::Endpoint> {
     use anyhow::bail;
     use mq_bridge::models::{
-        AmqpConfig, AwsConfig, ClickHouseConfig, Endpoint, EndpointType, FileConfig, GrpcConfig,
-        HttpConfig, IbmMqConfig, KafkaConfig, MongoDbConfig, MqttConfig, NatsConfig,
+        AmqpConfig, AwsConfig, ClickHouseConfig, DirSpoolConfig, Endpoint, EndpointType, FileConfig,
+        GrpcConfig, HttpConfig, IbmMqConfig, KafkaConfig, MongoDbConfig, MqttConfig, NatsConfig,
         ObjectStoreConfig, PostgresCdcConfig, RedisStreamsConfig, SqlxConfig, WebSocketConfig,
         ZeroMqConfig,
     };
@@ -1579,6 +1579,12 @@ fn base_endpoint_from_uri(uri: &str) -> anyhow::Result<mq_bridge::models::Endpoi
             schema_fields(schemars::schema_for!(RedisStreamsConfig)),
         ),
         "file" => ("file", schema_fields(schemars::schema_for!(FileConfig))),
+        // Directory-backed FIFO queue, targeted by path like `file`. An underscore
+        // is not a legal URI scheme character, hence `spool`/`dir-spool`.
+        "spool" | "dir-spool" | "dirspool" => (
+            "dir_spool",
+            schema_fields(schemars::schema_for!(DirSpoolConfig)),
+        ),
         // Cloud object storage. The bucket scheme both selects the endpoint and is
         // the connection URL the `object_store` crate expects, so it is not
         // rewritten below; credentials come from the environment.
@@ -1620,7 +1626,7 @@ fn base_endpoint_from_uri(uri: &str) -> anyhow::Result<mq_bridge::models::Endpoi
             return custom_endpoint_from_uri(other, &parsed, uri);
         }
         other => bail!(
-            "unsupported endpoint scheme '{other}' in URI '{uri}'. Supported schemes: postgres, postgresql, mysql, mariadb, sqlite, nats, mongodb, redis, file, kafka, mqtt, mqtts, amqp, amqps, rabbitmq, rabbitmqs, http, https, clickhouse, clickhouses, ws, wss, grpc, grpcs, ibmmq, aws, zeromq, zmq, s3, gs, az, abfs, and the structural memory, null, static, fanout, request, switch, response. A scheme may also name an endpoint registered by an extension (pulsar) or loaded with --plugin"
+            "unsupported endpoint scheme '{other}' in URI '{uri}'. Supported schemes: postgres, postgresql, mysql, mariadb, sqlite, nats, mongodb, redis, file, spool, kafka, mqtt, mqtts, amqp, amqps, rabbitmq, rabbitmqs, http, https, clickhouse, clickhouses, ws, wss, grpc, grpcs, ibmmq, aws, zeromq, zmq, s3, gs, az, abfs, and the structural memory, null, static, fanout, request, switch, response. A scheme may also name an endpoint registered by an extension (pulsar) or loaded with --plugin"
         ),
     };
 
@@ -1651,14 +1657,15 @@ fn base_endpoint_from_uri(uri: &str) -> anyhow::Result<mq_bridge::models::Endpoi
             | "clickhouse"
             | "websocket"
     );
+    // Target is a filesystem path carried by the URI itself, so `?path=`/`?url=`
+    // would be a second source for the same field.
+    let path_target = matches!(tag, "file" | "dir_spool");
     for (k, v) in parsed.query_pairs() {
         let (k, v) = (k.into_owned(), v.into_owned());
-        // A file endpoint takes its path from the URI itself, so a `?path=` would
-        // be a second, conflicting source for the same field.
-        if k == "path" && tag == "file" {
+        if k == "path" && path_target {
             continue;
         }
-        if k == "url" && tag != "file" {
+        if k == "url" && !path_target {
             escaped_url = Some(v);
             continue;
         }
@@ -1698,11 +1705,12 @@ fn base_endpoint_from_uri(uri: &str) -> anyhow::Result<mq_bridge::models::Endpoi
         );
     }
 
-    if tag == "file" {
+    if path_target {
         let path = uri.split('?').next().unwrap_or(uri);
-        let path = path.strip_prefix("file://").unwrap_or(path);
+        let prefix = format!("{}://", parsed.scheme());
+        let path = path.strip_prefix(prefix.as_str()).unwrap_or(path);
         if path.is_empty() {
-            bail!("file URI '{uri}' must include a path");
+            bail!("{tag} URI '{uri}' must include a path");
         }
         config.insert("path".into(), serde_json::Value::String(path.to_string()));
     } else if let Some(url) = escaped_url {

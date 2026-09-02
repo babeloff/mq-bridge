@@ -1878,7 +1878,7 @@ impl Route {
         // Mirrors the returns below, without consuming the error channel they read.
         let outcome = if loop_error.is_some() || !err_rx.is_empty() {
             DisconnectOutcome::Failed
-        } else if !exited_on_empty && shutdown_rx.is_empty() {
+        } else if !drained && shutdown_rx.is_empty() {
             DisconnectOutcome::Stopped
         } else {
             DisconnectOutcome::Completed

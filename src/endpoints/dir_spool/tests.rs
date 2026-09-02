@@ -1184,8 +1184,12 @@ async fn a_lock_left_by_a_dead_process_is_taken_over() {
     let dir = tempdir().unwrap();
     let cfg = config(dir.path());
 
-    // A pid that is definitely gone, because we waited for it.
-    let mut child = std::process::Command::new("/bin/true").spawn().unwrap();
+    // A pid that is definitely gone, because we waited for it. `/bin/sh` rather than
+    // `/bin/true`, which macOS does not ship.
+    let mut child = std::process::Command::new("/bin/sh")
+        .args(["-c", "exit 0"])
+        .spawn()
+        .unwrap();
     let dead_pid = child.id();
     child.wait().unwrap();
     std::fs::write(dir.path().join("PRODUCER"), dead_pid.to_string()).unwrap();

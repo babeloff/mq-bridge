@@ -218,6 +218,7 @@ fn endpoint_kind(endpoint_type: &EndpointType) -> &'static str {
     match endpoint_type {
         EndpointType::Amqp(_) => "amqp",
         EndpointType::Aws(_) => "aws",
+        EndpointType::DirSpool(_) => "dir_spool",
         EndpointType::File(_) => "file",
         EndpointType::Grpc(_) => "grpc",
         EndpointType::Http(_) => "http",

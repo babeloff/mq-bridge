@@ -171,6 +171,13 @@ const ENDPOINT_KIND_OVERRIDES = {
       fields: [{ inputId: "pub-url", field: "path", label: "PATH", placeholder: "/tmp/messages.jsonl" }],
     },
   },
+  dir_spool: {
+    order: 13,
+    basicFields: ["path", "payload_extension", "drain_on_read"],
+    requestBar: {
+      fields: [{ inputId: "pub-url", field: "path", label: "PATH", placeholder: "/tmp/spool" }],
+    },
+  },
   sled: {
     order: 15,
     basicFields: ["path", "tree"],
