@@ -92,6 +92,7 @@ impl Endpoint {
             topic: topic.to_string(),
             correlation_id: correlation_id.map(str::to_string),
             capacity: Some(capacity),
+            idle_ttl_secs: None,
         }))
     }
     pub fn has_retry_middleware(&self) -> bool {

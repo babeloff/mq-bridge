@@ -2,6 +2,54 @@
 
 All notable changes to `mq-bridge`. Newest first.
 
+## 0.4.10
+
+### Security
+
+- **AEAD nonces are now counter-based, not random.** A random 96-bit nonce caps `aes256gcm`
+  at the ~2^32 messages of NIST SP 800-38D — under an hour on a busy route, after which a
+  repeat leaks the XOR of two plaintexts and can expose the authentication key. Each `Crypto`
+  now draws a random prefix once and appends a counter, so nonces are unique for its lifetime
+  and the budget is gone. The nonce travels in the envelope verbatim, so the wire format,
+  existing at-rest files, and key rotation are all unaffected.
+
+- **`authenticate_metadata` binds metadata to the ciphertext.** Listed metadata keys stay in
+  the clear but are folded into the AEAD tag, so altering, removing or adding one in transit
+  fails decryption exactly like a tampered payload — no extra field and no second key, since
+  the tag already is the checksum. Such envelopes also cover the cleartext header, and are
+  tagged version 2 so version 1 envelopes keep opening unchanged. The default is an empty
+  list, which is byte-identical to previous releases. Both sides must configure the same
+  list; the at-rest `encryption` fields of `file` / `object_store` reject it, since there is
+  no per-message metadata at that layer.
+
+### Fixed
+
+- **Five pieces of process-wide state are now reclaimed.** The event store dropped timed-out
+  subscribers from its ack math but kept them in the map, so ephemeral subscribers — which
+  use a fresh id per instance — grew it with churn. A `stream_buffer` partition created by
+  the publish path for a correlation id whose reader never arrived was only ever removed by a
+  consumer's shutdown, holding its buffered batches until the process exited; the new
+  `idle_ttl_secs` discards those, never one with a consumer attached. The cookie jar had no
+  expiry at all, so a server rotating cookie names grew it without bound; `Max-Age=0` now
+  deletes, and `max_cookies` (default 256) caps it. The checkpoint path-lock map is pruned
+  like the file one already was.
+
+- **A cancelled memory request-reply no longer wedges its correlation id.** The waiter was
+  removed on every error path but not when the `send()` future itself was dropped, as route
+  shutdown or an outer timeout does. Since duplicate registrations are rejected, a
+  caller-supplied correlation id was then unusable for the life of the process. Cleanup is
+  now an RAII guard, so it covers cancellation too.
+
+### Changed
+
+- **Less allocation on hot paths.** The metrics middleware resolved its counter and histogram
+  from the registry — allocating both label strings — on every message; the handles are now
+  built once per wrapped endpoint. (Recorders must therefore be installed before routes
+  start.) The encryption middleware keeps failure-path plaintexts in a `Vec` rather than
+  building a `HashMap` per batch, `retry` moves the batch on its final attempt instead of
+  deep-copying metadata for a re-send that cannot happen, and `weak_join` expires groups in
+  one pass without cloning keys.
+
 ## 0.4.9
 
 ### Changed

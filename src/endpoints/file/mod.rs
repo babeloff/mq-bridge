@@ -567,7 +567,7 @@ impl FilePublisher {
             crypto: config
                 .encryption
                 .as_ref()
-                .map(Crypto::new)
+                .map(Crypto::new_at_rest)
                 .transpose()?
                 .map(Arc::new),
             csv_header: Arc::new(Mutex::new(None)),
@@ -2261,7 +2261,7 @@ impl FileConsumer {
         let crypto = config
             .encryption
             .as_ref()
-            .map(Crypto::new)
+            .map(Crypto::new_at_rest)
             .transpose()?
             .map(Arc::new);
         let make_reader = move |file: std::fs::File| -> Box<dyn std::io::Read> {

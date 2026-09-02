@@ -301,7 +301,7 @@ impl ObjectStorePublisher {
             crypto: config
                 .encryption
                 .as_ref()
-                .map(Crypto::new)
+                .map(Crypto::new_at_rest)
                 .transpose()?
                 .map(Arc::new),
             date_partition: config.date_partition_enabled(name_by),
@@ -722,7 +722,7 @@ impl ObjectStoreConsumer {
             crypto: config
                 .encryption
                 .as_ref()
-                .map(Crypto::new)
+                .map(Crypto::new_at_rest)
                 .transpose()?
                 .map(Arc::new),
             checkpoint,

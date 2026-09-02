@@ -748,6 +748,7 @@ async fn test_http_publisher_stream_response_to_stream_buffer_isolates_parallel_
         topic: topic.clone(),
         correlation_id: None,
         capacity: Some(20),
+        idle_ttl_secs: None,
     }));
     let mut consumer_a = create_consumer_from_route(
         "http_stream_buffer_a",
@@ -755,6 +756,7 @@ async fn test_http_publisher_stream_response_to_stream_buffer_isolates_parallel_
             topic: topic.clone(),
             correlation_id: Some("stream-a".to_string()),
             capacity: Some(20),
+            idle_ttl_secs: None,
         })),
     )
     .await
@@ -765,6 +767,7 @@ async fn test_http_publisher_stream_response_to_stream_buffer_isolates_parallel_
             topic: topic.clone(),
             correlation_id: Some("stream-b".to_string()),
             capacity: Some(20),
+            idle_ttl_secs: None,
         })),
     )
     .await
@@ -903,6 +906,7 @@ async fn test_http_publisher_stream_response_to_stream_buffer_uses_message_id_fa
         topic: topic.clone(),
         correlation_id: None,
         capacity: Some(10),
+        idle_ttl_secs: None,
     }));
     let publisher_endpoint = Endpoint::new(EndpointType::Http(HttpConfig {
         url: format!("http://{}", addr),
@@ -922,6 +926,7 @@ async fn test_http_publisher_stream_response_to_stream_buffer_uses_message_id_fa
             topic: topic.clone(),
             correlation_id: Some(expected_correlation_id.clone()),
             capacity: Some(10),
+            idle_ttl_secs: None,
         })),
     )
     .await

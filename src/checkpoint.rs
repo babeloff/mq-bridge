@@ -33,6 +33,8 @@ fn path_lock(path: &Path) -> Arc<AsyncMutex<()>> {
     static LOCKS: OnceLock<Mutex<HashMap<PathBuf, Arc<AsyncMutex<()>>>>> = OnceLock::new();
     let map = LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
     let mut guard = map.lock().unwrap();
+    // Drop locks no caller holds any more, so the map doesn't grow with cursor paths.
+    guard.retain(|_, v| Arc::strong_count(v) > 1);
     guard
         .entry(path.to_path_buf())
         .or_insert_with(|| Arc::new(AsyncMutex::new(())))

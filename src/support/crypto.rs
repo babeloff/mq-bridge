@@ -13,10 +13,20 @@
 //! [version:u8=1][cipher:u8][key_id_len:u8][key_id][nonce][ciphertext‖tag]
 //! ```
 //!
-//! A fresh random nonce is drawn per `seal`. The default XChaCha20-Poly1305
-//! uses a 192-bit nonce, which is collision-safe with random nonces at any
-//! realistic message rate; AES-256-GCM (96-bit nonce) is offered for
-//! interoperability.
+//! Nonces are `random prefix ‖ per-instance counter`, not fully random: a
+//! random 96-bit nonce would cap AES-256-GCM at the ~2^32 messages of NIST SP
+//! 800-38D, which a busy route reaches in under an hour. The counter makes
+//! nonces unique for the life of a `Crypto`, so only two concurrent instances
+//! drawing the same prefix could collide. The nonce is written into the
+//! envelope verbatim, so this is not a wire-format change.
+//!
+//! A non-empty `aad` is additionally prefixed with the cleartext envelope header,
+//! so the cipher id, key id and nonce are covered by the tag too. Those envelopes
+//! carry version 2; an empty `aad` binds nothing and stays byte-identical to v1.
+
+// TODO key hygiene (deferred): no zeroize, so key bytes outlive use in EncryptionConfig.key,
+// decode_key's Vec, Crypto.key and decrypt_keys. EncryptionConfig also derives Debug with the
+// key as a plain String -- SecretExtractor covers only the serialize path.
 
 use crate::models::{CipherKind, EncryptionConfig};
 use aes_gcm::Aes256Gcm;
@@ -25,13 +35,18 @@ use base64::Engine as _;
 use chacha20poly1305::aead::{Aead, AeadInOut, KeyInit, Payload};
 use chacha20poly1305::XChaCha20Poly1305;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::crypto_envelope::{
-    AES_GCM_NONCE_LEN, CIPHER_AES_GCM, CIPHER_XCHACHA, ENVELOPE_VERSION, XCHACHA_NONCE_LEN,
+    AES_GCM_NONCE_LEN, CIPHER_AES_GCM, CIPHER_XCHACHA, ENVELOPE_VERSION,
+    ENVELOPE_VERSION_AAD_BOUND, XCHACHA_NONCE_LEN,
 };
 
 /// Authentication tag length; 16 bytes for both ciphers.
 const TAG_LEN: usize = 16;
+
+/// Trailing counter bytes of every nonce; the rest is the per-instance random prefix.
+const NONCE_COUNTER_LEN: usize = 8;
 
 /// The AEAD instance for one key, built once. AES-256's key schedule and GHASH
 /// table cost more to set up than sealing a small payload, so they are not
@@ -103,6 +118,10 @@ pub struct Crypto {
     key: [u8; 32],
     active: Cipher,
     decrypt_keys: HashMap<String, [u8; 32]>,
+    /// Drawn once; the leading `nonce_len - NONCE_COUNTER_LEN` bytes are used.
+    nonce_prefix: [u8; XCHACHA_NONCE_LEN - NONCE_COUNTER_LEN],
+    nonce_counter: AtomicU64,
+    authenticate_metadata: Vec<String>,
 }
 
 /// Decodes a configured key: optional `${env:VAR}` indirection, then base64 to
@@ -147,7 +166,45 @@ impl Crypto {
             active: Cipher::new(config.cipher, &key),
             key,
             decrypt_keys,
+            nonce_prefix: rand::random(),
+            nonce_counter: AtomicU64::new(0),
+            authenticate_metadata: config.authenticate_metadata.clone(),
         })
+    }
+
+    /// At-rest sealing has no per-message metadata, so `authenticate_metadata` would be
+    /// silently ignored there. Reject it instead of pretending the metadata is protected.
+    pub fn new_at_rest(config: &EncryptionConfig) -> anyhow::Result<Self> {
+        if !config.authenticate_metadata.is_empty() {
+            return Err(anyhow!(
+                "authenticate_metadata is supported by the encryption middleware only, \
+                 not by at-rest file/object_store encryption"
+            ));
+        }
+        Self::new(config)
+    }
+
+    /// Encodes the configured metadata keys into an AAD blob, in config order.
+    ///
+    /// Each entry is `len(key):u32 ‖ key ‖ present:u8 [‖ len(value):u32 ‖ value]`, so an
+    /// absent key cannot be confused with an empty one and values cannot be shifted
+    /// between keys. Returns an empty `Vec` when nothing is configured, which keeps
+    /// `seal` on its original no-AAD path.
+    pub fn metadata_aad(&self, metadata: &HashMap<String, String>) -> Vec<u8> {
+        let mut aad = Vec::new();
+        for key in &self.authenticate_metadata {
+            aad.extend_from_slice(&(key.len() as u32).to_be_bytes());
+            aad.extend_from_slice(key.as_bytes());
+            match metadata.get(key) {
+                Some(value) => {
+                    aad.push(1);
+                    aad.extend_from_slice(&(value.len() as u32).to_be_bytes());
+                    aad.extend_from_slice(value.as_bytes());
+                }
+                None => aad.push(0),
+            }
+        }
+        aad
     }
 
     /// Encrypts `plaintext` with the active key into a self-describing envelope.
@@ -156,18 +213,34 @@ impl Crypto {
             CipherKind::Xchacha20poly1305 => (CIPHER_XCHACHA, XCHACHA_NONCE_LEN),
             CipherKind::Aes256gcm => (CIPHER_AES_GCM, AES_GCM_NONCE_LEN),
         };
-        let nonce_bytes: [u8; XCHACHA_NONCE_LEN] = rand::random();
+        let mut nonce_bytes = [0u8; XCHACHA_NONCE_LEN];
+        let prefix_len = nonce_len - NONCE_COUNTER_LEN;
+        nonce_bytes[..prefix_len].copy_from_slice(&self.nonce_prefix[..prefix_len]);
+        let counter = self.nonce_counter.fetch_add(1, Ordering::Relaxed);
+        nonce_bytes[prefix_len..nonce_len].copy_from_slice(&counter.to_be_bytes());
         let nonce = &nonce_bytes[..nonce_len];
 
         let mut out =
             Vec::with_capacity(3 + self.key_id.len() + nonce_len + plaintext.len() + TAG_LEN);
-        out.push(ENVELOPE_VERSION);
+        out.push(if aad.is_empty() {
+            ENVELOPE_VERSION
+        } else {
+            ENVELOPE_VERSION_AAD_BOUND
+        });
         out.push(cipher_byte);
         out.push(self.key_id.len() as u8);
         out.extend_from_slice(self.key_id.as_bytes());
         out.extend_from_slice(nonce);
         let body = out.len();
+        let bound;
+        let aad = if aad.is_empty() {
+            aad
+        } else {
+            bound = [&out[..body], aad].concat();
+            &bound
+        };
         out.extend_from_slice(plaintext);
+
         self.active.seal_in_place(nonce, aad, &mut out, body)?;
         Ok(out)
     }
@@ -177,7 +250,7 @@ impl Crypto {
     pub fn open(&self, envelope: &[u8], aad: &[u8]) -> anyhow::Result<Vec<u8>> {
         let err = || anyhow!("invalid encryption envelope");
         let (&version, rest) = envelope.split_first().ok_or_else(err)?;
-        if version != ENVELOPE_VERSION {
+        if version != ENVELOPE_VERSION && version != ENVELOPE_VERSION_AAD_BOUND {
             return Err(anyhow!("unsupported encryption envelope version {version}"));
         }
         let (&cipher_byte, rest) = rest.split_first().ok_or_else(err)?;
@@ -196,6 +269,15 @@ impl Crypto {
             return Err(err());
         }
         let (nonce, ciphertext) = rest.split_at(nonce_len);
+        // v1 authenticates only what the caller passed; v2 also covers the cleartext
+        // header, so the version selects the construction rather than the AAD's shape.
+        let bound;
+        let aad = if version == ENVELOPE_VERSION {
+            aad
+        } else {
+            bound = [&envelope[..envelope.len() - ciphertext.len()], aad].concat();
+            &bound
+        };
 
         // Anything sealed by this config opens with the pre-built cipher; only a
         // rotation key or a foreign cipher needs one built here.
@@ -227,6 +309,7 @@ mod tests {
             key_id: "k1".to_string(),
             key: base64::engine::general_purpose::STANDARD.encode([7u8; 32]),
             decrypt_keys: HashMap::new(),
+            authenticate_metadata: Vec::new(),
         }
     }
 
@@ -261,6 +344,26 @@ mod tests {
                 .collect();
             let crypto = Crypto::new(&config(cipher)).unwrap();
             assert_eq!(crypto.open(&envelope, b"aad").unwrap(), b"secret payload");
+        }
+    }
+
+    /// Counter nonces must never repeat within one `Crypto`, which is what removes
+    /// the random-nonce message budget of AES-GCM.
+    #[test]
+    fn nonces_are_unique_across_many_seals() {
+        for cipher in [CipherKind::Xchacha20poly1305, CipherKind::Aes256gcm] {
+            let nonce_len = match cipher {
+                CipherKind::Xchacha20poly1305 => XCHACHA_NONCE_LEN,
+                CipherKind::Aes256gcm => AES_GCM_NONCE_LEN,
+            };
+            let crypto = Crypto::new(&config(cipher)).unwrap();
+            let nonces: std::collections::HashSet<Vec<u8>> = (0..100_000)
+                .map(|_| {
+                    let envelope = crypto.seal(b"x", b"").unwrap();
+                    envelope[5..5 + nonce_len].to_vec()
+                })
+                .collect();
+            assert_eq!(nonces.len(), 100_000);
         }
     }
 
@@ -304,6 +407,62 @@ mod tests {
     }
 
     #[test]
+    fn authenticated_metadata_is_bound_to_the_ciphertext() {
+        let mut cfg = config(CipherKind::Xchacha20poly1305);
+        cfg.authenticate_metadata = vec!["tenant".to_string(), "kind".to_string()];
+        let crypto = Crypto::new(&cfg).unwrap();
+
+        let meta: HashMap<String, String> =
+            [("tenant", "acme"), ("kind", "order"), ("trace", "t1")]
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+        let envelope = crypto
+            .seal(b"payload", &crypto.metadata_aad(&meta))
+            .unwrap();
+        assert_eq!(
+            crypto.open(&envelope, &crypto.metadata_aad(&meta)).unwrap(),
+            b"payload"
+        );
+
+        let mut uncovered = meta.clone();
+        uncovered.insert("trace".to_string(), "t2".to_string());
+        assert!(crypto
+            .open(&envelope, &crypto.metadata_aad(&uncovered))
+            .is_ok());
+
+        for tamper in [
+            |m: &mut HashMap<String, String>| {
+                m.insert("tenant".to_string(), "evil".to_string());
+            },
+            |m: &mut HashMap<String, String>| {
+                m.remove("kind");
+            },
+            // "acme"+"order" must not re-associate as "acmeorder"+"".
+            |m: &mut HashMap<String, String>| {
+                m.insert("tenant".to_string(), "acmeorder".to_string());
+                m.insert("kind".to_string(), String::new());
+            },
+        ] {
+            let mut tampered = meta.clone();
+            tamper(&mut tampered);
+            assert!(crypto
+                .open(&envelope, &crypto.metadata_aad(&tampered))
+                .is_err());
+        }
+    }
+
+    /// At-rest encryption has no metadata to bind, so the option must be rejected
+    /// rather than quietly ignored.
+    #[test]
+    fn at_rest_rejects_authenticated_metadata() {
+        let mut cfg = config(CipherKind::Xchacha20poly1305);
+        assert!(Crypto::new_at_rest(&cfg).is_ok());
+        cfg.authenticate_metadata = vec!["tenant".to_string()];
+        assert!(Crypto::new_at_rest(&cfg).is_err());
+    }
+
+    #[test]
     fn rejects_bad_keys() {
         let mut cfg = config(CipherKind::Xchacha20poly1305);
         cfg.key = "not base64!!".to_string();
@@ -334,6 +493,7 @@ mod proptests {
             key_id: "k1".to_string(),
             key: base64::engine::general_purpose::STANDARD.encode([7u8; 32]),
             decrypt_keys: HashMap::new(),
+            authenticate_metadata: Vec::new(),
         })
         .unwrap()
     }
