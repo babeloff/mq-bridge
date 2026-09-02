@@ -473,9 +473,9 @@ impl MessagePublisher for MongoDbPublisher {
         }
 
         // Unordered: an ordered insert stops at the first error, so one duplicate
-        // `_id` would leave the rest of the batch uninserted and indistinguishable
-        // from a failure. Documents carry their own `seq`, so insertion order
-        // holds nothing the stored data depends on.
+        // `_id` would leave the rest uninserted and indistinguishable from a
+        // failure. Capped collections take unordered inserts too and still store
+        // in $natural order, so `seq` and insertion order both survive.
         match self.collection.insert_many(docs).ordered(false).await {
             Ok(_) => {
                 if failed_messages.is_empty() {
