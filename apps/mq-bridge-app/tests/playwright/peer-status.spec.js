@@ -1,4 +1,5 @@
 const { test, expect } = require("./fixtures");
+const { makeConfig, resetConfig } = require("./helpers");
 
 // Peer rows come from other mq-bridge processes on the same machine. Driving
 // them through a real second process would make these tests depend on process
@@ -6,11 +7,7 @@ const { test, expect } = require("./fixtures");
 // endpoint is stubbed instead — what is under test is the UI contract:
 // grouping, read-only rendering, escaping, and disappearance.
 
-const BASE_CONFIG = {
-  log_level: "info",
-  ui_addr: "127.0.0.1:39091",
-  metrics_addr: "",
-  default_tab: "publishers",
+const BASE_CONFIG = makeConfig({
   routes: {},
   consumers: [
     {
@@ -24,7 +21,7 @@ const BASE_CONFIG = {
       endpoint: { memory: { topic: "local-out" } },
     },
   ],
-};
+});
 
 const summary = (overrides = {}) => ({
   running: true,
@@ -130,13 +127,8 @@ async function stubPeerStatus(page, initialInstances) {
   return state;
 }
 
-async function resetConfig(page) {
-  const response = await page.request.post("/config", { data: BASE_CONFIG });
-  expect(response.ok()).toBeTruthy();
-}
-
 test.beforeEach(async ({ page }) => {
-  await resetConfig(page);
+  await resetConfig(page, BASE_CONFIG);
 });
 
 test("peer consumers and route inputs are grouped under their instance", async ({ page }) => {

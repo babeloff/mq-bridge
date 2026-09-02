@@ -10,7 +10,7 @@
  * config, so one button's side effects cannot mask or break the next one.
  */
 const { test, expect } = require("./fixtures");
-const { resetConfig, gotoView } = require("./helpers");
+const { resetConfig, gotoView, waitForShell } = require("./helpers");
 
 // Requests the app issues on a 1s timer; they prove nothing about a click.
 const POLLING_PATHS = ["/runtime-status", "/peer-status"];
@@ -182,11 +182,19 @@ function isPolling(url) {
 /**
  * Changing only the hash is a same-document navigation, so the app keeps
  * whatever dialog the previous button opened — and an open modal swallows the
- * clicks that follow. Routing through about:blank forces a real remount.
+ * clicks that follow. A real document remount is what clears it.
+ *
+ * Reload when already on the right URL: it remounts in one navigation where
+ * about:blank plus a goto costs two, and the sweep does this once per button.
  */
 async function freshView(page, view) {
-  await page.goto("about:blank");
-  await gotoView(page, view.hash);
+  if (page.url().endsWith(`/${view.hash}`)) {
+    await page.reload();
+    await waitForShell(page);
+  } else {
+    await page.goto("about:blank");
+    await gotoView(page, view.hash);
+  }
   await settle(page);
   if (view.seed) {
     await view.seed(page);

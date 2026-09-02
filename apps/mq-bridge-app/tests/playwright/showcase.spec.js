@@ -1,21 +1,22 @@
-const { test, expect } = require("@playwright/test");
+// Imported from the shared base only for the app-server fixture that supplies
+// baseURL. This records a video rather than asserting, so the page-problem guard
+// the other specs rely on is off.
+const { test, expect } = require("./fixtures");
+const { DATA_ADDR, makeConfig } = require("./helpers");
+test.use({ failOnPageProblems: false });
 
 /**
  * This test is designed to be recorded as a video showcase.
  * It demonstrates the bridge workflow: Publisher -> Consumer -> History -> Presets.
  */
 
-const BASE_CONFIG = {
-  log_level: "info",
-  ui_addr: "127.0.0.1:39091",
-  metrics_addr: "",
-  default_tab: "publishers",
+const BASE_CONFIG = makeConfig({
   publishers: [
     {
       name: "demo_http_publisher",
       endpoint: {
         http: {
-          url: "http://127.0.0.1:39081/showcase",
+          url: `http://${DATA_ADDR}/showcase`,
           method: "POST",
         },
       },
@@ -51,7 +52,7 @@ const BASE_CONFIG = {
   ],
   consumers: [],
   routes: {},
-};
+});
 
 const isShowcase = process.env.SHOWCASE === "true";
 

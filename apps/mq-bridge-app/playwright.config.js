@@ -24,7 +24,18 @@ module.exports = defineConfig({
   timeout: 30_000,
   // No maxFailures: when the UI is broken the point is to see every failure in
   // one run, not to stop at the first one.
-  workers: 1, // Required because tests modify shared global /config state
+  //
+  // Each worker runs its own app process on its own port (tests/playwright/
+  // app-server.js), so the shared global /config that used to force workers: 1
+  // is no longer shared. The cap is deliberate: a worker costs a browser *and*
+  // an app process, and the box still has to run them.
+  workers: isCI ? 2 : 4,
+  // Spread a file's tests across workers too, not just whole files. Without it
+  // the four sweep tests queue up behind each other in one worker and splitting
+  // them buys nothing.
+  fullyParallel: true,
+  // Builds the binary once so the workers only exec it.
+  globalSetup: require.resolve("./tests/playwright/global-setup.js"),
   expect: {
     timeout: 5_000,
   },
@@ -33,7 +44,8 @@ module.exports = defineConfig({
   // and orphan every reviewed screenshot; keep the established naming.
   snapshotPathTemplate: "{testFilePath}-snapshots/{arg}-{platform}{ext}",
   use: {
-    baseURL: "http://127.0.0.1:39091",
+    // baseURL is not set here: the appServer fixture assigns each worker the
+    // port its own app process actually bound.
     headless: process.env.SHOWCASE === "true" ? false : true,
     // Keep the evidence for a failure without paying for it on green runs.
     trace: "retain-on-failure",
@@ -55,13 +67,4 @@ module.exports = defineConfig({
       testMatch: CROSS_BROWSER_SPECS,
     },
   ].filter((project) => project.name === "chromium" || allEngines),
-  webServer: {
-    command:
-      'echo \'ui_addr: "127.0.0.1:39091"\nlog_level: "info"\npublishers: []\nconsumers: []\nroutes: {}\' > /tmp/mqb-playwright-minimal.yml && cargo run -p mq-bridge-app -- --config /tmp/mqb-playwright-minimal.yml',
-    url: "http://127.0.0.1:39091/health",
-    reuseExistingServer: !isCI,
-    // CI pre-builds the binary so this is a no-op link check; the generous
-    // budget is for cold local runs, where a full build takes ~10 min.
-    timeout: 900_000,
-  },
 });

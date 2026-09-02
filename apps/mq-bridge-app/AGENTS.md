@@ -35,36 +35,85 @@ an explicit app package because the workspace default member is the engine.
 
 ## Testing Guidance
 
-- Unit tests:
-  - Commands: `npm run test:unit` and `cargo test -p mq-bridge-app-core -p mq-bridge-app`
-  - Coverage report: `npm run test:unit:coverage`
-  - Focused suites used often:
-    - `tests/unit/consumers-view.test.ts`
-    - `tests/unit/publishers-view.test.ts`
-    - `tests/unit/publishers-view-model.test.ts` (random action sequences against the panel's invariants)
-    - `tests/unit/routes.test.ts`
-    - `tests/unit/import-export.test.ts`
-    - `tests/unit/bootstrap-runtime-status.test.ts`
-  - Components are mounted for real (`mount` from `svelte`), not asserted against
-    `.svelte` source text; see `tests/unit/component-regressions.test.ts`.
-    `tests/unit/dom-setup.ts` supplies the jsdom gaps the `wa-*` elements need.
+### Which layer to write in
 
-- UI/E2E tests:
-  - Command: `npm run test:ui` (all engines) or `npm run test:ui:chromium` (fast loop)
-  - Main spec: `tests/playwright/ui.spec.js`
-  - Every spec imports `test`/`expect` from `tests/playwright/fixtures.js`, which
-    fails a test on any uncaught exception, `console.error`, failed request or
-    5xx response. Import from there, not from `@playwright/test`.
-  - `button-sweep.spec.js` proves every button does something; `button-outcomes.spec.js`
-    pins what specific buttons do; `a11y.spec.js` scans each view with axe.
-  - firefox and webkit run only the cross-browser specs listed in `playwright.config.js`.
-  - Tests currently reset config before each case via `/config` post.
-  - Visual regression baselines use Playwright's built-in `toHaveScreenshot` assertions in `tests/playwright/ui-visual.spec.js`.
-  - That suite skips itself on any platform with no committed baseline. To add the
-    Linux ones CI needs, run the App workflow manually with
-    `update_visual_baselines=true` and commit the uploaded artifact.
-  - Do not use LLM-based screenshot comparison.
-  - Do not run `npm run test:ui:update-screenshots` just to make failing tests pass. Update screenshot baselines only after reviewing the diff and confirming the UI/layout change is intentional.
+Pick the cheapest layer that can actually fail for the bug you have in mind, and
+write the test there. Going up a layer costs roughly 100x the runtime.
+
+| The bug is about | Layer | Where |
+| --- | --- | --- |
+| A pure function: grouping, parsing, a format, a schema, a URL | Vitest, node env (no pragma) | `tests/unit/*.test.ts` |
+| DOM the view controllers build by hand | Vitest + `// @vitest-environment jsdom` | `tests/unit/*.test.ts` |
+| A Svelte component's rendered output or its callbacks | Vitest, mounted for real | `tests/unit/component-regressions.test.ts` |
+| A state machine with many orderings (select / edit / delete / add) | Vitest, model-based | `tests/unit/publishers-view-model.test.ts` |
+| CSS the markup depends on | Vitest, real cascade via `getComputedStyle` | `tests/unit/style-regressions.test.ts` |
+| A button doing *nothing* | Playwright, automatic | `button-sweep.spec.js` — no new test needed |
+| A button doing the *wrong thing* | Playwright | `button-outcomes.spec.js` |
+| A flow across views, or the app talking to the server | Playwright | `ui.spec.js` |
+| Keyboard/screen-reader reachability | Playwright + axe | `a11y.spec.js` |
+| Layout and spacing | Playwright screenshot | `ui-visual.spec.js` |
+
+Two rules that decide most cases:
+
+- **If it can be a unit test, it must be.** A Playwright test that only checks
+  rendered text belongs in jsdom.
+- **Do not add a Playwright test for a new button.** The sweep already clicks
+  every button it can reach and fails on the ones that do nothing. Add to
+  `button-outcomes.spec.js` only when the specific *outcome* matters.
+
+### What each Playwright file owns
+
+- `ui.spec.js` — cross-view flows and real server round trips.
+- `button-sweep.spec.js` — every reachable button produces some observable
+  effect. Grows by itself as buttons are added.
+- `button-outcomes.spec.js` — the specific outcome of specific controls.
+- `a11y.spec.js` — axe scan per view, against a shrinking known-violation list.
+- `peer-status.spec.js` — the peer sidebar, with `/peer-status` stubbed.
+- `settings.spec.js` — the config view.
+- `ui-visual.spec.js` — screenshot baselines.
+- `showcase.spec.js` — records a demo video; opt-in via `SHOWCASE=true`.
+- `fixtures.js` / `helpers.js` / `app-server.js` — shared base, not tests.
+
+### Shared rules
+
+- Import `test`/`expect` from `tests/playwright/fixtures.js`, never from
+  `@playwright/test`. That base fails a test on any uncaught exception,
+  `console.error`, failed request or 5xx response — so every spec hardens every
+  other spec's ground.
+- Build configs with `makeConfig()` from `helpers.js` and declare only the
+  publishers/consumers/routes the test asserts on. Do not paste a config shell.
+- Reset state with `resetConfig(page, config)` from `helpers.js`.
+- `gotoView` waits for the shell, **not** for the sidebar. Anything that counts
+  list items must first wait for the count the server reports — counting
+  straight after navigating is a race, and it has already caused flakes.
+- Each worker runs its own app process on its own port (`app-server.js`), so
+  tests never share `/config`. Never hard-code the UI port: `DISPLAY_UI_ADDR` in
+  a config is display data that a screenshot pins, not somewhere to connect.
+
+### Commands
+
+- `npm run test:unit` — Vitest. `npm run test:unit:coverage` for a report.
+- `cargo test -p mq-bridge-app-core -p mq-bridge-app` — the Rust side.
+- `npm run test:ui` — chromium only locally (~2min). CI runs all three engines;
+  `npm run test:ui:all` forces that locally, `PW_CHROMIUM_ONLY=1` forces chromium
+  anywhere.
+
+### Things that have bitten before
+
+- The sweep runs one test per view *family* so the families can go on separate
+  workers. Do not split it per state: dedup is per family, and a finer split
+  multiplies clicks instead of dividing them. A fourth test reports the buttons
+  no view reaches, which is only answerable across families.
+- firefox and webkit run only the cross-browser specs listed in
+  `playwright.config.js`; that is where engine-specific form-control behaviour
+  has bitten.
+- The visual suite skips itself on any platform with no committed baseline. To
+  add the Linux ones CI needs, run the App workflow manually with
+  `update_visual_baselines=true` and commit the uploaded artifact.
+- Do not use LLM-based screenshot comparison.
+- Do not run `npm run test:ui:update-screenshots` just to make failing tests
+  pass. Update baselines only after reviewing the diff and confirming the layout
+  change is intentional.
 
 ## Known Active Areas
 

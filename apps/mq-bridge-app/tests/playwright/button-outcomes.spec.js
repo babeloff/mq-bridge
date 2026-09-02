@@ -38,8 +38,12 @@ test.describe("add menus", () => {
     // The server also synthesizes a publisher per route output, so count what it
     // actually holds rather than what the fixture declares.
     const savedBefore = (await readConfig(page)).publishers.length;
+    // The sidebar hydrates a tick after the shell, so wait for it to agree with
+    // the server. Counting in between reads as an empty list and throws every
+    // later count off by the whole fixture.
     const items = page.locator("#pub-list .pub-item");
-    const before = await items.count();
+    await expect(items).toHaveCount(savedBefore);
+    const before = savedBefore;
 
     await page.locator("#pub-add").click();
     const menu = page.locator(".add-menu");
@@ -55,8 +59,9 @@ test.describe("add menus", () => {
 
   test("adding a consumer appends it to the consumer list", async ({ page }) => {
     await gotoView(page, "#consumers:0");
+    const before = (await readConfig(page)).consumers.length;
     const items = page.locator("#cons-list .cons-item");
-    const before = await items.count();
+    await expect(items).toHaveCount(before);
 
     await page.locator("#cons-add").click();
     await page.locator(".add-menu button", { hasText: "Memory" }).first().click();
@@ -67,8 +72,9 @@ test.describe("add menus", () => {
 
   test("the add menu closes again without adding anything when dismissed", async ({ page }) => {
     await gotoView(page, "#publishers:0");
+    const before = (await readConfig(page)).publishers.length;
     const items = page.locator("#pub-list .pub-item");
-    const before = await items.count();
+    await expect(items).toHaveCount(before);
 
     await page.locator("#pub-add").click();
     await expect(page.locator(".add-menu")).toBeVisible();
@@ -146,8 +152,9 @@ test.describe("theme selector", () => {
 test.describe("sidebar filter", () => {
   test("typing narrows the list and clearing restores it", async ({ page }) => {
     await gotoView(page, "#publishers:0");
+    const before = (await readConfig(page)).publishers.length;
     const names = page.locator("#pub-list .pub-item .item-name");
-    const before = await names.count();
+    await expect(names).toHaveCount(before);
 
     await page.locator("#pub-filter").fill("memory");
     await expect.poll(async () => names.count()).toBeLessThan(before);

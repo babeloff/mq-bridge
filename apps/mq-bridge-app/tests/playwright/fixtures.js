@@ -9,6 +9,7 @@
  * Import `test`/`expect` from here rather than from `@playwright/test`.
  */
 const base = require("@playwright/test");
+const { startApp } = require("./app-server");
 
 /**
  * Noise that is not the app's fault and cannot be fixed from here. Keep this
@@ -31,6 +32,24 @@ function isIgnored(message, extra) {
 }
 
 const test = base.test.extend({
+  /**
+   * This worker's own app process. Worker-scoped, so it is started once and
+   * reused by every test the worker runs — and torn down with it.
+   */
+  appServer: [
+    async ({}, use) => {
+      const app = await startApp();
+      await use(app);
+      await app.stop();
+    },
+    { scope: "worker" },
+  ],
+
+  /** Point every relative goto and `page.request` call at this worker's app. */
+  baseURL: async ({ appServer }, use) => {
+    await use(appServer.baseURL);
+  },
+
   /**
    * Per-spec escape hatch for a page problem a test provokes on purpose:
    * `test.use({ allowedPageProblems: /403 \(Forbidden\)/ })`. Pass one RegExp,
