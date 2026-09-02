@@ -458,6 +458,12 @@ The sentinel and the queue are checked together: `stop_on_done` ends the stream 
 the directory holds no unread chunks *and* `done_file` is present, so a producer that
 finished long ago still has its backlog drained first.
 
+A directory scan keeps up to 65,536 chunk names for the batches that follow, so draining a
+backlog costs one scan per that many messages rather than one per batch. Two consequences
+are visible from outside: chunks that arrive while a listing is still being served are
+picked up only once it is exhausted (within `poll_interval_ms` on an idle spool), and the
+batch that empties a listing can be shorter than the route's `batch_size`.
+
 **Example**: video frames plus telemetry, written by one process and drained by another.
 
 ```yaml

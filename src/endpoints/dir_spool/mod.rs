@@ -26,7 +26,7 @@ use crate::CanonicalMessage;
 use anyhow::Context;
 use async_trait::async_trait;
 use std::any::Any;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -37,6 +37,11 @@ use tracing::{debug, trace, warn};
 
 /// Suffix of a chunk that is still being written. Never handed to a consumer.
 const STAGING_SUFFIX: &str = ".tmp";
+
+/// How many chunk names one directory scan keeps for later batches. A backlog is drained in
+/// `ceil(depth / this)` scans rather than one scan per batch, and the cache costs about a
+/// name per entry — a few megabytes at this size — no matter how deep the directory is.
+const READY_CACHE_CAPACITY: usize = 65_536;
 
 /// Metadata key carrying the chunk's base name (its position in the queue).
 const SRC_CHUNK_KEY: &str = "mqb.src.spool_chunk";
@@ -348,6 +353,16 @@ pub struct DirSpoolConsumer {
     /// successfully. Shared with the commit closures, which run on the route's tasks and
     /// are what releases a chunk again after a nack.
     claimed: Arc<StdMutex<HashSet<String>>>,
+    /// Chunk names left over from the last directory scan, in queue order. Batches are
+    /// served from the front of this and the directory is only walked again once it runs
+    /// out, so a deep backlog is not re-listed and re-sorted for every batch.
+    ready: VecDeque<String>,
+    /// Chunks a nack released, waiting to be folded back into `ready`. Written by the
+    /// commit closures, which run on the route's tasks, hence the shared mutex.
+    requeued: Arc<StdMutex<Vec<String>>>,
+    /// Directory scans performed. Only read by the tests, which assert that draining a
+    /// backlog does not scan per batch; a counter bump is cheaper than a test hook.
+    scans: u64,
     exit_on_empty: bool,
 }
 
@@ -380,16 +395,49 @@ impl DirSpoolConsumer {
             poll_interval: Duration::from_millis(config.poll_interval_ms),
             source_metadata,
             claimed: Arc::new(StdMutex::new(HashSet::new())),
+            ready: VecDeque::new(),
+            requeued: Arc::new(StdMutex::new(Vec::new())),
+            scans: 0,
             exit_on_empty: false,
         })
     }
 
-    /// Base names of the finalized chunks not already in flight, in queue order.
-    async fn list_ready(&self, limit: usize) -> anyhow::Result<Vec<String>> {
+    /// Up to `limit` base names of finalized chunks not already in flight, in queue order.
+    ///
+    /// Served from the cached listing, which is refilled by a directory scan only once it
+    /// is exhausted. That is what keeps a drain linear in the queue depth: at
+    /// `batch_size: 128` a 100k backlog costs two scans, not N scans and N sorts.
+    async fn list_ready(&mut self, limit: usize) -> anyhow::Result<Vec<String>> {
+        self.absorb_requeued();
+        if self.ready.is_empty() {
+            self.refill_ready(limit).await?;
+        }
+        let take = limit.min(self.ready.len());
+        Ok(self.ready.drain(..take).collect())
+    }
+
+    /// Walks the directory and rebuilds the cached listing.
+    ///
+    /// Only the lexically smallest `capacity` names are kept, in a max-heap that evicts as
+    /// it goes, so the cost is one pass and bounded memory even for a directory holding
+    /// millions of chunks — the old code collected and sorted every name to then discard
+    /// all but a batch's worth.
+    async fn refill_ready(&mut self, limit: usize) -> anyhow::Result<()> {
+        let capacity = limit.max(READY_CACHE_CAPACITY);
+        // Snapshot rather than lock per entry: the guard must not be held across the
+        // `next_entry` await, which is what keeps this future `Send`. The set only holds
+        // chunks in flight (or, with `drain_on_read` off, already-read ones), and a refill
+        // happens once per cache-full of messages, so the clone is not on the hot path.
+        let claimed = self
+            .claimed
+            .lock()
+            .expect("dir_spool claim set poisoned")
+            .clone();
         let mut entries = fs::read_dir(&self.dir)
             .await
             .with_context(|| format!("Failed to list dir_spool directory: {}", self.path))?;
-        let mut names = Vec::new();
+        self.scans += 1;
+        let mut smallest: BinaryHeap<String> = BinaryHeap::new();
         while let Some(entry) = entries
             .next_entry()
             .await
@@ -401,18 +449,59 @@ impl DirSpoolConsumer {
             let Some(base) = chunk_base(&name, &self.payload_suffix) else {
                 continue;
             };
-            names.push(base.to_string());
-        }
-        // Filtered after the walk rather than inside it: the guard is not held across an
-        // await, which is what keeps this future `Send`.
-        {
-            let claimed = self.claimed.lock().expect("dir_spool claim set poisoned");
-            names.retain(|base| !claimed.contains(base));
+            if claimed.contains(base) {
+                continue;
+            }
+            if smallest.len() < capacity {
+                smallest.push(base.to_string());
+            } else if smallest.peek().is_some_and(|worst| base < worst.as_str()) {
+                smallest.pop();
+                smallest.push(base.to_string());
+            }
         }
         // Lexical order is queue order — that is the contract `naming_pattern` documents.
-        names.sort_unstable();
-        names.truncate(limit);
-        Ok(names)
+        self.ready = smallest.into_sorted_vec().into();
+        Ok(())
+    }
+
+    /// Folds the chunks a nack released back into the cached listing, so a redelivery does
+    /// not have to wait for the backlog ahead of it to drain and trigger the next scan.
+    fn absorb_requeued(&mut self) {
+        let mut returned = {
+            let mut requeued = self.requeued.lock().expect("dir_spool requeue poisoned");
+            if requeued.is_empty() {
+                return;
+            }
+            std::mem::take(&mut *requeued)
+        };
+        returned.sort_unstable();
+        returned.dedup();
+        // Merged, not appended-and-resorted: both sides are already in queue order and the
+        // cache can hold tens of thousands of names.
+        let cached = std::mem::take(&mut self.ready);
+        let mut merged = VecDeque::with_capacity(returned.len() + cached.len());
+        let mut returned = returned.into_iter().peekable();
+        let mut cached = cached.into_iter().peekable();
+        loop {
+            let pick = match (returned.peek(), cached.peek()) {
+                (Some(left), Some(right)) => Some(left.cmp(right)),
+                (Some(_), None) => Some(std::cmp::Ordering::Less),
+                (None, Some(_)) => Some(std::cmp::Ordering::Greater),
+                (None, None) => break,
+            };
+            match pick {
+                Some(std::cmp::Ordering::Less) => merged.extend(returned.next()),
+                Some(std::cmp::Ordering::Greater) => merged.extend(cached.next()),
+                // Equal means a nack landed after a refill scan had already picked the
+                // chunk up — it was unclaimed by then. Keep one: the cache must never hold
+                // a name twice, or the chunk would be delivered twice.
+                _ => {
+                    merged.extend(cached.next());
+                    returned.next();
+                }
+            }
+        }
+        self.ready = merged;
     }
 
     /// Reads one chunk into a message. A missing sidecar is not an error: a payload file
@@ -463,11 +552,47 @@ impl DirSpoolConsumer {
         }
     }
 
+    /// Reads every chunk in `ready`, returning the messages and the base names they came
+    /// from. A chunk that vanished between the listing and the read was taken by a
+    /// competing consumer; the rest of the batch is still good.
+    async fn read_ready(&self, ready: Vec<String>) -> (Vec<CanonicalMessage>, Vec<String>) {
+        let mut messages = Vec::with_capacity(ready.len());
+        let mut delivered = Vec::with_capacity(ready.len());
+        for base in ready {
+            match self.read_chunk(&base).await {
+                Ok(message) => {
+                    messages.push(message);
+                    delivered.push(base);
+                }
+                Err(error) => {
+                    warn!(chunk = %base, error = %error, "dir_spool skipping unreadable chunk");
+                }
+            }
+        }
+        (messages, delivered)
+    }
+
     /// Whether the producer has declared the stream finished.
     async fn done_present(&self) -> bool {
         fs::try_exists(self.dir.join(&self.done_file))
             .await
             .unwrap_or(false)
+    }
+
+    /// What to hand back when the directory holds nothing to read.
+    async fn idle(&self) -> Result<ReceivedBatch, ConsumerError> {
+        // The sentinel only ends the stream once the queue behind it is empty, which is
+        // the whole point of the two-part condition: a producer that finished long ago
+        // still has its backlog drained first.
+        if self.stop_on_done && self.done_present().await {
+            return Err(ConsumerError::EndOfStream);
+        }
+        // Under `--drain` an empty batch is the exit signal, so surface it immediately
+        // instead of holding the route for a poll interval it will not use.
+        if !self.exit_on_empty {
+            tokio::time::sleep(self.poll_interval).await;
+        }
+        Ok(ReceivedBatch::empty())
     }
 }
 
@@ -522,42 +647,31 @@ impl MessageConsumer for DirSpoolConsumer {
     }
 
     async fn receive_batch(&mut self, max_messages: usize) -> Result<ReceivedBatch, ConsumerError> {
-        let ready = self
-            .list_ready(max_messages)
-            .await
-            .map_err(ConsumerError::Connection)?;
-
-        if ready.is_empty() {
-            // The sentinel only ends the stream once the queue behind it is empty, which is
-            // the whole point of the two-part condition: a producer that finished long ago
-            // still has its backlog drained first.
-            if self.stop_on_done && self.done_present().await {
-                return Err(ConsumerError::EndOfStream);
+        // Two attempts: a cached listing whose chunks have all been deleted under us is
+        // stale, so drop it and rescan once rather than reporting an empty queue over a
+        // directory that may well have filled up again.
+        let mut messages = Vec::new();
+        let mut delivered = Vec::new();
+        for _ in 0..2 {
+            let ready = self
+                .list_ready(max_messages)
+                .await
+                .map_err(ConsumerError::Connection)?;
+            if ready.is_empty() {
+                return self.idle().await;
             }
-            // Under `--drain` an empty batch is the exit signal, so surface it immediately
-            // instead of holding the route for a poll interval it will not use.
+            (messages, delivered) = self.read_ready(ready).await;
+            if !messages.is_empty() {
+                break;
+            }
+            self.ready.clear();
+        }
+        if messages.is_empty() {
+            // Two listings' worth of chunks that would not read. They are still on disk, so
+            // this is not the end of the stream; back off and let the next poll retry.
             if !self.exit_on_empty {
                 tokio::time::sleep(self.poll_interval).await;
             }
-            return Ok(ReceivedBatch::empty());
-        }
-
-        let mut messages = Vec::with_capacity(ready.len());
-        let mut delivered = Vec::with_capacity(ready.len());
-        for base in ready {
-            match self.read_chunk(&base).await {
-                Ok(message) => {
-                    messages.push(message);
-                    delivered.push(base);
-                }
-                // A chunk that vanished between the listing and the read was taken by a
-                // competing consumer; the rest of the batch is still good.
-                Err(error) => {
-                    warn!(chunk = %base, error = %error, "dir_spool skipping unreadable chunk");
-                }
-            }
-        }
-        if messages.is_empty() {
             return Ok(ReceivedBatch::empty());
         }
         self.claimed
@@ -570,16 +684,21 @@ impl MessageConsumer for DirSpoolConsumer {
         let metadata_suffix = self.metadata_suffix.clone();
         let drain_on_read = self.drain_on_read;
         let claimed = Arc::clone(&self.claimed);
+        let requeued = Arc::clone(&self.requeued);
         let commit: crate::traits::BatchCommitFunc = Box::new(move |dispositions| {
             Box::pin(async move {
                 let mut release = Vec::new();
+                let mut redeliver = Vec::new();
                 for (index, base) in delivered.iter().enumerate() {
                     // A missing disposition means the route acked the whole batch.
                     let acked = !matches!(dispositions.get(index), Some(MessageDisposition::Nack));
                     if !acked {
                         // Put it back in the queue: a nack is a request to redeliver, and
-                        // the chunk is still on disk to redeliver from.
+                        // the chunk is still on disk to redeliver from. It goes back into
+                        // the cached listing too, so the redelivery does not wait for a
+                        // whole backlog to drain first.
                         release.push(base.clone());
+                        redeliver.push(base.clone());
                     } else if drain_on_read {
                         // Only unclaim once the payload is actually gone. A delete that
                         // failed would otherwise put the chunk back in the listing and
@@ -598,6 +717,12 @@ impl MessageConsumer for DirSpoolConsumer {
                     for base in release {
                         claimed.remove(&base);
                     }
+                }
+                if !redeliver.is_empty() {
+                    requeued
+                        .lock()
+                        .expect("dir_spool requeue poisoned")
+                        .extend(redeliver);
                 }
                 sync_directory(&dir).await;
                 Ok(())

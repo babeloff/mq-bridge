@@ -192,6 +192,102 @@ async fn delivers_chunks_in_sequence_order_across_batches() {
     assert_eq!(payloads, expected);
 }
 
+/// The headline scenario — a finished producer and a consumer draining a backlog in small
+/// batches — must not re-list the directory once per batch.
+#[tokio::test]
+async fn drains_a_backlog_without_rescanning_the_directory_per_batch() {
+    let dir = tempdir().unwrap();
+    let mut cfg = config(dir.path());
+    cfg.poll_interval_ms = 1;
+
+    let publisher = DirSpoolPublisher::new(&cfg).await.unwrap();
+    let backlog: Vec<CanonicalMessage> = (0..200)
+        .map(|index| message(&format!("chunk-{index}"), "seq"))
+        .collect();
+    publisher.send_batch(backlog).await.unwrap();
+
+    let mut consumer = DirSpoolConsumer::new(&cfg).await.unwrap();
+    let received = drain(&mut consumer, 5).await;
+    assert_eq!(received.len(), 200);
+    // One scan fills the cache with all 200 names, the second finds the queue empty and
+    // ends the drain. The unbatched version of this cost 41 scans of 200 names.
+    assert_eq!(
+        consumer.scans, 2,
+        "40 batches out of one listing should not have rescanned the directory"
+    );
+}
+
+/// A nack has to be redelivered promptly even when a deep backlog is cached behind it,
+/// which is what the requeue path in front of the cached listing is for.
+#[tokio::test]
+async fn redelivers_a_nacked_chunk_ahead_of_a_cached_backlog() {
+    let dir = tempdir().unwrap();
+    let mut cfg = config(dir.path());
+    cfg.poll_interval_ms = 1;
+
+    let publisher = DirSpoolPublisher::new(&cfg).await.unwrap();
+    let backlog: Vec<CanonicalMessage> = (0..50)
+        .map(|index| message(&format!("chunk-{index}"), "seq"))
+        .collect();
+    publisher.send_batch(backlog).await.unwrap();
+
+    let mut consumer = DirSpoolConsumer::new(&cfg).await.unwrap();
+    let batch = consumer.receive_batch(1).await.unwrap();
+    assert_eq!(&batch.messages[0].payload[..], b"chunk-0");
+    (batch.commit)(vec![MessageDisposition::Nack])
+        .await
+        .unwrap();
+
+    // Back at the head of the queue, not behind the 49 chunks still in the cache.
+    let again = consumer.receive_batch(1).await.unwrap();
+    assert_eq!(&again.messages[0].payload[..], b"chunk-0");
+    (again.commit)(vec![MessageDisposition::Ack]).await.unwrap();
+    assert_eq!(consumer.scans, 1, "a redelivery must not force a rescan");
+
+    // And the rest of the queue still comes out in order behind it.
+    let rest = drain(&mut consumer, 7).await;
+    let payloads: Vec<String> = rest
+        .iter()
+        .map(|m| String::from_utf8(m.payload.to_vec()).unwrap())
+        .collect();
+    let expected: Vec<String> = (1..50).map(|index| format!("chunk-{index}")).collect();
+    assert_eq!(payloads, expected);
+}
+
+/// A cached listing goes stale when another consumer drains the same directory; the batch
+/// that finds nothing must rescan rather than report the queue empty.
+#[tokio::test]
+async fn rescans_when_the_cached_listing_has_been_drained_by_someone_else() {
+    let dir = tempdir().unwrap();
+    let mut cfg = config(dir.path());
+    cfg.poll_interval_ms = 1;
+
+    let publisher = DirSpoolPublisher::new(&cfg).await.unwrap();
+    publisher
+        .send_batch(vec![message("taken", "x"), message("mine", "x")])
+        .await
+        .unwrap();
+
+    let mut consumer = DirSpoolConsumer::new(&cfg).await.unwrap();
+    // Fill the cache with both names, hand out neither.
+    consumer.list_ready(0).await.unwrap();
+    assert_eq!(consumer.ready.len(), 2);
+    // A competing consumer takes the chunk the cache is about to hand out, and a third
+    // chunk arrives that the stale cache has never seen.
+    std::fs::remove_file(dir.path().join("000000000.bin")).unwrap();
+    std::fs::remove_file(dir.path().join("000000000.json")).unwrap();
+    std::fs::remove_file(dir.path().join("000000001.bin")).unwrap();
+    std::fs::remove_file(dir.path().join("000000001.json")).unwrap();
+    publisher
+        .send_batch(vec![message("arrived-later", "x")])
+        .await
+        .unwrap();
+
+    let batch = consumer.receive_batch(2).await.unwrap();
+    assert_eq!(batch.messages.len(), 1);
+    assert_eq!(&batch.messages[0].payload[..], b"arrived-later");
+}
+
 #[tokio::test]
 async fn resumes_the_sequence_after_a_publisher_restart() {
     let dir = tempdir().unwrap();
