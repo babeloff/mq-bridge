@@ -306,7 +306,7 @@ impl DirSpoolConfig {
             metadata_extension: default_spool_metadata_extension(),
             atomic: true,
             done_file: default_spool_done_file(),
-            emit_done: false,
+            emit_done: SpoolDone::default(),
             producer_file: default_spool_producer_file(),
             consumer_file: default_spool_consumer_file(),
             drain_on_read: true,

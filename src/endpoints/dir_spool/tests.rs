@@ -1,6 +1,6 @@
 use super::*;
-use crate::models::{DirSpoolConfig, SpoolClaim};
-use crate::traits::{MessageConsumer, MessagePublisher};
+use crate::models::{DirSpoolConfig, SpoolClaim, SpoolDone};
+use crate::traits::{DisconnectOutcome, MessageConsumer, MessagePublisher};
 use tempfile::tempdir;
 
 fn config(path: &std::path::Path) -> DirSpoolConfig {
@@ -21,6 +21,15 @@ fn entries(dir: &std::path::Path) -> Vec<String> {
         .collect();
     names.sort();
     names
+}
+
+/// Closes a producer the way the route does, saying how the pass ended.
+async fn close_producer(publisher: &DirSpoolPublisher, outcome: DisconnectOutcome) {
+    publisher
+        .on_disconnect_with_outcome(outcome)
+        .expect("the publisher always has closing work to do")
+        .await
+        .unwrap();
 }
 
 /// Drains the consumer until the queue runs out, acking everything it hands out. Under
@@ -71,7 +80,7 @@ dir_spool:
   payload_extension: ".h264"
   metadata_extension: ".json"
   atomic: true
-  emit_done: true
+  emit_done: success
 "#,
     )
     .expect("the documented publisher config must parse");
@@ -83,7 +92,7 @@ dir_spool:
     // A leading dot is accepted and stripped, so `.h264` and `h264` mean the same thing.
     assert_eq!(cfg.payload_suffix(), "h264");
     assert_eq!(cfg.metadata_suffix(), Some("json"));
-    assert!(cfg.emit_done);
+    assert_eq!(cfg.emit_done, SpoolDone::Success);
     // Consumer-side fields keep their defaults on a publisher block.
     assert!(cfg.drain_on_read);
     assert!(!cfg.stop_on_done);
@@ -133,6 +142,24 @@ fn rejects_an_unknown_field() {
     assert!(
         error.to_string().contains("drain"),
         "the error should name the offending field, got: {error}"
+    );
+}
+
+/// `emit_done` used to be a boolean. It is three-valued now, and the old spelling must
+/// fail loudly rather than be coerced into one of the three.
+#[test]
+fn rejects_the_boolean_spelling_of_emit_done() {
+    use crate::models::Endpoint;
+
+    let error =
+        serde_yaml_ng::from_str::<Endpoint>("dir_spool:\n  path: \"/tmp/s\"\n  emit_done: true\n")
+            .expect_err("a boolean must be rejected");
+    // serde reports it as a type error rather than by field name, but a real config parse
+    // carries the route and the line: "spool.output: invalid type: boolean `true`, expected
+    // string or map at line 6 column 5".
+    assert!(
+        error.to_string().contains("invalid type: boolean"),
+        "unexpected error: {error}"
     );
 }
 
@@ -360,7 +387,7 @@ async fn never_hands_out_a_partially_written_chunk() {
 async fn ends_the_stream_once_the_queue_is_empty_and_done_is_present() {
     let dir = tempdir().unwrap();
     let mut cfg = config(dir.path());
-    cfg.emit_done = true;
+    cfg.emit_done = SpoolDone::Success;
     cfg.stop_on_done = true;
     cfg.poll_interval_ms = 1;
 
@@ -383,13 +410,114 @@ async fn ends_the_stream_once_the_queue_is_empty_and_done_is_present() {
     );
 
     // The route calls this hook when the publisher goes away: sentinel down, lock released.
-    publisher.on_disconnect_hook().unwrap().await.unwrap();
+    close_producer(&publisher, DisconnectOutcome::Completed).await;
     assert!(dir.path().join("DONE").exists());
     assert!(!dir.path().join("PRODUCER").exists());
     match consumer.receive_batch(10).await {
         Err(ConsumerError::EndOfStream) => {}
         other => panic!("expected EndOfStream once production finished, got {other:?}"),
     }
+}
+
+/// `success` is the strict reading: only a route that reached the end of its input and
+/// wrote everything it accepted has finished producing.
+#[tokio::test]
+async fn emit_done_success_writes_the_sentinel_only_on_a_completed_pass() {
+    let dir = tempdir().unwrap();
+    let mut cfg = config(dir.path());
+    cfg.emit_done = SpoolDone::Success;
+
+    for outcome in [DisconnectOutcome::Stopped, DisconnectOutcome::Failed] {
+        let publisher = DirSpoolPublisher::new(&cfg).await.unwrap();
+        publisher.send_batch(vec![message("x", "x")]).await.unwrap();
+        close_producer(&publisher, outcome).await;
+        assert!(
+            !dir.path().join("DONE").exists(),
+            "{outcome:?} is not a finished production, so no sentinel"
+        );
+        drop(publisher);
+    }
+
+    let publisher = DirSpoolPublisher::new(&cfg).await.unwrap();
+    close_producer(&publisher, DisconnectOutcome::Completed).await;
+    assert!(dir.path().join("DONE").exists());
+}
+
+/// `end` is the loose reading: nothing more is coming from here, whatever the reason.
+#[tokio::test]
+async fn emit_done_end_writes_the_sentinel_however_the_pass_ended() {
+    for outcome in [
+        DisconnectOutcome::Completed,
+        DisconnectOutcome::Stopped,
+        DisconnectOutcome::Failed,
+    ] {
+        let dir = tempdir().unwrap();
+        let mut cfg = config(dir.path());
+        cfg.emit_done = SpoolDone::End;
+
+        let publisher = DirSpoolPublisher::new(&cfg).await.unwrap();
+        close_producer(&publisher, outcome).await;
+        assert!(
+            dir.path().join("DONE").exists(),
+            "'end' must write the sentinel after {outcome:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn emit_done_never_writes_no_sentinel() {
+    let dir = tempdir().unwrap();
+    let cfg = config(dir.path());
+    assert_eq!(cfg.emit_done, SpoolDone::Never);
+
+    let publisher = DirSpoolPublisher::new(&cfg).await.unwrap();
+    close_producer(&publisher, DisconnectOutcome::Completed).await;
+    assert!(!dir.path().join("DONE").exists());
+}
+
+/// A chunk this producer accepted but could not write means production did not succeed,
+/// even when the route itself ran to the end of its input — the route may have sent the
+/// message to a DLQ, but the spool is missing it either way.
+#[tokio::test]
+async fn emit_done_success_holds_back_when_a_chunk_could_not_be_written() {
+    let dir = tempdir().unwrap();
+    let mut cfg = config(dir.path());
+    cfg.emit_done = SpoolDone::Success;
+    // A directory where the first chunk's payload has to be staged: the write cannot
+    // succeed. It has to be the `.tmp` name rather than the final one, or the publisher
+    // would read the blockage as an existing chunk and number itself past it.
+    std::fs::create_dir(dir.path().join("000000000.bin.tmp")).unwrap();
+
+    let publisher = DirSpoolPublisher::new(&cfg).await.unwrap();
+    let sent = publisher
+        .send_batch(vec![message("doomed", "x")])
+        .await
+        .unwrap();
+    assert!(
+        matches!(sent, SentBatch::Partial { .. }),
+        "the write should have failed, got {sent:?}"
+    );
+
+    close_producer(&publisher, DisconnectOutcome::Completed).await;
+    assert!(
+        !dir.path().join("DONE").exists(),
+        "a producer that dropped a chunk must not declare production successful"
+    );
+}
+
+/// An unexplained close — a caller that uses the plain disconnect hook — is read as a stop,
+/// because it is not evidence that production finished.
+#[tokio::test]
+async fn a_close_without_an_outcome_is_not_a_success() {
+    let dir = tempdir().unwrap();
+    let mut cfg = config(dir.path());
+    cfg.emit_done = SpoolDone::Success;
+
+    let publisher = DirSpoolPublisher::new(&cfg).await.unwrap();
+    publisher.on_disconnect_hook().unwrap().await.unwrap();
+    assert!(!dir.path().join("DONE").exists());
+    // The lock is still released, so the next producer is not blocked.
+    assert!(!dir.path().join("PRODUCER").exists());
 }
 
 /// The point of keeping a sentinel rather than reading the producer lock: production can
@@ -404,7 +532,7 @@ async fn production_can_span_several_producers_and_only_the_last_declares_done()
     let first = DirSpoolPublisher::new(&cfg).await.unwrap();
     first.send_batch(vec![message("a", "x")]).await.unwrap();
     // Closes without the sentinel: more production is coming.
-    first.on_disconnect_hook().unwrap().await.unwrap();
+    close_producer(&first, DisconnectOutcome::Completed).await;
     drop(first);
 
     let mut consumer = DirSpoolConsumer::new(&cfg).await.unwrap();
@@ -417,10 +545,10 @@ async fn production_can_span_several_producers_and_only_the_last_declares_done()
 
     // The second producer takes the freed lock, and this one is the last.
     let mut last_cfg = config(dir.path());
-    last_cfg.emit_done = true;
+    last_cfg.emit_done = SpoolDone::Success;
     let last = DirSpoolPublisher::new(&last_cfg).await.unwrap();
     last.send_batch(vec![message("b", "x")]).await.unwrap();
-    last.on_disconnect_hook().unwrap().await.unwrap();
+    close_producer(&last, DisconnectOutcome::Completed).await;
     drop(last);
 
     let received = drain(&mut consumer, 10).await;
@@ -438,14 +566,14 @@ async fn drains_the_backlog_before_ending_the_stream() {
     let dir = tempdir().unwrap();
     let mut cfg = config(dir.path());
     cfg.stop_on_done = true;
-    cfg.emit_done = true;
+    cfg.emit_done = SpoolDone::Success;
 
     let publisher = DirSpoolPublisher::new(&cfg).await.unwrap();
     publisher
         .send_batch(vec![message("one", "x"), message("two", "x")])
         .await
         .unwrap();
-    publisher.on_disconnect_hook().unwrap().await.unwrap();
+    close_producer(&publisher, DisconnectOutcome::Completed).await;
     drop(publisher);
     assert!(dir.path().join("DONE").exists());
 
@@ -738,7 +866,7 @@ async fn honours_custom_control_file_names() {
     cfg.done_file = "FINISHED".to_string();
     cfg.producer_file = "writer.lock".to_string();
     cfg.consumer_file = "reader.lock".to_string();
-    cfg.emit_done = true;
+    cfg.emit_done = SpoolDone::Success;
     cfg.stop_on_done = true;
     cfg.poll_interval_ms = 1;
 
@@ -758,7 +886,7 @@ async fn honours_custom_control_file_names() {
         .send_batch(vec![message("only", "x")])
         .await
         .unwrap();
-    publisher.on_disconnect_hook().unwrap().await.unwrap();
+    close_producer(&publisher, DisconnectOutcome::Completed).await;
     assert!(dir.path().join("FINISHED").exists());
 
     let mut consumer = DirSpoolConsumer::new(&cfg).await.unwrap();
@@ -856,7 +984,7 @@ async fn a_restarted_producer_clears_the_sentinel_and_reopens_the_stream() {
     let dir = tempdir().unwrap();
     let mut cfg = config(dir.path());
     cfg.stop_on_done = true;
-    cfg.emit_done = true;
+    cfg.emit_done = SpoolDone::Success;
     cfg.poll_interval_ms = 1;
 
     // First run: produce, declare done, drain to the end of the stream.
@@ -865,7 +993,7 @@ async fn a_restarted_producer_clears_the_sentinel_and_reopens_the_stream() {
         .send_batch(vec![message("run-one", "x")])
         .await
         .unwrap();
-    first.on_disconnect_hook().unwrap().await.unwrap();
+    close_producer(&first, DisconnectOutcome::Completed).await;
     drop(first);
     let mut consumer = DirSpoolConsumer::new(&cfg).await.unwrap();
     assert_eq!(drain(&mut consumer, 10).await.len(), 1);
@@ -907,7 +1035,7 @@ async fn a_route_drains_a_spool_its_producer_has_already_finished_writing() {
 
     // Producer: fill the spool and mark it finished, then go away entirely.
     let mut producer_cfg = DirSpoolConfig::new(spool.to_str().unwrap());
-    producer_cfg.emit_done = true;
+    producer_cfg.emit_done = SpoolDone::Success;
     let producer = DirSpoolPublisher::new(&producer_cfg).await.unwrap();
     for index in 0..20 {
         producer
@@ -915,7 +1043,7 @@ async fn a_route_drains_a_spool_its_producer_has_already_finished_writing() {
             .await
             .unwrap();
     }
-    producer.on_disconnect_hook().unwrap().await.unwrap();
+    close_producer(&producer, DisconnectOutcome::Completed).await;
     drop(producer);
 
     let mut consumer_cfg = DirSpoolConfig::new(spool.to_str().unwrap());

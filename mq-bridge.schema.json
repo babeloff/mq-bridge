@@ -587,9 +587,9 @@
           "default": true
         },
         "emit_done": {
-          "description": "(Sink only) Create `done_file` when the publisher is closed, marking production\nfinished for a `stop_on_done` consumer. Defaults to false.\n\nSet it on the *last* producer only. A publisher opening the spool deletes an\nexisting sentinel, since it is producing again.",
-          "type": "boolean",
-          "default": false
+          "description": "(Sink only) When to create `done_file`, marking production finished for a\n`stop_on_done` consumer. Defaults to `never`. See [`SpoolDone`].\n\nSet it on the *last* producer only. A publisher opening the spool deletes an\nexisting sentinel, since it is producing again.",
+          "$ref": "#/$defs/SpoolDone",
+          "default": "never"
         },
         "metadata_extension": {
           "description": "Extension of the JSON metadata sidecar, with or without the leading dot. Defaults to\n`json`. Set to an empty string to write and expect payload files only.",
@@ -3333,6 +3333,26 @@
           "description": "Take no claim and check for none.",
           "type": "string",
           "const": "off"
+        }
+      ]
+    },
+    "SpoolDone": {
+      "description": "When a `dir_spool` publisher writes its `done_file`, marking production finished.\n\nThe distinction is *how* the route ended, which the publisher learns from\n[`DisconnectOutcome`](crate::traits::DisconnectOutcome): every teardown path closes the\npublisher, so being closed says nothing on its own.",
+      "oneOf": [
+        {
+          "description": "Never write it (default). Something else decides when production is finished.",
+          "type": "string",
+          "const": "never"
+        },
+        {
+          "description": "Write it only when the route reached the natural end of its input and every chunk\nthis producer accepted was written.\n\nA route that is shut down, that fails, or that reconnects does *not* write it —\nproduction did not finish, so a `stop_on_done` consumer keeps waiting. Note that a\ncontinuously running producer never reaches a natural end, so `success` on one only\never means \"not yet\": use `end` there.",
+          "type": "string",
+          "const": "success"
+        },
+        {
+          "description": "Write it whenever the producer closes, however the route ended — a clean finish, a\nshutdown, or a failure.\n\nThis says \"nothing more is coming from here\", not \"everything worked\". Use it for a\nconsumer that must not wait forever on a producer that may have died, at the price\nof it treating a truncated stream as complete.",
+          "type": "string",
+          "const": "end"
         }
       ]
     },

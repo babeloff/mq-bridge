@@ -1046,13 +1046,13 @@ pub struct DirSpoolConfig {
     /// This file is what says the latter, and only the last producer should write it.
     #[serde(default = "default_spool_done_file")]
     pub done_file: String,
-    /// (Sink only) Create `done_file` when the publisher is closed, marking production
-    /// finished for a `stop_on_done` consumer. Defaults to false.
+    /// (Sink only) When to create `done_file`, marking production finished for a
+    /// `stop_on_done` consumer. Defaults to `never`. See [`SpoolDone`].
     ///
     /// Set it on the *last* producer only. A publisher opening the spool deletes an
     /// existing sentinel, since it is producing again.
     #[serde(default)]
-    pub emit_done: bool,
+    pub emit_done: SpoolDone,
     /// Name of the file holding the producer lock, which keeps a second producer out.
     /// Defaults to `PRODUCER`.
     ///
@@ -1090,6 +1090,35 @@ pub struct DirSpoolConfig {
     /// same role. Defaults to `exclusive`. See [`SpoolClaim`].
     #[serde(default)]
     pub claim: SpoolClaim,
+}
+
+/// When a `dir_spool` publisher writes its `done_file`, marking production finished.
+///
+/// The distinction is *how* the route ended, which the publisher learns from
+/// [`DisconnectOutcome`](crate::traits::DisconnectOutcome): every teardown path closes the
+/// publisher, so being closed says nothing on its own.
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum SpoolDone {
+    /// Never write it (default). Something else decides when production is finished.
+    #[default]
+    Never,
+    /// Write it only when the route reached the natural end of its input and every chunk
+    /// this producer accepted was written.
+    ///
+    /// A route that is shut down, that fails, or that reconnects does *not* write it —
+    /// production did not finish, so a `stop_on_done` consumer keeps waiting. Note that a
+    /// continuously running producer never reaches a natural end, so `success` on one only
+    /// ever means "not yet": use `end` there.
+    Success,
+    /// Write it whenever the producer closes, however the route ended — a clean finish, a
+    /// shutdown, or a failure.
+    ///
+    /// This says "nothing more is coming from here", not "everything worked". Use it for a
+    /// consumer that must not wait forever on a producer that may have died, at the price
+    /// of it treating a truncated stream as complete.
+    End,
 }
 
 /// What a `dir_spool` endpoint does when a second instance opens the same directory in the

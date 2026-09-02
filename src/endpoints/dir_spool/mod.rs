@@ -27,8 +27,8 @@
 
 use crate::models::DirSpoolConfig;
 use crate::traits::{
-    BoxFuture, ConsumerError, MessageConsumer, MessageDisposition, MessagePublisher,
-    PublisherError, ReceivedBatch, SentBatch,
+    BoxFuture, ConsumerError, DisconnectOutcome, MessageConsumer, MessageDisposition,
+    MessagePublisher, PublisherError, ReceivedBatch, SentBatch,
 };
 use crate::CanonicalMessage;
 use anyhow::Context;
@@ -36,7 +36,7 @@ use async_trait::async_trait;
 use std::any::Any;
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::fs::{self, File, OpenOptions};
@@ -439,7 +439,10 @@ pub struct DirSpoolPublisher {
     metadata_suffix: Option<String>,
     atomic: bool,
     done_file: String,
-    emit_done: bool,
+    emit_done: crate::models::SpoolDone,
+    /// Whether any chunk this publisher accepted failed to reach the disk, which makes the
+    /// difference between `emit_done: success` writing the sentinel and staying quiet.
+    write_failed: AtomicBool,
     /// Next sequence number. Seeded past the highest number already in the directory so a
     /// restart appends to the queue instead of overwriting its head.
     seq: Arc<AtomicU64>,
@@ -486,6 +489,7 @@ impl DirSpoolPublisher {
             atomic: config.atomic,
             done_file: config.done_file.clone(),
             emit_done: config.emit_done,
+            write_failed: AtomicBool::new(false),
             seq: Arc::new(AtomicU64::new(next_seq)),
             lock: StdMutex::new(lock),
         })
@@ -532,6 +536,40 @@ impl DirSpoolPublisher {
                 path.display()
             ))),
         }
+    }
+
+    /// Whether the sentinel should go down, given how the route ended.
+    ///
+    /// `success` is the strict reading of "production finished": the input ran out *and*
+    /// everything this producer accepted reached the disk. A shutdown or a failure leaves a
+    /// stream that may be missing its tail, and saying otherwise would have a `stop_on_done`
+    /// consumer treat a truncated spool as the whole of it.
+    fn should_emit_done(&self, outcome: DisconnectOutcome) -> bool {
+        use crate::models::SpoolDone;
+        match self.emit_done {
+            SpoolDone::Never => false,
+            SpoolDone::End => true,
+            SpoolDone::Success => {
+                matches!(outcome, DisconnectOutcome::Completed)
+                    && !self.write_failed.load(Ordering::Relaxed)
+            }
+        }
+    }
+
+    /// Closes this producer: sentinel down if it is owed, then the lock released.
+    ///
+    /// The sentinel goes first because, while the lock is still held, no other producer can
+    /// be in `new` clearing it — which is what keeps a hand-off between two producers from
+    /// losing it.
+    async fn close_with(&self, outcome: DisconnectOutcome) -> anyhow::Result<()> {
+        let wrote_done = if self.should_emit_done(outcome) {
+            self.write_done().await
+        } else {
+            Ok(())
+        };
+        self.release_lock();
+        sync_directory(&self.dir).await;
+        wrote_done
     }
 
     /// Releases the producer lock, freeing the spool for the next producer.
@@ -600,6 +638,10 @@ impl MessagePublisher for DirSpoolPublisher {
         let mut failed = Vec::new();
         for message in messages {
             if let Err(error) = self.write_chunk(&message).await {
+                // Remembered even though the batch is reported as partial and the route may
+                // well retry or DLQ it: this producer was handed a message it did not
+                // write, so it cannot claim production succeeded.
+                self.write_failed.store(true, Ordering::Relaxed);
                 failed.push((message, PublisherError::Retryable(error)));
             }
         }
@@ -616,21 +658,20 @@ impl MessagePublisher for DirSpoolPublisher {
         }
     }
 
+    // The route calls `on_disconnect_with_outcome`; this is the fallback for a caller that
+    // closes the publisher without saying why. It is read as `Stopped`, the cautious answer:
+    // an unexplained close is not evidence that production finished.
     fn on_disconnect_hook(&self) -> Option<BoxFuture<'_, anyhow::Result<()>>> {
-        // Both of this publisher's closing acts belong at the one moment the route can tell
-        // us it is closing. The sentinel goes down *before* the lock is released: while the
-        // lock is still held no other producer can be in `new` clearing the sentinel, which
-        // is what keeps a hand-off between two producers from losing it.
-        Some(Box::pin(async move {
-            let wrote_done = if self.emit_done {
-                self.write_done().await
-            } else {
-                Ok(())
-            };
-            self.release_lock();
-            sync_directory(&self.dir).await;
-            wrote_done
-        }))
+        Some(Box::pin(self.close_with(DisconnectOutcome::Stopped)))
+    }
+
+    fn on_disconnect_with_outcome(
+        &self,
+        outcome: DisconnectOutcome,
+    ) -> Option<BoxFuture<'_, anyhow::Result<()>>> {
+        // Closing is this producer's whole statement about production: the sentinel it may
+        // owe a `stop_on_done` consumer, and the lock the next producer needs.
+        Some(Box::pin(self.close_with(outcome)))
     }
 
     // The spool is a queue, and the sequence number a chunk gets is assigned inside

@@ -29,6 +29,23 @@ pub enum MessageDisposition {
     Nack,
 }
 
+/// How a route pass ended, for an endpoint whose close is a signal to someone else.
+///
+/// Passed to [`MessagePublisher::on_disconnect_with_outcome`]. Every teardown path runs
+/// the disconnect hooks — a clean finish, a shutdown and a failure alike — so an endpoint
+/// that has to tell the three apart cannot do it by being closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DisconnectOutcome {
+    /// The input reached its natural end and the route drained it. The only outcome that
+    /// means "all the work there was to do is done".
+    Completed,
+    /// The route was asked to stop, or is tearing down in order to reconnect. Work may
+    /// well remain: nothing says the input was exhausted.
+    Stopped,
+    /// The pass ended with an error.
+    Failed,
+}
+
 impl From<Option<CanonicalMessage>> for MessageDisposition {
     fn from(opt: Option<CanonicalMessage>) -> Self {
         match opt {
@@ -390,8 +407,27 @@ pub trait MessagePublisher: Send + Sync + 'static {
     ///
     /// The route awaits this hook during shutdown or reconnect cleanup. Errors are logged as
     /// warnings and do not replace the route's original result.
+    ///
+    /// The route calls [`on_disconnect_with_outcome`](Self::on_disconnect_with_outcome)
+    /// instead, which defers to this by default. Implement this one unless closing means
+    /// something different depending on how the route ended.
     fn on_disconnect_hook(&self) -> Option<BoxFuture<'_, anyhow::Result<()>>> {
         None
+    }
+
+    /// The disconnect hook, told how the route pass ended.
+    ///
+    /// For a publisher whose close is a *signal* to someone else — a sentinel file, a
+    /// stream-end marker, a final commit — "the route stopped" and "the route finished"
+    /// are not the same event, and only the route knows which happened. The default
+    /// ignores the outcome and defers to [`on_disconnect_hook`](Self::on_disconnect_hook),
+    /// so a publisher that does not care needs nothing.
+    fn on_disconnect_with_outcome(
+        &self,
+        outcome: DisconnectOutcome,
+    ) -> Option<BoxFuture<'_, anyhow::Result<()>>> {
+        let _ = outcome;
+        self.on_disconnect_hook()
     }
 
     /// Sends a batch of messages.
@@ -485,6 +521,13 @@ impl<T: MessagePublisher + ?Sized> MessagePublisher for Arc<T> {
         (**self).on_disconnect_hook()
     }
 
+    fn on_disconnect_with_outcome(
+        &self,
+        outcome: DisconnectOutcome,
+    ) -> Option<BoxFuture<'_, anyhow::Result<()>>> {
+        (**self).on_disconnect_with_outcome(outcome)
+    }
+
     async fn send(&self, message: CanonicalMessage) -> Result<Sent, PublisherError> {
         (**self).send(message).await
     }
@@ -521,6 +564,13 @@ impl<T: MessagePublisher + ?Sized> MessagePublisher for Box<T> {
 
     fn on_disconnect_hook(&self) -> Option<BoxFuture<'_, anyhow::Result<()>>> {
         (**self).on_disconnect_hook()
+    }
+
+    fn on_disconnect_with_outcome(
+        &self,
+        outcome: DisconnectOutcome,
+    ) -> Option<BoxFuture<'_, anyhow::Result<()>>> {
+        (**self).on_disconnect_with_outcome(outcome)
     }
 
     async fn send(&self, message: CanonicalMessage) -> Result<Sent, PublisherError> {

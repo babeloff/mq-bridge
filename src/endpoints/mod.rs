@@ -55,8 +55,8 @@ pub use crate::endpoints::structural::{
 };
 use crate::middleware::apply_middlewares_to_consumer;
 use crate::models::{
-    Endpoint, EndpointType, MemoryConfig, Middleware, NameBy, ResponseConfig, StreamBufferConfig,
-    TransformErrorPolicy,
+    Endpoint, EndpointType, MemoryConfig, Middleware, NameBy, ResponseConfig, SpoolDone,
+    StreamBufferConfig, TransformErrorPolicy,
 };
 use crate::route::{get_endpoint, get_endpoint_factory};
 use crate::traits::{BoxFuture, MessageConsumer, MessagePublisher};
@@ -533,7 +533,7 @@ fn check_consumer_recursive(
         EndpointType::DirSpool(cfg) => {
             dir_spool::validate_control_files(cfg)
                 .map_err(|error| anyhow!("[route:{route_name}] {error}"))?;
-            if cfg.emit_done {
+            if !matches!(cfg.emit_done, SpoolDone::Never) {
                 warnings.push(
                     "Endpoint 'dir_spool' is used as a consumer, but 'emit_done' is a publisher-only option and will be ignored."
                     .to_string()
@@ -1196,12 +1196,22 @@ async fn run_http_inline_response_fast_path(
             .await?;
 
     if let Err(err) = crate::route::run_publisher_connect_hook(name, &publisher).await {
-        crate::route::run_publisher_disconnect_hook(name, &publisher).await;
+        crate::route::run_publisher_disconnect_hook(
+            name,
+            &publisher,
+            crate::traits::DisconnectOutcome::Failed,
+        )
+        .await;
         return Err(err);
     }
     if let Err(err) = crate::route::run_consumer_connect_hook(name, &consumer).await {
         crate::route::run_consumer_disconnect_hook(name, &consumer).await;
-        crate::route::run_publisher_disconnect_hook(name, &publisher).await;
+        crate::route::run_publisher_disconnect_hook(
+            name,
+            &publisher,
+            crate::traits::DisconnectOutcome::Failed,
+        )
+        .await;
         return Err(err);
     }
 
@@ -1227,7 +1237,13 @@ async fn run_http_inline_response_fast_path(
         );
     }
     crate::route::run_consumer_disconnect_hook(name, &consumer).await;
-    crate::route::run_publisher_disconnect_hook(name, &publisher).await;
+    // This runner only ever ends on shutdown: an HTTP listener has no natural end.
+    crate::route::run_publisher_disconnect_hook(
+        name,
+        &publisher,
+        crate::traits::DisconnectOutcome::Stopped,
+    )
+    .await;
     Ok(true)
 }
 

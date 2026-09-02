@@ -444,7 +444,7 @@ opaque blobs, where the delimiter framing and the single append point both get i
 | `metadata_extension` | both | `json` | Extension of the metadata sidecar. Empty string writes and expects payload files only. |
 | `atomic` | sink | `true` | Write to `.tmp` and rename on completion. |
 | `done_file` | both | `DONE` | Sentinel that marks production finished. |
-| `emit_done` | sink | `false` | Create `done_file` when the publisher closes. Set it on the *last* producer only. |
+| `emit_done` | sink | `never` | When to create `done_file`: `success` (the route reached the end of its input and every chunk was written), `end` (whenever the producer closes, however the pass ended), `never`. Set it on the *last* producer only. |
 | `producer_file` | both | `PRODUCER` | File holding the producer lock, which keeps a second producer out. |
 | `consumer_file` | both | `CONSUMER` | File holding the consumer lock, which keeps a second draining consumer out. |
 | `drain_on_read` | source | `true` | Delete each chunk once its message is acknowledged. |
@@ -480,8 +480,19 @@ separate signal — the `done_file` sentinel:
 - `stop_on_done` ends the stream once the queue is empty **and** `done_file` is present, so
   a producer that finished long ago still has its backlog drained first, and the gap between
   two producers does not cut the stream short.
-- Only the **last** producer should set `emit_done`. It writes the sentinel as it closes,
-  before releasing its lock, so a hand-off to another producer cannot lose it.
+- Only the **last** producer should set `emit_done`, and its value says what "finished"
+  has to mean. The sentinel is written as that producer closes, before its lock is
+  released, so a hand-off to another producer cannot lose it.
+  - `success` is the strict reading: the route reached the natural end of its input (an
+    exhausted source, or a `--drain` that emptied it) **and** every chunk the producer
+    accepted reached the disk. A route that is shut down, that fails, or that reconnects
+    writes nothing, so a `stop_on_done` consumer keeps waiting for the production that did
+    not finish. A *continuously running* producer never reaches a natural end, so `success`
+    on one of those means "never" in practice — use `end` there.
+  - `end` is the loose reading: nothing more is coming from here, whatever the reason. It
+    says nothing about whether everything worked, so a consumer will treat a truncated
+    stream as the whole of it — which is the right trade when the alternative is waiting
+    forever on a producer that may have died.
 - A producer opening the spool **deletes** an existing sentinel: it is producing again, and
   a stale marker would tell a `stop_on_done` consumer to exit the moment its queue first ran
   dry.
@@ -520,7 +531,8 @@ batch that empties a listing can be shorter than the route's `batch_size`.
 
 ```yaml
 # Producer: raw H.264 chunks with a telemetry sidecar. Holds the PRODUCER lock while it
-# runs; `emit_done` marks production finished on close, which is what ends the stream below.
+# runs; on a clean finish it writes DONE, which is what ends the consumer's stream below.
+# Use `emit_done: end` instead if the consumer must not wait on a producer that may die.
 frame_capture:
   input:
     memory:
@@ -531,7 +543,7 @@ frame_capture:
       naming_pattern: "{seq:06d}_{timestamp}"
       payload_extension: ".h264"
       metadata_extension: ".json"
-      emit_done: true
+      emit_done: success
 
 # Consumer: drain in sequence order, delete as we go, exit when the producer is done.
 frame_ingest:

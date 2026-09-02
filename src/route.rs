@@ -14,8 +14,8 @@ use crate::errors::ProcessingError;
 pub use crate::models::Route;
 use crate::models::{Endpoint, EndpointType, Middleware, NameBy, RouteOptions};
 use crate::traits::{
-    BatchCommitFunc, ConsumerError, EndpointStatus, Handler, HandlerError, MessageConsumer,
-    MessageDisposition, MessagePublisher, PublisherError, SentBatch,
+    BatchCommitFunc, ConsumerError, DisconnectOutcome, EndpointStatus, Handler, HandlerError,
+    MessageConsumer, MessageDisposition, MessagePublisher, PublisherError, SentBatch,
 };
 use async_channel::{bounded, Sender};
 use serde::de::DeserializeOwned;
@@ -208,11 +208,22 @@ pub(crate) async fn run_consumer_connect_hook(
     Ok(())
 }
 
+/// The outcome a runner's return value describes: `Ok(false)` is a natural end,
+/// `Ok(true)` a shutdown, `Err` a failure.
+pub(crate) fn disconnect_outcome(result: &anyhow::Result<bool>) -> DisconnectOutcome {
+    match result {
+        Ok(false) => DisconnectOutcome::Completed,
+        Ok(true) => DisconnectOutcome::Stopped,
+        Err(_) => DisconnectOutcome::Failed,
+    }
+}
+
 pub(crate) async fn run_publisher_disconnect_hook(
     route_name: &str,
     publisher: &Arc<dyn MessagePublisher>,
+    outcome: DisconnectOutcome,
 ) {
-    if let Some(hook) = publisher.on_disconnect_hook() {
+    if let Some(hook) = publisher.on_disconnect_with_outcome(outcome) {
         if let Err(err) = hook.await {
             warn!(
                 "Publisher on_disconnect hook failed for route '{}': {}",
@@ -1431,12 +1442,12 @@ impl Route {
         .await?;
         consumer.set_exit_on_empty(self.options.exit_on_empty);
         if let Err(err) = run_publisher_connect_hook(name, &publisher).await {
-            run_publisher_disconnect_hook(name, &publisher).await;
+            run_publisher_disconnect_hook(name, &publisher, DisconnectOutcome::Failed).await;
             return Err(err);
         }
         if let Err(err) = run_consumer_connect_hook(name, consumer.as_ref()).await {
             run_consumer_disconnect_hook(name, consumer.as_ref()).await;
-            run_publisher_disconnect_hook(name, &publisher).await;
+            run_publisher_disconnect_hook(name, &publisher, DisconnectOutcome::Failed).await;
             return Err(err);
         }
         let (err_tx, err_rx) = bounded(1);
@@ -1555,7 +1566,7 @@ impl Route {
         drop(err_rx);
         commit_router.shutdown().await;
         run_consumer_disconnect_hook(name, consumer.as_ref()).await;
-        run_publisher_disconnect_hook(name, &publisher).await;
+        run_publisher_disconnect_hook(name, &publisher, disconnect_outcome(&run_result)).await;
         run_result
     }
 
@@ -1610,12 +1621,12 @@ impl Route {
         .await?;
         consumer.set_exit_on_empty(self.options.exit_on_empty);
         if let Err(err) = run_publisher_connect_hook(name, &publisher).await {
-            run_publisher_disconnect_hook(name, &publisher).await;
+            run_publisher_disconnect_hook(name, &publisher, DisconnectOutcome::Failed).await;
             return Err(err);
         }
         if let Err(err) = run_consumer_connect_hook(name, consumer.as_ref()).await {
             run_consumer_disconnect_hook(name, consumer.as_ref()).await;
-            run_publisher_disconnect_hook(name, &publisher).await;
+            run_publisher_disconnect_hook(name, &publisher, DisconnectOutcome::Failed).await;
             return Err(err);
         }
         if let Some(tx) = ready_tx {
@@ -1837,7 +1848,15 @@ impl Route {
         // Close sequencer (if any) now that all in-flight commits have drained.
         commit_router.shutdown().await;
         run_consumer_disconnect_hook(name, consumer.as_ref()).await;
-        run_publisher_disconnect_hook(name, &publisher).await;
+        // Mirrors the returns below, without consuming the error channel they read.
+        let outcome = if loop_error.is_some() || !err_rx.is_empty() {
+            DisconnectOutcome::Failed
+        } else if !exited_on_empty && shutdown_rx.is_empty() {
+            DisconnectOutcome::Stopped
+        } else {
+            DisconnectOutcome::Completed
+        };
+        run_publisher_disconnect_hook(name, &publisher, outcome).await;
 
         if let Some(err) = loop_error {
             return Err(err);
