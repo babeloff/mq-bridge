@@ -32,8 +32,11 @@
 //! choice rather than the System V one, and what lets the producer exit while the consumer
 //! drains), and in keeping control information in a file of its own — the payload/sidecar
 //! split. It differs in having no privileged daemon to serialize access, which is why
-//! exclusion is a pair of pid locks instead. See `docs/CONFIGURATION.md` (Directory spool →
-//! Further reading) for the sources.
+//! exclusion is a pair of pid locks instead, and why a chunk's states are implicit in the
+//! filesystem rather than owned by a supervisor. The vocabulary maps: a NonStop spooler's
+//! *collector* is this publisher, its *print process* this consumer, its *perusal process* a
+//! `drain_on_read: false` reader, and `PRINTCOMPLETE` the ack that deletes a chunk. See
+//! `docs/CONFIGURATION.md` (Directory spool → Further reading) for the sources.
 
 use crate::models::{DirSpoolConfig, SpoolFsync};
 use crate::traits::{

@@ -664,19 +664,41 @@ directory:
 - [Spooling: print spoolers in practice](https://www.onenoughtone.com/learn/spooling/2) — a
   modern worked example, tracing a job through CUPS end to end: the `cupsd` scheduler, the
   queue under `/var/spool/cups/`, filter chains, and device backends.
+- *Spooler Programmer's Guide*, Hewlett-Packard, part number 522287-002, August 2012
+  ([PDF](http://nonstoptools.com/manuals/Spoolcom-Guide.pdf) — the file is named for
+  Spoolcom, one component it documents, but it is the programmer's guide) — the deepest of
+  these, and the one closest to this endpoint's problem. It specifies a production spooler
+  (HP NonStop, documented since 1995) as a set of cooperating processes with explicit state
+  machines: a supervisor, *collectors* that accept data from application programs and write
+  it to disk, *print processes* that drain a job and mark it complete, and *perusal
+  processes* that read spooled data **without** consuming it. Worth reading for the state
+  diagrams — job, collector, print process, device — and for the chapter on spooling from a
+  fault-tolerant process pair, which is the classical treatment of the question this
+  endpoint answers with locks and redelivery: what a spool owes a producer that may die
+  mid-job.
 
-Three things `dir_spool` takes from that tradition. The directory *is* the queue, so the
+Four things `dir_spool` takes from that tradition. The directory *is* the queue, so the
 producer's obligation ends when the file lands and a crash on either side leaves a state you
 can read with `ls`. Data is copied into the spool rather than referenced in place — the BSD
 choice rather than the System V one — which is what lets the producer finish and exit while
-the consumer is still draining. And the control information is a separate file from the data,
-which is what the payload/sidecar split is, and why the two extensions must differ.
+the consumer is still draining. The control information is a separate file from the data,
+which is what the payload/sidecar split is, and why the two extensions must differ. And a
+reader that consumes is a different thing from a reader that only looks: NonStop's *perusal
+process* is `drain_on_read: false`, which is why several of those may share a spool while
+only one drainer may.
 
-One thing it does differently: a classic spooler has a single privileged daemon serializing
-access to the queue, and `dir_spool` has no daemon at all. That is why exclusion is done with
-the `producer_file` and `consumer_file` pid locks instead, and why the cardinality rules above
-have to be stated rather than enforced by a process boundary. The filter chains a print
-spooler applies on the way out are, in mq-bridge, the route's middleware and handlers.
+The vocabulary maps closely enough to be worth keeping in mind. A NonStop *collector* is
+this endpoint's publisher, a *print process* its consumer, `PRINTCOMPLETE` the acknowledgement
+that deletes a chunk, a *job number* the sequence in a chunk's name, and the supervisor's
+*ready list* the cached listing a consumer serves batches from.
+
+What it does differently is have no supervisor. A classic spooler puts one privileged daemon
+in front of the queue and lets it serialize access and own the state machine; `dir_spool` has
+no daemon at all, which is why exclusion is a pair of pid locks, why the cardinality rules
+above have to be stated rather than enforced by a process boundary, and why the states a
+chunk moves through are implicit in the filesystem rather than written down as a diagram. The
+filter chains a print spooler applies on the way out are, in mq-bridge, the route's middleware
+and handlers.
 
 ### IDE Support (Schema Validation) 
 mq-bridge includes a JSON schema for configuration validation and auto-completion. 
