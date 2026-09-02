@@ -1,4 +1,4 @@
-const { test, expect } = require("@playwright/test");
+const { test, expect } = require("./fixtures");
 
 const BASE_CONFIG = {
   log_level: "info",
@@ -130,17 +130,9 @@ async function expectFormLabelAbsent(page, text) {
   ).toHaveCount(0);
 }
 
+// Uncaught exceptions are caught for every spec by the shared base in fixtures.js.
 test.beforeEach(async ({ page }) => {
   await resetConfig(page);
-  const pageErrors = [];
-  page.on("pageerror", (error) => {
-    pageErrors.push(error);
-  });
-  page.__pageErrors = pageErrors;
-});
-
-test.afterEach(async ({ page }) => {
-  expect(page.__pageErrors || []).toEqual([]);
 });
 
 test("publisher advanced fields can be expanded and middlewares can be added", async ({ page }) => {

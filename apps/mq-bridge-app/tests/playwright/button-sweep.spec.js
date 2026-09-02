@@ -9,13 +9,15 @@
  * Each button is clicked from a freshly reloaded page with a freshly reset
  * config, so one button's side effects cannot mask or break the next one.
  */
-const { test, expect } = require("@playwright/test");
+const { test, expect } = require("./fixtures");
 const { resetConfig, gotoView } = require("./helpers");
 
 // Requests the app issues on a 1s timer; they prove nothing about a click.
 const POLLING_PATHS = ["/runtime-status", "/peer-status"];
 // Subtrees those pollers rewrite, excluded from the DOM signature.
 const VOLATILE_SELECTORS = ["#runtime-status", "#peer-status"];
+// How long a click gets to show an effect before it counts as inert.
+const CLICK_BUDGET_MS = 500;
 
 /** Open one of a panel's content tabs so the buttons in its pane become reachable. */
 const subtab = (target) => (page) => page.locator(`button.content-tab[data-target="${target}"]`).click();
@@ -218,174 +220,219 @@ async function settle(page) {
     .toBe(true);
 }
 
+/** The families VIEWS declares, in declaration order. */
+const FAMILIES = [...new Set(VIEWS.map((view) => view.family))];
+
+/**
+ * Wire up everything a click's effect can show up in. Returns the mutable record
+ * the sweep resets before each button.
+ */
+function observe(page) {
+  const observed = { requests: [], pageErrors: [], fileChoosers: 0, downloads: 0 };
+
+  page.on("request", (request) => {
+    if (!isPolling(request.url())) observed.requests.push(request.url());
+  });
+  page.on("pageerror", (error) => observed.pageErrors.push(String(error)));
+  // Registering this listener disables Playwright's auto-cancel, so the chooser
+  // must be dismissed here — otherwise it stays open and blocks every
+  // subsequent click in the sweep with an actionability timeout.
+  page.on("filechooser", (chooser) => {
+    observed.fileChoosers += 1;
+    void chooser.setFiles([]).catch(() => {});
+  });
+  page.on("download", () => {
+    observed.downloads += 1;
+  });
+  // The app uses its own wa-dialog, but never let a native one block the run.
+  page.on("dialog", (dialog) => void dialog.dismiss().catch(() => {}));
+
+  return observed;
+}
+
 test.describe("dead button sweep", () => {
-  test("every visible button does something when clicked", async ({ page }, testInfo) => {
-    // Ten states, each button clicked from its own reload. The budget is sized
-    // for a loaded runner, not for the ~3min this takes on an idle one.
-    testInfo.setTimeout(900_000);
+  // The sweep clicks Send too, against a publisher whose endpoint nothing is
+  // listening on. The 500 that comes back is the sweep doing its job.
+  test.use({ allowedPageProblems: /\/publish|500 \(Internal Server Error\)/ });
 
-    await page.addInitScript(installProbe);
+  /**
+   * One test per family rather than one for the whole app, so the families run
+   * on separate workers. Not per *state*: the states in a family share a sidebar
+   * and a toolbar, and the dedup that keeps 90 clicks from becoming 169 only
+   * holds within a family. Splitting finer would multiply the work, not divide
+   * it.
+   */
+  for (const family of FAMILIES) {
+    const states = VIEWS.filter((view) => view.family === family);
 
-    const requests = [];
-    const pageErrors = [];
-    let fileChoosers = 0;
-    let downloads = 0;
+    test(`every visible button in ${family} does something when clicked`, async ({ page }, testInfo) => {
+      // Budget sized for a loaded runner, not for the ~1min this takes idle.
+      testInfo.setTimeout(600_000);
 
-    page.on("request", (request) => {
-      if (!isPolling(request.url())) requests.push(request.url());
+      await page.addInitScript(installProbe);
+      const observed = observe(page);
+
+      const findings = [];
+      const skipped = [];
+      // Scenes in one family share a sidebar and a toolbar; without this the same
+      // button would be clicked once per scene for no extra coverage.
+      const sweptKeys = new Set();
+      let clicked = 0;
+      let deduped = 0;
+
+      for (const view of states) {
+        await resetConfig(page);
+        await freshView(page, view);
+        const inventory = (await page.evaluate(tagButtons, view.scope)).filter((button) => {
+          if (!button.visible) {
+            skipped.push({ view, button, reason: "not visible" });
+            return false;
+          }
+          if (button.disabled) {
+            skipped.push({ view, button, reason: "disabled" });
+            return false;
+          }
+          if (button.active) {
+            skipped.push({ view, button, reason: "already active" });
+            return false;
+          }
+          if (DRAG_HANDLE.test(button.label)) {
+            skipped.push({ view, button, reason: "drag handle" });
+            return false;
+          }
+          if (sweptKeys.has(button.key)) {
+            deduped += 1;
+            return false;
+          }
+          sweptKeys.add(button.key);
+          return true;
+        });
+
+        for (const button of inventory) {
+          await resetConfig(page);
+          await freshView(page, view);
+          const current = await page.evaluate(tagButtons, view.scope);
+          const match = current.find((entry) => entry.key === button.key);
+          if (!match || !match.visible || match.disabled || match.active) {
+            skipped.push({ view, button, reason: "not reachable on reload" });
+            continue;
+          }
+
+          const escapedKey = button.key.replace(/(["\\])/g, "\\$1");
+          const target = page.locator(`[data-sweep-key="${escapedKey}"]`);
+          const before = await domSignature(page);
+          const hashBefore = page.url();
+          observed.requests.length = 0;
+          observed.pageErrors.length = 0;
+          observed.fileChoosers = 0;
+          observed.downloads = 0;
+
+          let clickError = null;
+          try {
+            await target.click({ timeout: 5_000 });
+            clicked += 1;
+          } catch (error) {
+            clickError = String(error).split("\n")[0];
+          }
+
+          // Async handlers (fetch, dialog mount, Svelte flush) land a tick or two
+          // after the click, so poll for the effect rather than paying the
+          // slowest button's cost on every one: a live button resolves in a few
+          // ms and only a genuinely inert one waits out the budget.
+          //
+          // Exiting early can miss an exception thrown after the effect landed.
+          // The shared fixture still records every pageerror and fails the test
+          // at teardown; what is lost is only the attribution to this button.
+          const deadline = Date.now() + CLICK_BUDGET_MS;
+          let after;
+          let probe;
+          let alive;
+          for (;;) {
+            after = await domSignature(page);
+            probe = await page.evaluate(() => window.__mqbProbe || { clipboard: 0, objectUrls: 0 });
+            alive =
+              after !== before ||
+              page.url() !== hashBefore ||
+              observed.requests.length > 0 ||
+              observed.fileChoosers > 0 ||
+              observed.downloads > 0 ||
+              probe.clipboard > 0 ||
+              probe.objectUrls > 0;
+            if (alive || observed.pageErrors.length > 0 || Date.now() >= deadline) break;
+            await page.waitForTimeout(25);
+          }
+
+          if (clickError) {
+            findings.push(`${view.name}: "${button.label}" — click failed: ${clickError}`);
+            continue;
+          }
+          if (observed.pageErrors.length > 0) {
+            findings.push(`${view.name}: "${button.label}" — threw: ${observed.pageErrors[0]}`);
+            continue;
+          }
+
+          if (!alive && !EXPECTED_INERT.includes(button.label)) {
+            findings.push(`${view.name}: "${button.label}" — click had no observable effect`);
+          }
+        }
+      }
+
+      testInfo.attach("skipped-buttons", {
+        body: skipped.map((entry) => `${entry.view.name}: "${entry.button.label}" (${entry.reason})`).join("\n"),
+        contentType: "text/plain",
+      });
+      console.log(
+        `${family}: swept ${clicked} buttons across ${states.length} state(s) ` +
+          `(${deduped} reachable from more than one, clicked once)`,
+      );
+
+      expect(findings, `dead or broken buttons:\n  ${findings.join("\n  ")}`).toEqual([]);
     });
-    page.on("pageerror", (error) => pageErrors.push(String(error)));
-    // Registering this listener disables Playwright's auto-cancel, so the chooser
-    // must be dismissed here — otherwise it stays open and blocks every
-    // subsequent click in the sweep with an actionability timeout.
-    page.on("filechooser", (chooser) => {
-      fileChoosers += 1;
-      void chooser.setFiles([]).catch(() => {});
-    });
-    page.on("download", () => {
-      downloads += 1;
-    });
-    // The app uses its own wa-dialog, but never let a native one block the run.
-    page.on("dialog", (dialog) => void dialog.dismiss().catch(() => {}));
+  }
 
-    const findings = [];
-    const skipped = [];
-    // Scenes in one family share a sidebar and a toolbar; without this the same
-    // button would be clicked once per scene for no extra coverage.
-    const sweptKeys = new Set();
-    // Reached anywhere counts as reached: the same button is invisible in every
-    // view but its own, so a per-family key would report it as a coverage gap.
-    // The key is still per *button*, not per label — the two JSON dialogs each
-    // carry a "Copy" and a "Close", and one must not account for the other.
-    const sweptIds = new Set();
-    let clicked = 0;
-    let deduped = 0;
+  /**
+   * Coverage for the whole app, which no single family's test can see: a button
+   * is invisible in every view but its own, so a per-family verdict would report
+   * the other families' buttons as gaps. Inventory only, no clicking — this test
+   * answers "does anything render this button", not "does it work".
+   */
+  test("every button is reachable from some view", async ({ page }, testInfo) => {
+    testInfo.setTimeout(300_000);
 
+    // Keyed per *button*, not per label: the two JSON dialogs each carry a
+    // "Copy" and a "Close", and one must not account for the other.
+    const seen = new Map();
     for (const view of VIEWS) {
       await resetConfig(page);
       await freshView(page, view);
-      const inventory = (await page.evaluate(tagButtons, view.scope)).filter((button) => {
-        if (!button.visible) {
-          skipped.push({ view, button, reason: "not visible" });
-          return false;
+      for (const button of await page.evaluate(tagButtons, view.scope)) {
+        const entry = seen.get(button.key) || { label: button.label, views: new Set(), reached: false };
+        // Visible is the whole test. A visible button that is disabled or already
+        // active was found and deliberately not clicked; that is a decision, not
+        // a gap. A button no state ever renders is the gap.
+        if (button.visible) {
+          entry.reached = true;
+          entry.views.add(view.name);
         }
-        if (button.disabled) {
-          skipped.push({ view, button, reason: "disabled" });
-          return false;
-        }
-        if (button.active) {
-          skipped.push({ view, button, reason: "already active" });
-          return false;
-        }
-        if (DRAG_HANDLE.test(button.label)) {
-          skipped.push({ view, button, reason: "drag handle" });
-          return false;
-        }
-        const sweepId = `${view.family}:${button.key}`;
-        if (sweptKeys.has(sweepId)) {
-          deduped += 1;
-          return false;
-        }
-        sweptKeys.add(sweepId);
-        sweptIds.add(button.key);
-        return true;
-      });
-
-      for (const button of inventory) {
-        await resetConfig(page);
-        await freshView(page, view);
-        const current = await page.evaluate(tagButtons, view.scope);
-        const match = current.find((entry) => entry.key === button.key);
-        if (!match || !match.visible || match.disabled || match.active) {
-          skipped.push({ view, button, reason: "not reachable on reload" });
-          continue;
-        }
-
-        const escapedKey = button.key.replace(/(["\\])/g, "\\$1");
-        const target = page.locator(`[data-sweep-key="${escapedKey}"]`);
-        const before = await domSignature(page);
-        const hashBefore = page.url();
-        requests.length = 0;
-        pageErrors.length = 0;
-        fileChoosers = 0;
-        downloads = 0;
-
-        let clickError = null;
-        try {
-          await target.click({ timeout: 5_000 });
-          clicked += 1;
-        } catch (error) {
-          clickError = String(error).split("\n")[0];
-        }
-
-        // Give async handlers (fetch, dialog mount, Svelte flush) time to land.
-        await page.waitForTimeout(500);
-
-        const after = await domSignature(page);
-        const probe = await page.evaluate(() => window.__mqbProbe || { clipboard: 0, objectUrls: 0 });
-
-        if (clickError) {
-          findings.push(`${view.name}: "${button.label}" — click failed: ${clickError}`);
-          continue;
-        }
-        if (pageErrors.length > 0) {
-          findings.push(`${view.name}: "${button.label}" — threw: ${pageErrors[0]}`);
-          continue;
-        }
-
-        const alive =
-          after !== before ||
-          page.url() !== hashBefore ||
-          requests.length > 0 ||
-          fileChoosers > 0 ||
-          downloads > 0 ||
-          probe.clipboard > 0 ||
-          probe.objectUrls > 0;
-
-        if (!alive && !EXPECTED_INERT.includes(button.label)) {
-          findings.push(`${view.name}: "${button.label}" — click had no observable effect`);
-        }
+        seen.set(button.key, entry);
       }
     }
 
-    // Every view renders the whole app's DOM with the inactive panels display:none,
-    // so a raw skip count counts the same button once per state. What matters is
-    // the buttons no state reached at all.
-    // "disabled", "already active" and drag handles are deliberate exclusions, not
-    // gaps; a button that was never *visible* anywhere is the thing to report.
-    const accounted = new Set(sweptIds);
-    for (const entry of skipped) {
-      if (entry.reason === "already active" || entry.reason === "disabled") accounted.add(entry.button.key);
-    }
-    const neverReached = skipped.filter(
-      (entry) =>
-        !accounted.has(entry.button.key) &&
-        !DRAG_HANDLE.test(entry.button.label) &&
-        (entry.reason === "not visible" || entry.reason === "not reachable on reload"),
+    const neverReached = [...seen.values()].filter(
+      (entry) => !entry.reached && !DRAG_HANDLE.test(entry.label),
     );
-    // Counting is per button; the lines are grouped by label only to read well.
-    const neverReachedKeys = new Set(neverReached.map((entry) => entry.button.key));
-    const byLabel = new Map();
-    for (const entry of neverReached) {
-      const seen = byLabel.get(entry.button.label) || new Set();
-      seen.add(entry.reason);
-      byLabel.set(entry.button.label, seen);
-    }
 
-    testInfo.attach("skipped-buttons", {
-      body: skipped.map((entry) => `${entry.view.name}: "${entry.button.label}" (${entry.reason})`).join("\n"),
+    testInfo.attach("button-coverage", {
+      body: [...seen.entries()]
+        .map(([key, entry]) => `${entry.reached ? "reached" : "NEVER  "} ${key} ${[...entry.views].join(", ")}`)
+        .join("\n"),
       contentType: "text/plain",
     });
     console.log(
-      `swept ${clicked} buttons across ${VIEWS.length} states ` +
-        `(${deduped} reachable from more than one state, clicked once); ` +
-        `${neverReachedKeys.size} buttons never reached`,
+      `${seen.size} buttons across ${VIEWS.length} states; ${neverReached.length} never reached`,
     );
-    if (neverReachedKeys.size > 0) {
-      const lines = [...byLabel].map(([label, reasons]) => `"${label}" (${[...reasons].join(", ")})`);
-      console.log(`never reached:\n  ${lines.join("\n  ")}`);
+    if (neverReached.length > 0) {
+      console.log(`never reached:\n  ${neverReached.map((entry) => `"${entry.label}"`).join("\n  ")}`);
     }
-
-    expect(findings, `dead or broken buttons:\n  ${findings.join("\n  ")}`).toEqual([]);
   });
 });

@@ -1,4 +1,6 @@
-const { test, expect } = require("@playwright/test");
+const fs = require("node:fs");
+const path = require("node:path");
+const { test, expect } = require("./fixtures");
 
 const VISUAL_CONFIG = {
   log_level: "info",
@@ -85,7 +87,28 @@ const screenshotOptions = {
   maxDiffPixelRatio: 0.001,
 };
 
-test.skip(!!process.env.CI, "Screenshot baselines are local-only; CI runs the behavioral UI suite.");
+/**
+ * Screenshots are only comparable against a baseline rendered by the same font
+ * stack, so each platform needs its own. Rather than skip on CI outright — which
+ * is how a layout regression reaches main between two local runs — skip only
+ * while this platform has no baseline yet, so committing one turns the suite on
+ * with no code change.
+ *
+ * To produce the Linux baselines CI needs, run the "App" workflow manually with
+ * `update_visual_baselines: true`; it renders them on the same runner image CI
+ * compares against and uploads them as an artifact to review and commit.
+ */
+const BASELINE_DIR = path.join(__dirname, "ui-visual.spec.js-snapshots");
+const hasBaseline = fs.existsSync(BASELINE_DIR)
+  && fs.readdirSync(BASELINE_DIR).some((file) => file.endsWith(`-${process.platform}.png`));
+
+test.skip(
+  !hasBaseline,
+  `No screenshot baselines for platform "${process.platform}". ` +
+    "Generate them by running the App workflow with update_visual_baselines=true " +
+    "(Linux/CI) or `npm run test:ui:update-screenshots` (this machine), " +
+    "review the diff, and commit them.",
+);
 
 async function stabilizeForScreenshot(page) {
   await page.addStyleTag({

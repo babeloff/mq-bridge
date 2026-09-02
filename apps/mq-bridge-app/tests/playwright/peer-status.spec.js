@@ -1,4 +1,4 @@
-const { test, expect } = require("@playwright/test");
+const { test, expect } = require("./fixtures");
 
 // Peer rows come from other mq-bridge processes on the same machine. Driving
 // them through a real second process would make these tests depend on process
@@ -253,14 +253,20 @@ test("a peer whose lease expires disappears from the sidebar", async ({ page }) 
   await expect(page.locator("#cons-list .peer-group-label")).toHaveCount(0);
 });
 
-test("a non-local client is shown no peer section at all", async ({ page }) => {
-  const state = await stubPeerStatus(page, [SELF, MCP_PEER]);
-  state.status = 403;
-  await page.goto("/#consumers");
+test.describe("non-local client", () => {
+  // This case drives the peer endpoint into the 403 it is meant to return, so
+  // the resulting console error is the behaviour under test, not a defect.
+  test.use({ allowedPageProblems: /403 \(Forbidden\)/ });
 
-  await expect(page.locator("#cons-list .sidebar-item")).not.toHaveCount(0);
-  await expect(page.locator("#cons-list .sidebar-item--peer")).toHaveCount(0);
-  await expect(page.locator("#cons-list .peer-group-label")).toHaveCount(0);
+  test("a non-local client is shown no peer section at all", async ({ page }) => {
+    const state = await stubPeerStatus(page, [SELF, MCP_PEER]);
+    state.status = 403;
+    await page.goto("/#consumers");
+
+    await expect(page.locator("#cons-list .sidebar-item")).not.toHaveCount(0);
+    await expect(page.locator("#cons-list .sidebar-item--peer")).toHaveCount(0);
+    await expect(page.locator("#cons-list .peer-group-label")).toHaveCount(0);
+  });
 });
 
 test("the sidebar filter applies to peer rows", async ({ page }) => {

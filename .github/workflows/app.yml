@@ -13,6 +13,11 @@ on:
   # than a second copy of it that can drift.
   workflow_call:
   workflow_dispatch:
+    inputs:
+      update_visual_baselines:
+        description: "Re-render the Linux screenshot baselines and upload them as an artifact"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -121,9 +126,12 @@ jobs:
         working-directory: apps/mq-bridge-app
         run: npm run test:unit
 
-      - name: Install Playwright browser
+      - name: Install Playwright browsers
         working-directory: apps/mq-bridge-app
-        run: npx playwright install --with-deps chromium
+        # firefox and webkit run only the cross-browser specs (see
+        # playwright.config.js), which is where engine-specific form-control
+        # behaviour has bitten before.
+        run: npx playwright install --with-deps chromium firefox webkit
 
       - name: Build app binary for UI tests
         working-directory: apps/mq-bridge-app
@@ -132,6 +140,22 @@ jobs:
       - name: Run frontend UI tests
         working-directory: apps/mq-bridge-app
         run: npm run test:ui
+
+      # The screenshot suite skips itself while this platform has no committed
+      # baseline. Run this workflow manually with update_visual_baselines=true to
+      # render them here, then review and commit the artifact.
+      - name: Re-render visual baselines
+        if: inputs.update_visual_baselines
+        working-directory: apps/mq-bridge-app
+        run: npm run build:ui && npx playwright test ui-visual.spec.js --update-snapshots=all || true
+
+      - name: Upload visual baselines
+        if: inputs.update_visual_baselines
+        uses: actions/upload-artifact@v7
+        with:
+          name: visual-baselines-linux
+          path: apps/mq-bridge-app/tests/playwright/ui-visual.spec.js-snapshots/
+          if-no-files-found: warn
 
       - name: Upload Playwright test artifacts
         if: failure()

@@ -7,13 +7,14 @@ import { fileURLToPath } from "node:url";
 
 const checkOnly = process.argv.includes("--check");
 const appRoot = resolve(fileURLToPath(new URL("../..", import.meta.url)));
-const workspaceRoot = resolve(appRoot, "../..");
 const outputPath = resolve(appRoot, "ui/src/lib/generated/ui-types.ts");
 
 const rawSchemas = execFileSync(
   "cargo",
   ["run", "-p", "mq-bridge-app-core", "--bin", "export-ui-type-schemas", "--quiet"],
-  { cwd: workspaceRoot, encoding: "utf8" },
+  // The app is its own cargo workspace and the repo root excludes `apps/`, so
+  // running this from the root cannot see `mq-bridge-app-core` at all.
+  { cwd: appRoot, encoding: "utf8" },
 );
 
 const schemas = JSON.parse(rawSchemas);

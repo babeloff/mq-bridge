@@ -37,18 +37,32 @@ an explicit app package because the workspace default member is the engine.
 
 - Unit tests:
   - Commands: `npm run test:unit` and `cargo test -p mq-bridge-app-core -p mq-bridge-app`
+  - Coverage report: `npm run test:unit:coverage`
   - Focused suites used often:
     - `tests/unit/consumers-view.test.ts`
     - `tests/unit/publishers-view.test.ts`
-    - `tests/unit/routes-view.test.ts`
+    - `tests/unit/publishers-view-model.test.ts` (random action sequences against the panel's invariants)
+    - `tests/unit/routes.test.ts`
     - `tests/unit/import-export.test.ts`
     - `tests/unit/bootstrap-runtime-status.test.ts`
+  - Components are mounted for real (`mount` from `svelte`), not asserted against
+    `.svelte` source text; see `tests/unit/component-regressions.test.ts`.
+    `tests/unit/dom-setup.ts` supplies the jsdom gaps the `wa-*` elements need.
 
 - UI/E2E tests:
-  - Command: `npm run test:ui`
+  - Command: `npm run test:ui` (all engines) or `npm run test:ui:chromium` (fast loop)
   - Main spec: `tests/playwright/ui.spec.js`
+  - Every spec imports `test`/`expect` from `tests/playwright/fixtures.js`, which
+    fails a test on any uncaught exception, `console.error`, failed request or
+    5xx response. Import from there, not from `@playwright/test`.
+  - `button-sweep.spec.js` proves every button does something; `button-outcomes.spec.js`
+    pins what specific buttons do; `a11y.spec.js` scans each view with axe.
+  - firefox and webkit run only the cross-browser specs listed in `playwright.config.js`.
   - Tests currently reset config before each case via `/config` post.
   - Visual regression baselines use Playwright's built-in `toHaveScreenshot` assertions in `tests/playwright/ui-visual.spec.js`.
+  - That suite skips itself on any platform with no committed baseline. To add the
+    Linux ones CI needs, run the App workflow manually with
+    `update_visual_baselines=true` and commit the uploaded artifact.
   - Do not use LLM-based screenshot comparison.
   - Do not run `npm run test:ui:update-screenshots` just to make failing tests pass. Update screenshot baselines only after reviewing the diff and confirming the UI/layout change is intentional.
 
