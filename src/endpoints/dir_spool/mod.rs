@@ -458,7 +458,7 @@ pub(crate) fn validate_control_files(config: &DirSpoolConfig) -> anyhow::Result<
                 "dir_spool '{field}' must not be empty: it names a file in the spool directory"
             ));
         }
-        if name.contains('/') || name.contains('\\') {
+        if name.contains('/') || name.contains('\\') || name == "." || name == ".." {
             return Err(anyhow::anyhow!(
                 "dir_spool '{field}' must name a file in the spool directory, not a path: {name}"
             ));
@@ -938,20 +938,15 @@ impl MessagePublisher for DirSpoolPublisher {
         }
     }
 
-    // The route calls `on_disconnect_with_outcome`; this is the fallback for a caller that
-    // closes the publisher without saying why. It is read as `Stopped`, the cautious answer:
-    // an unexplained close is not evidence that production finished.
+    // Closing is this producer's whole statement about production: the sentinel it may owe
+    // a `stop_on_done` consumer, and the lock the next producer needs. A close with no
+    // outcome in scope reads as `Stopped` — an unexplained close is not evidence that
+    // production finished.
     fn on_disconnect_hook(&self) -> Option<BoxFuture<'_, anyhow::Result<()>>> {
-        Some(Box::pin(self.close_with(DisconnectOutcome::Stopped)))
-    }
-
-    fn on_disconnect_with_outcome(
-        &self,
-        outcome: DisconnectOutcome,
-    ) -> Option<BoxFuture<'_, anyhow::Result<()>>> {
-        // Closing is this producer's whole statement about production: the sentinel it may
-        // owe a `stop_on_done` consumer, and the lock the next producer needs.
-        Some(Box::pin(self.close_with(outcome)))
+        Some(Box::pin(async move {
+            let outcome = crate::traits::disconnect_outcome().unwrap_or(DisconnectOutcome::Stopped);
+            self.close_with(outcome).await
+        }))
     }
 
     // The spool is a queue, and the sequence number a chunk gets is assigned inside
@@ -1305,11 +1300,12 @@ impl DirSpoolConsumer {
     }
 
     /// What to hand back when the directory holds nothing to read.
-    async fn idle(&self) -> Result<ReceivedBatch, ConsumerError> {
-        // The sentinel only ends the stream once the queue behind it is empty, which is
-        // the whole point of the two-part condition: a producer that finished long ago
-        // still has its backlog drained first.
-        if self.stop_on_done && self.done_present().await {
+    ///
+    /// `done_before_scan` must be sampled *before* the listing that found nothing: a
+    /// sentinel seen afterwards says nothing about the chunks that scan was too early to
+    /// see. Only the two together prove the queue is drained.
+    async fn idle(&self, done_before_scan: bool) -> Result<ReceivedBatch, ConsumerError> {
+        if done_before_scan {
             return Err(ConsumerError::EndOfStream);
         }
         // Under `--drain` an empty batch is the exit signal, so surface it immediately
@@ -1398,6 +1394,9 @@ impl MessageConsumer for DirSpoolConsumer {
         // Two attempts: a cached listing whose chunks have all been deleted under us is
         // stale, so drop it and rescan once rather than reporting an empty queue over a
         // directory that may well have filled up again.
+        // Sampled ahead of the listing: a sentinel written between the scan and this
+        // check would end the stream over a chunk the scan had not yet seen.
+        let done_before_scan = self.stop_on_done && self.done_present().await;
         let mut messages = Vec::new();
         let mut delivered = Vec::new();
         for _ in 0..2 {
@@ -1406,7 +1405,7 @@ impl MessageConsumer for DirSpoolConsumer {
                 .await
                 .map_err(ConsumerError::Connection)?;
             if ready.is_empty() {
-                return self.idle().await;
+                return self.idle(done_before_scan).await;
             }
             (messages, delivered) = self.read_ready(ready).await;
             if !messages.is_empty() {

@@ -16,8 +16,7 @@ dir-spool:///absolute/path/to/spool?<option>=<value>
 ```
 
 The aliases `spool://` and `dirspool://` are also accepted. The directory path
-comes from the URI path, not a `path` query parameter. On Windows, use a URI
-such as `dir-spool:///C:/spool/orders`.
+comes from the URI path, not a `path` query parameter.
 
 ## Examples
 
@@ -37,9 +36,11 @@ mqb copy --drain \
   --to 'postgres://user:pass@localhost/app?table=orders'
 ```
 
-`stop_on_done=true` waits for both conditions: the queue is empty and the
-producer's `DONE` sentinel exists. Set `emit_done` only on the last producer.
-A producer opening the spool removes a stale sentinel before writing again.
+This one-shot example starts after the producer command has completed, so
+`--drain` exits when the backlog is empty. In a continuously running route,
+`stop_on_done=true` ends the source only when both the queue is empty and the
+producer's `DONE` sentinel exists. Set `emit_done` only on the last producer;
+a producer opening the spool removes a stale sentinel before writing again.
 
 **Shard a high-volume spool:**
 

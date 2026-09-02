@@ -582,10 +582,11 @@ Three things to get right:
   name, so that front has to be a fixed width — otherwise chunk 999 and chunk 1000 would
   shard to different depths and lexical order would stop being queue order. A pattern that
   cannot be split is rejected at startup, as is one with no room left for the file name.
-- **Both ends must agree on `shard_depth`.** A consumer only descends as far as its own
-  setting, so one left at `0` against a sharded spool reads it as permanently empty (and
-  under `stop_on_done`, ends the stream immediately). It warns when a scan finds
-  subdirectories it is not configured to enter, which is what that mistake looks like.
+- **Both ends must agree on `shard_depth` and `shard_width`.** A consumer descends only as
+  far as its own depth, into directory names only as wide as its own width, so either one
+  set differently from the producer reads the spool as permanently empty (and under
+  `stop_on_done`, ends the stream immediately). It warns when a scan finds subdirectories
+  it is not configured to enter, which is what that mistake looks like.
 - **A control file cannot be shaped like a shard.** `done_file: "000"` with
   `shard_width: 3` is rejected, since one name cannot be both the sentinel and a directory.
 

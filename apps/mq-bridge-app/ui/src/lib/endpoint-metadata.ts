@@ -172,7 +172,8 @@ const ENDPOINT_KIND_OVERRIDES = {
     },
   },
   dir_spool: {
-    order: 13,
+    // Between `file` (12) and `static` (13); the integer ranks either side are taken.
+    order: 12.5,
     basicFields: ["path", "payload_extension", "drain_on_read"],
     requestBar: {
       fields: [{ inputId: "pub-url", field: "path", label: "PATH", placeholder: "/tmp/spool" }],

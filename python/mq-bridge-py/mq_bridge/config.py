@@ -13,6 +13,7 @@ DeadLetterQueueMiddleware = dict
 DeduplicationMiddleware = dict
 DelayMiddleware = dict
 DetailedMappingRule = dict
+DirSpoolConfig = dict
 EncryptionConfig = dict
 Endpoint = dict
 FileConfig = dict
@@ -57,6 +58,9 @@ MongoDbFormat = str
 MqttProtocol = str
 NameBy = str
 NatsDeliverPolicy = str
+SpoolClaim = str
+SpoolDone = str
+SpoolFsync = str
 StaticConfig = str
 TransformErrorPolicy = str
 WeakJoinTimeout = str
@@ -83,6 +87,7 @@ __all__ = [
     "DeduplicationMiddleware",
     "DelayMiddleware",
     "DetailedMappingRule",
+    "DirSpoolConfig",
     "EncryptionConfig",
     "Endpoint",
     "EndpointConfig",
@@ -119,6 +124,9 @@ __all__ = [
     "RouteConfig",
     "RoutesConfig",
     "SledConfig",
+    "SpoolClaim",
+    "SpoolDone",
+    "SpoolFsync",
     "SqlxConfig",
     "StaticConfig",
     "StreamBufferConfig",

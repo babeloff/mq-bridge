@@ -23,13 +23,16 @@ fn entries(dir: &std::path::Path) -> Vec<String> {
     names
 }
 
-/// Closes a producer the way the route does, saying how the pass ended.
+/// Closes a producer the way the route does, with the outcome in scope.
 async fn close_producer(publisher: &DirSpoolPublisher, outcome: DisconnectOutcome) {
-    publisher
-        .on_disconnect_with_outcome(outcome)
-        .expect("the publisher always has closing work to do")
-        .await
-        .unwrap();
+    crate::traits::with_disconnect_outcome(outcome, async {
+        publisher
+            .on_disconnect_hook()
+            .expect("the publisher always has closing work to do")
+            .await
+            .unwrap();
+    })
+    .await;
 }
 
 /// Every file under `dir`, as sorted relative paths, so an assertion can name the shape of
@@ -337,6 +340,38 @@ async fn redelivers_a_nacked_chunk_ahead_of_a_cached_backlog() {
         .collect();
     let expected: Vec<String> = (1..50).map(|index| format!("chunk-{index}")).collect();
     assert_eq!(payloads, expected);
+}
+
+/// A nack can land after a refill scan has already picked the chunk back up, putting the
+/// same name on both sides of the merge. One entry has to survive, not two: the second
+/// would deliver the chunk twice.
+#[tokio::test]
+async fn a_requeued_chunk_the_scan_already_found_is_merged_once() {
+    let dir = tempdir().unwrap();
+    let cfg = config(dir.path());
+
+    let publisher = DirSpoolPublisher::new(&cfg).await.unwrap();
+    publisher
+        .send_batch(vec![message("chunk-0", "seq")])
+        .await
+        .unwrap();
+
+    let mut consumer = DirSpoolConsumer::new(&cfg).await.unwrap();
+    let batch = consumer.receive_batch(1).await.unwrap();
+    (batch.commit)(vec![MessageDisposition::Nack])
+        .await
+        .unwrap();
+
+    // Stands in for a scan that overlapped the nack: the claim is already released, so
+    // the listing collects a name the requeue is still holding.
+    consumer.refill_ready(8).await.unwrap();
+    assert_eq!(consumer.ready.len(), 1);
+
+    let again = consumer.receive_batch(4).await.unwrap();
+    assert_eq!(again.messages.len(), 1);
+    assert_eq!(&again.messages[0].payload[..], b"chunk-0");
+    (again.commit)(vec![MessageDisposition::Ack]).await.unwrap();
+    assert!(consumer.ready.is_empty(), "the merge kept a duplicate");
 }
 
 /// A cached listing goes stale when something else empties the directory — an operator, a
@@ -1352,6 +1387,17 @@ async fn rejects_control_file_names_that_would_collide() {
             (cfg, "not a path")
         },
         {
+            // Names the spool directory itself rather than a file in it.
+            let mut cfg = config(dir.path());
+            cfg.done_file = ".".to_string();
+            (cfg, "not a path")
+        },
+        {
+            let mut cfg = config(dir.path());
+            cfg.producer_file = "..".to_string();
+            (cfg, "not a path")
+        },
+        {
             let mut cfg = config(dir.path());
             cfg.consumer_file = String::new();
             (cfg, "must not be empty")
@@ -1516,6 +1562,64 @@ async fn a_route_drains_a_spool_its_producer_has_already_finished_writing() {
     assert_eq!(entries(&spool), vec!["DONE".to_string()]);
 }
 
+/// The producing half of the same story, driven by a real route rather than a hand-closed
+/// publisher: the route decides the pass completed, and that verdict has to reach the sink
+/// for `emit_done: success` to mean anything. Nothing between the route and the publisher
+/// forwards it explicitly, so this is what proves the scoped outcome arrives.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_route_writing_into_a_spool_marks_it_done_when_it_completes() {
+    use crate::models::{Endpoint, EndpointType};
+    use crate::route::Route;
+
+    let dir = tempdir().unwrap();
+    let source = dir.path().join("source");
+    let sink = dir.path().join("sink");
+
+    let mut source_cfg = DirSpoolConfig::new(source.to_str().unwrap());
+    source_cfg.emit_done = SpoolDone::Success;
+    let producer = DirSpoolPublisher::new(&source_cfg).await.unwrap();
+    for index in 0..20 {
+        producer
+            .send_batch(vec![message(&format!("{index}"), "frame")])
+            .await
+            .unwrap();
+    }
+    close_producer(&producer, DisconnectOutcome::Completed).await;
+    drop(producer);
+
+    let mut consumer_cfg = DirSpoolConfig::new(source.to_str().unwrap());
+    consumer_cfg.stop_on_done = true;
+    let mut sink_cfg = DirSpoolConfig::new(sink.to_str().unwrap());
+    sink_cfg.emit_done = SpoolDone::Success;
+    let route = Route::new(
+        Endpoint::new(EndpointType::DirSpool(consumer_cfg)),
+        Endpoint::new(EndpointType::DirSpool(sink_cfg)),
+    )
+    .with_concurrency(4)
+    .with_batch_size(3);
+
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        route.run_until_err("spool_to_spool", None, None),
+    )
+    .await
+    .expect("the route should end once the source is drained")
+    .expect("the route should complete without errors");
+
+    assert!(
+        sink.join("DONE").exists(),
+        "a completed route must leave the sentinel; sink holds {:?}",
+        entries(&sink)
+    );
+
+    // And a consumer downstream of it can now drain to a clean end.
+    let mut downstream_cfg = DirSpoolConfig::new(sink.to_str().unwrap());
+    downstream_cfg.stop_on_done = true;
+    let mut downstream = DirSpoolConsumer::new(&downstream_cfg).await.unwrap();
+    let drained = drain(&mut downstream, 20).await;
+    assert_eq!(drained.len(), 20);
+}
+
 #[tokio::test]
 async fn drains_immediately_under_exit_on_empty() {
     let dir = tempdir().unwrap();
@@ -1531,5 +1635,58 @@ async fn drains_immediately_under_exit_on_empty() {
     assert!(
         started.elapsed() < Duration::from_secs(1),
         "a drain must not wait out the idle poll interval"
+    );
+}
+
+/// A publisher middleware knows nothing about spools: it forwards the disconnect hook and
+/// nothing else. The outcome still has to reach the sink through it, or `emit_done: success`
+/// silently degrades to never writing the sentinel behind any middleware at all.
+#[tokio::test]
+async fn the_outcome_reaches_the_sink_through_an_unaware_wrapper() {
+    use crate::traits::{MessagePublisher, PublisherError, Sent, SentBatch};
+    use std::any::Any;
+
+    struct PassThrough(std::sync::Arc<dyn MessagePublisher>);
+
+    #[async_trait::async_trait]
+    impl MessagePublisher for PassThrough {
+        fn on_disconnect_hook(&self) -> Option<crate::traits::BoxFuture<'_, anyhow::Result<()>>> {
+            self.0.on_disconnect_hook()
+        }
+
+        async fn send(&self, message: CanonicalMessage) -> Result<Sent, PublisherError> {
+            self.0.send(message).await
+        }
+
+        async fn send_batch(
+            &self,
+            messages: Vec<CanonicalMessage>,
+        ) -> Result<SentBatch, PublisherError> {
+            self.0.send_batch(messages).await
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    let dir = tempdir().unwrap();
+    let mut cfg = config(dir.path());
+    cfg.emit_done = SpoolDone::Success;
+
+    let publisher: std::sync::Arc<dyn MessagePublisher> =
+        std::sync::Arc::new(DirSpoolPublisher::new(&cfg).await.unwrap());
+    let wrapped = PassThrough(publisher);
+    wrapped.send(message("payload", "kind")).await.unwrap();
+
+    crate::traits::with_disconnect_outcome(DisconnectOutcome::Completed, async {
+        wrapped.on_disconnect_hook().unwrap().await.unwrap();
+    })
+    .await;
+
+    assert!(
+        dir.path().join("DONE").exists(),
+        "a wrapper that only forwards the hook must not lose the outcome; spool held {:?}",
+        entries(dir.path())
     );
 }

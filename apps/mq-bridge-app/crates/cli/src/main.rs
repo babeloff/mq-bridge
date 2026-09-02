@@ -1707,8 +1707,11 @@ fn base_endpoint_from_uri(uri: &str) -> anyhow::Result<mq_bridge::models::Endpoi
 
     if path_target {
         let path = uri.split('?').next().unwrap_or(uri);
-        let prefix = format!("{}://", parsed.scheme());
+        // `scheme://x` and the authority-less `scheme:/x` both name a path, so the
+        // slashes come off separately from the scheme.
+        let prefix = format!("{}:", parsed.scheme());
         let path = path.strip_prefix(prefix.as_str()).unwrap_or(path);
+        let path = path.strip_prefix("//").unwrap_or(path);
         if path.is_empty() {
             bail!("{tag} URI '{uri}' must include a path");
         }
@@ -2459,6 +2462,60 @@ mod uri_tests {
         let cfg = config("file:///var/log/app.log?mode=subscribe&delete=true", "file");
         assert_eq!(cfg["mode"], "subscribe");
         assert_eq!(cfg["delete"], true);
+    }
+
+    /// `dir_spool` is targeted by path like `file`, under three scheme spellings
+    /// (an underscore is not legal in a URI scheme).
+    #[test]
+    fn spool_scheme_takes_the_path_from_the_uri() {
+        for uri in [
+            "spool:///tmp/video?payload_extension=.h264",
+            "dir-spool:///tmp/video?payload_extension=.h264",
+            "dirspool:///tmp/video?payload_extension=.h264",
+        ] {
+            let cfg = config(uri, "dir_spool");
+            assert_eq!(cfg["path"], "/tmp/video", "for {uri}");
+            assert_eq!(cfg["payload_extension"], ".h264", "for {uri}");
+            assert!(cfg.get("url").is_none(), "{uri} must not carry a url field");
+        }
+    }
+
+    /// The authority-less form has no `//` to strip, so the scheme has to come off on
+    /// its own or the path keeps it and names a relative directory.
+    #[test]
+    fn a_path_uri_without_an_authority_still_yields_an_absolute_path() {
+        for (uri, tag) in [
+            ("spool:/tmp/video", "dir_spool"),
+            ("dir-spool:/tmp/video", "dir_spool"),
+            ("file:/tmp/out.jsonl", "file"),
+        ] {
+            assert_eq!(config(uri, tag)["path"], uri.split(':').nth(1).unwrap());
+        }
+    }
+
+    /// The producer/consumer settings from the documented example are all scalar
+    /// config fields, so none of them trips the unrecognised-param error.
+    #[test]
+    fn spool_producer_and_consumer_settings_are_config_fields() {
+        let cfg = config(
+            "spool:///tmp/q?naming_pattern={seq:06d}&emit_done=success&shard_depth=2",
+            "dir_spool",
+        );
+        assert_eq!(cfg["naming_pattern"], "{seq:06d}");
+        assert_eq!(cfg["emit_done"], "success");
+        assert_eq!(cfg["shard_depth"], 2);
+
+        let cfg = config("spool:///tmp/q?drain_on_read=true&stop_on_done=true", "dir_spool");
+        assert_eq!(cfg["drain_on_read"], true);
+        assert_eq!(cfg["stop_on_done"], true);
+    }
+
+    /// A spool has no connection URL, so an unrecognised param is a user error
+    /// rather than a driver option riding along.
+    #[test]
+    fn spool_rejects_an_unrecognised_param() {
+        let err = endpoint_from_uri("spool:///tmp/q?nonsense=1").unwrap_err().to_string();
+        assert!(err.contains("nonsense"), "got: {err}");
     }
 
     #[test]

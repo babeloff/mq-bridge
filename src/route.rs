@@ -14,8 +14,9 @@ use crate::errors::ProcessingError;
 pub use crate::models::Route;
 use crate::models::{Endpoint, EndpointType, Middleware, NameBy, RouteOptions};
 use crate::traits::{
-    BatchCommitFunc, ConsumerError, DisconnectOutcome, EndpointStatus, Handler, HandlerError,
-    MessageConsumer, MessageDisposition, MessagePublisher, PublisherError, SentBatch,
+    with_disconnect_outcome, BatchCommitFunc, ConsumerError, DisconnectOutcome, EndpointStatus,
+    Handler, HandlerError, MessageConsumer, MessageDisposition, MessagePublisher, PublisherError,
+    SentBatch,
 };
 use async_channel::{bounded, Sender};
 use serde::de::DeserializeOwned;
@@ -223,14 +224,19 @@ pub(crate) async fn run_publisher_disconnect_hook(
     publisher: &Arc<dyn MessagePublisher>,
     outcome: DisconnectOutcome,
 ) {
-    if let Some(hook) = publisher.on_disconnect_with_outcome(outcome) {
-        if let Err(err) = hook.await {
-            warn!(
-                "Publisher on_disconnect hook failed for route '{}': {}",
-                route_name, err
-            );
+    // Scoped rather than passed as an argument, so it reaches the sink through any depth
+    // of middleware without each wrapper having to forward it.
+    with_disconnect_outcome(outcome, async {
+        if let Some(hook) = publisher.on_disconnect_hook() {
+            if let Err(err) = hook.await {
+                warn!(
+                    "Publisher on_disconnect hook failed for route '{}': {}",
+                    route_name, err
+                );
+            }
         }
-    }
+    })
+    .await;
 }
 
 pub(crate) async fn run_consumer_disconnect_hook(route_name: &str, consumer: &dyn MessageConsumer) {
@@ -1875,33 +1881,21 @@ impl Route {
         // Close sequencer (if any) now that all in-flight commits have drained.
         commit_router.shutdown().await;
         run_consumer_disconnect_hook(name, consumer.as_ref()).await;
-        // Mirrors the returns below, without consuming the error channel they read.
-        let outcome = if loop_error.is_some() || !err_rx.is_empty() {
-            DisconnectOutcome::Failed
-        } else if !drained && shutdown_rx.is_empty() {
-            DisconnectOutcome::Stopped
+        // Decided once so the outcome the publisher is told cannot drift from what the
+        // route returns. A drain-then-exit is a graceful completion, not a shutdown-driven
+        // exit; what is left after it is a shutdown signal (channel empty means it was
+        // closed/consumed) or a dropped connection the outer loop should reconnect.
+        let result = if let Some(err) = loop_error {
+            Err(err)
+        } else if let Ok(err) = err_rx.try_recv() {
+            Err(err)
+        } else if drained {
+            Ok(false)
         } else {
-            DisconnectOutcome::Completed
+            Ok(shutdown_rx.is_empty())
         };
-        run_publisher_disconnect_hook(name, &publisher, outcome).await;
-
-        if let Some(err) = loop_error {
-            return Err(err);
-        }
-
-        if let Ok(err) = err_rx.try_recv() {
-            return Err(err);
-        }
-
-        // A drain-then-exit is a graceful completion, not a shutdown-driven exit.
-        if drained {
-            return Ok(false);
-        }
-
-        // Every graceful terminal is handled above, so what is left is a shutdown
-        // signal (channel empty means it was closed/consumed) or a dropped
-        // connection the outer loop should reconnect.
-        Ok(shutdown_rx.is_empty())
+        run_publisher_disconnect_hook(name, &publisher, disconnect_outcome(&result)).await;
+        result
     }
 
     pub fn with_options(mut self, options: RouteOptions) -> Self {
