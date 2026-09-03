@@ -1,21 +1,24 @@
 name: Conda package
 
 on:
+  # An uncached release build on three platforms costs ~67 runner-minutes and
+  # only smoke-tests `--version`. Source changes are covered by ci.yml; run it
+  # on PRs only when the recipe or this workflow itself changes.
   pull_request:
     branches: [main, dev]
     paths:
-      - 'apps/mq-bridge-app/**'
-      - 'src/**'
-      - 'build.rs'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
+      - 'apps/mq-bridge-app/packaging/conda/**'
       - '.github/workflows/conda.yml'
-  release:
-    types: [published]
+  # Called by release.yml. A `release: [published]` trigger was used here
+  # before and never once fired: release.yml undrafts with GITHUB_TOKEN, and
+  # GitHub does not start workflow runs from GITHUB_TOKEN-triggered events.
+  workflow_call:
   workflow_dispatch:
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  # Prefixed because `github.workflow` resolves to the *caller* under
+  # workflow_call, which would otherwise share release.yml's group.
+  group: conda-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
@@ -55,17 +58,3 @@ jobs:
           recipe-path: apps/mq-bridge-app/packaging/conda/recipe.yaml
           build-args: --target-platform=${{ matrix.target }} -c conda-forge
           artifact-name: mq-bridge-app-${{ matrix.target }}
-
-      - name: Publish to Anaconda.org
-        if: github.event_name == 'release'
-        shell: bash
-        env:
-          ANACONDA_API_KEY: ${{ secrets.ANACONDA_API_TOKEN }}
-        run: |
-          if [ -z "$ANACONDA_API_KEY" ]; then
-            echo "::warning::ANACONDA_API_TOKEN is not configured; package was built but not published"
-            exit 0
-          fi
-          while IFS= read -r -d '' package; do
-            rattler-build upload anaconda -o marcomq -c main "$package"
-          done < <(find output -type f -name '*.conda' -print0)
