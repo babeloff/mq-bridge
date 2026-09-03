@@ -1624,12 +1624,20 @@ async fn a_route_writing_into_a_spool_marks_it_done_when_it_completes() {
     .with_concurrency(4)
     .with_batch_size(3);
 
+    // A loaded Windows CI runner has overrun 10s here once. The directory contents
+    // distinguish a route still moving chunks from one that has stalled.
     tokio::time::timeout(
-        Duration::from_secs(10),
+        Duration::from_secs(20),
         route.run_until_err("spool_to_spool", None, None),
     )
     .await
-    .expect("the route should end once the source is drained")
+    .unwrap_or_else(|_| {
+        panic!(
+            "the route should end once the source is drained; source holds {:?}, sink holds {:?}",
+            tree_entries(&source),
+            tree_entries(&sink)
+        )
+    })
     .expect("the route should complete without errors");
 
     assert!(
