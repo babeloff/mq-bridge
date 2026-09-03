@@ -10,7 +10,7 @@
 //! `schemars(transform = ...)` attributes keep resolving in this module.
 
 mod builders;
-mod defaults;
+pub(crate) mod defaults;
 mod secrets;
 mod serde_support;
 #[cfg(test)]
@@ -1851,22 +1851,29 @@ pub struct GrpcConfig {
     /// Deprecated compatibility hint. Dynamic RPC shape is always derived from the descriptor.
     #[serde(default)]
     pub server_streaming: bool,
-    /// Static ASCII metadata attached to dynamic RPCs. Values for keys that look
-    /// sensitive are extracted by mq-bridge's normal secret handling.
+    /// Static ASCII metadata attached to dynamic RPCs and to the reflection RPC that
+    /// fetches their descriptors. Values for keys that look sensitive are extracted by
+    /// mq-bridge's normal secret handling.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub metadata: HashMap<String, String>,
-    /// Static binary metadata for dynamic calls. Keys must end in `-bin`; values are raw bytes.
+    /// Static binary metadata for dynamic calls and the reflection RPC. Keys must end in
+    /// `-bin`; each value is raw bytes, written as a JSON array of byte values 0-255 (the
+    /// only accepted form — a base64 or text string is rejected). As a URL parameter:
+    /// `?binary_metadata=%7B%22x-trace-bin%22%3A%5B1%2C2%2C3%5D%7D`, which is
+    /// `{"x-trace-bin": [1, 2, 3]}` percent-encoded.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub binary_metadata: HashMap<String, Vec<u8>>,
-    /// Bearer token sent as `authorization` on dynamic calls; rejected in Bridge/server mode.
+    /// Bearer token sent as `authorization` on dynamic calls and the reflection RPC;
+    /// rejected in Bridge/server mode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "schema", schemars(extend("format"="password")))]
     pub bearer_token: Option<String>,
-    /// API key sent as `api_key_name` (default `x-api-key`) on dynamic calls only.
+    /// API key sent as `api_key_name` (default `x-api-key`) on dynamic calls and the
+    /// reflection RPC.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "schema", schemars(extend("format"="password")))]
     pub api_key: Option<String>,
-    /// Metadata key used for `api_key`.
+    /// Metadata key used for `api_key`. Defaults to `x-api-key`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key_name: Option<String>,
     /// (Publisher only) Share one gRPC channel per connection (default: true); false forces a dedicated channel.

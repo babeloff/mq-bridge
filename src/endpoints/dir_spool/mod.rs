@@ -64,6 +64,11 @@ const STAGING_SUFFIX: &str = ".tmp";
 /// name per entry — a few megabytes at this size — no matter how deep the directory is.
 const READY_CACHE_CAPACITY: usize = 65_536;
 
+/// How many times one chunk may fail to read before it is set aside. A chunk that cannot be
+/// read stays at the head of the listing, so without a bound a single unreadable file holds
+/// the queue there for as long as the consumer lives.
+const MAX_CHUNK_READ_FAILURES: u32 = 3;
+
 /// Metadata key carrying the chunk's base name (its position in the queue).
 const SRC_CHUNK_KEY: &str = "mqb.src.spool_chunk";
 /// Metadata key carrying the spool directory the chunk was read from.
@@ -993,6 +998,9 @@ pub struct DirSpoolConsumer {
     /// Chunks a nack released, waiting to be folded back into `ready`. Written by the
     /// commit closures, which run on the route's tasks, hence the shared mutex.
     requeued: Arc<StdMutex<Vec<String>>>,
+    /// Failed read attempts per chunk, for the chunks that have any. Emptied as chunks
+    /// read, so it only holds what is currently unreadable.
+    read_failures: HashMap<String, u32>,
     /// Directory scans performed. Only read by the tests, which assert that draining a
     /// backlog does not scan per batch; a counter bump is cheaper than a test hook.
     scans: u64,
@@ -1042,6 +1050,7 @@ impl DirSpoolConsumer {
             claimed: Arc::new(StdMutex::new(HashSet::new())),
             ready: VecDeque::new(),
             requeued: Arc::new(StdMutex::new(Vec::new())),
+            read_failures: HashMap::new(),
             scans: 0,
             _lock: lock,
             exit_on_empty: false,
@@ -1279,21 +1288,47 @@ impl DirSpoolConsumer {
     /// before either deletes it, and both will deliver it. The consumer lock is what keeps
     /// that from happening; this path covers an operator or a foreign tool clearing chunks
     /// out from under a listing.
-    async fn read_ready(&self, ready: Vec<String>) -> (Vec<CanonicalMessage>, Vec<String>) {
+    ///
+    /// A chunk that keeps failing is a different case — a bad permission or a corrupt file
+    /// does not heal by being listed again — so after [`MAX_CHUNK_READ_FAILURES`] it is
+    /// claimed and left on disk, which takes it out of the listing and lets the queue behind
+    /// it drain.
+    async fn read_ready(&mut self, ready: Vec<String>) -> (Vec<CanonicalMessage>, Vec<String>) {
         let mut messages = Vec::with_capacity(ready.len());
         let mut delivered = Vec::with_capacity(ready.len());
         for base in ready {
             match self.read_chunk(&base).await {
                 Ok(message) => {
+                    if !self.read_failures.is_empty() {
+                        self.read_failures.remove(&base);
+                    }
                     messages.push(message);
                     delivered.push(base);
                 }
-                Err(error) => {
-                    warn!(chunk = %base, error = %error, "dir_spool skipping unreadable chunk");
-                }
+                Err(error) => self.record_read_failure(base, &error),
             }
         }
         (messages, delivered)
+    }
+
+    /// Counts one failed read, setting the chunk aside once it has failed too often.
+    fn record_read_failure(&mut self, base: String, error: &anyhow::Error) {
+        let failures = self.read_failures.entry(base.clone()).or_insert(0);
+        *failures += 1;
+        if *failures < MAX_CHUNK_READ_FAILURES {
+            warn!(chunk = %base, error = %error, "dir_spool skipping unreadable chunk");
+            return;
+        }
+        self.read_failures.remove(&base);
+        warn!(
+            chunk = %base,
+            error = %error,
+            "dir_spool giving up on a chunk that failed to read {MAX_CHUNK_READ_FAILURES} times; it stays on disk and is skipped until this consumer restarts"
+        );
+        self.claimed
+            .lock()
+            .expect("dir_spool claim set poisoned")
+            .insert(base);
     }
 
     /// Whether production has been declared finished. That is the sentinel, not the
@@ -1496,11 +1531,16 @@ impl MessageConsumer for DirSpoolConsumer {
 /// The highest sequence number among the finalized chunks in `dir`, or `None` when it holds
 /// no chunk this publisher would have written.
 ///
-/// Walks the shard tree greatest-first and stops at the first chunk it finds: lexical order
-/// is sequence order, so the last chunk under the last shard is the highest one, and there is
-/// no reason to read the rest of a spool that may hold millions of files. A shard that turns
-/// out to be empty — pruned, or left behind by a producer that failed — is backtracked out
-/// of, which is why this is a search and not a single descent.
+/// Walks the shard tree greatest-first and stops at the first level that holds chunks:
+/// lexical order is sequence order, so every branch still pending at that point sorts below
+/// the one that answered, and there is no reason to read the rest of a spool that may hold
+/// millions of files. A shard that turns out to be empty — pruned, or left behind by a
+/// producer that failed — is backtracked out of, which is why this is a search and not a
+/// single descent.
+///
+/// Chunks at a level do not end the descent *into that level's own shards*: a spool written
+/// flat and later sharded holds both, and `000/000/006` outranks a flat `000000005` that
+/// would otherwise mask it and have the next chunk overwrite it.
 async fn highest_sequence(
     dir: &Path,
     payload_suffix: &str,
@@ -1511,6 +1551,7 @@ async fn highest_sequence(
         String::new(),
         sharding.map_or(0, |sharding| sharding.depth),
     )];
+    let mut best: Option<u64> = None;
     while let Some((path, prefix, depth_left)) = pending.pop() {
         let mut entries = match fs::read_dir(&path).await {
             Ok(entries) => entries,
@@ -1536,8 +1577,12 @@ async fn highest_sequence(
                 highest = Some(highest.map_or(seq, |current: u64| current.max(seq)));
             }
         }
-        if highest.is_some() {
-            return Ok(highest);
+        if let Some(seq) = highest {
+            best = Some(best.map_or(seq, |current: u64| current.max(seq)));
+            // Answered here, so every branch still queued is a lexically smaller prefix and
+            // cannot beat it. Only this directory's own shards can, and they are pushed
+            // below.
+            pending.clear();
         }
         if depth_left == 0 {
             continue;
@@ -1550,7 +1595,7 @@ async fn highest_sequence(
             pending.push((child, child_prefix, depth_left - 1));
         }
     }
-    Ok(None)
+    Ok(best)
 }
 
 #[cfg(test)]

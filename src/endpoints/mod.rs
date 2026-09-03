@@ -540,6 +540,18 @@ fn check_consumer_recursive(
                     .to_string()
                 );
             }
+            if cfg.naming_pattern != crate::models::defaults::default_spool_naming_pattern() {
+                warnings.push(
+                    "Endpoint 'dir_spool' is used as a consumer, but 'naming_pattern' is a publisher-only option and will be ignored."
+                    .to_string()
+                );
+            }
+            if !cfg.atomic {
+                warnings.push(
+                    "Endpoint 'dir_spool' is used as a consumer, but 'atomic' is a publisher-only option and will be ignored."
+                    .to_string()
+                );
+            }
             Ok(warnings)
         }
         #[cfg(feature = "object-store")]

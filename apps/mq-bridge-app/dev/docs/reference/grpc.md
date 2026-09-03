@@ -8,10 +8,10 @@ Query parameters recognised as config fields for this connector. The object-type
 
 | Name | Type | Required | Default | Description |
 |------|------|----------|---------|-------------|
-| `api_key` | string | no | — | API key sent as `api_key_name` (default `x-api-key`) on dynamic calls only. |
-| `api_key_name` | string | no | — | Metadata key used for `api_key`. |
-| `bearer_token` | string | no | — | Bearer token sent as `authorization` on dynamic calls; rejected in Bridge/server mode. |
-| `binary_metadata` | object | no | — | Static binary metadata for dynamic calls. Keys must end in `-bin`; values are raw bytes. |
+| `api_key` | string | no | — | API key sent as `api_key_name` (default `x-api-key`) on dynamic calls and the reflection RPC. |
+| `api_key_name` | string | no | — | Metadata key used for `api_key`. Defaults to `x-api-key`. |
+| `bearer_token` | string | no | — | Bearer token sent as `authorization` on dynamic calls and the reflection RPC; rejected in Bridge/server mode. |
+| `binary_metadata` | object | no | — | Static binary metadata for dynamic calls and the reflection RPC. Keys must end in `-bin`; each value is raw bytes, written as a JSON array of byte values 0-255 (the only accepted form — a base64 or text string is rejected). As a URL parameter: `?binary_metadata=%7B%22x-trace-bin%22%3A%5B1%2C2%2C3%5D%7D`, which is `{"x-trace-bin": [1, 2, 3]}` percent-encoded. |
 | `concurrency_limit_per_connection` | integer | no | `null` | Maximum number of concurrent requests handled per connection. **Server-mode only.** |
 | `connect_timeout_ms` | integer | no | `null` | Maximum time to establish a client connection. |
 | `consumer_id` | string | no | `null` | Stable subscription identity used for ACK tracking and redelivery. Defaults to a fresh id per consumer; set it to be redelivered unacknowledged messages on reconnect. |
@@ -24,7 +24,7 @@ Query parameters recognised as config fields for this connector. The object-type
 | `initial_stream_window_size` | integer | no | `null` | HTTP/2 stream-level initial window size in bytes. Applies in both modes. |
 | `max_decoding_message_size` | integer | no | `null` | Maximum size of a decoded incoming message in bytes. Applies in both modes. Default 4 MiB. |
 | `max_encoding_message_size` | integer | no | `null` | Maximum size of an encoded outgoing message in bytes. Default unlimited. |
-| `metadata` | object | no | — | Static ASCII metadata attached to dynamic RPCs. Values for keys that look sensitive are extracted by mq-bridge's normal secret handling. |
+| `metadata` | object | no | — | Static ASCII metadata attached to dynamic RPCs and to the reflection RPC that fetches their descriptors. Values for keys that look sensitive are extracted by mq-bridge's normal secret handling. |
 | `method_name` | string | no | `null` | RPC method name for dynamic client mode. |
 | `overall_timeout_ms` | integer | no | `null` | Maximum lifetime of a dynamic RPC; exceeding it stops the route instead of reconnecting. |
 | `reflection` | boolean | no | `false` | Discover descriptors from the remote gRPC server reflection v1 service. |

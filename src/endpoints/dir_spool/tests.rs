@@ -1716,3 +1716,82 @@ async fn the_outcome_reaches_the_sink_through_an_unaware_wrapper() {
         entries(dir.path())
     );
 }
+
+/// A spool written flat and later sharded holds chunks at two levels, and the deeper one is
+/// the higher sequence: finding the flat one first must not end the search, or the next
+/// chunk overwrites the sharded one.
+#[tokio::test]
+async fn resumes_past_a_flat_chunk_that_a_sharded_one_outranks() {
+    let dir = tempdir().unwrap();
+    let mut cfg = config(dir.path());
+    cfg.naming_pattern = "{seq:03}".to_string();
+    cfg.shard_depth = 2;
+    cfg.shard_width = 1;
+
+    // Chunk 5 written before sharding was turned on, chunk 12 after.
+    std::fs::write(dir.path().join("005.bin"), b"flat").unwrap();
+    std::fs::create_dir_all(dir.path().join("0/1")).unwrap();
+    std::fs::write(dir.path().join("0/1/2.bin"), b"sharded").unwrap();
+
+    assert_eq!(
+        highest_sequence(dir.path(), "bin", Sharding::from_config(&cfg))
+            .await
+            .unwrap(),
+        Some(12)
+    );
+
+    let publisher = DirSpoolPublisher::new(&cfg).await.unwrap();
+    publisher
+        .send_batch(vec![message("next", "x")])
+        .await
+        .unwrap();
+    assert!(
+        dir.path().join("0/1/3.bin").exists(),
+        "chunk 13 follows chunk 12; spool held {:?}",
+        tree_entries(dir.path())
+    );
+}
+
+/// An unreadable chunk sorts at the head of the listing, so it must not be able to hold the
+/// queue there for the life of the consumer.
+#[tokio::test]
+async fn a_chunk_that_never_reads_is_set_aside() {
+    let dir = tempdir().unwrap();
+    let mut cfg = config(dir.path());
+    cfg.poll_interval_ms = 1;
+
+    // A directory where a payload file belongs: listed as a chunk, unreadable as one.
+    std::fs::create_dir(dir.path().join("000000000.bin")).unwrap();
+    let publisher = DirSpoolPublisher::new(&cfg).await.unwrap();
+    publisher
+        .send_batch(vec![message("good", "x")])
+        .await
+        .unwrap();
+    drop(publisher);
+
+    let mut consumer = DirSpoolConsumer::new(&cfg).await.unwrap();
+    let first = consumer.receive_batch(10).await.unwrap();
+    assert_eq!(
+        first.messages.len(),
+        1,
+        "the readable chunk in the batch is still delivered"
+    );
+    (first.commit)(vec![MessageDisposition::Ack]).await.unwrap();
+
+    for _ in 0..MAX_CHUNK_READ_FAILURES {
+        assert!(consumer.receive_batch(10).await.unwrap().messages.is_empty());
+    }
+    assert!(
+        consumer
+            .claimed
+            .lock()
+            .unwrap()
+            .contains("000000000"),
+        "the unreadable chunk is set aside rather than kept at the queue head"
+    );
+    assert!(
+        dir.path().join("000000000.bin").exists(),
+        "and left on disk for the operator"
+    );
+    assert!(consumer.read_failures.is_empty());
+}
