@@ -28,7 +28,11 @@ build:
 
 requirements:
   build:
-    - ${{ compiler('c') }}
+    # `compiler('c')` defaults to vs2017 on Windows, which the runners no longer
+    # ship; its activation then leaves cl.exe off PATH and aws-lc-sys fails to build.
+    - if: win
+      then: vs2022_win-64
+      else: ${{ compiler('c') }}
     - if: win
       then: rust >=1.94
       else: ${{ compiler('rust') }}
@@ -36,6 +40,8 @@ requirements:
     - cargo-bundle-licenses
     - cmake
     - ninja
+    # protoc, required by the `pulsar` build script on every platform.
+    - libprotobuf
     - if: unix
       then: pkg-config
   host:
@@ -43,11 +49,16 @@ requirements:
       then: openssl
     - if: unix
       then: zlib
+    # librdkafka; matches the libcurl4-openssl-dev the release workflow installs.
+    - if: linux
+      then: libcurl
   run:
     - if: unix
       then: openssl
     - if: unix
       then: zlib
+    - if: linux
+      then: libcurl
 
 tests:
   - script:
