@@ -61,6 +61,13 @@ make = ">=4.3"
 # conda-forge ships one stable `rust`; there is no beta channel.
 rust = ">=1.93,<2"
 
+# Release chores only, so nodejs stays out of the environments CI builds and
+# tests in. scripts/sync-version.mjs is the single implementation of the
+# version fan-out; it is also driven by npm scripts from node/mq-bridge-node
+# and apps/mq-bridge-app, so it is not pixi-specific.
+[feature.release.dependencies]
+nodejs = ">=20"
+
 [feature.dev.dependencies]
 # Integration suites are archived and filtered with nextest in CI.
 cargo-nextest = ">=0.9"
@@ -72,11 +79,23 @@ docker-compose = ">=2.30"
 python = ">=3.12,<3.14"
 grpcio-tools = ">=1.60"
 
-[environments]
-default = { features = ["toolchain"], solve-group = "default" }
-dev = { features = ["toolchain", "dev"], solve-group = "default" }
+# --- Environments -------------------------------------------------------------
+
+[environments.default]
+features = ["toolchain"]
+solve-group = "default"
+
+[environments.dev]
+features = ["toolchain", "dev"]
+solve-group = "default"
+
 # Native libraries only, no Rust. For a build that supplies its own toolchain.
-native = { solve-group = "default" }
+[environments.native]
+solve-group = "default"
+
+[environments.release]
+features = ["release"]
+solve-group = "default"
 
 # --- Environment wiring -------------------------------------------------------
 #
@@ -107,28 +126,91 @@ RUSTFLAGS = "-C link-arg=-Wl,-rpath,$CONDA_PREFIX/lib"
 
 # --- Tasks --------------------------------------------------------------------
 
-[tasks]
-build = { cmd = "cargo build", description = "Build with default features" }
-build-full = { cmd = "cargo build --features full", description = "Build every endpoint and middleware" }
-build-portable = { cmd = "cargo build --features portable", description = "Build the feature set that needs no native library from the environment" }
-build-release = { cmd = "cargo build --release --features full", description = "Release build, full features" }
+[tasks.build]
+cmd = "cargo build"
+description = "Build with default features"
 
-fmt = { cmd = "cargo fmt --all", description = "Format the workspace" }
-fmt-check = { cmd = "cargo fmt --all -- --check", description = "Fail on unformatted code" }
-clippy = { cmd = "cargo clippy --all-targets --all-features -- -D warnings", description = "Lint as CI does" }
+[tasks.build-full]
+cmd = "cargo build --features full"
+description = "Build every endpoint and middleware"
 
-# Mirrors the feature-subset sweep in .github/workflows/ci.yml.
-check-features = { cmd = "cargo check --all-targets && cargo check --all-targets --features full && cargo check --all-targets --features kafka && cargo check --all-targets --features nats && cargo check --all-targets --features grpc && cargo check --all-targets --features mqtt && cargo check --all-targets --features mongodb && cargo check --all-targets --features http", description = "cargo check each feature subset CI covers" }
+[tasks.build-portable]
+cmd = "cargo build --features portable"
+description = "Build the feature set that needs no native library from the environment"
 
-test = { cmd = "cargo test --lib --features full", description = "Unit tests, full features" }
-test-no-docker = { cmd = "cargo test --test ref_test --test sqlite_test --test tls_example --test websocket_test --features full", description = "Integration tests that need no Docker services" }
-test-memory-leak = { cmd = "cargo test --test memory_leak_test --features full -- --ignored --nocapture", description = "Route commit-task JoinSet leak soak" }
-check-config-compat = { cmd = "cargo check -p grpc-config-compat", description = "Downstream GrpcConfig literal fixture (not a default member)" }
-doc = { cmd = "cargo doc --no-deps --features full", description = "Build rustdoc" }
+[tasks.build-release]
+cmd = "cargo build --release --features full"
+description = "Release build, full features"
+
+[tasks.fmt]
+cmd = "cargo fmt --all"
+description = "Format the workspace"
+
+[tasks.fmt-check]
+cmd = "cargo fmt --all -- --check"
+description = "Fail on unformatted code"
+
+[tasks.clippy]
+cmd = "cargo clippy --all-targets --all-features -- -D warnings"
+description = "Lint as CI does"
+
+# Mirrors the feature-subset sweep in .github/workflows/ci.yml. The trailing
+# backslashes are TOML line continuations, so `cmd` is still the single
+# `&&`-chained shell line it was before -- only the source is wrapped.
+[tasks.check-features]
+cmd = """
+cargo check --all-targets && \
+cargo check --all-targets --features full && \
+cargo check --all-targets --features kafka && \
+cargo check --all-targets --features nats && \
+cargo check --all-targets --features grpc && \
+cargo check --all-targets --features mqtt && \
+cargo check --all-targets --features mongodb && \
+cargo check --all-targets --features http\
+"""
+description = "cargo check each feature subset CI covers"
+
+[tasks.test]
+cmd = "cargo test --lib --features full"
+description = "Unit tests, full features"
+
+[tasks.test-no-docker]
+cmd = "cargo test --test ref_test --test sqlite_test --test tls_example --test websocket_test --features full"
+description = "Integration tests that need no Docker services"
+
+[tasks.test-memory-leak]
+cmd = "cargo test --test memory_leak_test --features full -- --ignored --nocapture"
+description = "Route commit-task JoinSet leak soak"
+
+[tasks.check-config-compat]
+cmd = "cargo check -p grpc-config-compat"
+description = "Downstream GrpcConfig literal fixture (not a default member)"
+
+[tasks.doc]
+cmd = "cargo doc --no-deps --features full"
+description = "Build rustdoc"
 
 # Prove the conda-forge libraries are the ones actually linked.
-verify-native-deps = { cmd = "pkg-config --modversion rdkafka sqlite3 libzmq && protoc --version", description = "Print the resolved conda-forge native library versions" }
+[tasks.verify-native-deps]
+cmd = "pkg-config --modversion rdkafka sqlite3 libzmq && protoc --version"
+description = "Print the resolved conda-forge native library versions"
 
-[feature.dev.tasks]
-test-integration = { cmd = "cargo nextest run --release --features full,test-utils --test integration_test --test armature_integration", description = "Full Docker-backed integration suite (needs a running Docker daemon)" }
-bench = { cmd = "cargo bench --features test-utils", description = "Criterion benchmarks" }
+[feature.dev.tasks.test-integration]
+cmd = "cargo nextest run --release --features full,test-utils --test integration_test --test armature_integration"
+description = "Full Docker-backed integration suite (needs a running Docker daemon)"
+
+[feature.dev.tasks.bench]
+cmd = "cargo bench --features test-utils"
+description = "Criterion benchmarks"
+
+# Run as `pixi run -e release bump-version 0.4.11`. Everything downstream of the
+# root [workspace.package] version is rewritten from it: pixi.toml, both
+# Cargo.toml/Cargo.lock pairs, server.json, tauri.conf.json and the Node
+# package/lock. pixi.lock needs no update -- it records no workspace version.
+[feature.release.tasks.bump-version]
+cmd = "node scripts/sync-version.mjs"
+description = "Set the version everywhere (pass the new version, or none to re-sync)"
+
+[feature.release.tasks.check-version]
+cmd = "node scripts/sync-version.mjs --check"
+description = "Fail if any committed copy of the version has drifted"

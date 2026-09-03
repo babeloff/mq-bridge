@@ -26,7 +26,16 @@ Use `pixi run <task>` or `pixi shell`; `pixi task list` enumerates the tasks
 (`build-full`, `test`, `clippy`, `check-features`, `verify-native-deps`, …).
 Environments: `default` (toolchain + libraries), `dev` (adds nextest, python +
 grpcio-tools, docker-compose), `native` (libraries only, for a build that brings
-its own rustup toolchain — the `beta` row of `test-matrix.yml`).
+its own rustup toolchain — the `beta` row of `test-matrix.yml`), `release`
+(nodejs, for the version tasks only).
+
+Version bumps go through `scripts/sync-version.mjs`, i.e.
+`pixi run -e release bump-version <VERSION>`. Root `Cargo.toml`
+`[workspace.package] version` is the source of truth and the script fans it out
+to `pixi.toml`, both Cargo manifest/lock pairs, `server.json`,
+`tauri.conf.json` and the Node package/lock. Never hand-edit one copy.
+`pixi.lock` holds no workspace version — its `version: 7` is the lockfile
+format number.
 
 CI uses `prefix-dev/setup-pixi` with `activate-environment`, so workflow steps
 keep calling plain `cargo`. `apps/mq-bridge-app` is a **separate** cargo

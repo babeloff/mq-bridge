@@ -53,6 +53,22 @@ or in `$PROTOC`, and SQLite additionally needs `libclang` for bindgen.
 | `pixi run clippy` | `cargo clippy --all-targets --all-features -- -D warnings` |
 | `pixi run check-features` | the per-feature-subset `cargo check` sweep CI runs |
 | `pixi run -e dev test-integration` | the Docker-backed nextest suite |
+| `pixi run -e release bump-version 0.4.11` | set the version everywhere |
+| `pixi run -e release check-version` | fail if a copy of the version has drifted |
+
+### Bumping the version
+
+The root `Cargo.toml` `[workspace.package] version` is the source of truth;
+`scripts/sync-version.mjs` fans it out to every committed copy — `pixi.toml`,
+both `Cargo.toml`/`Cargo.lock` pairs, `server.json`, `tauri.conf.json` and the
+Node `package.json`/`package-lock.json`. `pixi.lock` is not touched: it records
+no workspace version, and its top-level `version: 7` is the lockfile format
+number.
+
+The `release` environment exists only to carry `nodejs` for that script, so the
+environments CI builds and tests in stay free of it. The same script is also
+reachable as `npm run sync-version` from `node/mq-bridge-node` and as
+`npm run sync:version` / `check:version` from `apps/mq-bridge-app`.
 
 `apps/mq-bridge-app` is a separate cargo workspace with its own toolchain
 expectations; it is not covered by this pixi workspace.
