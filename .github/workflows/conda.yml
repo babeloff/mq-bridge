@@ -4,7 +4,11 @@ on:
   pull_request:
     branches: [main, dev]
     paths:
-      - 'apps/mq-bridge-app/packaging/conda/**'
+      - 'apps/mq-bridge-app/**'
+      - 'src/**'
+      - 'build.rs'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
       - '.github/workflows/conda.yml'
   release:
     types: [published]
