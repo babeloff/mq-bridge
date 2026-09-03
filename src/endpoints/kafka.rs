@@ -855,16 +855,22 @@ fn spawn_prefetcher_without_source_metadata(
     let task = tokio::spawn(async move {
         // One stream for the task's whole life. Rebuilding it per batch is what starved the
         // fetch pipeline; `ready_chunks` still batches whatever is already waiting.
-        let mut chunks = consumer.stream().ready_chunks(1024);
+        let stream = consumer
+            .stream()
+            .map(|result| capture_partition_eof_position(result, || consumer.position()));
+        let mut chunks = stream.ready_chunks(1024);
         while let Some(chunk) = chunks.next().await {
-            for result in chunk {
+            let mut chunk_eofs = Vec::new();
+            for (result, eof_position) in chunk {
                 let item = match result {
                     Ok(message) => match to_canonical(&message) {
                         Ok(canonical) => Ok(prefetched_record(&budget, canonical, &message).await),
                         Err(e) => Err(PrefetchError::Connection(e.to_string())),
                     },
                     Err(KafkaError::PartitionEOF(partition)) => {
-                        record_partition_eof(&consumer, partition, &task_eof_positions);
+                        if let Some(position) = eof_position {
+                            chunk_eofs.push((partition, position));
+                        }
                         continue;
                     }
                     Err(e) => Err(PrefetchError::Connection(e.to_string())),
@@ -873,6 +879,11 @@ fn spawn_prefetcher_without_source_metadata(
                 if tx.send(item).await.is_err() {
                     return;
                 }
+            }
+            // Do not expose a drained position until every later record that
+            // `ready_chunks` polled with the EOF is visible to the receiver.
+            for (partition, position) in chunk_eofs {
+                record_partition_eof(&position, partition, &task_eof_positions);
             }
         }
         let _ = tx.send(Err(PrefetchError::EndOfStream)).await;
@@ -922,16 +933,22 @@ fn spawn_prefetcher_with_source_metadata(
     let eof_positions = Arc::new(std::sync::Mutex::new(PartitionOffsets::new()));
     let task_eof_positions = eof_positions.clone();
     let task = tokio::spawn(async move {
-        let mut chunks = consumer.stream().ready_chunks(1024);
+        let stream = consumer
+            .stream()
+            .map(|result| capture_partition_eof_position(result, || consumer.position()));
+        let mut chunks = stream.ready_chunks(1024);
         while let Some(chunk) = chunks.next().await {
-            for result in chunk {
+            let mut chunk_eofs = Vec::new();
+            for (result, eof_position) in chunk {
                 let item = match result {
                     Ok(message) => match to_canonical_with_source_metadata(&message) {
                         Ok(canonical) => Ok(prefetched_record(&budget, canonical, &message).await),
                         Err(e) => Err(PrefetchError::Connection(e.to_string())),
                     },
                     Err(KafkaError::PartitionEOF(partition)) => {
-                        record_partition_eof(&consumer, partition, &task_eof_positions);
+                        if let Some(position) = eof_position {
+                            chunk_eofs.push((partition, position));
+                        }
                         continue;
                     }
                     Err(e) => Err(PrefetchError::Connection(e.to_string())),
@@ -939,6 +956,11 @@ fn spawn_prefetcher_with_source_metadata(
                 if tx.send(item).await.is_err() {
                     return;
                 }
+            }
+            // Do not expose a drained position until every later record that
+            // `ready_chunks` polled with the EOF is visible to the receiver.
+            for (partition, position) in chunk_eofs {
+                record_partition_eof(&position, partition, &task_eof_positions);
             }
         }
         let _ = tx.send(Err(PrefetchError::EndOfStream)).await;
@@ -950,16 +972,24 @@ fn spawn_prefetcher_with_source_metadata(
     }
 }
 
+fn capture_partition_eof_position<T>(
+    result: Result<T, KafkaError>,
+    position: impl FnOnce() -> rdkafka::error::KafkaResult<TopicPartitionList>,
+) -> (Result<T, KafkaError>, Option<TopicPartitionList>) {
+    let eof_position = matches!(result, Err(KafkaError::PartitionEOF(_)))
+        .then(position)
+        .and_then(Result::ok);
+    (result, eof_position)
+}
+
 /// Records an EOF only after it has travelled through the same stream as all preceding
-/// records. This is the ordering barrier that `StreamConsumer::position()` does not provide.
+/// records. The position was captured when the stream yielded the EOF, before
+/// `ready_chunks` could fetch later records.
 fn record_partition_eof(
-    consumer: &StreamConsumer,
+    positions: &TopicPartitionList,
     partition: i32,
     eof_positions: &std::sync::Mutex<PartitionOffsets>,
 ) {
-    let Ok(positions) = consumer.position() else {
-        return;
-    };
     let mut observed = eof_positions.lock().unwrap_or_else(|e| e.into_inner());
     for elem in positions.elements() {
         if elem.partition() != partition {
@@ -1913,6 +1943,48 @@ mod tests {
         assert!(drain_offset_reached(120, Some(120), None));
         assert!(drain_offset_reached(120, None, Some(120)));
         assert!(drain_offset_reached(0, None, None));
+    }
+
+    /// `ready_chunks` polls every immediately-ready item before yielding the chunk. Capture
+    /// the position as the EOF itself is polled, not after a later record advances it.
+    #[tokio::test]
+    async fn test_partition_eof_position_precedes_later_records_in_the_same_ready_chunk() {
+        let position = std::cell::Cell::new(10);
+        let events = futures::stream::iter([Err::<i32, _>(KafkaError::PartitionEOF(0)), Ok(10)]);
+        let mut chunks = events
+            .map(|event| {
+                if event.is_ok() {
+                    position.set(11);
+                }
+                capture_partition_eof_position(event, || {
+                    let mut positions = TopicPartitionList::new();
+                    positions.add_partition_offset("t", 0, Offset::Offset(position.get()))?;
+                    Ok(positions)
+                })
+            })
+            .ready_chunks(1024);
+
+        let chunk = chunks.next().await.unwrap();
+        let eof_position = chunk[0].1.as_ref().unwrap();
+        let observed = std::sync::Mutex::new(PartitionOffsets::new());
+        let (tx, rx) = prefetch_channel(1);
+        tx.try_send(Ok(prefetched("t", 0, 11))).unwrap();
+        record_partition_eof(eof_position, 0, &observed);
+
+        assert_eq!(
+            eof_position.find_partition("t", 0).unwrap().offset(),
+            Offset::Offset(10)
+        );
+        assert!(matches!(chunk[1].0, Ok(10)));
+        assert!(!drain_offset_reached(
+            11,
+            None,
+            observed.lock().unwrap().get(&("t".to_string(), 0)).copied()
+        ));
+        assert_eq!(position.get(), 11, "the later record must have been polled");
+
+        let first = await_first(&rx, true, "t", || DrainReadiness::Drained).await;
+        assert!(matches!(first, Some(Ok(record)) if record.offset == 11));
     }
 
     #[tokio::test]

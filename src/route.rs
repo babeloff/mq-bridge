@@ -1494,7 +1494,7 @@ impl Route {
         let has_dlq_middleware = self.output.has_dlq_middleware();
         // Messages processed since the last cooperative yield (see YIELD_EVERY_MSGS).
         let mut since_yield = 0usize;
-        let run_result = loop {
+        let mut run_result = loop {
             select! {
                 Ok(err) = err_rx.recv() => break Err(err),
 
@@ -1574,9 +1574,13 @@ impl Route {
         // Drain errors while waiting for tasks to finish to prevent deadlocks and lost errors
         loop {
             select! {
+                biased;
                 res = err_rx.recv() => {
                     if let Ok(err) = res {
                         error!("Error reported during shutdown: {}", err);
+                        if matches!(&run_result, Ok(false)) {
+                            run_result = Err(err);
+                        }
                     }
                 }
                 res = commit_tasks.join_next() => {
@@ -3710,6 +3714,100 @@ mod tests {
         assert_eq!(state.publisher_connects.load(Ordering::SeqCst), 1);
         assert_eq!(state.publisher_disconnects.load(Ordering::SeqCst), 1);
         assert_eq!(state.shared_mutations.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn test_final_commit_failure_after_end_of_stream_fails_sequential_route() {
+        let unique_id = fast_uuid_v7::gen_id().to_string();
+        let factory_name = format!("final_commit_failure_{unique_id}");
+        let eof_seen = Arc::new(tokio::sync::Notify::new());
+        let consumer_eof_seen = eof_seen.clone();
+        let mut factory = MockEndpointFactory::new();
+        let reads = Arc::new(AtomicUsize::new(0));
+        let consumer_reads = reads.clone();
+        factory.consumer_behavior = Arc::new(Mutex::new(move || {
+            struct FiniteConsumer {
+                reads: Arc<AtomicUsize>,
+                eof_seen: Arc<tokio::sync::Notify>,
+            }
+            #[async_trait::async_trait]
+            impl MessageConsumer for FiniteConsumer {
+                async fn receive_batch(
+                    &mut self,
+                    _: usize,
+                ) -> Result<ReceivedBatch, ConsumerError> {
+                    if self.reads.fetch_add(1, Ordering::SeqCst) > 0 {
+                        self.eof_seen.notify_one();
+                        return Err(ConsumerError::EndOfStream);
+                    }
+                    let eof_seen = self.eof_seen.clone();
+                    Ok(ReceivedBatch {
+                        messages: vec![crate::CanonicalMessage::from("only")],
+                        commit: Box::new(move |_| {
+                            Box::pin(async move {
+                                eof_seen.notified().await;
+                                Err(anyhow::anyhow!("final commit failed"))
+                            })
+                        }),
+                    })
+                }
+                fn as_any(&self) -> &dyn Any {
+                    self
+                }
+            }
+            Ok(Box::new(FiniteConsumer {
+                reads: consumer_reads.clone(),
+                eof_seen: consumer_eof_seen.clone(),
+            }) as Box<dyn MessageConsumer>)
+        }));
+
+        let disconnect_outcome = Arc::new(Mutex::new(None));
+        let publisher_outcome = disconnect_outcome.clone();
+        factory.publisher_behavior = Arc::new(Mutex::new(move || {
+            struct OutcomePublisher(Arc<Mutex<Option<DisconnectOutcome>>>);
+            #[async_trait::async_trait]
+            impl MessagePublisher for OutcomePublisher {
+                fn on_disconnect_hook(&self) -> Option<BoxFuture<'_, anyhow::Result<()>>> {
+                    Some(Box::pin(async move {
+                        *self.0.lock().unwrap() = crate::traits::disconnect_outcome();
+                        Ok(())
+                    }))
+                }
+                async fn send_batch(
+                    &self,
+                    _: Vec<crate::CanonicalMessage>,
+                ) -> Result<SentBatch, PublisherError> {
+                    Ok(SentBatch::Ack)
+                }
+                fn as_any(&self) -> &dyn Any {
+                    self
+                }
+            }
+            Ok(Box::new(OutcomePublisher(publisher_outcome.clone())) as Box<dyn MessagePublisher>)
+        }));
+        register_endpoint_factory(&factory_name, Arc::new(factory)).unwrap();
+
+        let endpoint = |name: String| Endpoint {
+            endpoint_type: EndpointType::Custom {
+                name,
+                config: serde_json::Value::Null,
+            },
+            middlewares: vec![],
+            handler: None,
+        };
+        let route = Route::new(endpoint(factory_name.clone()), endpoint(factory_name));
+
+        let err = route
+            .run_until_err("test_final_commit_failure", None, None)
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("final commit failed"));
+        assert_eq!(
+            *disconnect_outcome.lock().unwrap(),
+            Some(DisconnectOutcome::Failed)
+        );
+        assert_eq!(reads.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]

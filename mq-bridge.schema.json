@@ -589,7 +589,7 @@
           "default": "DONE"
         },
         "drain_on_read": {
-          "description": "(Source only) Delete each chunk's files once its message is acknowledged. Defaults to\ntrue — this is what makes the directory a queue rather than a growing archive. With\nit off, chunks are left in place and each is emitted at most once per consumer run.",
+          "description": "(Source only) Delete each chunk's files once its message is acknowledged. Defaults to\ntrue — this is what makes the directory a queue rather than a growing archive. With\nit off, chunks are left in place. Acknowledged chunks are emitted at most once per\nconsumer run; nacked chunks are redelivered.",
           "type": "boolean",
           "default": true
         },

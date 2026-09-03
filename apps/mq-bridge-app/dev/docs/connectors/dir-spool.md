@@ -18,6 +18,82 @@ dir-spool:///absolute/path/to/spool?<option>=<value>
 The aliases `spool://` and `dirspool://` are also accepted. The directory path
 comes from the URI path, not a `path` query parameter.
 
+## Source, target, and on-disk layout
+
+As a **target** (sink), the connector writes each incoming message as one chunk:
+
+```text
+/var/spool/orders/
+├── 000000000.bin   # raw payload bytes for message 0
+├── 000000000.json  # message id and string metadata for message 0
+├── 000000001.bin   # raw payload bytes for message 1
+├── 000000001.json  # message id and string metadata for message 1
+├── PRODUCER        # producer claim file
+├── CONSUMER        # draining-consumer claim file, when one is running
+└── DONE            # optional completion sentinel
+```
+
+The default `{seq:09}` naming pattern produces the zero-padded names above.
+`payload_extension` and `metadata_extension` change only the suffixes. A sidecar
+has this shape:
+
+```json
+{
+  "message_id": "0195f4a0c7d77801a2b3c4d5e6f78901",
+  "metadata": {
+    "content_type": "application/json",
+    "source": "orders"
+  }
+}
+```
+
+The payload file contains exactly the message payload, byte for byte. It may be
+UTF-8 text, JSON, an image, compressed data, or any other binary content. The
+connector does not add a delimiter, envelope, or encoding. Set
+`metadata_extension` to an empty string when sidecars are not needed.
+
+With the default `atomic=true`, files are first written to sibling `.tmp` names.
+The sidecar is finalized before the payload; the payload's final rename makes
+the chunk visible to readers without exposing incomplete data.
+
+As a **source**, the connector scans for files with `payload_extension`, reads
+each whole file as one message, and restores its message id and metadata from
+the matching sidecar when present. A payload without a sidecar is valid and is
+delivered with empty metadata, so another program can produce chunks without
+knowing the sidecar format. Such a producer should likewise finalize the
+payload last.
+
+With sharding enabled, the leading sequence digits become directories. For
+example, `{seq:09}`, `shard_depth=2`, and `shard_width=3` store message 1 as:
+
+```text
+/var/spool/orders/000/000/001.bin
+/var/spool/orders/000/000/001.json
+```
+
+Both source and target must use the same sharding depths, widths, and file
+extensions.
+
+## Payload formats and batching
+
+`dir_spool` does not parse or generate JSONL, CSV, or other record-oriented
+formats. A `.jsonl` or `.csv` payload file is still one opaque message, even if
+it contains many lines. Changing `payload_extension` changes file selection and
+naming, not parsing behavior.
+
+Use the [file connector](./file.md) when records must be framed:
+
+- `file:///data/orders.jsonl?format=json` reads or writes newline-delimited JSON.
+- `file:///data/orders.csv?format=csv` reads or writes CSV records.
+- Sending either source to a directory spool creates one chunk per message the
+  file connector emits, rather than one chunk containing the whole input file.
+
+Route-level batching is supported in both directions. A target can receive a
+batch of messages and writes one payload/sidecar pair for each message. A source
+can return up to the route's batch-size limit per read. Batching therefore
+reduces routing and filesystem-sync overhead but does not change the one-file,
+one-message chunk format.
+
 ## Examples
 
 **Write a finite input to a spool and mark it complete:**

@@ -145,7 +145,7 @@ one identity to every message missing the field, so it is dropped instead.
 | `sqlx` (PostgreSQL / MySQL / SQLite) | The table's own `UNIQUE`/`PRIMARY KEY` | `ON CONFLICT` / `ON DUPLICATE KEY` in `insert_query` |
 | `clickhouse` | `ReplacingMergeTree` collapses at merge time | Table DDL — no `mq-bridge` config |
 | `file`, `object_store` | Deterministic, sortable part names + covered-range recovery | `name_by: source_position` (needs a source that reproduces the same positions on a re-read — a file source only in `consume` mode; the `object_store` default under `auto`) |
-| `dir_spool` | A chunk name derived from the message rather than the run: a replay rewrites the same file instead of adding one | `naming_pattern` containing `{message_id}` (the default `{seq:09}` is per-run, so **not** idempotent) |
+| `dir_spool` | Not idempotent: every write consumes a new `{seq}` value, so a replay creates a new chunk path even when `naming_pattern` contains `{message_id}` | Rely on downstream deduplication or an idempotent sink |
 | `kafka` | `enable.idempotence` dedups **producer retries within one session** — this is *not* exactly-once semantics | On by default |
 | `nats`, `amqp`, `mqtt`, `redis_streams`, `aws`, `ibm_mq`, `zeromq` | None | Deduplicate at the next consumer instead |
 

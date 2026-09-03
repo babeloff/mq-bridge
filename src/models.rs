@@ -1099,7 +1099,8 @@ pub struct DirSpoolConfig {
     pub consumer_file: String,
     /// (Source only) Delete each chunk's files once its message is acknowledged. Defaults to
     /// true — this is what makes the directory a queue rather than a growing archive. With
-    /// it off, chunks are left in place and each is emitted at most once per consumer run.
+    /// it off, chunks are left in place. Acknowledged chunks are emitted at most once per
+    /// consumer run; nacked chunks are redelivered.
     #[serde(default = "default_true")]
     pub drain_on_read: bool,
     /// (Source only) End the stream once the directory holds no unread chunks *and*
