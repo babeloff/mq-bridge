@@ -13,7 +13,11 @@ categories = ["asynchronous", "network-programming"]
 # Test-only proto; build.rs skips it when absent so downstream builds skip the codegen.
 # `apps/` is a sibling product, not part of the library: cargo only auto-excludes
 # the app's member crates, so the UI, book and benches would ship in the tarball.
-exclude = ["tests/fixtures/grpc_dynamic.proto", "apps/"]
+# `pixi.toml`/`pixi.lock` describe the *development* environment (the
+# conda-forge native libraries the optional features link against). A crates.io
+# consumer resolves those through their own package manager, so the 268 KB lock
+# has no business in the tarball.
+exclude = ["tests/fixtures/grpc_dynamic.proto", "apps/", "pixi.toml", "pixi.lock"]
 
 [lints]
 workspace = true
@@ -133,8 +137,15 @@ tracing-subscriber = { version = "0.3", features = ["json", "env-filter"], optio
 
 # --- Optional Endpoint Dependencies ---
 
-# Kafka
-rdkafka = { version = "0.39", features = ["tokio"], optional = true }
+# Kafka.
+# `dynamic-linking` makes rdkafka-sys pkg-config-probe for `rdkafka >= 2.12.1`
+# and link it, instead of cmake-building the bundled librdkafka source. The
+# library comes from conda-forge's `librdkafka` (see pixi.toml), which already
+# has zlib/zstd/lz4/OpenSSL/SASL support compiled in — the bundled build had to
+# recompile all of it. rdkafka's default `libz` feature is dropped along with
+# it: libz-sys existed to feed the source build, and the shared librdkafka
+# carries its own zlib dependency.
+rdkafka = { version = "0.39", default-features = false, features = ["tokio", "dynamic-linking"], optional = true }
 
 # AMQP (RabbitMQ).
 # Drop lapin's defaults so the crypto provider remains wired through
@@ -200,8 +211,15 @@ aws-config = { version = "1.10", optional = true, default-features = false, feat
 aws-sdk-sqs = { version = "1.105", optional = true, default-features = false, features = ["rt-tokio", "default-https-client"] }
 aws-sdk-sns = { version = "1.107", optional = true, default-features = false, features = ["rt-tokio", "default-https-client"] }
 
-# SQLx
-sqlx = { version = "0.9", features = ["runtime-tokio", "tls-rustls", "postgres", "mysql", "sqlite", "any"], optional = true }
+# SQLx.
+# `sqlite-unbundled` rather than `sqlite`: the latter is an alias for
+# `sqlite-bundled`, which compiles the amalgamated SQLite C source through
+# libsqlite3-sys. Unbundled links conda-forge's `libsqlite` via pkg-config and
+# generates the bindings with bindgen (hence `libclang` in pixi.toml).
+# Note this drops `sqlite-deserialize` / `sqlite-load-extension` /
+# `sqlite-unlock-notify`, which the `sqlite` alias enabled and the crate does
+# not use.
+sqlx = { version = "0.9", features = ["runtime-tokio", "tls-rustls", "postgres", "mysql", "sqlite-unbundled", "any"], optional = true }
 
 # ClickHouse — talks the ClickHouse HTTP interface directly (JSONEachRow in/out).
 # reqwest is used rather than the typed `clickhouse` crate because that crate is
@@ -253,8 +271,10 @@ serde_yaml_ng = { workspace = true, optional = true }
 
 
 [build-dependencies]
+# protoc is NOT vendored: the compiler comes from conda-forge's `libprotobuf`
+# (see pixi.toml, which exports PROTOC). prost-build honours $PROTOC and
+# otherwise finds `protoc` on PATH, so no build-dependency is needed.
 tonic-prost-build = { version = "0.14", optional = true, default-features = false, features = ["transport"] }
-protoc-bin-vendored = { version = "3.2", optional = true }
 
 [features]
 default = []
@@ -270,14 +290,19 @@ float-roundtrip = ["serde_json/float_roundtrip"]
 # static linking.
 full = ["middleware", "plugin", "mongodb", "kafka", "amqp", "nats", "mqtt", "http", "aws", "zeromq", "zeromq-omq", "redis-streams", "sled", "grpc", "sqlx", "clickhouse", "websocket", "postgres-cdc", "object-store", "rustls-aws-lc", "ibm-mq"]
 
-# Endpoints that build across most OS targets (glibc/musl/Alpine, macOS,
-# Windows, aarch64/armv7) without a special toolchain — no librdkafka, protoc,
-# IBM SDK or bundled sqlite. NOT a wasm target: still needs a C compiler for
-# aws-lc crypto (amqp + aws pull aws-lc-sys), and tokio net/raw-TCP endpoints
-# don't run on wasm. Excluded — genuinely need an exotic native toolchain:
-# kafka (librdkafka), sqlx (libsqlite3-sys), grpc (protoc), ibm-mq/ibm-mq-static
-# (IBM C client). postgres-cdc is excluded too: its wire protocol is pure Rust
-# but it pulls in sqlx (C).
+# Endpoints that build from crates.io alone, with no native library or code
+# generator supplied by the environment. NOT a wasm target: still needs a C
+# compiler for aws-lc crypto (amqp + aws pull aws-lc-sys), and tokio
+# net/raw-TCP endpoints don't run on wasm. Excluded because each needs
+# something installed outside cargo — `pixi shell` provides the first three
+# from conda-forge (see pixi.toml), so they are only "not portable" for a
+# build that skips pixi:
+#   kafka                    librdkafka   (pkg-config, rdkafka/dynamic-linking)
+#   sqlx                     libsqlite    (pkg-config + libclang for bindgen)
+#   grpc                     protoc       (libprotobuf)
+#   ibm-mq/ibm-mq-static     IBM C client (not on conda-forge)
+# postgres-cdc is excluded too: its wire protocol is pure Rust but it pulls in
+# sqlx.
 portable = ["metrics", "dedup", "plugin", "mongodb", "amqp", "nats", "mqtt", "http", "aws", "zeromq", "redis-streams", "clickhouse", "websocket", "object-store", "rustls-aws-lc"]
 
 # Functionality features
@@ -345,8 +370,9 @@ zeromq = ["dep:zeromq"]
 # The default `backend: try_omq` uses it when present and falls back to zmq.
 zeromq-omq = ["dep:omq-tokio"]
 redis-streams = ["dep:redis"]
-# Note: The grpc feature requires protobuf-src which can significantly increase build times.
-grpc = ["tonic", "tonic-reflection", "prost", "prost-types", "prost-reflect", "tokio-stream", "tonic-prost", "tonic-prost-build", "protoc-bin-vendored", "rustls"]
+# Note: needs `protoc` at build time, from $PROTOC or PATH. `pixi shell`
+# provides it via conda-forge's libprotobuf.
+grpc = ["tonic", "tonic-reflection", "prost", "prost-types", "prost-reflect", "tokio-stream", "tonic-prost", "tonic-prost-build", "rustls"]
 sqlx = ["dep:sqlx", "url"]
 clickhouse = ["dep:reqwest", "dep:flate2", "dep:lz4_flex", "dep:zstd", "url"]
 # Cloud object-store checkpoint backend (S3/GCS/Azure/R2). Talks cloud REST via reqwest.
@@ -402,7 +428,7 @@ required-features = ["zeromq", "zeromq-omq"]
 name = "integration_test"
 required-features = ["test-utils"]
 
-[target.'cfg(windows)'.dependencies.rdkafka]
-version = "0.39"
-features = ["cmake-build", "tokio"]
-optional = true
+# No Windows-specific rdkafka override any more: `cmake-build` existed only to
+# get the bundled librdkafka source to compile under MSVC. With
+# `dynamic-linking` the library is a conda-forge package on Windows too, so the
+# same dependency line serves every platform.

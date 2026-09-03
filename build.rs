@@ -29,7 +29,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(feature = "grpc")]
     {
         let out_dir = std::path::PathBuf::from(std::env::var("OUT_DIR")?);
-        std::env::set_var("PROTOC", protoc_bin_vendored::protoc_bin_path().unwrap());
+        // protoc is taken from the environment rather than vendored as a binary
+        // build-dependency: prost-build reads $PROTOC and otherwise resolves
+        // `protoc` on PATH. `pixi shell` supplies both from conda-forge's
+        // libprotobuf; a non-pixi build needs protoc installed.
+        println!("cargo:rerun-if-env-changed=PROTOC");
         println!("cargo:rerun-if-changed=src/endpoints/grpc/proto/mqbridge/bridge.proto");
         tonic_prost_build::configure()
             .file_descriptor_set_path(out_dir.join("mqbridge_descriptor.bin"))

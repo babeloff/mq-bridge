@@ -9,6 +9,30 @@
 > from the enum definitions in `models.rs`; the reference records the behaviour and the
 > spelling traps too. Every snippet in it is parsed by `tests/reference_docs_test.rs`.
 
+## Build Environment
+
+The repository is a **pixi workspace** (`pixi.toml`, `pixi.lock`). It pins the Rust
+toolchain and every native library the feature-gated endpoints link, so no `-sys`
+crate compiles a vendored C library:
+
+| conda-forge package | Cargo wiring |
+| --- | --- |
+| `librdkafka` | `rdkafka/dynamic-linking` (was: bundled source + cmake) |
+| `libsqlite` | `sqlx/sqlite-unbundled` (was: `libsqlite3-sys/bundled`) |
+| `libprotobuf` | `$PROTOC` read by `build.rs` (was: `protoc-bin-vendored`) |
+| `zeromq` | libzmq peers for tests/benches; the endpoint itself is pure-Rust zmq.rs |
+
+Use `pixi run <task>` or `pixi shell`; `pixi task list` enumerates the tasks
+(`build-full`, `test`, `clippy`, `check-features`, `verify-native-deps`, …).
+Environments: `default` (toolchain + libraries), `dev` (adds nextest, python +
+grpcio-tools, docker-compose), `native` (libraries only, for a build that brings
+its own rustup toolchain — the `beta` row of `test-matrix.yml`).
+
+CI uses `prefix-dev/setup-pixi` with `activate-environment`, so workflow steps
+keep calling plain `cargo`. `apps/mq-bridge-app` is a **separate** cargo
+workspace and is *not* covered by the pixi workspace — it still cmake-builds its
+own librdkafka, which is why `CMAKE_ARGS` stays in `.cargo/config.toml`.
+
 ## Project Overview
 
 `mq-bridge` is an asynchronous message bridging library for Rust that connects different messaging systems, data stores, and protocols. It acts as a **programmable integration layer**, allowing for transformation, filtering, handling, events, and complex routing.

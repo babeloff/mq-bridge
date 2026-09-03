@@ -50,6 +50,15 @@ If you need to move data or events reliably between systems and you write code (
 | Python | [`mq-bridge-py`](python/mq-bridge-py/README.md) ([PyPI](https://pypi.org/project/mq-bridge-py/)) | `pip install mq-bridge-py` |
 | Node.js | [`mq-bridge`](node/mq-bridge-node/README.md) ([npm](https://www.npmjs.com/package/mq-bridge)) | `npm install mq-bridge` |
 
+### Building from source
+
+The repository is a [pixi](https://pixi.sh) workspace. `pixi run test` pins the
+Rust toolchain and every native library the optional features need — librdkafka
+for `kafka`, SQLite for `sqlx`, `protoc` for `grpc` — from conda-forge, so none
+of them is compiled from vendored C source. See
+[CONTRIBUTING.md](CONTRIBUTING.md#getting-started) for the task list and for the
+prerequisites if you build without pixi.
+
 The constructor names are kept aligned across languages, so a config loader reads the same in either binding (Python uses `snake_case`, Node uses `camelCase`):
 
 - `Route.from_file` / `Route.fromFile` — load a route from a YAML/JSON file

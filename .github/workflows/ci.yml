@@ -33,15 +33,22 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+
+      # Supplies the Rust toolchain (with rustfmt and clippy) *and* the native
+      # libraries the feature-gated endpoints link: librdkafka for `kafka`,
+      # libsqlite for `sqlx`, protoc for `grpc`. `activate-environment` exports
+      # pixi's activation into $GITHUB_ENV, so the plain `cargo` steps below —
+      # and Swatinem/rust-cache, which shells out to rustc — see them.
+      - name: Set up pixi environment
+        uses: prefix-dev/setup-pixi@v0.9.0
         with:
-          components: rustfmt, clippy
-      
+          environments: default
+          activate-environment: true
+          cache: true
+
       - name: Cache cargo build
         uses: Swatinem/rust-cache@v2
-      
+
       - name: Check formatting
         run: cargo fmt --all -- --check
       
@@ -62,8 +69,12 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - name: Set up pixi environment
+        uses: prefix-dev/setup-pixi@v0.9.0
+        with:
+          environments: default
+          activate-environment: true
+          cache: true
 
       - name: Cache cargo build
         uses: Swatinem/rust-cache@v2
@@ -92,22 +103,21 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
-      
+
+      # The `dev` environment adds python + grpcio-tools on top of the toolchain
+      # and native libraries, which is what src/endpoints/grpc/tests.rs shells
+      # out to for the Python gRPC compatibility test (it skips itself if the
+      # import fails). No setup-python and no PEP-668 workaround needed.
+      - name: Set up pixi environment
+        uses: prefix-dev/setup-pixi@v0.9.0
+        with:
+          environments: dev
+          activate-environment: dev
+          cache: true
+
       - name: Cache cargo build
         uses: Swatinem/rust-cache@v2
 
-      # setup-python provides a non-PEP-668 interpreter; the system python3 on
-      # ubuntu-latest is externally managed and rejects a plain pip install.
-      - uses: actions/setup-python@v7
-        with:
-          python-version: '3.12'
-
-      - name: Install Python gRPC compatibility tools
-        run: python3 -m pip install grpcio-tools
-      
       - name: Run unit tests
         run: cargo test --lib --features=full
 # currently - just random panic test
@@ -129,13 +139,14 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
-
-      - name: Install cargo-nextest
-        uses: taiki-e/install-action@v2
+      # `dev` also carries cargo-nextest, so the archive is built with the same
+      # nextest the run jobs below use.
+      - name: Set up pixi environment
+        uses: prefix-dev/setup-pixi@v0.9.0
         with:
-          tool: nextest
+          environments: dev
+          activate-environment: dev
+          cache: true
 
       - name: Cache cargo build
         uses: Swatinem/rust-cache@v2
@@ -191,10 +202,17 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Install cargo-nextest
-        uses: taiki-e/install-action@v2
+      # Not just for nextest: the archived binaries are dynamically linked
+      # against librdkafka/libsqlite in the pixi env, with an rpath recorded at
+      # build time. That rpath is <checkout>/.pixi/envs/dev/lib, which resolves
+      # here because the checkout path is the same on every runner — so the
+      # environment has to be restored before the archive can run.
+      - name: Set up pixi environment
+        uses: prefix-dev/setup-pixi@v0.9.0
         with:
-          tool: nextest
+          environments: dev
+          activate-environment: dev
+          cache: true
 
       - name: Download nextest archive
         uses: actions/download-artifact@v8
@@ -238,10 +256,14 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Install cargo-nextest
-        uses: taiki-e/install-action@v2
+      # Same reason as the integration job above: nextest plus the runtime
+      # libraries the archived binaries were linked against.
+      - name: Set up pixi environment
+        uses: prefix-dev/setup-pixi@v0.9.0
         with:
-          tool: nextest
+          environments: dev
+          activate-environment: dev
+          cache: true
 
       - name: Download nextest archive
         uses: actions/download-artifact@v8
@@ -260,13 +282,19 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
-      
+
+      # --all-features reaches grpc and sqlx, so rustdoc needs protoc and
+      # libsqlite just as much as a build does.
+      - name: Set up pixi environment
+        uses: prefix-dev/setup-pixi@v0.9.0
+        with:
+          environments: default
+          activate-environment: true
+          cache: true
+
       - name: Cache cargo build
         uses: Swatinem/rust-cache@v2
-      
+
       - name: Build documentation (deny warnings)
         run: RUSTDOCFLAGS="-D warnings" cargo doc --all-features --no-deps
 
