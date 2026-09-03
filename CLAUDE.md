@@ -17,10 +17,29 @@ crate compiles a vendored C library:
 
 | conda-forge package | Cargo wiring |
 | --- | --- |
-| `librdkafka` | `rdkafka/dynamic-linking` (was: bundled source + cmake) |
-| `libsqlite` | `sqlx/sqlite-unbundled` (was: `libsqlite3-sys/bundled`) |
-| `libprotobuf` | `$PROTOC` read by `build.rs` (was: `protoc-bin-vendored`) |
+| `libprotobuf` | `$PROTOC` read by `build.rs` (was: `protoc-bin-vendored`) — every variant |
+| `librdkafka` | `rdkafka/dynamic-linking`, `link-dynamic` variant only |
+| `libsqlite` + `libclang` | `sqlx/sqlite-unbundled` + bindgen, `link-dynamic` only |
 | `zeromq` | libzmq peers for tests/benches; the endpoint itself is pure-Rust zmq.rs |
+
+**Three build variants**, chosen by the orthogonal `link-static` /
+`link-dynamic` features (they gate no code, so the ~65 `#[cfg(feature =
+"kafka")]` / `"sqlx"` sites are untouched by the choice):
+
+| pixi task | Features | librdkafka / SQLite | IBM MQ |
+| --- | --- | --- | --- |
+| `build-static` | `full` | compiled in | dlopen at runtime |
+| `build-static-ibm-mq` | `full-static-ibm-mq` | compiled in | link-time, SDK at build |
+| `build-dynamic` | `full-dynamic` | from the environment | dlopen at runtime |
+
+`src/lib.rs` has `compile_error!` guards for both-enabled and for
+`sqlx`-without-a-linkage. Consequently **CI lints with `--features lint-all`,
+not `--all-features`** (which would enable both). `full` deliberately stays
+self-contained — `apps/mq-bridge-app` forwards `mq-bridge/full` and builds
+without conda-forge libraries. IBM MQ details: [docs/IBM_MQ.md](docs/IBM_MQ.md).
+Do not enable rdkafka's `libz` (non-static): it makes libz-sys probe for a
+system zlib and emit `-L /usr/lib64`, which shadows conda's sysroot libc and
+breaks the link with undefined `__libc_csu_init`. Use `libz-static`.
 
 Use `pixi run <task>` or `pixi shell`; `pixi task list` enumerates the tasks
 (`build-full`, `test`, `clippy`, `check-features`, `verify-native-deps`, …).

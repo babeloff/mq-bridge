@@ -52,8 +52,11 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
       
+      # Not --all-features: that enables link-static and link-dynamic together,
+      # which src/lib.rs rejects. `lint-all` is the aggregate of every
+      # code-gating feature; linkage features gate no code.
       - name: Run clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --all-targets --features lint-all -- -D warnings
 
       # Not a workspace default member, so nothing else builds it. It pins the
       # exhaustive `GrpcConfig` literal a downstream crate would write.
@@ -80,10 +83,14 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       # amqp/aws/zeromq are omitted: unchanged for a while and covered by `full`.
+      # `full` is the static-linkage variant, so `full-dynamic` is swept too —
+      # it is the only subset that exercises the pkg-config paths into
+      # conda-forge's librdkafka and libsqlite, and nothing else here would
+      # catch those breaking.
       - name: Check each feature subset
         run: |
           failed=""
-          for f in "" full kafka nats grpc mqtt mongodb http; do
+          for f in "" full full-dynamic kafka nats grpc mqtt mongodb http; do
             echo "::group::cargo check --features ${f:-<default>}"
             if [ -z "$f" ]; then
               cargo check --all-targets || failed="$failed <default>"
@@ -296,7 +303,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Build documentation (deny warnings)
-        run: RUSTDOCFLAGS="-D warnings" cargo doc --all-features --no-deps
+        run: RUSTDOCFLAGS="-D warnings" cargo doc --features lint-all --no-deps
 
   # Supply chain: licenses, banned crates, source registries, RustSec advisories
   supply-chain:

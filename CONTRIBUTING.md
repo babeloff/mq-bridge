@@ -24,21 +24,47 @@ has a Compose file per broker, so you don't have to install them natively.
 
 ### Native dependencies
 
-These come from conda-forge rather than being vendored, so the corresponding
-cargo features build in seconds instead of minutes:
+Only two endpoints link a C library whose provenance is a choice — `kafka`
+(librdkafka) and `sqlx` (SQLite) — plus IBM MQ, whose client is always a shared
+object and differs only in when it is resolved. That gives three build variants:
 
-| conda-forge package | Replaces | Consumed by |
-| --- | --- | --- |
-| `librdkafka` | librdkafka C source bundled in `rdkafka-sys` (cmake build) | `kafka`, via `rdkafka/dynamic-linking` |
-| `libsqlite` | the SQLite amalgamation bundled in `libsqlite3-sys` | `sqlx`, via `sqlx/sqlite-unbundled` |
-| `libprotobuf` | `protoc-bin-vendored` | `grpc`, via `$PROTOC` in `build.rs` |
-| `zeromq` | — (libzmq is not linked; the `zeromq` endpoint uses the pure-Rust zmq.rs) | libzmq interop peers in tests and the `compare_libzmq` bench |
+| Task | Feature set | librdkafka / SQLite | IBM MQ client |
+| --- | --- | --- | --- |
+| `pixi run build-static` | `full` | compiled in | runtime `dlopen`, optional |
+| `pixi run build-static-ibm-mq` | `full-static-ibm-mq` | compiled in | bound at link time, required at build |
+| `pixi run build-dynamic` | `full-dynamic` | linked from the environment | runtime `dlopen`, optional |
+
+The linkage is chosen by the `link-static` / `link-dynamic` cargo features,
+which are deliberately **orthogonal** to the endpoint features: they gate no
+code, so the `#[cfg(feature = "kafka")]` / `#[cfg(feature = "sqlx")]` sites are
+unaffected by the choice. Enable exactly one — `src/lib.rs` rejects both, and
+rejects neither-when-`sqlx`-is-on, with an explanatory `compile_error!`.
+
+That is also why CI lints with `--features lint-all` rather than
+`--all-features`: the latter would switch both linkage features on at once.
+
+`full` stays self-contained so `cargo add mq-bridge --features full` needs no
+system librdkafka or libsqlite. `full-dynamic` exists for conda-forge and distro
+packaging, where the shared libraries have to stay patchable.
+
+What conda-forge supplies:
+
+| conda-forge package | Needed by |
+| --- | --- |
+| `libprotobuf` | every variant — `grpc` runs `protoc` (replaces `protoc-bin-vendored`) |
+| `librdkafka` | `link-dynamic` only, via `rdkafka/dynamic-linking` |
+| `libsqlite` + `libclang` | `link-dynamic` only, via `sqlx/sqlite-unbundled` (bindgen) |
+| `cmake`, `c-compiler` | `link-static` (librdkafka, SQLite) and always for aws-lc/ring/zstd |
+| `zeromq` | libzmq interop peers in tests; the `zeromq` endpoint is pure-Rust zmq.rs and links nothing |
 
 `pixi run verify-native-deps` prints the versions actually resolved.
 
-Building without pixi still works, but then Kafka needs librdkafka ≥ 2.12.1 and
-SQLite ≥ 3.34.1 discoverable through `pkg-config`, gRPC needs `protoc` on `PATH`
-or in `$PROTOC`, and SQLite additionally needs `libclang` for bindgen.
+Building without pixi still works: `full` needs only `protoc` plus a C
+compiler and cmake, while `full-dynamic` additionally needs librdkafka ≥ 2.12.1
+and SQLite ≥ 3.34.1 discoverable through `pkg-config`, and `libclang`.
+
+For IBM MQ specifically — installing the client, the loader's search order, TLS
+key repositories — see [docs/IBM_MQ.md](docs/IBM_MQ.md).
 
 ### Task reference
 

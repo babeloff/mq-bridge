@@ -20,13 +20,18 @@ channels = ["conda-forge"]
 platforms = ["linux-64", "linux-aarch64", "osx-arm64", "osx-64", "win-64"]
 
 [dependencies]
-# Native libraries that replace vendored/bundled builds inside -sys crates.
-# Each one is paired with the cargo feature that consumes it:
+# Native libraries and tools the build needs from conda-forge rather than from a
+# vendored copy inside a -sys crate:
 #
-#   librdkafka  <- rdkafka/dynamic-linking   (was: bundled C source + cmake)
-#   libsqlite   <- sqlx/sqlite-unbundled    (was: libsqlite3-sys/bundled)
-#   zeromq      <- libzmq for the zeromq interop tests and the zmq.rs benches
-#   libprotobuf <- ships bin/protoc         (was: protoc-bin-vendored)
+#   librdkafka  used by the `link-dynamic` variant (rdkafka/dynamic-linking).
+#               The `link-static` variant cmake-builds librdkafka instead, so
+#               this is only needed for `build-dynamic` and the CI sweep.
+#   libsqlite   likewise, for sqlx/sqlite-unbundled.
+#   libprotobuf ships bin/protoc, needed by EVERY variant's `grpc` feature
+#               (replaces the protoc-bin-vendored build-dependency).
+#   zeromq      libzmq peers for the interop tests and the zmq.rs comparison
+#               bench. The zeromq endpoint itself is pure-Rust zmq.rs and links
+#               nothing, so this is test scaffolding, not a build dependency.
 #
 # rdkafka-sys 4.10 pkg-config-probes `rdkafka >= 2.12.1`.
 librdkafka = ">=2.12.1,<3"
@@ -117,11 +122,16 @@ BINDGEN_EXTRA_CLANG_ARGS = "-I$CONDA_PREFIX/include"
 # prost-build would also find `protoc` on PATH; set explicitly so a build
 # script cannot silently pick up a different one.
 PROTOC = "$CONDA_PREFIX/bin/protoc"
-# The one genuinely required setting. librdkafka and libsqlite are linked
-# dynamically and conda does not set LD_LIBRARY_PATH, so without a recorded
-# rpath the built binaries only run while a shell is activated -- which breaks
-# `./target/debug/deps/<test>` and the prebuilt nextest archive CI ships
-# between jobs.
+# Records an rpath so a dynamically linked binary finds librdkafka/libsqlite
+# without LD_LIBRARY_PATH, which conda does not set. That matters for
+# `./target/release/...` and for the prebuilt nextest archive CI passes between
+# jobs.
+#
+# Measured caveat: on linux-64 the conda toolchain adds this same rpath at link
+# time on its own, so this line is belt-and-braces there and shows up as a
+# duplicated DT_RPATH entry. It is kept because that behaviour is a property of
+# conda's compiler rather than something guaranteed across the platforms in
+# `platforms` above, and a missing rpath fails at runtime rather than at build.
 RUSTFLAGS = "-C link-arg=-Wl,-rpath,$CONDA_PREFIX/lib"
 
 # --- Tasks --------------------------------------------------------------------
@@ -133,6 +143,43 @@ description = "Build with default features"
 [tasks.build-full]
 cmd = "cargo build --features full"
 description = "Build every endpoint and middleware"
+
+# --- Release build variants ---------------------------------------------------
+#
+# Three ways to obtain the C libraries; see the "three build variants" comment
+# in Cargo.toml. All three take the toolchain, cmake, the C compiler and protoc
+# from this environment -- they differ only in librdkafka/libsqlite/libmqm_r.
+#
+# Verified on linux-64 by readelf on target/release/mq_bridge_http_profile:
+#   build-static   DT_NEEDED = ld-linux, libc, libdl, libgcc_s, libm, libpthread
+#   build-dynamic  the same, plus librdkafka.so.1 and libsqlite3.so.0
+#
+# Note the static variants are self-contained but not fully relocatable: the
+# conda toolchain records an rpath into $CONDA_PREFIX/lib whatever RUSTFLAGS
+# says, and only libgcc_s could ever resolve from there. It falls through to
+# the system loader path on a machine without the environment, so it is
+# hygiene rather than a functional problem; strip it with
+# `patchelf --remove-rpath` if a released artifact must carry no build paths.
+
+# Nothing links out to a C library that has to be installed alongside the
+# binary -- except the IBM MQ client, which is loaded lazily at runtime only if
+# an ibm-mq endpoint is actually used.
+[tasks.build-static]
+cmd = "cargo build --release --features full"
+description = "Self-contained C libs; IBM MQ resolved at runtime via dlopen"
+
+# As build-static, but libmqm_r is bound at link time. Requires the IBM MQ
+# client at BUILD time (MQ_INSTALLATION_PATH, default /opt/mqm) and the binary
+# will not start without it installed. See docs/IBM_MQ.md.
+[tasks.build-static-ibm-mq]
+cmd = "cargo build --release --features full-static-ibm-mq"
+description = "Self-contained C libs; libmqm_r bound at link time (needs the IBM MQ client at build)"
+
+# Links this environment's librdkafka and libsqlite. What a conda-forge recipe
+# or a distro package wants, so the shared libraries stay patchable.
+[tasks.build-dynamic]
+cmd = "cargo build --release --features full-dynamic"
+description = "Link librdkafka + libsqlite from the environment (conda-forge packaging)"
 
 [tasks.build-portable]
 cmd = "cargo build --features portable"
@@ -151,7 +198,7 @@ cmd = "cargo fmt --all -- --check"
 description = "Fail on unformatted code"
 
 [tasks.clippy]
-cmd = "cargo clippy --all-targets --all-features -- -D warnings"
+cmd = "cargo clippy --all-targets --features lint-all -- -D warnings"
 description = "Lint as CI does"
 
 # Mirrors the feature-subset sweep in .github/workflows/ci.yml. The trailing
@@ -161,6 +208,7 @@ description = "Lint as CI does"
 cmd = """
 cargo check --all-targets && \
 cargo check --all-targets --features full && \
+cargo check --all-targets --features full-dynamic && \
 cargo check --all-targets --features kafka && \
 cargo check --all-targets --features nats && \
 cargo check --all-targets --features grpc && \

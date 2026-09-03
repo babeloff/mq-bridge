@@ -53,11 +53,23 @@ If you need to move data or events reliably between systems and you write code (
 ### Building from source
 
 The repository is a [pixi](https://pixi.sh) workspace. `pixi run test` pins the
-Rust toolchain and every native library the optional features need — librdkafka
-for `kafka`, SQLite for `sqlx`, `protoc` for `grpc` — from conda-forge, so none
-of them is compiled from vendored C source. See
+Rust toolchain, `protoc`, cmake and a C compiler, so a clone builds without
+installing anything by hand. See
 [CONTRIBUTING.md](CONTRIBUTING.md#getting-started) for the task list and for the
 prerequisites if you build without pixi.
+
+Three release variants differ only in where their C libraries come from:
+
+| Task | Feature set | librdkafka / SQLite | IBM MQ client |
+| :--- | :--- | :--- | :--- |
+| `pixi run build-static` | `full` | compiled in | runtime `dlopen`, optional |
+| `pixi run build-static-ibm-mq` | `full-static-ibm-mq` | compiled in | bound at link time, required |
+| `pixi run build-dynamic` | `full-dynamic` | linked from the environment | runtime `dlopen`, optional |
+
+`full` is the default and stays self-contained, so `cargo add mq-bridge
+--features full` needs no system librdkafka or libsqlite. `full-dynamic` is for
+conda-forge and distro packaging, where the shared libraries have to stay
+patchable.
 
 The constructor names are kept aligned across languages, so a config loader reads the same in either binding (Python uses `snake_case`, Node uses `camelCase`):
 
@@ -87,7 +99,7 @@ For implementation details and quick start examples for each usage type, see the
 
 *   **Supported Backends**: Kafka, NATS, AMQP (RabbitMQ), MQTT, MongoDB, SQL Databases (PostgreSQL, MySQL, SQLite via sqlx), **Postgres CDC** (logical replication), ClickHouse, gRPC, HTTP, WebSocket, ZeroMQ, Redis Streams, Files, cloud object storage (S3 / GCS / Azure), AWS (SQS/SNS), IBM MQ, and in-memory channels.
 *   **Change Data Capture**: PostgreSQL logical replication (`postgres_cdc`) and MongoDB change streams, surfaced as flat rows with an `*.operation` marker (`insert`/`update`/`delete`/`truncate`).
-    > **Note**: IBM MQ is included in the `full` feature set via the `ibm-mq` feature, which loads the IBM MQ client library at runtime via dlopen — **no IBM SDK is needed to build**. The IBM MQ redistributable client only has to be present at runtime, and only if you actually use an IBM MQ endpoint (it is loaded lazily on first connect). If the client is missing, the affected route fails fast with a non-retryable error instead of reconnecting forever. The loader finds the client via the platform default name, `MQ_INSTALLATION_PATH` (e.g. `/opt/mqm`), or an explicit `MQB_IBM_MQ_LIB` path. To link the client statically at build time instead, use the `ibm-mq-static` feature (requires the IBM MQ SDK). See the [mqi crate](https://crates.io/crates/mqi/) for details.
+    > **Note**: IBM MQ is included in the `full` feature set via the `ibm-mq` feature, which loads the IBM MQ client library at runtime via dlopen through the [`mqi`](https://crates.io/crates/mqi) / [`libmqm-sys`](https://crates.io/crates/libmqm-sys) wrapper crates — **no IBM SDK is needed to build**, and nothing proprietary is vendored into this repository. The IBM MQ redistributable client only has to be present at runtime, and only if you actually use an IBM MQ endpoint (it is loaded lazily on first connect). If the client is missing, the affected route fails fast with a non-retryable error instead of reconnecting forever. The loader finds the client via `MQB_IBM_MQ_LIB`, `MQ_INSTALLATION_PATH` (e.g. `/opt/mqm`), or the platform default name. The alternative `ibm-mq-static` feature binds the client at link time instead, which does require it at build time — despite the name it links no static archive, since IBM ships none. **See [docs/IBM_MQ.md](docs/IBM_MQ.md)** for installation, the loader's search order, TLS key repositories and route configuration.
     >
     > **TLS**: IBM MQ has its own TLS config shape (`IbmTlsConfig`), since the native client doesn't consume PEM files. The field names mirror the generic `TlsConfig` for config parity, but carry MQ-native semantics: `tls.cert_file` (alias `key_repository`) is a CMS key repository path (e.g. `/path/to/tls` for `tls.kdb`), not a PEM file. The repository can either be passwordless (backed by a `.sth` stash file next to the `.kdb`) or password-protected via `tls.cert_password` (alias `key_repository_password`; requires an IBM MQ client/server at 9.3.0.0 or later, which is the capability level `ibm-mq`/`ibm-mq-static` build against; 9.2 is EOL).
 *   **Configuration**: Routes can be defined via YAML, JSON or environment variables.

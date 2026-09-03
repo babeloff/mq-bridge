@@ -1,5 +1,16 @@
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    if std::env::var("CARGO_FEATURE_IBM_MQ").is_ok() {
+    // Only the `ibm-mq-static` path needs this. It was previously gated on
+    // CARGO_FEATURE_IBM_MQ — the *dlopen* feature — which is exactly backwards:
+    // dlopen resolves the client by name at runtime and never consults the
+    // link search path, so the only effect was to bake a /opt/mqm/lib64 RPATH
+    // into every binary built with `full`. That entry is dead weight when the
+    // directory is absent, and an RPATH naming a directory an unprivileged user
+    // could later create is somewhere a library can be injected from.
+    //
+    // libmqm-sys emits its own `rustc-link-search` under its `link_mqm`
+    // feature; what it does not emit is an rpath, so the binary would otherwise
+    // need LD_LIBRARY_PATH to find libmqm_r at run time. That is what this adds.
+    if std::env::var("CARGO_FEATURE_IBM_MQ_STATIC").is_ok() {
         // Ensure rebuild when these environment variables change
         println!("cargo:rerun-if-env-changed=MQ_INSTALLATION_PATH");
         println!("cargo:rerun-if-env-changed=MQ_HOME");
