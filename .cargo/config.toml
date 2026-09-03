@@ -6,8 +6,11 @@
 
 [env]
 # librdkafka's CMakeLists declares cmake_minimum_required(3.2), which cmake 4
-# refuses. rdkafka-sys is reachable from the engine's kafka feature and from
-# every app build, so this belongs at the root.
+# refuses. The engine no longer hits this — its `kafka` feature links
+# conda-forge's librdkafka through rdkafka/dynamic-linking rather than
+# cmake-building the bundled source — but apps/mq-bridge-app is a separate
+# workspace that still depends on rdkafka with default features, and its build
+# can be started from the repository root. Kept for that path.
 CMAKE_ARGS = "-DCMAKE_POLICY_VERSION_MINIMUM=3.5"
 
 # Pinned explicitly so a --manifest-path build of the app workspace still writes

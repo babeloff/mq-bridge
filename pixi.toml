@@ -1,0 +1,134 @@
+# pixi workspace for the mq-bridge engine crate.
+#
+# Purpose: every native library the crate needs comes from conda-forge instead of
+# being vendored, bundled or cmake-built by a `-sys` crate. That means one solved,
+# locked toolchain (`pixi.lock`) reproduces the build on every platform, and the
+# long librdkafka/SQLite/protobuf source compiles disappear from `cargo build`.
+#
+# Enter the environment with `pixi shell`, or run a single task with
+# `pixi run <task>`. See the "Building with pixi" section of CONTRIBUTING.md.
+
+[workspace]
+name = "mq-bridge"
+version = "0.4.10"
+description = "An asynchronous message bridging library connecting Kafka, MQTT, AMQP, NATS, MongoDB, HTTP, and more."
+authors = ["Marco Mengelkoch"]
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/marcomq/mq-bridge"
+channels = ["conda-forge"]
+platforms = ["linux-64", "linux-aarch64", "osx-arm64", "osx-64", "win-64"]
+
+[dependencies]
+# Native libraries that replace vendored/bundled builds inside -sys crates.
+# Each one is paired with the cargo feature that consumes it:
+#
+#   librdkafka  <- rdkafka/dynamic-linking   (was: bundled C source + cmake)
+#   libsqlite   <- sqlx/sqlite-unbundled    (was: libsqlite3-sys/bundled)
+#   zeromq      <- libzmq for the zeromq interop tests and the zmq.rs benches
+#   libprotobuf <- ships bin/protoc         (was: protoc-bin-vendored)
+#
+# rdkafka-sys 4.10 pkg-config-probes `rdkafka >= 2.12.1`.
+librdkafka = ">=2.12.1,<3"
+# sqlx-sqlite's `unbundled` path needs libsqlite3-sys' min_sqlite_version_3_34_1.
+libsqlite = ">=3.34.1,<4"
+zeromq = ">=4.3.5,<5"
+# protoc lives in libprotobuf on conda-forge; the `protobuf` package is the
+# Python runtime and is not what tonic-prost-build needs.
+libprotobuf = ">=5"
+
+# Build glue. pkg-config is how rdkafka-sys and libsqlite3-sys locate the two
+# libraries above; conda-forge's build bakes the environment prefix into its
+# default search path, so no PKG_CONFIG_PATH is needed.
+pkg-config = ">=0.29"
+# aws-lc-sys / ring / zstd-sys still compile C, and aws-lc-sys drives cmake.
+# These pin the compiler instead of taking whatever the host happens to have.
+c-compiler = ">=1.11"
+cxx-compiler = ">=1.11"
+cmake = ">=3.31"
+# libsqlite3-sys' `buildtime_bindgen` runs bindgen, which dlopens libclang.
+libclang = ">=19"
+
+[target.unix.dependencies]
+# cmake's default generator on unix.
+make = ">=4.3"
+
+# The toolchain is a separate feature so the `native` environment can leave it
+# out: the beta row of .github/workflows/test-matrix.yml brings its own rustup
+# toolchain and only needs the native libraries from here.
+[feature.toolchain.dependencies]
+# `full` reaches omq-tokio, whose MSRV is 1.93; the base crate is 1.85.
+# conda-forge ships one stable `rust`; there is no beta channel.
+rust = ">=1.93,<2"
+
+[feature.dev.dependencies]
+# Integration suites are archived and filtered with nextest in CI.
+cargo-nextest = ">=0.9"
+# `pixi run -e dev test-integration` drives the compose stacks under
+# tests/integration/docker-compose/.
+docker-compose = ">=2.30"
+# src/endpoints/grpc/tests.rs shells out to `python3 -m grpc_tools.protoc` for
+# the wire-compatibility test (it skips itself if the import fails).
+python = ">=3.12,<3.14"
+grpcio-tools = ">=1.60"
+
+[environments]
+default = { features = ["toolchain"], solve-group = "default" }
+dev = { features = ["toolchain", "dev"], solve-group = "default" }
+# Native libraries only, no Rust. For a build that supplies its own toolchain.
+native = { solve-group = "default" }
+
+# --- Environment wiring -------------------------------------------------------
+#
+# Only what cargo cannot work out for itself. Everything else already resolves
+# through the environment: protoc via PATH, the Windows DLLs via PATH, and the
+# .pc files via pkg-config's baked-in prefix.
+#
+# There is deliberately no [target.win-64.activation.env]: pixi emits these
+# values verbatim into a shell-specific export, so a `$CONDA_PREFIX`
+# interpolation has no spelling that works in both cmd.exe and PowerShell.
+# Windows needs none of it -- protoc.exe and the DLLs are found on PATH, and
+# bindgen finds libclang.dll there too.
+
+[target.unix.activation.env]
+# Pin bindgen to the environment's libclang and headers rather than letting
+# clang-sys fall back to whatever the host has installed.
+LIBCLANG_PATH = "$CONDA_PREFIX/lib"
+BINDGEN_EXTRA_CLANG_ARGS = "-I$CONDA_PREFIX/include"
+# prost-build would also find `protoc` on PATH; set explicitly so a build
+# script cannot silently pick up a different one.
+PROTOC = "$CONDA_PREFIX/bin/protoc"
+# The one genuinely required setting. librdkafka and libsqlite are linked
+# dynamically and conda does not set LD_LIBRARY_PATH, so without a recorded
+# rpath the built binaries only run while a shell is activated -- which breaks
+# `./target/debug/deps/<test>` and the prebuilt nextest archive CI ships
+# between jobs.
+RUSTFLAGS = "-C link-arg=-Wl,-rpath,$CONDA_PREFIX/lib"
+
+# --- Tasks --------------------------------------------------------------------
+
+[tasks]
+build = { cmd = "cargo build", description = "Build with default features" }
+build-full = { cmd = "cargo build --features full", description = "Build every endpoint and middleware" }
+build-portable = { cmd = "cargo build --features portable", description = "Build the feature set that needs no native library from the environment" }
+build-release = { cmd = "cargo build --release --features full", description = "Release build, full features" }
+
+fmt = { cmd = "cargo fmt --all", description = "Format the workspace" }
+fmt-check = { cmd = "cargo fmt --all -- --check", description = "Fail on unformatted code" }
+clippy = { cmd = "cargo clippy --all-targets --all-features -- -D warnings", description = "Lint as CI does" }
+
+# Mirrors the feature-subset sweep in .github/workflows/ci.yml.
+check-features = { cmd = "cargo check --all-targets && cargo check --all-targets --features full && cargo check --all-targets --features kafka && cargo check --all-targets --features nats && cargo check --all-targets --features grpc && cargo check --all-targets --features mqtt && cargo check --all-targets --features mongodb && cargo check --all-targets --features http", description = "cargo check each feature subset CI covers" }
+
+test = { cmd = "cargo test --lib --features full", description = "Unit tests, full features" }
+test-no-docker = { cmd = "cargo test --test ref_test --test sqlite_test --test tls_example --test websocket_test --features full", description = "Integration tests that need no Docker services" }
+test-memory-leak = { cmd = "cargo test --test memory_leak_test --features full -- --ignored --nocapture", description = "Route commit-task JoinSet leak soak" }
+check-config-compat = { cmd = "cargo check -p grpc-config-compat", description = "Downstream GrpcConfig literal fixture (not a default member)" }
+doc = { cmd = "cargo doc --no-deps --features full", description = "Build rustdoc" }
+
+# Prove the conda-forge libraries are the ones actually linked.
+verify-native-deps = { cmd = "pkg-config --modversion rdkafka sqlite3 libzmq && protoc --version", description = "Print the resolved conda-forge native library versions" }
+
+[feature.dev.tasks]
+test-integration = { cmd = "cargo nextest run --release --features full,test-utils --test integration_test --test armature_integration", description = "Full Docker-backed integration suite (needs a running Docker daemon)" }
+bench = { cmd = "cargo bench --features test-utils", description = "Criterion benchmarks" }

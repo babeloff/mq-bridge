@@ -45,11 +45,22 @@ jobs:
           # Nothing in this job writes back to the repository.
           persist-credentials: false
       
+      # The `native` pixi environment carries the native libraries the `full`
+      # feature set links (librdkafka, libsqlite, protoc) but deliberately no
+      # Rust, because this matrix also tests `beta` and conda-forge only ships a
+      # stable `rust`. The toolchain therefore still comes from rustup below.
+      - name: Set up native dependencies
+        uses: prefix-dev/setup-pixi@v0.9.0
+        with:
+          environments: native
+          activate-environment: native
+          cache: true
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           toolchain: ${{ matrix.rust }}
-      
+
       - name: Cache cargo registry
         uses: actions/cache@v6
         with:
