@@ -4,26 +4,37 @@
 
 Schemes: `grpc://`, `grpcs://`
 
-Query parameters recognised as config fields for this connector. The object-typed `tls` is set with a JSON literal, e.g. `?tls={...}`. Unrecognised parameters are not forwarded as driver options, so any other `?key=value` pair is rejected rather than silently ignored.
+Query parameters recognised as config fields for this connector. The object-typed `binary_metadata` is set with a JSON literal, e.g. `?binary_metadata={...}`. Unrecognised parameters are not forwarded as driver options, so any other `?key=value` pair is rejected rather than silently ignored.
 
 | Name | Type | Required | Default | Description |
 |------|------|----------|---------|-------------|
+| `api_key` | string | no | — | API key sent as `api_key_name` (default `x-api-key`) on dynamic calls only. |
+| `api_key_name` | string | no | — | Metadata key used for `api_key`. |
+| `bearer_token` | string | no | — | Bearer token sent as `authorization` on dynamic calls; rejected in Bridge/server mode. |
+| `binary_metadata` | object | no | — | Static binary metadata for dynamic calls. Keys must end in `-bin`; values are raw bytes. |
 | `concurrency_limit_per_connection` | integer | no | `null` | Maximum number of concurrent requests handled per connection. **Server-mode only.** |
+| `connect_timeout_ms` | integer | no | `null` | Maximum time to establish a client connection. |
 | `consumer_id` | string | no | `null` | Stable subscription identity used for ACK tracking and redelivery. Defaults to a fresh id per consumer; set it to be redelivered unacknowledged messages on reconnect. |
+| `descriptor_set_bytes` | array of integer | no | — | Compiled protobuf FileDescriptorSet bytes for embedded callers. Takes precedence over `descriptor_set_path` and avoids writing a temporary descriptor file. |
 | `descriptor_set_path` | string | no | `null` | Compiled protobuf FileDescriptorSet for dynamic client mode. |
 | `http2_keepalive_interval_ms` | integer | no | `null` | HTTP/2 keepalive ping interval in milliseconds. Applies in both modes. Default disabled |
 | `http2_keepalive_timeout_ms` | integer | no | `null` | Timeout for a keepalive ping acknowledgement in milliseconds. Applies in both modes. |
+| `idle_stream_timeout_ms` | integer | no | `null` | Maximum time a dynamic response stream may remain idle between messages. |
 | `initial_connection_window_size` | integer | no | `null` | HTTP/2 connection-level initial window size in bytes. Applies in both modes. |
 | `initial_stream_window_size` | integer | no | `null` | HTTP/2 stream-level initial window size in bytes. Applies in both modes. |
 | `max_decoding_message_size` | integer | no | `null` | Maximum size of a decoded incoming message in bytes. Applies in both modes. Default 4 MiB. |
 | `max_encoding_message_size` | integer | no | `null` | Maximum size of an encoded outgoing message in bytes. Default unlimited. |
+| `metadata` | object | no | — | Static ASCII metadata attached to dynamic RPCs. Values for keys that look sensitive are extracted by mq-bridge's normal secret handling. |
 | `method_name` | string | no | `null` | RPC method name for dynamic client mode. |
+| `overall_timeout_ms` | integer | no | `null` | Maximum lifetime of a dynamic RPC; exceeding it stops the route instead of reconnecting. |
+| `reflection` | boolean | no | `false` | Discover descriptors from the remote gRPC server reflection v1 service. |
 | `request` | any | no | `null` | JSON request mapped to the dynamic protobuf input message. |
+| `request_timeout_ms` | integer | no | `null` | Maximum time to establish an RPC and receive its initial response. |
 | `server_mode` | boolean | no | `false` | If `true`, start an embedded tonic gRPC server that accepts incoming `Publish` / `PublishBatch` RPCs. If `false` (the default), connect to a remote server as a client. |
-| `server_streaming` | boolean | no | `false` | Use a server-streaming dynamic RPC. False selects unary. |
+| `server_streaming` | boolean | no | `false` | Deprecated compatibility hint. Dynamic RPC shape is always derived from the descriptor. |
 | `service_name` | string | no | `null` | Fully-qualified protobuf service name for dynamic client mode. |
 | `shared` | boolean | no | `true` | (Publisher only) Share one gRPC channel per connection (default: true); false forces a dedicated channel. |
-| `timeout_ms` | integer | no | — | Timeout in milliseconds. - Client mode: used as the connection timeout and per-request deadline. - Server mode: applied as the per-request deadline on the embedded server. |
+| `timeout_ms` | integer | no | — | Deprecated compatibility timeout in milliseconds. Used as the fallback for connection and initial-request deadlines. Prefer the dedicated settings. |
 | `tls` | object | no | [see below](#tls) | TLS configuration. |
 | `topic` | string | no | — | Topic / subject used for both subscribe and publish paths. |
 | `url` | string | yes | — | The gRPC server URL (e.g., "http://localhost:50051" for client or "0.0.0.0:50051" for server mode). |

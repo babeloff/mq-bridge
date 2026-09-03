@@ -116,8 +116,18 @@ fn main() -> std::io::Result<()> {
         },
         Connector {
             slug: "object-store",
-            title: "Cloud Object Storage",
-            schemes: &["s3", "s3a", "gs", "gcs", "az", "azure", "abfs", "abfss"],
+            title: "Object Storage (local / cloud)",
+            schemes: &[
+                "local-store",
+                "s3",
+                "s3a",
+                "gs",
+                "gcs",
+                "az",
+                "azure",
+                "abfs",
+                "abfss",
+            ],
             schema: schemars::schema_for!(ObjectStoreConfig),
         },
         Connector {

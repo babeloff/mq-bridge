@@ -396,7 +396,7 @@ class NatsConfig(TypedDict, total=False):
 
 
 class ObjectStoreConfig(TypedDict, total=False):
-    """Configuration for a cloud object-store endpoint (S3, GCS, Azure Blob, R2, ...)."""
+    """Configuration for a local or cloud object-store endpoint."""
     checkpoint_store: Optional[str]
     compression: Compression
     cursor_id: Optional[str]

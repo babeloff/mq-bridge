@@ -2070,6 +2070,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn local_filesystem_sink_and_source_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = ObjectStoreConfig {
+            url: format!("file://{}", dir.path().display()),
+            format: FileFormat::Normal,
+            date_partition: Some(false),
+            polling_interval_ms: Some(1),
+            ..Default::default()
+        };
+
+        let publisher = ObjectStorePublisher::new(&config).await.unwrap();
+        publisher
+            .send_batch(vec![json_msg(serde_json::json!({"source": "local"}))])
+            .await
+            .unwrap();
+
+        let mut consumer = ObjectStoreConsumer::new(&config).await.unwrap();
+        let batch = consumer.receive_batch(10).await.unwrap();
+        assert_eq!(batch.messages.len(), 1);
+        assert_eq!(batch.messages[0].payload.as_ref(), br#"{"source":"local"}"#);
+        (batch.commit)(vec![MessageDisposition::Ack]).await.unwrap();
+
+        let drained = consumer.receive_batch(10).await.unwrap();
+        assert!(drained.messages.is_empty());
+    }
+
+    #[tokio::test]
+    async fn local_filesystem_source_reads_csv_drop_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("2026-09-03-orders.csv"),
+            b"id,name\n1,Ada\n2,Grace\n",
+        )
+        .unwrap();
+        let config = ObjectStoreConfig {
+            url: format!("file://{}", dir.path().display()),
+            format: FileFormat::Csv,
+            polling_interval_ms: Some(1),
+            ..Default::default()
+        };
+
+        let mut consumer = ObjectStoreConsumer::new(&config).await.unwrap();
+        let batch = consumer.receive_batch(10).await.unwrap();
+        assert_eq!(batch.messages.len(), 2);
+        assert_eq!(
+            batch.messages[0].payload.as_ref(),
+            br#"{"id":"1","name":"Ada"}"#
+        );
+        assert_eq!(
+            batch.messages[1].payload.as_ref(),
+            br#"{"id":"2","name":"Grace"}"#
+        );
+        (batch.commit)(vec![MessageDisposition::Ack; 2])
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn nacked_records_are_redelivered() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let publisher = test_publisher(store.clone());

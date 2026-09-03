@@ -21,6 +21,7 @@ under [`../reference/`](../reference/).
 - [IBM MQ](./ibmmq.md)
 - [File (CSV / JSON / JSONL)](./file.md)
 - [Directory spool](./dir-spool.md)
+- [Object storage (local / cloud)](./object-store.md)
 
 Every connector recognised by `mqb copy` now has a hand-written page.
 For the full, auto-generated parameter tables see the matching page under

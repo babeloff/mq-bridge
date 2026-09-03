@@ -2850,7 +2850,7 @@
       ]
     },
     "ObjectStoreConfig": {
-      "description": "Configuration for a cloud object-store endpoint (S3, GCS, Azure Blob, R2, ...).\n\nAs a **sink**, each flushed batch is written as one immutable object under `url`,\nnamed `<prefix>/[YYYY/MM/DD/]<uuidv7>.<ext>`. As a **source**, objects under `url`\nare listed in key order, fetched, split by `delimiter`, and emitted as messages;\nprogress is persisted to `checkpoint_store` (the last processed object key) so a\nrestart resumes without re-emitting. Objects are never mutated or deleted in place.",
+      "description": "Configuration for a local or cloud object-store endpoint.\n\nAs a **sink**, each flushed batch is written as one immutable object under `url`,\nnamed `<prefix>/[YYYY/MM/DD/]<uuidv7>.<ext>`. As a **source**, objects under `url`\nare listed in key order, fetched, split by `delimiter`, and emitted as messages;\nprogress is persisted to `checkpoint_store` (the last processed object key) so a\nrestart resumes without re-emitting. Objects are never mutated or deleted in place.",
       "type": "object",
       "properties": {
         "checkpoint_store": {
@@ -2942,7 +2942,7 @@
           "minimum": 0
         },
         "url": {
-          "description": "Object-store URL, e.g. `s3://bucket/prefix`, `gs://bucket/prefix`,\n`az://account/container/prefix`. Credentials are resolved from the environment by\nthe `object_store` crate (same mechanism as the checkpoint backend); R2 uses\n`s3://` plus a custom `AWS_ENDPOINT_URL`.",
+          "description": "Object-store URL, e.g. `file:///var/lib/mqb/incoming`, `s3://bucket/prefix`,\n`gs://bucket/prefix`, or `az://account/container/prefix`. Credentials are resolved\nfrom the environment by the `object_store` crate (same mechanism as the checkpoint\nbackend); R2 uses `s3://` plus a custom `AWS_ENDPOINT_URL`.",
           "type": "string"
         }
       },

@@ -20,6 +20,7 @@ Query parameters recognised as config fields for this connector. The object-type
 | `internal_buffer_size` | integer | no | — | (Consumer only) Internal buffer size for the channel. Defaults to 100. |
 | `message_id_header` | string | no | — | (Consumer only) Header key to extract the message ID from. Defaults to "message-id". |
 | `method` | string | no | — | (Optional) HTTP method. For publishers: the method to use (defaults to POST). For consumers: restrict to this method (others return 405). |
+| `pass_through_status` | boolean | no | `false` | (Publisher) Treat every HTTP response status as response data instead of classifying non-2xx statuses as publisher errors. Transport and response-read failures remain errors. (Consumer) When every output sink opts in, transient sink failures return 502 without stopping a non-streaming request/reply route. Defaults to false. |
 | `path` | string | no | — | (Consumer only) Optional request path filter. If set, only requests whose URI path matches exactly are delivered to this consumer. |
 | `pool_idle_timeout_ms` | integer | no | — | (Publisher only) Timeout for idle connections in the connection pool in milliseconds. Defaults to 90000ms. |
 | `receive_streamable` | boolean | no | `false` | (Consumer only) If true, read request bodies as a stream and emit each received stream item as a separate message. |

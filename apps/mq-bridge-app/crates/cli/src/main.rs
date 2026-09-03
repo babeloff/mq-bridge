@@ -1585,10 +1585,11 @@ fn base_endpoint_from_uri(uri: &str) -> anyhow::Result<mq_bridge::models::Endpoi
             "dir_spool",
             schema_fields(schemars::schema_for!(DirSpoolConfig)),
         ),
-        // Cloud object storage. The bucket scheme both selects the endpoint and is
-        // the connection URL the `object_store` crate expects, so it is not
-        // rewritten below; credentials come from the environment.
-        "s3" | "s3a" | "gs" | "gcs" | "az" | "azure" | "abfs" | "abfss" => (
+        // Local and cloud object storage. Cloud schemes pass through; the explicit
+        // local alias is rewritten to `file://` below so plain `file://` keeps
+        // selecting the single-file connector.
+        "local-store" | "s3" | "s3a" | "gs" | "gcs" | "az" | "azure" | "abfs"
+        | "abfss" => (
             "object_store",
             schema_fields(schemars::schema_for!(ObjectStoreConfig)),
         ),
@@ -1772,8 +1773,8 @@ fn base_endpoint_from_uri(uri: &str) -> anyhow::Result<mq_bridge::models::Endpoi
             "clickhouse" => &[("clickhouses://", "https://"), ("clickhouse://", "http://")],
             "grpc" => &[("grpcs://", "https://"), ("grpc://", "http://")],
             "zeromq" => &[("zeromq://", "tcp://"), ("zmq://", "tcp://")],
-            // `object_store` only recognizes `gs://` for GCS, not the `gcs://` alias.
-            "object_store" => &[("gcs://", "gs://")],
+            // Normalize CLI-only aliases to schemes recognized by `object_store`.
+            "object_store" => &[("gcs://", "gs://"), ("local-store://", "file://")],
             _ => &[],
         };
         for (prefix, replacement) in rewrites {
@@ -2977,9 +2978,9 @@ mod uri_tests {
         assert_eq!(cfg["database"], "analytics");
     }
 
-    // Bucket schemes select the `object_store` endpoint and are also the connection
-    // URL the crate expects, so they pass through unrewritten; `gcs://` is the one
-    // alias normalised (to `gs://`). `cursor_id`/`checkpoint_store` are scalar fields.
+    // Storage schemes select the `object_store` endpoint. Cloud URLs pass through,
+    // while CLI aliases are normalized to schemes understood by the backing crate.
+    // `cursor_id`/`checkpoint_store` are scalar fields.
     #[test]
     fn object_store_bucket_schemes() {
         let cfg = config(
@@ -2993,6 +2994,10 @@ mod uri_tests {
         assert_eq!(config("gs://b/p", "object_store")["url"], "gs://b/p");
         assert_eq!(config("az://b/p", "object_store")["url"], "az://b/p");
         assert_eq!(config("gcs://b/p", "object_store")["url"], "gs://b/p");
+        assert_eq!(
+            config("local-store:///var/lib/mqb/incoming", "object_store")["url"],
+            "file:///var/lib/mqb/incoming"
+        );
     }
 
     #[test]

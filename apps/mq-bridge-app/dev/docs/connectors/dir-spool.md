@@ -5,9 +5,9 @@ metadata sidecar. Use it as a durable FIFO hand-off between processes when you
 want a queue that can be inspected with ordinary filesystem tools and do not
 want to operate a broker.
 
-Unlike the [file connector](./file.md), which frames many records in one file,
-the directory spool writes one opaque payload per file. A producer may exit
-while a consumer continues draining the backlog.
+Unlike the [file connector](./file.md) and local [object storage](./object-store.md),
+which can frame many records in a file, the directory spool writes one opaque
+payload per file. A producer may exit while a consumer continues draining the backlog.
 
 ## URL format
 
@@ -81,12 +81,14 @@ formats. A `.jsonl` or `.csv` payload file is still one opaque message, even if
 it contains many lines. Changing `payload_extension` changes file selection and
 naming, not parsing behavior.
 
-Use the [file connector](./file.md) when records must be framed:
+Use a record-oriented connector when records must be framed:
 
-- `file:///data/orders.jsonl?format=json` reads or writes newline-delimited JSON.
-- `file:///data/orders.csv?format=csv` reads or writes CSV records.
-- Sending either source to a directory spool creates one chunk per message the
-  file connector emits, rather than one chunk containing the whole input file.
+- The [file connector](./file.md) reads or writes one named file, for example
+  `file:///data/orders.jsonl?format=json` or `file:///data/orders.csv?format=csv`.
+- Local [object storage](./object-store.md) watches a directory of immutable,
+  multi-record files, making it a better fit for CSV/JSONL ETL drop zones.
+- Sending either source to a directory spool creates one chunk per emitted
+  message, rather than one chunk containing the whole input file.
 
 Route-level batching is supported in both directions. A target can receive a
 batch of messages and writes one payload/sidecar pair for each message. A source

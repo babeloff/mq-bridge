@@ -144,9 +144,10 @@ lapin = { version = "4.10", default-features = false, features = ["tokio", "rust
 # MongoDB
 mongodb = { version = "3.8", optional = true, features = ["cert-key-password"] }
 
-# Object store (checkpoint backend): cloud REST via reqwest, not aws-sdk. 0.12 is the
+# Object store (endpoint and checkpoint backend): local files or cloud REST via reqwest,
+# not aws-sdk. 0.12 is the
 # last release supporting rust-version 1.75 (0.14 needs 1.85).
-object_store = { version = "0.14", optional = true, default-features = false, features = ["aws", "gcp", "azure", "http"] }
+object_store = { version = "0.14", optional = true, default-features = false, features = ["aws", "gcp", "azure", "http", "fs"] }
 
 # NATS
 async-nats = { version = "0.50", optional = true }

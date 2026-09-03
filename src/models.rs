@@ -1213,9 +1213,9 @@ pub enum SpoolClaim {
     Off,
 }
 
-// --- Object Store (S3/GCS/Azure) Specific Configuration ---
+// --- Object Store (local/S3/GCS/Azure) Specific Configuration ---
 
-/// Configuration for a cloud object-store endpoint (S3, GCS, Azure Blob, R2, ...).
+/// Configuration for a local or cloud object-store endpoint.
 ///
 /// As a **sink**, each flushed batch is written as one immutable object under `url`,
 /// named `<prefix>/[YYYY/MM/DD/]<uuidv7>.<ext>`. As a **source**, objects under `url`
@@ -1225,10 +1225,10 @@ pub enum SpoolClaim {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct ObjectStoreConfig {
-    /// Object-store URL, e.g. `s3://bucket/prefix`, `gs://bucket/prefix`,
-    /// `az://account/container/prefix`. Credentials are resolved from the environment by
-    /// the `object_store` crate (same mechanism as the checkpoint backend); R2 uses
-    /// `s3://` plus a custom `AWS_ENDPOINT_URL`.
+    /// Object-store URL, e.g. `file:///var/lib/mqb/incoming`, `s3://bucket/prefix`,
+    /// `gs://bucket/prefix`, or `az://account/container/prefix`. Credentials are resolved
+    /// from the environment by the `object_store` crate (same mechanism as the checkpoint
+    /// backend); R2 uses `s3://` plus a custom `AWS_ENDPOINT_URL`.
     pub url: String,
     /// (Sink only) `auto`, `write_time` (uuidv7 name) or `source_position` (name carries the source range).
     #[serde(default)]

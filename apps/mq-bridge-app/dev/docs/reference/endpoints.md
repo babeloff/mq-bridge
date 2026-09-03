@@ -121,13 +121,15 @@ oplog, i.e. a replica set.
 > not only documents written by the bridge's own publisher). The deprecated `change_stream:
 > true` boolean resolves to `capture_new`.
 
-## Cloud object storage (S3 / GCS / Azure)
+## Object storage (local / cloud)
 
-The `object_store` endpoint (alias `s3`) reads and writes Amazon S3, Google Cloud Storage,
-Azure Blob, Cloudflare R2, and anything else the `object_store` crate speaks. Enable with the
-`object-store` feature. Credentials and backend options come from the environment
+The `object_store` endpoint reads and writes local directories, Amazon S3, Google Cloud Storage,
+Azure Blob, Cloudflare R2, and anything else the `object_store` crate speaks. Enable it with the
+`object-store` feature. Use `local-store:///absolute/path` in CLI URLs (it becomes
+`file:///absolute/path` internally), or use `url: file:///absolute/path` in structured YAML.
+Credentials and cloud backend options come from the environment
 (`AWS_ACCESS_KEY_ID`, `AWS_REGION`, `GOOGLE_SERVICE_ACCOUNT`, `AZURE_STORAGE_ACCOUNT`, …); the
-URL scheme picks the backend (`s3://`, `gs://`, `az://`).
+URL scheme picks the backend (`file://`, `s3://`, `gs://`, `az://`).
 
 - **As a sink**, each flushed batch is encoded with the file formats (`normal` JSONL, `json`,
   `text`, `raw`) and written as **one immutable object** at
