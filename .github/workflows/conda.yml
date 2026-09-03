@@ -50,7 +50,7 @@ jobs:
           NODE
 
       - name: Build, test, and retain conda package
-        uses: prefix-dev/rattler-build-action@v0.2.34
+        uses: prefix-dev/rattler-build-action@5181e1960c2bbd84537e94b18586475dc1f63309 # v0.2.34
         with:
           recipe-path: apps/mq-bridge-app/packaging/conda/recipe.yaml
           build-args: --target-platform=${{ matrix.target }} -c conda-forge

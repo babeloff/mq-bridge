@@ -55,10 +55,16 @@ fn binary_metadata_key(name: &str) -> Result<MetadataKey<Binary>> {
 /// A credential carried as static metadata is held to the same bar as `bearer_token`,
 /// under either the text or the `-bin` key, and hex-encoded by the secret round trip.
 fn is_credential_metadata_key(name: &str, api_key_name: &str) -> bool {
-    let matches = |name: &str| {
+    // Both sides are normalized: an `api_key_name` that itself ends in `-bin` would
+    // otherwise never match the metadata key carrying it.
+    let normalize = |name: &str| {
         let name = name.to_ascii_lowercase();
-        let name = name.strip_suffix("-bin").unwrap_or(&name);
-        name == "authorization" || name.eq_ignore_ascii_case(api_key_name)
+        name.strip_suffix("-bin").unwrap_or(&name).to_owned()
+    };
+    let api_key_name = normalize(api_key_name);
+    let matches = |name: &str| {
+        let name = normalize(name);
+        name == "authorization" || name == api_key_name
     };
     matches(name)
         || crate::models::decode_secret_map_key(name).is_some_and(|decoded| matches(&decoded))

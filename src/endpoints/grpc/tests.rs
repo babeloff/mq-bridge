@@ -1035,12 +1035,19 @@ mod dynamic {
         authorization_bin
             .binary_metadata
             .insert("authorization-bin".to_string(), vec![1, 2, 3]);
+        // An `api_key_name` that is itself a `-bin` key, carried as binary metadata.
+        let mut binary_api_key_name = GrpcConfig::new("http://localhost:50051");
+        binary_api_key_name.api_key_name = Some("x-tenant-bin".to_string());
+        binary_api_key_name
+            .binary_metadata
+            .insert("x-tenant-bin".to_string(), vec![1, 2, 3]);
         for config in [
             GrpcConfig::new("http://localhost:50051").with_bearer_token("token"),
             GrpcConfig::new("http://localhost:50051").with_api_key("key"),
             authorization_metadata,
             api_key_metadata,
             authorization_bin,
+            binary_api_key_name,
         ] {
             let error = apply_call_metadata(&config, &mut MetadataMap::new()).unwrap_err();
             assert!(error.to_string().contains("https://"), "{error:#}");
