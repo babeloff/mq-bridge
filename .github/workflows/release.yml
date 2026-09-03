@@ -145,13 +145,19 @@ jobs:
 
           failed=()
           for pkg in "${packages[@]}"; do
-            code="$(curl -sS -o /dev/null -w '%{http_code}' -X POST \
+            # The exchange answers 201 Created, not 200, so the status alone is
+            # the wrong signal — assert on the minted token instead, which is
+            # what `npm publish` actually consumes.
+            body="$(curl -sS -o - -w '\n%{http_code}' -X POST \
               -H "Authorization: Bearer $id_token" \
               "https://registry.npmjs.org/-/npm/v1/oidc/token/exchange/package/$pkg")"
-            if [ "$code" = "200" ]; then
+            code="${body##*$'\n'}"
+            token="$(printf '%s' "${body%$'\n'*}" \
+              | python3 -c 'import json,sys; print(json.load(sys.stdin).get("token") or "")' 2>/dev/null || true)"
+            if [ -n "$token" ]; then
               echo "  ok       $pkg"
             else
-              echo "  REFUSED  $pkg (HTTP $code)"
+              echo "  REFUSED  $pkg (HTTP $code, no token)"
               failed+=("$pkg")
             fi
             # Informational only: `publish_only` re-runs deliberately, and the

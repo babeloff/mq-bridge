@@ -1349,16 +1349,21 @@ impl Route {
                 outcome,
             });
         }
-        handle.abort();
         // The startup failure itself stays inside the reconnect loop, so
         // surface the cause it recorded rather than a bare timeout.
         // "connecting" is the initial marker, not a recorded failure.
+        //
+        // Read before aborting: the abort drops `OutcomeGuard`, which replaces
+        // the recorded cause with its panicked-or-aborted fallback as soon as
+        // the task is polled. Under load that lands first and the real reason
+        // — an unusable filter expression, say — is lost.
         let cause = recover_read_lock(&status, "route_handle_status")
             .error
             .clone()
             .filter(|e| e != "connecting")
             .map(|e| format!(": {e}"))
             .unwrap_or_default();
+        handle.abort();
         Err(match started {
             // Every `ready_tx` was dropped: the route task ended without ever
             // signalling ready. That returns immediately, so calling it a timeout
