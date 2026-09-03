@@ -44,5 +44,7 @@ The upload step is skipped, with a workflow warning, until that secret exists.
 Conda-forge feedstocks build from immutable release sources. Before copying the
 recipe into `conda-forge/staged-recipes`, replace the local `source.path` with a
 tag archive URL and SHA-256, and replace the environment-derived version with
-the released version. The build, requirements, tests, and metadata can remain
-the same.
+the released version. Also add `${{ stdlib('c') }}` to the build requirements;
+the feedstock supplies the standard-library variant that this standalone
+rattler-build workflow does not. The remaining build, tests, and metadata can
+stay the same.

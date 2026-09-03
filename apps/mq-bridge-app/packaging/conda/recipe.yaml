@@ -28,9 +28,10 @@ build:
 
 requirements:
   build:
-    - ${{ stdlib('c') }}
     - ${{ compiler('c') }}
-    - ${{ compiler('rust') }}
+    - if: win
+      then: rust >=1.94
+      else: ${{ compiler('rust') }}
     - cargo-auditable
     - cargo-bundle-licenses
     - cmake

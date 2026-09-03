@@ -45,23 +45,12 @@ jobs:
           fs.appendFileSync(process.env.GITHUB_ENV, `MQ_BRIDGE_VERSION=${version}\n`);
           NODE
 
-      - name: Install rattler-build
+      - name: Build, test, and retain conda package
         uses: prefix-dev/rattler-build-action@v0.2.34
-
-      - name: Build and test package
-        shell: bash
-        run: >-
-          rattler-build build
-          --recipe apps/mq-bridge-app/packaging/conda/recipe.yaml
-          --target-platform=${{ matrix.target }}
-          -c conda-forge
-
-      - name: Retain conda package
-        uses: actions/upload-artifact@v7
         with:
-          name: mq-bridge-app-${{ matrix.target }}
-          path: output/**/*.conda
-          if-no-files-found: error
+          recipe-path: apps/mq-bridge-app/packaging/conda/recipe.yaml
+          build-args: --target-platform=${{ matrix.target }} -c conda-forge
+          artifact-name: mq-bridge-app-${{ matrix.target }}
 
       - name: Publish to Anaconda.org
         if: github.event_name == 'release'
