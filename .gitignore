@@ -54,3 +54,7 @@ python/mq-bridge-py/dist/
 # Both .cargo/config.toml files are tracked on purpose: the root one applies to
 # every build started from the repository root (CI, Docker), the app one to
 # app-cwd builds. Don't add .cargo/ back to this file.
+
+# rattler-build writes here; it sits inside the recipe's source path, so it must be
+# ignored or the source copy recurses into its own output.
+/output

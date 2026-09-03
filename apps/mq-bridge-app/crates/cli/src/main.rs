@@ -1314,8 +1314,8 @@ fn custom_endpoint_from_uri(
 fn base_endpoint_from_uri(uri: &str) -> anyhow::Result<mq_bridge::models::Endpoint> {
     use anyhow::bail;
     use mq_bridge::models::{
-        AmqpConfig, AwsConfig, ClickHouseConfig, Endpoint, EndpointType, FileConfig, GrpcConfig,
-        HttpConfig, IbmMqConfig, KafkaConfig, MongoDbConfig, MqttConfig, NatsConfig,
+        AmqpConfig, AwsConfig, ClickHouseConfig, DirSpoolConfig, Endpoint, EndpointType, FileConfig,
+        GrpcConfig, HttpConfig, IbmMqConfig, KafkaConfig, MongoDbConfig, MqttConfig, NatsConfig,
         ObjectStoreConfig, PostgresCdcConfig, RedisStreamsConfig, SqlxConfig, WebSocketConfig,
         ZeroMqConfig,
     };
@@ -1579,10 +1579,17 @@ fn base_endpoint_from_uri(uri: &str) -> anyhow::Result<mq_bridge::models::Endpoi
             schema_fields(schemars::schema_for!(RedisStreamsConfig)),
         ),
         "file" => ("file", schema_fields(schemars::schema_for!(FileConfig))),
-        // Cloud object storage. The bucket scheme both selects the endpoint and is
-        // the connection URL the `object_store` crate expects, so it is not
-        // rewritten below; credentials come from the environment.
-        "s3" | "s3a" | "gs" | "gcs" | "az" | "azure" | "abfs" | "abfss" => (
+        // Directory-backed FIFO queue, targeted by path like `file`. An underscore
+        // is not a legal URI scheme character, hence `spool`/`dir-spool`.
+        "spool" | "dir-spool" | "dirspool" => (
+            "dir_spool",
+            schema_fields(schemars::schema_for!(DirSpoolConfig)),
+        ),
+        // Local and cloud object storage. Cloud schemes pass through; the explicit
+        // local alias is rewritten to `file://` below so plain `file://` keeps
+        // selecting the single-file connector.
+        "local-store" | "s3" | "s3a" | "gs" | "gcs" | "az" | "azure" | "abfs"
+        | "abfss" => (
             "object_store",
             schema_fields(schemars::schema_for!(ObjectStoreConfig)),
         ),
@@ -1620,7 +1627,7 @@ fn base_endpoint_from_uri(uri: &str) -> anyhow::Result<mq_bridge::models::Endpoi
             return custom_endpoint_from_uri(other, &parsed, uri);
         }
         other => bail!(
-            "unsupported endpoint scheme '{other}' in URI '{uri}'. Supported schemes: postgres, postgresql, mysql, mariadb, sqlite, nats, mongodb, redis, file, kafka, mqtt, mqtts, amqp, amqps, rabbitmq, rabbitmqs, http, https, clickhouse, clickhouses, ws, wss, grpc, grpcs, ibmmq, aws, zeromq, zmq, s3, gs, az, abfs, and the structural memory, null, static, fanout, request, switch, response. A scheme may also name an endpoint registered by an extension (pulsar) or loaded with --plugin"
+            "unsupported endpoint scheme '{other}' in URI '{uri}'. Supported schemes: postgres, postgresql, mysql, mariadb, sqlite, nats, mongodb, redis, file, spool, kafka, mqtt, mqtts, amqp, amqps, rabbitmq, rabbitmqs, http, https, clickhouse, clickhouses, ws, wss, grpc, grpcs, ibmmq, aws, zeromq, zmq, s3, gs, az, abfs, and the structural memory, null, static, fanout, request, switch, response. A scheme may also name an endpoint registered by an extension (pulsar) or loaded with --plugin"
         ),
     };
 
@@ -1651,14 +1658,15 @@ fn base_endpoint_from_uri(uri: &str) -> anyhow::Result<mq_bridge::models::Endpoi
             | "clickhouse"
             | "websocket"
     );
+    // Target is a filesystem path carried by the URI itself, so `?path=`/`?url=`
+    // would be a second source for the same field.
+    let path_target = matches!(tag, "file" | "dir_spool");
     for (k, v) in parsed.query_pairs() {
         let (k, v) = (k.into_owned(), v.into_owned());
-        // A file endpoint takes its path from the URI itself, so a `?path=` would
-        // be a second, conflicting source for the same field.
-        if k == "path" && tag == "file" {
+        if k == "path" && path_target {
             continue;
         }
-        if k == "url" && tag != "file" {
+        if k == "url" && !path_target {
             escaped_url = Some(v);
             continue;
         }
@@ -1698,11 +1706,15 @@ fn base_endpoint_from_uri(uri: &str) -> anyhow::Result<mq_bridge::models::Endpoi
         );
     }
 
-    if tag == "file" {
+    if path_target {
         let path = uri.split('?').next().unwrap_or(uri);
-        let path = path.strip_prefix("file://").unwrap_or(path);
+        // `scheme://x` and the authority-less `scheme:/x` both name a path, so the
+        // slashes come off separately from the scheme.
+        let prefix = format!("{}:", parsed.scheme());
+        let path = path.strip_prefix(prefix.as_str()).unwrap_or(path);
+        let path = path.strip_prefix("//").unwrap_or(path);
         if path.is_empty() {
-            bail!("file URI '{uri}' must include a path");
+            bail!("{tag} URI '{uri}' must include a path");
         }
         config.insert("path".into(), serde_json::Value::String(path.to_string()));
     } else if let Some(url) = escaped_url {
@@ -1761,8 +1773,8 @@ fn base_endpoint_from_uri(uri: &str) -> anyhow::Result<mq_bridge::models::Endpoi
             "clickhouse" => &[("clickhouses://", "https://"), ("clickhouse://", "http://")],
             "grpc" => &[("grpcs://", "https://"), ("grpc://", "http://")],
             "zeromq" => &[("zeromq://", "tcp://"), ("zmq://", "tcp://")],
-            // `object_store` only recognizes `gs://` for GCS, not the `gcs://` alias.
-            "object_store" => &[("gcs://", "gs://")],
+            // Normalize CLI-only aliases to schemes recognized by `object_store`.
+            "object_store" => &[("gcs://", "gs://"), ("local-store://", "file://")],
             _ => &[],
         };
         for (prefix, replacement) in rewrites {
@@ -2453,6 +2465,60 @@ mod uri_tests {
         assert_eq!(cfg["delete"], true);
     }
 
+    /// `dir_spool` is targeted by path like `file`, under three scheme spellings
+    /// (an underscore is not legal in a URI scheme).
+    #[test]
+    fn spool_scheme_takes_the_path_from_the_uri() {
+        for uri in [
+            "spool:///tmp/video?payload_extension=.h264",
+            "dir-spool:///tmp/video?payload_extension=.h264",
+            "dirspool:///tmp/video?payload_extension=.h264",
+        ] {
+            let cfg = config(uri, "dir_spool");
+            assert_eq!(cfg["path"], "/tmp/video", "for {uri}");
+            assert_eq!(cfg["payload_extension"], ".h264", "for {uri}");
+            assert!(cfg.get("url").is_none(), "{uri} must not carry a url field");
+        }
+    }
+
+    /// The authority-less form has no `//` to strip, so the scheme has to come off on
+    /// its own or the path keeps it and names a relative directory.
+    #[test]
+    fn a_path_uri_without_an_authority_still_yields_an_absolute_path() {
+        for (uri, tag) in [
+            ("spool:/tmp/video", "dir_spool"),
+            ("dir-spool:/tmp/video", "dir_spool"),
+            ("file:/tmp/out.jsonl", "file"),
+        ] {
+            assert_eq!(config(uri, tag)["path"], uri.split(':').nth(1).unwrap());
+        }
+    }
+
+    /// The producer/consumer settings from the documented example are all scalar
+    /// config fields, so none of them trips the unrecognised-param error.
+    #[test]
+    fn spool_producer_and_consumer_settings_are_config_fields() {
+        let cfg = config(
+            "spool:///tmp/q?naming_pattern={seq:06d}&emit_done=success&shard_depth=2",
+            "dir_spool",
+        );
+        assert_eq!(cfg["naming_pattern"], "{seq:06d}");
+        assert_eq!(cfg["emit_done"], "success");
+        assert_eq!(cfg["shard_depth"], 2);
+
+        let cfg = config("spool:///tmp/q?drain_on_read=true&stop_on_done=true", "dir_spool");
+        assert_eq!(cfg["drain_on_read"], true);
+        assert_eq!(cfg["stop_on_done"], true);
+    }
+
+    /// A spool has no connection URL, so an unrecognised param is a user error
+    /// rather than a driver option riding along.
+    #[test]
+    fn spool_rejects_an_unrecognised_param() {
+        let err = endpoint_from_uri("spool:///tmp/q?nonsense=1").unwrap_err().to_string();
+        assert!(err.contains("nonsense"), "got: {err}");
+    }
+
     #[test]
     fn file_name_by_is_a_scalar_flag() {
         let cfg = config("file:///var/lib/mqb/parts?name_by=source_position", "file");
@@ -2912,9 +2978,9 @@ mod uri_tests {
         assert_eq!(cfg["database"], "analytics");
     }
 
-    // Bucket schemes select the `object_store` endpoint and are also the connection
-    // URL the crate expects, so they pass through unrewritten; `gcs://` is the one
-    // alias normalised (to `gs://`). `cursor_id`/`checkpoint_store` are scalar fields.
+    // Storage schemes select the `object_store` endpoint. Cloud URLs pass through,
+    // while CLI aliases are normalized to schemes understood by the backing crate.
+    // `cursor_id`/`checkpoint_store` are scalar fields.
     #[test]
     fn object_store_bucket_schemes() {
         let cfg = config(
@@ -2928,6 +2994,10 @@ mod uri_tests {
         assert_eq!(config("gs://b/p", "object_store")["url"], "gs://b/p");
         assert_eq!(config("az://b/p", "object_store")["url"], "az://b/p");
         assert_eq!(config("gcs://b/p", "object_store")["url"], "gs://b/p");
+        assert_eq!(
+            config("local-store:///var/lib/mqb/incoming", "object_store")["url"],
+            "file:///var/lib/mqb/incoming"
+        );
     }
 
     #[test]

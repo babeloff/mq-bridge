@@ -52,24 +52,43 @@ fn binary_metadata_key(name: &str) -> Result<MetadataKey<Binary>> {
     decoded.ok_or_else(|| anyhow::anyhow!("invalid binary gRPC metadata key '{name}'"))
 }
 
+/// A credential carried as static metadata is held to the same bar as `bearer_token`,
+/// under either the text or the `-bin` key, and hex-encoded by the secret round trip.
+fn is_credential_metadata_key(name: &str, api_key_name: &str) -> bool {
+    // Both sides are normalized: an `api_key_name` that itself ends in `-bin` would
+    // otherwise never match the metadata key carrying it.
+    let normalize = |name: &str| {
+        let name = name.to_ascii_lowercase();
+        name.strip_suffix("-bin").unwrap_or(&name).to_owned()
+    };
+    let api_key_name = normalize(api_key_name);
+    let matches = |name: &str| {
+        let name = normalize(name);
+        name == "authorization" || name == api_key_name
+    };
+    matches(name)
+        || crate::models::decode_secret_map_key(name).is_some_and(|decoded| matches(&decoded))
+}
+
 /// Attaches the configured static metadata and credentials. Error text never
 /// includes a configured value, so an unusable credential cannot leak through logs.
 pub(super) fn apply_call_metadata(config: &GrpcConfig, metadata: &mut MetadataMap) -> Result<()> {
     let normalized_url = config.tls.normalize_url(&config.url);
-    // Static `authorization` metadata is a credential too, so it is held to the same bar.
+    let api_key_name = config.api_key_name.as_deref().unwrap_or("x-api-key");
     let sends_credentials = config.bearer_token.is_some()
         || config.api_key.is_some()
         || config
             .metadata
             .keys()
-            .any(|name| name.eq_ignore_ascii_case("authorization"));
+            .chain(config.binary_metadata.keys())
+            .any(|name| is_credential_metadata_key(name, api_key_name));
     if sends_credentials
         && !normalized_url
             .get(..8)
             .is_some_and(|scheme| scheme.eq_ignore_ascii_case("https://"))
     {
         anyhow::bail!(
-            "gRPC bearer_token, api_key and authorization metadata require an https:// endpoint"
+            "gRPC bearer_token, api_key and credential metadata require an https:// endpoint"
         );
     }
 
@@ -93,9 +112,8 @@ pub(super) fn apply_call_metadata(config: &GrpcConfig, metadata: &mut MetadataMa
         metadata.insert("authorization", value);
     }
     if let Some(api_key) = &config.api_key {
-        let name = config.api_key_name.as_deref().unwrap_or("x-api-key");
-        let key = MetadataKey::<Ascii>::from_bytes(name.as_bytes())
-            .map_err(|error| anyhow::anyhow!("invalid api_key_name '{name}': {error}"))?;
+        let key = MetadataKey::<Ascii>::from_bytes(api_key_name.as_bytes())
+            .map_err(|error| anyhow::anyhow!("invalid api_key_name '{api_key_name}': {error}"))?;
         let value = MetadataValue::<Ascii>::try_from(api_key.as_str())
             .map_err(|_| anyhow::anyhow!("api_key is not a valid gRPC metadata value"))?;
         metadata.insert(key, value);

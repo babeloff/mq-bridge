@@ -72,17 +72,12 @@ jobs:
           cache: npm
           cache-dependency-path: node/mq-bridge-node/package-lock.json
 
-      - name: Cache cargo registry
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: ${{ runner.os }}-node-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-node-cargo-
+          # The binding depends on the engine, which lives in this workspace;
+          # without this rust-cache purges it and every run recompiles it.
+          cache-workspace-crates: true
 
       - name: Install Node dependencies
         working-directory: node/mq-bridge-node

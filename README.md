@@ -179,6 +179,7 @@ The table below summarizes the capabilities and configuration for each backend:
 | :--- | :--- | :--- | :--- |
 | **AMQP** | Set `subscribe_mode: true` | Emulated (Property) | **Yes** (Basic.nack) |
 | **AWS** | N/A (Use SNS) | No | **Yes** (Visibility Timeout) |
+| **Directory spool** | Set `drain_on_read: false` (non-destructive fan-out) | No | **Yes** (chunk left on disk, redelivered) |
 | **File** | Set `mode: subscribe` | No | Simulated (In-Memory) |
 | **gRPC** | N/A | No | **Yes** for the built-in Bridge protocol (NACK replays); **No** for dynamic services unless their API defines an acknowledgement contract |
 | **HTTP** | N/A | **Native** (Implicit) | **Yes** (HTTP 500) |

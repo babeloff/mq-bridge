@@ -564,6 +564,106 @@
         "path"
       ]
     },
+    "DirSpoolConfig": {
+      "description": "Configuration for a `dir_spool` endpoint: a crash-safe FIFO queue backed by a directory.\n\nAs a **sink** each message becomes a pair of files under `path` — a payload file holding\nthe raw `CanonicalMessage.payload` bytes, and an optional JSON sidecar holding its\nmetadata. Both are written to a `.tmp` name, fsynced, and renamed into place, so a reader\nnever observes a partial write. As a **source** the directory is listed in lexical order,\neach finalized pair is emitted as one message, and (with `drain_on_read`) the pair is\ndeleted once the message is acknowledged.\n\nThe names are what makes the queue ordered, so `naming_pattern` must keep the sequence\nnumber zero-padded and leading. The publisher resumes the sequence from the highest\nnumber already present in the directory, so a restart appends rather than overwrites.",
+      "type": "object",
+      "properties": {
+        "atomic": {
+          "description": "(Sink only) Write to a `.tmp` name and rename into place, so a reader never sees a\npartial chunk. Defaults to true; turning it off trades that guarantee for one less\nrename per chunk.",
+          "type": "boolean",
+          "default": true
+        },
+        "claim": {
+          "description": "How this endpoint claims its side of the spool against a second instance in the\nsame role. Defaults to `exclusive`. See [`SpoolClaim`].",
+          "$ref": "#/$defs/SpoolClaim",
+          "default": "exclusive"
+        },
+        "consumer_file": {
+          "description": "Name of the file holding the consumer lock, which keeps a second *draining*\nconsumer out. Defaults to `CONSUMER`. Same rules as `producer_file`.",
+          "type": "string",
+          "default": "CONSUMER"
+        },
+        "done_file": {
+          "description": "Name of the producer-completion sentinel file. Defaults to `DONE`.\n\nProduction can span several producers — they run one at a time, which\n`producer_file` enforces — so \"a producer closed\" is not \"production finished\".\nThis file is what says the latter, and only the last producer should write it.",
+          "type": "string",
+          "default": "DONE"
+        },
+        "drain_on_read": {
+          "description": "(Source only) Delete each chunk's files once its message is acknowledged. Defaults to\ntrue — this is what makes the directory a queue rather than a growing archive. With\nit off, chunks are left in place. Acknowledged chunks are emitted at most once per\nconsumer run; nacked chunks are redelivered.",
+          "type": "boolean",
+          "default": true
+        },
+        "emit_done": {
+          "description": "(Sink only) When to create `done_file`, marking production finished for a\n`stop_on_done` consumer. Defaults to `never`. See [`SpoolDone`].\n\nSet it on the *last* producer only. A publisher opening the spool deletes an\nexisting sentinel, since it is producing again.",
+          "$ref": "#/$defs/SpoolDone",
+          "default": "never"
+        },
+        "fsync": {
+          "description": "How hard to work at making a chunk survive a power loss. Defaults to `chunk`, which\nis two fsyncs per message with a sidecar. See [`SpoolFsync`].",
+          "$ref": "#/$defs/SpoolFsync",
+          "default": "chunk"
+        },
+        "metadata_extension": {
+          "description": "Extension of the JSON metadata sidecar, with or without the leading dot. Defaults to\n`json`. Set to an empty string to write and expect payload files only.",
+          "type": "string",
+          "default": "json"
+        },
+        "naming_pattern": {
+          "description": "(Sink only) Name template for each chunk, without extension. Supports `{seq}`,\n`{seq:06}` / `{seq:06d}` (zero-padded), `{timestamp}` (unix millis) and\n`{message_id}`. Defaults to `{seq:09}`. Lexical order must match sequence order,\nso keep a zero-padded `{seq}` first.",
+          "type": "string",
+          "default": "{seq:09}"
+        },
+        "path": {
+          "description": "Directory holding the spool. Created if missing.",
+          "type": "string"
+        },
+        "payload_extension": {
+          "description": "Extension of the payload file, with or without the leading dot. Defaults to `bin`.",
+          "type": "string",
+          "default": "bin"
+        },
+        "poll_interval_ms": {
+          "description": "(Source only) Idle poll interval in milliseconds when the directory holds no new\nchunks. Defaults to 100.",
+          "type": "integer",
+          "format": "uint64",
+          "default": 100,
+          "minimum": 0
+        },
+        "producer_file": {
+          "description": "Name of the file holding the producer lock, which keeps a second producer out.\nDefaults to `PRODUCER`.\n\nEvery instance sharing the directory must agree on this name — that is what makes\nthem exclude each other — and it must not collide with the other control files or\nwith a chunk name. See [`SpoolClaim`].",
+          "type": "string",
+          "default": "PRODUCER"
+        },
+        "shard_depth": {
+          "description": "How many levels of shard subdirectory to spread chunks over. Defaults to 0, which\nwrites every chunk straight into `path`.\n\nA flat spool is one directory per stream, and most filesystems degrade long before\nmq-bridge does: 30fps with sidecars is over 200,000 files an hour. Sharding takes the\nleading digits of the sequence number as directory names, so `{seq:09}` with a depth\nof 2 and a width of 3 writes chunk 1 as `000/000/001.bin` and gives every directory\nat most 1000 entries.\n\nBoth ends must agree: a consumer only descends as far as its own `shard_depth`. It\nwarns when a scan finds subdirectories it is not configured to enter, since the\nalternative is a spool that reads as permanently empty.",
+          "type": "integer",
+          "format": "uint",
+          "default": 0,
+          "minimum": 0
+        },
+        "shard_width": {
+          "description": "How many characters of the sequence number each shard level consumes. Defaults to 3,\ngiving 1000 entries per level. Ignored when `shard_depth` is 0.\n\nWith sharding on, `naming_pattern` must start with a zero-padded `{seq:0N}` wider\nthan `shard_depth * shard_width`, so that every chunk shards identically and one\ncharacter is left for the file itself.",
+          "type": "integer",
+          "format": "uint",
+          "default": 3,
+          "minimum": 0
+        },
+        "source_metadata": {
+          "description": "(Source only) Include `mqb.src.spool_*` source positions in each message's metadata.\nDefaults to false.",
+          "type": "boolean",
+          "default": false
+        },
+        "stop_on_done": {
+          "description": "(Source only) End the stream once the directory holds no unread chunks *and*\n`done_file` is present. Defaults to false, which tails the directory indefinitely.\n\nBoth halves matter: a producer that finished long ago still has its backlog drained\nfirst, and a spool that is merely empty keeps the stream open, because another\nproducer may still be coming.",
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "path"
+      ]
+    },
     "EncryptionConfig": {
       "description": "AEAD encryption settings, shared by the `encryption` middleware (per-message\npayload encryption) and the at-rest `encryption` field of the file and\nobject_store endpoints. Requires the `encryption` feature.",
       "type": "object",
@@ -660,6 +760,17 @@
           },
           "required": [
             "file"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "dir_spool": {
+              "$ref": "#/$defs/DirSpoolConfig"
+            }
+          },
+          "required": [
+            "dir_spool"
           ]
         },
         {
@@ -1151,7 +1262,7 @@
       "type": "object",
       "properties": {
         "api_key": {
-          "description": "API key sent as `api_key_name` (default `x-api-key`) on dynamic calls only.",
+          "description": "API key sent as `api_key_name` (default `x-api-key`) on dynamic calls and the\nreflection RPC.",
           "type": [
             "string",
             "null"
@@ -1159,14 +1270,14 @@
           "format": "password"
         },
         "api_key_name": {
-          "description": "Metadata key used for `api_key`.",
+          "description": "Metadata key used for `api_key`. Defaults to `x-api-key`.",
           "type": [
             "string",
             "null"
           ]
         },
         "bearer_token": {
-          "description": "Bearer token sent as `authorization` on dynamic calls; rejected in Bridge/server mode.",
+          "description": "Bearer token sent as `authorization` on dynamic calls and the reflection RPC;\nrejected in Bridge/server mode.",
           "type": [
             "string",
             "null"
@@ -1174,7 +1285,7 @@
           "format": "password"
         },
         "binary_metadata": {
-          "description": "Static binary metadata for dynamic calls. Keys must end in `-bin`; values are raw bytes.",
+          "description": "Static binary metadata for dynamic calls and the reflection RPC. Keys must end in\n`-bin`; each value is raw bytes, written as a JSON array of byte values 0-255 (the\nonly accepted form — a base64 or text string is rejected). As a URL parameter:\n`?binary_metadata=%7B%22x-trace-bin%22%3A%5B1%2C2%2C3%5D%7D`, which is\n`{\"x-trace-bin\": [1, 2, 3]}` percent-encoded.",
           "type": "object",
           "additionalProperties": {
             "type": "array",
@@ -1306,7 +1417,7 @@
           "minimum": 0
         },
         "metadata": {
-          "description": "Static ASCII metadata attached to dynamic RPCs. Values for keys that look\nsensitive are extracted by mq-bridge's normal secret handling.",
+          "description": "Static ASCII metadata attached to dynamic RPCs and to the reflection RPC that\nfetches their descriptors. Values for keys that look sensitive are extracted by\nmq-bridge's normal secret handling.",
           "type": "object",
           "additionalProperties": {
             "type": "string"
@@ -2739,7 +2850,7 @@
       ]
     },
     "ObjectStoreConfig": {
-      "description": "Configuration for a cloud object-store endpoint (S3, GCS, Azure Blob, R2, ...).\n\nAs a **sink**, each flushed batch is written as one immutable object under `url`,\nnamed `<prefix>/[YYYY/MM/DD/]<uuidv7>.<ext>`. As a **source**, objects under `url`\nare listed in key order, fetched, split by `delimiter`, and emitted as messages;\nprogress is persisted to `checkpoint_store` (the last processed object key) so a\nrestart resumes without re-emitting. Objects are never mutated or deleted in place.",
+      "description": "Configuration for a local or cloud object-store endpoint.\n\nAs a **sink**, each flushed batch is written as one immutable object under `url`,\nnamed `<prefix>/[YYYY/MM/DD/]<uuidv7>.<ext>`. As a **source**, objects under `url`\nare listed in key order, fetched, split by `delimiter`, and emitted as messages;\nprogress is persisted to `checkpoint_store` (the last processed object key) so a\nrestart resumes without re-emitting. Objects are never mutated or deleted in place.",
       "type": "object",
       "properties": {
         "checkpoint_store": {
@@ -2831,7 +2942,7 @@
           "minimum": 0
         },
         "url": {
-          "description": "Object-store URL, e.g. `s3://bucket/prefix`, `gs://bucket/prefix`,\n`az://account/container/prefix`. Credentials are resolved from the environment by\nthe `object_store` crate (same mechanism as the checkpoint backend); R2 uses\n`s3://` plus a custom `AWS_ENDPOINT_URL`.",
+          "description": "Object-store URL, e.g. `file:///var/lib/mqb/incoming`, `s3://bucket/prefix`,\n`gs://bucket/prefix`, or `az://account/container/prefix`. Credentials are resolved\nfrom the environment by the `object_store` crate (same mechanism as the checkpoint\nbackend); R2 uses `s3://` plus a custom `AWS_ENDPOINT_URL`.",
           "type": "string"
         }
       },
@@ -3236,6 +3347,61 @@
       "additionalProperties": false,
       "required": [
         "path"
+      ]
+    },
+    "SpoolClaim": {
+      "description": "What a `dir_spool` endpoint does when a second instance opens the same directory in the\nsame role — a second producer writing it, or a second draining consumer emptying it.\n\nNeither is supported by the endpoint's design: two producers seeded from the same\nhighest sequence number overwrite each other's chunks, and two draining consumers each\ndeliver every chunk they win the race to read. So each role takes a pid lock on its own\nfile — `producer_file` or `consumer_file` — created when the endpoint opens and removed\nwhen it closes. A producer and a consumer sharing a directory do not conflict:\nthat is the whole point of the endpoint.\n\nThe locks say \"someone is running\", not \"production is finished\" — several producers\nmay fill one spool in turn, and `done_file` is what marks the end of that.\n\nA lock whose owner is no longer running is broken and retaken, so a crash does not\nwedge a restart. That check is by process id, which is only meaningful on the machine\nand in the pid namespace that wrote it: a spool shared between hosts or containers can\nhave a live holder's lock broken by a second starter that cannot see its process.",
+      "oneOf": [
+        {
+          "description": "Refuse to start when the role is already claimed, naming the holder (default).",
+          "type": "string",
+          "const": "exclusive"
+        },
+        {
+          "description": "Log a warning and run anyway. For a spool deliberately shared by several\nproducers, which needs `{message_id}` in `naming_pattern` to keep names unique.",
+          "type": "string",
+          "const": "warn"
+        },
+        {
+          "description": "Take no claim and check for none.",
+          "type": "string",
+          "const": "off"
+        }
+      ]
+    },
+    "SpoolDone": {
+      "description": "When a `dir_spool` publisher writes its `done_file`, marking production finished.\n\nThe distinction is *how* the route ended, which the publisher learns from\n[`DisconnectOutcome`](crate::traits::DisconnectOutcome): every teardown path closes the\npublisher, so being closed says nothing on its own.",
+      "oneOf": [
+        {
+          "description": "Never write it (default). Something else decides when production is finished.",
+          "type": "string",
+          "const": "never"
+        },
+        {
+          "description": "Write it only when the route reached the natural end of its input and every chunk\nthis producer accepted was written.\n\nA route that is shut down, that fails, or that reconnects does *not* write it —\nproduction did not finish, so a `stop_on_done` consumer keeps waiting. Note that a\ncontinuously running producer never reaches a natural end, so `success` on one only\never means \"not yet\": use `end` there.",
+          "type": "string",
+          "const": "success"
+        },
+        {
+          "description": "Write it whenever the producer closes, however the route ended — a clean finish, a\nshutdown, or a failure.\n\nThis says \"nothing more is coming from here\", not \"everything worked\". Use it for a\nconsumer that must not wait forever on a producer that may have died, at the price\nof it treating a truncated stream as complete.",
+          "type": "string",
+          "const": "end"
+        }
+      ]
+    },
+    "SpoolFsync": {
+      "description": "How hard a `dir_spool` endpoint works to make its writes survive a power loss.\n\nThis is the endpoint's dominant cost. `chunk`, the default, is two fsyncs per message —\nthe payload and its sidecar — plus one directory fsync per batch, and on a spinning disk\nor a conservative SSD that sets the throughput ceiling long before anything in\nmq-bridge does. Dropping the sidecar (`metadata_extension: \"\"`) halves it; `off` removes\nit.\n\nIndependent of `atomic`, which decides whether a reader can see a half-written chunk,\nnot whether a crash can lose one. The once-per-run fsyncs — the lock, the sentinel — are\nnot affected by either.",
+      "oneOf": [
+        {
+          "description": "fsync every chunk file before it is renamed into place, and the directory once per\nbatch (default). An acknowledged batch has reached the disk.",
+          "type": "string",
+          "const": "chunk"
+        },
+        {
+          "description": "Do not fsync chunks at all, and let the operating system flush when it chooses.\n\nA crash or a power loss can then lose recent chunks *or* leave one present but\ntruncated, which a consumer would deliver as a short message — so this trades the\nendpoint's crash-safety claim, not merely its tail. Reasonable when the spool is a\nbuffer between two processes on one machine and a reboot means starting over anyway.",
+          "type": "string",
+          "const": "off"
+        }
       ]
     },
     "SqlxConfig": {

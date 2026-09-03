@@ -49,17 +49,12 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
 
-      - name: Cache cargo registry
-        uses: actions/cache@v6
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
+          # The extension depends on the engine, which lives in this workspace;
+          # without this rust-cache purges it and every run recompiles it.
+          cache-workspace-crates: true
 
       - name: Sync Python dev environment
         working-directory: python/mq-bridge-py
@@ -72,10 +67,6 @@ jobs:
       - name: Run Python tests
         working-directory: python/mq-bridge-py
         run: uv run pytest -q
-
-      - name: Smoke test import
-        working-directory: python/mq-bridge-py
-        run: uv run python -c "from mq_bridge import Message, Publisher, Route; print(Message, Publisher, Route)"
 
       - name: Run no-default feature regression tests
         run: |

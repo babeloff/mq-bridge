@@ -5,7 +5,7 @@ the **CLI / server**, the **desktop app (UI)**, and the **library**. Pick the
 install path for the form you need. To compile any of them yourself, see
 [BUILD.md](BUILD.md).
 
-- [CLI / server](#cli--server) — Homebrew, `cargo binstall`, `cargo install`, Docker
+- [CLI / server](#cli--server) — Homebrew, Conda, `cargo binstall`, `cargo install`, Docker
 - [Desktop app (UI)](#desktop-app-ui) — Homebrew cask, or a prebuilt bundle
 - [Library](#library) — Rust, Python, Node.js
 
@@ -29,6 +29,18 @@ brew upgrade mq-bridge-app     # later, to update
 Prebuilt bottles cover **Apple Silicon macOS** and **`x86_64` Linux**. Homebrew
 refreshes the tap only on `brew update`, so if `brew upgrade` doesn't pick up a
 new release yet, run `brew update` first.
+
+### Conda (Windows, macOS, Linux)
+
+Conda is the package-manager install path for Windows and is also available on
+macOS and Linux. It installs both `mq-bridge-app` and `mqb`:
+
+```bash
+conda install -c marcomq -c conda-forge mq-bridge-app
+```
+
+The `marcomq` channel carries mq-bridge itself; `conda-forge` supplies its build
+and runtime dependencies.
 
 ### `cargo binstall` — prebuilt binary
 

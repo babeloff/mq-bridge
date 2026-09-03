@@ -959,6 +959,56 @@ jobs:
       # that is exactly the failure that cost a full release run before.
       skip_publish: true
 
+  # Deliberately NOT gated on publish-release: the conda matrix takes ~33 min
+  # (win-64), which fits entirely inside the ~35 min node macOS build already on
+  # the critical path. Only the upload below waits for the release to go public.
+  build-conda-packages:
+    name: Build Conda Packages
+    needs: [metadata, preflight, test, app-checks, package-dry-run]
+    # See build-node-packages: `preflight` has to be named explicitly, because
+    # tolerating a skipped `needs` waives the default failure-skip for every one.
+    if: >-
+      ${{ !cancelled()
+          && !inputs.publish_only
+          && needs.preflight.result == 'success'
+          && needs.test.result == 'success'
+          && needs.app-checks.result == 'success'
+          && needs.package-dry-run.result == 'success' }}
+    permissions:
+      contents: read
+    uses: ./.github/workflows/conda.yml
+
+  # Anaconda.org uploads are irreversible, so this waits for the release to be
+  # public. It only downloads and uploads prebuilt artifacts, so it costs ~1 min.
+  publish-conda:
+    name: Publish Conda Packages
+    needs: [build-conda-packages, publish-release]
+    if: >-
+      ${{ !cancelled()
+          && needs.build-conda-packages.result == 'success'
+          && needs.publish-release.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Download built packages
+        uses: actions/download-artifact@v4
+        with:
+          pattern: mq-bridge-app-*
+          path: conda-packages
+
+      - name: Upload to Anaconda.org
+        env:
+          ANACONDA_API_TOKEN: ${{ secrets.ANACONDA_API_TOKEN }}
+        run: |
+          if [ -z "$ANACONDA_API_TOKEN" ]; then
+            echo "::warning::ANACONDA_API_TOKEN is not configured; packages were built but not published"
+            exit 0
+          fi
+          pipx install anaconda-client
+          find conda-packages -type f -name '*.conda' -print0 \
+            | xargs -0 anaconda --token "$ANACONDA_API_TOKEN" upload --user marcomq --label main
+
   publish-node:
     name: Publish Node Packages
     needs: [build-node-packages, publish-release]

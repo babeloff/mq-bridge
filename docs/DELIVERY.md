@@ -75,6 +75,7 @@ therefore useless for dedup across a restart.
 | `amqp` | Only if the producer set the AMQP `message_id` property; the `delivery_tag` fallback resets per channel | No |
 | `redis_streams` | Only if the producer wrote a `mq_bridge.message_id` field; the entry ID is **not** used | No |
 | `http` / `websocket` / `grpc` | From the request when it carries an id | No (request/reply, not replay) |
+| `dir_spool` | **Yes** — the sidecar's `message_id`, when the chunk was written by `mq-bridge`. A foreign producer's payload-only chunk gets a fresh id | No — a drained chunk is deleted |
 | `mqtt`, `aws` (SQS), `zeromq`, `ibm_mq`, `file`, `object_store`, `clickhouse` | No — fresh id per read | No |
 
 Two consequences worth internalising:
@@ -144,6 +145,7 @@ one identity to every message missing the field, so it is dropped instead.
 | `sqlx` (PostgreSQL / MySQL / SQLite) | The table's own `UNIQUE`/`PRIMARY KEY` | `ON CONFLICT` / `ON DUPLICATE KEY` in `insert_query` |
 | `clickhouse` | `ReplacingMergeTree` collapses at merge time | Table DDL — no `mq-bridge` config |
 | `file`, `object_store` | Deterministic, sortable part names + covered-range recovery | `name_by: source_position` (needs a source that reproduces the same positions on a re-read — a file source only in `consume` mode; the `object_store` default under `auto`) |
+| `dir_spool` | Not idempotent: every write consumes a new `{seq}` value, so a replay creates a new chunk path even when `naming_pattern` contains `{message_id}` | Rely on downstream deduplication or an idempotent sink |
 | `kafka` | `enable.idempotence` dedups **producer retries within one session** — this is *not* exactly-once semantics | On by default |
 | `nats`, `amqp`, `mqtt`, `redis_streams`, `aws`, `ibm_mq`, `zeromq` | None | Deduplicate at the next consumer instead |
 

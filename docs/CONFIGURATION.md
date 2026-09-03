@@ -419,6 +419,292 @@ output:
         path: "/var/data/unroutable_orders.log"
 ```
 
+#### Directory spool (`dir_spool`)
+
+The `dir_spool` endpoint is a crash-safe FIFO queue whose backing store is a directory. Each
+message becomes a *chunk*: a payload file holding the raw `CanonicalMessage` payload bytes,
+plus an optional JSON sidecar holding its metadata. Chunks are written to a `.tmp` name,
+fsynced, and renamed into place, so a reader listing the directory never sees a partial
+write; on the reading side a chunk is deleted once its message is acknowledged.
+
+Use it to decouple a fast producer from a slower consumer across a process or language
+boundary — a Rust edge engine feeding a Python data-science script, say — with no broker to
+run and no shared memory to size. The producer can finish and exit while the consumer is
+still draining, and a crash on either side leaves a directory you can inspect with `ls`.
+
+Prefer the [`file`](#configuration-reference) endpoint instead when the data is a stream of
+delimited records appended to one file. `dir_spool` is for a queue of arbitrarily large
+opaque blobs, where the delimiter framing and the single append point both get in the way.
+
+| Field | Side | Default | Meaning |
+|---|---|---|---|
+| `path` | both | — | Spool directory. Created if missing. |
+| `naming_pattern` | sink | `{seq:09}` | Chunk name without extension. Supports `{seq}`, `{seq:06}` / `{seq:06d}`, `{timestamp}` (unix millis) and `{message_id}`. |
+| `shard_depth` | both | `0` | Levels of shard subdirectory to spread chunks over. 0 writes every chunk straight into `path`. |
+| `shard_width` | both | `3` | Characters of the sequence number each shard level consumes. Ignored when `shard_depth` is 0. |
+| `payload_extension` | both | `bin` | Extension of the payload file, with or without the leading dot. |
+| `metadata_extension` | both | `json` | Extension of the metadata sidecar. Empty string writes and expects payload files only. |
+| `atomic` | sink | `true` | Write to `.tmp` and rename on completion. |
+| `fsync` | both | `chunk` | Durability: `chunk` fsyncs every chunk file and the directory once per batch, `off` fsyncs nothing and lets the OS flush. |
+| `done_file` | both | `DONE` | Sentinel that marks production finished. |
+| `emit_done` | sink | `never` | When to create `done_file`: `success` (the route reached the end of its input and every chunk was written), `end` (whenever the producer closes, however the pass ended), `never`. Set it on the *last* producer only. |
+| `producer_file` | both | `PRODUCER` | File holding the producer lock, which keeps a second producer out. |
+| `consumer_file` | both | `CONSUMER` | File holding the consumer lock, which keeps a second draining consumer out. |
+| `drain_on_read` | source | `true` | Delete each chunk once its message is acknowledged. |
+| `stop_on_done` | source | `false` | End the stream once the queue is empty *and* `done_file` is present. |
+| `poll_interval_ms` | source | `100` | Idle poll interval when the directory holds no new chunks. |
+| `source_metadata` | source | `false` | Stamp `mqb.src.spool_path` and `mqb.src.spool_chunk`. |
+| `claim` | both | `exclusive` | Lock this side of the spool: `exclusive` refuses to start when another instance holds the same role, `warn` logs and runs anyway, `off` takes no lock at all. |
+
+Lexical order is queue order, so `naming_pattern` **must start with the sequence** — a sink
+whose pattern begins with anything else is rejected. The front of a chunk name is
+load-bearing twice over: the listing is ordered by it, and a publisher opening an existing
+spool reads its next sequence number back out of it, resuming past the highest chunk already
+there rather than overwriting the head of the queue. `{timestamp}_{seq}` would resume from a
+13-digit timestamp, and a literal prefix would resume from zero and overwrite. Padding is
+not enforced, but an unpadded `{seq}` warns: chunk 10 sorts before chunk 2.
+
+`payload_extension` and `metadata_extension` must also differ, on both sides — a consumer
+whose two extensions match would read every sidecar as a payload.
+
+##### Cardinality, and how production ends
+One spool directory takes **one producer and one consumer at a time**, each of which may be
+internally concurrent — `concurrency > 1` on either side is fine, since the sequence counter
+and the in-flight set are shared within an instance. A *second* instance in the same role
+corrupts the queue rather than sharing it: two producers seed from the same highest sequence
+number and overwrite each other's chunks, and two draining consumers each deliver every
+chunk they win the race to read.
+
+So each side takes a pid lock on its own file in the spool — `producer_file` and
+`consumer_file` — created when the endpoint opens and removed when it closes, and `claim:
+exclusive` (the default) refuses to start when its role is already held, naming the holder.
+The two roles never conflict with each other, so a producer and a consumer sharing a
+directory — the point of the endpoint — needs no configuration. Every instance touching one
+spool must of course agree on the two names; that agreement is what makes them exclude each
+other.
+
+*At a time* is the operative phrase: the locks say "someone is running", not "production is
+finished". A spool may be filled by several producers in turn, so the end of the stream is a
+separate signal — the `done_file` sentinel:
+
+- `stop_on_done` ends the stream once the queue is empty **and** `done_file` is present, so
+  a producer that finished long ago still has its backlog drained first, and the gap between
+  two producers does not cut the stream short.
+- Only the **last** producer should set `emit_done`, and its value says what "finished"
+  has to mean. The sentinel is written as that producer closes, before its lock is
+  released, so a hand-off to another producer cannot lose it.
+  - `success` is the strict reading: the route reached the natural end of its input (an
+    exhausted source, or a `--drain` that emptied it) **and** every chunk the producer
+    accepted reached the disk. A route that is shut down, that fails, or that reconnects
+    writes nothing, so a `stop_on_done` consumer keeps waiting for the production that did
+    not finish. A *continuously running* producer never reaches a natural end, so `success`
+    on one of those means "never" in practice — use `end` there.
+  - `end` is the loose reading: nothing more is coming from here, whatever the reason. It
+    says nothing about whether everything worked, so a consumer will treat a truncated
+    stream as the whole of it — which is the right trade when the alternative is waiting
+    forever on a producer that may have died.
+- A producer opening the spool **deletes** an existing sentinel: it is producing again, and
+  a stale marker would tell a `stop_on_done` consumer to exit the moment its queue first ran
+  dry.
+- A producer that *crashes* never writes the sentinel, so a `stop_on_done` consumer keeps
+  waiting — correct, because production did not finish. Its lock, on the other hand, is
+  broken automatically, so the restarted producer can pick up where it left off.
+
+Two things to know about the locks themselves:
+
+- **A lock is broken only when its owner is provably gone.** The check is by process id, so
+  it works for a crash on the machine that wrote the lock. A spool shared between hosts or
+  containers cannot be judged that way: clear such a lock by deleting the file, and be aware
+  that a pid check across a pid-namespace boundary can also break a lock whose owner is
+  alive but invisible.
+- **The three control files must not collide** with each other or with a chunk. A name that
+  ends in `payload_extension` would be delivered as a message, one ending in
+  `metadata_extension` would be read as a chunk's sidecar, one ending in `.tmp` looks like a
+  chunk mid-write, and two roles under one name would have each release deleting the other's
+  lock. All of these are rejected at startup (and by route validation), compared
+  case-insensitively so that `DONE` and `done` count as one file on Windows and macOS.
+
+Genuinely shared spools are still possible with `claim: warn` or `claim: off`, at a price on
+each side. Several *simultaneous* producers need `{message_id}` in `naming_pattern` to keep
+names from colliding. Several *draining* consumers get **duplicate delivery**: a chunk is
+claimed only in the reading process's memory, and deleted only once its message is
+acknowledged, so two drainers can both read one before either deletes it and both will
+deliver it. There is no on-disk claim — no rename-to-claim handshake — so competing
+consumers do not partition a spool between themselves. The lock is what makes that
+arrangement hard to enter by accident; if you switch it off, one drainer per spool is still
+the rule.
+
+`drain_on_read: false` is the one exception to the cardinality rule: such a reader deletes
+nothing, so several of them over one spool each see every chunk once and none of them takes
+a lock — though each will warn if a draining consumer holds the directory, because that one
+deletes chunks out from under it. It remembers what it has read by name, in memory, for as
+long as the run lasts: a chunk may appear with a name below one already delivered, so a
+position alone could not tell the two apart. Budget for that on a spool of millions of
+chunks that is never drained, and restart the reader to reset it — a fresh run re-reads
+the directory from the beginning.
+
+##### Throughput and durability
+The endpoint's dominant cost is fsync, not mq-bridge. The default `fsync: chunk` is **two
+fsyncs per message** when a sidecar is written — the payload and its sidecar — plus one
+directory fsync per batch. Measured on one machine (btrfs on NVMe, 64 KiB payloads, one
+message per `send_batch`), single sink, no route:
+
+| | `fsync: chunk` | `fsync: off` |
+|---|---|---|
+| with sidecar | ~210 msg/s | ~2100 msg/s |
+| `metadata_extension: ""` | ~360 msg/s | ~3900 msg/s |
+
+On tmpfs the same run gives ~3500 and ~9200 msg/s respectively, which is the number to use
+if the spool lives in `/dev/shm` — and a caution against sizing from a tmpfs measurement for
+a spool that will land on a disk. Treat these as an order of magnitude, not a specification:
+a spinning disk is far slower and a battery-backed controller far faster.
+
+Two ways to buy headroom before reaching for `fsync: off`: drop the sidecar when the payload
+is self-describing (`metadata_extension: ""`, which nearly doubles the rate and halves the
+file count), and batch — the per-batch directory fsync is amortized over the batch, so
+`batch_size: 32` pays it once rather than 32 times. `fsync: off` trades the endpoint's
+crash-safety claim, not just its tail: a power loss can leave a chunk present but truncated,
+which a consumer would deliver as a short message.
+
+##### Sharding
+A flat spool is one directory per stream, and most filesystems degrade long before mq-bridge
+does — 30fps with sidecars is over 200,000 files an hour. `shard_depth` spreads chunks over
+subdirectories named from the leading digits of the sequence number, so with the default
+`{seq:09}`, `shard_depth: 2` and `shard_width: 3`, chunk 1 is written as `000/000/001.bin`
+(its sidecar beside it) and no directory ever holds more than 1000 entries.
+
+Queue order is unaffected: lexical order over the whole relative path is still sequence
+order, and a chunk's recorded identity (`mqb.src.spool_chunk`) becomes that path. Sharding
+also makes a large backlog cheaper to read, not just to store — the consumer walks shards in
+order and stops as soon as its listing is full, so it reads the leading shards rather than
+the whole tree, and a drained shard directory is pruned as it empties.
+
+Three things to get right:
+
+- **`naming_pattern` must start with a zero-padded `{seq:0N}`** wider than
+  `shard_depth * shard_width`. The directory names are cut from the front of every rendered
+  name, so that front has to be a fixed width — otherwise chunk 999 and chunk 1000 would
+  shard to different depths and lexical order would stop being queue order. A pattern that
+  cannot be split is rejected at startup, as is one with no room left for the file name.
+- **Both ends must agree on `shard_depth` and `shard_width`.** A consumer descends only as
+  far as its own depth, into directory names only as wide as its own width, so either one
+  set differently from the producer reads the spool as permanently empty (and under
+  `stop_on_done`, ends the stream immediately). It warns when a scan finds subdirectories
+  it is not configured to enter, which is what that mistake looks like.
+- **A control file cannot be shaped like a shard.** `done_file: "000"` with
+  `shard_width: 3` is rejected, since one name cannot be both the sentinel and a directory.
+
+A directory scan keeps up to 65,536 chunk names for the batches that follow, so draining a
+backlog costs one scan per that many messages rather than one per batch. Two consequences
+are visible from outside: chunks that arrive while a listing is still being served are
+picked up only once it is exhausted (within `poll_interval_ms` on an idle spool), and the
+batch that empties a listing can be shorter than the route's `batch_size`.
+
+**Example**: video frames written by one process and drained by another.
+
+```yaml
+# Producer: raw H.264 chunks, no sidecar — an Annex B chunk is self-describing, and a
+# sidecar per frame would double the file count and the fsyncs for nothing. Keep the
+# default `metadata_extension: "json"` on a spool whose metadata has to travel.
+# Holds the PRODUCER lock while it runs; on a clean finish it writes DONE, which is what
+# ends the consumer's stream below. Use `emit_done: end` instead if the consumer must not
+# wait on a producer that may die.
+frame_capture:
+  input:
+    memory:
+      topic: "frames"
+  output:
+    dir_spool:
+      path: "/tmp/video_telemetry_spool"
+      naming_pattern: "{seq:09}_{timestamp}"
+      # 30fps fills a flat directory fast: two levels of three digits keep every
+      # directory under 1000 entries. The consumer needs the same shard_depth.
+      shard_depth: 2
+      shard_width: 3
+      payload_extension: ".h264"
+      metadata_extension: ""
+      emit_done: success
+
+# Consumer: drain in sequence order, delete as we go, exit when the producer is done.
+frame_ingest:
+  input:
+    dir_spool:
+      path: "/tmp/video_telemetry_spool"
+      shard_depth: 2
+      shard_width: 3
+      payload_extension: ".h264"
+      metadata_extension: ""
+      drain_on_read: true
+      stop_on_done: true
+  output:
+    mongodb:
+      url: "mongodb://localhost:27017"
+      database: "telemetry"
+      collection: "frames"
+```
+
+A message nacked by the route is left on disk and redelivered on the next poll. A chunk
+whose payload file exists without a sidecar is still delivered, with empty metadata — which
+is what lets a foreign producer write into the spool with nothing but `write()` and
+`rename()`.
+
+##### Further reading
+`dir_spool` is a deliberately old idea. Spooling — buffering plus a queue, so that a fast
+producer hands work off and carries on while a slow consumer drains it at its own pace — has
+been the standard answer to this problem since the 1960s, and the print spooler is its
+canonical form. These are worth reading before designing anything on top of a spool
+directory:
+
+- [Spooling](https://en.wikipedia.org/wiki/Spooling) (Wikipedia) — the concept and its
+  vocabulary, the name (said to come from "Simultaneous Peripheral Operations On-Line",
+  possibly a backronym), and a bibliography that goes back to the primary sources: Lundin &
+  Stoneman's *The Spooler User Guide* (1977), Donovan's *Systems Programming* (1972), and the
+  spooling chapters of Peterson & Silberschatz and Tanenbaum.
+- [Printing and spooling](https://www.cise.ufl.edu/~jnw/SysAdminfa04/Lectures/34.html)
+  (University of Florida CISE, system administration lecture, 2004) — Unix print spooling
+  from the operator's side: BSD copying job data into the spool directory under a job id
+  versus System V writing a request file that points at the original, the `lpd`/`lpsched`
+  daemons, and the operational concerns that outlive the software — who owns the spool
+  directory and with what permissions, and which hosts may submit into it.
+- [Spooling: print spoolers in practice](https://www.onenoughtone.com/learn/spooling/2) — a
+  modern worked example, tracing a job through CUPS end to end: the `cupsd` scheduler, the
+  queue under `/var/spool/cups/`, filter chains, and device backends.
+- *Spooler Programmer's Guide*, Hewlett-Packard, part number 522287-002, August 2012
+  ([PDF](http://nonstoptools.com/manuals/Spoolcom-Guide.pdf) — the file is named for
+  Spoolcom, one component it documents, but it is the programmer's guide) — the deepest of
+  these, and the one closest to this endpoint's problem. It specifies a production spooler
+  (HP NonStop, documented since 1995) as a set of cooperating processes with explicit state
+  machines: a supervisor, *collectors* that accept data from application programs and write
+  it to disk, *print processes* that drain a job and mark it complete, and *perusal
+  processes* that read spooled data **without** consuming it. Worth reading for the state
+  diagrams — job, collector, print process, device — and for the chapter on spooling from a
+  fault-tolerant process pair, which is the classical treatment of the question this
+  endpoint answers with locks and redelivery: what a spool owes a producer that may die
+  mid-job.
+
+Four things `dir_spool` takes from that tradition. The directory *is* the queue, so the
+producer's obligation ends when the file lands and a crash on either side leaves a state you
+can read with `ls`. Data is copied into the spool rather than referenced in place — the BSD
+choice rather than the System V one — which is what lets the producer finish and exit while
+the consumer is still draining. The control information is a separate file from the data,
+which is what the payload/sidecar split is, and why the two extensions must differ. And a
+reader that consumes is a different thing from a reader that only looks: NonStop's *perusal
+process* is `drain_on_read: false`, which is why several of those may share a spool while
+only one drainer may.
+
+The vocabulary maps closely enough to be worth keeping in mind. A NonStop *collector* is
+this endpoint's publisher, a *print process* its consumer, `PRINTCOMPLETE` the acknowledgement
+that deletes a chunk, a *job number* the sequence in a chunk's name, and the supervisor's
+*ready list* the cached listing a consumer serves batches from.
+
+What it does differently is have no supervisor. A classic spooler puts one privileged daemon
+in front of the queue and lets it serialize access and own the state machine; `dir_spool` has
+no daemon at all, which is why exclusion is a pair of pid locks, why the cardinality rules
+above have to be stated rather than enforced by a process boundary, and why the states a
+chunk moves through are implicit in the filesystem rather than written down as a diagram. The
+filter chains a print spooler applies on the way out are, in mq-bridge, the route's middleware
+and handlers.
+
 ### IDE Support (Schema Validation) 
 mq-bridge includes a JSON schema for configuration validation and auto-completion. 
 1. Ensure you have a YAML plugin installed (e.g., YAML for VS Code). 

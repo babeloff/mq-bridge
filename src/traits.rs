@@ -29,6 +29,46 @@ pub enum MessageDisposition {
     Nack,
 }
 
+/// How a route pass ended, for an endpoint whose close is a signal to someone else.
+///
+/// Read with [`disconnect_outcome`] from inside a disconnect hook. Every teardown path runs
+/// the disconnect hooks — a clean finish, a shutdown and a failure alike — so an endpoint
+/// that has to tell the three apart cannot do it by being closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DisconnectOutcome {
+    /// The input reached its natural end and the route drained it. The only outcome that
+    /// means "all the work there was to do is done".
+    Completed,
+    /// The route was asked to stop, or is tearing down in order to reconnect. Work may
+    /// well remain: nothing says the input was exhausted.
+    Stopped,
+    /// The pass ended with an error.
+    Failed,
+}
+
+tokio::task_local! {
+    static DISCONNECT_OUTCOME: DisconnectOutcome;
+}
+
+/// How the route pass that is tearing down ended, or `None` outside a teardown.
+///
+/// Read it from inside a publisher's [`MessagePublisher::on_disconnect_hook`] future. The
+/// route establishes it for the whole teardown, so it reaches a publisher through any depth
+/// of middleware without those wrappers passing it along. A publisher reached outside a
+/// route teardown — or from a task the hook spawned itself — sees `None` and should treat
+/// the close as [`DisconnectOutcome::Stopped`], the reading that claims least.
+pub fn disconnect_outcome() -> Option<DisconnectOutcome> {
+    DISCONNECT_OUTCOME.try_with(|outcome| *outcome).ok()
+}
+
+/// Runs `teardown` with [`disconnect_outcome`] set to `outcome`.
+pub(crate) async fn with_disconnect_outcome<F: std::future::Future>(
+    outcome: DisconnectOutcome,
+    teardown: F,
+) -> F::Output {
+    DISCONNECT_OUTCOME.scope(outcome, teardown).await
+}
+
 impl From<Option<CanonicalMessage>> for MessageDisposition {
     fn from(opt: Option<CanonicalMessage>) -> Self {
         match opt {
@@ -390,6 +430,10 @@ pub trait MessagePublisher: Send + Sync + 'static {
     ///
     /// The route awaits this hook during shutdown or reconnect cleanup. Errors are logged as
     /// warnings and do not replace the route's original result.
+    ///
+    /// A publisher whose close is a *signal* to someone else can read
+    /// [`disconnect_outcome`] from inside the returned future to tell a finished route
+    /// from a stopped one.
     fn on_disconnect_hook(&self) -> Option<BoxFuture<'_, anyhow::Result<()>>> {
         None
     }

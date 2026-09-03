@@ -14,8 +14,9 @@ use crate::errors::ProcessingError;
 pub use crate::models::Route;
 use crate::models::{Endpoint, EndpointType, Middleware, NameBy, RouteOptions};
 use crate::traits::{
-    BatchCommitFunc, ConsumerError, EndpointStatus, Handler, HandlerError, MessageConsumer,
-    MessageDisposition, MessagePublisher, PublisherError, SentBatch,
+    with_disconnect_outcome, BatchCommitFunc, ConsumerError, DisconnectOutcome, EndpointStatus,
+    Handler, HandlerError, MessageConsumer, MessageDisposition, MessagePublisher, PublisherError,
+    SentBatch,
 };
 use async_channel::{bounded, Sender};
 use serde::de::DeserializeOwned;
@@ -208,18 +209,34 @@ pub(crate) async fn run_consumer_connect_hook(
     Ok(())
 }
 
+/// The outcome a runner's return value describes: `Ok(false)` is a natural end,
+/// `Ok(true)` a shutdown, `Err` a failure.
+pub(crate) fn disconnect_outcome(result: &anyhow::Result<bool>) -> DisconnectOutcome {
+    match result {
+        Ok(false) => DisconnectOutcome::Completed,
+        Ok(true) => DisconnectOutcome::Stopped,
+        Err(_) => DisconnectOutcome::Failed,
+    }
+}
+
 pub(crate) async fn run_publisher_disconnect_hook(
     route_name: &str,
     publisher: &Arc<dyn MessagePublisher>,
+    outcome: DisconnectOutcome,
 ) {
-    if let Some(hook) = publisher.on_disconnect_hook() {
-        if let Err(err) = hook.await {
-            warn!(
-                "Publisher on_disconnect hook failed for route '{}': {}",
-                route_name, err
-            );
+    // Scoped rather than passed as an argument, so it reaches the sink through any depth
+    // of middleware without each wrapper having to forward it.
+    with_disconnect_outcome(outcome, async {
+        if let Some(hook) = publisher.on_disconnect_hook() {
+            if let Err(err) = hook.await {
+                warn!(
+                    "Publisher on_disconnect hook failed for route '{}': {}",
+                    route_name, err
+                );
+            }
         }
-    }
+    })
+    .await;
 }
 
 pub(crate) async fn run_consumer_disconnect_hook(route_name: &str, consumer: &dyn MessageConsumer) {
@@ -1448,12 +1465,12 @@ impl Route {
         .await?;
         consumer.set_exit_on_empty(self.options.exit_on_empty);
         if let Err(err) = run_publisher_connect_hook(name, &publisher).await {
-            run_publisher_disconnect_hook(name, &publisher).await;
+            run_publisher_disconnect_hook(name, &publisher, DisconnectOutcome::Failed).await;
             return Err(err);
         }
         if let Err(err) = run_consumer_connect_hook(name, consumer.as_ref()).await {
             run_consumer_disconnect_hook(name, consumer.as_ref()).await;
-            run_publisher_disconnect_hook(name, &publisher).await;
+            run_publisher_disconnect_hook(name, &publisher, DisconnectOutcome::Failed).await;
             return Err(err);
         }
         let (err_tx, err_rx) = bounded(1);
@@ -1477,7 +1494,7 @@ impl Route {
         let has_dlq_middleware = self.output.has_dlq_middleware();
         // Messages processed since the last cooperative yield (see YIELD_EVERY_MSGS).
         let mut since_yield = 0usize;
-        let run_result = loop {
+        let mut run_result = loop {
             select! {
                 Ok(err) = err_rx.recv() => break Err(err),
 
@@ -1557,9 +1574,13 @@ impl Route {
         // Drain errors while waiting for tasks to finish to prevent deadlocks and lost errors
         loop {
             select! {
+                biased;
                 res = err_rx.recv() => {
                     if let Ok(err) = res {
                         error!("Error reported during shutdown: {}", err);
+                        if matches!(&run_result, Ok(false)) {
+                            run_result = Err(err);
+                        }
                     }
                 }
                 res = commit_tasks.join_next() => {
@@ -1573,7 +1594,7 @@ impl Route {
         drop(err_rx);
         commit_router.shutdown().await;
         run_consumer_disconnect_hook(name, consumer.as_ref()).await;
-        run_publisher_disconnect_hook(name, &publisher).await;
+        run_publisher_disconnect_hook(name, &publisher, disconnect_outcome(&run_result)).await;
         run_result
     }
 
@@ -1628,12 +1649,12 @@ impl Route {
         .await?;
         consumer.set_exit_on_empty(self.options.exit_on_empty);
         if let Err(err) = run_publisher_connect_hook(name, &publisher).await {
-            run_publisher_disconnect_hook(name, &publisher).await;
+            run_publisher_disconnect_hook(name, &publisher, DisconnectOutcome::Failed).await;
             return Err(err);
         }
         if let Err(err) = run_consumer_connect_hook(name, consumer.as_ref()).await {
             run_consumer_disconnect_hook(name, consumer.as_ref()).await;
-            run_publisher_disconnect_hook(name, &publisher).await;
+            run_publisher_disconnect_hook(name, &publisher, DisconnectOutcome::Failed).await;
             return Err(err);
         }
         if let Some(tx) = ready_tx {
@@ -1864,25 +1885,21 @@ impl Route {
         // Close sequencer (if any) now that all in-flight commits have drained.
         commit_router.shutdown().await;
         run_consumer_disconnect_hook(name, consumer.as_ref()).await;
-        run_publisher_disconnect_hook(name, &publisher).await;
-
-        if let Some(err) = loop_error {
-            return Err(err);
-        }
-
-        if let Ok(err) = err_rx.try_recv() {
-            return Err(err);
-        }
-
-        // A drain-then-exit is a graceful completion, not a shutdown-driven exit.
-        if drained {
-            return Ok(false);
-        }
-
-        // Every graceful terminal is handled above, so what is left is a shutdown
-        // signal (channel empty means it was closed/consumed) or a dropped
-        // connection the outer loop should reconnect.
-        Ok(shutdown_rx.is_empty())
+        // Decided once so the outcome the publisher is told cannot drift from what the
+        // route returns. A drain-then-exit is a graceful completion, not a shutdown-driven
+        // exit; what is left after it is a shutdown signal (channel empty means it was
+        // closed/consumed) or a dropped connection the outer loop should reconnect.
+        let result = if let Some(err) = loop_error {
+            Err(err)
+        } else if let Ok(err) = err_rx.try_recv() {
+            Err(err)
+        } else if drained {
+            Ok(false)
+        } else {
+            Ok(shutdown_rx.is_empty())
+        };
+        run_publisher_disconnect_hook(name, &publisher, disconnect_outcome(&result)).await;
+        result
     }
 
     pub fn with_options(mut self, options: RouteOptions) -> Self {
@@ -3697,6 +3714,100 @@ mod tests {
         assert_eq!(state.publisher_connects.load(Ordering::SeqCst), 1);
         assert_eq!(state.publisher_disconnects.load(Ordering::SeqCst), 1);
         assert_eq!(state.shared_mutations.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn test_final_commit_failure_after_end_of_stream_fails_sequential_route() {
+        let unique_id = fast_uuid_v7::gen_id().to_string();
+        let factory_name = format!("final_commit_failure_{unique_id}");
+        let eof_seen = Arc::new(tokio::sync::Notify::new());
+        let consumer_eof_seen = eof_seen.clone();
+        let mut factory = MockEndpointFactory::new();
+        let reads = Arc::new(AtomicUsize::new(0));
+        let consumer_reads = reads.clone();
+        factory.consumer_behavior = Arc::new(Mutex::new(move || {
+            struct FiniteConsumer {
+                reads: Arc<AtomicUsize>,
+                eof_seen: Arc<tokio::sync::Notify>,
+            }
+            #[async_trait::async_trait]
+            impl MessageConsumer for FiniteConsumer {
+                async fn receive_batch(
+                    &mut self,
+                    _: usize,
+                ) -> Result<ReceivedBatch, ConsumerError> {
+                    if self.reads.fetch_add(1, Ordering::SeqCst) > 0 {
+                        self.eof_seen.notify_one();
+                        return Err(ConsumerError::EndOfStream);
+                    }
+                    let eof_seen = self.eof_seen.clone();
+                    Ok(ReceivedBatch {
+                        messages: vec![crate::CanonicalMessage::from("only")],
+                        commit: Box::new(move |_| {
+                            Box::pin(async move {
+                                eof_seen.notified().await;
+                                Err(anyhow::anyhow!("final commit failed"))
+                            })
+                        }),
+                    })
+                }
+                fn as_any(&self) -> &dyn Any {
+                    self
+                }
+            }
+            Ok(Box::new(FiniteConsumer {
+                reads: consumer_reads.clone(),
+                eof_seen: consumer_eof_seen.clone(),
+            }) as Box<dyn MessageConsumer>)
+        }));
+
+        let disconnect_outcome = Arc::new(Mutex::new(None));
+        let publisher_outcome = disconnect_outcome.clone();
+        factory.publisher_behavior = Arc::new(Mutex::new(move || {
+            struct OutcomePublisher(Arc<Mutex<Option<DisconnectOutcome>>>);
+            #[async_trait::async_trait]
+            impl MessagePublisher for OutcomePublisher {
+                fn on_disconnect_hook(&self) -> Option<BoxFuture<'_, anyhow::Result<()>>> {
+                    Some(Box::pin(async move {
+                        *self.0.lock().unwrap() = crate::traits::disconnect_outcome();
+                        Ok(())
+                    }))
+                }
+                async fn send_batch(
+                    &self,
+                    _: Vec<crate::CanonicalMessage>,
+                ) -> Result<SentBatch, PublisherError> {
+                    Ok(SentBatch::Ack)
+                }
+                fn as_any(&self) -> &dyn Any {
+                    self
+                }
+            }
+            Ok(Box::new(OutcomePublisher(publisher_outcome.clone())) as Box<dyn MessagePublisher>)
+        }));
+        register_endpoint_factory(&factory_name, Arc::new(factory)).unwrap();
+
+        let endpoint = |name: String| Endpoint {
+            endpoint_type: EndpointType::Custom {
+                name,
+                config: serde_json::Value::Null,
+            },
+            middlewares: vec![],
+            handler: None,
+        };
+        let route = Route::new(endpoint(factory_name.clone()), endpoint(factory_name));
+
+        let err = route
+            .run_until_err("test_final_commit_failure", None, None)
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("final commit failed"));
+        assert_eq!(
+            *disconnect_outcome.lock().unwrap(),
+            Some(DisconnectOutcome::Failed)
+        );
+        assert_eq!(reads.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]

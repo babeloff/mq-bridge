@@ -106,6 +106,27 @@ class DetailedMappingRule(TypedDict, total=False):
     required: bool
 
 
+class DirSpoolConfig(TypedDict, total=False):
+    """Configuration for a `dir_spool` endpoint: a crash-safe FIFO queue backed by a directory."""
+    atomic: bool
+    claim: SpoolClaim
+    consumer_file: str
+    done_file: str
+    drain_on_read: bool
+    emit_done: SpoolDone
+    fsync: SpoolFsync
+    metadata_extension: str
+    naming_pattern: str
+    path: Required[str]
+    payload_extension: str
+    poll_interval_ms: int
+    producer_file: str
+    shard_depth: int
+    shard_width: int
+    source_metadata: bool
+    stop_on_done: bool
+
+
 class EncryptionConfig(TypedDict, total=False):
     """AEAD encryption settings, shared by the `encryption` middleware (per-message"""
     authenticate_metadata: List[str]
@@ -121,6 +142,7 @@ class Endpoint(TypedDict, total=False):
     aws: AwsConfig
     clickhouse: ClickHouseConfig
     custom: Dict[str, Any]
+    dir_spool: DirSpoolConfig
     fanout: List[Endpoint]
     file: FileConfig
     grpc: GrpcConfig
@@ -374,7 +396,7 @@ class NatsConfig(TypedDict, total=False):
 
 
 class ObjectStoreConfig(TypedDict, total=False):
-    """Configuration for a cloud object-store endpoint (S3, GCS, Azure Blob, R2, ...)."""
+    """Configuration for a local or cloud object-store endpoint."""
     checkpoint_store: Optional[str]
     compression: Compression
     cursor_id: Optional[str]
@@ -592,6 +614,9 @@ MongoDbFormat = Literal["normal", "json", "text", "raw"]
 MqttProtocol = Literal["v5", "v3"]
 NameBy = Literal["auto", "source_position", "write_time"]
 NatsDeliverPolicy = Literal["all", "last", "new", "last_per_subject"]
+SpoolClaim = Literal["exclusive", "warn", "off"]
+SpoolDone = Literal["never", "success", "end"]
+SpoolFsync = Literal["chunk", "off"]
 StaticConfig = Union[str, Dict[str, Any]]
 TransformErrorPolicy = Literal["reject", "pass_through"]
 WeakJoinTimeout = Literal["fire", "discard"]

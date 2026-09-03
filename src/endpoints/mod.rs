@@ -9,6 +9,7 @@ pub mod amqp;
 pub mod aws;
 #[cfg(feature = "clickhouse")]
 pub mod clickhouse;
+pub mod dir_spool;
 pub mod file;
 #[cfg(feature = "grpc")]
 pub mod grpc;
@@ -54,8 +55,8 @@ pub use crate::endpoints::structural::{
 };
 use crate::middleware::apply_middlewares_to_consumer;
 use crate::models::{
-    Endpoint, EndpointType, MemoryConfig, Middleware, NameBy, ResponseConfig, StreamBufferConfig,
-    TransformErrorPolicy,
+    Endpoint, EndpointType, MemoryConfig, Middleware, NameBy, ResponseConfig, SpoolDone,
+    StreamBufferConfig, TransformErrorPolicy,
 };
 use crate::route::{get_endpoint, get_endpoint_factory};
 use crate::traits::{BoxFuture, MessageConsumer, MessagePublisher};
@@ -530,6 +531,29 @@ fn check_consumer_recursive(
             Ok(warnings)
         }
         EndpointType::File(_) => Ok(warnings),
+        EndpointType::DirSpool(cfg) => {
+            dir_spool::validate_spool_layout(cfg)
+                .map_err(|error| anyhow!("[route:{route_name}] {error}"))?;
+            if !matches!(cfg.emit_done, SpoolDone::Never) {
+                warnings.push(
+                    "Endpoint 'dir_spool' is used as a consumer, but 'emit_done' is a publisher-only option and will be ignored."
+                    .to_string()
+                );
+            }
+            if cfg.naming_pattern != crate::models::defaults::default_spool_naming_pattern() {
+                warnings.push(
+                    "Endpoint 'dir_spool' is used as a consumer, but 'naming_pattern' is a publisher-only option and will be ignored."
+                    .to_string()
+                );
+            }
+            if !cfg.atomic {
+                warnings.push(
+                    "Endpoint 'dir_spool' is used as a consumer, but 'atomic' is a publisher-only option and will be ignored."
+                    .to_string()
+                );
+            }
+            Ok(warnings)
+        }
         #[cfg(feature = "object-store")]
         EndpointType::ObjectStore(cfg) => {
             if cfg.extension.is_some() {
@@ -745,6 +769,10 @@ fn source_metadata_requested(endpoint_type: &EndpointType) -> bool {
         EndpointType::PostgresCdc(config) => config.source_metadata,
         EndpointType::MongoDb(config) => config.source_metadata,
         EndpointType::File(config) => config.source_metadata,
+        // Provenance only, not a replay position — so `dir_spool` is deliberately absent
+        // from `supports_source_metadata` above. A chunk name orders the queue but says
+        // nothing an idempotent sink could re-derive after the chunk has been drained.
+        EndpointType::DirSpool(config) => config.source_metadata,
         EndpointType::Sqlx(config) => config.source_metadata,
         _ => false,
     }
@@ -1181,12 +1209,22 @@ async fn run_http_inline_response_fast_path(
             .await?;
 
     if let Err(err) = crate::route::run_publisher_connect_hook(name, &publisher).await {
-        crate::route::run_publisher_disconnect_hook(name, &publisher).await;
+        crate::route::run_publisher_disconnect_hook(
+            name,
+            &publisher,
+            crate::traits::DisconnectOutcome::Failed,
+        )
+        .await;
         return Err(err);
     }
     if let Err(err) = crate::route::run_consumer_connect_hook(name, &consumer).await {
         crate::route::run_consumer_disconnect_hook(name, &consumer).await;
-        crate::route::run_publisher_disconnect_hook(name, &publisher).await;
+        crate::route::run_publisher_disconnect_hook(
+            name,
+            &publisher,
+            crate::traits::DisconnectOutcome::Failed,
+        )
+        .await;
         return Err(err);
     }
 
@@ -1212,7 +1250,13 @@ async fn run_http_inline_response_fast_path(
         );
     }
     crate::route::run_consumer_disconnect_hook(name, &consumer).await;
-    crate::route::run_publisher_disconnect_hook(name, &publisher).await;
+    // This runner only ever ends on shutdown: an HTTP listener has no natural end.
+    crate::route::run_publisher_disconnect_hook(
+        name,
+        &publisher,
+        crate::traits::DisconnectOutcome::Stopped,
+    )
+    .await;
     Ok(true)
 }
 
@@ -1297,6 +1341,9 @@ async fn create_base_consumer(
         }
         EndpointType::File(cfg) => Ok(boxed(
             file::FileConsumer::new_with_source_metadata(cfg, _source_metadata).await?,
+        )),
+        EndpointType::DirSpool(cfg) => Ok(boxed(
+            dir_spool::DirSpoolConsumer::new_with_source_metadata(cfg, _source_metadata).await?,
         )),
         #[cfg(feature = "object-store")]
         EndpointType::ObjectStore(cfg) => {
@@ -1752,6 +1799,27 @@ fn check_publisher_recursive(
             Ok(warnings)
         }
         EndpointType::File(_) => Ok(warnings),
+        EndpointType::DirSpool(cfg) => {
+            for (set, option) in [
+                (!cfg.drain_on_read, "drain_on_read"),
+                (cfg.stop_on_done, "stop_on_done"),
+                (cfg.source_metadata, "source_metadata"),
+            ] {
+                if set {
+                    warnings.push(format!(
+                        "Endpoint 'dir_spool' is used as a publisher, but '{option}' is a consumer-only option and will be ignored."
+                    ));
+                }
+            }
+            dir_spool::validate_spool_layout(cfg)
+                .map_err(|error| anyhow!("[route:{route_name}] {error}"))?;
+            // Sink-only: the front of a chunk name has to be the sequence, or the queue
+            // loses both its order and its resume point.
+            dir_spool::validate_naming_pattern(cfg)
+                .map_err(|error| anyhow!("[route:{route_name}] {error}"))?;
+            warnings.extend(dir_spool::naming_pattern_warning(cfg));
+            Ok(warnings)
+        }
         #[cfg(feature = "object-store")]
         EndpointType::ObjectStore(cfg) => {
             if cfg.checkpoint_store.is_some() {
@@ -2111,6 +2179,10 @@ async fn create_base_publisher(
             file::FilePublisher::new_with_name_by(cfg, cfg.resolved_name_by(source_has_position))
                 .await?,
         ) as Box<dyn MessagePublisher>),
+        EndpointType::DirSpool(cfg) => {
+            Ok(Box::new(dir_spool::DirSpoolPublisher::new(cfg).await?)
+                as Box<dyn MessagePublisher>)
+        }
         #[cfg(feature = "object-store")]
         EndpointType::ObjectStore(cfg) => Ok(Box::new(
             object_store::ObjectStorePublisher::new_with_name_by(

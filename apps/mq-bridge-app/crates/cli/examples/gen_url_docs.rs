@@ -8,9 +8,9 @@
 //! Run with `cargo run -p mq-bridge-app --example gen_url_docs`.
 
 use mq_bridge_app::mq_bridge::models::{
-    AmqpConfig, AwsConfig, ClickHouseConfig, FileConfig, GrpcConfig, HttpConfig, IbmMqConfig,
-    KafkaConfig, MongoDbConfig, MqttConfig, NatsConfig, ObjectStoreConfig, PostgresCdcConfig,
-    RedisStreamsConfig, SqlxConfig, WebSocketConfig, ZeroMqConfig,
+    AmqpConfig, AwsConfig, ClickHouseConfig, DirSpoolConfig, FileConfig, GrpcConfig, HttpConfig,
+    IbmMqConfig, KafkaConfig, MongoDbConfig, MqttConfig, NatsConfig, ObjectStoreConfig,
+    PostgresCdcConfig, RedisStreamsConfig, SqlxConfig, WebSocketConfig, ZeroMqConfig,
 };
 use schemars::Schema;
 use serde_json::Value;
@@ -109,9 +109,25 @@ fn main() -> std::io::Result<()> {
             schema: schemars::schema_for!(FileConfig),
         },
         Connector {
+            slug: "dir-spool",
+            title: "Directory spool",
+            schemes: &["spool", "dir-spool", "dirspool"],
+            schema: schemars::schema_for!(DirSpoolConfig),
+        },
+        Connector {
             slug: "object-store",
-            title: "Cloud Object Storage",
-            schemes: &["s3", "s3a", "gs", "gcs", "az", "azure", "abfs", "abfss"],
+            title: "Object Storage (local / cloud)",
+            schemes: &[
+                "local-store",
+                "s3",
+                "s3a",
+                "gs",
+                "gcs",
+                "az",
+                "azure",
+                "abfs",
+                "abfss",
+            ],
             schema: schemars::schema_for!(ObjectStoreConfig),
         },
         Connector {

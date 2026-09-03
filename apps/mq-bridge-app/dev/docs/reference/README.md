@@ -14,7 +14,8 @@ Auto-generated from the same JSON Schemas `mqb copy` uses to parse `--from`/`--t
 - [WebSocket](./websocket.md) — schemes: `ws://`, `wss://`
 - [MongoDB](./mongodb.md) — schemes: `mongodb://`
 - [File (CSV / JSON / JSONL)](./file.md) — schemes: `file://`
-- [Cloud Object Storage](./object-store.md) — schemes: `s3://`, `s3a://`, `gs://`, `gcs://`, `az://`, `azure://`, `abfs://`, `abfss://`
+- [Directory spool](./dir-spool.md) — schemes: `spool://`, `dir-spool://`, `dirspool://`
+- [Object Storage (local / cloud)](./object-store.md) — schemes: `local-store://`, `s3://`, `s3a://`, `gs://`, `gcs://`, `az://`, `azure://`, `abfs://`, `abfss://`
 - [NATS](./nats.md) — schemes: `nats://`
 - [Redis Streams](./redis.md) — schemes: `redis://`, `rediss://`, `redis_streams://`
 - [gRPC](./grpc.md) — schemes: `grpc://`, `grpcs://`

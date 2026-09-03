@@ -20,8 +20,8 @@ const ALWAYS_IGNORED = [
   /\/favicon\.ico\b/,
   // Navigating away cancels whatever the pollers had in flight. That is the
   // browser doing as it was told, not a request the server refused — and the
-  // specs navigate constantly, the sweep twice per button.
-  /net::ERR_ABORTED/,
+  // specs navigate constantly, the sweep twice per button. One spelling per engine.
+  /net::ERR_ABORTED|NS_BINDING_ABORTED|Load request cancelled/,
 ];
 
 function isIgnored(message, extra) {
