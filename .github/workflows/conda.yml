@@ -1,0 +1,78 @@
+name: Conda package
+
+on:
+  pull_request:
+    branches: [main, dev]
+    paths:
+      - 'apps/mq-bridge-app/packaging/conda/**'
+      - '.github/workflows/conda.yml'
+  release:
+    types: [published]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }} package
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-64
+            runner: ubuntu-22.04
+          - target: osx-arm64
+            runner: macos-14
+          - target: win-64
+            runner: windows-2022
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Resolve package version
+        shell: bash
+        run: |
+          node - <<'NODE'
+          const fs = require('fs');
+          const manifest = fs.readFileSync('apps/mq-bridge-app/Cargo.toml', 'utf8');
+          const version = manifest.match(/\[workspace\.package\][\s\S]*?^version = "([^"]+)"/m)?.[1];
+          if (!version) throw new Error('workspace package version not found');
+          fs.appendFileSync(process.env.GITHUB_ENV, `MQ_BRIDGE_VERSION=${version}\n`);
+          NODE
+
+      - name: Install rattler-build
+        uses: prefix-dev/rattler-build-action@v0.2.34
+
+      - name: Build and test package
+        shell: bash
+        run: >-
+          rattler-build build
+          --recipe apps/mq-bridge-app/packaging/conda/recipe.yaml
+          --target-platform=${{ matrix.target }}
+          -c conda-forge
+
+      - name: Retain conda package
+        uses: actions/upload-artifact@v7
+        with:
+          name: mq-bridge-app-${{ matrix.target }}
+          path: output/**/*.conda
+          if-no-files-found: error
+
+      - name: Publish to Anaconda.org
+        if: github.event_name == 'release'
+        shell: bash
+        env:
+          ANACONDA_API_KEY: ${{ secrets.ANACONDA_API_TOKEN }}
+        run: |
+          if [ -z "$ANACONDA_API_KEY" ]; then
+            echo "::warning::ANACONDA_API_TOKEN is not configured; package was built but not published"
+            exit 0
+          fi
+          while IFS= read -r -d '' package; do
+            rattler-build upload anaconda -o marcomq -c main "$package"
+          done < <(find output -type f -name '*.conda' -print0)
