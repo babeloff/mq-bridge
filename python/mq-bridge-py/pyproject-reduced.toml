@@ -20,7 +20,7 @@ dependencies = [
   "typing-extensions>=4.0",
 ]
 license = { text = "MIT" }
-license-files = ["LICENSE.python"]
+license-files = ["LICENSE.python", "THIRD_PARTY_LICENSES.txt"]
 keywords = ["messaging", "tokio", "pyo3", "maturin", "mq-bridge"]
 classifiers = [
   "Development Status :: 3 - Alpha",

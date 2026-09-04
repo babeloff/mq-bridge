@@ -138,4 +138,6 @@ Active development. Originally the reference implementation and testbed for the 
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+mq-bridge-app is MIT licensed; see [LICENSE](LICENSE). Third-party terms for
+the CLI and desktop distributions are in
+[THIRD_PARTY_LICENSES.txt](crates/core/THIRD_PARTY_LICENSES.txt).

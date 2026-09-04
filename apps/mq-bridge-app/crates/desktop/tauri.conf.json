@@ -31,10 +31,14 @@
       "icons/icon.icns",
       "icons/32x32.png",
       "icons/128x128.png"
-    ]
+    ],
+    "resources": {
+      "../../LICENSE": "LICENSE",
+      "../core/THIRD_PARTY_LICENSES.txt": "THIRD_PARTY_LICENSES.txt"
+    }
   },
   "identifier": "com.marcomq.mqbridgeapp",
   "mainBinaryName": "mq-bridge",
   "productName": "mq-bridge",
-  "version": "0.4.10"
+  "version": "0.4.11"
 }
