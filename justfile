@@ -43,6 +43,35 @@ _require-protoc:
     EOF
     exit 1
 
+# Check that the recipes compiling pyo3 have an interpreter to compile against.
+#
+# Only the chain those recipes actually leave pyo3: $PYO3_PYTHON, then
+# $VIRTUAL_ENV, then PATH. $CONDA_PREFIX is deliberately NOT considered — the
+# python recipes unset it, for the reasons documented above that group — so
+# treating it as a candidate here would reject the very recipe that fixes it.
+_require-python:
+    #!/usr/bin/env bash
+    if [ -n "${PYO3_PYTHON:-}" ]; then
+        [ -x "${PYO3_PYTHON}" ] && exit 0
+        echo "error: \$PYO3_PYTHON=${PYO3_PYTHON} is not executable." >&2
+        exit 1
+    fi
+    if [ -n "${VIRTUAL_ENV:-}" ]; then
+        if [ -x "${VIRTUAL_ENV}/bin/python" ] || [ -x "${VIRTUAL_ENV}/bin/python3" ]; then exit 0; fi
+        cat >&2 <<EOF
+    error: \$VIRTUAL_ENV=${VIRTUAL_ENV} has no bin/python, and pyo3 prefers it
+           over PATH rather than falling through.
+
+      Clear it, or point \$PYO3_PYTHON at a real interpreter:
+        unset VIRTUAL_ENV
+        PYO3_PYTHON=\$(command -v python3) just <recipe>
+    EOF
+        exit 1
+    fi
+    command -v python3 >/dev/null 2>&1 && exit 0
+    echo "error: no python3 on PATH, \$PYO3_PYTHON unset and \$VIRTUAL_ENV unset." >&2
+    exit 1
+
 # --- Gates --------------------------------------------------------------------
 
 [doc('Everything ci.yml gates a PR on, bar the Docker suites')]
@@ -189,26 +218,55 @@ check-native-deps:
     protoc --version
 
 # --- Python bindings ----------------------------------------------------------
+#
+# These recipes drop $CONDA_PREFIX, which CI never has but a local shell often
+# does — `pixi global install` and `conda activate` both export it. It breaks
+# the Python build two different ways:
+#
+#   * pyo3-ffi picks its interpreter from $PYO3_PYTHON, then $VIRTUAL_ENV, then
+#     $CONDA_PREFIX, and does not fall through when the one it picked is wrong.
+#     A prefix with no bin/python fails the build naming a path you never chose.
+#   * maturin refuses outright when $VIRTUAL_ENV and $CONDA_PREFIX are *both*
+#     set ("Please unset one of them") — and `uv run` always sets the first.
+#     This one bites even when $CONDA_PREFIX is a perfectly good env, so
+#     pointing $PYO3_PYTHON somewhere valid does not rescue it.
+#
+# uv owns the interpreter for this project (python/mq-bridge-py/.venv), so
+# $CONDA_PREFIX has no say here and dropping it is the fix for both.
 
 [doc('Sync the dev environment and build the extension into it')]
 [group('python')]
-py-dev:
-    cd python/mq-bridge-py && uv sync --group dev --no-install-project && uv run maturin develop
+py-dev: _require-python
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd python/mq-bridge-py
+    unset CONDA_PREFIX
+    uv sync --group dev --no-install-project
+    uv run maturin develop
 
 [doc('Run the Python test suite')]
 [group('python')]
 py-test:
-    cd python/mq-bridge-py && uv run pytest -q
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd python/mq-bridge-py
+    unset CONDA_PREFIX
+    uv run pytest -q
 
 # python.yml's regression check that the lean, no-default build still exposes
-# the always-on public API.
+# the always-on public API. The two cargo steps run outside uv, as they do in
+# CI, so they need an interpreter of their own — hence _require-python.
 [doc('Lean no-default-features regression tests')]
 [group('python')]
-py-test-lean:
+py-test-lean: _require-python
+    #!/usr/bin/env bash
+    set -euo pipefail
+    unset CONDA_PREFIX
     cargo test -p mq-bridge-py --no-default-features --features http,rustls-ring test_config_schema_is_always_available
     cargo test -p mq-bridge-py --no-default-features --features http,rustls-ring test_module_init_installs_rustls_provider
-    cd python/mq-bridge-py && uv run maturin develop --no-default-features -F http -F rustls-ring -F pyo3/extension-module \
-        && uv run pytest -q tests/test_public_api.py tests/test_config_types.py
+    cd python/mq-bridge-py
+    uv run maturin develop --no-default-features -F http -F rustls-ring -F pyo3/extension-module
+    uv run pytest -q tests/test_public_api.py tests/test_config_types.py
 
 # --- Application (separate workspace) -----------------------------------------
 
