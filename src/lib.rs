@@ -108,7 +108,15 @@
 // obtained. They are mutually exclusive because sqlx's `sqlite-bundled` and
 // `sqlite-unbundled` hand libsqlite3-sys two conflicting build strategies, and
 // cargo features are additive, so nothing but a hard error can stop a caller
-// enabling both. Failing here beats a confusing libsqlite3-sys build error.
+// enabling both.
+//
+// Caveat on the first guard: it is a backstop, not the message you are
+// guaranteed to see. Both features reach dependency *build scripts*
+// (rdkafka-sys, libsqlite3-sys), which cargo may run before this crate's own
+// lib is compiled — so enabling both often surfaces as an rdkafka-sys
+// pkg-config failure instead. The second guard has no such race: `sqlx` with no
+// linkage feature leaves libsqlite3-sys without a driver to build at all, so
+// nothing fails ahead of it.
 
 #[cfg(all(feature = "link-static", feature = "link-dynamic"))]
 compile_error!(
