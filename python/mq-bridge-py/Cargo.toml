@@ -52,6 +52,22 @@ default = ["full"]
 # Testing-only middleware hooks; do not include this feature in production wheels.
 middleware = ["mq-bridge/middleware"]
 full = ["mq-bridge/full", "plugin", "rustls-aws-lc", "mimalloc"]
+# As `full`, but librdkafka and libsqlite are linked from the environment via
+# pkg-config instead of compiled from vendored C sources — the engine's
+# `link-dynamic` in place of `link-static`. The two are mutually exclusive, so
+# this cannot be layered on top of `full` and has to restate the list.
+#
+# Not the default: a PyPI wheel has to be self-contained, so `default = ["full"]`
+# stays static. Build the dynamic wheel by replacing the feature list on the
+# command line, which is what conda-forge packaging does:
+#
+#   maturin build --no-default-features \
+#       --features pyo3/extension-module,full-dynamic,schema
+#
+# (`--no-default-features` is required: `full` would otherwise come back with
+# the default and collide with `link-dynamic`. Through pip, pass it in
+# MATURIN_PEP517_ARGS.)
+full-dynamic = ["mq-bridge/full-dynamic", "plugin", "rustls-aws-lc", "mimalloc"]
 # mimalloc as Rust-side global allocator. Only redirects allocations made by
 # this cdylib's Rust code; CPython's own allocator is untouched. Safe here
 # because no raw Rust-allocated buffer crosses the extension boundary.
