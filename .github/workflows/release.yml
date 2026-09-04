@@ -523,7 +523,7 @@ jobs:
           else
             cp "target/${{ matrix.target }}/release/mqb" staging/
           fi
-          cp apps/mq-bridge-app/LICENSE apps/mq-bridge-app/README.md staging/
+          cp apps/mq-bridge-app/LICENSE apps/mq-bridge-app/README.md apps/mq-bridge-app/crates/core/THIRD_PARTY_LICENSES.txt staging/
           if [ "$RUNNER_OS" == "Windows" ]; then
             7z a "${ASSET_NAME}.zip" ./staging/*
             echo "ASSET_PATH=${ASSET_NAME}.zip" >> "$GITHUB_ENV"
@@ -1082,10 +1082,35 @@ jobs:
           pip install twine
           twine check dist/*
 
-      - name: Publish to PyPI
+      # One upload per project. PyPI mints an OIDC token scoped to the projects
+      # this identity is a registered publisher for, so a single mixed upload
+      # fails halfway with a 403 naming a project rather than telling you which
+      # registration is missing.
+      - name: Split distributions by project
+        run: |
+          set -euo pipefail
+          mkdir -p dist/mq-bridge-py dist/mq-bridge-py-basic
+          mv dist/mq_bridge_py_basic-* dist/mq-bridge-py-basic/
+          mv dist/mq_bridge_py-* dist/mq-bridge-py/
+          for d in dist/mq-bridge-py dist/mq-bridge-py-basic; do
+            [ -n "$(ls -A "$d")" ] || { echo "::error::no distributions for $d"; exit 1; }
+          done
+          ls -lh dist/mq-bridge-py dist/mq-bridge-py-basic
+
+      # skip-existing keeps a partial upload retryable: without it, re-publishing
+      # after one project was refused dies on the other's duplicate files.
+      - name: Publish mq-bridge-py to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
-          packages-dir: dist/
+          packages-dir: dist/mq-bridge-py/
+          skip-existing: true
+
+      - name: Publish mq-bridge-py-basic to PyPI
+        if: ${{ !cancelled() }}
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/mq-bridge-py-basic/
+          skip-existing: true
 
   update-homebrew-tap:
     name: Update Homebrew tap
@@ -1246,7 +1271,7 @@ jobs:
 
       - name: Package artifacts
         run: |
-          cp apps/mq-bridge-app/LICENSE apps/mq-bridge-app/README.md staging/
+          cp apps/mq-bridge-app/LICENSE apps/mq-bridge-app/README.md apps/mq-bridge-app/crates/core/THIRD_PARTY_LICENSES.txt staging/
           tar -czf mq-bridge-cli-aarch64-unknown-linux-gnu.tar.gz -C staging .
 
       - name: Upload Release Asset

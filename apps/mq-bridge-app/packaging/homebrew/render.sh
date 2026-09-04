@@ -73,6 +73,7 @@ class MqBridgeApp < Formula
     # that forwards to it.
     bin.install "mq-bridge-app"
     bin.install "mqb"
+    pkgshare.install "LICENSE", "THIRD_PARTY_LICENSES.txt"
   end
 
   test do

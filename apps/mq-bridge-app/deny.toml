@@ -62,9 +62,13 @@ version = 2
 # actual --all-features tree, not copied from a template: add a license only
 # after confirming which dependency needs it.
 #
-# There is no copyleft obligation in the tree today. `r-efi` is the only crate
-# offering an (L)GPL option and it is one arm of `MIT OR Apache-2.0 OR
-# LGPL-2.1-or-later`, so a permissive arm is always selectable.
+# MPL-2.0 is file-level copyleft. It reaches the desktop bundle via
+# cssparser/cssparser-macros/selectors/dtoa-short and the CLI via option-ext
+# (shellexpand -> dirs -> dirs-sys), so both distributions carry the obligation.
+# The distributed third-party notice identifies the covered crates and where
+# recipients can obtain their corresponding source.
+# `r-efi` also offers LGPL, but it is one arm of `MIT OR Apache-2.0 OR
+# LGPL-2.1-or-later`, so a permissive arm is selectable.
 allow = [
     "MIT",
     "MIT-0",
@@ -81,7 +85,7 @@ allow = [
     "BSL-1.0",
     "0BSD",                  # adler2 (as one arm of an OR)
     "Unlicense",             # win_uds; also one arm of aho-corasick / memchr / byteorder
-    "MPL-2.0",               # cssparser/selectors in the Tauri desktop dependency tree
+    "MPL-2.0",               # see the note above: desktop and CLI both carry it
 ]
 confidence-threshold = 0.8
 # Per-crate license clarifications go here if a crate's license can't be detected.

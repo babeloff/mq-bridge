@@ -83,6 +83,7 @@ about:
   license: MIT
   license_file:
     - apps/mq-bridge-app/LICENSE
+    - apps/mq-bridge-app/crates/core/THIRD_PARTY_LICENSES.txt
     - THIRDPARTY.yml
 
 extra:
