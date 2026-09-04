@@ -16,6 +16,33 @@ lint_features := "lint-all"
 _default:
     @just --list
 
+# Fail early, with instructions, for the recipes that need a protoc the build
+# does not supply itself.
+#
+# The engine's own `grpc` needs none: `full` and `lint-all` include
+# `vendored-protoc`, which hands its build script a prebuilt binary. Two things
+# are not covered by that. The app workspace depends on `pulsar`, whose build
+# script calls protoc and vendors nothing — `std::env::set_var("PROTOC", …)` in
+# the engine's build script sets it only in that process, not in a sibling's.
+# And `full-dynamic` deliberately drops `vendored-protoc`, because a distro or
+# conda-forge build has to compile against the protobuf it packages.
+_require-protoc:
+    #!/usr/bin/env bash
+    if [ -n "${PROTOC:-}" ] && [ -x "${PROTOC:-}" ]; then exit 0; fi
+    if command -v protoc >/dev/null 2>&1; then exit 0; fi
+    cat >&2 <<'EOF'
+    error: protoc not found, and this target does not vendor one.
+
+      Fedora        sudo dnf install protobuf-compiler
+      Debian        sudo apt-get install protobuf-compiler
+      macOS         brew install protobuf
+      conda-forge   <env>/bin/protoc, from the libprotobuf package
+      Windows       choco install protoc
+
+    Or point $PROTOC at a binary you already have.
+    EOF
+    exit 1
+
 # --- Gates --------------------------------------------------------------------
 
 [doc('Everything ci.yml gates a PR on, bar the Docker suites')]
@@ -152,7 +179,7 @@ build-static-ibm-mq:
 # libclang, for the bindgen-generated SQLite bindings.
 [doc('Link librdkafka and libsqlite from the environment')]
 [group('build')]
-build-dynamic:
+build-dynamic: _require-protoc
     cargo build --release --features full-dynamic
 
 [doc('Check the environment can satisfy build-dynamic')]
@@ -191,17 +218,17 @@ app-ci: app-check app-lint app-test
 
 [doc('cargo check the app crates')]
 [group('app')]
-app-check:
+app-check: _require-protoc
     cd apps/mq-bridge-app && cargo check -p mq-bridge-app-core -p mq-bridge-app --all-targets
 
 [doc('Clippy the app crates, warnings denied')]
 [group('app')]
-app-lint:
+app-lint: _require-protoc
     cd apps/mq-bridge-app && cargo clippy -p mq-bridge-app-core -p mq-bridge-app --all-targets -- -D warnings
 
 [doc('Unit and bin tests for the app crates')]
 [group('app')]
-app-test:
+app-test: _require-protoc
     cd apps/mq-bridge-app && cargo test -p mq-bridge-app-core -p mq-bridge-app --lib --bins
 
 # Reaches the engine's `link-dynamic` through the passthroughs in crates/core
@@ -209,7 +236,7 @@ app-test:
 # would otherwise be on too and collide with it.
 [doc('The app, linked against the environment libraries')]
 [group('app')]
-app-build-dynamic:
+app-build-dynamic: _require-protoc
     cd apps/mq-bridge-app && cargo build --release -p mq-bridge-app \
         --no-default-features --features full-dynamic
 
