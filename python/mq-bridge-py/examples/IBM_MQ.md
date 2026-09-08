@@ -182,7 +182,7 @@ fixtures, not redistributed IBM software.
 ## Other ways in
 
 - **`mq-bridge-app`** — the endpoint is compiled into any build made with
-  `full`, `full-dynamic` or `full-static-ibm-mq`, and routes are declared in
+  `full` or `full-dynamic`, and routes are declared in
   YAML rather than in code. See
   [`IBM_MQ_SETUP.md`](../../../apps/mq-bridge-app/dev/docs/IBM_MQ_SETUP.md) for
   the install, the `/features` check and `mqb copy` one-off drains.
@@ -192,6 +192,12 @@ fixtures, not redistributed IBM software.
   `link-dynamic` companion: those two select how librdkafka and SQLite are
   obtained, and IBM MQ is not part of that choice. Enabling `ibm-mq` alongside
   `ibm-mq-static` forces the link-time path.
+
+  `ibm-mq-static` is a deliberate individual opt-in and is in **no** `full*`
+  feature set, because binding IBM's client at link time is not something a
+  general-purpose build may do under IBM's licence terms. Enable it only if you
+  have accepted those terms for your own build, and see
+  [Redistribution](#redistribution).
 
   On `ibm-mq-static`, `build.rs` adds `$MQ_INSTALLATION_PATH/lib64` (or `lib` on
   32-bit) to the link search path and records it as an rpath, so the binary

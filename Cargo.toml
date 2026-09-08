@@ -281,14 +281,12 @@ middleware = ["metrics", "dedup", "compression", "encryption", "filter"]
 # on ~19% of 17-significant-digit doubles (e.g. a Postgres `double precision` value
 # moved through a JSON payload). Enable if bit-exact float round-tripping matters.
 float-roundtrip = ["serde_json/float_roundtrip"]
-# --- The three build variants -------------------------------------------------
+# --- The two build variants ---------------------------------------------------
 #
 # Only two endpoints link a C library whose provenance is a choice — kafka
-# (librdkafka) and sqlx (SQLite) — plus IBM MQ, whose client is always a shared
-# object and differs only in *when* it is resolved. That gives three variants:
+# (librdkafka) and sqlx (SQLite). That gives two variants:
 #
 #   full                  self-contained C libs; IBM MQ via runtime dlopen
-#   full-static-ibm-mq    as above, but libmqm_r bound at link time
 #   full-dynamic          librdkafka + libsqlite linked from the environment
 #
 # `full` is the default and stays self-contained, so `cargo add mq-bridge
@@ -297,19 +295,21 @@ float-roundtrip = ["serde_json/float_roundtrip"]
 # link the system copies; it also drops the vendored protoc, which those builds
 # are not allowed to use.
 #
+# Neither includes `ibm-mq-static`. IBM MQ reaches both only through `ibm-mq`,
+# the dlopen path, which links no IBM code and needs no SDK. Binding the client
+# at link time is not something a general-purpose feature set may do under IBM's
+# licence, so there is deliberately no `full-*` set that does it; `ibm-mq-static`
+# remains available as an explicit, individual opt-in for whoever has accepted
+# those terms.
+#
 # Every endpoint, with the linkage left out. Not meant to be enabled on its
-# own; it exists so the three variant lists below cannot drift apart.
+# own; it exists so the variant lists below cannot drift apart.
 full-common = ["middleware", "plugin", "mongodb", "kafka", "amqp", "nats", "mqtt", "http", "aws", "zeromq", "zeromq-omq", "redis-streams", "sled", "grpc", "sqlx", "clickhouse", "websocket", "postgres-cdc", "object-store", "rustls-aws-lc"]
 
 # ibm-mq (dlopen) is safe to include: it needs no IBM SDK at build, and at
 # runtime the client is loaded lazily only when an ibm-mq endpoint is opened
 # (clear error if the client isn't installed).
 full = ["full-common", "ibm-mq", "link-static", "vendored-protoc"]
-# Same, but libmqm_r becomes a link-time dependency, so the IBM MQ client must
-# be present at BUILD time and the binary will not start without it installed.
-# See python/mq-bridge-py/examples/IBM_MQ.md, and
-# apps/mq-bridge-app/dev/docs/IBM_MQ_SETUP.md for the app.
-full-static-ibm-mq = ["full-common", "ibm-mq-static", "link-static", "vendored-protoc"]
 # librdkafka and libsqlite come from the environment via pkg-config, and protoc
 # from $PROTOC or PATH — nothing prebuilt, nothing vendored.
 full-dynamic = ["full-common", "ibm-mq", "link-dynamic"]

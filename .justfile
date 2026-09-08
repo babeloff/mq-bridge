@@ -244,14 +244,6 @@ integration-certs:
 build-static:
     cargo build --release --features full
 
-# libmqm_r is bound at link time, so the IBM MQ client must be present at BUILD
-# time (MQ_INSTALLATION_PATH, default /opt/mqm) and the binary will not start
-# without it. See python/mq-bridge-py/examples/IBM_MQ.md.
-[doc('Self-contained, but libmqm_r bound at link time')]
-[group('build')]
-build-static-ibm-mq:
-    cargo build --release --features full-static-ibm-mq
-
 # Links librdkafka >= 2.12.1 and libsqlite3 >= 3.34.1 from the environment via
 # pkg-config. What a conda-forge recipe or a distro package wants, so the
 # shared libraries stay patchable.
