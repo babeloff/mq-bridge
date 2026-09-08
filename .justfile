@@ -43,6 +43,56 @@ _require-protoc:
     EOF
     exit 1
 
+# Fail early for `build-dynamic`, which needs bindgen.
+#
+# `sqlite-unbundled` resolves to libsqlite3-sys/buildtime_bindgen, and bindgen
+# dlopens libclang at build time. `link-static` does not: it compiles the
+# SQLite amalgamation, whose bindings are pre-generated. So this is a cost of
+# the dynamic variant alone, and one the librdkafka/libsqlite provider does not
+# necessarily also supply.
+#
+# clang-sys, which is how bindgen loads it, checks $LIBCLANG_PATH first and
+# then a set of standard directories.
+_require-libclang:
+    #!/usr/bin/env bash
+    shopt -s nullglob
+    # Each candidate is tested with -e, NOT by counting glob matches: nullglob
+    # only drops patterns that contain metacharacters, so a literal
+    # `libclang.dylib` survives even when the file does not exist and would
+    # make every directory look like a hit.
+    holds_libclang() {
+        local file
+        for file in "$1"/libclang.so* "$1"/libclang.dylib "$1"/libclang*.dll; do
+            [ -e "$file" ] && return 0
+        done
+        return 1
+    }
+    if [ -n "${LIBCLANG_PATH:-}" ]; then
+        holds_libclang "$LIBCLANG_PATH" && exit 0
+        echo "error: \$LIBCLANG_PATH=$LIBCLANG_PATH contains no libclang." >&2
+        exit 1
+    fi
+    for dir in /usr/lib64 /usr/lib /usr/lib/x86_64-linux-gnu /usr/local/lib \
+               /usr/lib/llvm*/lib /opt/homebrew/opt/llvm/lib /usr/local/opt/llvm/lib; do
+        holds_libclang "$dir" && exit 0
+    done
+    if command -v llvm-config >/dev/null 2>&1; then
+        holds_libclang "$(llvm-config --libdir)" && exit 0
+    fi
+    cat >&2 <<'EOF'
+    error: libclang not found, and `full-dynamic` needs it — sqlite-unbundled
+           generates its bindings with bindgen, which dlopens libclang.
+
+      Fedora        sudo dnf install clang-devel
+      Debian        sudo apt-get install libclang-dev
+      macOS         brew install llvm
+      pixi          pixi global install libclang
+      conda-forge   the libclang package
+
+    Or set $LIBCLANG_PATH to the directory holding libclang.so.
+    EOF
+    exit 1
+
 # Check that the recipes compiling pyo3 have an interpreter to compile against.
 #
 # Only the chain those recipes actually leave pyo3: $PYO3_PYTHON, then
@@ -203,19 +253,74 @@ build-static-ibm-mq:
     cargo build --release --features full-static-ibm-mq
 
 # Links librdkafka >= 2.12.1 and libsqlite3 >= 3.34.1 from the environment via
-# pkg-config, and takes protoc from $PROTOC or PATH. What a conda-forge recipe
-# or a distro package wants, so the shared libraries stay patchable. Also needs
-# libclang, for the bindgen-generated SQLite bindings.
+# pkg-config. What a conda-forge recipe or a distro package wants, so the
+# shared libraries stay patchable.
+#
+# Three prerequisites, from three different places, which is why this recipe is
+# more than a cargo line:
+#
+#   librdkafka + libsqlite3   pkg-config. A distro's librdkafka-dev +
+#                             libsqlite3-dev, or `pixi global install
+#                             librdkafka libsqlite`.
+#   protoc                    $PROTOC or PATH — `full-dynamic` drops
+#                             `vendored-protoc` on purpose.
+#   libclang                  bindgen, for the SQLite bindings that
+#                             `sqlite-unbundled` generates.
+#
+# The rpath is derived from pkg-config rather than hard-coded, because the
+# shared libraries generally live somewhere the loader does not search by
+# default — a conda prefix, a Conan package cache — and a binary linked here
+# would not start without it. rustc does not read LDFLAGS, hence RUSTFLAGS.
+# Appended, so an ambient RUSTFLAGS survives.
+#
+# Verified on linux-64: readelf on the resulting test binary shows
+# librdkafka.so.1 and libsqlite3.so in DT_NEEDED, a RUNPATH covering both, and
+# 180 rd_kafka* / 90 sqlite3_* symbols imported rather than compiled in.
 [doc('Link librdkafka and libsqlite from the environment')]
 [group('build')]
-build-dynamic: _require-protoc
+build-dynamic: _require-protoc _require-libclang
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if ! pkg-config --exists rdkafka sqlite3; then
+        echo "error: rdkafka and/or sqlite3 not on PKG_CONFIG_PATH." >&2
+        echo "       'just check-native-deps' reports what is missing." >&2
+        exit 1
+    fi
+    for dir in $(pkg-config --libs-only-L rdkafka sqlite3 | tr ' ' '\n' | sed -n 's/^-L//p' | sort -u); do
+        RUSTFLAGS="${RUSTFLAGS:-} -C link-arg=-Wl,-rpath,$dir"
+    done
+    export RUSTFLAGS
     cargo build --release --features full-dynamic
 
+# Reports rather than fails on the first problem, so it is usable as a
+# diagnosis of a broken build-dynamic. Exits non-zero if anything is missing.
 [doc('Check the environment can satisfy build-dynamic')]
 [group('build')]
 check-native-deps:
-    pkg-config --modversion rdkafka sqlite3
-    protoc --version
+    #!/usr/bin/env bash
+    missing=0
+    for probe in "rdkafka >= 2.12.1" "sqlite3 >= 3.34.1"; do
+        name="${probe%% *}"
+        if version=$(pkg-config --modversion "$name" 2>/dev/null); then
+            printf '  %-12s %s\n' "$name" "$version"
+            pkg-config "$probe" || { echo "    ^ too old, need '$probe'"; missing=1; }
+        else
+            printf '  %-12s MISSING\n' "$name"; missing=1
+        fi
+    done
+    if command -v protoc >/dev/null 2>&1; then
+        printf '  %-12s %s\n' protoc "$(protoc --version)"
+    elif [ -n "${PROTOC:-}" ] && [ -x "${PROTOC}" ]; then
+        printf '  %-12s %s\n' protoc "$("$PROTOC" --version) (\$PROTOC)"
+    else
+        printf '  %-12s MISSING\n' protoc; missing=1
+    fi
+    if just _require-libclang >/dev/null 2>&1; then
+        printf '  %-12s found\n' libclang
+    else
+        printf '  %-12s MISSING\n' libclang; missing=1
+    fi
+    exit $missing
 
 # --- Python bindings ----------------------------------------------------------
 #
