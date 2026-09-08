@@ -207,15 +207,27 @@ aws-config = { version = "1.10", optional = true, default-features = false, feat
 aws-sdk-sqs = { version = "1.105", optional = true, default-features = false, features = ["rt-tokio", "default-https-client"] }
 aws-sdk-sns = { version = "1.107", optional = true, default-features = false, features = ["rt-tokio", "default-https-client"] }
 
-# SQLx. The SQLite driver is NOT selected here: sqlx's `sqlite-bundled` and
-# `sqlite-unbundled` are mutually exclusive (they hand libsqlite3-sys two
-# conflicting build strategies), so cargo's additive features cannot carry both.
-# `link-static` / `link-dynamic` below pick exactly one, which is why one of
-# them is mandatory whenever `sqlx` is enabled.
-# Note both drop `sqlite-deserialize` / `sqlite-load-extension` /
-# `sqlite-unlock-notify`, which the plain `sqlite` alias enabled and the crate
-# does not use.
-sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "mysql", "any"], optional = true }
+# SQLx. `sqlite-bundled` is chosen here, and deliberately NOT left to
+# `link-static` / `link-dynamic`.
+#
+# Those two exist for librdkafka, whose provenance is a genuine packaging
+# choice: a distro or conda-forge build has to link the copy it ships so a
+# security fix reaches this crate through a rebuild. SQLite is not in that
+# position — it is a single-file amalgamation that costs seconds to compile and
+# has no separate shared-library story worth honouring — so it got dragged into
+# the pair only because sqlx happens to spell its two build strategies as a
+# mutually exclusive feature pair too.
+#
+# Coupling them made `--features sqlx` uncompilable on its own, which broke
+# every path that enables sqlx or postgres-cdc without naming a linkage: the
+# app's `bench` / `bench-cdc`, the core crate's passthroughs, both bindings'
+# `sqlx`, and the `sqlite_test` invocation in tests/README.md. It also forced
+# Postgres/MySQL-only users to supply a SQLite they never call.
+#
+# `sqlite-bundled` rather than the plain `sqlite` alias: the alias also enables
+# `sqlite-deserialize` / `sqlite-load-extension` / `sqlite-unlock-notify`,
+# which this crate does not use.
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "mysql", "any", "sqlite-bundled"], optional = true }
 
 # ClickHouse — talks the ClickHouse HTTP interface directly (JSONEachRow in/out).
 # reqwest is used rather than the typed `clickhouse` crate because that crate is
@@ -286,14 +298,18 @@ middleware = ["metrics", "dedup", "compression", "encryption", "filter"]
 float-roundtrip = ["serde_json/float_roundtrip"]
 # --- The two build variants ---------------------------------------------------
 #
-# Only two endpoints link a C library whose provenance is a choice — kafka
-# (librdkafka) and sqlx (SQLite). That gives two variants:
+# One endpoint links a C library whose provenance is a genuine packaging
+# choice: kafka (librdkafka), which a distro or conda-forge build has to take
+# from the copy it ships so a security fix arrives through a rebuild. That
+# gives two variants:
 #
-#   full                  self-contained C libs; IBM MQ via runtime dlopen
-#   full-dynamic          librdkafka + libsqlite linked from the environment
+#   full                  self-contained librdkafka; IBM MQ via runtime dlopen
+#   full-dynamic          librdkafka linked from the environment
 #
-# `full` is the default and stays self-contained, so `cargo add mq-bridge
-# --features full` needs no system librdkafka, libsqlite or protoc.
+# SQLite is deliberately NOT in this choice — it is bundled either way; see the
+# sqlx dependency above for why. `full` is the default and stays
+# self-contained, so `cargo add mq-bridge --features full` needs no system
+# librdkafka or protoc.
 # `full-dynamic` is for conda-forge packaging and for distro builds that must
 # link the system copies; it also drops the vendored protoc, which those builds
 # are not allowed to use.
@@ -313,8 +329,8 @@ full-common = ["middleware", "plugin", "mongodb", "kafka", "amqp", "nats", "mqtt
 # runtime the client is loaded lazily only when an ibm-mq endpoint is opened
 # (clear error if the client isn't installed).
 full = ["full-common", "ibm-mq", "link-static", "vendored-protoc"]
-# librdkafka and libsqlite come from the environment via pkg-config, and protoc
-# from $PROTOC or PATH — nothing prebuilt, nothing vendored.
+# librdkafka comes from the environment via pkg-config, and protoc from
+# $PROTOC or PATH — nothing prebuilt, nothing vendored.
 full-dynamic = ["full-common", "ibm-mq", "link-dynamic"]
 
 # Everything clippy and rustdoc should see, for CI. `--all-features` cannot be
@@ -345,13 +361,15 @@ lint-all = ["full", "test-utils", "schema", "plugin-sdk", "perf-diagnostics", "f
 # CMakeLists still compiles the OAUTHBEARER OIDC code that includes
 # <curl/curl.h> even under `-DWITH_CURL=0`, whereas its configure script (what
 # rdkafka-sys uses by default) probes for curl and disables the feature.
-link-static = ["rdkafka?/libz-static", "sqlx?/sqlite-bundled"]
-# Links a shared librdkafka >= 2.12.1 and libsqlite3 >= 3.34.1 found through
-# pkg-config — a distro's `librdkafka-dev` + `libsqlite3-dev`, or conda-forge's
-# `librdkafka` + `libsqlite`. No zlib feature here: the shared librdkafka already has zlib,
-# zstd, lz4, OpenSSL and SASL linked in (see its .pc `Libs.private`). The SQLite
-# bindings are generated by bindgen, so this variant also needs libclang.
-link-dynamic = ["rdkafka?/dynamic-linking", "sqlx?/sqlite-unbundled"]
+link-static = ["rdkafka?/libz-static"]
+# Links a shared librdkafka >= 2.12.1 found through pkg-config — a distro's
+# `librdkafka-dev`, or conda-forge's `librdkafka`. No zlib feature here: the
+# shared librdkafka already has zlib, zstd, lz4, OpenSSL and SASL linked in
+# (see its .pc `Libs.private`).
+#
+# SQLite is not part of this choice; see the sqlx dependency above. That also
+# means this variant needs no libclang: nothing here runs bindgen.
+link-dynamic = ["rdkafka?/dynamic-linking"]
 
 # The third C dependency whose provenance is a choice, kept separate from the
 # two above because it is a build-time *tool* rather than something linked, and
@@ -414,8 +432,8 @@ rustls-aws-lc  = ["rustls/aws_lc_rs",  "rustls/prefer-post-quantum", "tokio-rust
 # Generate Schema file
 schema = ["dep:schemars"]
 
-# Endpoint features. These decide which code compiles; how librdkafka and
-# SQLite are obtained is the separate `link-static` / `link-dynamic` choice.
+# Endpoint features. These decide which code compiles; how librdkafka is
+# obtained is the separate `link-static` / `link-dynamic` choice.
 # Without `link-static` or `link-dynamic` alongside it this builds librdkafka
 # from rdkafka-sys' bundled source with no zlib, so gzip-compressed topics are
 # unavailable — `libz-static` rides on `link-static`, and `link-dynamic` gets
@@ -452,8 +470,8 @@ redis-streams = ["dep:redis"]
 # does), or supply your own through $PROTOC or PATH. Enabling `grpc` on its own
 # therefore expects protoc to be installed.
 grpc = ["tonic", "tonic-reflection", "prost", "prost-types", "prost-reflect", "tokio-stream", "tonic-prost", "tonic-prost-build", "rustls"]
-# Needs `link-static` or `link-dynamic` alongside it to supply sqlx's SQLite
-# driver; src/lib.rs fails the build with an explanatory message otherwise.
+# Needs no linkage feature: SQLite is bundled by the sqlx dependency, so this
+# compiles on its own, as does `postgres-cdc`, which reaches it.
 sqlx = ["dep:sqlx", "url"]
 clickhouse = ["dep:reqwest", "dep:flate2", "dep:lz4_flex", "dep:zstd", "dep:percent-encoding", "url"]
 # Cloud object-store checkpoint backend (S3/GCS/Azure/R2). Talks cloud REST via reqwest.
