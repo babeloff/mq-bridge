@@ -13,7 +13,7 @@ or archives are checked in, and the default build never needs them.
 Three audiences, and they need different things:
 
 - **Running `mq-bridge-app`** — the endpoint is already compiled into any build
-  made with `full`, `full-dynamic` or `full-static-ibm-mq`, so there is nothing
+  made with `full` or `full-dynamic`, so there is nothing
   to rebuild. Install the client, point the process at it, write a route. See
   [Using it from `mq-bridge-app`](#using-it-from-mq-bridge-app).
 - **Depending on the `mq-bridge` crate** — pick a feature, build an endpoint in
@@ -34,11 +34,17 @@ first.
 | IBM client needed to **run** | only if a route uses an IBM MQ endpoint | always, or the binary will not start |
 | How it is found | `dlopen` on first connect | `DT_NEEDED`, resolved by the loader at startup |
 | Missing client shows up as | a non-retryable error on that one route | the process failing to start |
-| In `full` | yes | no — use `full-static-ibm-mq` |
+| In `full` | yes | no — and in no other `full*` set either, see below |
 
 `ibm-mq` is in the `full` feature set precisely because it costs nothing: with
 no client installed the crate still builds, and only a route that actually opens
 an IBM MQ endpoint fails, and it fails fast rather than reconnecting forever.
+
+`ibm-mq-static` is in **no** `full*` set, and there is deliberately no feature
+set that bundles it: IBM's licence does not permit a general-purpose build to
+bind their client at link time. Enable it only as an explicit, individual
+opt-in, and only if you have accepted those terms for your own build. See
+[Redistribution](#redistribution).
 
 A note on the name: **`ibm-mq-static` does not statically link anything.**
 `libmqm_r` is a shared object either way — IBM ships no static archive. The
@@ -348,12 +354,11 @@ Only needed for `ibm-mq-static`; the dlopen build needs none of this.
 ```sh
 export MQ_INSTALLATION_PATH=/opt/mqm
 cargo build --features ibm-mq-static
-cargo build --features full-static-ibm-mq   # whole set, link-time IBM MQ
 ```
 
-With pixi: `pixi run build-static-ibm-mq`. The dlopen equivalents are
-`pixi run build-static` (`--features full`) and `pixi run build-dynamic`
-(`--features full-dynamic`).
+With pixi, the dlopen equivalents are `pixi run build-static`
+(`--features full`) and `pixi run build-dynamic` (`--features full-dynamic`).
+There is no pixi task for the link-time build, deliberately.
 
 `build.rs` adds `$MQ_INSTALLATION_PATH/lib64` (or `lib` on 32-bit) to the link
 search path and records it as an rpath, so the resulting binary finds

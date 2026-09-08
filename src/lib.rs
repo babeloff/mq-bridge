@@ -127,8 +127,8 @@ compile_error!(
 compile_error!(
     "the `sqlx` endpoint (also reached through `postgres-cdc`) needs a linkage feature: add \
      `link-static` to compile SQLite from source, or `link-dynamic` to link a shared \
-     libsqlite3 >= 3.34.1 via pkg-config (which also needs libclang for bindgen). The `full`, \
-     `full-static-ibm-mq` and `full-dynamic` feature sets already include one."
+     libsqlite3 >= 3.34.1 via pkg-config (which also needs libclang for bindgen). The `full` \
+     and `full-dynamic` feature sets already include one."
 );
 
 pub mod canonical_message;

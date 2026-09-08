@@ -29,7 +29,6 @@ crate compiles a vendored C library:
 | pixi task | Features | librdkafka / SQLite | IBM MQ |
 | --- | --- | --- | --- |
 | `build-static` | `full` | compiled in | dlopen at runtime |
-| `build-static-ibm-mq` | `full-static-ibm-mq` | compiled in | link-time, SDK at build |
 | `build-dynamic` | `full-dynamic` | from the environment | dlopen at runtime |
 
 `src/lib.rs` has `compile_error!` guards for both-enabled and for

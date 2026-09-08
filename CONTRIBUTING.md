@@ -26,12 +26,12 @@ has a Compose file per broker, so you don't have to install them natively.
 
 Only two endpoints link a C library whose provenance is a choice — `kafka`
 (librdkafka) and `sqlx` (SQLite) — plus IBM MQ, whose client is always a shared
-object and differs only in when it is resolved. That gives three build variants:
+object and is always resolved the same way, at runtime. That gives two build
+variants:
 
 | Task | Feature set | librdkafka / SQLite | IBM MQ client |
 | --- | --- | --- | --- |
 | `pixi run build-static` | `full` | compiled in | runtime `dlopen`, optional |
-| `pixi run build-static-ibm-mq` | `full-static-ibm-mq` | compiled in | bound at link time, required at build |
 | `pixi run build-dynamic` | `full-dynamic` | linked from the environment | runtime `dlopen`, optional |
 
 The linkage is chosen by the `link-static` / `link-dynamic` cargo features,

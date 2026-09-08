@@ -168,13 +168,6 @@ description = "Build every endpoint and middleware"
 cmd = "cargo build --release --features full"
 description = "Self-contained C libs; IBM MQ resolved at runtime via dlopen"
 
-# As build-static, but libmqm_r is bound at link time. Requires the IBM MQ
-# client at BUILD time (MQ_INSTALLATION_PATH, default /opt/mqm) and the binary
-# will not start without it installed. See docs/IBM_MQ.md.
-[tasks.build-static-ibm-mq]
-cmd = "cargo build --release --features full-static-ibm-mq"
-description = "Self-contained C libs; libmqm_r bound at link time (needs the IBM MQ client at build)"
-
 # Links this environment's librdkafka and libsqlite. What a conda-forge recipe
 # or a distro package wants, so the shared libraries stay patchable.
 [tasks.build-dynamic]

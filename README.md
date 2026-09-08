@@ -63,7 +63,6 @@ Three release variants differ only in where their C libraries come from:
 | Task | Feature set | librdkafka / SQLite | IBM MQ client |
 | :--- | :--- | :--- | :--- |
 | `pixi run build-static` | `full` | compiled in | runtime `dlopen`, optional |
-| `pixi run build-static-ibm-mq` | `full-static-ibm-mq` | compiled in | bound at link time, required |
 | `pixi run build-dynamic` | `full-dynamic` | linked from the environment | runtime `dlopen`, optional |
 
 `full` is the default and stays self-contained, so `cargo add mq-bridge

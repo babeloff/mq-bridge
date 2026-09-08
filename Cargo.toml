@@ -285,15 +285,17 @@ float-roundtrip = ["serde_json/float_roundtrip"]
 #
 # Only two endpoints link a C library whose provenance is a choice — kafka
 # (librdkafka) and sqlx (SQLite) — plus IBM MQ, whose client is always a shared
-# object and differs only in *when* it is resolved. That gives three variants,
-# each with a pixi task (see pixi.toml):
+# object and is always resolved the same way, at runtime. That gives two
+# variants, each with a pixi task (see pixi.toml):
 #
 #   full                  pixi run build-static          self-contained C libs,
 #                                                        IBM MQ via runtime dlopen
-#   full-static-ibm-mq    pixi run build-static-ibm-mq   as above, but libmqm_r
-#                                                        bound at link time
 #   full-dynamic          pixi run build-dynamic         librdkafka + libsqlite
 #                                                        from the environment
+#
+# No `full*` set binds IBM's client at link time: IBM's licence does not permit
+# a general-purpose build to do that. `ibm-mq-static` remains as an explicit,
+# individual opt-in for whoever has accepted those terms.
 #
 # `full` is the default and stays self-contained, so `cargo add mq-bridge
 # --features full` needs no system librdkafka/libsqlite (protoc is still
@@ -301,17 +303,13 @@ float-roundtrip = ["serde_json/float_roundtrip"]
 # distro builds that must link the system copies.
 #
 # Every endpoint, with the linkage left out. Not meant to be enabled on its
-# own; it exists so the three variant lists below cannot drift apart.
+# own; it exists so the variant lists below cannot drift apart.
 full-common = ["middleware", "plugin", "mongodb", "kafka", "amqp", "nats", "mqtt", "http", "aws", "zeromq", "zeromq-omq", "redis-streams", "sled", "grpc", "sqlx", "clickhouse", "websocket", "postgres-cdc", "object-store", "rustls-aws-lc"]
 
 # ibm-mq (dlopen) is safe to include: it needs no IBM SDK at build, and at
 # runtime the client is loaded lazily only when an ibm-mq endpoint is opened
 # (clear error if the client isn't installed).
 full = ["full-common", "ibm-mq", "link-static"]
-# Same, but libmqm_r becomes a link-time dependency, so the IBM MQ client must
-# be present at BUILD time and the binary will not start without it installed.
-# See docs/IBM_MQ.md.
-full-static-ibm-mq = ["full-common", "ibm-mq-static", "link-static"]
 # librdkafka and libsqlite come from the environment via pkg-config.
 full-dynamic = ["full-common", "ibm-mq", "link-dynamic"]
 
