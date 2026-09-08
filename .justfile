@@ -234,8 +234,9 @@ integration-certs:
 
 # --- Build variants -----------------------------------------------------------
 #
-# Three ways to obtain the C libraries; see "The three build variants" in
-# Cargo.toml. They differ only in librdkafka, libsqlite and libmqm_r.
+# Two ways to obtain the C libraries; see "The two build variants" in
+# Cargo.toml. They differ only in librdkafka and libsqlite — IBM MQ reaches
+# both the same way, via runtime dlopen.
 
 # librdkafka and SQLite compiled from bundled sources, protoc from the vendored
 # binary, IBM MQ resolved at runtime via dlopen. Needs nothing installed.
