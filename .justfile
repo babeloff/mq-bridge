@@ -13,6 +13,10 @@
 # with a compile_error!. See the `lint-all` comment in Cargo.toml.
 lint_features := "lint-all"
 
+# Where `just conan` writes the generated .pc files. Gitignored: they bake in
+# absolute paths into the Conan package cache, so they are per-machine.
+conan_dir := "build/conan"
+
 _default:
     @just --list
 
@@ -216,13 +220,44 @@ build-static:
 # default — a conda prefix, a Conan package cache — and a binary linked here
 # would not start without it. rustc does not read LDFLAGS, hence RUSTFLAGS.
 # Appended, so an ambient RUSTFLAGS survives.
+# Provision the one shared library `build-dynamic` links, from conan-center,
+# for a machine that does not have it. conanfile.txt carries the version and
+# the reasoning; PkgConfigDeps writes the rdkafka.pc that rdkafka-sys probes
+# for.
+#
+# Only librdkafka: SQLite is bundled by the sqlx dependency, so this no longer
+# provisions sqlite3 — and with no bindgen in the tree there is no libclang to
+# provide either. `just check-native-deps` reports what is still missing.
+#
+# Not needed if the environment already has it — a distro's librdkafka-dev, or
+# `pixi global install librdkafka`.
+[doc('Install librdkafka via Conan for build-dynamic')]
+[group('build')]
+conan:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    command -v conan >/dev/null 2>&1 || {
+        echo "error: conan not found. 'pixi global install conan', 'pipx install conan'," >&2
+        echo "       or see https://conan.io/downloads." >&2
+        exit 1
+    }
+    # A profile is per-machine and not committed; create one on first run
+    # rather than failing with conan's own "no default profile" error.
+    conan profile detect --exist-ok >/dev/null 2>&1 || true
+    conan install . --output-folder="{{ conan_dir }}" --build=missing
+
 [doc('Link librdkafka from the environment')]
 [group('build')]
 build-dynamic: _require-protoc
     #!/usr/bin/env bash
     set -euo pipefail
+    # Only prepended when it exists, so an environment that already provides
+    # librdkafka — a distro, or `pixi global install` — still wins.
+    if [ -f "{{ conan_dir }}/rdkafka.pc" ]; then
+        export PKG_CONFIG_PATH="{{ justfile_directory() }}/{{ conan_dir }}${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+    fi
     if ! pkg-config --exists rdkafka; then
-        echo "error: rdkafka not on PKG_CONFIG_PATH." >&2
+        echo "error: rdkafka not on PKG_CONFIG_PATH. Run 'just conan', or install it;" >&2
         echo "       'just check-native-deps' reports what is missing." >&2
         exit 1
     fi
@@ -248,6 +283,10 @@ build-dynamic: _require-protoc
 [group('build')]
 check-native-deps:
     #!/usr/bin/env bash
+    if [ -f "{{ conan_dir }}/rdkafka.pc" ]; then
+        export PKG_CONFIG_PATH="{{ justfile_directory() }}/{{ conan_dir }}${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+        echo "  (using the Conan output in {{ conan_dir }})"
+    fi
     missing=0
     advice=()
     say() { advice+=("$@"); }
