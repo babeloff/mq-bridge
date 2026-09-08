@@ -18,9 +18,13 @@ if (unknownFlags.length > 0 || positional.length > 1 || (checkOnly && positional
   process.exit(2);
 }
 
+// pixi.lock is deliberately absent: it carries no workspace version. Its
+// top-level `version: 7` is the lockfile *format* number and must not be
+// rewritten.
 const paths = {
   rootCargo: resolve(repoRoot, "Cargo.toml"),
   rootLock: resolve(repoRoot, "Cargo.lock"),
+  pixi: resolve(repoRoot, "pixi.toml"),
   appCargo: resolve(repoRoot, "apps/mq-bridge-app/Cargo.toml"),
   appLock: resolve(repoRoot, "apps/mq-bridge-app/Cargo.lock"),
   server: resolve(repoRoot, "apps/mq-bridge-app/server.json"),
@@ -64,6 +68,15 @@ replaceOnce(
   /(\[workspace\.package\][\s\S]*?(?:^|\n)\s*version\s*=\s*")[^"]+("\s*$)/m,
   `$1${version}$2`,
   "root workspace version",
+);
+// pixi's own key is [workspace] version, not [workspace.package] — and it is
+// the only `version = "..."` in the file, since conda dependencies are written
+// as `name = ">=x"`.
+replaceOnce(
+  paths.pixi,
+  /(\[workspace\][\s\S]*?(?:^|\n)\s*version\s*=\s*")[^"]+("\s*$)/m,
+  `$1${version}$2`,
+  "pixi workspace version",
 );
 replaceOnce(
   paths.appCargo,

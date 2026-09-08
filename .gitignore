@@ -40,6 +40,10 @@ tests/**/*.pkcs12
 .serena
 .tokensave
 
+# pixi environments. pixi.lock IS tracked — it is what makes the conda-forge
+# native dependencies (librdkafka, libsqlite, libzmq, protoc) reproducible.
+.pixi/
+
 # Python packaging / local dev
 **/__pycache__/
 *.py[cod]

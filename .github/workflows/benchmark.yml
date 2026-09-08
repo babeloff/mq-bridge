@@ -24,8 +24,15 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      # Rust toolchain plus the native libraries `--features full` links
+      # (librdkafka, libsqlite, protoc). The shard jobs below restore the same
+      # environment so the prebuilt binary's recorded rpath resolves.
+      - name: Set up pixi environment
+        uses: prefix-dev/setup-pixi@v0.9.0
+        with:
+          environments: default
+          activate-environment: true
+          cache: true
 
       - name: Cache cargo build
         uses: Swatinem/rust-cache@v2
@@ -63,6 +70,16 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
+
+      # performance_bench_bin is dynamically linked against librdkafka and
+      # libsqlite in the pixi environment, with the rpath recorded at build
+      # time. Restore the environment or the binary will not start.
+      - name: Set up pixi environment
+        uses: prefix-dev/setup-pixi@v0.9.0
+        with:
+          environments: default
+          activate-environment: true
+          cache: true
 
       - name: Download bench binary
         uses: actions/download-artifact@v8
@@ -106,6 +123,16 @@ jobs:
         with:
           persist-credentials: false
 
+      # performance_bench_bin is dynamically linked against librdkafka and
+      # libsqlite in the pixi environment, with the rpath recorded at build
+      # time. Restore the environment or the binary will not start.
+      - name: Set up pixi environment
+        uses: prefix-dev/setup-pixi@v0.9.0
+        with:
+          environments: default
+          activate-environment: true
+          cache: true
+
       - name: Download bench binary
         uses: actions/download-artifact@v8
         with:
@@ -147,6 +174,16 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
+
+      # performance_bench_bin is dynamically linked against librdkafka and
+      # libsqlite in the pixi environment, with the rpath recorded at build
+      # time. Restore the environment or the binary will not start.
+      - name: Set up pixi environment
+        uses: prefix-dev/setup-pixi@v0.9.0
+        with:
+          environments: default
+          activate-environment: true
+          cache: true
 
       - name: Download bench binary
         uses: actions/download-artifact@v8

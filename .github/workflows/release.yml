@@ -324,12 +324,20 @@ jobs:
           # a release must be built from the tag it claims to be.
           ref: ${{ inputs.tag_name || github.ref }}
 
-      - name: Install Rust toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+      # Supplies the toolchain and the engine's native libraries (librdkafka,
+      # libsqlite, protoc), pinned by pixi.lock.
+      - name: Set up pixi environment
+        uses: prefix-dev/setup-pixi@v0.9.0
         with:
-          toolchain: stable
+          environments: default
+          activate-environment: true
+          cache: true
 
-      - name: Install system dependencies
+      # Still needed for the "Test mq-bridge-app" step below: apps/mq-bridge-app
+      # is a separate cargo workspace that is not part of the pixi workspace and
+      # still cmake-builds the bundled librdkafka from its own rdkafka
+      # dependency. The engine steps do not use any of these.
+      - name: Install system dependencies (app workspace only)
         run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config zlib1g-dev cmake libcurl4-openssl-dev protobuf-compiler
 
       # Not --all-targets: it selects the benches as well, and `cargo test` runs

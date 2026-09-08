@@ -9,6 +9,57 @@
 > from the enum definitions in `models.rs`; the reference records the behaviour and the
 > spelling traps too. Every snippet in it is parsed by `tests/reference_docs_test.rs`.
 
+## Build Environment
+
+The repository is a **pixi workspace** (`pixi.toml`, `pixi.lock`). It pins the Rust
+toolchain and every native library the feature-gated endpoints link, so no `-sys`
+crate compiles a vendored C library:
+
+| conda-forge package | Cargo wiring |
+| --- | --- |
+| `libprotobuf` | `$PROTOC` read by `build.rs` (was: `protoc-bin-vendored`) — every variant |
+| `librdkafka` | `rdkafka/dynamic-linking`, `link-dynamic` variant only |
+| `libsqlite` + `libclang` | `sqlx/sqlite-unbundled` + bindgen, `link-dynamic` only |
+| `zeromq` | libzmq peers for tests/benches; the endpoint itself is pure-Rust zmq.rs |
+
+**Three build variants**, chosen by the orthogonal `link-static` /
+`link-dynamic` features (they gate no code, so the ~65 `#[cfg(feature =
+"kafka")]` / `"sqlx"` sites are untouched by the choice):
+
+| pixi task | Features | librdkafka / SQLite | IBM MQ |
+| --- | --- | --- | --- |
+| `build-static` | `full` | compiled in | dlopen at runtime |
+| `build-dynamic` | `full-dynamic` | from the environment | dlopen at runtime |
+
+`src/lib.rs` has `compile_error!` guards for both-enabled and for
+`sqlx`-without-a-linkage. Consequently **CI lints with `--features lint-all`,
+not `--all-features`** (which would enable both). `full` deliberately stays
+self-contained — `apps/mq-bridge-app` forwards `mq-bridge/full` and builds
+without conda-forge libraries. IBM MQ details: [python/mq-bridge-py/examples/IBM_MQ.md](python/mq-bridge-py/examples/IBM_MQ.md).
+Do not enable rdkafka's `libz` (non-static): it makes libz-sys probe for a
+system zlib and emit `-L /usr/lib64`, which shadows conda's sysroot libc and
+breaks the link with undefined `__libc_csu_init`. Use `libz-static`.
+
+Use `pixi run <task>` or `pixi shell`; `pixi task list` enumerates the tasks
+(`build-full`, `test`, `clippy`, `check-features`, `verify-native-deps`, …).
+Environments: `default` (toolchain + libraries), `dev` (adds nextest, python +
+grpcio-tools, docker-compose), `native` (libraries only, for a build that brings
+its own rustup toolchain — the `beta` row of `test-matrix.yml`), `release`
+(nodejs, for the version tasks only).
+
+Version bumps go through `scripts/sync-version.mjs`, i.e.
+`pixi run -e release bump-version <VERSION>`. Root `Cargo.toml`
+`[workspace.package] version` is the source of truth and the script fans it out
+to `pixi.toml`, both Cargo manifest/lock pairs, `server.json`,
+`tauri.conf.json` and the Node package/lock. Never hand-edit one copy.
+`pixi.lock` holds no workspace version — its `version: 7` is the lockfile
+format number.
+
+CI uses `prefix-dev/setup-pixi` with `activate-environment`, so workflow steps
+keep calling plain `cargo`. `apps/mq-bridge-app` is a **separate** cargo
+workspace and is *not* covered by the pixi workspace — it still cmake-builds its
+own librdkafka, which is why `CMAKE_ARGS` stays in `.cargo/config.toml`.
+
 ## Project Overview
 
 `mq-bridge` is an asynchronous message bridging library for Rust that connects different messaging systems, data stores, and protocols. It acts as a **programmable integration layer**, allowing for transformation, filtering, handling, events, and complex routing.
