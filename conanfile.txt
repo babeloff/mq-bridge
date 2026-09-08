@@ -1,34 +1,34 @@
-# Native C libraries for the `link-dynamic` build variant, for development.
+# The native C library the `link-dynamic` build variant needs, for development.
 #
-# `just build-dynamic` (`--features full-dynamic`) links librdkafka and
-# libsqlite3 from the environment instead of compiling them from bundled
-# sources, and finds both through pkg-config. That is what a conda-forge or
-# distro package does; this file is how a developer gets the same thing on a
-# machine that has neither.
+# `just build-dynamic` (`--features full-dynamic`) links librdkafka from the
+# environment instead of compiling it from rdkafka-sys' bundled tree, and finds
+# it through pkg-config. That is what a conda-forge or distro package does;
+# this file is how a developer gets the same thing on a machine without it.
 #
-# `just conan` installs these and writes the .pc files; `just build-dynamic`
-# then puts them on PKG_CONFIG_PATH. Nothing else in the repository depends on
-# Conan — the default `full` build compiles its own copies and needs none of
+# `just conan` installs it and writes rdkafka.pc; `just build-dynamic` then
+# puts that on PKG_CONFIG_PATH. Nothing else in the repository depends on
+# Conan — the default `full` build compiles its own copy and needs none of
 # this.
 #
+# librdkafka only. SQLite used to be here too, because `link-dynamic` selected
+# sqlx's `sqlite-unbundled`; it no longer does — SQLite is bundled either way,
+# so there is nothing to provision, and with `sqlite-unbundled` went the only
+# bindgen in the tree, so there is no libclang to provide either.
+#
 # NOT what the packages link. conda-forge builds against conda-forge's
-# librdkafka and libsqlite, a distro against the distro's. This only has to
-# satisfy the same pkg-config probes locally.
+# librdkafka, a distro against the distro's. This only has to satisfy the same
+# pkg-config probe locally.
 
 [requires]
 # The exact version rdkafka-sys 4.10 probes for (`rdkafka >= 2.12.1`), and the
 # same one it would have compiled from its bundled tree — so the headers the
 # bindings are generated against match what the static variant uses.
 librdkafka/2.12.1
-# libsqlite3-sys' unbundled path requires min_sqlite_version_3_34_1; this is
-# far past it.
-sqlite3/3.53.4
 
 [options]
 # Shared, or there is nothing for `link-dynamic` to link against and the whole
 # point is lost.
 librdkafka/*:shared=True
-sqlite3/*:shared=True
 # librdkafka's own optional codecs and TLS. Kept on because a route that talks
 # to a real broker generally needs them, and because the static variant gets
 # gzip via `rdkafka/libz-static` — leaving zlib off here would make the two
@@ -38,6 +38,5 @@ librdkafka/*:with_zlib=True
 librdkafka/*:with_zstd=True
 
 [generators]
-# Writes rdkafka.pc / sqlite3.pc, which is the only interface rdkafka-sys and
-# libsqlite3-sys use to find these.
+# Writes rdkafka.pc, which is the only interface rdkafka-sys uses to find this.
 PkgConfigDeps
