@@ -232,30 +232,105 @@ build-dynamic: _require-protoc
     export RUSTFLAGS
     cargo build --release --features full-dynamic
 
-# Reports rather than fails on the first problem, so it is usable as a
-# diagnosis of a broken build-dynamic. Exits non-zero if anything is missing.
-[doc('Check the environment can satisfy build-dynamic')]
+# Reports every prerequisite rather than failing on the first, so it is usable
+# as a diagnosis of a broken `build-dynamic`, and tells you how to fix whatever
+# is missing. Exits non-zero if anything is.
+#
+# Advice is accumulated as one array element per output line rather than as
+# multi-line strings: a just recipe body has to stay indented, so a string
+# containing a column-0 line silently ends the recipe.
+#
+# Each remediation leads with `just build-static`, because `full` compiles its
+# own librdkafka and carries a prebuilt protoc — so wanting `full-dynamic` at
+# all is a packaging requirement, and someone who just wants a working build
+# should be told the shorter way out first.
+[doc('Check the environment can satisfy build-dynamic, and how to fix gaps')]
 [group('build')]
 check-native-deps:
     #!/usr/bin/env bash
     missing=0
+    advice=()
+    say() { advice+=("$@"); }
+
+    search_path() {
+        if [ -n "${PKG_CONFIG_LIBDIR:-}" ]; then
+            echo "PKG_CONFIG_LIBDIR=$PKG_CONFIG_LIBDIR (this replaces the built-in path)"
+        elif [ -n "${PKG_CONFIG_PATH:-}" ]; then
+            echo "PKG_CONFIG_PATH=$PKG_CONFIG_PATH, then pkg-config's built-in path"
+        else
+            echo "pkg-config's built-in path only (PKG_CONFIG_PATH is unset)"
+        fi
+    }
+
+    advise_rdkafka() {
+        say "librdkafka $1." ""
+        say "Only the dynamic variant needs it. If you do not specifically want" \
+            "dynamic linkage, build the self-contained variant instead — it" \
+            "compiles its own librdkafka and needs nothing installed:" \
+            "" "    just build-static" ""
+        say "To supply it anyway, any one of:" "" \
+            "    Fedora        sudo dnf install librdkafka-devel" \
+            "    Debian        sudo apt-get install librdkafka-dev" \
+            "    macOS         brew install librdkafka" \
+            "    pixi          pixi global install librdkafka" \
+            "    conda-forge   the librdkafka package" \
+            "    Conan         see the feature/conan-native-deps branch" ""
+        say "then make sure its rdkafka.pc is somewhere pkg-config looks:" "" \
+            "    export PKG_CONFIG_PATH=/path/to/lib/pkgconfig:\$PKG_CONFIG_PATH" "" \
+            "Currently searching: $(search_path)"
+    }
+
+    advise_protoc() {
+        say "protoc is not on PATH, and \$PROTOC is unset or not executable." ""
+        say "\`full-dynamic\` drops \`vendored-protoc\` deliberately, so the grpc" \
+            "build script needs a protoc from the environment:" "" \
+            "    Fedora        sudo dnf install protobuf-compiler" \
+            "    Debian        sudo apt-get install protobuf-compiler" \
+            "    macOS         brew install protobuf" \
+            "    pixi          pixi global install libprotobuf" \
+            "    conda-forge   the libprotobuf package" \
+            "    Windows       choco install protoc" ""
+        say "or point \$PROTOC at one you already have:" "" \
+            "    export PROTOC=/path/to/protoc" ""
+        say "Alternatively \`just build-static\` carries a prebuilt protoc through" \
+            "\`vendored-protoc\` and needs none installed."
+    }
+
     for probe in "rdkafka >= 2.12.1"; do
         name="${probe%% *}"
         if version=$(pkg-config --modversion "$name" 2>/dev/null); then
-            printf '  %-12s %s\n' "$name" "$version"
-            pkg-config "$probe" || { echo "    ^ too old, need '$probe'"; missing=1; }
+            if pkg-config "$probe"; then
+                printf '  %-10s %s\n' "$name" "$version"
+            else
+                printf '  %-10s %s   TOO OLD, need "%s"\n' "$name" "$version" "$probe"
+                advise_rdkafka "is $version, but rdkafka-sys probes for \"$probe\""
+                missing=1
+            fi
         else
-            printf '  %-12s MISSING\n' "$name"; missing=1
+            printf '  %-10s MISSING\n' "$name"
+            advise_rdkafka "was not found by pkg-config"
+            missing=1
         fi
     done
+
     if command -v protoc >/dev/null 2>&1; then
-        printf '  %-12s %s\n' protoc "$(protoc --version)"
+        printf '  %-10s %s\n' protoc "$(protoc --version)"
     elif [ -n "${PROTOC:-}" ] && [ -x "${PROTOC}" ]; then
-        printf '  %-12s %s\n' protoc "$("$PROTOC" --version) (\$PROTOC)"
+        printf '  %-10s %s (from $PROTOC)\n' protoc "$("$PROTOC" --version)"
     else
-        printf '  %-12s MISSING\n' protoc; missing=1
+        printf '  %-10s MISSING\n' protoc
+        advise_protoc
+        missing=1
     fi
-    exit $missing
+
+    if [ "$missing" -eq 0 ]; then
+        printf '\n  all prerequisites satisfied; `just build-dynamic` should work\n'
+        exit 0
+    fi
+
+    printf '\n  ── how to fix ──\n\n'
+    printf '  %s\n' "${advice[@]}"
+    exit 1
 
 # --- Python bindings ----------------------------------------------------------
 #
