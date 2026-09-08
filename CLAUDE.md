@@ -19,7 +19,6 @@ crate compiles a vendored C library:
 | --- | --- |
 | `libprotobuf` | `$PROTOC` read by `build.rs` (was: `protoc-bin-vendored`) — every variant |
 | `librdkafka` | `rdkafka/dynamic-linking`, `link-dynamic` variant only |
-| `libsqlite` + `libclang` | `sqlx/sqlite-unbundled` + bindgen, `link-dynamic` only |
 | `zeromq` | libzmq peers for tests/benches; the endpoint itself is pure-Rust zmq.rs |
 
 **Three build variants**, chosen by the orthogonal `link-static` /

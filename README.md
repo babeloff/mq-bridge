@@ -66,7 +66,7 @@ Three release variants differ only in where their C libraries come from:
 | `pixi run build-dynamic` | `full-dynamic` | linked from the environment | runtime `dlopen`, optional |
 
 `full` is the default and stays self-contained, so `cargo add mq-bridge
---features full` needs no system librdkafka or libsqlite. `full-dynamic` is for
+--features full` needs no system librdkafka. `full-dynamic` is for
 conda-forge and distro packaging, where the shared libraries have to stay
 patchable.
 

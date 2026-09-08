@@ -44,7 +44,7 @@ That is also why CI lints with `--features lint-all` rather than
 `--all-features`: the latter would switch both linkage features on at once.
 
 `full` stays self-contained so `cargo add mq-bridge --features full` needs no
-system librdkafka or libsqlite. `full-dynamic` exists for conda-forge and distro
+system librdkafka. `full-dynamic` exists for conda-forge and distro
 packaging, where the shared libraries have to stay patchable.
 
 What conda-forge supplies:
@@ -53,7 +53,6 @@ What conda-forge supplies:
 | --- | --- |
 | `libprotobuf` | every variant — `grpc` runs `protoc` (replaces `protoc-bin-vendored`) |
 | `librdkafka` | `link-dynamic` only, via `rdkafka/dynamic-linking` |
-| `libsqlite` + `libclang` | `link-dynamic` only, via `sqlx/sqlite-unbundled` (bindgen) |
 | `cmake`, `c-compiler` | `link-static` (librdkafka, SQLite) and always for aws-lc/ring/zstd |
 | `zeromq` | libzmq interop peers in tests; the `zeromq` endpoint is pure-Rust zmq.rs and links nothing |
 
@@ -61,7 +60,9 @@ What conda-forge supplies:
 
 Building without pixi still works: `full` needs only `protoc` plus a C
 compiler and cmake, while `full-dynamic` additionally needs librdkafka ≥ 2.12.1
-and SQLite ≥ 3.34.1 discoverable through `pkg-config`, and `libclang`.
+discoverable through `pkg-config`. SQLite is bundled either way, so neither
+variant needs a system libsqlite3 — nor the libclang that generating its
+bindings used to require.
 
 For IBM MQ specifically — installing the client, the loader's search order, TLS
 key repositories — see [python/mq-bridge-py/examples/IBM_MQ.md](python/mq-bridge-py/examples/IBM_MQ.md).
