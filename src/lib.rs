@@ -102,23 +102,6 @@
 #![warn(rustdoc::broken_intra_doc_links)]
 #![warn(rustdoc::missing_crate_level_docs)]
 
-// --- Native linkage guard ----------------------------------------------------
-//
-// `link-static` and `link-dynamic` select how librdkafka is obtained, and are
-// mutually exclusive: rdkafka-sys either builds its bundled source or links a
-// shared library found via pkg-config, and it cannot do both. Cargo features
-// are additive, so nothing but a hard error can stop a caller enabling both.
-//
-// Neither feature is required. `--features kafka` on its own falls back to
-// rdkafka-sys' own bundled build, and no other endpoint consults them — SQLite
-// is bundled unconditionally by the sqlx dependency, so `--features sqlx` and
-// `--features postgres-cdc` compile with no linkage feature named.
-//
-// This is a backstop, not the message you are guaranteed to see. Both features
-// reach rdkafka-sys' *build script*, which cargo may run before this crate's
-// own lib is compiled, so enabling both often surfaces as an rdkafka-sys
-// pkg-config failure first.
-
 #[cfg(all(feature = "link-static", feature = "link-dynamic"))]
 compile_error!(
     "features `link-static` and `link-dynamic` are mutually exclusive - enable exactly one. \
