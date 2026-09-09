@@ -278,7 +278,7 @@ full-dynamic = ["full-common", "ibm-mq", "link-dynamic"]
 
 lint-all = ["full", "test-utils", "schema", "plugin-sdk", "perf-diagnostics", "float-roundtrip"]
 
-link-static = ["rdkafka?/libz-static"]
+link-static = []
 link-dynamic = ["rdkafka?/dynamic-linking"]
 
 vendored-protoc = ["dep:protoc-bin-vendored"]
@@ -332,7 +332,7 @@ rustls-aws-lc  = ["rustls/aws_lc_rs",  "rustls/prefer-post-quantum", "tokio-rust
 schema = ["dep:schemars"]
 
 # Endpoint features
-kafka = ["rdkafka"]
+kafka = ["rdkafka", "rdkafka/libz-static"]
 amqp = ["lapin", "rustls", "rustls-pemfile", "url"]
 nats = ["async-nats", "rustls", "rustls-pemfile"]
 mongodb = ["dep:mongodb", "url"]
