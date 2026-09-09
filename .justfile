@@ -262,20 +262,56 @@ check-native-deps:
         fi
     }
 
+    # An rdkafka.pc that exists but is not on the search path is the common
+    # case, not the exceptional one: `pixi global install` and `conda install`
+    # both place one under their prefix, and neither puts that prefix on
+    # PKG_CONFIG_PATH — pixi global exposes binaries only. Look before telling
+    # anyone to install something they already have.
+    find_rdkafka_pc() {
+        local d
+        for d in "${HOME}/.pixi/envs"/*/lib/pkgconfig \
+                 "${CONDA_PREFIX:-/nonexistent}/lib/pkgconfig" \
+                 .pixi/envs/*/lib/pkgconfig \
+                 build/conan \
+                 /opt/homebrew/lib/pkgconfig \
+                 /usr/local/lib/pkgconfig; do
+            # Absolute, always: this path goes into an `export` line the
+            # reader will paste, and a relative one only works from the
+            # repository root.
+            [ -f "$d/rdkafka.pc" ] && (cd "$d" && pwd)
+        done
+    }
+
     advise_rdkafka() {
         say "librdkafka $1." ""
+
+        local found
+        found=$(find_rdkafka_pc | head -1)
+        if [ -n "$found" ]; then
+            say "It is already installed — pkg-config just cannot see it. Its" \
+                "rdkafka.pc is here:" "" "    $found" "" \
+                "so all that is missing is the search path:" "" \
+                "    export PKG_CONFIG_PATH=$found\${PKG_CONFIG_PATH:+:\$PKG_CONFIG_PATH}" "" \
+                "\`pixi global install\` and \`conda install\` both expose binaries" \
+                "rather than libraries, so installing librdkafka does not by itself" \
+                "make its .pc discoverable." "" \
+                "Currently searching: $(search_path)"
+            return
+        fi
+
         say "Only the dynamic variant needs it. If you do not specifically want" \
             "dynamic linkage, build the self-contained variant instead — it" \
             "compiles its own librdkafka and needs nothing installed:" \
             "" "    just build-static" ""
-        say "To supply it anyway, any one of:" "" \
+        say "To supply it, any one of:" "" \
             "    Fedora        sudo dnf install librdkafka-devel" \
             "    Debian        sudo apt-get install librdkafka-dev" \
             "    macOS         brew install librdkafka" \
             "    pixi          pixi global install librdkafka" \
             "    conda-forge   the librdkafka package" \
-            "    Conan         see the feature/conan-native-deps branch" ""
-        say "then make sure its rdkafka.pc is somewhere pkg-config looks:" "" \
+            "    Conan         just conan" ""
+        say "then make sure its rdkafka.pc is somewhere pkg-config looks — the" \
+            "install alone is often not enough:" "" \
             "    export PKG_CONFIG_PATH=/path/to/lib/pkgconfig:\$PKG_CONFIG_PATH" "" \
             "Currently searching: $(search_path)"
     }

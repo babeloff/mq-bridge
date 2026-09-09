@@ -52,9 +52,6 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
       
-      # Not --all-features: that enables `link-static` and `link-dynamic`
-      # together, which src/lib.rs rejects with a compile_error!. `lint-all` is
-      # every feature that gates code, with one linkage picked; see Cargo.toml.
       - name: Run clippy
         run: cargo clippy --all-targets --features lint-all -- -D warnings
 
@@ -83,14 +80,6 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       # amqp/aws/zeromq are omitted: unchanged for a while and covered by `full`.
-      # `full-dynamic` is swept here and nowhere else: it is the only subset
-      # that exercises the pkg-config paths into conda-forge's librdkafka and
-      # libsqlite, which is exactly what the pixi environment supplies. On a
-      # branch without pixi there is no way to run it.
-      #
-      # `grpc` needs no `vendored-protoc` here either, because pixi puts
-      # libprotobuf's protoc on PATH. `full` still carries the vendored one, so
-      # both routes to protoc stay covered.
       - name: Check each feature subset
         run: |
           failed=""
@@ -306,7 +295,6 @@ jobs:
       - name: Cache cargo build
         uses: Swatinem/rust-cache@v2
 
-      # `lint-all` rather than --all-features, for the same reason as clippy.
       - name: Build documentation (deny warnings)
         run: RUSTDOCFLAGS="-D warnings" cargo doc --features lint-all --no-deps
 
