@@ -51,6 +51,14 @@ pkg-config = ">=0.29"
 c-compiler = ">=1.11"
 cxx-compiler = ">=1.11"
 cmake = ">=3.31"
+# Task scripts with real control flow live in scripts/pixi/*.nu rather than as
+# multi-line `cmd` strings; nushell runs them identically on win-64, which a
+# bash snippet would not.
+nushell = ">=0.100"
+# Supply-chain and integration gates, previously only reachable through the
+# task runner this branch replaces.
+cargo-deny = ">=0.16"
+cargo-nextest = ">=0.9"
 # No libclang either: `sqlite-unbundled` was the only bindgen in the tree, and
 # it is gone with it.
 
@@ -83,6 +91,10 @@ docker-compose = ">=2.30"
 # the wire-compatibility test (it skips itself if the import fails).
 python = ">=3.12,<3.14"
 grpcio-tools = ">=1.60"
+# The py-* tasks build and test the extension with this environment's own
+# interpreter, so maturin and pytest come from here rather than from uv.
+maturin = ">=1.7,<2"
+pytest = ">=8"
 
 # --- Environments -------------------------------------------------------------
 
@@ -192,22 +204,9 @@ description = "Fail on unformatted code"
 cmd = "cargo clippy --all-targets --features lint-all -- -D warnings"
 description = "Lint as CI does"
 
-# Mirrors the feature-subset sweep in .github/workflows/ci.yml. The trailing
-# backslashes are TOML line continuations, so `cmd` is still the single
-# `&&`-chained shell line it was before -- only the source is wrapped.
 [tasks.check-features]
-cmd = """
-cargo check --all-targets && \
-cargo check --all-targets --features full && \
-cargo check --all-targets --features full-dynamic && \
-cargo check --all-targets --features kafka && \
-cargo check --all-targets --features nats && \
-cargo check --all-targets --features grpc && \
-cargo check --all-targets --features mqtt && \
-cargo check --all-targets --features mongodb && \
-cargo check --all-targets --features http\
-"""
-description = "cargo check each feature subset CI covers"
+cmd = "nu scripts/pixi/check-features.nu"
+description = "cargo check each feature subset CI covers, reporting every failure"
 
 [tasks.test]
 cmd = "cargo test --lib --features full"
@@ -229,10 +228,9 @@ description = "Downstream GrpcConfig literal fixture (not a default member)"
 cmd = "cargo doc --no-deps --features full"
 description = "Build rustdoc"
 
-# Prove the conda-forge libraries are the ones actually linked.
 [tasks.verify-native-deps]
-cmd = "pkg-config --modversion rdkafka libzmq && protoc --version"
-description = "Print the resolved conda-forge native library versions"
+cmd = "nu scripts/pixi/verify-native-deps.nu"
+description = "Show which native libraries resolved, and from where"
 
 [feature.dev.tasks.test-integration]
 cmd = "cargo nextest run --release --features full,test-utils --test integration_test --test armature_integration"
@@ -253,3 +251,102 @@ description = "Set the version everywhere (pass the new version, or none to re-s
 [feature.release.tasks.check-version]
 cmd = "node scripts/sync-version.mjs --check"
 description = "Fail if any committed copy of the version has drifted"
+
+# --- Gates the replaced task runner carried ---------------------------------
+
+# Everything ci.yml gates a PR on, bar the Docker-backed suites.
+[tasks.ci]
+depends-on = ["fmt-check", "clippy", "check-config-compat", "check-features", "test", "test-no-docker", "doc"]
+description = "Run every PR gate except the Docker suites"
+
+[tasks.deny]
+cmd = "cargo deny check bans licenses sources"
+description = "Licenses, bans and sources (a hard gate in CI)"
+
+# Informational in CI: every current advisory is in a transitive dependency we
+# cannot upgrade ourselves. deny.toml carries the reasoning.
+[tasks.deny-advisories]
+cmd = "cargo deny check advisories"
+description = "RustSec advisories (informational)"
+
+[tasks.node-check]
+cmd = 'cargo check -p mq-bridge-node --no-default-features --features "http middleware schema"'
+description = "cargo check the node bindings as node.yml does"
+
+# --- Docker-backed integration ----------------------------------------------
+#
+# Compiled once into an archive, as ci.yml does, so the filtered runs need no
+# recompilation.
+
+[feature.dev.tasks.integration-archive]
+cmd = """
+cargo nextest archive --release --features full,test-utils   --test integration_test --test armature_integration   --archive-file nextest-archive.tar.zst"""
+description = "Build the nextest archive for the Docker suites"
+
+# Narrow with a nextest filter, e.g.
+#   pixi run -e dev integration 'binary(integration_test) & test(=test_all_status)'
+[feature.dev.tasks.integration]
+args = [{ arg = "filter", default = "all()" }]
+cmd = """
+cargo nextest run --archive-file nextest-archive.tar.zst   --run-ignored all --no-capture -E '{{ filter }}'"""
+depends-on = ["integration-certs"]
+description = "Run the Docker suites from the archive; takes a nextest filter"
+
+[feature.dev.tasks.integration-certs]
+cmd = "nu scripts/pixi/integration-certs.nu"
+description = "Generate the TLS fixtures the integration services need"
+
+# --- Python bindings --------------------------------------------------------
+#
+# These use this environment's own python and maturin rather than uv. The
+# replaced task runner had to unset CONDA_PREFIX to stop maturin refusing when
+# it and VIRTUAL_ENV were both set; here there is only one interpreter and pixi
+# owns it, so that whole failure mode is gone.
+
+[feature.dev.tasks.py-dev]
+cmd = "maturin develop --manifest-path python/mq-bridge-py/Cargo.toml"
+description = "Build the extension into this environment"
+
+[feature.dev.tasks.py-test]
+cmd = "pytest -q"
+cwd = "python/mq-bridge-py"
+depends-on = ["py-dev"]
+description = "Run the Python test suite"
+
+# python.yml's regression check that the lean, no-default build still exposes
+# the always-on public API.
+[feature.dev.tasks.py-test-lean]
+cmd = """
+cargo test -p mq-bridge-py --no-default-features --features http,rustls-ring test_config_schema_is_always_available && cargo test -p mq-bridge-py --no-default-features --features http,rustls-ring test_module_init_installs_rustls_provider"""
+description = "Lean no-default-features regression tests"
+
+# --- Application (separate cargo workspace) ---------------------------------
+#
+# apps/mq-bridge-app has its own Cargo.lock, so these run from inside it.
+
+[tasks.app-check]
+cmd = "cargo check -p mq-bridge-app-core -p mq-bridge-app --all-targets"
+cwd = "apps/mq-bridge-app"
+description = "cargo check the app crates"
+
+[tasks.app-lint]
+cmd = "cargo clippy -p mq-bridge-app-core -p mq-bridge-app --all-targets -- -D warnings"
+cwd = "apps/mq-bridge-app"
+description = "Clippy the app crates, warnings denied"
+
+[tasks.app-test]
+cmd = "cargo test -p mq-bridge-app-core -p mq-bridge-app --lib --bins"
+cwd = "apps/mq-bridge-app"
+description = "Unit and bin tests for the app crates"
+
+[tasks.app-ci]
+depends-on = ["app-check", "app-lint", "app-test"]
+description = "Everything app.yml gates the app crates on"
+
+# Reaches the engine's `link-dynamic` through the passthroughs in crates/core
+# and crates/cli. `--no-default-features` is required: `default = ["full"]`
+# would otherwise be on too and collide with it.
+[tasks.app-build-dynamic]
+cmd = "cargo build --release -p mq-bridge-app --no-default-features --features full-dynamic"
+cwd = "apps/mq-bridge-app"
+description = "The app, linked against this environment's librdkafka"
