@@ -1,5 +1,7 @@
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    if std::env::var("CARGO_FEATURE_IBM_MQ_STATIC").is_ok() {
+    if std::env::var("CARGO_FEATURE_IBM_MQ").is_ok()
+        || std::env::var("CARGO_FEATURE_IBM_MQ_STATIC").is_ok()
+    {
         // Ensure rebuild when these environment variables change
         println!("cargo:rerun-if-env-changed=MQ_INSTALLATION_PATH");
         println!("cargo:rerun-if-env-changed=MQ_HOME");

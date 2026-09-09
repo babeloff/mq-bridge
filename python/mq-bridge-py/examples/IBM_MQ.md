@@ -72,8 +72,12 @@ loader, which tries these in order and takes the first that loads:
 1. `$MQB_IBM_MQ_LIB` — a full path to the library file. Use this when the
    install does not follow the usual layout.
 2. `$MQ_INSTALLATION_PATH/lib64/<lib>` then `$MQ_INSTALLATION_PATH/lib/<lib>`.
-3. the bare library name, leaving it to the platform's search path
-   (`LD_LIBRARY_PATH`, `DYLD_LIBRARY_PATH`, `PATH` on Windows).
+3. the bare library name, leaving it to the platform's search path. On Linux
+   that is `dlopen("libmqm_r.so")`, which glibc resolves against the calling
+   object's `DT_RPATH`, then `LD_LIBRARY_PATH`, then its `DT_RUNPATH`, then
+   `ld.so.cache` and the default directories — so the rpath `build.rs` records
+   (see below) counts here, not just `LD_LIBRARY_PATH`. macOS uses
+   `DYLD_LIBRARY_PATH` and the `LC_RPATH` entries; Windows uses `PATH`.
 
 `<lib>` is `libmqm_r.so` on Linux, `libmqm_r.dylib` on macOS and `mqm.dll` on
 Windows.
@@ -199,11 +203,13 @@ fixtures, not redistributed IBM software.
   have accepted those terms for your own build, and see
   [Redistribution](#redistribution).
 
-  On `ibm-mq-static`, `build.rs` adds `$MQ_INSTALLATION_PATH/lib64` (or `lib` on
-  32-bit) to the link search path and records it as an rpath, so the binary
-  finds `libmqm_r` without `LD_LIBRARY_PATH`. It falls back to `MQ_HOME`, then
-  `/opt/mqm`. The dlopen build gets no rpath, because it never consults the link
-  search path.
+  On either feature, `build.rs` adds `$MQ_INSTALLATION_PATH/lib64` (or `lib` on
+  32-bit) to the link search path and records it as an rpath, falling back to
+  `MQ_HOME` and then `/opt/mqm`. Both builds need it, for different reasons: on
+  `ibm-mq-static` the loader resolves `libmqm_r` at startup, and on the dlopen
+  build `dlopen("libmqm_r.so")` by bare name — step 3 of the search order above
+  — consults the calling object's `DT_RUNPATH` too. So the rpath is what makes
+  a stock `/opt/mqm` install work with no environment variables set at all.
 
 ## Verifying an install
 
